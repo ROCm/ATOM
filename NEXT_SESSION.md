@@ -1,12 +1,24 @@
 # Next-session pickup notes — ATOM gfx1201 / Ministral-3
 
-## What runs today (commit `c983d98` on branch `carhuang/support_gfx1201_mistral3`)
+## Headline
+
+End-to-end **prefill** of Mistral-3-8B works on gfx1201 (RX 9070 XT) using the
+torch-native fallback path. Engine boots, warmup completes, and a real prompt
+gets through all 34 transformer layers + sampler before hitting the explicit
+`NotImplementedError` at `TorchNativeMetadataBuilder.prepare_decode`.
+
+The only remaining piece for a working `simple_inference` / `openai_server`
+greedy generation is **decode + paged KV-cache write**. That's the focus of
+the next session.
+
+## Reproduce furthest-progress run
 
 ```bash
 ssh -i /home/carhuang/id_rsa_carhuang carhuang@agent-tr9980x-01
 docker exec -it atom_gfx1201 bash -lc '
   cd /tmp && \
   ATOM_USE_TRITON_GEMM=1 AITER_LOG_LEVEL=WARNING \
+  AITER_ROPE_NATIVE_BACKEND=1 \
   ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT=0 \
   ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT=0 \
   ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0 \
@@ -17,97 +29,94 @@ docker exec -it atom_gfx1201 bash -lc '
     --gpu-memory-utilization 0.85'
 ```
 
-How far it gets right now (with probes removed, you'll just see SIGSEGV):
+Expected progression: `Model load done` → `warmup_model done` → engine ready
+→ first real prompt prefill completes → `NotImplementedError:
+TorchNativeMetadataBuilder.prepare_decode is a TODO`.
 
-```
-Model load done
-TorchNativeMetadataBuilder: initialized
-ModelRunner.forward → prepare_model → run_model
-  embed → ✓
-  layer 0 → input_layernorm (RMSNorm via torch fallback ✓)
-          → self_attn → qkv_proj → SIGSEGV  ← next blocker
-```
+## Branch state (`carhuang/support_gfx1201_mistral3`, local-only on remote)
 
-## Next blocker: FP8 GEMM in `qkv_proj` / `gate_up_proj` / `down_proj` / `o_proj`
-
-Mistral-3 weights are FP8 per-tensor (`weight_block_size: null`). When ATOM's
-`linear.py` runs the GEMM, it picks one of the prebuilt aiter HIP kernels:
-`aiter.gemm_a8w8`, `aiter.gemm_a8w8_bpreshuffle`, or `aiter.gemm_a8w8_blockscale`.
-None of these have a gfx1201 code object.
-
-`ATOM_USE_TRITON_GEMM=1` only swaps in the **blockscale** Triton kernel
-(`aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale`), which doesn't help
-per-tensor FP8.
-
-Two reasonable directions for next session:
-
-### Option A — torch fallback (mirrors the RMSNorm fix done this session)
-
-Patch `atom/model_ops/linear.py` to detect gfx1201 and dequantize FP8 → BF16
-inside the linear forward, then `torch.matmul(input_bf16, weight_bf16.T)`.
-Slow but correct. Pattern to copy from the RMSNorm fallback:
-
-```python
-# atom/model_ops/layernorm.py:_is_gfx1201_layernorm + _rmsnorm_torch
-```
-
-The relevant linear-layer call sites are inside `linear.py`'s
-`weight_loader_process` / forward methods — the FP8 GEMM dispatch is around
-the `gemm_a8w8*` calls. Dequant approach: `weight_bf16 = (weight_fp8.to(torch.float32) * weight_scale).to(torch.bfloat16)`.
-
-### Option B — dequantize the model at load time (simpler globally)
-
-Find where ATOM stores FP8 weights post-load and add a one-time dequant
-sweep when on gfx1201 so the rest of ATOM thinks it's a BF16 model.
-HF's transformers has `FineGrainedFP8Config(dequantize=True)` doing
-exactly this; mirror the idea inside ATOM. Trades VRAM (12GB → ~17GB
-weights) for a one-shot fix that bypasses the FP8-kernel ecosystem
-entirely. Won't fit on 16 GB without offload.
-
-**Recommendation:** Option A — tighter scope, reuses the RMSNorm pattern,
-keeps weights in FP8 (preserves the user's FP8 goal).
-
-## After FP8 GEMM works, more aiter HIP loads will surface
-
-In rough order of likelihood (each will SIGSEGV the same way):
-
-1. **`silu_and_mul`** in `atom/model_ops/activation.py` — used by SwiGLU MLP.
-   Trivial torch fallback: `F.silu(x[..., :n//2]) * x[..., n//2:]`.
-2. **`reshape_and_cache`** for KV writes when our impl tries to fill the
-   paged cache. We're skipping the paged cache today, so this only matters
-   once we add decode (TODO-7).
-3. **Anything else in the model_ops/ files that imports aiter's prebuilt
-   modules.** Strategy: each one gets a `_is_gfx1201()`-gated torch
-   fallback at the call site. Don't try to refactor — just bisect by
-   re-running and patching the next thing that crashes.
-
-## Useful test loop
-
-Re-add probes any time by running `/tmp/probe_llama.py` (kept on the box)
-before a run; revert with `git checkout -- atom/models/llama.py atom/model_engine/model_runner.py`
-after.
-
-## Critical paths reminder
-
-| Purpose | File |
+| commit | what works |
 |---|---|
-| Branch | `carhuang/support_gfx1201_mistral3` (local on remote, not pushed) |
-| Working RMSNorm fallback (template for next ones) | `atom/model_ops/layernorm.py:_is_gfx1201_layernorm` |
-| Backend selector | `atom/utils/selector.py:get_attn_backend_cls` |
-| Torch-native impl (prefill done, decode TODO) | `atom/model_ops/attentions/torch_native_attn.py` |
-| Dispatch hook | `atom/model_ops/paged_attention.py` (TORCH_NATIVE_ATTENTION branch) |
-| Mistral3 model port | `atom/models/mistral3.py` |
-| Plan doc | `~/.claude/plans/glittery-dazzling-crayon.md` (host-side) |
+| `93e6013` | Mistral3 model + loader fixes — model loads cleanly |
+| `4f848a9` | Backend scaffold + selector wiring |
+| `c983d98` | Torch-native attention impl (prefill) + RMSNorm fallback |
+| `e2a0e1b` | FP8 GEMM + SiLU+Mul + sampler fallbacks; KV-budget unblocked |
 
-## Required env vars to repro current furthest progress
+## What works on gfx1201 today (and via what)
+
+| op | replaced by | file |
+|---|---|---|
+| RMSNorm (with/without residual) | torch RMSNorm | `atom/model_ops/layernorm.py` |
+| Per-tensor FP8 linear (qkv_proj, o_proj, gate_up_proj, down_proj) | dequant + `F.linear` | `atom/model_ops/linear.py` |
+| YaRN-scaled RoPE | `forward_native` via `AITER_ROPE_NATIVE_BACKEND=1` | env var (no patch) |
+| SiluAndMul (SwiGLU) | existing `forward_native` | `atom/model_ops/activation.py` |
+| Mixed Gumbel sampler | torch Gumbel-max + argmax | `atom/model_ops/sampler.py` |
+| Attention prefill | per-seq SDPA loop using cu_seqlens | `atom/model_ops/attentions/torch_native_attn.py` |
+| `compute_block_bytes` (KV budget) | rough placeholder so engine boots | same file |
+
+## Decode work — the actual remaining piece
+
+The two TODOs still raising in `torch_native_attn.py`:
+
+1. **`TorchNativeMetadataBuilder.prepare_decode(batch, bs)`** — must build
+   `AttentionMetaData` with at minimum: `slot_mapping`, `context_lens`,
+   `block_tables`, `cu_seqlens_q` (decode is `cu_seqlens_q[i+1]-cu_seqlens_q[i]==1`),
+   `max_seqlen_q=1`, `max_seqlen_k=max(context_lens)`. Reference implementation:
+   `atom/model_ops/attentions/aiter_attention.py:prepare_decode` (lines ~529-620).
+   Strip aiter-specific fields (`kv_indptr`, `kv_indices`, persistent worker
+   buffers); we won't need them. Returns `(attn_metadata, positions_tensor)`.
+
+2. **`TorchNativeAttentionImpl.forward` decode path** (and KV-cache write).
+   Today the prefill path is the whole forward. Add a branch on
+   `is_prefill==False`:
+   - Read current K/V from the new q/k/v inputs.
+   - Write them into the paged KV pool at `slot_mapping`. The KV pool is
+     stored on the parent `PagedAttention` instance as `self.kv_cache`
+     (or `module.k_cache`/`module.v_cache` after `build_kv_cache_tensor`).
+     **Currently we don't allocate a KV pool** — so before this works we
+     also need to override `allocate_kv_cache_tensors` /
+     `build_kv_cache_tensor` to actually create the tensors.
+   - Gather historical K/V from the pool using `block_tables` + the
+     new `slot_mapping`, then SDPA: query is [bs, num_heads, 1, d],
+     keys are [bs, num_heads, ctx_len, d], no causal mask needed for
+     decode (length-1 query).
+
+A minimal-correctness shortcut to consider:
+**stateless decode** — recompute the full prefill on every step using the
+growing input ids, never store a KV cache. Wildly inefficient (O(N²) per
+token) but correct, and avoids the entire KV-cache machinery for a first
+greedy/gsm8k run. Could be the fastest path to lm_eval results.
+
+## Validation milestones, in order
+
+1. `simple_inference` greedy generation completes at least one real
+   sentence. Print the output and eyeball that it's English.
+2. Spin up `openai_server` and curl `/v1/chat/completions` with a tiny
+   prompt; check the response is sane.
+3. `lm_eval --model local-completions --base_url http://localhost:30000/v1/completions --tasks gsm8k --num_fewshot 5 --apply_chat_template`
+   — first real accuracy number.
+
+## Required env vars (record verbatim, keep in repo recipes/Ministral-3-8B.md when committing)
 
 ```
-ATOM_USE_TRITON_GEMM=1                                  # blockscale Triton GEMM (best-effort)
-AITER_LOG_LEVEL=WARNING                                 # quiet
-ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT=0    # don't try the FP8-fused RMSNorm path
+ATOM_USE_TRITON_GEMM=1
+AITER_LOG_LEVEL=WARNING
+AITER_ROPE_NATIVE_BACKEND=1
+ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT=0
 ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT=0
 ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0
 ```
 
-CLI required: `--enforce-eager --level 0 --kv_cache_dtype bf16` (CUDAGraph
-capture and FP8 KV are both still TODO).
+## Caveats / known issues to revisit
+
+* 238 `activation_scale` checkpoint tensors get silently dropped during
+  load. Currently fine because our FP8 linear fallback ignores
+  `input_scale`. Once we want fully native FP8 (no dequant) we'll need to
+  fix the loader to merge q/k/v static scales into `qkv_proj.input_scale`.
+* `--enforce-eager --level 0` are still required. CUDAGraph capture will
+  break the dispatch-by-arch checks; revisit only after decode works.
+* `--kv_cache_dtype bf16` only. FP8 KV is gated on real KV cache + a
+  quant/dequant step we don't have.
+* The KV-cache "allocation mismatch" warning at boot is the placeholder
+  `compute_block_bytes` lying about the pool size. Harmless until decode
+  needs it.
