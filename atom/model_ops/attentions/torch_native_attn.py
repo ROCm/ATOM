@@ -113,6 +113,87 @@ def _get_triton_pa_decode():
 # ---------------------------------------------------------------------------
 
 
+
+# ---------------------------------------------------------------------------
+# Triton KV-cache write kernel (skips -1 sentinels in-kernel; no Python sync)
+# ---------------------------------------------------------------------------
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _kv_cache_write_kernel(
+    K_NEW_PTR, V_NEW_PTR,                # [N, H, D] BF16 (or compatible)
+    SLOT_PTR,                            # [N] int64
+    K_CACHE_PTR, V_CACHE_PTR,            # [B, H, S, D] BF16
+    new_stride_token, new_stride_head,
+    cache_stride_block, cache_stride_head, cache_stride_within,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    S: tl.constexpr,
+):
+    """One program per token; copies the token's full (H, D) K/V slab into
+    cache[block_id, :, within, :]. Slot < 0 sentinels are skipped."""
+    token_idx = tl.program_id(0)
+    if token_idx >= N:
+        return
+    slot = tl.load(SLOT_PTR + token_idx)
+    if slot < 0:
+        return
+    block_id = slot // S
+    within = slot % S
+
+    head_offs = tl.arange(0, H)
+    d_offs = tl.arange(0, D)
+
+    new_off = (
+        token_idx * new_stride_token
+        + head_offs[:, None] * new_stride_head
+        + d_offs[None, :]
+    )
+    cache_off = (
+        block_id * cache_stride_block
+        + head_offs[:, None] * cache_stride_head
+        + within * cache_stride_within
+        + d_offs[None, :]
+    )
+
+    k_vals = tl.load(K_NEW_PTR + new_off)
+    v_vals = tl.load(V_NEW_PTR + new_off)
+    tl.store(K_CACHE_PTR + cache_off, k_vals)
+    tl.store(V_CACHE_PTR + cache_off, v_vals)
+
+
+def _kv_cache_write_triton(
+    k_cache: torch.Tensor,   # [B, H, S, D]
+    v_cache: torch.Tensor,   # [B, H, S, D]
+    slot_mapping: torch.Tensor,  # [N]
+    k_new: torch.Tensor,     # [N, H, D]
+    v_new: torch.Tensor,     # [N, H, D]
+):
+    N = slot_mapping.shape[0]
+    if N == 0:
+        return
+    B, H, S, D = k_cache.shape
+    # Triton requires power-of-two block sizes; H, D should be already.
+    # k_new strides assume contiguous [N, H, D].
+    k_new_c = k_new.contiguous() if not k_new.is_contiguous() else k_new
+    v_new_c = v_new.contiguous() if not v_new.is_contiguous() else v_new
+    slot_i64 = slot_mapping.to(torch.int64) if slot_mapping.dtype != torch.int64 else slot_mapping
+
+    new_stride = k_new_c.stride()
+    cache_stride = k_cache.stride()
+    grid = (N,)
+    _kv_cache_write_kernel[grid](
+        k_new_c, v_new_c,
+        slot_i64,
+        k_cache, v_cache,
+        new_stride[0], new_stride[1],
+        cache_stride[0], cache_stride[1], cache_stride[2],
+        N=N, H=H, D=D, S=S,
+    )
+
 class TorchNativeBackend(AttentionBackend):
     """AITER-free attention backend (torch + selectively triton)."""
 
@@ -346,27 +427,23 @@ class TorchNativeAttentionImpl(AttentionImpl):
 
     @staticmethod
     def _write_kv_cache(
-        k_cache: torch.Tensor,  # [B, H, S, D] (aiter layout)
-        v_cache: torch.Tensor,  # [B, H, S, D]
-        slot_mapping: torch.Tensor,  # [N] flat slot indices = block * S + within
-        k_new: torch.Tensor,  # [N, H, D]
-        v_new: torch.Tensor,  # [N, H, D]
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
     ) -> None:
-        valid = slot_mapping >= 0
-        if not bool(valid.all()):
-            slot_mapping = slot_mapping[valid]
-            k_new = k_new[valid]
-            v_new = v_new[valid]
+        """Triton-launched scatter into the paged KV pool. Slot == -1 entries
+        are skipped inside the kernel, so this path has no Python-side
+        conditional and is CUDAGraph-capturable."""
         if slot_mapping.numel() == 0:
             return
-        S = k_cache.shape[2]
-        slot_mapping = slot_mapping.long()
-        block_idx = slot_mapping // S       # [N]
-        within = slot_mapping % S           # [N]
-        # Advanced indexing: cache[I, :, J, :] for parallel (I, J) of length N
-        # gives a (N, H, D) view; assignment from (N, H, D) writes back.
-        k_cache[block_idx, :, within, :] = k_new.to(k_cache.dtype)
-        v_cache[block_idx, :, within, :] = v_new.to(v_cache.dtype)
+        # Cast K/V to cache dtype if needed (cheap pointwise; otherwise no-op).
+        if k_new.dtype != k_cache.dtype:
+            k_new = k_new.to(k_cache.dtype)
+        if v_new.dtype != v_cache.dtype:
+            v_new = v_new.to(v_cache.dtype)
+        _kv_cache_write_triton(k_cache, v_cache, slot_mapping, k_new, v_new)
 
     def _gather_kv_for_request(
         self,

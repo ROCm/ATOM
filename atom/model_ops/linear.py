@@ -548,12 +548,18 @@ class LinearBase(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
-            y = tgemm.mm(
-                x,
-                self.weight,
-                self.bias,
-                otype=otype,
-            )
+            if _is_gfx1201_linear():
+                # gfx1201: skip aiter tgemm.mm (no gfx1201 HIP code object).
+                # Plain BF16 F.linear; weight is already in the right dtype.
+                import torch.nn.functional as _F
+                y = _F.linear(x.to(otype), self.weight.to(otype), self.bias)
+            else:
+                y = tgemm.mm(
+                    x,
+                    self.weight,
+                    self.bias,
+                    otype=otype,
+                )
         else:
             if x_scale is None:
                 quant_func = self.quant_func
