@@ -84,6 +84,18 @@ class SiluAndMul(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # gfx1201 (RDNA4): aiter prebuilt silu_and_mul HIP kernel has no
+        # gfx1201 code object and SIGSEGVs on load. Use the existing
+        # forward_native (pure torch SiLU * Mul) instead.
+        if not hasattr(self, "_is_gfx1201_cached"):
+            try:
+                self._is_gfx1201_cached = (
+                    torch.cuda.get_device_properties(0).gcnArchName or ""
+                ).startswith("gfx1201")
+            except Exception:
+                self._is_gfx1201_cached = False
+        if self._is_gfx1201_cached:
+            return self.forward_native(x, x_scale)
         # fp8 quantization
         if x_scale is not None and self.fused_quant:
             from aiter.ops.triton.fused_fp8_quant import (

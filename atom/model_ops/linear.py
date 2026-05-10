@@ -37,6 +37,55 @@ from torch import nn
 logger = logging.getLogger("atom")
 
 
+
+# --- gfx1201 (RDNA4) FP8 GEMM fallback --------------------------------------
+# AITER prebuilts (gemm_a8w8*, tgemm.mm dispatched to aiter HIP) do not have
+# gfx1201 code objects in the rocm/atom-dev:latest image, causing SIGSEGV on
+# kernel load. We dequantize FP8 weights to BF16 and run F.linear instead.
+# Detection is cached after first call.
+def _is_gfx1201_linear() -> bool:
+    if not hasattr(_is_gfx1201_linear, "_cached"):
+        try:
+            import torch as _t
+            name = _t.cuda.get_device_properties(0).gcnArchName or ""
+            _is_gfx1201_linear._cached = name.startswith("gfx1201")
+        except Exception:
+            _is_gfx1201_linear._cached = False
+    return _is_gfx1201_linear._cached
+
+
+def _fp8_per_tensor_linear_torch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale,
+    bias,
+    x_scale,
+    otype,
+) -> torch.Tensor:
+    """Pure-torch per-tensor FP8 linear: dequant weight (and x if FP8) to a
+    floating dtype, then F.linear. Used as a gfx1201 fallback for tgemm.mm."""
+    import torch.nn.functional as _F
+
+    # Dequantize weight from FP8 to fp32 then cast to otype
+    w_scale = weight_scale.to(torch.float32) if weight_scale is not None else None
+    w = weight.to(torch.float32)
+    if w_scale is not None:
+        w = w * w_scale
+    w = w.to(otype)
+
+    # Dequantize x if it came in as FP8
+    if x.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2):
+        xs = x.to(torch.float32)
+        if x_scale is not None:
+            xs = xs * x_scale.to(torch.float32)
+        x_in = xs.to(otype)
+    else:
+        x_in = x.to(otype)
+
+    return _F.linear(x_in, w, bias if bias is not None else None)
+
+# ----------------------------------------------------------------------------
+
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
@@ -417,20 +466,31 @@ class LinearBase(nn.Module):
                         transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
-                    x, x_scale = quant_func(
-                        x,
-                        quant_dtype=self.params_dtype,
-                        scale=getattr(self, "input_scale", None),
-                    )
+                    if _is_gfx1201_linear():
+                        # skip dynamic FP8 quant on gfx1201; fallback handles BF16 inputs
+                        x_scale = getattr(self, "input_scale", None)
+                    else:
+                        x, x_scale = quant_func(
+                            x,
+                            quant_dtype=self.params_dtype,
+                            scale=getattr(self, "input_scale", None),
+                        )
             if self.quant_type.value == QuantType.per_Tensor.value:
-                y = tgemm.mm(
-                    x,
-                    self.weight,
-                    self.bias,
-                    otype=otype,
-                    scale_a=x_scale,
-                    scale_b=self.weight_scale,
-                )
+                if _is_gfx1201_linear():
+                    # gfx1201: skip aiter tgemm.mm (no gfx1201 HIP code object),
+                    # dequant FP8 weight + run F.linear in BF16.
+                    y = _fp8_per_tensor_linear_torch(
+                        x, self.weight, self.weight_scale, self.bias, x_scale, otype
+                    )
+                else:
+                    y = tgemm.mm(
+                        x,
+                        self.weight,
+                        self.bias,
+                        otype=otype,
+                        scale_a=x_scale,
+                        scale_b=self.weight_scale,
+                    )
             elif self.quant_type.value == QuantType.per_Token.value:
                 if self.params_dtype == dtypes.i8:
                     y = gemm_a8w8(

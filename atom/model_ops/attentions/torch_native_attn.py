@@ -115,6 +115,24 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
             "TorchNativeMetadataBuilder: initialized (no aiter HIP allocations)"
         )
 
+    def compute_block_bytes(self) -> int:
+        """Return a nonzero placeholder so engine_core.get_num_blocks does not
+        ZeroDivisionError. We do not actually use this paged KV pool yet
+        (decode is a TODO); a small constant per layer keeps the math sane.
+        """
+        runner = self.model_runner
+        cfg = runner.config
+        hf = cfg.hf_config
+        from atom.config import _MULTIMODAL_MODEL_TYPES
+        # Mistral3 etc: text fields live on text_config after flattening.
+        num_kv_heads = max(1, runner._get_num_kv_heads())
+        head_dim = getattr(hf, "head_dim", None) or (
+            hf.hidden_size // hf.num_attention_heads
+        )
+        n_layers = runner._get_total_num_layers()
+        # bytes per block for K and V together: 2 * layers * block * heads * d * 2
+        return 2 * n_layers * self.block_size * num_kv_heads * head_dim * 2
+
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         # TODO: build slot_mapping/context_lens/block_tables for decode without
         # aiter's kv_indptr/kv_indices. Mirror aiter_attention.py:prepare_decode
@@ -211,6 +229,7 @@ class TorchNativeAttentionImpl(AttentionImpl):
           4. For each sequence (per cu_seqlens_q), call SDPA with is_causal=True.
           5. Reassemble into the flat token-major output layout.
         """
+        import sys
         if use_mla:
             raise NotImplementedError(
                 "TorchNativeAttentionImpl: MLA path is not implemented; "

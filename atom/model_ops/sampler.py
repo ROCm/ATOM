@@ -128,6 +128,22 @@ class Sampler(nn.Module):
             exponential = get_per_token_exponential(vocab_size, logits.device).expand(
                 num_tokens, vocab_size
             )
+        if not hasattr(self, "_is_gfx1201_cached"):
+            try:
+                self._is_gfx1201_cached = (
+                    torch.cuda.get_device_properties(0).gcnArchName or ""
+                ).startswith("gfx1201")
+            except Exception:
+                self._is_gfx1201_cached = False
+        if self._is_gfx1201_cached:
+            # Torch fallback: Gumbel-max sampling. exponential is Exp(1) noise,
+            # so log(exponential) is Gumbel-distributed (up to sign). Greedy
+            # (T->0) collapses to argmax.
+            scaled = logits / temperatures.clamp(min=self.eps).unsqueeze(-1)
+            # Use Gumbel = -log(exponential); add to scaled logits and argmax.
+            gumbel = -torch.log(exponential.clamp(min=1e-20))
+            sampled_tokens.copy_((scaled + gumbel).argmax(dim=-1).to(torch.int))
+            return sampled_tokens
         mixed_sample_outer_exponential(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
