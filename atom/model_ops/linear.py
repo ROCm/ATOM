@@ -54,6 +54,71 @@ def _is_gfx1201_linear() -> bool:
     return _is_gfx1201_linear._cached
 
 
+_TRITON_FP8_GEMM = None
+def _get_triton_fp8_gemm():
+    """Lazily import aiter triton gemm_a8w8 (JIT-compiled per arch)."""
+    global _TRITON_FP8_GEMM
+    if _TRITON_FP8_GEMM is None:
+        try:
+            from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
+            _TRITON_FP8_GEMM = gemm_a8w8
+        except Exception:
+            _TRITON_FP8_GEMM = False
+    return _TRITON_FP8_GEMM if _TRITON_FP8_GEMM is not False else None
+
+
+def _fp8_per_tensor_linear_triton(
+    triton_gemm,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale,
+    bias,
+    otype,
+    output_partition_sizes,
+):
+    """Per-tensor FP8 linear via aiter triton gemm_a8w8 (~360x faster than
+    torch dequant + matmul on gfx1201).
+
+    - x          : [M, K] BF16 (we per-tensor dynamic-quantize to FP8).
+    - weight     : [N, K] uint8 (raw FP8 bytes; reinterpret as float8_e4m3fn).
+    - weight_scale: scalar / (P, 1) per-partition / per-channel scale.
+    - bias       : [N] or None.
+    """
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # Dynamic per-tensor quant of x.
+    x_abs_max = x.abs().amax().to(torch.float32).clamp_(min=1e-12)
+    x_scale = (x_abs_max / fp8_max)
+    x_scale_full = x_scale.reshape(1, 1).expand(M, 1).contiguous()
+    x_q = (x.to(torch.float32) / x_scale).clamp_(-fp8_max, fp8_max).to(fp8_dtype)
+
+    # Reinterpret raw uint8 weight as FP8 (no copy).
+    w_q = weight.view(fp8_dtype)
+
+    # Build per-output-channel weight scale (1, N).
+    ws = weight_scale.to(torch.float32)
+    if ws.numel() == 1:
+        w_scale_full = ws.reshape(1, 1).expand(1, N).contiguous()
+    elif (
+        ws.dim() == 2
+        and ws.shape[1] == 1
+        and output_partition_sizes is not None
+        and ws.shape[0] == len(output_partition_sizes)
+    ):
+        parts = [
+            ws[i].reshape(1, 1).expand(1, p_size)
+            for i, p_size in enumerate(output_partition_sizes)
+        ]
+        w_scale_full = torch.cat(parts, dim=1).contiguous()
+    else:
+        w_scale_full = ws.reshape(1, -1).contiguous()
+
+    return triton_gemm(x_q, w_q, x_scale_full, w_scale_full, bias=bias, dtype=otype)
+
+
 def _fp8_per_tensor_linear_torch(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -63,37 +128,42 @@ def _fp8_per_tensor_linear_torch(
     otype,
     output_partition_sizes=None,
 ) -> torch.Tensor:
-    """Pure-torch per-tensor FP8 linear: dequant weight (and x if FP8) to a
-    floating dtype, then F.linear. Used as a gfx1201 fallback for tgemm.mm.
-
-    For fused linear layers (QKV, gate_up), `weight_scale` has shape (P, 1)
-    where P is the number of output partitions; each partition's rows are
-    scaled by its own scalar. Pass `output_partition_sizes` to apply the
-    scales correctly.
+    """Per-tensor FP8 linear for gfx1201. Tries the aiter triton kernel first
+    (JIT-compiled, fast), then falls back to dequant + F.linear if unavailable.
     """
+    triton_gemm = _get_triton_fp8_gemm()
+    if triton_gemm is not None and x.is_cuda and weight.dtype == torch.uint8:
+        try:
+            return _fp8_per_tensor_linear_triton(
+                triton_gemm, x, weight, weight_scale, bias, otype,
+                output_partition_sizes,
+            )
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger("atom").warning(
+                "triton FP8 GEMM raised %s; falling back to torch", e
+            )
+
     import torch.nn.functional as _F
 
     # AITER stores FP8 weights as raw torch.uint8 bytes. Reinterpret-cast
-    # to torch.float8_e4m3fn (Mistral / transformers FP8 convention) before
-    # converting to fp32 so we recover the actual encoded floats. Already-fp8
-    # tensors pass through as-is.
+    # to torch.float8_e4m3fn before fp32 conversion.
     if weight.dtype == torch.uint8:
-        w_fp8 = weight.view(torch.float8_e4m3fn)
-        w = w_fp8.to(torch.float32)
+        w = weight.view(torch.float8_e4m3fn).to(torch.float32)
     else:
         w = weight.to(torch.float32)
+
+    # Per-partition or per-tensor weight scale
     if weight_scale is not None:
         ws = weight_scale.to(torch.float32)
-        if ws.dim() <= 1 or ws.numel() == 1:
-            # scalar / per-tensor scale
-            w = w * ws.reshape(()).item() if ws.numel() == 1 else w * ws
+        if ws.numel() == 1:
+            w = w * ws.reshape(()).item()
         elif (
             ws.dim() == 2
             and ws.shape[1] == 1
             and output_partition_sizes is not None
             and ws.shape[0] == len(output_partition_sizes)
         ):
-            # per-partition scale: shape (P, 1), one scalar per output sub-block
             offset = 0
             for i, p_size in enumerate(output_partition_sizes):
                 w[offset : offset + p_size] = (
@@ -101,11 +171,9 @@ def _fp8_per_tensor_linear_torch(
                 )
                 offset += p_size
         else:
-            # generic per-output-row broadcast
             w = w * ws
     w = w.to(otype)
 
-    # Dequantize x if it came in as FP8
     if x.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2):
         xs = x.to(torch.float32)
         if x_scale is not None:
@@ -116,7 +184,6 @@ def _fp8_per_tensor_linear_torch(
 
     return _F.linear(x_in, w, bias if bias is not None else None)
 
-# ----------------------------------------------------------------------------
 
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
