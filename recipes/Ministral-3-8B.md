@@ -134,25 +134,44 @@ SDPA at gsm8k context lengths (500–1500 tokens).
 Full gsm8k (1319 problems) extrapolates to ~30 min wall time at
 `num_concurrent=4`.
 
-**CUDAGraph at bs ≤ 2** (single-prompt latency, single-token bench):
+**CUDAGraph at bs ≤ 2 + fused FP8 quant** (single-prompt latency,
+single-token bench, "The capital of France is", max_tokens=64):
 
-| Mode | TPOT | TTFT |
+| Stack | TPOT | TTFT |
 |---|---:|---:|
-| Eager (`--enforce-eager`) | 0.033 s/tok | 0.21 s |
-| CUDAGraph (`--cudagraph-capture-sizes "[1,2]"`) | 0.025 s/tok | 0.06 s |
+| Eager (pre-cudagraph) | 0.034 s/tok | 0.21 s |
+| Eager (after FP8 fused-quant + cached w_scale) | 0.032 s/tok | 0.24 s |
+| CUDAGraph `[1,2]` (pre-fused-quant) | 0.025 s/tok | 0.06 s |
+| **CUDAGraph `[1,2]` + fused-quant + cached w_scale** | **0.022 s/tok** | **0.07 s** |
 
-24% TPOT reduction and 3.3× TTFT reduction at bs=1.
+Cumulative vs the original eager baseline: **35% TPOT reduction** and
+**3× TTFT reduction**. gsm8k accuracy preserved across both wins:
 
-gsm8k accuracy is preserved with cudagraph at bs ≤ 2:
-`0.765 strict / 0.765 flex on n=200, num_concurrent=2` (matches eager
-0.785 within ±0.030 stderr).
+| Stack | strict | flex |
+|---|---:|---:|
+| Eager baseline | 0.785 | 0.785 |
+| CUDAGraph `[1,2]` | 0.765 | 0.765 |
+| CUDAGraph `[1,2]` + fused-quant | 0.78 | 0.78 |
+
+(All within ±0.030 stderr at n=200, num_concurrent=2.)
 
 Remaining perf headroom worth pursuing:
 
-- **CUDAGraph at bs ≥ 4**: captured graphs at decode bs ≥ 4 corrupt
-  the first decode-step logits (see Known caveats); root cause is
-  unknown. Concurrency above 2 still works (engine falls back to
-  eager), but loses the graph speedup.
+- **CUDAGraph at bs ≥ 3**: captured graphs at decode bs ≥ 3 corrupt
+  the first decode-step logits (see Known caveats). Root cause is
+  unidentified; investigation ruled out v1/v2 dispatch, prewarm,
+  capture-stream alignment, JIT-during-capture, FP8 GEMM split-K
+  configs, and lm_head capture. Eager-mode multi-seq decode is fine
+  (gsm8k 0.785 at concurrent=4) — only the captured-graph replay at
+  bs ≥ 3 corrupts. Symptom is consistent with sglang#1558 / sglang#19799
+  (triton + cudagraph + ROCm). Concurrency above 2 still works via the
+  engine's eager fallback path; just no graph speedup.
+- **TP=2**: blocked at host kernel level — RCCL needs `iommu=pt` (and
+  `amd_iommu=on`) on the GRUB cmdline for cross-GPU P2P. Without that
+  every multi-rank `nccl_init` fails with `HIP failure: invalid device
+  ordinal`. Fix is host-side: edit `/etc/default/grub`, regen, reboot.
+  Once unblocked, TP=2 lets the BF16 8B Reasoning variant fit (16.6 GB
+  weights → 8.3 GB / GPU); see "TP=2 (Reasoning-8B)" caveat.
 - **FP8 KV cache**: BF16 KV today; would halve KV memory and shave
   some bandwidth on long-context decode.
 
@@ -167,12 +186,33 @@ Remaining perf headroom worth pursuing:
   boot. Cosmetic — KV writes/reads work end-to-end.
 * `--max-model-len` must accommodate the chat-templated prompt (the
   Mistral system prompt is ~540 tokens).
-* **CUDAGraph at decode bs ≥ 4 is broken**: captured graphs at bs=4 (and
-  presumably larger captured sizes) emit a wrong logit at the first
-  decode step after prefill, almost always sampling EOS / a stop token.
-  Eager mode at bs=4 is correct (e.g., gsm8k 5-shot 0.785). bs=1 and
-  bs=2 captured graphs are correct. Root cause is open: confirmed it is
-  *not* the v2 vs v1 dispatch (v1-only is also broken), *not* the
-  prewarm helper (capture works without it), and *not* a JIT-during-
-  capture failure (capture succeeds and per-call kernels work in
-  eager). Workaround: limit capture to `[1,2]`.
+* **CUDAGraph at decode bs ≥ 3 is broken**: captured graphs at bs=3,4,8
+  all emit a wrong logit at the first decode step after prefill, almost
+  always sampling EOS or a stop token. bs=1 and bs=2 captured graphs
+  are correct. Eager mode at the same bs is correct (gsm8k 5-shot 0.785
+  at concurrent=4). Investigated and ruled out as causes: v1 vs v2
+  pa_decode dispatch (v1-only forced is also broken at bs ≥ 3); the
+  prewarm helper (engine reaches capture without it; bs ≥ 3 still
+  breaks); JIT during capture (capture itself succeeds, eager works);
+  capture-stream alignment (warmup now on `gc.stream`, twice, per the
+  SGLang/PyTorch idiom); FP8 GEMM split-K configs (`_get_config`
+  returns NUM_KSPLIT=1 across all our (M, N, K) so no per-bs binary
+  divergence); lm_head being captured (`logits_in_graph=False` also
+  broken). Symptom is consistent with sglang#1558 / sglang#19799 and
+  pytorch#155684 (HIP graph capture is silent on illegal-during-capture
+  ops). Workaround: `--cudagraph-capture-sizes "[1,2]"`. Concurrency
+  > 2 still works via eager fallback.
+* **TP=2 not yet usable on this host**: `nccl_init` for world_size > 1
+  fails with `HIP failure: invalid device ordinal` and a warning that
+  `iommu=pt` is missing from the kernel command line. RCCL needs
+  `iommu=pt amd_iommu=on` on the host GRUB cmdline to set up cross-GPU
+  P2P. `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1` does not help — RCCL
+  fails before it gets to the transport choice. Fix is host-side:
+  ```
+  # /etc/default/grub
+  GRUB_CMDLINE_LINUX_DEFAULT="... iommu=pt amd_iommu=on"
+  # then update-grub && reboot
+  ```
+  Once that's in, TP=2 should work and lets the BF16 Ministral-3-8B-
+  Reasoning model (16.6 GB) split across 2 × 16 GB gfx1201s. Without
+  it, only single-GPU FP8 / 3B-BF16 models fit.
