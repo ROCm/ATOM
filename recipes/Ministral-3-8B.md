@@ -15,8 +15,8 @@ The torch-native backend bypasses the prebuilt path:
 | Op | Backend on gfx1201 |
 |---|---|
 | Per-tensor FP8 GEMM (qkv/o/gate_up/down proj) | **aiter triton `gemm_a8w8`** (JIT-compiled, ~360× faster than torch dequant) |
-| Paged attention **decode** | **aiter triton `paged_attention_decode`** (JIT-compiled; ~20% e2e speedup; falls back to torch when sliding window active) |
-| Paged attention prefill | `F.scaled_dot_product_attention` per-seq (TODO: triton flash prefill) |
+| Paged attention **prefill** | **aiter triton `context_attention_fwd`** (JIT-compiled; 2.2× faster per-call than torch SDPA; handles GQA internally) |
+| Paged attention **decode** | **aiter triton `paged_attention_decode`** (JIT-compiled; ~20% e2e speedup) |
 | KV cache write | torch advanced indexing into `[num_blocks, kv_heads, block_size, d]` (aiter layout) |
 | RMSNorm (with/without residual) | torch RMSNorm fallback |
 | SiLU + Mul (SwiGLU) | `forward_native` (existing torch path) |
@@ -86,32 +86,49 @@ OPENAI_API_KEY=dummy lm_eval \
 
 ### Verified results on RX 9070 XT (gfx1201, 16 GB)
 
-Best end-to-end with **aiter triton FP8 GEMM + triton paged_attention_decode**:
+Best end-to-end with the **full triton stack** (FP8 GEMM + paged
+attention decode + flash-attention prefill):
 
 | Setup | n | strict-match | flexible-extract |
 |---|---:|---:|---:|
-| gsm8k 5-shot, n=200 | 200 | **0.765** | **0.770** |
+| gsm8k 5-shot, n=200 | 200 | **0.785** | **0.785** |
 
-Within Mistral's published Ministral-3-8B range (~75–80% on gsm8k 5-shot).
+Sits at the top of Mistral's published Ministral-3-8B gsm8k range
+(~75–80% 5-shot).
+
+**Accuracy evolution** (gsm8k 5-shot, n=200):
+
+| Stack | strict | flex |
+|---|---:|---:|
+| Torch fallback | 0.765 | 0.770 |
+| + triton FP8 GEMM | 0.765 | 0.770 |
+| + triton paged_attention_decode | 0.765 | 0.770 |
+| + triton context_attention_fwd (prefill) | **0.785** | **0.785** |
 
 **Throughput evolution** (gsm8k 5-shot, num_concurrent=4):
 
-| Backend | TPOT (5-tok prompt) | sec/problem |
-|---|---:|---:|
-| Torch fallback | 0.28 s/tok | ~21 |
-| + triton FP8 GEMM | 0.038 s/tok | ~2.1 |
-| + triton pa_decode | 0.042 s/tok* | ~1.7 |
+| Backend | TPOT (5-tok prompt) | TTFT (5-tok prompt) | sec/problem |
+|---|---:|---:|---:|
+| Torch fallback (pre-triton) | 0.28 s/tok | 0.7 s | ~21 |
+| + triton FP8 GEMM | 0.038 s/tok | 0.16 s | ~2.1 |
+| + triton paged_attention_decode | 0.042 s/tok* | 0.54 s | ~1.7 |
+| + triton context_attention_fwd | 0.044 s/tok* | **0.23 s** | ~1.4 |
 
-\* TPOT measurement is dominated by Python overhead at very short ctx;
-the 20% per-problem speedup at gsm8k context lengths (500–1500 tokens)
-reflects the actual decode-attention win.
+\* TPOT for very short prompts is dominated by Python overhead; per-call
+benchmarks show triton paged_attention_decode is 1.8× faster than torch
+SDPA at gsm8k context lengths (500–1500 tokens).
 
-Full gsm8k (1319 problems) extrapolates to ~37 min wall time at
+Full gsm8k (1319 problems) extrapolates to ~30 min wall time at
 `num_concurrent=4`.
 
-The remaining perf headroom is the **prefill SDPA loop** (still pure
-torch, per-sequence). Aiter has `pa_prefill` and `unified_attention`
-triton kernels that would help — TODO.
+Remaining perf headroom worth pursuing:
+
+- **CUDAGraph capture** is still disabled (`--enforce-eager --level 0`).
+  The torch-native backend doesn't yet implement
+  `build_for_cudagraph_capture`; wiring it would shave Python launch
+  overhead from each step.
+- **FP8 KV cache**: BF16 KV today; would halve KV memory and shave
+  some bandwidth on long-context decode.
 
 ## Known caveats
 
