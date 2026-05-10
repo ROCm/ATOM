@@ -17,7 +17,8 @@ The torch-native backend bypasses the prebuilt path:
 | Per-tensor FP8 GEMM (qkv/o/gate_up/down proj) | **aiter triton `gemm_a8w8`** (JIT-compiled, ~360× faster than torch dequant) |
 | Paged attention **prefill** | **aiter triton `context_attention_fwd`** (JIT-compiled; 2.2× faster per-call than torch SDPA; handles GQA internally) |
 | Paged attention **decode** | **aiter triton `paged_attention_decode`** (JIT-compiled; ~20% e2e speedup) |
-| KV cache write | torch advanced indexing into `[num_blocks, kv_heads, block_size, d]` (aiter layout) |
+| **KV cache write** | **in-tree triton kernel** (handles -1 sentinels in-kernel; ~12× faster than torch advanced indexing; no GPU→CPU sync — CUDAGraph-capturable) |
+| Unquantized BF16 linear (Reasoning checkpoints) | torch `F.linear` (gfx1201 fallback) |
 | RMSNorm (with/without residual) | torch RMSNorm fallback |
 | SiLU + Mul (SwiGLU) | `forward_native` (existing torch path) |
 | Mixed Gumbel sampler | torch Gumbel-max + argmax |
