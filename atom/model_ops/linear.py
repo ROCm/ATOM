@@ -67,6 +67,49 @@ def _get_triton_fp8_gemm():
     return _TRITON_FP8_GEMM if _TRITON_FP8_GEMM is not False else None
 
 
+def _build_w_scale_full(weight_scale, output_partition_sizes, N):
+    """Build the (1, N) per-output-channel weight scale that gemm_a8w8 wants.
+
+    The result depends ONLY on weight_scale + output_partition_sizes — both
+    constant per layer. We cache it on the weight_scale tensor itself so
+    subsequent forwards skip the cat/expand/contiguous chain.
+    """
+    cached = getattr(weight_scale, "_atom_w_scale_full", None)
+    if cached is not None:
+        return cached
+    ws = weight_scale.to(torch.float32)
+    if ws.numel() == 1:
+        full = ws.reshape(1, 1).expand(1, N).contiguous()
+    elif (
+        ws.dim() == 2
+        and ws.shape[1] == 1
+        and output_partition_sizes is not None
+        and ws.shape[0] == len(output_partition_sizes)
+    ):
+        parts = [
+            ws[i].reshape(1, 1).expand(1, p_size)
+            for i, p_size in enumerate(output_partition_sizes)
+        ]
+        full = torch.cat(parts, dim=1).contiguous()
+    else:
+        full = ws.reshape(1, -1).contiguous()
+    weight_scale._atom_w_scale_full = full
+    return full
+
+
+def _get_aiter_dynamic_per_tensor_quant():
+    """Lazy import of aiter's fused dynamic per-tensor FP8 quant kernel."""
+    fn = getattr(_get_aiter_dynamic_per_tensor_quant, "_cached", None)
+    if fn is None:
+        try:
+            from aiter.ops.triton.quant.quant import dynamic_per_tensor_quant_fp8_i8
+            fn = dynamic_per_tensor_quant_fp8_i8
+        except Exception:
+            fn = False
+        _get_aiter_dynamic_per_tensor_quant._cached = fn
+    return fn if fn is not False else None
+
+
 def _fp8_per_tensor_linear_triton(
     triton_gemm,
     x: torch.Tensor,
@@ -85,36 +128,26 @@ def _fp8_per_tensor_linear_triton(
     - bias       : [N] or None.
     """
     fp8_dtype = torch.float8_e4m3fn
-    fp8_max = torch.finfo(fp8_dtype).max
     M, K = x.shape
     N = weight.shape[0]
 
-    # Dynamic per-tensor quant of x.
-    x_abs_max = x.abs().amax().to(torch.float32).clamp_(min=1e-12)
-    x_scale = (x_abs_max / fp8_max)
+    # Dynamic per-tensor quant of x — fused triton kernel from aiter
+    # (one launch instead of abs/amax/clamp/div/cast chain).
+    # NOTE: the kernel uses tl.atomic_max to compute scale_out, so the
+    # buffer MUST be zero-initialized — torch.empty(1) leaves uninitialized
+    # memory and a >0 garbage value silently wins the atomic_max.
+    fused_quant = _get_aiter_dynamic_per_tensor_quant()
+    x_q = torch.empty((M, K), dtype=fp8_dtype, device=x.device)
+    x_scale = torch.zeros(1, dtype=torch.float32, device=x.device)
+    fused_quant(x_q, x, x_scale)
+    # gemm_a8w8 wants x_scale shape (M, 1) — broadcast the scalar.
     x_scale_full = x_scale.reshape(1, 1).expand(M, 1).contiguous()
-    x_q = (x.to(torch.float32) / x_scale).clamp_(-fp8_max, fp8_max).to(fp8_dtype)
 
     # Reinterpret raw uint8 weight as FP8 (no copy).
     w_q = weight.view(fp8_dtype)
 
-    # Build per-output-channel weight scale (1, N).
-    ws = weight_scale.to(torch.float32)
-    if ws.numel() == 1:
-        w_scale_full = ws.reshape(1, 1).expand(1, N).contiguous()
-    elif (
-        ws.dim() == 2
-        and ws.shape[1] == 1
-        and output_partition_sizes is not None
-        and ws.shape[0] == len(output_partition_sizes)
-    ):
-        parts = [
-            ws[i].reshape(1, 1).expand(1, p_size)
-            for i, p_size in enumerate(output_partition_sizes)
-        ]
-        w_scale_full = torch.cat(parts, dim=1).contiguous()
-    else:
-        w_scale_full = ws.reshape(1, -1).contiguous()
+    # Per-output-channel weight scale — cached on the layer (constant per fwd).
+    w_scale_full = _build_w_scale_full(weight_scale, output_partition_sizes, N)
 
     return triton_gemm(x_q, w_q, x_scale_full, w_scale_full, bias=bias, dtype=otype)
 
