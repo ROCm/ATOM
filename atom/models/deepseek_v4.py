@@ -1574,8 +1574,7 @@ class DeepseekV4Attention(nn.Module):
             #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
             # `_fill_csa_paged_compress` dispatches internally on is_pure_decode.
             self._fill_csa_paged_compress(attn_md, indexer_topk_batched, num_tokens)
-
-        if self._use_async_compress and self.indexer is None:
+        elif self._use_async_compress:
             torch.cuda.current_stream().wait_stream(self.alt_stream)
 
         # ===== Sparse attention dispatch =====
