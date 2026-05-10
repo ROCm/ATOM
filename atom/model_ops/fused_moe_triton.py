@@ -157,9 +157,7 @@ def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
     scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
     expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad)
 
-    routing_data = RoutingData(
-        gate_scal, hist, n_expts_tot, n_expts_act, expt_data
-    )
+    routing_data = RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
     return routing_data, gather_indx, scatter_indx
 
 
