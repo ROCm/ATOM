@@ -75,6 +75,19 @@ def use_torch_native_attn() -> bool:
 # ---------------------------------------------------------------------------
 _TRITON_PA_DECODE = None
 _TRITON_TL_BF16 = None
+_TRITON_PREFILL = None
+
+
+def _get_triton_prefill():
+    global _TRITON_PREFILL
+    if _TRITON_PREFILL is None:
+        try:
+            from aiter.ops.triton.attention.prefill_attention import context_attention_fwd
+            _TRITON_PREFILL = context_attention_fwd
+        except Exception as e:
+            logger.warning("triton context_attention_fwd unavailable: %s", e)
+            _TRITON_PREFILL = False
+    return _TRITON_PREFILL if _TRITON_PREFILL is not False else None
 
 
 def _get_triton_pa_decode():
@@ -442,6 +455,36 @@ class TorchNativeAttentionImpl(AttentionImpl):
         attn_md: AttentionMetaData,
         total_tokens: int,
     ) -> torch.Tensor:
+        # Prefer triton context_attention_fwd (handles GQA internally; ~2x
+        # faster than the torch SDPA loop on gfx1201 at gsm8k context lengths).
+        # Falls back to per-sequence torch SDPA when sliding window is active
+        # (kernel doesn't support it) or on any kernel exception.
+        sw_active = self.sliding_window is not None and self.sliding_window > 0
+        prefill = _get_triton_prefill()
+        if prefill is not None and not sw_active:
+            try:
+                out = torch.empty_like(q)
+                cu_q_gpu = attn_md.cu_seqlens_q.to(torch.int32)
+                # b_start_loc = cu_seqlens_q[:-1]; b_seq_len = diffs.
+                b_start_loc = cu_q_gpu[:-1].contiguous()
+                b_seq_len = (cu_q_gpu[1:] - cu_q_gpu[:-1]).contiguous()
+                prefill(
+                    q.contiguous(),
+                    k.contiguous(),
+                    v.contiguous(),
+                    out,
+                    b_start_loc,
+                    b_seq_len,
+                    int(attn_md.max_seqlen_q),
+                    is_causal=True,
+                )
+                return out.reshape(total_tokens, self.num_heads * self.head_dim)
+            except Exception as e:
+                logger.warning(
+                    "triton context_attention_fwd raised %s; falling back to torch SDPA", e
+                )
+
+        # Torch fallback: per-sequence SDPA loop.
         if self.num_kv_heads != self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(n_rep, dim=1)
