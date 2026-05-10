@@ -769,12 +769,14 @@ class Compressor(nn.Module):
         d = self.head_dim
         rd = self.rope_head_dim
 
-        # Single fused BF16 GEMM via tgemm; otype=fp32 keeps softmax-pool
-        # accumulator in fp32. torch.split returns zero-copy strided views;
-        # downstream kernels (fused_compress_attn, update_compressor_states)
-        # accept strided kv/score (only inner stride must be 1).
+        # Single fused BF16 GEMM via tgemm. (Probing whether dropping the
+        # otype=fp32 upcast — relying on fused_compress_attn's internal fp32
+        # accumulator instead — is accuracy-neutral.) torch.split returns
+        # zero-copy strided views; downstream kernels (fused_compress_attn,
+        # update_compressor_states) accept strided kv/score (only inner
+        # stride must be 1).
         coff_d = (1 + overlap) * d
-        combined = self.wkv_gate(x, otype=torch.float32)
+        combined = self.wkv_gate(x)
         kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
@@ -920,8 +922,11 @@ class Indexer(nn.Module):
     def forward_batched(
         self,
         x_full: torch.Tensor,  # [total_tokens, dim]
-        qr_full: torch.Tensor,  # [total_tokens, q_lora_rank]
+        qr_full: torch.Tensor,  # [total_tokens, q_lora_rank] — fp8 when qr_full_scale given
         positions: torch.Tensor,  # [total_tokens]
+        qr_full_scale: Optional[
+            torch.Tensor
+        ] = None,  # per_1x128 scale paired with qr_full
     ) -> torch.Tensor:
         """Q proj + RoPE + FP8-quant + weights compute (have module state),
         then dispatch to `torch.ops.aiter.indexer_score_topk`, which calls
@@ -946,7 +951,9 @@ class Indexer(nn.Module):
         # Q proj + RoPE + rotate (batched). rotary_emb internally reshapes
         # to (1, num_tokens, -1, rotary_dim) so the input doesn't need an
         # explicit batch dim. rotate_activation is last-dim-only.
-        q = self.wq_b(qr_full).view(total_tokens, self.n_heads, self.head_dim)
+        q = self.wq_b(qr_full, x_scale=qr_full_scale).view(
+            total_tokens, self.n_heads, self.head_dim
+        )
         # self.rotary_emb(positions, q[..., -rd:])
         # q = rotate_activation(q)
         cos, sin = self.rotary_emb._caches(q.device)
@@ -1235,7 +1242,16 @@ class DeepseekV4Attention(nn.Module):
             quant_config=qc,
             prefix=f"{p}.wqkv_a",
         )
-        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
+        # Fuse q_norm + per_1x128 FP8 quant: kernel emits (qr_fp8, qr_scale)
+        # in one launch, both wq_b consumers (outer ColumnParallel + Indexer
+        # ReplicatedLinear) skip their own input quant.
+        self.q_norm = RMSNorm(
+            self.q_lora_rank,
+            self.eps,
+            fused_quant=True,
+            quant_config=qc,
+            prefix=f"{p}.q_norm",
+        )
         # q_norm2: per-head Q normalization. The checkpoint has no
         # `q_norm2.weight` entry, so the module is constructed with
         # `weight=None` (no learnable Parameter) — `DualRMSNorm` reads the
@@ -1451,15 +1467,17 @@ class DeepseekV4Attention(nn.Module):
         # Single fused FP8 GEMM for [wq_a; wkv]; torch.split returns zero-copy views.
         qkv_a = self.wqkv_a(x)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        qr = self.q_norm(q_lora)  # [num_tokens, q_lora_rank]  shared with Indexer
-        if _V4_FORCE_UE8M0_QUANT:
-            qr = qr.clone()
-            act_quant_inplace(qr, 128, "ue8m0")
+        # q_norm is fused-quant: returns (qr_fp8, qr_scale) — shared by
+        # outer wq_b and Indexer.wq_b, both per_1x128 FP8 GEMMs.
+        assert (
+            not _V4_FORCE_UE8M0_QUANT
+        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        qr, qr_scale = self.q_norm(q_lora)
         # Flat q_flat is [num_tokens, n_local_heads * head_dim]; DualRMSNorm
         # views internally to per-head shape and returns flat. Single Triton
         # launch fuses per-head Q RMSNorm (weightless) + KV RMSNorm (both
         # head_dim=128), replacing the prior `_rmsnorm_nw + kv_norm` pair.
-        q_flat = self.wq_b(qr)
+        q_flat = self.wq_b(qr, x_scale=qr_scale)
         q_flat, kv = self.qk_norm(q_flat, kv_pre)
         q = q_flat.view(num_tokens, self.n_local_heads, self.head_dim)
         # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
@@ -1513,6 +1531,7 @@ class DeepseekV4Attention(nn.Module):
             indexer_topk_batched = self.indexer.forward_batched(
                 x_full=x,
                 qr_full=qr,
+                qr_full_scale=qr_scale,
                 positions=positions,
             )  # raw seq-local [T, index_topk] int32, -1 sentinels in tail cols
             # Translate seq-local topk → physical paged offsets and write into

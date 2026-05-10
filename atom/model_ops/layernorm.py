@@ -119,51 +119,93 @@ def fused_add_rmsnorm_pad_(
     return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
 
 
-def mxfp4_rms_quant_fuse_fake(
+# ---------------------------------------------------------------------------
+# Aiter dynamic RMSNorm + quant — single dispatch covering per_1x32 (MXFP4),
+# per_1x128 (FP8 block), and per_Token (FP8). All three reach
+# aiter.{rmsnorm_quant, add_rmsnorm_quant} (HIP) which both normalizes and
+# emits a freshly-computed scale, so callers must have x_scale=None
+# (static-scale FP8 stays on its own branch). Per-quant params (out_dtype,
+# scale shape, group_size, shuffle_scale) are derived from quant_type_value
+# inside the fake helper so torch.compile's schema infer sees a single,
+# stable signature.
+#
+# `mutates_args=[]` keeps torch.compile from functionalizing the out-buffers
+# — same pattern as the legacy mxfp4 fuse helper.
+# ---------------------------------------------------------------------------
+
+_QV_PER_1X32 = QuantType.per_1x32.value
+_QV_PER_1X128 = QuantType.per_1x128.value
+_QV_PER_TOKEN = QuantType.per_Token.value
+_AITER_RMS_QUANT_TYPE_VALUES = frozenset({_QV_PER_1X32, _QV_PER_1X128, _QV_PER_TOKEN})
+
+
+def _aiter_rms_quant_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    shuffle: bool = False,
+    quant_type_value: int,
+    transpose_scale: bool,
     res1: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.utility.dtypes import fp8
+
     M, N = x.shape
-    out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
-    MXFP4_QUANT_BLOCK_SIZE = 32
-    SCALE_N_valid = (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-    use_scale_shuffle_padding = shuffle
-    if use_scale_shuffle_padding:
-        SCALE_M = ((M + 255) // 256) * 256
-        SCALE_N = ((SCALE_N_valid + 7) // 8) * 8
-    else:
-        SCALE_M = M
-        SCALE_N = SCALE_N_valid
-    scale = torch.empty(
-        (SCALE_M, SCALE_N),
-        dtype=torch.float8_e8m0fnu,
-        device=x.device,
-    )
-    out_res1 = None
-    if res1 is not None:
-        out_res1 = torch.empty_like(res1)
+    if quant_type_value == _QV_PER_1X32:
+        # MXFP4: out=(M, N/2) fp4x2; scale=(⌈M/256⌉*256, ⌈⌈N/32⌉/8⌉*8) UE8M0
+        # bytes (kernel writes one uint8 per group; passing fp8_e8m0fnu
+        # directly yields the matching byte layout — no fp32 view).
+        out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
+        scale_m = ((M + 255) // 256) * 256
+        scale_n = ((((N + 31) // 32) + 7) // 8) * 8
+        scale = torch.empty(
+            (scale_m, scale_n), dtype=torch.float8_e8m0fnu, device=x.device
+        )
+    elif quant_type_value == _QV_PER_1X128:
+        # FP8 per-block: scale=(M, ⌈N/128⌉) fp32. Preshuffle GEMM expects
+        # column-major; allocate (num_groups, M) row-major then view as
+        # (M, num_groups). Matches GemmaRMSNorm._forward_fused_fp8.
+        out = torch.empty((M, N), dtype=fp8, device=x.device)
+        num_groups = N // 128
+        if transpose_scale:
+            scale = torch.empty(
+                (num_groups, M), dtype=torch.float32, device=x.device
+            ).view(M, num_groups)
+        else:
+            scale = torch.empty((M, num_groups), dtype=torch.float32, device=x.device)
+    else:  # _QV_PER_TOKEN
+        out = torch.empty((M, N), dtype=fp8, device=x.device)
+        scale = torch.empty((M, 1), dtype=torch.float32, device=x.device)
+    out_res1 = torch.empty_like(res1) if res1 is not None else None
     return (out, scale, out_res1)
 
 
-# It's important to use mutates_args=[] to avoid functionized_v2 op generation
-@torch_compile_guard(gen_fake=mxfp4_rms_quant_fuse_fake, mutates_args=[])
-def mxfp4_rms_quant_fuse(
+@torch_compile_guard(gen_fake=_aiter_rms_quant_fake, mutates_args=[])
+def _aiter_rms_quant(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    shuffle: bool = False,
+    quant_type_value: int,
+    transpose_scale: bool,
     res1: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+    from aiter import add_rmsnorm_quant, rmsnorm_quant
 
-    (x_quant, x_scale), _, _, residual_out = fused_rms_mxfp4_quant(
-        x, weight, eps, shuffle=shuffle, res1=res1
+    out, scale, out_res1 = _aiter_rms_quant_fake(
+        x, weight, eps, quant_type_value, transpose_scale, res1
     )
-
-    return x_quant, x_scale, residual_out
+    if quant_type_value == _QV_PER_1X32:
+        group_size, shuffle = 32, True
+    elif quant_type_value == _QV_PER_1X128:
+        group_size, shuffle = 128, transpose_scale
+    else:  # _QV_PER_TOKEN
+        group_size, shuffle = 0, False
+    if res1 is None:
+        rmsnorm_quant(out, x, scale, weight, eps, group_size, shuffle)
+    else:
+        add_rmsnorm_quant(
+            out, x, res1, out_res1, scale, weight, eps, group_size, shuffle
+        )
+    return out, scale, out_res1
 
 
 class RMSNorm(nn.Module):
@@ -195,6 +237,14 @@ class RMSNorm(nn.Module):
         params_dtype = layer_quant_config.quant_dtype
         self.quant_type = quant_type
         self.params_dtype = params_dtype
+        # transpose_scale (column-major scale) only applies to per_1x128 with
+        # the preshuffle GEMM consumer; resolve the env once at init time so
+        # forward sees a hot static bool instead of an env lookup per call.
+        self._aiter_transpose_scale = (
+            fused_quant
+            and quant_type.value == _QV_PER_1X128
+            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
 
     @mark_trace(prefix="rmsnorm", torch_compile=True)
     def forward(
@@ -263,19 +313,24 @@ class RMSNorm(nn.Module):
                         res1=residual,
                     )
                     return (x, x_scale), residual
-            elif self.use_fused_quant and (
-                x_scale is None and self.quant_type.value == QuantType.per_1x32.value
+            elif (
+                self.use_fused_quant
+                and x_scale is None
+                and self.quant_type.value in _AITER_RMS_QUANT_TYPE_VALUES
             ):
+                # Dynamic-scale fused RMSNorm + quant via aiter HIP kernels.
+                # Static FP8 (x_scale provided) stays on the branch above.
+                x, x_scale, residual_out = _aiter_rms_quant(
+                    x,
+                    self.weight,
+                    self.eps,
+                    self.quant_type.value,
+                    self._aiter_transpose_scale,
+                    residual,
+                )
                 if residual is None:
-                    x, x_scale, _ = mxfp4_rms_quant_fuse(
-                        x, self.weight, self.eps, shuffle=True
-                    )
                     return x, x_scale
-                else:
-                    x, x_scale, residual = mxfp4_rms_quant_fuse(
-                        x, self.weight, self.eps, shuffle=True, res1=residual
-                    )
-                    return (x, x_scale), residual
+                return (x, x_scale), residual_out
             else:
                 if residual is None:
                     # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
