@@ -1503,15 +1503,16 @@ class DeepseekV4Attention(nn.Module):
         # the kernel iterate over all M rows for kv RoPE, matching the eager
         # path.
         self.quant_dtype = None
+        self.quant_dtype_value = None
         quant_dtype = qc.get_layer_quant_config(f"{p}.wq_b").quant_dtype
         if (
             qc is not None
             and ENABLE_DS_QKNORM_QUANT_FUSION
             and not _V4_FORCE_UE8M0_QUANT
         ):
-            self.quant_dtype = dtypes.fp8
             if quant_dtype == dtypes.fp8 or quant_dtype == dtypes.fp4x2:
                 self.quant_dtype = quant_dtype
+                self.quant_dtype_value = self.wq_b.quant_type.value
                 self.use_fuse_qknorm_quant_q_norm_qk_rope_swa_write = (
                     _V4_USE_TRITON_FUSION
                 )
@@ -1683,8 +1684,8 @@ class DeepseekV4Attention(nn.Module):
             and self.use_fuse_qknorm_quant_q_norm_qk_rope_swa_write
         ):
             (
-                (qr_quant, qr_scale),
-                qr,
+                (qr, qr_scale),
+                _,
                 kv,
                 _,
             ) = _fuse_rmsnorm_quant(
@@ -1699,10 +1700,11 @@ class DeepseekV4Attention(nn.Module):
                 shuffle=False,
                 scale_shuffle_padding=False,
                 group_size=128,
-                output_unquantized_inp1=True,
+                quant_type=self.quant_dtype_value,
+                output_unquantized_inp1=False,
                 transpose_scale=True,
             )
-            q = self.wq_b(qr_quant, x_scale=qr_scale)
+            q = self.wq_b(qr, x_scale=qr_scale)
             # Fused: wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw
             # + RoPE on q tail + RoPE on kv tail (+ SWA write) in one triton
             # kernel. KV RMSNorm stays out (kernel doesn't apply weighted norm
@@ -2621,6 +2623,8 @@ class DeepseekV4Model(nn.Module):
         self.compress_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
+        self.alt_stream = None
+        self.compress_stream = None
         self.layers = nn.ModuleList(
             [
                 Block(
