@@ -28,7 +28,7 @@ class EngineArgs:
     tensor_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     block_size: int = 16
@@ -79,9 +79,11 @@ class EngineArgs:
             help="Enforce eager mode execution.",
         )
         parser.add_argument(
+            "--enable-prefix-caching",
             "--enable_prefix_caching",
-            action="store_true",
-            help="Enable prefix caching.",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Enable prefix caching. Pass --no-enable-prefix-caching to disable.",
         )
         parser.add_argument(
             "--port",

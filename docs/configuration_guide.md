@@ -44,7 +44,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1 |
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
-| `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
+| `enable_prefix_caching` | `bool` | `True` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
@@ -276,7 +276,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--tensor-parallel-size` | `-tp` | `int` | `1` | Tensor parallel size |
 | `--data-parallel-size` | `-dp` | `int` | `1` | Data parallel size |
 | `--enforce-eager` | | flag | `False` | Enforce eager mode execution |
-| `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
+| `--enable-prefix-caching` / `--no-enable-prefix-caching` | | flag | `True` | Enable prefix caching (pass `--no-enable-prefix-caching` to disable) |
 | `--port` | | `int` | `8006` | Engine internal port |
 | `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
 | `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`) |

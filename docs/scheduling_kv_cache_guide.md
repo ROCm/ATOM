@@ -24,7 +24,7 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 | `max_num_seqs` | 512 | Maximum sequences in a single batch |
 | `max_num_batched_tokens` | 16384 | Maximum tokens scheduled in a single step |
 | `kv_cache_block_size` | 16 | Tokens per KV cache block (must be multiple of 16, or 1) |
-| `enable_prefix_caching` | `False` | Enable hash-based prefix block sharing |
+| `enable_prefix_caching` | `True` | Enable hash-based prefix block sharing |
 | `scheduler_delay_factor` | 0.0 | Delay factor for batching prompt requests (0 = no delay) |
 | `gpu_memory_utilization` | 0.9 | Fraction of GPU memory for KV cache |
 
@@ -329,7 +329,7 @@ During `allocate()`, for each full block:
 
 ### 4.5 Enabling Prefix Caching
 
-Set `enable_prefix_caching=True` in `Config`. When disabled, the hash lookup in `allocate()` is skipped entirely (`block_id` is always `-1`).
+Prefix caching is enabled by default (`enable_prefix_caching=True` in `Config`). Set it to `False` (or pass `--no-enable-prefix-caching` on the CLI) to disable; the hash lookup in `allocate()` is then skipped entirely (`block_id` is always `-1`).
 
 ---
 
