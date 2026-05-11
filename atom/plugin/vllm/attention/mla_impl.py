@@ -21,6 +21,9 @@ import logging
 
 logger = logging.getLogger("atom")
 
+fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
+fused_gemm_afp4wfp4_preshuffle_split_cat = None
+
 
 if use_triton_gemm():
     try:
@@ -32,8 +35,6 @@ if use_triton_gemm():
         )
     except ImportError as e:
         logger.warning(f"Triton fused GEMM split_cat not available: {e}")
-        fused_gemm_afp4wfp4_preshuffle_split_cat = None
-        fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 
 
 def reorg_kvcache(
