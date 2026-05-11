@@ -1515,7 +1515,6 @@ class DeepseekV4Attention(nn.Module):
                 self.use_fuse_qknorm_quant_q_norm_qk_rope_swa_write = (
                     _V4_USE_TRITON_FUSION
                 )
-        print(f"{self.use_fuse_qknorm_quant_q_norm_qk_rope_swa_write=}")
 
         self.layer_name = prefix
         atom_config = get_current_atom_config()
