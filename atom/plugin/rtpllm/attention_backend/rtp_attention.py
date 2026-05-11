@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import math
 import os
-from datetime import datetime
 from typing import Any, Optional
 
 import torch
@@ -16,11 +14,7 @@ except Exception:  # pragma: no cover - runtime fallback
 
 from atom.model_ops.base_attention import BaseAttention
 from atom.plugin.prepare import is_plugin_mode, is_rtpllm
-from atom.plugin.rtpllm.utils.tensor_dump import dump_tensor as dump_atom_tensor
 from atom.utils.forward_context import get_forward_context
-
-_FULL_KV_DUMPED: set[tuple[int, str]] = set()
-
 
 if triton is not None:
 
@@ -282,12 +276,6 @@ def _write_kv_cache_with_rtp_fused_kernel(
             ],
             dim=-1,
         ).contiguous()
-        dump_atom_tensor(
-            tag="full_attn/qkv_before_fused_write",
-            tensor=qkv,
-            layer=layer,
-            meta=dump_meta,
-        )
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         if is_prefill:
             op = FusedRopeKVCachePrefillOpNonAsm(attn_configs)
@@ -426,140 +414,6 @@ def _run_nonasm_paged_attention(
         k_scale = unit_scale
         v_scale = unit_scale
 
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/query_preview",
-        tensor=query,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/key_cache_preview",
-        tensor=key_cache,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/value_cache_preview",
-        tensor=value_cache,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/block_tables_preview",
-        tensor=block_tables,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/seq_lens_preview",
-        tensor=seq_lens,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/k_scale_preview",
-        tensor=k_scale,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/v_scale_preview",
-        tensor=v_scale,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/kv_scale_base_preview",
-        tensor=kv_scale_base,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_full_tensor_once(
-        tag="full_attn/decode_nonasm/key_cache_full",
-        tensor=key_cache,
-        layer=layer_num,
-        base_meta=dump_meta,
-        side="atom",
-    )
-    _dump_full_tensor_once(
-        tag="full_attn/decode_nonasm/value_cache_full",
-        tensor=value_cache,
-        layer=layer_num,
-        base_meta=dump_meta,
-        side="atom",
-    )
-    _dump_scalar_as_tensor(
-        tag="full_attn/decode_nonasm/num_kv_heads",
-        value=float(num_kv_heads),
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_scalar_as_tensor(
-        tag="full_attn/decode_nonasm/scale",
-        value=float(scale),
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_scalar_as_tensor(
-        tag="full_attn/decode_nonasm/block_size",
-        value=float(block_size),
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_scalar_as_tensor(
-        tag="full_attn/decode_nonasm/max_seq_len",
-        value=float(max_seq_len),
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_scalar_as_tensor(
-        tag="full_attn/decode_nonasm/partition_size",
-        value=float(partition_size),
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_scalar_as_tensor(
-        tag="full_attn/decode_nonasm/alibi_slopes_is_none",
-        value=1.0,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_scalar_as_tensor(
-        tag="full_attn/decode_nonasm/fp8_out_scale_is_none",
-        value=1.0,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_scalar_as_tensor(
-        tag="full_attn/decode_nonasm/kv_cache_dtype_auto",
-        value=1.0,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/output_buffer_preview",
-        tensor=output,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/tmp_output_preview",
-        tensor=tmp_output,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/exp_sums_preview",
-        tensor=exp_sums,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/max_logits_preview",
-        tensor=max_logits,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
     decode_flags = torch.tensor(
         [
             int(kv_scale_base is not None),
@@ -568,12 +422,6 @@ def _run_nonasm_paged_attention(
         ],
         dtype=torch.int32,
         device=query.device,
-    )
-    dump_atom_tensor(
-        tag="full_attn/decode_nonasm/arg_flags",
-        tensor=decode_flags,
-        layer=layer_num,
-        meta=dump_meta,
     )
 
     aiter.paged_attention_rocm(
@@ -597,102 +445,7 @@ def _run_nonasm_paged_attention(
         None,  # fp8_out_scale
         partition_size,
     )
-    _dump_tensor_preview(
-        tag="full_attn/decode_nonasm/output_preview",
-        tensor=output,
-        layer=layer_num,
-        base_meta=dump_meta,
-    )
     return output
-
-
-def _dump_tensor_preview(
-    *,
-    tag: str,
-    tensor: torch.Tensor | None,
-    layer: int,
-    base_meta: dict[str, Any],
-    preview_elems: int = 50,
-) -> None:
-    if tensor is None:
-        return
-    flat = tensor.detach().reshape(-1)
-    preview_n = min(int(preview_elems), int(flat.numel()))
-    preview = flat[:preview_n].clone()
-    preview_meta = dict(base_meta)
-    preview_meta.update(
-        {
-            "source_shape": list(tensor.shape),
-            "source_dtype": str(tensor.dtype),
-            "source_numel": int(tensor.numel()),
-            "preview_elems": preview_n,
-        }
-    )
-    dump_atom_tensor(
-        tag=tag,
-        tensor=preview,
-        layer=layer,
-        meta=preview_meta,
-    )
-
-
-def _dump_scalar_as_tensor(
-    *,
-    tag: str,
-    value: float,
-    layer: int,
-    base_meta: dict[str, Any],
-) -> None:
-    t = torch.tensor([value], dtype=torch.float32)
-    dump_atom_tensor(tag=tag, tensor=t, layer=layer, meta=base_meta)
-
-
-def _dump_full_tensor_once(
-    *,
-    tag: str,
-    tensor: torch.Tensor | None,
-    layer: int,
-    base_meta: dict[str, Any],
-    side: str,
-    enabled_env: str = "ATOM_RTP_DUMP_DECODE_FULL_KV_ONCE",
-    layer_env: str = "ATOM_RTP_DUMP_DECODE_FULL_KV_LAYER",
-) -> None:
-    if tensor is None:
-        return
-    if os.getenv(enabled_env, "0") != "1":
-        return
-    layer_filter_raw = os.getenv(layer_env, "").strip()
-    if layer_filter_raw:
-        try:
-            if int(layer_filter_raw) != int(layer):
-                return
-        except ValueError:
-            return
-    key = (int(layer), tag)
-    if key in _FULL_KV_DUMPED:
-        return
-    _FULL_KV_DUMPED.add(key)
-
-    rank = os.getenv("RANK", os.getenv("LOCAL_RANK", "0"))
-    root = os.getenv("ATOM_RTP_DUMP_ROOT", "/mnt/raid0/zhaoan12/cache/atom_rtp")
-    base_dir = os.path.join(root, side, f"rank{rank}_pid{os.getpid()}")
-    os.makedirs(base_dir, exist_ok=True)
-    safe_tag = tag.replace("/", "_").replace(" ", "_")
-    prefix = os.path.join(base_dir, f"fullkv_layer{int(layer)}_{safe_tag}")
-    t_cpu = tensor.detach().to("cpu")
-    torch.save(t_cpu, f"{prefix}.pt")
-    info = {
-        "time": datetime.utcnow().isoformat() + "Z",
-        "tag": tag,
-        "layer": int(layer),
-        "shape": list(tensor.shape),
-        "dtype": str(tensor.dtype),
-        "device": str(tensor.device),
-        "numel": int(tensor.numel()),
-        "meta": base_meta,
-    }
-    with open(f"{prefix}.json", "w", encoding="utf-8") as f:
-        json.dump(info, f, ensure_ascii=True, indent=2)
 
 
 class RTPAttention(BaseAttention):
@@ -763,81 +516,8 @@ class RTPAttention(BaseAttention):
         v = value.view(-1, self.num_kv_heads, self.head_dim)
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         dump_meta = {"is_prefill": is_prefill}
-        dump_atom_tensor(
-            tag="full_attn/q",
-            tensor=q,
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-        dump_atom_tensor(
-            tag="full_attn/k",
-            tensor=k,
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-        dump_atom_tensor(
-            tag="full_attn/v",
-            tensor=v,
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-        dump_atom_tensor(
-            tag="full_attn/qkv",
-            tensor=torch.cat(
-                (
-                    q.reshape(q.shape[0], -1),
-                    k.reshape(k.shape[0], -1),
-                    v.reshape(v.shape[0], -1),
-                ),
-                dim=-1,
-            ),
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-        dump_atom_tensor(
-            tag="full_attn/block_map",
-            tensor=getattr(attn_inputs, "kv_cache_kernel_block_id_device", None),
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-        dump_atom_tensor(
-            tag="full_attn/sequence_lengths",
-            tensor=getattr(attn_inputs, "sequence_lengths", None),
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-        dump_atom_tensor(
-            tag="full_attn/sequence_lengths_plus_1",
-            tensor=getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-        dump_atom_tensor(
-            tag="full_attn/prefix_lengths",
-            tensor=getattr(attn_inputs, "prefix_lengths", None),
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-        dump_atom_tensor(
-            tag="full_attn/prefix_lengths_d",
-            tensor=getattr(attn_inputs, "prefix_lengths_d", None),
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-        dump_atom_tensor(
-            tag="full_attn/input_lengths",
-            tensor=getattr(attn_inputs, "input_lengths", None),
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
         cu_seqlens_tag = (
             "full_attn/cu_seqlens_prefill" if is_prefill else "full_attn/cu_seqlens_decode"
-        )
-        dump_atom_tensor(
-            tag=cu_seqlens_tag,
-            tensor=getattr(attn_inputs, "cu_seqlens", None),
-            layer=int(self.layer_num),
-            meta=dump_meta,
         )
 
         raw = getattr(layer_cache, "kv_cache_base", None)
@@ -871,12 +551,7 @@ class RTPAttention(BaseAttention):
             target_kv_heads=target_kv_heads,
         )
         if kv_dup_factor != 1:
-            _dump_scalar_as_tensor(
-                tag="full_attn/kv_head_dup_factor",
-                value=float(kv_dup_factor),
-                layer=int(self.layer_num),
-                base_meta=dump_meta,
-            )
+            pass
         query_start_loc = getattr(attn_metadata.plugin_metadata, "query_start_loc", None)
         block_tables = _resolve_block_tables_for_layer(attn_inputs, int(self.layer_num))
         if block_tables is None or block_tables.numel() == 0:
@@ -911,12 +586,6 @@ class RTPAttention(BaseAttention):
                 block_tables=block_tables[: int(q.shape[0])],
                 seq_size_per_block=seq_size_per_block,
             )
-        dump_atom_tensor(
-            tag="full_attn/slot_mapping",
-            tensor=slot_mapping,
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
         used_fused_write = _write_kv_cache_with_rtp_fused_kernel(
             query=q,
             key=k,
@@ -938,51 +607,6 @@ class RTPAttention(BaseAttention):
                 v,
                 slot_mapping,
             )
-        if is_prefill:
-            _dump_tensor_preview(
-                tag="full_attn/prefill_post_write/key_cache_preview",
-                tensor=key_cache,
-                layer=int(self.layer_num),
-                base_meta=dump_meta,
-            )
-            _dump_tensor_preview(
-                tag="full_attn/prefill_post_write/value_cache_preview",
-                tensor=value_cache,
-                layer=int(self.layer_num),
-                base_meta=dump_meta,
-            )
-            _dump_full_tensor_once(
-                tag="full_attn/prefill_post_write/key_cache_full",
-                tensor=key_cache,
-                layer=int(self.layer_num),
-                base_meta=dump_meta,
-                side="atom",
-                enabled_env="ATOM_RTP_DUMP_PREFILL_FULL_KV_ONCE",
-                layer_env="ATOM_RTP_DUMP_PREFILL_FULL_KV_LAYER",
-            )
-            _dump_full_tensor_once(
-                tag="full_attn/prefill_post_write/value_cache_full",
-                tensor=value_cache,
-                layer=int(self.layer_num),
-                base_meta=dump_meta,
-                side="atom",
-                enabled_env="ATOM_RTP_DUMP_PREFILL_FULL_KV_ONCE",
-                layer_env="ATOM_RTP_DUMP_PREFILL_FULL_KV_LAYER",
-            )
-
-        dump_atom_tensor(
-            tag="full_attn/block_tables",
-            tensor=block_tables,
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-        dump_atom_tensor(
-            tag="full_attn/seq_lens",
-            tensor=seq_lens,
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
-
         cu_seqlens_q = getattr(attn_inputs, "cu_seqlens", None)
         if is_prefill and cu_seqlens_q is not None and cu_seqlens_q.numel() > 1:
             cu_seqlens_q = cu_seqlens_q.to(device=q.device, dtype=torch.int32, non_blocking=True)
@@ -1045,12 +669,6 @@ class RTPAttention(BaseAttention):
                 )
             output = output.reshape(int(q.shape[0]), self.num_heads * self.head_dim)
             output = output.view(-1, self.num_heads * self.head_dim)
-            dump_atom_tensor(
-                tag="full_attn/kernel_output",
-                tensor=output,
-                layer=int(self.layer_num),
-                meta=dump_meta,
-            )
             return output
 
         num_seqs = int(q.shape[0])
@@ -1064,12 +682,6 @@ class RTPAttention(BaseAttention):
             dump_meta=dump_meta,
         )
         output = output.view(num_seqs, -1)
-        dump_atom_tensor(
-            tag="full_attn/kernel_output",
-            tensor=output,
-            layer=int(self.layer_num),
-            meta=dump_meta,
-        )
         return output
 
     def forward(

@@ -18,7 +18,6 @@ from atom.plugin.attention import (
     AiterFlashAttentionMetadataForPluginMode,
     AiterFlashAttentionPrefillMetadata,
 )
-from atom.plugin.rtpllm.utils.tensor_dump import dump_tensor as dump_atom_tensor
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
@@ -296,19 +295,6 @@ class RTPForwardContext:
             is_prefill=is_prefill,
             device=target_device,
             seq_size_per_block=seq_size_per_block,
-        )
-        dump_atom_tensor(
-            tag="forward_context/query_start_loc",
-            tensor=query_start_loc,
-            meta={"is_prefill": bool(is_prefill)},
-        )
-        dump_atom_tensor(
-            tag="forward_context/state_indices",
-            tensor=state_indices,
-            meta={
-                "is_prefill": bool(is_prefill),
-                "seq_size_per_block": int(seq_size_per_block),
-            },
         )
 
         if is_prefill:
@@ -646,21 +632,6 @@ class RTPForwardContext:
             common_prefix_len=0,
             total_tokens=0,
             context=None,
-        )
-        dump_atom_tensor(
-            tag="forward_context/full_attn/query_start_loc",
-            tensor=query_start_loc,
-            meta={"is_prefill": bool(is_prefill)},
-        )
-        dump_atom_tensor(
-            tag="forward_context/full_attn/seq_lens",
-            tensor=seq_lens,
-            meta={"is_prefill": bool(is_prefill)},
-        )
-        dump_atom_tensor(
-            tag="forward_context/full_attn/slot_mapping",
-            tensor=slot_mapping,
-            meta={"is_prefill": bool(is_prefill)},
         )
         return AttentionMetaData(
             max_seqlen_q=max_query_len,

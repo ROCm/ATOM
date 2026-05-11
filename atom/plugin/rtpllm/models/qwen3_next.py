@@ -7,7 +7,6 @@ import logging
 
 import torch
 
-from atom.plugin.rtpllm.utils.tensor_dump import dump_tensor as dump_atom_tensor
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom.plugin.rtpllm.models.qwen3_next")
@@ -106,18 +105,7 @@ def apply_qwen3_next_rtpllm_patch() -> None:
         is_prefill = _current_is_prefill()
         dump_meta = {"is_prefill": is_prefill}
         if self.layer_type == "full_attention":
-            dump_atom_tensor(
-                tag="full_attn/hidden_states_in",
-                tensor=hidden_states,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="full_attn/residual_in",
-                tensor=residual,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
+            pass
         if self.input_layernorm.use_fused_quant:
             if residual is None:
                 residual = hidden_states
@@ -149,36 +137,6 @@ def apply_qwen3_next_rtpllm_patch() -> None:
                 x_scale_to_dump = torch.empty(
                     (0,), dtype=torch.float32, device=pre_ln_hidden.device
                 )
-            dump_atom_tensor(
-                tag="gdn/pre_ln_weight",
-                tensor=pre_ln_weight,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="gdn/pre_ln_out",
-                tensor=pre_ln_hidden,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="gdn/pre_ln_residual_out",
-                tensor=residual,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="gdn/x_scale",
-                tensor=x_scale_to_dump,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="gdn/hidden_states_in",
-                tensor=pre_ln_hidden,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
             proj_input_fp8 = (
                 hidden_states
                 if x_scale is not None
@@ -188,30 +146,6 @@ def apply_qwen3_next_rtpllm_patch() -> None:
                 [1 if x_scale is not None else 0],
                 dtype=torch.int32,
                 device=pre_ln_hidden.device,
-            )
-            dump_atom_tensor(
-                tag="gdn/proj_input_hidden",
-                tensor=pre_ln_hidden,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="gdn/proj_input_fp8",
-                tensor=proj_input_fp8,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="gdn/proj_input_scale",
-                tensor=x_scale_to_dump,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="gdn/proj_input_source_id",
-                tensor=proj_input_source_id,
-                layer=layer_idx,
-                meta=dump_meta,
             )
             # Dump RTP-aligned projection tensors here as a stable fallback hook.
             # This branch is always executed for linear-attn layers in decoder forward.
@@ -228,40 +162,10 @@ def apply_qwen3_next_rtpllm_patch() -> None:
             except Exception:  # noqa: BLE001
                 projected_qkvz = None
                 projected_ba = None
-            dump_atom_tensor(
-                tag="gdn/projected_qkvz",
-                tensor=projected_qkvz,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="gdn/projected_ba",
-                tensor=projected_ba,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="gdn/mixed_qkv_input_qkvz",
-                tensor=projected_qkvz,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="gdn/mixed_qkv_input_ba",
-                tensor=projected_ba,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
             hidden_states = self.linear_attn(
                 hidden_states=pre_ln_hidden,
                 x_fp8=hidden_states if x_scale is not None else None,
                 x_scale=x_scale,
-            )
-            dump_atom_tensor(
-                tag="gdn/attn_output",
-                tensor=hidden_states,
-                layer=layer_idx,
-                meta=dump_meta,
             )
         elif self.layer_type == "full_attention":
             attn_inputs = _current_attn_inputs()
@@ -273,102 +177,19 @@ def apply_qwen3_next_rtpllm_patch() -> None:
             attn_positions = (
                 torch.zeros_like(positions) if use_rtp_fused_kv_write else positions
             )
-            dump_atom_tensor(
-                tag="full_attn/pre_ln_weight",
-                tensor=pre_ln_weight,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="full_attn/pre_ln_out",
-                tensor=hidden_states,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="full_attn/pre_ln_residual_out",
-                tensor=residual,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="full_attn/positions",
-                tensor=positions,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="full_attn/positions_for_attn",
-                tensor=attn_positions,
-                layer=layer_idx,
-                meta={**dump_meta, "rope_mocked": use_rtp_fused_kv_write},
-            )
-            dump_atom_tensor(
-                tag="full_attn/block_map",
-                tensor=getattr(attn_inputs, "kv_cache_kernel_block_id_device", None),
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="full_attn/sequence_lengths",
-                tensor=getattr(attn_inputs, "sequence_lengths", None),
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="full_attn/sequence_lengths_plus_1",
-                tensor=getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="full_attn/prefix_lengths",
-                tensor=getattr(attn_inputs, "prefix_lengths", None),
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="full_attn/prefix_lengths_d",
-                tensor=getattr(attn_inputs, "prefix_lengths_d", None),
-                layer=layer_idx,
-                meta=dump_meta,
-            )
-            dump_atom_tensor(
-                tag="full_attn/input_lengths",
-                tensor=getattr(attn_inputs, "input_lengths", None),
-                layer=layer_idx,
-                meta=dump_meta,
-            )
             cu_seqlens_tag = (
                 "full_attn/cu_seqlens_prefill"
                 if bool(getattr(attn_inputs, "is_prefill", False))
                 else "full_attn/cu_seqlens_decode"
-            )
-            dump_atom_tensor(
-                tag=cu_seqlens_tag,
-                tensor=getattr(attn_inputs, "cu_seqlens", None),
-                layer=layer_idx,
-                meta=dump_meta,
             )
             hidden_states = self.self_attn(
                 hidden_states=hidden_states,
                 positions=attn_positions,
                 x_scale=x_scale,
             )
-            dump_atom_tensor(
-                tag="full_attn/attn_output",
-                tensor=hidden_states,
-                layer=layer_idx,
-                meta=dump_meta,
-            )
         else:
             raise ValueError("Invalid layer_type")
 
-        dump_atom_tensor(
-            tag="bridge/attn_out",
-            tensor=hidden_states,
-            layer=layer_idx,
-        )
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -381,22 +202,7 @@ def apply_qwen3_next_rtpllm_patch() -> None:
                 )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        dump_atom_tensor(
-            tag="bridge/post_ln_out",
-            tensor=hidden_states,
-            layer=layer_idx,
-        )
-        dump_atom_tensor(
-            tag="bridge/post_ln_residual_out",
-            tensor=residual,
-            layer=layer_idx,
-        )
         hidden_states = self.mlp(hidden_states)
-        dump_atom_tensor(
-            tag="bridge/mlp_out",
-            tensor=hidden_states,
-            layer=layer_idx,
-        )
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -459,18 +265,6 @@ def apply_qwen3_next_rtpllm_patch() -> None:
                 self.head_v_dim,
             )
 
-        dump_atom_tensor(
-            tag="gdn/projected_qkvz",
-            tensor=projected_states_qkvz,
-            layer=layer_num,
-            meta={"is_prefill": bool(is_prefill)},
-        )
-        dump_atom_tensor(
-            tag="gdn/projected_ba",
-            tensor=projected_states_ba,
-            layer=layer_num,
-            meta={"is_prefill": bool(is_prefill)},
-        )
         layer_cache = None
         fwd_ctx = get_forward_context()
         if fwd_ctx is not None:
@@ -478,32 +272,10 @@ def apply_qwen3_next_rtpllm_patch() -> None:
             if isinstance(kv_cache_data, dict):
                 layer_cache = kv_cache_data.get(f"layer_{layer_num}")
         if layer_cache is not None:
-            dump_atom_tensor(
-                tag="gdn/state_conv_pre",
-                tensor=getattr(layer_cache, "k_cache", None),
-                layer=layer_num,
-                meta={"is_prefill": bool(is_prefill)},
-            )
-            dump_atom_tensor(
-                tag="gdn/state_ssm_pre",
-                tensor=getattr(layer_cache, "v_cache", None),
-                layer=layer_num,
-                meta={"is_prefill": bool(is_prefill)},
-            )
+            pass
         core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
         if layer_cache is not None:
-            dump_atom_tensor(
-                tag="gdn/state_conv_post",
-                tensor=getattr(layer_cache, "k_cache", None),
-                layer=layer_num,
-                meta={"is_prefill": bool(is_prefill)},
-            )
-            dump_atom_tensor(
-                tag="gdn/state_ssm_post",
-                tensor=getattr(layer_cache, "v_cache", None),
-                layer=layer_num,
-                meta={"is_prefill": bool(is_prefill)},
-            )
+            pass
         core_attn_out, maybe_scale = self.norm(core_attn_out, z)
         output = self.out_proj(core_attn_out, x_scale=maybe_scale)
         return output
