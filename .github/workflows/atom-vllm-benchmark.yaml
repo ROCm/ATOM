@@ -305,7 +305,7 @@ on:
       publish_to_dashboard:
         description: "Upload benchmark results to the dashboard"
         type: boolean
-        default: false
+        default: true
       upload_to_custom_dashboard:
         description: "Upload benchmark results to the LLM-Booster dashboard"
         type: boolean
@@ -475,9 +475,9 @@ jobs:
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             PUBLISH_TO_DASHBOARD=true
-            UPLOAD_TO_CUSTOM_DASHBOARD=false
+            UPLOAD_TO_CUSTOM_DASHBOARD=true
           else
-            PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-false}"
+            PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
             UPLOAD_TO_CUSTOM_DASHBOARD="${INPUT_UPLOAD_TO_CUSTOM_DASHBOARD:-true}"
           fi
 
@@ -985,6 +985,7 @@ jobs:
                           aws_param = dict(param)
                           aws_param["input_length"] = input_length
                           aws_param["output_length"] = output_length
+                          aws_param["random_range_ratio"] = "1"
                           base_params.append(aws_param)
 
                   variants = []
@@ -1882,9 +1883,13 @@ jobs:
               prefix, isl, osl, concurrency, ratio = stem.rsplit("-", 4)
               return prefix, int(isl), int(osl), int(concurrency), float(ratio)
 
-          benchmark_client = os.environ["BENCHMARK_CLIENT"]
-          client_slug = "vllmbench" if benchmark_client == "vLLM bench" else "inferencemax"
-          client_label = "vllm bench" if benchmark_client == "vLLM bench" else "inferencemax"
+          default_benchmark_client = os.environ["BENCHMARK_CLIENT"]
+
+          def resolve_client(payload):
+              bc = str(payload.get("benchmark_client", default_benchmark_client))
+              slug = "vllmbench" if bc == "vLLM bench" else "inferencemax"
+              label = "vllm bench" if bc == "vLLM bench" else "inferencemax"
+              return slug, label
 
           grouped = defaultdict(list)
           for path in sorted(root.glob("*.json")):
@@ -1912,11 +1917,13 @@ jobs:
               atom_source_sha = str(payload.get("atom_source_sha", "")) or "unknown"
               sha7 = atom_source_sha[:7] if atom_source_sha else "unknown"
               day = time.strftime("%Y-%m-%d", time.gmtime())
+              client_slug, _ = resolve_client(payload)
               grouped[(day, sha7, model, isl, osl, client_slug)].append((path, payload, precision, concurrency, ratio))
 
           written_files = set()
           for (day, sha7, model, isl, osl, client_slug), entries in sorted(grouped.items()):
               entries.sort(key=lambda item: (item[3], item[4]))
+              client_label = "vllm bench" if client_slug == "vllmbench" else "inferencemax"
               timestamp_ms = int(time.time() * 1000)
               precision = entries[0][2]
               first_payload = entries[0][1]
