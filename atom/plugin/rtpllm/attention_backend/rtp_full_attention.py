@@ -1,201 +1,13 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Any, Optional
 
 import torch
-try:
-    import triton
-    import triton.language as tl
-except Exception:  # pragma: no cover - runtime fallback
-    triton = None
-    tl = None
 
 from atom.model_ops.base_attention import BaseAttention
 from atom.plugin.prepare import is_plugin_mode, is_rtpllm
 from atom.utils.forward_context import get_forward_context
-
-if triton is not None:
-
-    @triton.jit
-    def _reshape_and_cache_shuffle_kernel(
-        key_ptr,  # [num_tokens, num_kv_heads, head_size]
-        value_ptr,  # [num_tokens, num_kv_heads, head_size]
-        key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, block_size, x]
-        value_cache_ptr,  # [num_blocks, num_kv_heads, block_size // x, head_size, x]
-        slot_mapping_ptr,  # [num_tokens]
-        k_scale_ptr,
-        v_scale_ptr,
-        x,
-        k_stride0,
-        k_stride1,
-        v_stride0,
-        v_stride1,
-        key_cache_stride0,
-        key_cache_stride1,
-        key_cache_stride2,
-        key_cache_stride3,
-        key_cache_stride4,
-        value_cache_stride0,
-        value_cache_stride1,
-        value_cache_stride2,
-        value_cache_stride3,
-        value_cache_stride4,
-        block_size,
-        head_size,
-        BLOCK_SIZE: tl.constexpr,
-        QUANT: tl.constexpr,
-    ):
-        tid = tl.program_id(0)
-        head_id = tl.program_id(1)
-        offset = tl.arange(0, BLOCK_SIZE)
-        mask = offset < head_size
-        slot_id = tl.load(slot_mapping_ptr + tid)
-        if slot_id < 0:
-            return
-        block_id = slot_id // block_size
-        block_offset = slot_id % block_size
-
-        src_offset_k = tid * k_stride0 + head_id * k_stride1 + offset
-        src_offset_v = tid * v_stride0 + head_id * v_stride1 + offset
-        k_val = tl.load(key_ptr + src_offset_k, mask=mask, other=0)
-        v_val = tl.load(value_ptr + src_offset_v, mask=mask, other=0)
-
-        if QUANT:
-            k_scale = tl.load(k_scale_ptr)
-            v_scale = tl.load(v_scale_ptr)
-            k_dtype = key_cache_ptr.type.element_ty
-            v_dtype = value_cache_ptr.type.element_ty
-            k_val = (k_val.to(tl.float32) / k_scale).to(k_dtype)
-            v_val = (v_val.to(tl.float32) / v_scale).to(v_dtype)
-
-        k_hdx = offset // x
-        k_x = offset % x
-        dst_k = (
-            block_id * key_cache_stride0
-            + head_id * key_cache_stride1
-            + k_hdx * key_cache_stride2
-            + block_offset * key_cache_stride3
-            + k_x * key_cache_stride4
-        )
-        tl.store(key_cache_ptr + dst_k, k_val, mask=mask)
-
-        v_bdx = block_offset // x
-        v_x = block_offset % x
-        dst_v = (
-            block_id * value_cache_stride0
-            + head_id * value_cache_stride1
-            + v_bdx * value_cache_stride2
-            + offset * value_cache_stride3
-            + v_x * value_cache_stride4
-        )
-        tl.store(value_cache_ptr + dst_v, v_val, mask=mask)
-
-
-def _reshape_and_cache_shuffle_triton(
-    *,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> bool:
-    if triton is None:
-        return False
-    if key.numel() == 0 or slot_mapping.numel() == 0:
-        return True
-    if not (
-        key.is_cuda
-        and value.is_cuda
-        and key_cache.is_cuda
-        and value_cache.is_cuda
-        and slot_mapping.is_cuda
-    ):
-        return False
-
-    num_tokens, num_kv_heads, head_size = key.shape
-    num_blocks, _, block_size, _ = key_cache.shape
-    x = 16 // int(key_cache.element_size())
-    if x <= 0 or head_size % x != 0 or block_size % x != 0:
-        return False
-
-    try:
-        new_key_cache = key_cache.view(
-            num_blocks, num_kv_heads, head_size // x, block_size, x
-        )
-        new_value_cache = value_cache.view(
-            num_blocks, num_kv_heads, block_size // x, head_size, x
-        )
-    except Exception:
-        return False
-
-    kv_cache_dtype = "fp8" if key_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) else "auto"
-    quant = kv_cache_dtype.startswith("fp8")
-    k_scale = torch.ones(1, dtype=torch.float32, device=key.device)
-    v_scale = torch.ones(1, dtype=torch.float32, device=key.device)
-
-    grid = (num_tokens, num_kv_heads)
-    _reshape_and_cache_shuffle_kernel[grid](
-        key,
-        value,
-        new_key_cache,
-        new_value_cache,
-        slot_mapping.to(dtype=torch.int32, device=key.device),
-        k_scale,
-        v_scale,
-        x,
-        key.stride(0),
-        key.stride(1),
-        value.stride(0),
-        value.stride(1),
-        new_key_cache.stride(0),
-        new_key_cache.stride(1),
-        new_key_cache.stride(2),
-        new_key_cache.stride(3),
-        new_key_cache.stride(4),
-        new_value_cache.stride(0),
-        new_value_cache.stride(1),
-        new_value_cache.stride(2),
-        new_value_cache.stride(3),
-        new_value_cache.stride(4),
-        block_size,
-        head_size,
-        BLOCK_SIZE=head_size,
-        QUANT=quant,
-    )
-    return True
-
-
-def _write_kv_cache_from_slot_mapping(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    slot_mapping: torch.Tensor | None,
-) -> None:
-    if slot_mapping is None or slot_mapping.numel() == 0:
-        return
-    # Align with RTP paged KV cache layout directly and avoid aiter asm_layout path.
-    slots = slot_mapping.to(device=key.device, dtype=torch.int64, non_blocking=True)
-    valid = slots >= 0
-    slots = slots[valid].contiguous()
-    if slots.numel() == 0:
-        return
-    key = key[valid].contiguous()
-    value = value[valid].contiguous()
-    if _reshape_and_cache_shuffle_triton(
-        key=key,
-        value=value,
-        key_cache=k_cache,
-        value_cache=v_cache,
-        slot_mapping=slots,
-    ):
-        return
-    block_size = int(k_cache.shape[2])
-    block_ids = torch.div(slots, block_size, rounding_mode="floor")
-    offsets = torch.remainder(slots, block_size)
-    k_cache[block_ids, :, offsets, :] = key
-    v_cache[block_ids, :, offsets, :] = value
 
 
 def _align_kv_heads_for_cache(
@@ -221,69 +33,6 @@ def _align_kv_heads_for_cache(
     return key_aligned, value_aligned, dup_factor
 
 
-def _write_kv_cache_with_rtp_fused_kernel(
-    *,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    layer_cache: object,
-    attn_inputs: object,
-    tokens_per_block: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    layer: int | None = None,
-) -> bool:
-    try:
-        from rtp_llm.ops import AttentionConfigs, KvCacheDataType
-        from rtp_llm.ops.compute_ops import (
-            FusedRopeKVCacheDecodeOpNonAsm,
-            FusedRopeKVCachePrefillOpNonAsm,
-        )
-    except Exception:
-        return False
-
-    try:
-        attn_configs = AttentionConfigs()
-        attn_configs.head_num = int(num_heads)
-        attn_configs.kv_head_num = int(num_kv_heads)
-        attn_configs.size_per_head = int(head_dim)
-        attn_configs.tokens_per_block = int(tokens_per_block)
-        attn_configs.kernel_tokens_per_block = int(tokens_per_block)
-        attn_configs.is_causal = True
-        attn_configs.use_mla = False
-        attn_configs.q_scaling = 1.0
-        attn_configs.dtype = query.dtype
-        kv_dtype = getattr(getattr(layer_cache, "kv_cache_base", None), "dtype", None)
-        if kv_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-            attn_configs.kv_cache_dtype = KvCacheDataType.FP8
-        else:
-            attn_configs.kv_cache_dtype = KvCacheDataType.BASE
-
-        # Keep RoPE mocked on ATOM side for this experiment;
-        # we only reuse RTP fused address/write semantics here.
-        attn_configs.need_rope_kv_cache = False
-
-        qkv = torch.cat(
-            [
-                query.reshape(query.shape[0], -1),
-                key.reshape(key.shape[0], -1),
-                value.reshape(value.shape[0], -1),
-            ],
-            dim=-1,
-        ).contiguous()
-        is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
-        if is_prefill:
-            op = FusedRopeKVCachePrefillOpNonAsm(attn_configs)
-        else:
-            op = FusedRopeKVCacheDecodeOpNonAsm(attn_configs)
-        params = op.prepare(attn_inputs)
-        _ = op.forward(qkv, layer_cache, params)
-        return True
-    except Exception:
-        return False
-
-
 def _resolve_block_tables_for_layer(attn_inputs: object, layer_num: int) -> torch.Tensor | None:
     # Mirror RTP select_block_map_for_layer semantics:
     # 1) compute gid from kv_cache_layer_to_group[layer]
@@ -305,57 +54,6 @@ def _resolve_block_tables_for_layer(attn_inputs: object, layer_num: int) -> torc
         if t is not None and t.numel() > 0:
             return t
     return current
-
-
-def _build_slot_mapping_for_layer(
-    *,
-    positions: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    block_tables: torch.Tensor,
-    seq_size_per_block: int,
-) -> torch.Tensor:
-    if block_tables.dim() == 1:
-        block_tables = block_tables.unsqueeze(0)
-    lengths = query_start_loc[1:] - query_start_loc[:-1]
-    seq_id = torch.repeat_interleave(
-        torch.arange(int(lengths.numel()), device=positions.device, dtype=torch.int64),
-        lengths.to(dtype=torch.int64),
-    )
-    block_col = torch.div(
-        positions.to(dtype=torch.int32), int(seq_size_per_block), rounding_mode="floor"
-    )
-    slot_base = block_tables.to(dtype=torch.int64)[seq_id, block_col.to(dtype=torch.int64)]
-    token_offset = torch.remainder(positions.to(dtype=torch.int32), int(seq_size_per_block))
-    return (slot_base * int(seq_size_per_block) + token_offset.to(dtype=torch.int64)).contiguous()
-
-
-def _build_decode_slot_mapping_for_layer(
-    *,
-    seq_lens: torch.Tensor,
-    block_tables: torch.Tensor,
-    seq_size_per_block: int,
-) -> torch.Tensor:
-    if block_tables.dim() == 1:
-        block_tables = block_tables.unsqueeze(0)
-    if seq_lens.dim() != 1:
-        seq_lens = seq_lens.view(-1)
-    if int(seq_lens.numel()) != int(block_tables.shape[0]):
-        raise ValueError(
-            "RTPAttention decode slot mapping requires seq_lens/block_tables batch match "
-            f"(seq_lens={int(seq_lens.numel())}, block_tables={int(block_tables.shape[0])})."
-        )
-    # Decode writes one token per sequence at logical index (seq_len - 1),
-    # matching RTP decode path semantics.
-    token_idx = torch.clamp(seq_lens.to(torch.int64) - 1, min=0)
-    block_col = torch.div(
-        token_idx, int(seq_size_per_block), rounding_mode="floor"
-    ).to(torch.int64)
-    row_idx = torch.arange(
-        int(seq_lens.numel()), device=seq_lens.device, dtype=torch.int64
-    )
-    slot_base = block_tables.to(torch.int64)[row_idx, block_col]
-    token_offset = torch.remainder(token_idx, int(seq_size_per_block))
-    return (slot_base * int(seq_size_per_block) + token_offset).contiguous()
 
 
 def _run_nonasm_paged_attention(
@@ -460,6 +158,50 @@ class RTPFullAttention(BaseAttention):
         self.num_kv_heads = int(num_kv_heads)
         self.scale = float(scale)
         self.layer_num = int(layer_num)
+        # Cached reshape view — invalidated when kv_cache_base is reallocated.
+        self._paged_kv_cache: torch.Tensor | None = None
+        self._raw_kv_data_ptr: int = 0
+        self._raw_kv_numel: int = 0
+        self._kernel_seq_size_per_block: int = 0
+        # Cached fused KV write ops — built once on first forward.
+        self._fused_prefill_op: Any | None = None
+        self._fused_decode_op: Any | None = None
+
+    def _ensure_fused_ops(
+        self,
+        layer_cache: object,
+        kv_head_num: int,
+        kernel_seq_size_per_block: int,
+        dtype: torch.dtype,
+    ) -> None:
+        if self._fused_prefill_op is not None:
+            return
+        from rtp_llm.ops import AttentionConfigs, KvCacheDataType
+        from rtp_llm.ops.compute_ops import (
+            FusedRopeKVCacheDecodeOpNonAsm,
+            FusedRopeKVCachePrefillOpNonAsm,
+        )
+        attn_configs = AttentionConfigs()
+        attn_configs.head_num = self.num_heads
+        # Use post-alignment kv head count so the fused-write op interprets the
+        # qkv strides consistently with how we lay out the (already-aligned) k/v.
+        attn_configs.kv_head_num = int(kv_head_num)
+        attn_configs.size_per_head = self.head_dim
+        attn_configs.tokens_per_block = kernel_seq_size_per_block
+        attn_configs.kernel_tokens_per_block = kernel_seq_size_per_block
+        attn_configs.is_causal = True
+        attn_configs.use_mla = False
+        attn_configs.q_scaling = 1.0
+        attn_configs.dtype = dtype
+        kv_dtype = getattr(getattr(layer_cache, "kv_cache_base", None), "dtype", None)
+        attn_configs.kv_cache_dtype = (
+            KvCacheDataType.FP8
+            if kv_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            else KvCacheDataType.BASE
+        )
+        attn_configs.need_rope_kv_cache = False
+        self._fused_prefill_op = FusedRopeKVCachePrefillOpNonAsm(attn_configs)
+        self._fused_decode_op = FusedRopeKVCacheDecodeOpNonAsm(attn_configs)
 
     def _forward_impl_plugin_mode(
         self,
@@ -511,17 +253,29 @@ class RTPFullAttention(BaseAttention):
             or getattr(layer_cache, "seq_size_per_block", 0)
             or 16
         )
-        paged_kv = reshape_paged_kv_cache(
-            raw,
-            num_kv_heads=self.num_kv_heads,
-            tokens_per_block=kernel_seq_size_per_block,
-            head_dim=self.head_dim,
-        )
-        if paged_kv.dim() != 5 or int(paged_kv.shape[1]) != 2:
-            raise ValueError(
-                f"RTPAttention expects paged kv cache [num_blocks,2,H,T,D], got {tuple(paged_kv.shape)}"
+        # Invalidate cached view when the underlying buffer is reallocated (more blocks added).
+        if (
+            self._paged_kv_cache is None
+            or raw.data_ptr() != self._raw_kv_data_ptr
+            or raw.numel() != self._raw_kv_numel
+        ):
+            paged_kv = reshape_paged_kv_cache(
+                raw,
+                num_kv_heads=self.num_kv_heads,
+                tokens_per_block=kernel_seq_size_per_block,
+                head_dim=self.head_dim,
             )
+            if paged_kv.dim() != 5 or int(paged_kv.shape[1]) != 2:
+                raise ValueError(
+                    f"RTPAttention expects paged kv cache [num_blocks,2,H,T,D], "
+                    f"got {tuple(paged_kv.shape)}"
+                )
+            self._paged_kv_cache = paged_kv
+            self._raw_kv_data_ptr = raw.data_ptr()
+            self._raw_kv_numel = raw.numel()
+            self._kernel_seq_size_per_block = kernel_seq_size_per_block
 
+        paged_kv = self._paged_kv_cache
         key_cache = paged_kv.select(1, 0)
         value_cache = paged_kv.select(1, 1)
         target_kv_heads = int(key_cache.shape[1])
@@ -530,60 +284,34 @@ class RTPFullAttention(BaseAttention):
             value=v,
             target_kv_heads=target_kv_heads,
         )
-        query_start_loc = getattr(attn_metadata.plugin_metadata, "query_start_loc", None)
+        seq_lens = getattr(attn_metadata.plugin_metadata, "seq_lens", None)
+        if seq_lens is None:
+            raise ValueError("RTPAttention requires seq_lens in plugin_metadata.")
         block_tables = _resolve_block_tables_for_layer(attn_inputs, int(self.layer_num))
         if block_tables is None or block_tables.numel() == 0:
             raise ValueError(
                 f"RTPAttention requires block table for layer_{self.layer_num}."
             )
-        seq_size_per_block = kernel_seq_size_per_block
-        positions = getattr(getattr(fwd_ctx, "context", None), "positions", None)
-        seq_lens = getattr(attn_metadata.plugin_metadata, "seq_lens", None)
-        if block_tables is None or seq_lens is None:
-            raise ValueError("RTPAttention requires block tables and sequence lengths.")
         block_tables = block_tables.to(device=q.device, dtype=torch.int32, non_blocking=True)
         seq_lens = seq_lens.to(device=q.device, dtype=torch.int32, non_blocking=True)
-        if is_prefill:
-            if positions is None or positions.numel() == 0:
-                raise ValueError("RTPAttention prefill requires non-empty positions.")
-            if query_start_loc is None or query_start_loc.numel() < 2:
-                raise ValueError("RTPAttention prefill requires valid query_start_loc.")
-            slot_mapping = _build_slot_mapping_for_layer(
-                positions=positions.to(
-                    device=q.device, dtype=torch.int32, non_blocking=True
-                ),
-                query_start_loc=query_start_loc.to(
-                    device=q.device, dtype=torch.int32, non_blocking=True
-                ),
-                block_tables=block_tables,
-                seq_size_per_block=seq_size_per_block,
-            )
-        else:
-            slot_mapping = _build_decode_slot_mapping_for_layer(
-                seq_lens=seq_lens[: int(q.shape[0])],
-                block_tables=block_tables[: int(q.shape[0])],
-                seq_size_per_block=seq_size_per_block,
-            )
-        used_fused_write = _write_kv_cache_with_rtp_fused_kernel(
-            query=q,
-            key=k,
-            value=v,
-            layer_cache=layer_cache,
-            attn_inputs=attn_inputs,
-            tokens_per_block=seq_size_per_block,
-            num_heads=self.num_heads,
-            num_kv_heads=int(k.shape[1]),
-            head_dim=self.head_dim,
-            layer=int(self.layer_num),
+
+        self._ensure_fused_ops(
+            layer_cache,
+            int(k.shape[1]),
+            self._kernel_seq_size_per_block,
+            q.dtype,
         )
-        if not used_fused_write:
-            _write_kv_cache_from_slot_mapping(
-                key_cache,
-                value_cache,
-                k,
-                v,
-                slot_mapping,
-            )
+        op = self._fused_prefill_op if is_prefill else self._fused_decode_op
+        qkv = torch.cat(
+            [
+                q.reshape(q.shape[0], -1),
+                k.reshape(k.shape[0], -1),
+                v.reshape(v.shape[0], -1),
+            ],
+            dim=-1,
+        ).contiguous()
+        params = op.prepare(attn_inputs)
+        op.forward(qkv, layer_cache, params)
         cu_seqlens_q = getattr(attn_inputs, "cu_seqlens", None)
         if is_prefill and cu_seqlens_q is not None and cu_seqlens_q.numel() > 1:
             cu_seqlens_q = cu_seqlens_q.to(device=q.device, dtype=torch.int32, non_blocking=True)
