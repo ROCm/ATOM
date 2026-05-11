@@ -852,6 +852,21 @@ class PagedAttentionImplPluginModeMethods:
 
             _pf_out = output_actual_tokens[num_decode_tokens + num_extend_tokens :]
             if self.head_dim > 256:
+                # _triton_flash_attn_varlen does not accept sink_ptr; if the
+                # caller has attention sinks configured, routing here would
+                # silently drop them and produce wrong attention. No current
+                # model triggers this (Gemma 4 has head_dim>256 but no sinks;
+                # gpt-oss / MiMo have sinks but head_dim<=256), but guard
+                # explicitly to avoid silent breakage on future models.
+                if getattr(self, "sinks", None) is not None:
+                    raise RuntimeError(
+                        f"head_dim={self.head_dim} > 256 routes prefill "
+                        f"through _triton_flash_attn_varlen which does not "
+                        f"forward sink_ptr; self.sinks is set so this "
+                        f"combination would silently drop attention sinks. "
+                        f"Add sink_ptr support to the Triton/SDPA fallback "
+                        f"path before enabling this model."
+                    )
                 _triton_flash_attn_varlen(
                     q=prefill_query, k=prefill_key, v=prefill_value,
                     cu_seqlens_q=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
