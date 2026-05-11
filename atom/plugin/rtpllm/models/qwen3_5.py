@@ -24,7 +24,6 @@ from atom.plugin.rtpllm.model_ops import (
 )
 from atom.plugin.rtpllm.models.qwen3_next import apply_qwen3_next_rtpllm_patch
 from atom.plugin.rtpllm.utils import RTPForwardContext
-from atom.plugin.rtpllm.utils.tensor_dump import dump_tensor as dump_atom_tensor
 
 logger = logging.getLogger("atom.plugin.rtpllm.models")
 
@@ -246,16 +245,6 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                 model_inputs_embeds = self.model.embed_input_ids(input_ids)
             except Exception:  # noqa: BLE001
                 model_inputs_embeds = None
-        dump_atom_tensor(
-            tag="runtime/input_ids",
-            tensor=input_ids,
-            meta={"token_num": token_num},
-        )
-        dump_atom_tensor(
-            tag="runtime/positions",
-            tensor=positions,
-            meta={"token_num": token_num},
-        )
         if input_ids is None or input_ids.numel() == 0:
             inputs_embeds = inputs.input_hiddens
             if (
@@ -270,11 +259,6 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                 and inputs_embeds.dtype != model_dtype
             ):
                 inputs_embeds = inputs_embeds.to(dtype=model_dtype)
-        dump_atom_tensor(
-            tag="runtime/inputs_embeds",
-            tensor=model_inputs_embeds if model_inputs_embeds is not None else inputs_embeds,
-            meta={"token_num": token_num},
-        )
 
         with RTPForwardContext.bind(
             model=self.model, runtime=self, inputs=inputs, positions=positions
@@ -285,11 +269,6 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                 intermediate_tensors=None,
                 inputs_embeds=inputs_embeds,
             )
-        dump_atom_tensor(
-            tag="runtime/hidden_states",
-            tensor=hidden_states,
-            meta={"token_num": token_num},
-        )
         return PyModelOutputs(hidden_states)
 
 
