@@ -11,114 +11,24 @@ on:
     - cron: '0 15 * * 0-4'
   workflow_dispatch:
     inputs:
-      deepseek-r1-fp8-met:
-        description: "DeepSeek-R1 FP8 TP8 (MET)"
-        type: boolean
-        default: false
-      deepseek-r1-mxfp4-met:
-        description: "DeepSeek-R1 MXFP4 TP8 (MET)"
-        type: boolean
-        default: false
-      gpt-oss-120b-met:
-        description: "gpt-oss-120b TP1 (MET)"
-        type: boolean
-        default: false
-      glm-5-1-fp8-tp8-oob:
-        description: "GLM-5.1-FP8 TP8 (OOB)"
-        type: boolean
-        default: false
-      kimi-k2-thinking-mxfp4-tp4-met:
-        description: "Kimi-K2-Thinking-MXFP4 TP4 (MET)"
-        type: boolean
-        default: false
-      kimi-k2-thinking-mxfp4-tp8-met:
-        description: "Kimi-K2-Thinking-MXFP4 TP8 (MET)"
-        type: boolean
-        default: false
-      kimi-k25-mxfp4-tp4-met:
-        description: "Kimi-K2.5-MXFP4 TP4 (MET)"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-oob:
-        description: "Qwen3.5-397B-A17B TP8 (OOB)"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8-tp4-oob:
-        description: "Qwen3.5-397B-A17B-FP8 TP4 (OOB)"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8-oob:
-        description: "Qwen3.5-397B-A17B-FP8 TP8 (OOB)"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-tp1-met:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-tp4-met:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-aw-tp1:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-aw-tp2:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-aw-tp4:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)"
-        type: boolean
-        default: false
-      deepseek-v3-2-fp8-aw-tp4:
-        description: "DeepSeek-V3.2 FP8 TP4 (AW)"
-        type: boolean
-        default: false
-      deepseek-v3-2-fp8-aw-tp8:
-        description: "DeepSeek-V3.2 FP8 TP8 (AW)"
-        type: boolean
-        default: false
-      glm-4-7-fp8-aw-tp4:
-        description: "GLM-4.7-FP8 TP4 (AW)"
-        type: boolean
-        default: false
-      glm-4-7-fp8-aw-tp8:
-        description: "GLM-4.7-FP8 TP8 (AW)"
-        type: boolean
-        default: false
-      gpt-oss-120b-aw-tp1:
-        description: "gpt-oss-120b TP1 (AW)"
-        type: boolean
-        default: false
-      gpt-oss-120b-aw-tp2:
-        description: "gpt-oss-120b TP2 (AW)"
-        type: boolean
-        default: false
-      gpt-oss-120b-aw-tp8:
-        description: "gpt-oss-120b TP8 (AW)"
-        type: boolean
-        default: false
-      kimi-k2-5-mxfp4-aw-tp4:
-        description: "Kimi-K2.5-MXFP4 TP4 (AW)"
-        type: boolean
-        default: false
-      kimi-k2-5-mxfp4-aw-tp8:
-        description: "Kimi-K2.5-MXFP4 TP8 (AW)"
-        type: boolean
-        default: false
-      minimax-m2-5-aw-tp2:
-        description: "MiniMax-M2.5 TP2 (AW)"
-        type: boolean
-        default: false
-      minimax-m2-5-aw-tp4:
-        description: "MiniMax-M2.5 TP4 (AW)"
-        type: boolean
-        default: false
-      minimax-m2-5-aw-tp8:
-        description: "MiniMax-M2.5 TP8 (AW)"
-        type: boolean
-        default: false
+      model_preset:
+        description: "Model preset (use custom_model_prefixes to override)"
+        type: choice
+        default: smoke
+        options:
+          - smoke
+          - deepseek
+          - kimi
+          - qwen
+          - all
+      custom_model_prefixes:
+        description: |
+          Optional custom model prefixes (comma/semicolon/newline separated).
+          Full prefix list: .github/benchmark/oot_benchmark_models.json
+          Example:
+          deepseek-r1-fp8,qwen3-next-80b-a3b-instruct-fp8-tp4
+        type: string
+        default: ""
       oot_image:
         description: "Optional OOT benchmark image override. Leave empty to resolve main to the same-digest published nightly tag behind vllm-latest, or rebuild from the selected non-main branch."
         type: string
@@ -127,15 +37,25 @@ on:
         description: "Upload benchmark results to the dashboard"
         type: boolean
         default: true
+      param_profile:
+        description: "Parameter profile used when param_lists is empty"
+        type: choice
+        default: full-matrix
+        options:
+          - smoke
+          - short
+          - long-output
+          - long-input
+          - full-matrix
       param_lists:
         description: |
-          "Benchmark parameter lists.
+          Optional custom benchmark parameter lists.
           Input as a single or multiple sets (comma-separated, semicolon between sets),
           format: input_length,output_length,concurrency,random_range_ratio.
           Example (single set): 1024,1024,64,0.8
-          Example (multiple sets): 1024,1024,64,0.8;2048,1024,32,0.7"
+          Example (multiple sets): 1024,1024,64,0.8;2048,1024,32,0.7
         type: string
-        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
+        default: ""
 
 jobs:
   wait-for-older-manual-runs:
@@ -445,7 +365,31 @@ jobs:
       - name: Parse parameter lists
         id: parse-param-lists
         run: |
-          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8' }}"
+          PARAM_PROFILE="${{ inputs.param_profile || 'full-matrix' }}"
+          PARAM_LISTS="${{ inputs.param_lists || '' }}"
+          if [[ -z "${PARAM_LISTS}" ]]; then
+            case "${PARAM_PROFILE}" in
+              smoke)
+                PARAM_LISTS="1024,1024,4,0.8"
+                ;;
+              short)
+                PARAM_LISTS="1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8"
+                ;;
+              long-output)
+                PARAM_LISTS="1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8"
+                ;;
+              long-input)
+                PARAM_LISTS="8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
+                ;;
+              full-matrix)
+                PARAM_LISTS="1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
+                ;;
+              *)
+                echo "Unsupported param_profile: ${PARAM_PROFILE}"
+                exit 1
+                ;;
+            esac
+          fi
           echo "Using param_lists: ${PARAM_LISTS}"
           printf 'param_lists=%s\n' "${PARAM_LISTS}" >> "$GITHUB_OUTPUT"
           IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
@@ -489,38 +433,14 @@ jobs:
       - uses: actions/checkout@v6
       - id: load
         env:
-          ENABLE_DEEPSEEK_R1_FP8: ${{ inputs.deepseek-r1-fp8-met }}
-          ENABLE_DEEPSEEK_R1_MXFP4: ${{ inputs.deepseek-r1-mxfp4-met }}
-          ENABLE_GPT_OSS_120B: ${{ inputs.gpt-oss-120b-met }}
-          ENABLE_GLM_5_1_FP8_TP8: ${{ inputs.glm-5-1-fp8-tp8-oob }}
-          ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4-met }}
-          ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8-met }}
-          ENABLE_KIMI_K25_TP4: ${{ inputs.kimi-k25-mxfp4-tp4-met }}
-          ENABLE_QWEN3_5_397B_A17B: ${{ inputs.qwen3-5-397b-a17b-oob }}
-          ENABLE_QWEN3_5_397B_A17B_FP8_TP4: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4-oob }}
-          ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8-oob }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1-met }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4-met }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp1 }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP2: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp2 }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp4 }}
-          ENABLE_DEEPSEEK_V3_2_FP8_AW_TP4: ${{ inputs.deepseek-v3-2-fp8-aw-tp4 }}
-          ENABLE_DEEPSEEK_V3_2_FP8_AW_TP8: ${{ inputs.deepseek-v3-2-fp8-aw-tp8 }}
-          ENABLE_GLM_4_7_FP8_AW_TP4: ${{ inputs.glm-4-7-fp8-aw-tp4 }}
-          ENABLE_GLM_4_7_FP8_AW_TP8: ${{ inputs.glm-4-7-fp8-aw-tp8 }}
-          ENABLE_GPT_OSS_120B_AW_TP1: ${{ inputs.gpt-oss-120b-aw-tp1 }}
-          ENABLE_GPT_OSS_120B_AW_TP2: ${{ inputs.gpt-oss-120b-aw-tp2 }}
-          ENABLE_GPT_OSS_120B_AW_TP8: ${{ inputs.gpt-oss-120b-aw-tp8 }}
-          ENABLE_KIMI_K2_5_MXFP4_AW_TP4: ${{ inputs.kimi-k2-5-mxfp4-aw-tp4 }}
-          ENABLE_KIMI_K2_5_MXFP4_AW_TP8: ${{ inputs.kimi-k2-5-mxfp4-aw-tp8 }}
-          ENABLE_MINIMAX_M2_5_AW_TP2: ${{ inputs.minimax-m2-5-aw-tp2 }}
-          ENABLE_MINIMAX_M2_5_AW_TP4: ${{ inputs.minimax-m2-5-aw-tp4 }}
-          ENABLE_MINIMAX_M2_5_AW_TP8: ${{ inputs.minimax-m2-5-aw-tp8 }}
+          MODEL_PRESET: ${{ inputs.model_preset || 'smoke' }}
+          CUSTOM_MODEL_PREFIXES: ${{ inputs.custom_model_prefixes || '' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           import os
+          import re
           import sys
           from datetime import datetime, timedelta, timezone
           from pathlib import Path
@@ -531,36 +451,22 @@ jobs:
               Path(".github/benchmark/oot_benchmark_models.json").read_text(encoding="utf-8")
           )
           event = os.environ["GITHUB_EVENT_NAME"]
-
-          manual_toggles = {
-              "deepseek-r1-fp8-met": os.environ.get("ENABLE_DEEPSEEK_R1_FP8", "").lower() == "true",
-              "deepseek-r1-mxfp4-met": os.environ.get("ENABLE_DEEPSEEK_R1_MXFP4", "").lower() == "true",
-              "gpt-oss-120b-met": os.environ.get("ENABLE_GPT_OSS_120B", "").lower() == "true",
-              "glm-5-1-fp8-tp8-oob": os.environ.get("ENABLE_GLM_5_1_FP8_TP8", "").lower() == "true",
-              "kimi-k2-thinking-mxfp4-tp4-met": os.environ.get("ENABLE_KIMI_K2_TP4", "").lower() == "true",
-              "kimi-k2-thinking-mxfp4-tp8-met": os.environ.get("ENABLE_KIMI_K2_TP8", "").lower() == "true",
-              "kimi-k25-mxfp4-tp4-met": os.environ.get("ENABLE_KIMI_K25_TP4", "").lower() == "true",
-              "qwen3-5-397b-a17b-oob": os.environ.get("ENABLE_QWEN3_5_397B_A17B", "").lower() == "true",
-              "qwen3-5-397b-a17b-fp8-tp4-oob": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP4", "").lower() == "true",
-              "qwen3-5-397b-a17b-fp8-oob": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8", "").lower() == "true",
-              "qwen3-next-80b-a3b-instruct-fp8-tp1-met": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1", "").lower() == "true",
-              "qwen3-next-80b-a3b-instruct-fp8-tp4-met": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4", "").lower() == "true",
-              "qwen3-next-80b-a3b-instruct-fp8-aw-tp1": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP1", "").lower() == "true",
-              "qwen3-next-80b-a3b-instruct-fp8-aw-tp2": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP2", "").lower() == "true",
-              "qwen3-next-80b-a3b-instruct-fp8-aw-tp4": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP4", "").lower() == "true",
-              "deepseek-v3-2-fp8-aw-tp4": os.environ.get("ENABLE_DEEPSEEK_V3_2_FP8_AW_TP4", "").lower() == "true",
-              "deepseek-v3-2-fp8-aw-tp8": os.environ.get("ENABLE_DEEPSEEK_V3_2_FP8_AW_TP8", "").lower() == "true",
-              "glm-4-7-fp8-aw-tp4": os.environ.get("ENABLE_GLM_4_7_FP8_AW_TP4", "").lower() == "true",
-              "glm-4-7-fp8-aw-tp8": os.environ.get("ENABLE_GLM_4_7_FP8_AW_TP8", "").lower() == "true",
-              "gpt-oss-120b-aw-tp1": os.environ.get("ENABLE_GPT_OSS_120B_AW_TP1", "").lower() == "true",
-              "gpt-oss-120b-aw-tp2": os.environ.get("ENABLE_GPT_OSS_120B_AW_TP2", "").lower() == "true",
-              "gpt-oss-120b-aw-tp8": os.environ.get("ENABLE_GPT_OSS_120B_AW_TP8", "").lower() == "true",
-              "kimi-k2-5-mxfp4-aw-tp4": os.environ.get("ENABLE_KIMI_K2_5_MXFP4_AW_TP4", "").lower() == "true",
-              "kimi-k2-5-mxfp4-aw-tp8": os.environ.get("ENABLE_KIMI_K2_5_MXFP4_AW_TP8", "").lower() == "true",
-              "minimax-m2-5-aw-tp2": os.environ.get("ENABLE_MINIMAX_M2_5_AW_TP2", "").lower() == "true",
-              "minimax-m2-5-aw-tp4": os.environ.get("ENABLE_MINIMAX_M2_5_AW_TP4", "").lower() == "true",
-              "minimax-m2-5-aw-tp8": os.environ.get("ENABLE_MINIMAX_M2_5_AW_TP8", "").lower() == "true",
+          model_prefixes = [model["prefix"] for model in models]
+          model_by_prefix = {model["prefix"]: model for model in models}
+          model_presets = {
+              "smoke": [
+                  "deepseek-r1-fp8-met",
+                  "gpt-oss-120b-met",
+                  "qwen3-next-80b-a3b-instruct-fp8-tp1-met",
+              ],
+              "deepseek": [prefix for prefix in model_prefixes if prefix.startswith("deepseek-")],
+              "kimi": [prefix for prefix in model_prefixes if prefix.startswith("kimi-")],
+              "qwen": [prefix for prefix in model_prefixes if prefix.startswith("qwen")],
+              "all": model_prefixes,
           }
+
+          def parse_prefix_list(raw: str) -> list:
+              return [token.strip() for token in re.split(r"[,\n;]+", raw) if token.strip()]
 
           def fetch_run_created_at() -> datetime:
               api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
@@ -621,9 +527,76 @@ jobs:
                       f"Weekend schedule in Beijing ({beijing_dt.date()}); no benchmark group configured."
                   )
           else:
-              selected = [
-                  model for model in models if manual_toggles.get(model["prefix"], False)
+              custom_raw = os.environ.get("CUSTOM_MODEL_PREFIXES", "")
+              preset = os.environ.get("MODEL_PRESET", "smoke").strip().lower()
+              if custom_raw.strip():
+                  requested_prefixes = parse_prefix_list(custom_raw)
+                  selected_group = "manual-custom"
+              else:
+                  if preset not in model_presets:
+                      print(
+                          f"Unsupported model_preset '{preset}'. Supported values: {', '.join(sorted(model_presets))}.",
+                          file=sys.stderr,
+                      )
+                      sys.exit(1)
+                  requested_prefixes = model_presets[preset]
+                  selected_group = f"manual-preset-{preset}"
+
+              if not requested_prefixes:
+                  print(
+                      "No model prefixes were selected. Set model_preset or provide custom_model_prefixes.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              unknown_prefixes = [prefix for prefix in requested_prefixes if prefix not in model_by_prefix]
+              if unknown_prefixes:
+                  print(
+                      "Unknown model prefixes in custom_model_prefixes: "
+                      + ", ".join(unknown_prefixes)
+                      + ". Available prefixes: "
+                      + ", ".join(model_prefixes),
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              selected = []
+              seen_prefixes = set()
+              for prefix in requested_prefixes:
+                  if prefix in seen_prefixes:
+                      continue
+                  seen_prefixes.add(prefix)
+                  selected.append(model_by_prefix[prefix])
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_path:
+              lines = [
+                  "### Selected OOT models",
+                  f"- Selection mode: `{selected_group or 'manual'}`",
+                  "",
+                  "| Display | Prefix | TP | Runner |",
+                  "|---|---|---:|---|",
               ]
+              for model in selected:
+                  tp_match = re.search(
+                      r"--tensor-parallel-size\\s+(\\d+)",
+                      model.get("extra_args", ""),
+                  )
+                  tensor_parallel_size = tp_match.group(1) if tp_match else "-"
+                  lines.append(
+                      "| "
+                      + str(model.get("display", ""))
+                      + " | "
+                      + str(model.get("prefix", ""))
+                      + " | "
+                      + str(tensor_parallel_size)
+                      + " | "
+                      + str(model.get("runner", ""))
+                      + " |"
+                  )
+              lines.append("")
+              with Path(summary_path).open("a", encoding="utf-8") as summary_file:
+                  summary_file.write("\n".join(lines))
 
           print(f"models_json={json.dumps(selected, separators=(',', ':'))}")
           print(f"selected_group={selected_group}")
@@ -633,7 +606,7 @@ jobs:
       - name: Print selected models
         run: |
           if [ -n "${{ steps.load.outputs.selected_group }}" ]; then
-            echo "Scheduled nightly benchmark group: ${{ steps.load.outputs.selected_group }}"
+            echo "Model selection mode: ${{ steps.load.outputs.selected_group }}"
           fi
           echo "Selected models: ${{ steps.load.outputs.models_json }}"
 
@@ -893,41 +866,7 @@ jobs:
       - name: Check if model is enabled
         id: check
         run: |
-          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          case "${{ matrix.model.prefix }}" in
-            deepseek-r1-fp8-met) echo "enabled=${{ inputs.deepseek-r1-fp8-met }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-mxfp4-met) echo "enabled=${{ inputs.deepseek-r1-mxfp4-met }}" >> "$GITHUB_OUTPUT" ;;
-            gpt-oss-120b-met) echo "enabled=${{ inputs.gpt-oss-120b-met }}" >> "$GITHUB_OUTPUT" ;;
-            glm-5-1-fp8-tp8-oob) echo "enabled=${{ inputs.glm-5-1-fp8-tp8-oob }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-thinking-mxfp4-tp4-met) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4-met }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-thinking-mxfp4-tp8-met) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8-met }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k25-mxfp4-tp4-met) echo "enabled=${{ inputs.kimi-k25-mxfp4-tp4-met }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-oob) echo "enabled=${{ inputs.qwen3-5-397b-a17b-oob }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8-tp4-oob) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp4-oob }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8-oob) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-oob }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-tp1-met) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1-met }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-tp4-met) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4-met }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-aw-tp1) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp1 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-aw-tp2) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp2 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-aw-tp4) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-v3-2-fp8-aw-tp4) echo "enabled=${{ inputs.deepseek-v3-2-fp8-aw-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-v3-2-fp8-aw-tp8) echo "enabled=${{ inputs.deepseek-v3-2-fp8-aw-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            glm-4-7-fp8-aw-tp4) echo "enabled=${{ inputs.glm-4-7-fp8-aw-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            glm-4-7-fp8-aw-tp8) echo "enabled=${{ inputs.glm-4-7-fp8-aw-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            gpt-oss-120b-aw-tp1) echo "enabled=${{ inputs.gpt-oss-120b-aw-tp1 }}" >> "$GITHUB_OUTPUT" ;;
-            gpt-oss-120b-aw-tp2) echo "enabled=${{ inputs.gpt-oss-120b-aw-tp2 }}" >> "$GITHUB_OUTPUT" ;;
-            gpt-oss-120b-aw-tp8) echo "enabled=${{ inputs.gpt-oss-120b-aw-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-5-mxfp4-aw-tp4) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-aw-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-5-mxfp4-aw-tp8) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-aw-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            minimax-m2-5-aw-tp2) echo "enabled=${{ inputs.minimax-m2-5-aw-tp2 }}" >> "$GITHUB_OUTPUT" ;;
-            minimax-m2-5-aw-tp4) echo "enabled=${{ inputs.minimax-m2-5-aw-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            minimax-m2-5-aw-tp8) echo "enabled=${{ inputs.minimax-m2-5-aw-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
-          esac
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Clean up containers and workspace
         if: steps.check.outputs.enabled == 'true'
