@@ -20,10 +20,6 @@ from atom.plugin.vllm.attention.metadata import (
     AiterMLACommonPrefillMetadataForPluginMode,
     AiterMLADecodeMetadataForPluginMode,
 )
-from atom.plugin.vllm.attention_backend.mla_sparse import (
-    AiterMLASparseIndexerMetadataBuilder,
-    AiterMLASparseMetadataBuilder,
-)
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
@@ -1134,6 +1130,10 @@ class AiterSparseMlaBackendForVllm(AiterMlaBackendForVllm):
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLASparseMetadataBuilder"]:
+        from atom.plugin.vllm.attention_backend.mla_sparse import (
+            AiterMLASparseMetadataBuilder,
+        )
+
         return AiterMLASparseMetadataBuilder
 
     @classmethod
@@ -1156,6 +1156,10 @@ class AiterSparseMlaIndexerBackendForVllm(AiterMlaBackendForVllm):
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLASparseIndexerMetadataBuilder"]:
+        from atom.plugin.vllm.attention_backend.mla_sparse import (
+            AiterMLASparseIndexerMetadataBuilder,
+        )
+
         return AiterMLASparseIndexerMetadataBuilder
 
     @classmethod
