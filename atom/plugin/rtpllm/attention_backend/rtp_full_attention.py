@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 try:
@@ -234,7 +234,6 @@ def _write_kv_cache_with_rtp_fused_kernel(
     num_kv_heads: int,
     head_dim: int,
     layer: int | None = None,
-    dump_meta: dict[str, object] | None = None,
 ) -> bool:
     if os.getenv("ATOM_RTP_USE_RTP_FUSED_KV_WRITE", "0") != "1":
         return False
@@ -370,7 +369,6 @@ def _run_nonasm_paged_attention(
     seq_lens: torch.Tensor,
     block_tables: torch.Tensor,
     layer_num: int,
-    dump_meta: dict[str, Any],
 ) -> torch.Tensor:
     import aiter
 
@@ -448,7 +446,7 @@ def _run_nonasm_paged_attention(
     return output
 
 
-class RTPAttention(BaseAttention):
+class RTPFullAttention(BaseAttention):
     """RTP-style full attention adapter for rtpllm plugin mode."""
 
     def __init__(
@@ -515,11 +513,6 @@ class RTPAttention(BaseAttention):
         k = key.view(-1, self.num_kv_heads, self.head_dim)
         v = value.view(-1, self.num_kv_heads, self.head_dim)
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
-        dump_meta = {"is_prefill": is_prefill}
-        cu_seqlens_tag = (
-            "full_attn/cu_seqlens_prefill" if is_prefill else "full_attn/cu_seqlens_decode"
-        )
-
         raw = getattr(layer_cache, "kv_cache_base", None)
         if raw is None:
             raise ValueError(
@@ -597,7 +590,6 @@ class RTPAttention(BaseAttention):
             num_kv_heads=int(k.shape[1]),
             head_dim=self.head_dim,
             layer=int(self.layer_num),
-            dump_meta=dump_meta,
         )
         if not used_fused_write:
             _write_kv_cache_from_slot_mapping(
@@ -679,7 +671,6 @@ class RTPAttention(BaseAttention):
             seq_lens=seq_lens[:num_seqs],
             block_tables=block_tables[:num_seqs],
             layer_num=int(self.layer_num),
-            dump_meta=dump_meta,
         )
         output = output.view(num_seqs, -1)
         return output
@@ -695,7 +686,7 @@ class RTPAttention(BaseAttention):
     ) -> torch.Tensor:
         del q_scale
         if not is_plugin_mode() or not is_rtpllm():
-            raise NotImplementedError("RTPAttention is only supported in rtpllm plugin mode.")
+            raise NotImplementedError("RTPFullAttention is only supported in rtpllm plugin mode.")
         return self._forward_impl_plugin_mode(
             query=query,
             key=key,
@@ -704,3 +695,5 @@ class RTPAttention(BaseAttention):
             **kwargs,
         )
 
+
+RTPAttention = RTPFullAttention
