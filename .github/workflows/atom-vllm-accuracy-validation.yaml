@@ -286,7 +286,8 @@ jobs:
                   "model_name": "gpt-oss-120b TP1",
                   "model_path": "openai/gpt-oss-120b",
                   "extra_args": "--tensor-parallel-size 1",
-                  "accuracy_test_threshold": 0.38,
+                  "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
+                  "accuracy_test_threshold": 0.88,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-1",
               },
@@ -295,7 +296,8 @@ jobs:
                   "model_name": "gpt-oss-120b TP2",
                   "model_path": "openai/gpt-oss-120b",
                   "extra_args": "--tensor-parallel-size 2",
-                  "accuracy_test_threshold": 0.38,
+                  "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
+                  "accuracy_test_threshold": 0.88,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-4",
               },
@@ -600,6 +602,7 @@ jobs:
           OOT_MODEL_NAME: ${{ matrix.model_name }}
           OOT_MODEL_PATH: ${{ matrix.model_path }}
           OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
+          OOT_CLIENT_COMMAND: ${{ matrix.client_command || '' }}
           OOT_ENV_VARS: ${{ matrix.env_vars }}
           LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
           MAX_WAIT_RETRIES: "120"
@@ -609,6 +612,7 @@ jobs:
             -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e OOT_CLIENT_COMMAND="${OOT_CLIENT_COMMAND}" \
             -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
             -e OOT_DOCKER_IMAGE="${OOT_IMAGE_TAG}" \
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \

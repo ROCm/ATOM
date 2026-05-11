@@ -51,6 +51,7 @@ class EngineArgs:
     method: Optional[str] = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
+    draft_model: Optional[str] = None
     mark_trace: bool = False
 
     @staticmethod
@@ -114,7 +115,7 @@ class EngineArgs:
         parser.add_argument(
             "--cudagraph-capture-sizes",
             type=str,
-            default="[1,2,4,8,16,32,48,64,128,256]",
+            default="[1,2,4,8,16,32,48,64,128,256,512]",
             help="Sizes to capture cudagraph. Example: [1,2,4,8,16]",
         )
         parser.add_argument(
@@ -163,7 +164,7 @@ class EngineArgs:
             "--method",
             type=str,
             default=None,
-            choices=["mtp"],
+            choices=["mtp", "eagle3"],
             help="Speculative method",
         )
         parser.add_argument(
@@ -171,6 +172,12 @@ class EngineArgs:
             type=int,
             default=1,
             help="Number of speculative tokens to generate per iteration (draft model runs this many times autoregressively)",
+        )
+        parser.add_argument(
+            "--draft-model",
+            type=str,
+            default=None,
+            help="Path to external Eagle3 draft model. Required when --method eagle3.",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -243,14 +250,25 @@ class EngineArgs:
             ),
         )
         if self.method and self.num_speculative_tokens > 0:
-            kwargs["speculative_config"] = SpeculativeConfig(
-                method=kwargs.pop("method"),
-                model=self.model,
-                num_speculative_tokens=kwargs.pop("num_speculative_tokens"),
-            )
+            method = kwargs.pop("method")
+            num_spec_tokens = kwargs.pop("num_speculative_tokens")
+            draft_model = kwargs.pop("draft_model")
+            if method == "eagle3":
+                kwargs["speculative_config"] = SpeculativeConfig(
+                    method=method,
+                    model=draft_model,
+                    num_speculative_tokens=num_spec_tokens,
+                )
+            else:
+                kwargs["speculative_config"] = SpeculativeConfig(
+                    method=method,
+                    model=self.model,
+                    num_speculative_tokens=num_spec_tokens,
+                )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
+            kwargs.pop("draft_model")
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode

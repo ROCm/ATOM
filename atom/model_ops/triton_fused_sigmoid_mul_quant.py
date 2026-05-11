@@ -120,6 +120,7 @@ def fused_sigmoid_mul_fp8_quant(
     attn_output: Tensor,
     gate: Tensor,
     group_size: int = 128,
+    transpose_scale: bool | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Fused sigmoid(gate) * attn_output + FP8 per-group quantization.
 
@@ -127,13 +128,20 @@ def fused_sigmoid_mul_fp8_quant(
         attn_output: [M, N] bf16/fp16 — attention output tensor.
         gate: [M, N] bf16/fp16 — gating tensor (pre-sigmoid).
         group_size: Quantization group size (default 128, matching per_1x128).
+        transpose_scale: If True, produce column-major x_scale (for preshuffle GEMM).
+                         If False, produce row-major x_scale (for non-preshuffle GEMM).
+                         If None (default), follows ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE env var.
 
     Returns:
         (x_fp8, x_scale):
             x_fp8: [M, N] FP8 — quantized sigmoid(gate) * attn_output.
-            x_scale: [M, N // group_size] float32 — per-group scales in
-                     transpose_scale layout (column-major storage).
+            x_scale: [M, N // group_size] float32 — per-group scales.
     """
+    if transpose_scale is None:
+        from atom.utils import envs
+
+        transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+
     M, N = attn_output.shape
     assert (
         N % group_size == 0
@@ -144,11 +152,21 @@ def fused_sigmoid_mul_fp8_quant(
     out_fp8 = torch.empty((M, N), dtype=fp8_dtype, device=attn_output.device)
     num_scale_cols = N // group_size
 
-    # transpose_scale layout: allocate as (num_scale_cols, M) contiguous,
-    # then view as (M, num_scale_cols) after kernel
-    out_scale = torch.empty(
-        (num_scale_cols, M), dtype=torch.float32, device=attn_output.device
-    )
+    if transpose_scale:
+        # column-major: allocate as (num_scale_cols, M) contiguous,
+        # then view as (M, num_scale_cols) after kernel
+        out_scale = torch.empty(
+            (num_scale_cols, M), dtype=torch.float32, device=attn_output.device
+        )
+        stride_scale_m = out_scale.stride(1)
+        stride_scale_n = out_scale.stride(0)
+    else:
+        # row-major: allocate as (M, num_scale_cols) contiguous
+        out_scale = torch.empty(
+            (M, num_scale_cols), dtype=torch.float32, device=attn_output.device
+        )
+        stride_scale_m = out_scale.stride(0)
+        stride_scale_n = out_scale.stride(1)
 
     grid = (M, N // BLOCK_SIZE_N)
     _fused_sigmoid_mul_fp8_group_quant_kernel[grid](
@@ -162,9 +180,8 @@ def fused_sigmoid_mul_fp8_quant(
         gate.stride(1),
         out_fp8.stride(0),
         out_fp8.stride(1),
-        # transpose_scale: swap strides so kernel writes in column-major
-        out_scale.stride(1),  # stride_scale_m = stride along dim 1 (M dim)
-        out_scale.stride(0),  # stride_scale_n = stride along dim 0 (scale_col dim)
+        stride_scale_m,
+        stride_scale_n,
         N=N,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         QUANT_BLOCK_SIZE=group_size,
@@ -172,7 +189,8 @@ def fused_sigmoid_mul_fp8_quant(
         FP8_MIN=DTYPE_MIN,
     )
 
-    # View transposed buffer back to (M, num_scale_cols) shape
-    out_scale = out_scale.view(M, num_scale_cols)
+    if transpose_scale:
+        # View transposed buffer back to (M, num_scale_cols) shape
+        out_scale = out_scale.view(M, num_scale_cols)
 
     return out_fp8, out_scale

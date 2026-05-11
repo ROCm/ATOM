@@ -48,6 +48,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    stride_a_token,
+    stride_b_token,
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
@@ -87,13 +89,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     p_A_log = A_log + i_hv
     if not IS_KDA:
-        p_a = a + bos * HV + i_hv
+        p_a = a + bos * stride_a_token + i_hv
         p_dt_bias = dt_bias + i_hv
     else:
         p_a = a + (bos * HV + i_hv) * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
 
-    p_b = b + bos * HV + i_hv
+    p_b = b + bos * stride_b_token + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
@@ -175,8 +177,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_k += H * K
         p_o += HV * V
         p_v += HV * V
-        p_b += HV
-        p_a += HV
+        p_b += stride_b_token
+        p_a += stride_a_token
 
 
 def fused_sigmoid_gating_delta_rule_update(
@@ -246,8 +248,8 @@ def fused_sigmoid_gating_delta_rule_update(
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
-        a=a.contiguous(),
-        b=b.contiguous(),
+        a=a,
+        b=b,
         dt_bias=dt_bias,
         beta=beta,
         threshold=threshold,
@@ -270,6 +272,8 @@ def fused_sigmoid_gating_delta_rule_update(
         V=V,
         BK=BK,
         BV=BV,
+        stride_a_token=a.stride(-2),
+        stride_b_token=b.stride(-2),
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
