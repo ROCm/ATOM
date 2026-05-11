@@ -607,11 +607,14 @@ jobs:
           PY
 
       - name: Print selected models
+        env:
+          SELECTED_GROUP: ${{ steps.load.outputs.selected_group }}
+          SELECTED_MODELS_JSON: ${{ steps.load.outputs.models_json }}
         run: |
-          if [ -n "${{ steps.load.outputs.selected_group }}" ]; then
-            echo "Model selection mode: ${{ steps.load.outputs.selected_group }}"
+          if [ -n "${SELECTED_GROUP}" ]; then
+            echo "Model selection mode: ${SELECTED_GROUP}"
           fi
-          echo "Selected models: ${{ steps.load.outputs.models_json }}"
+          printf 'Selected models: %s\n' "${SELECTED_MODELS_JSON}"
 
   build-benchmark-matrix:
     name: Build OOT benchmark matrix
