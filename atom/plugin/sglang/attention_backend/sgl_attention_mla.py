@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 import torch
 from aiter import dtypes
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size, get_tp_group
-from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mla import (
     dynamic_per_batched_tensor_quant,
@@ -117,6 +116,11 @@ def _unwrap_linear_output(output: Any) -> torch.Tensor:
     return output
 
 
+def _linear_quant_type_value(linear: Any) -> Optional[int]:
+    quant_type = getattr(linear, "quant_type", None)
+    return None if quant_type is None else getattr(quant_type, "value", quant_type)
+
+
 def _fuse_qk_rmsnorm_and_q_quant(
     attn: DeepseekV2MLAAttention,
     q: torch.Tensor,
@@ -139,6 +143,7 @@ def _fuse_qk_rmsnorm_and_q_quant(
         shuffle=False,
         scale_shuffle_padding=False,
         group_size=128,
+        quant_type=attn.qknorm_quant_type,
         output_unquantized_inp1=output_unquantized_q,
         transpose_scale=True,
     )
@@ -681,16 +686,19 @@ def forward_sgl_mha_prepare(
             )
 
         if _use_aiter_gfx95 and attn.q_b_proj.weight.dtype == torch.float8_e4m3fn:
-            (q, q_scale), _, _, _ = fused_rms_fp8_group_quant(
+            from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
+
+            (q, q_scale), _, _, _ = _fuse_rmsnorm_quant(
                 q,
                 attn.q_a_layernorm.weight,
                 attn.q_a_layernorm.eps,
                 None,
                 None,
                 None,
-                group_size=128,
-                dtype_quant=torch.float8_e4m3fn,
                 res1=None,
+                dtype_quant=torch.float8_e4m3fn,
+                group_size=128,
+                quant_type=attn.qknorm_quant_type,
                 output_unquantized_inp1=False,
                 transpose_scale=True,
             )
@@ -715,16 +723,19 @@ def forward_sgl_mha_prepare(
     latent_cache = latent_cache.unsqueeze(1)
 
     if _use_aiter_gfx95 and attn.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-        (kv_a_quanted, kv_a_quanted_scale), kv_a, _, _ = fused_rms_fp8_group_quant(
+        from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
+
+        (kv_a_quanted, kv_a_quanted_scale), kv_a, _, _ = _fuse_rmsnorm_quant(
             kv_a,
             attn.kv_a_layernorm.weight,
             attn.kv_a_layernorm.eps,
             None,
             None,
             None,
-            group_size=128,
-            dtype_quant=torch.float8_e4m3fn,
             res1=None,
+            dtype_quant=torch.float8_e4m3fn,
+            group_size=128,
+            quant_type=_linear_quant_type_value(attn.kv_b_proj),
             output_unquantized_inp1=True,
             transpose_scale=True,
         )
