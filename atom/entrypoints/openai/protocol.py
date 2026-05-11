@@ -48,6 +48,15 @@ class ChatMessage(BaseModel):
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
 
+    def has_image_content(self) -> bool:
+        """Check if this message contains image parts."""
+        if not isinstance(self.content, list):
+            return False
+        return any(
+            isinstance(p, dict) and p.get("type") in ("image_url", "image")
+            for p in self.content
+        )
+
     def to_template_dict(self) -> Dict[str, Any]:
         """Convert to dict for chat template, preserving tool-related fields.
 
@@ -56,6 +65,23 @@ class ChatMessage(BaseModel):
         """
         d: Dict[str, Any] = {"role": self.role, "content": self.get_content_text()}
         # Preserve extra fields needed by chat templates (e.g. Kimi-K2)
+        extras = self.model_extra or {}
+        for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
+            if key in extras:
+                d[key] = extras[key]
+        return d
+
+    def to_template_dict_multimodal(self) -> Dict[str, Any]:
+        """Convert to dict for multimodal chat template.
+
+        Preserves the full content list (including image parts) so that
+        AutoProcessor.apply_chat_template can insert image placeholders.
+        """
+        d: Dict[str, Any] = {"role": self.role}
+        if isinstance(self.content, list):
+            d["content"] = self.content
+        else:
+            d["content"] = self.get_content_text()
         extras = self.model_extra or {}
         for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
             if key in extras:

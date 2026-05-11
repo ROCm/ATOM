@@ -325,6 +325,8 @@ class GatedDeltaNet(nn.Module):
 
         # 2.2: Process the remaining part
         if gdn_metadata.num_prefills > 0:
+            # currently not support kvcache dtype fp8
+            # initial_state = ssm_state[non_spec_state_indices_tensor].contiguous().to(torch.bfloat16)
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
             (

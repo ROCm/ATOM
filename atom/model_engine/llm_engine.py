@@ -80,6 +80,7 @@ class LLMEngine:
         prompt_or_tokens_list: List[Union[str, List[int]]],
         sampling_params_list: SamplingParams | List[SamplingParams],
         stream_callback=None,
+        multimodal_data_list: List[dict] | None = None,
     ):
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
@@ -106,12 +107,29 @@ class LLMEngine:
         else:
             stream_callback_iter = itertools.repeat(None)
 
+        # Handle multimodal data
+        if multimodal_data_list is not None:
+            if len(multimodal_data_list) != len(prompt_or_tokens_list):
+                raise ValueError(
+                    f"number of elements in prompt_or_tokens_list and multimodal_data_list is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(multimodal_data_list)=}"
+                )
+            mm_data_iter = multimodal_data_list
+        else:
+            mm_data_iter = itertools.repeat(None)
+
         reqs = []
-        for prompt, sampling_param, callback in zip(
-            prompt_or_tokens_list, sampling_params_iter, stream_callback_iter
+        for prompt, sampling_param, callback, mm_data in zip(
+            prompt_or_tokens_list,
+            sampling_params_iter,
+            stream_callback_iter,
+            mm_data_iter,
         ):
             req = self.io_processor.preprocess(
-                prompt, sampling_param, stream_callback=callback
+                prompt,
+                sampling_param,
+                stream_callback=callback,
+                multimodal_data=mm_data,
             )
             reqs.append(req)
         self.core_mgr.add_request(reqs)
@@ -133,6 +151,30 @@ class LLMEngine:
         self.core_mgr._rr_counter = 0
 
         self.add_request(prompts, sampling_params)
+        outputs = {}
+        while not self.is_finished() and (
+            self.core_mgr.is_alive() or self.core_mgr.is_rest()
+        ):
+            seqs = self.step()
+            outs = self.io_processor.postprocess(seqs)
+            outputs.update(outs)
+
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
+        return outputs
+
+    def generate_multimodal(
+        self,
+        token_ids_list: list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        multimodal_data_list: list[dict],
+    ) -> list[dict]:
+        """Generate completions for multimodal inputs (token IDs + vision data)."""
+        self.core_mgr._rr_counter = 0
+        self.add_request(
+            token_ids_list,
+            sampling_params,
+            multimodal_data_list=multimodal_data_list,
+        )
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -204,6 +246,7 @@ class InputOutputProcessor:
         sampling_params: SamplingParams,
         stream_callback=None,
         kv_transfer_params=None,
+        multimodal_data=None,
     ):
         """responsible for:
         1) Tokenize
@@ -223,6 +266,7 @@ class InputOutputProcessor:
             sampling_params,
             stream_callback=stream_callback,
             kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
         )
         return seqs[0]
 
@@ -234,6 +278,7 @@ class InputOutputProcessor:
         stream_callbacks: Optional[List] = None,
         kv_transfer_params=None,
         parent_request_id: Optional[str] = None,
+        multimodal_data=None,
     ) -> List[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -293,6 +338,8 @@ class InputOutputProcessor:
                 needs_independent_noise=(n > 1),
                 parent_request_id=parent_request_id,
                 sibling_index=i,
+                mamba_enabled=self.mamba_enabled,
+                multimodal_data=multimodal_data,
             )
             seq.arrive_time = time.time()
             self.requests[seq.id] = seq

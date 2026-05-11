@@ -55,7 +55,7 @@ def create_chat_chunk(
 async def stream_chat_response(
     request_id: str,
     model: str,
-    prompt: str,
+    prompt: str | list[int],
     stream_queue: asyncio.Queue,
     seq_id: int,
     tokenizer,
@@ -68,7 +68,7 @@ async def stream_chat_response(
     - content deltas for the answer
     - tool_calls deltas when model invokes tools
     """
-    num_tokens_input = len(tokenizer.encode(prompt))
+    num_tokens_input = len(prompt) if isinstance(prompt, list) else len(tokenizer.encode(prompt))
     num_tokens_output = 0
     reasoning_filter = ReasoningFilter()
     tool_parser = ToolCallStreamParser()

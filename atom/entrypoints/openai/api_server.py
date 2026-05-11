@@ -64,6 +64,7 @@ DEFAULT_PORT = 8000
 
 engine = None
 tokenizer: Optional[AutoTokenizer] = None
+processor = None  # AutoProcessor for multimodal models
 model_name: str = ""
 default_chat_template_kwargs: Dict[str, Any] = {}
 _stream_queues: Dict[str, asyncio.Queue] = {}
@@ -208,10 +209,11 @@ def _send_stream_chunk_tagged(
 
 
 async def generate_async(
-    prompt: str,
+    prompt: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    multimodal_data: dict | None = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
     global engine, tokenizer
@@ -249,6 +251,7 @@ async def generate_async(
             sampling_params,
             stream_callback=completion_callback,
             kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -413,10 +416,11 @@ def validate_model(requested_model: Optional[str]) -> None:
 
 
 async def setup_streaming_request(
-    prompt: str,
+    prompt: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    multimodal_data: dict | None = None,
 ) -> Tuple[int, asyncio.Queue]:
     """Set up a streaming request with the engine."""
     global engine, _stream_queues, _seq_id_to_request_id
@@ -439,6 +443,7 @@ async def setup_streaming_request(
             sampling_params,
             stream_callback=stream_callback,
             kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -574,13 +579,62 @@ async def general_error_handler(request: Request, exc: Exception):
     )
 
 
+# ---- Multimodal helpers ----
+def _decode_base64_image(data_url: str):
+    """Decode a base64 data URL to a PIL Image."""
+    import base64
+    import binascii
+    import io
+    from PIL import Image
+
+    if "," not in data_url:
+        raise ValueError("Invalid data URL: missing comma separator")
+    _, data = data_url.split(",", 1)
+    try:
+        img_bytes = base64.b64decode(data)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"Invalid base64 image data: {e}")
+    return Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+
+def _extract_images(messages) -> list:
+    """Extract PIL images from OpenAI-format multimodal messages.
+
+    Only base64 data URLs are supported. Local file paths and HTTP URLs
+    are rejected to prevent path traversal attacks.
+    """
+    images = []
+    for msg in messages:
+        if not isinstance(msg.content, list):
+            continue
+        for part in msg.content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image_url":
+                url = part["image_url"]["url"]
+                if not url.startswith("data:"):
+                    raise ValueError(
+                        "Only base64 data URLs are supported for image_url. "
+                        "Provide images as data:image/...;base64,<data>"
+                    )
+                images.append(_decode_base64_image(url))
+            elif part.get("type") == "image":
+                src = part.get("image")
+                if isinstance(src, str) and src.startswith("data:"):
+                    images.append(_decode_base64_image(src))
+                elif isinstance(src, str):
+                    raise ValueError(
+                        "Only base64 data URLs are supported for image content. "
+                        "Provide images as data:image/...;base64,<data>"
+                    )
+    return images
 # ---- Endpoints ----
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     """Handle chat completion requests (OpenAI-compatible)."""
-    global engine, tokenizer, model_name
+    global engine, tokenizer, model_name, processor
 
     validate_model(request.model)
 
@@ -596,10 +650,31 @@ async def chat_completions(request: ChatCompletionRequest):
         if request.tools:
             merged_kwargs["tools"] = request.tools
 
-        prompt = tokenizer.apply_chat_template(
-            [msg.to_template_dict() for msg in messages],
-            **merged_kwargs,
+        # Detect multimodal content
+        has_images = processor is not None and any(
+            msg.has_image_content() for msg in messages
         )
+
+        multimodal_data = None
+        if has_images:
+            images = _extract_images(messages)
+            if not images:
+                raise ValueError("Request contains image content but no valid images were found")
+            template_dicts = [msg.to_template_dict_multimodal() for msg in messages]
+            text = processor.apply_chat_template(
+                template_dicts, **merged_kwargs
+            )
+            inputs = processor(text=[text], images=images, return_tensors="pt")
+            prompt = inputs["input_ids"][0].tolist()
+            multimodal_data = {
+                "pixel_values": inputs["pixel_values"],
+                "image_grid_thw": inputs["image_grid_thw"],
+            }
+        else:
+            prompt = tokenizer.apply_chat_template(
+                [msg.to_template_dict() for msg in messages],
+                **merged_kwargs,
+            )
 
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
@@ -633,7 +708,8 @@ async def chat_completions(request: ChatCompletionRequest):
                 )
             else:
                 seq_id, stream_queue = await setup_streaming_request(
-                    prompt, sampling_params, request_id
+                    prompt, sampling_params, request_id,
+                    multimodal_data=multimodal_data,
                 )
                 gen = stream_chat_response(
                     request_id,
@@ -657,7 +733,10 @@ async def chat_completions(request: ChatCompletionRequest):
             resp = build_chat_response_multi(request_id, model_name, outputs)
         else:
             final_output = None
-            async for output in generate_async(prompt, sampling_params, request_id):
+            async for output in generate_async(
+                prompt, sampling_params, request_id,
+                multimodal_data=multimodal_data,
+            ):
                 final_output = output
             if final_output is None:
                 raise RuntimeError("No output generated")
@@ -824,7 +903,7 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
+    global engine, tokenizer, processor, model_name, default_chat_template_kwargs, _request_logger
 
     parser = argparse.ArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -869,6 +948,16 @@ def main():
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
     model_name = args.model
+
+    # Load multimodal processor if the model supports vision
+    from atom.config import get_hf_config
+    hf_config = get_hf_config(args.model, trust_remote_code=args.trust_remote_code)
+    if getattr(hf_config, "_multimodal_config", None) is not None:
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(
+            args.model, trust_remote_code=args.trust_remote_code
+        )
+        logger.info("Multimodal processor loaded")
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)

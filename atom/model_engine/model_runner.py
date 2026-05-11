@@ -1690,7 +1690,38 @@ class ModelRunner:
                 label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
             label += "]"
             with record_function(label):
-                model_output = self.model(input_ids, positions)
+                # Handle multimodal prefill: compute vision embeddings and merge
+                inputs_embeds = None
+                if (
+                    is_prefill
+                    and hasattr(self.model, "get_vision_embeddings")
+                    and batch is not None
+                    and hasattr(batch, "multimodal_data")
+                    and batch.multimodal_data
+                ):
+                    mm_data = next(iter(batch.multimodal_data.values()))
+                    pixel_values = mm_data["pixel_values"].to(
+                        device=self.device, dtype=self.config.torch_dtype
+                    )
+                    grid_thw = mm_data["image_grid_thw"].to(device=self.device)
+                    vision_embeds = self.model.get_vision_embeddings(
+                        pixel_values, grid_thw
+                    )
+                    text_embeds = self.model.embed_input_ids(input_ids)
+                    image_token_count = (input_ids == self.model.image_token_id).sum().item()
+                    if image_token_count != vision_embeds.shape[0]:
+                        raise RuntimeError(
+                            f"Image token count ({image_token_count}) does not match "
+                            f"vision embeddings ({vision_embeds.shape[0]}). "
+                            f"Check that the processor and model use the same image_token_id."
+                        )
+                    inputs_embeds = self.model.merge_multimodal_embeddings(
+                        input_ids, text_embeds, vision_embeds
+                    )
+
+                model_output = self.model(
+                    input_ids, positions, inputs_embeds=inputs_embeds
+                )
                 if self.use_aux_hidden_state_outputs:
                     hidden_states, self._aux_hidden_states = model_output
                 else:

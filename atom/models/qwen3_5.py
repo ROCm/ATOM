@@ -561,14 +561,9 @@ class Qwen3_5MoeForConditionalGenerationTextOnly(
         )
 
     def detect_fused_expert_format(self, weight_name: str) -> bool:
-        """Detect if weight is from fused expert checkpoint (BF16 format)."""
-        # Qwen3.5 BF16 has: experts.gate_up_proj, experts.down_proj
-        # Qwen3.5 FP8 has: experts.0.gate_proj, experts.0.up_proj, experts.0.down_proj
         return detect_fused_expert_format(weight_name)
 
     def get_fused_expert_mapping(self) -> list[tuple[str, str, str]]:
-        """Return mapping for fused expert weights (BF16 format)."""
-        # (param_name, weight_name, shard_id)
         return get_fused_expert_mapping()
 
     def load_fused_expert_weights(
@@ -580,19 +575,6 @@ class Qwen3_5MoeForConditionalGenerationTextOnly(
         shard_id: str,
         num_experts: int,
     ) -> bool:
-        """Load fused expert weights (BF16 format) into per-expert parameters.
-
-        Args:
-            original_name: Original weight name from checkpoint (e.g., "experts.gate_up_proj")
-            name: Mapped parameter name (e.g., "experts.w13_weight")
-            params_dict: Model parameters dict
-            loaded_weight: The weight tensor to load
-            shard_id: Shard identifier ("w1", "w2", "w3")
-            num_experts: Number of experts
-
-        Returns:
-            True if weights were loaded successfully
-        """
         return load_fused_expert_weights(
             original_name,
             name,
@@ -601,6 +583,129 @@ class Qwen3_5MoeForConditionalGenerationTextOnly(
             shard_id,
             num_experts,
         )
+
+
+class Qwen3_5MoeMultimodalModel(nn.Module):
+
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
+        "in_proj_z": ("in_proj_qkvz", 3),
+        "in_proj_b": ("in_proj_ba", 0),
+        "in_proj_a": ("in_proj_ba", 1),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
+    }
+
+    hf_to_atom_mapper = {
+        "model.visual.": "visual.",
+        "lm_head.": "language_model.lm_head.",
+        "model.language_model.": "language_model.model.",
+    }
+
+    quant_exclude_name_mapping = {
+        "model.visual.": "visual.",
+        "lm_head.": "language_model.lm_head.",
+        "model.language_model.": "language_model.model.",
+    }
+
+    def __init__(self, atom_config: Config, prefix: str = ""):
+        super().__init__()
+        from atom.models.qwen3_5_vl import Qwen3VisionTransformer
+
+        multimodal_config = atom_config.multimodal_config
+
+        text_config = atom_config.hf_config.text_config
+        if not hasattr(text_config, "n_shared_experts"):
+            text_config.n_shared_experts = 1
+        if not hasattr(text_config, "n_routed_experts"):
+            text_config.n_routed_experts = text_config.num_experts
+
+        self.visual = Qwen3VisionTransformer(
+            multimodal_config.vision_config,
+            norm_eps=getattr(multimodal_config, "rms_norm_eps", 1e-6),
+        )
+
+        self.language_model = Qwen3_5MoeForCausalLM(
+            atom_config=atom_config,
+            prefix=maybe_prefix("", "language_model"),
+        )
+
+        self.image_token_id = getattr(multimodal_config, "image_token_id", 248056)
+        self.video_token_id = getattr(multimodal_config, "video_token_id", 248057)
+
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    def get_vision_embeddings(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        return self.visual(pixel_values, grid_thw)
+
+    def merge_multimodal_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        vision_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = input_ids == self.image_token_id
+        inputs_embeds = inputs_embeds.clone()
+        inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
+        return inputs_embeds
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.language_model.compute_logits(hidden_states)
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return self.language_model.get_expert_mapping()
+
+    def detect_fused_expert_format(self, weight_name: str) -> bool:
+        return detect_fused_expert_format(weight_name)
+
+    def get_fused_expert_mapping(self) -> list[tuple[str, str, str]]:
+        return get_fused_expert_mapping()
+
+    def load_fused_expert_weights(
+        self,
+        original_name: str,
+        name: str,
+        params_dict: dict,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        num_experts: int,
+    ) -> bool:
+        return load_fused_expert_weights(
+            original_name,
+            name,
+            params_dict,
+            loaded_weight,
+            shard_id,
+            num_experts,
+        )
+
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()

@@ -47,6 +47,8 @@ class Sequence:
         needs_independent_noise: bool = False,
         parent_request_id: Optional[str] = None,
         sibling_index: int = 0,
+        mamba_enabled: bool = False,
+        multimodal_data: Optional[dict] = None,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
@@ -61,6 +63,8 @@ class Sequence:
         # Triggers BlockManager to allocate a per-req cache slot in
         # allocate() / free it in deallocate().
         self.has_per_req_cache = has_per_req_cache
+        self.mamba_enabled = mamba_enabled
+        self.multimodal_data = multimodal_data
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
