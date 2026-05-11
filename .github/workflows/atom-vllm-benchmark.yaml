@@ -1169,6 +1169,7 @@ jobs:
                     --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
                     --max-concurrency \"${CONC}\" \
                     --num-prompts \"$(( CONC * 10 ))\" \
+                    --num-warmups \"$(( 2 * CONC ))\" \
                     --seed 42 \
                     --ignore-eos \
                     ${TRUST_REMOTE_CODE_ARG} \
