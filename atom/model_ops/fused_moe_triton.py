@@ -29,14 +29,26 @@ from aiter.ops.triton.fusions.fused_routing_from_topk import (
 )
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from atom.model_ops.utils import has_triton_kernels
+from aiter.utility.fp4_utils import mxfp4_to_f32, f32_to_mxfp4
 from atom.model_ops.moe_utils import (
     check_and_swizzle_scales,
     quantize,
 )
+from atom.utils import envs
+
 
 logger = logging.getLogger("atom")
 
-
+if envs.ATOM_USE_TRITON_GEMM:
+    from aiter.ops.triton.moe.moe_routing.routing import routing
+    from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+        mxfp4_quant,
+        moe_gemm_a4w4,
+    )
+    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+        moe_gemm_a8w4,
+    )
+    from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 if has_triton_kernels():
     try:
         import triton_kernels.swiglu
@@ -108,34 +120,48 @@ def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1
     # is there any need for layouts or do i just swizzle scales and call it a day
     # weight and scale passed in
     # scrap all the layouts and whatever and just implement swizzle basically
-    #assert has_triton_kernels()
+    assert envs.ATOM_USE_TRITON_GEMM
     #from triton_kernels.numerics import InFlexData
+
+    # this should do two things -- quantize and swizzle. 
+    # 
 
     # x: ()
     # W1: (experts, N, K)
     # W2: (experts, N, K)
     # expected W1 for aiter triton matmul: (experts, N, K)
     # expected W2 for aiter triton matmul: (experts, K, N)
-    w2_triton_layout = w2.transpose(-2, -1)#.contiguous()
+    w2_triton_layout = w2.transpose(-2, -1)
     w2_scale_triton_layout = w2_scale.transpose(-2, -1)
-    # logger.warning("shape")
+
+    # logger.warning("shape and dtype")
     # logger.warning(w1.shape)
+    # logger.warning(w1.dtype)
     # logger.warning(w2.shape)
+    # logger.warning(w2.dtype)
     # logger.warning(w2_triton_layout.shape)
     # logger.warning(N_1)
     # logger.warning(K_1)
     # logger.warning(N_2)
     # logger.warning(K_2)
 
-    assert w1.shape[-1] == w2_triton_layout.shape[-2] # check if w1=(N, K), w2_triton_layout=(K,N), and Ks match
+    # i think this is the problem area. quantizing is taking the atom padding into account
+    # maybe????????????
+    # i think the swizzle perhaps is messing things up
 
     w1, w1_scale = quantize(w1, w_dtype)
     w2_triton_layout, w2_scale_triton_layout = quantize(w2_triton_layout, w_dtype)
-    w1_scale, swizzle_mx_scale1 = check_and_swizzle_scales(w1_scale, K_1 // TP, N_1)
-    w2_scale_triton_layout, swizzle_mx_scale2 = check_and_swizzle_scales(
-        w2_scale_triton_layout, N_2, K_2 // TP // 2
+    # removed for now
+    w1_scale, _ = check_and_swizzle_scales(w1_scale, N_1, K_1 // TP)
+    w2_scale_triton_layout, _ = check_and_swizzle_scales(
+        w2_scale_triton_layout, K_2 // TP // 2, N_2
     )
-
+    # logger.warning("post quant shape")
+    # logger.warning(w1.shape)
+    # logger.warning(w1)
+    # logger.warning(w2.shape)
+    # logger.warning(w2)
+    # logger.warning(w2_triton_layout.shape)
 
     # from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     # from triton_kernels.tensor_details.layout import StridedLayout
@@ -156,7 +182,7 @@ def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1
     #     wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
     # )
     # scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
-    return w1, w1_scale, w2_triton_layout, w2_scale_triton_layout # transferring triton layout for now
+    return w1, w1_scale, w2_triton_layout, w2_scale_triton_layout# transferring triton layout for now
 
 
 def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
@@ -338,17 +364,22 @@ def triton_kernel_moe_forward(
     activation: str = "silu",
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
+    w13_swizzle_layout: torch.Tensor | None = None,
+    w2_swizzle_layout: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
+    x_q_dtype: str | None = None,
+    static_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     routing_data, gather_idx, scatter_idx = routing(
         gating_output, topk, sm_first=not renormalize
     )
 
     output = torch.empty_like(hidden_states)
+
 
     return triton_kernel_fused_experts(
         output,
@@ -362,11 +393,15 @@ def triton_kernel_moe_forward(
         activation=activation,
         w13_scale=w13_scale,
         w2_scale=w2_scale,
+        w13_swizzle_layout=w13_swizzle_layout,
+        w2_swizzle_layout=w2_swizzle_layout,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
         apply_router_weight_on_input=apply_router_weight_on_input,
         global_num_experts=global_num_experts,
         expert_map=expert_map,
+        x_q_dtype=x_q_dtype,
+        static_scale=static_scale
     )
 
 
@@ -383,6 +418,8 @@ def triton_kernel_fused_experts(
     activation: str = "silu",
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
+    w13_swizzle_layout: torch.Tensor | None = None,
+    w2_swizzle_layout: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     swiglu_alpha: float = 1.702,
@@ -392,25 +429,25 @@ def triton_kernel_fused_experts(
     expert_map: torch.Tensor | None = None,
     intermediate_cache: torch.Tensor | None = None,
     a1q_scale: torch.Tensor | None = None,
+    x_q_dtype: str | None = None,
+    static_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
     assert w1_bias is None or w1_bias.dtype == torch.float32
     assert w2_bias is None or w2_bias.dtype == torch.float32
 
+    logger.warning("x_q_dtype")
+    logger.warning(x_q_dtype)
+
     # Shape check, only check non-mxfp4
     assert hidden_states.ndim == 2
-    assert hidden_states.shape[-1] == w1.shape[-2]
-    # logger.warning("shape")
-    # logger.warning(hidden_states.shape)
-    # logger.warning(hidden_states.shape[-2:])
-    # logger.warning(w1.shape)
-    # logger.warning(w2.shape)
-    assert w2.shape[-1] == w1.shape[1]
+    # assert hidden_states.shape[-1] == w1.shape[-2] # flipped to mimic benchmark weights -- #w1.shape[-2]
+    # assert w2.shape[-2] == w1.shape[-1] # flipped to mimic benchmark weights -- both column major
 
     batch_dim = 1
-    M, K = hidden_states.shape[-2:]
-    E, _, N = w1.shape
+    M, K = hidden_states.shape[-2:] # 
+    E, _, N = w1.shape # N = hidden_size // 2?
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -430,7 +467,7 @@ def triton_kernel_fused_experts(
     )
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
-    gammas = routing_data.gate_scal if routing_data else None
+    #gammas = routing_data.gate_scal if routing_data else None
 
     # NOTE: We intentionally do NOT use the triton fused SwiGLU activation
     # because it expects interleaved [gate0, up0, gate1, up1, ...] layout
@@ -445,39 +482,138 @@ def triton_kernel_fused_experts(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+    
 
     with _amd_smem_safe_tile():
         if activation == ActivationType.Swiglu:
             # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
-            x, x_scale = mxfp4_quant(hidden_states)
+            x_q_dtype_base = x_q_dtype.split("_")[0]
+            logger.warning("split")
+            logger.warning(x_q_dtype_base)
+            if (x_q_dtype_base == "fp8"):
+                from aiter.ops.triton.utils._triton.arch_info import get_arch
 
-            raw_intermediate = moe_gemm_a4w4(
-                x,
-                w1, # w1
-                x_scale, # x scale
-                w13_scale, # w1 scale
-                None, # x static scale
-                None, # quant static scale
-                w1_bias,
-                routing_data,
-                gather_indx=gather_indx,
-                swizzle_mx_scale="CDNA4_SCALE", # ?
-                out_dtype=raw_intermediate.dtype,
-                apply_swiglu=True,
-            )
-            x, x_scale = mxfp4_quant(raw_intermediate)
-            output_tensor = moe_gemm_a4w4(
-                x, # intermediate_cache.view(M * topk, half_N)
-                w2, # w2
-                x_scale, # x scales
-                w2_scale, # w2 scale
-                None, # x static scale
-                None, # quant static scale
-                w2_bias, # bias
-                routing_data, # routing data
-                scatter_indx=scatter_indx,
-                swizzle_mx_scale="CDNA4_SCALE", # ?
-            )
+                x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
+
+                if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
+                    x_dtype = torch.float8_e4m3fnuz
+
+                hidden_states = downcast_to_static_fp8(hidden_states, static_scale)
+                logger.warning("hidden states")
+                logger.warning(hidden_states)
+                raw_intermediate = moe_gemm_a8w4(
+                    hidden_states,
+                    w1,
+                    None,
+                    w13_scale,
+                    static_scale,
+                    static_scale,
+                    w1_bias,
+                    routing_data,
+                    gather_indx=gather_indx,
+                    swizzle_mx_scale="CDNA4_SCALE", # TODO assuming it's not None for simplicity's sake for now but should be checked
+                    out_dtype=raw_intermediate.dtype,#x_dtype
+                    apply_swiglu=False,
+                ) 
+            elif (x_q_dtype_base == "mx8"): # basic handling along the lines of mx8 since scale swizzled elsewhere
+                # do not default to mxfp4. quantize to fp8 and run appropriate kernel
+                hidden_states, x_scale = quantize(hidden_states, x_q_dtype_base)
+                raw_intermediate = moe_gemm_a8w4(
+                    hidden_states,
+                    w1,
+                    x_scale,
+                    w13_scale,
+                    None,
+                    None,
+                    w1_bias,
+                    routing_data,
+                    gather_indx=gather_indx,
+                    swizzle_mx_scale="CDNA4_SCALE",
+                    out_dtype=raw_intermediate.dtype,
+                    apply_swiglu=False,
+                ) 
+            else:
+                hidden_states, x_scale = mxfp4_quant(hidden_states)
+                raw_intermediate = moe_gemm_a4w4(
+                    hidden_states,
+                    w1, # w1
+                    x_scale, # x scale
+                    w13_scale, # w1 scale
+                    None, # x static scale
+                    None, # quant static scale
+                    w1_bias,
+                    routing_data,
+                    gather_indx=gather_indx,
+                    swizzle_mx_scale="CDNA4_SCALE", # ?
+                    out_dtype=raw_intermediate.dtype,
+                    apply_swiglu=False,
+                )
+
+            # Standard SiLU/SwiGLU activation: silu(gate) * up
+            # needed for all quant versions
+            raw_2d = raw_intermediate.view(M * topk, N)
+            gate = raw_2d[:, :half_N]
+            up = raw_2d[:, half_N:]
+            intermediate_cache[0] = torch.nn.functional.silu(gate) * up
+
+            # matmul_ogs(
+            #     intermediate_cache.view(M * topk, half_N),
+            #     w2,
+            #     w2_bias,
+            #     routing_data,
+            #     scatter_indx=scatter_indx,
+            #     precision_config=w2_precision_config,
+            #     gammas=None if apply_router_weight_on_input else gammas,
+            #     y=output_tensor,
+            # )
+
+
+            if (x_q_dtype_base == "fp8" or x_q_dtype_base == "mx8"):
+                # do not default to mxfp4
+                logger.warning("second stage")
+                from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+                x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
+
+                if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
+                    x_dtype = torch.float8_e4m3fnuz
+
+                interm_cache = downcast_to_static_fp8(intermediate_cache.view(M * topk, half_N), static_scale)
+                output_tensor = moe_gemm_a8w4(
+                    interm_cache,
+                    w2,
+                    None,
+                    w2_scale,
+                    static_scale,
+                    None,
+                    w2_bias,
+                    routing_data,
+                    scatter_indx=scatter_indx,
+                    swizzle_mx_scale="CDNA4_SCALE", # simplicity
+                )
+                logger.warning("output")
+                logger.warning(output_tensor)
+            else:
+                interm_cache, x_scale = mxfp4_quant(intermediate_cache.view(M * topk, half_N))
+                output_tensor = moe_gemm_a4w4(
+                    interm_cache, # intermediate_cache.view(M * topk, half_N)
+                    w2, # w2
+                    x_scale, # x scales
+                    w2_scale, # w2 scale
+                    None, # x static scale
+                    None, # quant static scale
+                    w2_bias, # bias
+                    routing_data, # routing data
+                    scatter_indx=scatter_indx,
+                    swizzle_mx_scale="CDNA4_SCALE", # ?
+                )
+
+            # logger.warning("output")
+            # logger.warning(output_tensor.shape)
+            # logger.warning(output_tensor.dtype)
+            # logger.warning(output_tensor)
+            # logger.warning(output_tensor.view(M, K))
+
         else:
             # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation
             raw_intermediate = matmul_ogs(
