@@ -14,6 +14,7 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -47,7 +48,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             )
 
         if getattr(config, "use_routing_bias", False):
-            self.e_score_correction_bias = nn.Parameter(
+            self.e_score_correction_bias = atom_parameter(
                 torch.zeros(self.num_experts, dtype=torch.float32)
             )
         else:
@@ -80,9 +81,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         )
         # Match vLLM: gate weights in fp32 for routing precision
         old_wlp = self.gate.weight.weight_loader_process
-        self.gate.weight = nn.Parameter(
-            self.gate.weight.data.to(torch.float32), requires_grad=False
-        )
+        self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
         self.gate.weight.weight_loader_process = old_wlp
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -132,6 +131,7 @@ class MiniMaxM2Attention(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         tp_size = self.tp_size
+        self.layer_num = layer_num
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -202,6 +202,7 @@ class MiniMaxM2Attention(nn.Module):
             layer_num=layer_num,
             use_mla=False,
             rotary_emb=self.rotary_emb,
+            prefix=f"{prefix}.attn",
         )
 
     @staticmethod
@@ -245,7 +246,10 @@ class MiniMaxM2Attention(nn.Module):
                 orig_dtype
             )
 
-        attn_output = self.attn(q, k, v, positions)
+            attn_output = self.attn(
+                query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
+            )
+
         output = self.o_proj(attn_output)
         return output
 
@@ -322,6 +326,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
         hidden_states = self.block_sparse_moe(hidden_states)
 
         return hidden_states, residual

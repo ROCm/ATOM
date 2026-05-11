@@ -180,6 +180,101 @@ def fused_split_chunk_zeros(
 
 
 @triton.jit
+def fused_split_chunk_kernel_qwen3_5_qkvzba(
+    qkvzba_ptr,
+    mixed_qkv_ptr,
+    z_ptr,
+    b_ptr,
+    a_ptr,
+    core_attn_out_ptr,
+    num_tokens,
+    qkv_size: tl.constexpr,
+    z_size: tl.constexpr,
+    head_v_dim: tl.constexpr,
+    num_v_heads_tp: tl.constexpr,
+    total_dim: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    work_id = tl.program_id(1)
+
+    if work_id < num_v_heads_tp:
+        head_id = work_id
+        cols = tl.arange(0, block_size)
+        mask = cols < head_v_dim
+        src = token_id * total_dim + qkv_size + head_id * head_v_dim + cols
+        vals = tl.load(qkvzba_ptr + src, mask=mask, other=0.0)
+        dst = token_id * num_v_heads_tp * head_v_dim + head_id * head_v_dim + cols
+        tl.store(z_ptr + dst, vals, mask=mask)
+        zeros = tl.zeros([block_size], dtype=core_attn_out_ptr.type.element_ty)
+        tl.store(core_attn_out_ptr + dst, zeros, mask=mask)
+    elif work_id == num_v_heads_tp:
+        cols = tl.arange(0, block_size)
+        ba_size = num_v_heads_tp * 2
+        mask = cols < ba_size
+        src = token_id * total_dim + qkv_size + z_size + cols
+        vals = tl.load(qkvzba_ptr + src, mask=mask, other=0.0)
+        b_mask = cols < num_v_heads_tp
+        a_mask = (cols >= num_v_heads_tp) & (cols < ba_size)
+        dst = token_id * num_v_heads_tp
+        tl.store(b_ptr + dst + cols, vals, mask=b_mask)
+        tl.store(a_ptr + dst + (cols - num_v_heads_tp), vals, mask=a_mask)
+    else:
+        chunk_id = work_id - num_v_heads_tp - 1
+        chunk_start = chunk_id * block_size
+        if chunk_start < qkv_size:
+            cols = tl.arange(0, block_size)
+            mask = (chunk_start + cols) < qkv_size
+            src = token_id * total_dim + chunk_start + cols
+            dst = token_id * qkv_size + chunk_start + cols
+            vals = tl.load(qkvzba_ptr + src, mask=mask, other=0.0)
+            tl.store(mixed_qkv_ptr + dst, vals, mask=mask)
+
+
+def fused_split_chunk_zeros_qwen3_5_qkvzba(
+    qkvzba: torch.Tensor,
+    num_k_heads_tp: int,
+    num_v_heads_tp: int,
+    head_k_dim: int,
+    head_v_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
+    qkv_size = 2 * num_k_heads_tp * head_k_dim + num_v_heads_tp * head_v_dim
+    z_size = num_v_heads_tp * head_v_dim
+    total_dim = qkv_size + z_size + num_v_heads_tp * 2
+
+    mixed_qkv = torch.empty(num_tokens, qkv_size, dtype=dtype, device=device)
+    z = torch.empty(num_tokens, num_v_heads_tp, head_v_dim, dtype=dtype, device=device)
+    b = torch.empty(num_tokens, num_v_heads_tp, dtype=dtype, device=device)
+    a = torch.empty(num_tokens, num_v_heads_tp, dtype=dtype, device=device)
+    core_attn_out = torch.empty(
+        num_tokens, num_v_heads_tp, head_v_dim, dtype=dtype, device=device
+    )
+
+    block_size = 128
+    num_qkv_blocks = (qkv_size + block_size - 1) // block_size
+    grid = (num_tokens, num_v_heads_tp + 1 + num_qkv_blocks)
+
+    fused_split_chunk_kernel_qwen3_5_qkvzba[grid](
+        qkvzba,
+        mixed_qkv,
+        z,
+        b,
+        a,
+        core_attn_out,
+        num_tokens,
+        qkv_size,
+        z_size,
+        head_v_dim,
+        num_v_heads_tp,
+        total_dim,
+        block_size,
+    )
+
+    return mixed_qkv, z, b, a, core_attn_out
+
+
+@triton.jit
 def fused_split_chunk_kernel_qwen_next_qkvz_ba(
     qkvz_ptr,  # [num_tokens, (num_k_heads//tp) * (2*head_k_dim + 2*head_v_dim*kv_ratio)]
     ba_ptr,  # [num_tokens, (num_v_heads//tp) * 2]

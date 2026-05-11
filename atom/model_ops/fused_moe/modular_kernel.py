@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
-from atom.utils.dbo.ubatching import dbo_enabled
+from atom.utils.tbo.ubatching import tbo_overlap_enabled
 from atom.utils.forward_context import get_forward_context
 import torch
 from typing import Callable, Optional, final
@@ -99,7 +99,7 @@ class FusedMoEPrepareAndFinalize(ABC):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
-    ) -> None:
+    ) -> torch.Tensor:
         raise NotImplementedError
 
     def finalize_async(
@@ -173,11 +173,10 @@ class FusedMoEModularKernel(torch.nn.Module):
     ]:
         """
         The _prepare method is a wrapper around self.prepare_finalize.prepare
-        that handles DBO and async.
+        that handles TBO and async.
         """
         if not self.prepare_finalize.supports_async():
-            # TODO: enable dbo
-            assert not dbo_enabled()
+            assert not tbo_overlap_enabled()
 
             (
                 a1q,
@@ -196,7 +195,35 @@ class FusedMoEModularKernel(torch.nn.Module):
                 quant_type,
             )
         else:
-            assert False, "Now DBO async is not supported"
+            from atom.utils.tbo.ubatching import (
+                tbo_maybe_run_recv_hook,
+                tbo_register_recv_hook,
+                tbo_yield,
+            )
+
+            tbo_maybe_run_recv_hook()
+
+            result = self.prepare_finalize.prepare_async(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                global_num_experts,
+                expert_map,
+                apply_router_weight_on_input,
+            )
+            if isinstance(result, tuple):
+                hook, receiver = result
+                tbo_register_recv_hook(hook)
+                tbo_yield()
+            else:
+                receiver = result
+            (
+                a1q,
+                a1q_scale,
+                expert_tokens_meta,
+                _expert_topk_ids,
+                _expert_topk_weights,
+            ) = receiver()
 
         # Maybe prepare gathered topk_ids and topk_weights from other EP ranks.
         topk_ids = topk_ids if _expert_topk_ids is None else _expert_topk_ids
@@ -217,33 +244,43 @@ class FusedMoEModularKernel(torch.nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         The _finalize method is a wrapper around self.prepare_finalize.finalize
-        that handles DBO, async and shared expert overlap.
+        that handles TBO, async and shared expert overlap.
         """
-        shared_output: torch.Tensor | None = None
 
         if not self.prepare_finalize.supports_async():
-            assert not dbo_enabled()
+            assert not tbo_overlap_enabled()
 
-            self.prepare_finalize.finalize(
+            output = self.prepare_finalize.finalize(
                 output,
                 fused_out,
                 topk_weights,
                 topk_ids,
                 apply_router_weight_on_input,
-                # self.fused_experts.finalize_weight_and_reduce_impl(),
             )
-            # if self.shared_experts is not None:
-            #     shared_output = self.shared_experts(hidden_states)
         else:
-            assert False, "Now DBO async is not supported"
-        return output
+            from atom.utils.tbo.ubatching import (
+                tbo_maybe_run_recv_hook,
+                tbo_register_recv_hook,
+                tbo_yield,
+            )
 
-        # Now mori now supported shared expert
-        if self.shared_experts is None:
-            return output
-        else:
-            assert shared_output is not None
-            return shared_output, output
+            tbo_maybe_run_recv_hook()
+
+            result = self.prepare_finalize.finalize_async(
+                output,
+                fused_out,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+            )
+            if isinstance(result, tuple):
+                hook, receiver = result
+                tbo_register_recv_hook(hook)
+                tbo_yield()
+                output = receiver()
+            else:
+                output = result()
+        return output
 
     def forward(
         self,
@@ -271,7 +308,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         if inplace and self.shared_experts is None and not disable_inplace():
             output = hidden_states
         else:
-            output = torch.zeros_like(hidden_states)
+            output = None
 
         local_num_experts = w1.size(0)
         if global_num_experts == -1:

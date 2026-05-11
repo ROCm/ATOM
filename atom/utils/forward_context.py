@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Union
@@ -141,6 +143,11 @@ class Context:
     batch_size: int = 0
     graph_bs: int = 0
     is_draft: bool = False
+    # Optional flat token ids for the current forward. Read by callbacks
+    # invoked inside Dynamo-opaque custom ops (e.g. V4 MoE hash routing)
+    # that need the token ids but cannot receive them as a function arg
+    # (the op signature is fixed by the consumer's plugin contract).
+    input_ids: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -150,6 +157,7 @@ class Context:
         batch_size: int = 0,
         graph_bs: int = 0,
         is_draft: bool = False,
+        input_ids: Optional[torch.Tensor] = None,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -157,6 +165,7 @@ class Context:
         self.batch_size = batch_size
         self.graph_bs = graph_bs
         self.is_draft = is_draft
+        self.input_ids = input_ids
 
 
 @dataclass
@@ -325,6 +334,8 @@ class ForwardContext:
 
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None
 
+    ubatch_slices: Optional[list[Any]] = None
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -335,9 +346,18 @@ class ForwardContext:
 _forward_context: Optional[ForwardContext] = ForwardContext()
 _forward_kv_cache_context: Optional[ForwardContext] = ForwardContext()
 
+# Thread-local storage for TBO dual-thread execution
+
+_forward_context_local = threading.local()
+
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
+    # Check thread-local first (used by TBO threads)
+    ctx = getattr(_forward_context_local, "ctx", None)
+    if ctx is not None:
+        return ctx
+
     assert _forward_context is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context."
@@ -352,6 +372,7 @@ def set_forward_context(
     num_tokens: Optional[int] = None,
     num_tokens_across_dp: Optional[torch.Tensor] = None,
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
+    ubatch_slices: Optional[list[Any]] = None,
 ) -> None:
     global _forward_context
     dp_metadata: Optional[DPMetadata] = None
@@ -370,6 +391,7 @@ def set_forward_context(
         context=context,
         dp_metadata=dp_metadata,
         spec_decode_metadata=spec_decode_metadata,
+        ubatch_slices=ubatch_slices,
     )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
@@ -380,6 +402,81 @@ def reset_forward_context() -> None:
     _forward_context = ForwardContext()
 
 
-def set_kv_cache_data(kv_cache_data: dict[int, KVCacheTensor]) -> None:
+# ---------------------------------------------------------------------------
+# KV Connector global instances (lazy initialization)
+# ---------------------------------------------------------------------------
+
+_logger = logging.getLogger("atom")
+
+_global_kvconnector: Optional[Any] = None
+_global_kvconnector_scheduler: Optional[Any] = None
+
+
+def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> Any:
+    """Get or lazily initialize the global KV connector instance.
+
+    The connector is role-dependent:
+      - ``"worker"``: Returns a :class:`KVConnectorBase` (worker-side, per TP rank).
+      - ``"scheduler"``: Returns a :class:`KVConnectorSchedulerBase` (scheduler-side).
+
+    The concrete backend is selected by :class:`KVConnectorFactory` based on
+    ``config.kv_transfer_config["kv_connector"]`` (default: ``"moriio"``).
+
+    Args:
+        role: Either ``"worker"`` or ``"scheduler"``.
+        config: Engine config; required on first call to trigger initialization.
+
+    Returns:
+        The KV connector instance, or ``None`` if KV transfer is not configured.
+    """
+    global _global_kvconnector, _global_kvconnector_scheduler
+
+    if not (hasattr(config, "kv_transfer_config") and config.kv_transfer_config):
+        return _global_kvconnector
+
+    if role == "worker":
+        from aiter.dist.parallel_state import get_tp_group
+
+        try:
+            tp_rank = get_tp_group().rank_in_group
+        except Exception:
+            _logger.warning(
+                "get_tp_group() failed (dist not initialized?), returning None"
+            )
+            return None
+
+        if _global_kvconnector is None:
+            from atom.kv_transfer.disaggregation import KVConnectorFactory
+
+            _global_kvconnector = KVConnectorFactory.create_connector(
+                config, role="worker"
+            )
+            _logger.debug("Initialized global KVConnector at tp_rank %d", tp_rank)
+
+    elif role == "scheduler":
+        from atom.kv_transfer.disaggregation import KVConnectorFactory
+
+        _global_kvconnector_scheduler = KVConnectorFactory.create_connector(
+            config, role="scheduler"
+        )
+        _logger.debug("Initialized global KVConnectorScheduler")
+        return _global_kvconnector_scheduler
+
+    else:
+        raise ValueError(f"Unknown KV connector role: {role!r}")
+
+    return _global_kvconnector
+
+
+def set_kv_cache_data(
+    kv_cache_data: dict[int, KVCacheTensor], config: Optional[Config] = None
+) -> None:
+    """Register KV cache data globally and with the KV connector if enabled."""
     global _forward_kv_cache_context
+
+    if hasattr(config, "kv_transfer_config") and config.kv_transfer_config:
+        connector = get_kvconnector(config=config)
+        if connector is not None:
+            connector.register_kv_caches(kv_cache_data)
+
     _forward_kv_cache_context.kv_cache_data = kv_cache_data

@@ -111,11 +111,25 @@ When a decode step cannot extend a sequence's KV cache (no free blocks), the sch
 ```python
 def preempt(self, seq: Sequence):
     seq.status = SequenceStatus.WAITING
+    # Strip placeholder + rejected draft tokens added by postprocess.
+    if self.mtp_k > 0:
+        strip = self.mtp_k + seq.num_rejected
+        if strip > 0:
+            del seq.token_ids[-strip:]
+            del seq.output_tokens[-strip:]
+            seq.num_tokens -= strip
+    seq.num_rejected = 0
+    seq.num_bonus_tokens = 0
+    seq.spec_token_ids = np.array([], dtype=np.int32)
     self.block_manager.deallocate(seq)
     self.waiting.appendleft(seq)
 ```
 
 The preempted sequence is pushed to the front of the waiting queue and its blocks are fully deallocated, so it will be re-prefilled on the next scheduling cycle.
+
+**MTP placeholder stripping:** When speculative decoding is active (`mtp_k > 0`), `postprocess()` appends placeholder tokens (EOS) to running sequences to reserve KV cache slots for the next step (see section 5.6). If a sequence is preempted before those placeholders are consumed, they must be removed so that re-prefill starts from the correct token history. The strip count is `mtp_k + seq.num_rejected` -- this accounts for both the `mtp_k` placeholder slots and any tokens that were rejected during the last verification step. The method deletes that many trailing entries from both `seq.token_ids` and `seq.output_tokens` and decrements `seq.num_tokens` accordingly.
+
+**Speculative state reset:** After stripping, the sequence's speculative decoding state is fully cleared: `num_rejected` and `num_bonus_tokens` are zeroed, and `spec_token_ids` is set to an empty array. This ensures the sequence re-enters the scheduling pipeline with a clean state -- no stale draft predictions or acceptance metadata carry over across preemption.
 
 ---
 
@@ -219,9 +233,29 @@ class BlockManager:
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
+        
+        # Per-request cache: per-request slot pool + equiv-block accounting.
+        # Used by attention types whose state lives outside the paged KV pool
+        # (currently GDN recurrent state; future stateful attentions plug in
+        # via AttentionMetadataBuilder.compute_per_req_cache_bytes()).
+        # Each slot group contains (1+num_spec) contiguous tensor indices.
+        self.per_req_cache_equiv_blocks: int = getattr(
+            config, "per_req_cache_equiv_blocks", 0
+        )
+        num_per_req_cache_groups: int = getattr(config, "num_per_req_cache_groups", 0)
+        self.free_per_req_cache_groups: list[int] = list(
+            range(num_per_req_cache_groups)
+        )
+        # seq_id → list of accounting block_ids (memory bookkeeping only)
+        self.per_req_cache_accounting: dict[int, list[int]] = {}
 ```
 
 The block pool is pre-allocated at startup. `free_block_ids` is a deque for O(1) pop/push, `used_block_ids` tracks active blocks, and `hash_to_block_id` maps content hashes to block IDs for prefix caching.
+
+**Per-Request Cache Pools (Stateful-Attention Models):** For models whose attention type maintains per-request state outside the paged KV pool (currently GDN: Qwen3-Next, Qwen3.5; future: DeepseekV4 ring buffer + compressor state, etc.):
+- `free_per_req_cache_groups` -- list of available per-request slot group indices (0 to `num_per_req_cache_groups - 1`). Each group corresponds to one request and contains `1 + num_speculative_tokens` contiguous tensor slot indices.
+- `per_req_cache_accounting` -- maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and per-request state through dynamic competition; per-request memory is accounted for as block equivalents.
+- `per_req_cache_equiv_blocks` -- number of KV cache block equivalents reserved per request for its per-request cache (computed from `AttentionMetadataBuilder.compute_per_req_cache_bytes() / block_bytes`).
 
 ### 3.3 Allocation (`allocate`)
 
@@ -231,12 +265,20 @@ Called during prefill scheduling for new sequences:
 def allocate(self, seq: Sequence):
 ```
 
+**KV Cache allocation:**
+
 1. Iterates over `seq.num_blocks` blocks.
 2. For each block, computes hash if the block is full (`len(token_ids) == block_size`). Partial (last) blocks get `hash = -1`.
 3. If prefix caching is enabled, looks up `hash_to_block_id`:
    - **Cache hit:** Verifies `token_ids` match. If the block is already in `used_block_ids`, increments `ref_count`. If it was evicted but still in the free list, re-allocates it. Increments `seq.num_cached_tokens` by `block_size`.
    - **Cache miss:** Allocates from `free_block_ids[0]`.
 4. Full blocks are registered in `hash_to_block_id`.
+
+**Per-request cache allocation (if `seq.has_per_req_cache`):**
+
+1. Allocates `per_req_cache_equiv_blocks` accounting blocks from the free pool (for memory accounting only).
+2. Stores these block IDs in `per_req_cache_accounting[seq.id]` to track per-request memory usage.
+3. Pops one slot group index from `free_per_req_cache_groups` and assigns it to `seq.per_req_cache_group` (per-request state indexing into the builder-allocated tensors).
 
 ### 3.4 Deallocation (`deallocate`)
 
@@ -251,22 +293,53 @@ def deallocate(self, seq: Sequence):
             self._deallocate_block(block_id)
     seq.num_cached_tokens = 0
     seq.block_table.clear()
+    if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
+        for block_id in self.per_req_cache_accounting.pop(seq.id, []):
+            block = self.blocks[block_id]
+            block.ref_count = 0  # accounting blocks bypass ref-counting
+            self._deallocate_block(block_id)
+        self.free_per_req_cache_groups.append(seq.per_req_cache_group)
+        seq.per_req_cache_group = -1
 ```
 
-Blocks are released in reverse order. Shared blocks (with `ref_count > 1` from prefix caching) are not freed until all referencing sequences release them.
+**KV Cache deallocation:** Blocks are released in reverse order. Shared blocks (with `ref_count > 1` from prefix caching) are not freed until all referencing sequences release them.
+
+**Per-request cache deallocation (if `seq.has_per_req_cache`):**
+
+1. Releases all accounting blocks for this sequence from `per_req_cache_accounting[seq.id]` directly (bypassing ref-counting, as they are internal to the accounting system).
+2. Returns the slot group index `seq.per_req_cache_group` to `free_per_req_cache_groups` for reuse.
+3. Clears `seq.per_req_cache_group` to `-1` to mark it as released.
 
 ### 3.5 Can-Allocate and Can-Append Checks
 
 ```python
 def can_allocate(self, seq: Sequence) -> bool:
-    return len(self.free_block_ids) >= seq.num_blocks
+    per_req_cache_cost = (
+        self.per_req_cache_equiv_blocks if seq.has_per_req_cache else 0
+    )
+    per_req_cache_slot_ok = (
+        (not seq.has_per_req_cache) or len(self.free_per_req_cache_groups) > 0
+    )
+    if not self.enable_prefix_caching:
+        return (
+            len(self.free_block_ids_set) >= seq.num_blocks + per_req_cache_cost
+            and per_req_cache_slot_ok
+        )
+    # ... (prefix caching dry-run logic with per_req_cache_cost included)
 
-def can_append(self, seq: Sequence) -> bool:
-    return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
+    seq_len = len(seq)
+    current_blocks = len(seq.block_table)
+    needed_blocks = (seq_len + num_new_tokens + self.block_size - 1) // self.block_size
+    new_blocks_needed = max(0, needed_blocks - current_blocks)
+    return len(self.free_block_ids_set) >= new_blocks_needed
 ```
 
-- `can_allocate` checks that enough free blocks exist for the full sequence.
-- `can_append` checks whether a decode step needs a new block. A new block is needed only when `len(seq) % block_size == 1` (the previous block just filled up), requiring exactly 1 free block.
+- `can_allocate` checks that:
+  - Enough free KV blocks exist for the full sequence (`seq.num_blocks + per_req_cache_cost` accounting blocks for per-request state if applicable).
+  - At least one per-request cache slot group is available if the sequence has `has_per_req_cache=True`.
+  
+- `can_append` checks whether a decode step needs a new block. Calculates the required block count given `num_new_tokens` (typically `mtp_k + 1` for speculative decode) and returns whether enough free blocks remain.
 
 ### 3.6 May-Append (Decode Extension)
 
@@ -503,6 +576,8 @@ class Sequence:
 | `num_prompt_tokens` | `int` | Number of prompt tokens (fixed at init) |
 | `num_cached_tokens` | `int` | Tokens served from prefix cache |
 | `block_table` | `list[int]` | Ordered list of block IDs assigned to this sequence |
+| `has_per_req_cache` | `bool` | Whether the model's attention type maintains per-request state outside the paged KV pool (set at sequence init; True for GDN-based models, future stateful attentions) |
+| `per_req_cache_group` | `int` | Per-request stateful-attention slot group index (assigned by BlockManager during allocation, `-1` if unallocated) |
 | `last_token` | `int` | Most recently appended token ID |
 | `temperature` | `float` | Sampling temperature (from `SamplingParams`) |
 | `max_tokens` | `int` | Max completion tokens (from `SamplingParams`, default 64) |

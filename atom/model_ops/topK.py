@@ -16,17 +16,25 @@ def is_rocm_aiter_fusion_shared_expert_enabled() -> bool:
     config = get_current_atom_config()
 
     quant_config = config.quant_config
-    is_shared_experts_excluded = False
-    is_experts_excluded = False
+
+    # Resolve actual dtypes for shared experts vs routed experts.
+    # Find a representative shared expert entry from the exclude list to
+    # get its resolved dtype, then compare against the global quant spec
+    # (which represents the dtype of non-excluded routed experts).
+    # We cannot use a fixed probe prefix because the exclude list format
+    # changes after remap_layer_name (native vs plugin mode, packed_modules
+    # remap). Instead, pick the first exclude entry that mentions
+    # "shared_expert" and resolve its dtype via get_layer_quant_config.
     exclude_layers = quant_config.exclude_layers or []
-    for layer in exclude_layers:
-        if "shared_experts" in layer:
-            is_shared_experts_excluded = True
-        if "experts" in layer and "shared_experts" not in layer:
-            is_experts_excluded = True
-    # don't fuse shared experts if they don't share the same quantization
-    if is_shared_experts_excluded != is_experts_excluded:
-        return False
+    for entry in exclude_layers:
+        if "shared_experts" in entry or "shared_expert" in entry:
+            shared_spec = quant_config.get_layer_quant_config(entry)
+            # Compare shared expert dtype against the global (routed) dtype.
+            # If they differ, shared experts cannot be fused into the MoE
+            # kernel (e.g. shared experts are BF16 while routed are FP4).
+            if shared_spec.quant_dtype != quant_config.quant_dtype:
+                return False
+            break
 
     dp_size = config.parallel_config.data_parallel_size
     if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:

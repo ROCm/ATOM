@@ -173,6 +173,10 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
+    quant_exclude_name_mapping = {
+        "language_model.model.": "model.language_model.model.",
+        "language_model.lm_head": "model.language_model.lm_head",
+    }
     hf_to_atom_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.visual.": "visual.",
@@ -242,7 +246,9 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
         self, quant_config: Any, exclude_layers: list[str], layer_name: str
     ):
         for exclude_layer in exclude_layers:
-            if QuantizationConfig._matches_exclude(layer_name, exclude_layer):
+            if QuantizationConfig._matches_exclude(
+                layer_name, exclude_layer, check_contains=True
+            ):
                 return None
         return quant_config
 

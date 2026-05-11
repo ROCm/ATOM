@@ -9,6 +9,7 @@ set -euo pipefail
 #   OOT_MODEL_NAME
 #   OOT_MODEL_PATH
 #   OOT_EXTRA_ARGS
+#   LM_EVAL_NUM_FEWSHOT
 #
 # TYPE:
 #   launch   - launch vLLM server and wait until ready
@@ -48,7 +49,15 @@ KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
 EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
+EXPLICIT_CLIENT_COMMAND=${OOT_CLIENT_COMMAND:-}
+OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
+LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LAST_VLLM_LOG_LINE=0
+
+if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid LM_EVAL_NUM_FEWSHOT: ${LM_EVAL_NUM_FEWSHOT}. Expected a non-negative integer."
+  exit 2
+fi
 
 declare -a ACTIVE_MODELS=()
 if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLICIT_EXTRA_ARGS}" ]]; then
@@ -56,7 +65,7 @@ if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLIC
     echo "OOT_MODEL_NAME and OOT_MODEL_PATH must both be set when using explicit model overrides."
     exit 2
   fi
-  ACTIVE_MODELS=("${EXPLICIT_MODEL_NAME}|${EXPLICIT_MODEL_PATH}|${EXPLICIT_EXTRA_ARGS}")
+  ACTIVE_MODELS=("${EXPLICIT_MODEL_NAME}|${EXPLICIT_MODEL_PATH}|${EXPLICIT_EXTRA_ARGS}|${EXPLICIT_CLIENT_COMMAND}")
 else
   echo "${MODE} mode requires OOT_MODEL_NAME and OOT_MODEL_PATH env vars from the workflow."
   exit 2
@@ -71,6 +80,14 @@ resolve_model_path() {
   else
     echo "${model_path}"
   fi
+}
+
+# gpt-oss OpenAI weights require Chat Completions (messages); local-completions sends "prompt" and vLLM returns 400.
+is_gpt_oss_model() {
+  local name_lc path_lc
+  name_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  path_lc="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+  [[ "${name_lc}" == *gpt-oss* || "${path_lc}" == *gpt-oss* ]]
 }
 
 emit_new_vllm_logs() {
@@ -143,7 +160,19 @@ launch_one_model() {
   resolved_model_path=$(resolve_model_path "${model_path}")
 
   if [[ -n "${extra_args}" ]]; then
-    read -r -a extra_arg_array <<< "${extra_args}"
+    while IFS= read -r -d '' token; do
+      extra_arg_array+=("${token}")
+    done < <(
+      EXTRA_ARGS="${extra_args}" python3 - <<'PY'
+import os
+import shlex
+import sys
+
+for token in shlex.split(os.environ["EXTRA_ARGS"]):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
   fi
 
   echo ""
@@ -156,8 +185,6 @@ launch_one_model() {
   export VLLM_RPC_TIMEOUT=1800000
   export VLLM_CACHE_ROOT=/root/.cache/vllm
   export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
-  # FIXME: here disable the dual stream in OOT CI for avoid the hang issue
-  export ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0
 
   if [[ -n "${OOT_ENV_VARS:-}" ]]; then
     while IFS= read -r _env_line; do
@@ -192,6 +219,7 @@ accuracy_one_model() {
   local model_name="$1"
   local model_path="$2"
   local extra_args="$3"
+  local client_command="${4:-}"
   local flat_result_file=""
 
   local resolved_model_path
@@ -211,12 +239,82 @@ accuracy_one_model() {
   echo ""
   echo "========== Running OOT gsm8k accuracy =========="
   echo "Model name: ${model_name}"
+  echo "Few-shot count: ${LM_EVAL_NUM_FEWSHOT}"
 
-  lm_eval --model local-completions \
-    --model_args model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
-    --tasks gsm8k \
-    --num_fewshot 3 \
-    --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+  if [[ -n "${client_command}" ]]; then
+    local -a client_command_args=()
+    while IFS= read -r -d '' token; do
+      client_command_args+=("${token}")
+    done < <(
+      CLIENT_COMMAND="${client_command}" \
+      MODEL_PATH_VALUE="${resolved_model_path}" \
+      OUTPUT_PATH_VALUE="${output_path}" \
+      LM_EVAL_NUM_FEWSHOT_VALUE="${LM_EVAL_NUM_FEWSHOT}" \
+      VLLM_PORT_VALUE="${VLLM_PORT}" \
+      python3 - <<'PY'
+import os
+import shlex
+import sys
+
+client_command = os.environ["CLIENT_COMMAND"]
+replacements = {
+    "${MODEL_PATH}": os.environ["MODEL_PATH_VALUE"],
+    "$MODEL_PATH": os.environ["MODEL_PATH_VALUE"],
+    "${OUTPUT_PATH}": os.environ["OUTPUT_PATH_VALUE"],
+    "$OUTPUT_PATH": os.environ["OUTPUT_PATH_VALUE"],
+    "${LM_EVAL_NUM_FEWSHOT}": os.environ["LM_EVAL_NUM_FEWSHOT_VALUE"],
+    "$LM_EVAL_NUM_FEWSHOT": os.environ["LM_EVAL_NUM_FEWSHOT_VALUE"],
+    "${VLLM_PORT}": os.environ["VLLM_PORT_VALUE"],
+    "$VLLM_PORT": os.environ["VLLM_PORT_VALUE"],
+}
+for src, dst in replacements.items():
+    client_command = client_command.replace(src, dst)
+
+for token in shlex.split(client_command):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
+
+    if [[ ${#client_command_args[@]} -eq 0 ]]; then
+      echo "ERROR: client_command is set but empty after parsing."
+      return 2
+    fi
+
+    for arg in "${client_command_args[@]}"; do
+      if [[ "${arg}" =~ \$\{[A-Z0-9_]+\} ]] || [[ "${arg}" =~ \$[A-Z_][A-Z0-9_]* ]]; then
+        echo "ERROR: client_command contains unresolved placeholder after expansion: ${arg}"
+        return 2
+      fi
+    done
+
+    echo "Using custom lm-eval command from client_command: ${client_command}"
+    "${client_command_args[@]}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+  else
+    local lm_args=(
+      --model_args
+      model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
+    )
+    if is_gpt_oss_model "${model_name}" "${model_path}"; then
+      echo "Using chat completions + apply_chat_template for gpt-oss (OpenAI-compatible messages API)."
+      lm_args=(
+        --model_args
+        model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/chat/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
+      )
+      lm_eval --model local-chat-completions \
+        --apply_chat_template \
+        "${lm_args[@]}" \
+        --tasks gsm8k \
+        --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+        --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+    else
+      lm_eval --model local-completions \
+        "${lm_args[@]}" \
+        --tasks gsm8k \
+        --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+        --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+    fi
+  fi
 
   # lm-eval output layout differs across versions: output_path may be a file
   # or a directory containing one/more JSON files. Follow native CI style:
@@ -255,6 +353,38 @@ PY
     result_file="${flat_result_file}"
   fi
 
+  if [[ -n "${OOT_DOCKER_IMAGE:-}" ]] || [[ -n "${GPU_NAME:-}" ]] || [[ -n "${GPU_VRAM_GB:-}" ]] || [[ -n "${ROCM_VERSION:-}" ]]; then
+    RESULT_FILE="${result_file}" \
+    OOT_DOCKER_IMAGE="${OOT_DOCKER_IMAGE:-}" \
+    GPU_NAME="${GPU_NAME:-}" \
+    GPU_VRAM_GB="${GPU_VRAM_GB:-}" \
+    ROCM_VERSION="${ROCM_VERSION:-}" \
+    python - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+if os.environ.get("OOT_DOCKER_IMAGE"):
+    metadata["docker_image"] = os.environ["OOT_DOCKER_IMAGE"]
+if os.environ.get("GPU_NAME"):
+    metadata["gpu_name"] = os.environ["GPU_NAME"]
+if os.environ.get("GPU_VRAM_GB"):
+    try:
+        metadata["gpu_vram_gb"] = int(float(os.environ["GPU_VRAM_GB"]))
+    except ValueError:
+        pass
+if os.environ.get("ROCM_VERSION"):
+    metadata["rocm_version"] = os.environ["ROCM_VERSION"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+  fi
+
   local value
   if command -v jq >/dev/null 2>&1; then
     value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "${result_file}")
@@ -277,7 +407,7 @@ run_for_models() {
   local matched=0
 
   for entry in "${ACTIVE_MODELS[@]}"; do
-    IFS='|' read -r model_name model_path extra_args <<< "${entry}"
+    IFS='|' read -r model_name model_path extra_args client_command <<< "${entry}"
 
     if [[ -n "${SELECTED_MODEL}" && "${SELECTED_MODEL}" != "${model_name}" ]]; then
       continue
@@ -291,7 +421,7 @@ run_for_models() {
 
     # accuracy mode: launch + evaluate each selected model, then stop server.
     launch_one_model "${model_name}" "${model_path}" "${extra_args}"
-    accuracy_one_model "${model_name}" "${model_path}" "${extra_args}"
+    accuracy_one_model "${model_name}" "${model_path}" "${extra_args}" "${client_command}"
     stop_server
   done
 

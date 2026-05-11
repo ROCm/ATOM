@@ -1,0 +1,1023 @@
+name: ATOM SGLang Benchmark
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      deepseek-r1-fp8-tp8:
+        description: "DeepSeek-R1-0528 FP8 TP8"
+        type: boolean
+        default: false
+      deepseek-r1-fp8-tp4:
+        description: "DeepSeek-R1-0528 FP8 TP4"
+        type: boolean
+        default: false
+      deepseek-r1-fp4-tp8:
+        description: "DeepSeek-R1-0528-MXFP4 FP4 TP8"
+        type: boolean
+        default: false
+      deepseek-r1-fp4-tp4:
+        description: "DeepSeek-R1-0528-MXFP4 FP4 TP4"
+        type: boolean
+        default: false
+      deepseek-r1-fp4-tp8-ep8:
+        description: "DeepSeek-R1-0528-MXFP4 FP4 TP8 EP8"
+        type: boolean
+        default: false
+      sglang_image:
+        description: "Optional SGLang benchmark image override. Leave empty to use sglang-latest on main or rebuild from the selected non-main branch."
+        type: string
+        default: ""
+      publish_to_dashboard:
+        description: "Upload benchmark results to the dashboard"
+        type: boolean
+        default: true
+      param_lists:
+        description: |
+          "Benchmark parameter lists.
+          Input as a single or multiple sets (comma-separated, semicolon between sets),
+          format: input_length,output_length,concurrency,random_range_ratio.
+          Example (single set): 1024,1024,64,0.8
+          Example (multiple sets): 1024,1024,64,0.8;2048,1024,32,0.7"
+        type: string
+        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
+
+jobs:
+  resolve-atom-source:
+    name: Resolve ATOM benchmark source
+    runs-on: ubuntu-latest
+    outputs:
+      atom_repository: ${{ steps.resolve.outputs.atom_repository }}
+      atom_ref: ${{ steps.resolve.outputs.atom_ref }}
+      normalized_ref: ${{ steps.resolve.outputs.normalized_ref }}
+      rebuild_sglang_image: ${{ steps.resolve.outputs.rebuild_sglang_image }}
+      prebuilt_sglang_image: ${{ steps.resolve.outputs.prebuilt_sglang_image }}
+      selected_sglang_ref: ${{ steps.resolve.outputs.selected_sglang_ref }}
+      selected_sglang_version: ${{ steps.resolve.outputs.selected_sglang_version }}
+      sglang_base_image: ${{ steps.resolve.outputs.sglang_base_image }}
+      sglang_image_source: ${{ steps.resolve.outputs.sglang_image_source }}
+      publish_to_dashboard: ${{ steps.resolve.outputs.publish_to_dashboard }}
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v6
+
+      - name: Resolve benchmark source
+        id: resolve
+        env:
+          INPUT_SGLANG_IMAGE: ${{ inputs.sglang_image || '' }}
+          INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
+        run: |
+          set -euo pipefail
+
+          ATOM_REPOSITORY="${GITHUB_REPOSITORY}"
+          ATOM_REF="${GITHUB_REF_NAME}"
+          SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
+
+          NORMALIZED_REF="${ATOM_REF#refs/heads/}"
+          NORMALIZED_REF="${NORMALIZED_REF#refs/tags/}"
+
+          PREBUILT_SGLANG_IMAGE=""
+          REBUILD_SGLANG_IMAGE=false
+          SGLANG_IMAGE_SOURCE="prebuilt"
+          USER_PROVIDED_SGLANG_IMAGE=false
+          if [[ -n "${INPUT_SGLANG_IMAGE}" ]]; then
+            PREBUILT_SGLANG_IMAGE="${INPUT_SGLANG_IMAGE}"
+            SGLANG_IMAGE_SOURCE="user-provided"
+            USER_PROVIDED_SGLANG_IMAGE=true
+          elif [[ "${NORMALIZED_REF}" == "main" ]]; then
+            PREBUILT_SGLANG_IMAGE="rocm/atom-dev:sglang-latest"
+            SGLANG_IMAGE_SOURCE="prebuilt"
+          else
+            REBUILD_SGLANG_IMAGE=true
+            SGLANG_IMAGE_SOURCE="rebuild"
+          fi
+
+          PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
+
+          mapfile -t VLLM_META < <(python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path(".github/workflows/docker-release.yaml").read_text(encoding="utf-8")
+          commit_match = re.search(r'^\s*SGLANG_REF:\s*"([^"]+)"', text, re.MULTILINE)
+          version_match = re.search(r'^\s*SGLANG_VERSION:\s*"([^"]+)"', text, re.MULTILINE)
+
+          if not commit_match or not version_match:
+              raise SystemExit("Failed to read SGLANG_REF/SGLANG_VERSION from .github/workflows/docker-release.yaml")
+
+          print(commit_match.group(1))
+          print(version_match.group(1))
+          PY
+          )
+
+          SELECTED_SGLANG_REF="${VLLM_META[0]}"
+          SELECTED_SGLANG_VERSION="${VLLM_META[1]}"
+
+          {
+            echo "atom_repository=${ATOM_REPOSITORY}"
+            echo "atom_ref=${ATOM_REF}"
+            echo "normalized_ref=${NORMALIZED_REF}"
+            echo "rebuild_sglang_image=${REBUILD_SGLANG_IMAGE}"
+            echo "prebuilt_sglang_image=${PREBUILT_SGLANG_IMAGE}"
+            echo "selected_sglang_ref=${SELECTED_SGLANG_REF}"
+            echo "selected_sglang_version=${SELECTED_SGLANG_VERSION}"
+            echo "sglang_base_image=${SGLANG_BASE_IMAGE}"
+            echo "sglang_image_source=${SGLANG_IMAGE_SOURCE}"
+            echo "publish_to_dashboard=${PUBLISH_TO_DASHBOARD}"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '### SGLang benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
+            "${ATOM_REPOSITORY}" \
+            "${ATOM_REF}" \
+            "${SGLANG_IMAGE_SOURCE}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${USER_PROVIDED_SGLANG_IMAGE}" == "true" ]]; then
+            printf -- '- User-provided image: `%s`\n- Expected SGLang version: `%s`\n- Expected SGLang commit: `%s`\n' \
+              "${PREBUILT_SGLANG_IMAGE}" \
+              "${SELECTED_SGLANG_VERSION}" \
+              "${SELECTED_SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
+            printf -- '\nBecause an explicit `sglang_image` input was provided, this run uses that image directly and skips branch-based rebuild logic.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${REBUILD_SGLANG_IMAGE}" == "true" ]]; then
+            printf -- '- Base image: `%s`\n- SGLang version: `%s`\n- SGLang commit: `%s`\n- SGLang source: `.github/workflows/docker-release.yaml`\n' \
+              "${SGLANG_BASE_IMAGE}" \
+              "${SELECTED_SGLANG_VERSION}" \
+              "${SELECTED_SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
+            printf -- '\nBecause branch `%s` is not `main` and no `sglang_image` override was provided, a custom SGLang docker is rebuilt from the selected branch.\n' \
+              "${ATOM_REF}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf -- '- Prebuilt image: `%s`\n- Expected SGLang version: `%s`\n- Expected SGLang commit: `%s`\n' \
+              "${PREBUILT_SGLANG_IMAGE}" \
+              "${SELECTED_SGLANG_VERSION}" \
+              "${SELECTED_SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          printf -- '- Upload to dashboard: `%s`\n' \
+            "${PUBLISH_TO_DASHBOARD}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${PUBLISH_TO_DASHBOARD}" != "true" ]]; then
+            printf '\nDashboard upload is disabled by workflow input, so results are kept in artifacts and run summaries only.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  parse-param-lists:
+    name: Parse parameter lists
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
+      param_lists: ${{ steps.parse-param-lists.outputs.param_lists }}
+    steps:
+      - name: Parse parameter lists
+        id: parse-param-lists
+        run: |
+          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8' }}"
+          echo "Using param_lists: ${PARAM_LISTS}"
+          printf 'param_lists=%s\n' "${PARAM_LISTS}" >> "$GITHUB_OUTPUT"
+          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
+          MATRIX_JSON="["
+          SEP=""
+          for SET in "${SETS[@]}"; do
+            IFS=',' read -ra PARAMS <<< "$SET"
+            INPUT_LEN="${PARAMS[0]}"
+            OUTPUT_LEN="${PARAMS[1]}"
+            CONCURRENCY="${PARAMS[2]}"
+            RANDOM_RANGE_RATIO="${PARAMS[3]}"
+            case "${CONCURRENCY}" in
+              4|8|16|32|64|128|256) ;;
+              *)
+                echo "Unsupported concurrency: ${CONCURRENCY}. Allowed values: 4,8,16,32,64,128,256"
+                exit 1
+                ;;
+            esac
+            MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
+            SEP=","
+          done
+          MATRIX_JSON="${MATRIX_JSON}]"
+          echo "matrix_json=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+
+      - name: Print matrix JSON
+        run: |
+          echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
+
+  load-models:
+    name: Load SGLang model configs
+    runs-on: ubuntu-latest
+    outputs:
+      models_json: ${{ steps.load.outputs.models_json }}
+      has_enabled_models: ${{ steps.load.outputs.has_enabled_models }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: load
+        env:
+          ENABLE_DEEPSEEK_R1_FP8_TP8: ${{ inputs.deepseek-r1-fp8-tp8 }}
+          ENABLE_DEEPSEEK_R1_FP8_TP4: ${{ inputs.deepseek-r1-fp8-tp4 }}
+          ENABLE_DEEPSEEK_R1_FP4_TP8: ${{ inputs.deepseek-r1-fp4-tp8 }}
+          ENABLE_DEEPSEEK_R1_FP4_TP4: ${{ inputs.deepseek-r1-fp4-tp4 }}
+          ENABLE_DEEPSEEK_R1_FP4_TP8_EP8: ${{ inputs.deepseek-r1-fp4-tp8-ep8 }}
+        run: |
+          MODELS_JSON="$(jq -c '
+            map(select(
+              (.prefix == "deepseek-r1-fp8-tp8" and env.ENABLE_DEEPSEEK_R1_FP8_TP8 == "true")
+              or (.prefix == "deepseek-r1-fp8-tp4" and env.ENABLE_DEEPSEEK_R1_FP8_TP4 == "true")
+              or (.prefix == "deepseek-r1-fp4-tp8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8 == "true")
+              or (.prefix == "deepseek-r1-fp4-tp4" and env.ENABLE_DEEPSEEK_R1_FP4_TP4 == "true")
+              or (.prefix == "deepseek-r1-fp4-tp8-ep8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8_EP8 == "true")
+            ))
+          ' .github/benchmark/sglang_benchmark_models.json)"
+          echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
+          if [ "${MODELS_JSON}" = "[]" ]; then
+            echo "has_enabled_models=false" >> "$GITHUB_OUTPUT"
+            echo "No models selected for SGLang benchmark."
+          else
+            echo "has_enabled_models=true" >> "$GITHUB_OUTPUT"
+            echo "Selected models: ${MODELS_JSON}"
+          fi
+
+  build-benchmark-matrix:
+    name: Build SGLang benchmark matrix
+    needs: [parse-param-lists, load-models]
+    if: >-
+      needs.parse-param-lists.result == 'success'
+      && needs.load-models.result == 'success'
+      && needs.load-models.outputs.has_enabled_models == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      benchmark_matrix: ${{ steps.build.outputs.benchmark_matrix }}
+      has_benchmark_cells: ${{ steps.build.outputs.has_benchmark_cells }}
+    steps:
+      - name: Combine models and params
+        id: build
+        env:
+          MODELS_JSON: ${{ needs.load-models.outputs.models_json }}
+          PARAMS_JSON: ${{ needs.parse-param-lists.outputs.matrix_json }}
+        run: |
+          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          import json
+          import os
+
+          models = json.loads(os.environ["MODELS_JSON"])
+          params = json.loads(os.environ["PARAMS_JSON"])
+
+          include = []
+          for model in models:
+              supported_pairs = set(model.get("supported_input_output_pairs", []))
+              excluded_pairs = set(model.get("excluded_input_output_pairs", []))
+              model_params = []
+              seen = set()
+
+              for param in params:
+                  variants = [param]
+
+                  for variant in variants:
+                      key = (
+                          int(variant["input_length"]),
+                          int(variant["output_length"]),
+                          int(variant["concurrency"]),
+                          str(variant["random_range_ratio"]),
+                      )
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      model_params.append(variant)
+
+              for param in model_params:
+                  pair = f"{param['input_length']}x{param['output_length']}"
+                  if supported_pairs and pair not in supported_pairs:
+                      continue
+                  if pair in excluded_pairs:
+                      continue
+                  
+                  include.append({"model": model, "params": param})
+
+          print(json.dumps({"include": include}))
+          PY
+          )"
+          echo "benchmark_matrix=${BENCHMARK_MATRIX}" >> "$GITHUB_OUTPUT"
+          if [ "${BENCHMARK_MATRIX}" = '{"include":[]}' ]; then
+            echo "has_benchmark_cells=false" >> "$GITHUB_OUTPUT"
+            echo "No eligible benchmark cases remain after model-specific parameter filtering."
+          else
+            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
+            echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
+          fi
+
+  build-sglang-image:
+    name: Build custom SGLang benchmark image
+    needs: [resolve-atom-source, build-benchmark-matrix]
+    if: >-
+      needs.resolve-atom-source.outputs.rebuild_sglang_image == 'true'
+      && needs.build-benchmark-matrix.result == 'success'
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
+    runs-on: build-only-atom
+    outputs:
+      sglang_image_tag: ${{ steps.image-meta.outputs.sglang_image_tag }}
+      atom_source_sha: ${{ steps.source-meta.outputs.atom_source_sha }}
+    env:
+      ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
+      ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
+      SGLANG_BASE_IMAGE: ${{ needs.resolve-atom-source.outputs.sglang_base_image }}
+      SGLANG_REF: ${{ needs.resolve-atom-source.outputs.selected_sglang_ref }}
+      SGLANG_VERSION: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
+      SGLANG_IMAGE_REPO: rocm/atom-dev
+    steps:
+      - name: Checkout benchmark ATOM source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.ATOM_SOURCE_REPOSITORY }}
+          ref: ${{ env.ATOM_SOURCE_REF }}
+          fetch-depth: 1
+
+      - name: Record source metadata
+        id: source-meta
+        run: |
+          ATOM_SOURCE_SHA="$(git rev-parse HEAD)"
+          echo "atom_source_sha=${ATOM_SOURCE_SHA}" >> "$GITHUB_OUTPUT"
+          printf '### Building custom SGLang image\n- Repository: `%s`\n- Ref: `%s`\n- Commit: `%s`\n- Base image: `%s`\n- SGLang version: `%s`\n- SGLang commit: `%s`\n' \
+            "${ATOM_SOURCE_REPOSITORY}" \
+            "${ATOM_SOURCE_REF}" \
+            "${ATOM_SOURCE_SHA}" \
+            "${SGLANG_BASE_IMAGE}" \
+            "${SGLANG_VERSION}" \
+            "${SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Docker Login
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login docker.io -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Generate custom SGLang base Dockerfile
+        run: |
+          cat > Dockerfile.sglang-base <<EOF
+          FROM ${SGLANG_BASE_IMAGE}
+          RUN pip install -U lm-eval[api]
+          RUN pip show lm-eval || true
+          RUN pip install hf_transfer
+          RUN pip show hf_transfer || true
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
+          RUN pip uninstall -y amd-aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+          RUN pip install "vcs-versioning>=1"
+          RUN rm -rf /app/aiter-test
+          RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-test && \\
+              cd /app/aiter-test && \\
+              git checkout HEAD && \\
+              git submodule sync && git submodule update --init --recursive && \\
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
+          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
+          RUN pip uninstall -y atom || true
+          RUN rm -rf /app/ATOM
+          COPY . /app/ATOM
+          RUN cd /app/ATOM && pip install -e .
+          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          EOF
+
+      - name: Build custom SGLang base image
+        run: |
+          docker build --pull --network=host \
+            --no-cache \
+            -t atom_sglang_base:ci \
+            -f Dockerfile.sglang-base .
+
+      - name: Build custom SGLang image
+        id: image-meta
+        run: |
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          SHORT_SGLANG="$(printf '%s' "${SGLANG_REF}" | cut -c1-12)"
+          SAFE_SGLANG_VERSION="$(printf '%s' "${SGLANG_VERSION}" | tr '/:' '--')"
+          SGLANG_IMAGE_TAG="${SGLANG_IMAGE_REPO}:sglang-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_SGLANG_VERSION}-${SHORT_SGLANG}"
+          docker build --network=host \
+            --no-cache \
+            -t "${SGLANG_IMAGE_TAG}" \
+            --target atom_sglang \
+            --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
+            --build-arg MAX_JOBS=64 \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
+            --build-arg INSTALL_LM_EVAL=1 \
+            --build-arg INSTALL_FASTSAFETENSORS=1 \
+            -f docker/Dockerfile .
+          echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Push custom SGLang image
+        run: |
+          docker push "${{ steps.image-meta.outputs.sglang_image_tag }}"
+
+      - name: Clean up build images
+        if: always()
+        run: |
+          docker rmi "${{ steps.image-meta.outputs.sglang_image_tag }}" || true
+          docker rmi atom_sglang_base:ci || true
+
+  benchmark:
+    name: SGLang ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
+    needs: [resolve-atom-source, build-benchmark-matrix, build-sglang-image]
+    if: >-
+      always()
+      && needs.resolve-atom-source.result == 'success'
+      && needs.build-benchmark-matrix.result == 'success'
+      && (needs.build-sglang-image.result == 'success' || needs.build-sglang-image.result == 'skipped')
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.build-benchmark-matrix.outputs.benchmark_matrix) }}
+    runs-on: ${{ matrix.model.runner }}
+    timeout-minutes: 240
+    permissions:
+      actions: read
+      contents: write
+    env:
+      MODEL_NAME: ${{ matrix.model.display }}
+      DASHBOARD_MODEL_NAME: ${{ matrix.model.dashboard_model || '' }}
+      MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
+      MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
+      SGLANG_EXTRA_ARGS: ${{ matrix.model.extra_args }}
+      BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
+      RESULT_PREFIX: ${{ matrix.model.prefix }}
+      ISL: ${{ matrix.params.input_length }}
+      OSL: ${{ matrix.params.output_length }}
+      CONC: ${{ matrix.params.concurrency }}
+      RANDOM_RANGE_RATIO: ${{ matrix.params.random_range_ratio }}
+      RESULT_FILENAME: ${{ matrix.model.prefix }}-${{ matrix.params.input_length }}-${{ matrix.params.output_length }}-${{ matrix.params.concurrency }}-${{ matrix.params.random_range_ratio }}
+      CONTAINER_NAME: atom_sglang_benchmark_${{ strategy.job-index }}
+      CONTAINER_RESULT_DIR: /tmp/sglang-benchmark-results
+      CONTAINER_BENCH_SERVING_DIR: /tmp/sglang-benchmark/bench_serving
+      SGLANG_IMAGE_TAG: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
+      SGLANG_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.sglang_image_source }}
+      BENCH_SERVING_REPO_URL: https://github.com/kimbochen/bench_serving.git
+      ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
+      ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
+      SGLANG_REF_USED: ${{ needs.resolve-atom-source.outputs.selected_sglang_ref }}
+      SGLANG_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
+      PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
+    steps:
+      - name: Detect container engine
+        run: |
+          if docker info > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
+            echo "Container engine: docker"
+          elif command -v podman > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
+            echo "Container engine: podman"
+          else
+            echo "ERROR: Neither docker nor podman is available on this runner."
+            exit 1
+          fi
+
+      - name: Check if model is enabled
+        id: check
+        run: |
+          case "${{ matrix.model.prefix }}" in
+            deepseek-r1-fp8-tp8) echo "enabled=${{ inputs.deepseek-r1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp8-tp4) echo "enabled=${{ inputs.deepseek-r1-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp4-tp8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp4-tp4) echo "enabled=${{ inputs.deepseek-r1-fp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp4-tp8-ep8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-ep8 }}" >> "$GITHUB_OUTPUT" ;;
+            *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Clean up containers and workspace
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          echo "=== Cleaning up containers on $(hostname) ==="
+          containers=$($CONTAINER_ENGINE ps -q)
+          if [ -n "$containers" ]; then
+            $CONTAINER_ENGINE kill $containers || true
+          fi
+          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged docker.io/rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
+
+      - name: Checkout benchmark ATOM source
+        if: steps.check.outputs.enabled == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.ATOM_SOURCE_REPOSITORY }}
+          ref: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Record benchmark source revision
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          echo "ATOM_SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
+          echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${SGLANG_IMAGE_SOURCE} image ${SGLANG_IMAGE_TAG}"
+
+      - name: Container Engine Login
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          # Podman requires an explicit registry when registries.conf has no search list;
+          # Docker Hub short names (e.g. rocm/foo) must use docker.io here.
+          REG="${SGLANG_IMAGE_TAG%%/*}"
+          if [[ "$REG" != *.* && "$REG" != localhost* && "$REG" != *:* ]]; then
+            REG="docker.io"
+          fi
+          echo "Logging in to registry: ${REG}"
+          echo "${{ secrets.DOCKER_PASSWORD }}" | $CONTAINER_ENGINE login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Set HF_TOKEN
+        if: steps.check.outputs.enabled == 'true'
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
+
+      - name: Pull SGLang benchmark image
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          IMG="${SGLANG_IMAGE_TAG}"
+          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+            if [[ "${IMG}" != */* ]]; then
+              IMG="docker.io/library/${IMG}"
+            else
+              reg="${IMG%%/*}"
+              if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
+                IMG="docker.io/${IMG}"
+              fi
+            fi
+          fi
+          echo "SGLANG_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+          echo "Pulling SGLang benchmark image: ${IMG} (workflow tag: ${SGLANG_IMAGE_TAG})"
+          $CONTAINER_ENGINE pull "${IMG}"
+
+      - name: Prepare model cache mount
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          MODEL_CACHE_MOUNT=""
+          MODEL_CACHE_DESC="container-local /models (no host cache mount)"
+          if [ -d "/it-share/models" ]; then
+            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
+            MODEL_CACHE_DESC="/it-share/models (shared host path)"
+          elif [ -d "/models" ]; then
+            MODEL_CACHE_MOUNT="-v /models:/models"
+            MODEL_CACHE_DESC="/models (shared host path)"
+          elif [ -d "/data/models" ]; then
+            MODEL_CACHE_MOUNT="-v /data/models:/models"
+            MODEL_CACHE_DESC="/data/models (shared host path)"
+          else
+            echo "No shared host model cache found; using container-local /models."
+          fi
+
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
+          echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
+
+      - name: Start SGLang benchmark container
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+
+          printf '%s\n' "${{ matrix.model.env_vars }}" | sed 's/^[[:space:]]*//' > /tmp/oot_env_file.txt
+
+          $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+            $MODEL_MOUNT \
+            -w /workspace \
+            --ipc=host --group-add video \
+            --privileged \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            --env-file /tmp/oot_env_file.txt \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            --name "$CONTAINER_NAME" \
+            "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Collect GPU info (inside container)
+        if: steps.check.outputs.enabled == 'true'
+        id: gpu-info
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
+
+      - name: Download model if needed
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          model_dir="${MODEL_PATH}"
+          if [[ "${model_dir}" = /models/* ]]; then
+            model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /it-share/models/* ]]; then
+            model_dir="/models/${model_dir#/it-share/models/}"
+          elif [[ "${model_dir}" = /data/models/* ]]; then
+            model_dir="/models/${model_dir#/data/models/}"
+          elif [[ "${model_dir}" != /* ]]; then
+            model_dir="/models/${model_dir}"
+          fi
+          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+            echo "/models directory found, downloading model to ${model_dir}"
+            if ! $CONTAINER_ENGINE exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download \"${MODEL_SOURCE_PATH}\" --local-dir \"$model_dir\""; then
+              echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not mounted; skipping model download"
+          fi
+
+      - name: Resolve SGLang model path
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          model_dir="${MODEL_PATH}"
+          if [[ "${model_dir}" = /models/* ]]; then
+            model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /it-share/models/* ]]; then
+            model_dir="/models/${model_dir#/it-share/models/}"
+          elif [[ "${model_dir}" = /data/models/* ]]; then
+            model_dir="/models/${model_dir#/data/models/}"
+          elif [[ "${model_dir}" != /* ]]; then
+            model_dir="/models/${model_dir}"
+          fi
+          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+            echo "SGLANG_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
+            echo "Using mounted model path: ${model_dir}"
+          else
+            echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_SOURCE_PATH}" >> "$GITHUB_ENV"
+            echo "Using model id: ${MODEL_SOURCE_PATH}"
+          fi
+
+      - name: Prepare SGLang benchmark runner in container
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
+            set -euo pipefail
+            rm -rf \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
+            mkdir -p \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
+            git clone --depth 1 \"${BENCH_SERVING_REPO_URL}\" \"${CONTAINER_BENCH_SERVING_DIR}\"
+            test -f \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\"
+          "
+
+      - name: Run SGLang benchmark
+        if: steps.check.outputs.enabled == 'true'
+        timeout-minutes: 240
+        env:
+          MAX_WAIT_RETRIES: "120"
+          STREAM_SGLANG_LOGS: "1"
+        run: |
+          set -euo pipefail
+          $CONTAINER_ENGINE exec \
+            -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
+            -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
+            -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
+            -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
+            -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
+            -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              bash .github/scripts/atom_sglang_test.sh launch
+            "
+
+          TRUST_REMOTE_CODE_ARG=""
+          if [[ "${SGLANG_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
+            TRUST_REMOTE_CODE_ARG="--trust-remote-code"
+          fi
+
+          echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
+
+          $CONTAINER_ENGINE exec \
+            -e ISL="${ISL}" \
+            -e OSL="${OSL}" \
+            -e CONC="${CONC}" \
+            -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+            -e RESULT_FILENAME="${RESULT_FILENAME}" \
+            -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              rm -rf \"${CONTAINER_RESULT_DIR}\"
+              mkdir -p \"${CONTAINER_RESULT_DIR}\"
+              PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
+                --model=\"${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                --backend=sglang \
+                --base-url=http://127.0.0.1:8000 \
+                --dataset-name=random \
+                --random-input-len=\"${ISL}\" \
+                --random-output-len=\"${OSL}\" \
+                --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                --num-prompts=\"$(( CONC * 10 ))\" \
+                --max-concurrency=\"${CONC}\" \
+                ${TRUST_REMOTE_CODE_ARG} \
+                --num-warmups=\"$(( 2 * CONC ))\" \
+                --request-rate=inf \
+                --ignore-eos \
+                --save-result \
+                --percentile-metrics=\"ttft,tpot,itl,e2el\" \
+                --result-dir=\"${CONTAINER_RESULT_DIR}\" \
+                --result-filename=\"${RESULT_FILENAME}.json\" \
+                ${BENCH_EXTRA_ARGS:-}
+            "
+
+          $CONTAINER_ENGINE exec -i \
+            -e RESULT_PATH="${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" \
+            -e ISL="${ISL}" \
+            -e OSL="${OSL}" \
+            -e EXTRA_ARGS_TEXT="${SGLANG_EXTRA_ARGS}" \
+            -e DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
+            -e ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
+            -e ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
+            -e ATOM_SOURCE_SHA="${ATOM_SOURCE_SHA}" \
+            -e SGLANG_REF_USED="${SGLANG_REF_USED}" \
+            -e SGLANG_VERSION_USED="${SGLANG_VERSION_USED}" \
+            -e SGLANG_IMAGE_SOURCE="${SGLANG_IMAGE_SOURCE}" \
+            -e SGLANG_IMAGE_TAG_USED="${SGLANG_IMAGE_TAG}" \
+            -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
+            "$CONTAINER_NAME" python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          result_path = os.environ["RESULT_PATH"]
+          with open(result_path, encoding="utf-8") as f:
+              data = json.load(f)
+
+          data["random_input_len"] = int(os.environ["ISL"])
+          data["random_output_len"] = int(os.environ["OSL"])
+          data["benchmark_backend"] = "ATOM-SGLang"
+
+          display_name = os.environ.get("DASHBOARD_MODEL_NAME", "")
+          if display_name:
+              data["benchmark_model_name"] = display_name
+
+          tp_match = re.search(
+              r"--tensor-parallel-size\s+(\d+)",
+              os.environ.get("EXTRA_ARGS_TEXT", ""),
+          )
+          if tp_match:
+              data["tensor_parallel_size"] = int(tp_match.group(1))
+
+          data["atom_source_repository"] = os.environ.get("ATOM_SOURCE_REPOSITORY", "")
+          data["atom_source_ref"] = os.environ.get("ATOM_SOURCE_REF", "")
+          data["atom_source_sha"] = os.environ.get("ATOM_SOURCE_SHA", "")
+          data["sglang_ref"] = os.environ.get("SGLANG_REF_USED", "")
+          data["sglang_version"] = os.environ.get("SGLANG_VERSION_USED", "")
+          data["sglang_image_source"] = os.environ.get("SGLANG_IMAGE_SOURCE", "")
+          data["sglang_image_tag"] = os.environ.get("SGLANG_IMAGE_TAG_USED", "")
+          data["dashboard_publish_allowed"] = (
+              os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
+          )
+
+          with open(result_path, "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2)
+          PY
+
+          $CONTAINER_ENGINE cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json"
+
+      - name: Inject GPU metadata into benchmark results
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          shopt -s nullglob
+          for f in "${RESULT_PREFIX}"-*.json; do
+            GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            RESULT_PATH="$f" \
+            python3 -c "
+          import json, os
+          p = os.environ['RESULT_PATH']
+          with open(p) as f:
+              d = json.load(f)
+          d['gpu_name'] = os.environ.get('GPU_NAME', '')
+          d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
+          d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
+          with open(p, 'w') as f:
+              json.dump(d, f, indent=2)
+          "
+          done
+
+      - name: Collect benchmark result
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          if [ ! -f "${RESULT_FILENAME}.json" ]; then
+            echo "ERROR: Benchmark result file ${RESULT_FILENAME}.json was not generated for ${MODEL_NAME}."
+            exit 1
+          fi
+
+      - name: Upload benchmark result
+        if: steps.check.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-benchmark-${{ env.RESULT_FILENAME }}
+          path: ${{ env.RESULT_FILENAME }}.json
+
+      - name: Clean up SGLang benchmark container
+        if: always() && steps.check.outputs.enabled == 'true'
+        run: |
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
+          $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
+          if [[ "${SGLANG_IMAGE_SOURCE}" == "rebuild" ]]; then
+            $CONTAINER_ENGINE rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
+          else
+            echo "Keeping prebuilt SGLang image cached on runner: ${SGLANG_IMAGE_TAG}"
+          fi
+
+  summarize-benchmark-result:
+    if: >-
+      always()
+      && needs.resolve-atom-source.result == 'success'
+      && needs.build-benchmark-matrix.result == 'success'
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
+    name: Summarize SGLang benchmark result
+    needs: [resolve-atom-source, build-benchmark-matrix, benchmark]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: 'sglang-benchmark-*'
+          merge-multiple: true
+          path: .
+        continue-on-error: true
+
+      - name: Count downloaded benchmark results
+        id: downloaded
+        run: |
+          shopt -s nullglob
+          json_files=(*.json)
+          echo "downloaded_count=${#json_files[@]}" >> "$GITHUB_OUTPUT"
+          printf 'Downloaded %s benchmark result files\n' "${#json_files[@]}"
+
+      - name: Note summary behavior
+        run: |
+          if [[ "${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}" == "true" ]]; then
+            printf '### Summary mode\nResults from `%s@%s` using `%s` SGLang image mode are shown below as a workflow summary table. Because dashboard upload is enabled for this run, this final Ubuntu summary job collects benchmark artifacts from all completed GPU cases and publishes the available successful results in one pass, then reconciles the completed run for regression comparison.\n' \
+              "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
+              "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
+              "${{ needs.resolve-atom-source.outputs.sglang_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '### Summary mode\nResults from `%s@%s` using `%s` SGLang image mode are shown below as a workflow summary table only. Dashboard upload is disabled for this run.\n' \
+              "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
+              "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
+              "${{ needs.resolve-atom-source.outputs.sglang_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Generate SGLang benchmark summary table
+        env:
+          BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/scripts/plugin_benchmark_summary.py \
+            --result-dir . \
+            --matrix-json "${BENCHMARK_MATRIX}" \
+            --run-url "${RUN_URL}" \
+            --output-json sglang_benchmark_summary.json \
+            --title "SGLang Benchmark Summary" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Read summary stats
+        id: summary-stats
+        run: |
+          PASSED_CASES=$(python3 -c "import json; print(json.load(open('sglang_benchmark_summary.json', encoding='utf-8'))['passed_cases'])")
+          FAILED_CASES=$(python3 -c "import json; print(json.load(open('sglang_benchmark_summary.json', encoding='utf-8'))['failed_cases'])")
+          echo "passed_cases=${PASSED_CASES}" >> "$GITHUB_OUTPUT"
+          echo "failed_cases=${FAILED_CASES}" >> "$GITHUB_OUTPUT"
+          echo "Summary stats: passed=${PASSED_CASES}, failed=${FAILED_CASES}"
+
+      - name: Upload SGLang benchmark summary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-benchmark-summary
+          path: sglang_benchmark_summary.json
+
+      - name: Download baseline from previous successful main run
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -t CANDIDATE_RUN_IDS < <(
+            {
+              gh run list \
+                --workflow="ATOM SGLang Benchmark" \
+                --branch=main \
+                --event=workflow_dispatch \
+                --status=success \
+                --limit=10 \
+                --json databaseId \
+                --jq '.[].databaseId // empty' || true
+            }
+          )
+
+          BASELINE_DIR=""
+          for PREV_RUN_ID in "${CANDIDATE_RUN_IDS[@]}"; do
+            if [ -z "$PREV_RUN_ID" ] || [ "$PREV_RUN_ID" = "${{ github.run_id }}" ]; then
+              continue
+            fi
+
+            echo "Checking baseline candidate run #$PREV_RUN_ID"
+            rm -rf /tmp/baseline_candidate /tmp/baseline
+            mkdir -p /tmp/baseline_candidate
+
+            if ! gh run download "$PREV_RUN_ID" --dir /tmp/baseline_candidate; then
+              echo "::warning::Failed to download baseline artifacts from run #$PREV_RUN_ID"
+              continue
+            fi
+
+            if python3 .github/scripts/plugin_benchmark_validate_baseline.py /tmp/baseline_candidate; then
+              mv /tmp/baseline_candidate /tmp/baseline
+              BASELINE_DIR="/tmp/baseline"
+              echo "Using baseline from run #$PREV_RUN_ID"
+              break
+            fi
+
+            echo "Skipping run #$PREV_RUN_ID because it is not a dashboard-eligible baseline."
+          done
+
+          echo "baseline_dir=${BASELINE_DIR}" >> "$GITHUB_OUTPUT"
+
+      - name: Note skipped dashboard processing
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases == '0'
+        run: |
+          printf '\nNo successful benchmark result JSONs were produced, so regression comparison and dashboard upload were skipped.\n' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize regression against baseline
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        id: check-regression
+        run: |
+          BASELINE_ARG=""
+          if [ -n "${{ steps.baseline.outputs.baseline_dir }}" ]; then
+            BASELINE_ARG="--baseline-dir ${{ steps.baseline.outputs.baseline_dir }}"
+          else
+            printf '\nNo eligible baseline run was found. Showing current successful results without regression deltas.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          python3 .github/scripts/plugin_benchmark_regression.py \
+            --result-dir . \
+            $BASELINE_ARG \
+            --output-json regression_report.json \
+            >> "$GITHUB_STEP_SUMMARY" || true
+
+          if [ -f regression_report.json ]; then
+            REG_COUNT=$(python3 -c "import json; print(json.load(open('regression_report.json', encoding='utf-8'))['regression_count'])")
+            if [ "$REG_COUNT" -gt 0 ]; then
+              echo "has_regression=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_regression=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "has_regression=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload regression report
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.check-regression.outputs.has_regression == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-benchmark-regression-report
+          path: regression_report.json
+
+      - name: Transform results for benchmark dashboard
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        run: |
+          python3 .github/scripts/plugin_benchmark_to_dashboard.py \
+            . \
+            --output benchmark-action-input.json \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --default-backend "ATOM-SGLang"
+
+      - name: Store benchmark result to dashboard
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: customBiggerIsBetter
+          output-file-path: benchmark-action-input.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmark-dashboard
+          auto-push: false
+          alert-threshold: "80%"
+          comment-on-alert: true
+          fail-on-alert: false
+          max-items-in-chart: 90
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push dashboard data to gh-pages
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/sglang-benchmark-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/sglang-benchmark-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update SGLang benchmark dashboard data"
+          git push origin HEAD:gh-pages

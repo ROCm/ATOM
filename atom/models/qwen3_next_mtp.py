@@ -108,17 +108,28 @@ class Qwen3NextMTP(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
+    weights_mapping = {"mtp.": "model."}
+
+    def remap_mtp_weight_name(self, name: str) -> str | None:
+        """Filter MTP weights; remap (mtp.* → model.*) is via weights_mapping."""
+        shared_weight_names = ["embed_tokens", "lm_head"]
+
+        # MTP-specific weights
+        if name.startswith("mtp."):
+            return name
+
+        # Shared weights loaded into both target and draft
+        if any(key in name for key in shared_weight_names):
+            return name
+
+        # Skip target model weights
+        return None
 
     def __init__(self, atom_config: Config, prefix: str = ""):
-        config = atom_config.hf_config
-        self.vllm_config = atom_config
-        assert (
-            not atom_config.enable_prefix_caching
-        ), "Qwen3NextMTP currently does not support prefix caching"
-
-        self.quant_config = atom_config.quant_config
-
         super().__init__()
+        config = atom_config.hf_config
+        if atom_config.enable_prefix_caching:
+            raise ValueError("Qwen3NextMTP currently does not support prefix caching")
         self.config = config
         self.model = Qwen3NextMultiTokenPredictor(
             atom_config=atom_config, prefix=maybe_prefix(prefix, "mtp")
@@ -163,26 +174,3 @@ class Qwen3NextMTP(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts,
         )
-
-
-def remap_mtp_weight_name(name: str) -> str | None:
-    """
-    Remap MTP weight names to match the model structure.
-    Returns None if the weight should be skipped.
-
-    MTP weights are stored with 'mtp.' prefix in checkpoints but loaded
-    into 'model.' in the actual model structure.
-    Shared weights (embed_tokens, lm_head) are loaded into both base model and MTP.
-    """
-    shared_weight_names = ["embed_tokens", "lm_head"]
-
-    # Remap mtp.* -> model.*
-    if name.startswith("mtp."):
-        return name.replace("mtp.", "model.")
-
-    # Allow shared weights to be loaded
-    if any(key in name for key in shared_weight_names):
-        return name
-
-    # Skip all other weights (they belong to base model, not MTP)
-    return None
