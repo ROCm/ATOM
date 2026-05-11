@@ -71,6 +71,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             device_resource_config=device_resource_config,
         )
         self.model = atom_model
+        # Cache module layer maps once to avoid per-forward model.modules() traversal.
+        self._rtp_layer_maps = RTPForwardContext.collect_layer_maps(model=self.model)
 
     def load_weights(self):
         # ATOM weights should be loaded exactly once from ATOMQwen35Moe._create_python_model.
@@ -238,13 +240,6 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         positions = self._extract_positions(
             inputs=inputs, model_device=model_device, token_num=token_num
         )
-        model_inputs_embeds = None
-        if input_ids is not None and input_ids.numel() > 0:
-            try:
-                # Dump-only tensor to align with RTP runtime/inputs_embeds comparison point.
-                model_inputs_embeds = self.model.embed_input_ids(input_ids)
-            except Exception:  # noqa: BLE001
-                model_inputs_embeds = None
         if input_ids is None or input_ids.numel() == 0:
             inputs_embeds = inputs.input_hiddens
             if (
@@ -261,7 +256,11 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                 inputs_embeds = inputs_embeds.to(dtype=model_dtype)
 
         with RTPForwardContext.bind(
-            model=self.model, runtime=self, inputs=inputs, positions=positions
+            model=self.model,
+            runtime=self,
+            inputs=inputs,
+            positions=positions,
+            layer_maps=self._rtp_layer_maps,
         ):
             hidden_states = self.model(
                 input_ids=input_ids,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import Optional
 
 import torch
@@ -179,9 +178,9 @@ def _write_kv_cache_from_slot_mapping(
     # Align with RTP paged KV cache layout directly and avoid aiter asm_layout path.
     slots = slot_mapping.to(device=key.device, dtype=torch.int64, non_blocking=True)
     valid = slots >= 0
-    if not bool(valid.any()):
-        return
     slots = slots[valid].contiguous()
+    if slots.numel() == 0:
+        return
     key = key[valid].contiguous()
     value = value[valid].contiguous()
     if _reshape_and_cache_shuffle_triton(
@@ -235,8 +234,6 @@ def _write_kv_cache_with_rtp_fused_kernel(
     head_dim: int,
     layer: int | None = None,
 ) -> bool:
-    if os.getenv("ATOM_RTP_USE_RTP_FUSED_KV_WRITE", "0") != "1":
-        return False
     try:
         from rtp_llm.ops import AttentionConfigs, KvCacheDataType
         from rtp_llm.ops.compute_ops import (
@@ -412,16 +409,6 @@ def _run_nonasm_paged_attention(
         k_scale = unit_scale
         v_scale = unit_scale
 
-    decode_flags = torch.tensor(
-        [
-            int(kv_scale_base is not None),
-            int(k_scale is not None),
-            int(v_scale is not None),
-        ],
-        dtype=torch.int32,
-        device=query.device,
-    )
-
     aiter.paged_attention_rocm(
         output,
         exp_sums,
@@ -538,13 +525,11 @@ class RTPFullAttention(BaseAttention):
         key_cache = paged_kv.select(1, 0)
         value_cache = paged_kv.select(1, 1)
         target_kv_heads = int(key_cache.shape[1])
-        k, v, kv_dup_factor = _align_kv_heads_for_cache(
+        k, v, _ = _align_kv_heads_for_cache(
             key=k,
             value=v,
             target_kv_heads=target_kv_heads,
         )
-        if kv_dup_factor != 1:
-            pass
         query_start_loc = getattr(attn_metadata.plugin_metadata, "query_start_loc", None)
         block_tables = _resolve_block_tables_for_layer(attn_inputs, int(self.layer_num))
         if block_tables is None or block_tables.numel() == 0:

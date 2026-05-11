@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import logging
 
 import torch
@@ -18,7 +17,6 @@ def apply_qwen3_next_rtpllm_patch() -> None:
         return
 
     import atom.models.qwen3_next as qwen3_next
-
     def _split_router_logits(self, router_logits: torch.Tensor):
         n_shared = int(getattr(self, "n_shared_experts", 0) or 0)
         if n_shared <= 0:
@@ -79,8 +77,6 @@ def apply_qwen3_next_rtpllm_patch() -> None:
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.layer_type == "full_attention":
-            pass
         if self.input_layernorm.use_fused_quant:
             if residual is None:
                 residual = hidden_states
@@ -99,12 +95,6 @@ def apply_qwen3_next_rtpllm_patch() -> None:
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        pre_ln_weight = getattr(self.input_layernorm, "weight", None)
-        if pre_ln_weight is not None:
-            # GemmaRMSNorm keeps delta in parameter and applies (1 + weight) in forward.
-            # Dump gamma-form weight to align with RTP side RMSResNorm weight semantics.
-            pre_ln_weight = pre_ln_weight + 1.0
-
         if self.layer_type == "linear_attention":
             pre_ln_hidden = hidden_bf16 if hidden_bf16 is not None else hidden_states
             hidden_states = self.linear_attn(
@@ -113,12 +103,8 @@ def apply_qwen3_next_rtpllm_patch() -> None:
                 x_scale=x_scale,
             )
         elif self.layer_type == "full_attention":
-            use_rtp_fused_kv_write = (
-                os.getenv("ATOM_RTP_USE_RTP_FUSED_KV_WRITE", "0") == "1"
-            )
-            attn_positions = (
-                torch.zeros_like(positions) if use_rtp_fused_kv_write else positions
-            )
+            # RTP+ATOM mode always uses RTP fused KV write path.
+            attn_positions = torch.zeros_like(positions)
             hidden_states = self.self_attn(
                 hidden_states=hidden_states,
                 positions=attn_positions,

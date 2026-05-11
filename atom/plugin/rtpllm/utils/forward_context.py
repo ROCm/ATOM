@@ -38,6 +38,7 @@ class RTPForwardContext:
     kv_cache_data: Dict[str, KVCacheTensor]
     context: Context
     num_tokens: int
+    LayerMaps = tuple[Dict[int, GatedDeltaNet], Dict[int, Any]]
 
     @staticmethod
     def _non_empty_int32(
@@ -643,10 +644,7 @@ class RTPForwardContext:
         )
 
     @staticmethod
-    def _build_kv_cache_tensors(model: Any, runtime: Any) -> Dict[str, KVCacheTensor]:
-        if runtime.kv_cache is None:
-            raise ValueError("RTP plugin requires initialized kv_cache for ATOM model.")
-
+    def collect_layer_maps(model: Any) -> LayerMaps:
         gdn_layer_map: Dict[int, GatedDeltaNet] = {}
         full_attn_layer_map: Dict[int, Any] = {}
         rtp_attention_cls: type[Any] | None = None
@@ -656,6 +654,7 @@ class RTPForwardContext:
             rtp_attention_cls = RTPAttention
         except Exception:  # noqa: BLE001
             rtp_attention_cls = None
+
         for module in model.modules():
             if isinstance(module, GatedDeltaNet):
                 gdn_layer_map[int(module.layer_num)] = module
@@ -668,6 +667,17 @@ class RTPForwardContext:
                     layer_num = getattr(module, "layer_num", None)
                 if layer_num is not None:
                     full_attn_layer_map[int(layer_num)] = module
+        return gdn_layer_map, full_attn_layer_map
+
+    @staticmethod
+    def _build_kv_cache_tensors(
+        runtime: Any,
+        layer_maps: LayerMaps,
+    ) -> Dict[str, KVCacheTensor]:
+        if runtime.kv_cache is None:
+            raise ValueError("RTP plugin requires initialized kv_cache for ATOM model.")
+
+        gdn_layer_map, full_attn_layer_map = layer_maps
 
         if not gdn_layer_map and not full_attn_layer_map:
             return {}
@@ -761,7 +771,14 @@ class RTPForwardContext:
         return cache_tensors
 
     @classmethod
-    def build(cls, model: Any, runtime: Any, inputs: Any, positions: torch.Tensor) -> "RTPForwardContext":
+    def build(
+        cls,
+        model: Any,
+        runtime: Any,
+        inputs: Any,
+        positions: torch.Tensor,
+        layer_maps: LayerMaps | None = None,
+    ) -> "RTPForwardContext":
         attn_inputs = getattr(inputs, "attention_inputs", None)
         if attn_inputs is None:
             raise ValueError("RTP plugin requires inputs.attention_inputs for forward context.")
@@ -787,7 +804,10 @@ class RTPForwardContext:
             positions=positions,
             seq_size_per_block=kernel_seq_size_per_block,
         )
-        kv_cache_data = cls._build_kv_cache_tensors(model=model, runtime=runtime)
+        kv_cache_data = cls._build_kv_cache_tensors(
+            runtime=runtime,
+            layer_maps=layer_maps or cls.collect_layer_maps(model),
+        )
         input_lengths = cls._non_empty_int32(
             getattr(attn_inputs, "input_lengths", None),
             device=positions.device,
@@ -823,12 +843,14 @@ class RTPForwardContext:
         runtime: Any,
         inputs: Any,
         positions: torch.Tensor,
+        layer_maps: LayerMaps | None = None,
     ) -> Iterator[None]:
         forward_context = cls.build(
             model=model,
             runtime=runtime,
             inputs=inputs,
             positions=positions,
+            layer_maps=layer_maps,
         )
         prev_kv = _forward_kv_cache_context.kv_cache_data
         attn_md = forward_context.attn_metadata
