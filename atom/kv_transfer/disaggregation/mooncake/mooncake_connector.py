@@ -327,6 +327,7 @@ class MooncakeConnector(KVConnectorBase):
         # The write listener looks up block_ids here when consumer requests a write.
         self._completed_prefills: dict[ReqId, list[int]] = {}
         self._completed_prefills_lock = threading.Lock()
+        self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
 
         # --- Consumer: pending receive tracking ---
         self._pending_recv: set[ReqId] = set()
@@ -641,8 +642,9 @@ class MooncakeConnector(KVConnectorBase):
         # Producer: cache block_ids from completed prefills
         if self.is_producer:
             for req_id, meta in metadata.reqs_to_save.items():
-                with self._completed_prefills_lock:
+                with self._completed_prefills_cv:
                     self._completed_prefills[req_id] = meta.local_block_ids
+                    self._completed_prefills_cv.notify_all()
                 logger.info(
                     "[PRODUCER] Cached %d prefill blocks for req %s",
                     len(meta.local_block_ids),
@@ -955,14 +957,14 @@ class MooncakeConnector(KVConnectorBase):
 
     def _wait_for_prefill_blocks(self, req_id: str) -> list[int] | None:
         """Wait until prefill block_ids are available for this request."""
-        deadline = time.monotonic() + PREFILL_LOOKUP_TIMEOUT
-        while time.monotonic() < deadline:
-            with self._completed_prefills_lock:
-                block_ids = self._completed_prefills.get(req_id)
-                if block_ids is not None:
-                    return block_ids
-            time.sleep(PREFILL_LOOKUP_POLL_INTERVAL)
-        return None
+        with self._completed_prefills_cv:
+            ready = self._completed_prefills_cv.wait_for(
+                lambda: req_id in self._completed_prefills,
+                timeout=PREFILL_LOOKUP_TIMEOUT,
+            )
+            if ready:
+                return self._completed_prefills[req_id]
+            return None
 
     def _send_write_done(self, host: str, port: int, req_id: str) -> None:
         """Send write-done notification to consumer via persistent socket.

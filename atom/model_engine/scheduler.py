@@ -649,30 +649,6 @@ class Scheduler:
 
         total_tokens_num_decode = sum(num_scheduled_tokens)
 
-        # ---- PD diagnostic: block collision check ----
-        if remote_kv_blocks and scheduled_seqs:
-            all_blocks_by_seq: dict[int, list[int]] = {}
-            for sid, seq in scheduled_seqs.items():
-                all_blocks_by_seq[sid] = list(seq.block_table)
-            seen: dict[int, int] = {}
-            for sid, blocks in all_blocks_by_seq.items():
-                for blk in blocks:
-                    if blk in seen:
-                        logger.error(
-                            "[PD-DIAG] BLOCK COLLISION! block %d shared by "
-                            "seq %d and seq %d. "
-                            "seq %d blocks=%s, seq %d blocks=%s",
-                            blk,
-                            seen[blk],
-                            sid,
-                            seen[blk],
-                            all_blocks_by_seq[seen[blk]][:10],
-                            sid,
-                            blocks[:10],
-                        )
-                    else:
-                        seen[blk] = sid
-
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs.values()))
 
