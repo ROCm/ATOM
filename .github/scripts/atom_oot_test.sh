@@ -50,12 +50,18 @@ EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
 EXPLICIT_CLIENT_COMMAND=${OOT_CLIENT_COMMAND:-}
+OOT_GPU_MEMORY_UTILIZATION=${OOT_GPU_MEMORY_UTILIZATION:-0.9}
 OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LAST_VLLM_LOG_LINE=0
 
 if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
   echo "Invalid LM_EVAL_NUM_FEWSHOT: ${LM_EVAL_NUM_FEWSHOT}. Expected a non-negative integer."
+  exit 2
+fi
+
+if ! [[ "${OOT_GPU_MEMORY_UTILIZATION}" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+  echo "Invalid OOT_GPU_MEMORY_UTILIZATION: ${OOT_GPU_MEMORY_UTILIZATION}. Expected a numeric value."
   exit 2
 fi
 
@@ -180,6 +186,7 @@ PY
   echo "Model name: ${model_name}"
   echo "Model path: ${resolved_model_path}"
   echo "Extra args: ${extra_args}"
+  echo "GPU memory utilization: ${OOT_GPU_MEMORY_UTILIZATION}"
 
   export SAFETENSORS_FAST_GPU=1
   export VLLM_RPC_TIMEOUT=1800000
@@ -206,7 +213,7 @@ PY
     --trust-remote-code \
     --kv-cache-dtype fp8 \
     "${extra_arg_array[@]}" \
-    --gpu-memory-utilization 0.9 \
+    --gpu-memory-utilization "${OOT_GPU_MEMORY_UTILIZATION}" \
     --no-enable-prefix-caching \
     > "${VLLM_LOG_FILE}" 2>&1 &
   echo $! > "${VLLM_PID_FILE}"

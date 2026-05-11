@@ -1,10 +1,13 @@
+import copy
 import logging
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+from aiter import dtypes
 from aiter.dist.parallel_state import get_pp_group
-from atom.config import CompilationLevel, Config
+from atom.config import CompilationLevel, Config, KVCacheTensor
 from atom.model_loader.loader import load_model
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import SpecDecodeMetadata, get_forward_context
@@ -18,7 +21,135 @@ support_eagle_model_arch_dict = {
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
     "MiMoV2FlashMTPModel": "atom.models.mimo_v2_flash_mtp.MiMoV2FlashMTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
+    "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
 }
+
+
+class Eagle3DraftBuilder:
+    """KV cache subsystem for an Eagle3 MHA draft alongside a non-MHA target.
+
+    Implements the same subset of `AttentionMetadataBuilder` hooks that
+    ModelRunner consults during KV pool sizing and per-module binding —
+    `compute_block_bytes`, `allocate_kv_cache_tensors`, and
+    `build_kv_cache_tensor` — so the draft's independent non-MLA cache
+    fits the post-#659 builder protocol without leaking into the target's
+    builder. The draft does NOT drive prepare_decode/prepare_prefill;
+    it piggybacks on the target builder's metadata flow during propose.
+    """
+
+    def __init__(self, model_runner, draft_hf):
+        self.model_runner = model_runner
+        self.draft_hf = draft_hf
+        self.block_size = model_runner.block_size
+        self.num_kv_heads = draft_hf.num_key_value_heads // model_runner.world_size
+        self.num_layers = draft_hf.num_hidden_layers
+        self.head_dim = draft_hf.head_dim
+        self._next_layer_id = 0  # consumed by build_kv_cache_tensor
+        self.num_blocks = 0  # set in allocate_kv_cache_tensors
+
+    def compute_block_bytes(self) -> int:
+        """Per-block bytes for the draft's independent non-MLA KV cache."""
+        kv_dtype_size = dtypes.d_dtypes[
+            self.model_runner.config.kv_cache_dtype
+        ].itemsize
+        bb = (
+            2
+            * self.num_layers
+            * self.block_size
+            * self.num_kv_heads
+            * self.head_dim
+            * kv_dtype_size
+        )
+        if self.model_runner.config.kv_cache_dtype == "fp8":
+            # fp8 KV cache needs an extra per-(layer, block, kv_head) scale
+            # tensor (one fp32 per element) to dequantize fp8 → bf16 at
+            # attention time. Reserve that space alongside the cache.
+            bb += (
+                2
+                * self.num_layers
+                * self.block_size
+                * self.num_kv_heads
+                * dtypes.fp32.itemsize
+            )
+        return bb
+
+    def allocate_kv_cache_tensors(self, num_kv_heads, num_draft_layers) -> dict:
+        """Allocate the draft's [2, L, blocks, block_size, kv_heads, head_dim]
+        cache and matching fp32 scale; ModelRunner setattr's both onto itself
+        under namespaced keys so they don't collide with the target builder's
+        `kv_cache` / `kv_scale`.
+        """
+        runner = self.model_runner
+        config = runner.config
+        # Draft's block budget scales with the target pool: same total token
+        # capacity, just paged at the draft's own block size.
+        self.num_blocks = (
+            config.num_kvcache_blocks * runner.block_size // self.block_size
+        )
+        cache = torch.zeros(
+            2,
+            self.num_layers,
+            self.num_blocks,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+            device="cuda",
+        )
+        scale = torch.zeros(
+            2,
+            self.num_layers,
+            self.num_blocks,
+            self.num_kv_heads,
+            self.block_size,
+            dtype=dtypes.fp32,
+            device="cuda",
+        )
+        logger.info(f"Allocated Eagle3 draft KV cache: {cache.shape}")
+        return {"eagle3_kv_cache": cache, "eagle3_kv_scale": scale}
+
+    def build_kv_cache_tensor(self, layer_id: int, module):
+        """Bind one Eagle3 draft attention module to its slice of the
+        independent draft KV cache. Returns None for non-MHA modules so
+        ModelRunner falls through to the target builder.
+        """
+        if not (
+            hasattr(module, "base_attention")
+            and hasattr(module, "use_mla")
+            and not module.use_mla
+        ):
+            return None
+        runner = self.model_runner
+        idx = self._next_layer_id
+        self._next_layer_id += 1
+        cache = runner.eagle3_kv_cache
+        x = 16 // cache.element_size()
+        k_cache = cache[0, idx].view(
+            self.num_blocks,
+            self.num_kv_heads,
+            self.head_dim // x,
+            self.block_size,
+            x,
+        )
+        v_cache = cache[1, idx].view(
+            self.num_blocks,
+            self.num_kv_heads,
+            self.head_dim,
+            self.block_size,
+        )
+        module.max_model_len = runner.config.max_model_len
+        if runner.config.kv_cache_dtype == "fp8":
+            module.k_scale = runner.eagle3_kv_scale[0, idx]
+            module.v_scale = runner.eagle3_kv_scale[1, idx]
+        module.k_cache = k_cache
+        module.v_cache = v_cache
+        return KVCacheTensor(
+            layer_num=layer_id,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_scale=getattr(module, "k_scale", None),
+            v_scale=getattr(module, "v_scale", None),
+        )
 
 
 class EagleProposer:
@@ -49,7 +180,30 @@ class EagleProposer:
         self.device = device
         draft_model_hf_config = self.speculative_config.draft_model_hf_config
         model_class = resolve_obj_by_qualname(support_eagle_model_arch_dict[draft_model_hf_config.architectures[0]])  # type: ignore
-        self.model = model_class(self.config)
+
+        if self.speculative_config.method == "eagle3":
+            # Eagle3 draft model has its own architecture (Llama, not MLA),
+            # so it must be constructed with the draft model's hf_config.
+            # Also disable torch.compile for the draft model to avoid
+            # Dynamo tracing issues with the separate KV cache binding.
+            draft_atom_config = copy.deepcopy(atom_config)
+            draft_atom_config.hf_config = draft_model_hf_config
+            draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
+            # Draft attention layer_num must continue from the target model's
+            # layer count so it maps to the correct kv_cache_data entry.
+            self.model = model_class(
+                draft_atom_config,
+                layer_offset=atom_config.hf_config.num_hidden_layers,
+            )
+            # Attach the draft's KV-cache builder to the runner. ModelRunner
+            # consults `runner.eagle3_draft_builder` from `_compute_block_bytes`
+            # / `allocate_kv_cache` to size + allocate + bind the draft's
+            # independent non-MLA cache through the standard builder protocol.
+            runner.eagle3_draft_builder = Eagle3DraftBuilder(
+                runner, draft_model_hf_config
+            )
+        else:
+            self.model = model_class(self.config)
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
@@ -78,6 +232,23 @@ class EagleProposer:
             setattr(owner, attr, source)
 
     def load_model(self, target_model: nn.Module) -> None:
+        if self.speculative_config.method == "eagle3":
+            # Eagle3: load from a separate draft model checkpoint with
+            # independent embed_tokens and lm_head (no sharing).
+            load_model(
+                self.model,
+                self.speculative_config.model,
+                self.speculative_config.draft_model_hf_config,
+                self.config.load_dummy,
+                False,
+            )
+            logger.info(
+                "Eagle3 draft model loaded from %s (independent embed/lm_head)",
+                self.speculative_config.model,
+            )
+            return
+
+        # MTP: load from the target model checkpoint and share embeddings/lm_head.
         loaded = load_model(
             self.model,
             self.config.model,
@@ -101,11 +272,6 @@ class EagleProposer:
             )
             del self.model.model.embed_tokens
             self.model.model.embed_tokens = target_base.model.embed_tokens
-        else:
-            logger.info(
-                "The EAGLE head's vocab embedding will be loaded separately"
-                " from the target model."
-            )
 
         # Share lm_head from target if not loaded from checkpoint.
         # Case 1: per-layer shared_head.head (DeepSeek MTP)
@@ -148,6 +314,7 @@ class EagleProposer:
         num_reject_tokens: torch.Tensor,
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
+        aux_hidden_states: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
 
         forward_context = get_forward_context()
@@ -161,21 +328,48 @@ class EagleProposer:
         # input_ids[last_token_indices] = next_token_ids
         input_ids.scatter_(0, last_token_indices, next_token_ids)
         positions = target_positions + 1
-        hidden_states = target_hidden_states
+
+        # Eagle3: project concatenated aux hidden states through fc
+        if aux_hidden_states is not None:
+            concat_aux = torch.cat(aux_hidden_states, dim=-1)
+            hidden_states = self.model.combine_hidden_states(concat_aux)
+        else:
+            hidden_states = target_hidden_states
 
         draft_token_ids = torch.empty(
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
-        # return draft_token_ids.fill_(1) # for debug
         var = self.runner.forward_vars
-        use_mla = self.runner.use_mla
+        target_uses_mla = self.runner.use_mla
+        # Eaale3 only support mha currently
+        draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
+
+        # Eagle3 MLA: re-slice slot_mapping to len(input_ids).
+        # Target's MLA prepare_decode sized it
+        # to bs*max_q_len; after rejection len(input_ids) may be smaller,
+        # and the MHA cache-write kernel asserts slot_mapping <= q.
+        # Other fields (block_tables, context_lens, slot_mapping values
+        # themselves) are already in a draft-compatible format because
+        # MLA's prepare_decode uses the same runner.block_size as the draft.
+        if draft_uses_mha:
+            attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
+
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
-                ret_hidden_states = self.model(
+                model_output = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     hidden_states=hidden_states,
                 )
+                # Eagle3 draft (the only draft_uses_mha case under narrow
+                # semantics) returns (post_norm, pre_norm); MTP drafts return
+                # a single hidden tensor.
+                if draft_uses_mha:
+                    ret_hidden_states, ret_hidden_prenorm = model_output
+                else:
+                    ret_hidden_states = model_output
+                    ret_hidden_prenorm = None
+
                 sample_hidden_states = (
                     torch.index_select(ret_hidden_states, 0, last_token_indices)
                     if i == 0
@@ -204,7 +398,7 @@ class EagleProposer:
                         attn_metadata.kv_indices = kv_indices
                         attn_metadata.cu_seqlens_q = cu_seqlens_q
                         attn_metadata.slot_mapping = slot_mapping
-                        if use_mla:
+                        if target_uses_mla:
                             kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
                             attn_metadata.kv_last_page_lens = kv_last_page_lens
                         # block_tables, context_lens, and sparse_kv_indptr are
@@ -216,7 +410,7 @@ class EagleProposer:
                                 "sparse_kv_indptr"
                             ].gpu[: bs + 1]
                         cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
-                        if use_mla:
+                        if target_uses_mla:
                             # MLA: block_size=1, kv_indptr tracks tokens
                             kv_indptr[1 : bs + 1] -= torch.cumsum(
                                 num_reject_tokens, dim=0
@@ -243,9 +437,19 @@ class EagleProposer:
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
                     slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
+
                     input_ids = new_draft_ids
                     positions += 1
-                    hidden_states = sample_hidden_states
+                    if ret_hidden_prenorm is not None:
+                        hidden_states = (
+                            torch.index_select(
+                                ret_hidden_prenorm, 0, last_token_indices
+                            )
+                            if i == 0
+                            else ret_hidden_prenorm
+                        )
+                    else:
+                        hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]

@@ -131,7 +131,12 @@ class PagedAttentionImpl(nn.Module):
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
-        use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
+        # MTP MHA must go through triton/gluon; aiter ASM non-persistent path may have some unexpected behavior.
+        use_triton_attn = (
+            self.sliding_window != -1
+            or self.head_dim != 128
+            or self.num_heads == self.num_kv_heads
+        )
         self.use_triton_attn = use_triton_attn
 
         if (
@@ -535,9 +540,7 @@ class PagedAttentionImpl(nn.Module):
         # variable lenth attention use key value as input
         attn_metadata = fwd_ctx.attn_metadata
         sliding_window = (
-            (self.sliding_window, 0, 0)
-            if self.sliding_window is not None
-            else (-1, -1, 0)
+            (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
         )
         o = aiter.flash_attn_varlen_func(
             q,
@@ -579,9 +582,7 @@ class PagedAttentionImpl(nn.Module):
         num_seqs = attn_metadata.cu_seqlens_q.shape[0] - 1
         descale_shape = (num_seqs, k.shape[1])
         sliding_window = (
-            (self.sliding_window - 1, 0)
-            if self.sliding_window is not None
-            else (-1, -1)
+            (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
 
         # `block_tables` is always populated by TritonMHAMetadataBuilder.

@@ -1840,6 +1840,8 @@ class DeepseekV2Model(nn.Module):
             )
         else:
             self.norm = PPMissingLayer()
+        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
+
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -1853,7 +1855,9 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> Union[
+        torch.Tensor, IntermediateTensors, Tuple[torch.Tensor, list[torch.Tensor]]
+    ]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1865,7 +1869,13 @@ class DeepseekV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer : self.end_layer]:
+        aux_hidden_states = []
+        for idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[idx]
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    hidden_states if residual is None else hidden_states + residual
+                )
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
@@ -1874,6 +1884,9 @@ class DeepseekV2Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -1973,6 +1986,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                 ),
             }
         )
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Default Eagle3 aux hidden-state layer ids: early / middle / late
+        of the target model. Aligned with vLLM's default (see
+        vllm/model_executor/models/deepseek_v2.py).
+        """
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

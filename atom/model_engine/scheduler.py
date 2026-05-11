@@ -676,12 +676,21 @@ class Scheduler:
                 continue
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
-            if self.spec_stats:
-                self.spec_stats.update(num_new_token)
             if is_deferred_out or self.use_spec:
                 num_rejected = fwd_output.num_rejected[idx]
                 num_bonus = fwd_output.num_bonus[idx]
                 offset = 0 if (num_new_token + num_rejected) == 1 else self.mtp_k
+                # Align stats with vLLM: only count steps that actually ran
+                # speculation (drafts proposed and validated). Skip the
+                # prefill-only step where no draft tokens were scored against
+                # the target — vLLM gates this via
+                # `if scheduled_spec_token_ids and generated_token_ids`.
+                if (
+                    self.spec_stats
+                    and num_new_token > 0
+                    and (num_new_token + num_rejected) > 1
+                ):
+                    self.spec_stats.update(num_new_token)
                 seq.num_rejected = num_rejected
                 seq.num_bonus_tokens = num_bonus
                 for i, el in enumerate(token_ids):

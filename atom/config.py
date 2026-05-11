@@ -723,6 +723,8 @@ class SpeculativeConfig:
     model: Optional[str] = None
     num_speculative_tokens: Optional[int] = None
     draft_model_hf_config: Optional[PretrainedConfig] = None
+    use_aux_hidden_state: bool = False
+    eagle3_aux_layer_ids: list[int] = field(default_factory=list)
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -754,8 +756,34 @@ class SpeculativeConfig:
             self.draft_model_hf_config = self.draft_model_hf_config.text_config
         self.hf_config_override(self.draft_model_hf_config)
 
+        if self.method == "eagle3":
+            if getattr(self.draft_model_hf_config, "kv_lora_rank", None):
+                raise NotImplementedError(
+                    "Eagle3 draft model with MLA attention is not supported"
+                )
+            # Aux hidden state layers: prefer the draft checkpoint's
+            # eagle_config; if absent or the list is empty, ModelRunner
+            # falls back to model.get_eagle3_aux_hidden_state_layers(),
+            # which defaults to 3 layers — early / middle / late
+            # (see DeepseekV2ForCausalLM.get_eagle3_aux_hidden_state_layers,
+            # returns `(2, num_layers // 2, num_layers - 3)`, aligned with vLLM).
+            eagle_cfg = getattr(self.draft_model_hf_config, "eagle_config", None)
+            if eagle_cfg:
+                self.use_aux_hidden_state = eagle_cfg.get("use_aux_hidden_state", False)
+                if self.use_aux_hidden_state and not self.eagle3_aux_layer_ids:
+                    self.eagle3_aux_layer_ids = eagle_cfg.get(
+                        "eagle_aux_hidden_state_layer_ids", []
+                    )
+            else:
+                self.use_aux_hidden_state = True
+
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> None:
+        # Eagle3 architecture mapping (architecture-level, not model_type)
+        arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        if arch == "LlamaForCausalLMEagle3":
+            hf_config.architectures = ["Eagle3LlamaModel"]
+
         # Step 1: resolve model_type → mtp model_type
         mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)
         if mtp_type is not None:

@@ -559,6 +559,13 @@ class ModelRunner:
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
+        self.eagle3_mode = (
+            self.config.speculative_config is not None
+            and self.config.speculative_config.method == "eagle3"
+        )
+
+        self.use_aux_hidden_state_outputs = False
+        self._aux_hidden_states = None
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
@@ -621,6 +628,18 @@ class ModelRunner:
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
+
+        if self.eagle3_mode and self.config.speculative_config.use_aux_hidden_state:
+            aux_ids = self.config.speculative_config.eagle3_aux_layer_ids
+            if not aux_ids and hasattr(
+                self.model, "get_eagle3_aux_hidden_state_layers"
+            ):
+                aux_ids = list(self.model.get_eagle3_aux_hidden_state_layers())
+            if aux_ids:
+                self.model.set_aux_hidden_state_layers(tuple(aux_ids))
+                self.use_aux_hidden_state_outputs = True
+                logger.info(f"Eagle3 aux hidden state layers: {aux_ids}")
+
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
@@ -1075,24 +1094,35 @@ class ModelRunner:
             return 1
 
     def _get_total_num_layers(self):
-        """Return total layer count including draft (MTP) layers."""
+        """Return total layer count including draft (MTP) layers.
+
+        Drafts that own an independent KV cache via their own builder
+        (e.g. Eagle3 MHA draft on an MLA target) account for their layers
+        through that builder, so they are NOT added here. Only MTP-style
+        drafts that share the target's KV pool contribute.
+        """
         total = self.config.hf_config.num_hidden_layers
         if self.config.speculative_config and hasattr(self, "drafter"):
-            draft_hf = self.config.speculative_config.draft_model_hf_config
-            total += getattr(draft_hf, "num_nextn_predict_layers", 1)
+            if not hasattr(self, "eagle3_draft_builder"):
+                draft_hf = self.config.speculative_config.draft_model_hf_config
+                total += getattr(draft_hf, "num_nextn_predict_layers", 1)
         return total
 
     def _compute_block_bytes(self):
         """Per-block bytes for the unified KV pool budget.
 
-        Delegates to the attention builder, which knows its own tensor
-        layout (MLA 576-dim packed, GDN-hybrid full-attn-only, MiMo-V2
-        per-layer-type, standard MHA split-K/V). Mirror of
-        `attn_metadata_builder.allocate_kv_cache_tensors()` so the budget
-        math matches what's actually allocated. Per-request cache bytes
-        are accounted for separately via `compute_per_req_cache_bytes()`.
+        Sum across all attention builders attached to this runner: the
+        target builder always, plus an optional `eagle3_draft_builder`
+        when a heterogeneous spec-decode draft owns its own KV pool. Each
+        builder knows its own tensor layout (MLA 576-dim packed, GDN-hybrid
+        full-attn-only, MiMo-V2 per-layer-type, standard MHA split-K/V,
+        Eagle3 independent MHA). Per-request cache bytes are accounted
+        for separately via `compute_per_req_cache_bytes()`.
         """
-        return self.attn_metadata_builder.compute_block_bytes()
+        block_bytes = self.attn_metadata_builder.compute_block_bytes()
+        if hasattr(self, "eagle3_draft_builder"):
+            block_bytes += self.eagle3_draft_builder.compute_block_bytes()
+        return block_bytes
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
@@ -1255,13 +1285,24 @@ class ModelRunner:
         num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
-            # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
-            num_draft_layers = getattr(draft_hf_config, "num_nextn_predict_layers", 1)
-            total_num_layers += num_draft_layers
-            logger.info(
-                f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
-                f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
-            )
+            if hasattr(self, "eagle3_draft_builder"):
+                # Heterogeneous draft (e.g. Eagle3 MHA on MLA target) owns
+                # its own KV pool via its builder; don't add to target's count.
+                num_draft_layers = draft_hf_config.num_hidden_layers
+                logger.info(
+                    f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
+                    f"{num_draft_layers} Eagle3 draft layers (separate non-MLA cache)"
+                )
+            else:
+                # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
+                num_draft_layers = getattr(
+                    draft_hf_config, "num_nextn_predict_layers", 1
+                )
+                total_num_layers += num_draft_layers
+                logger.info(
+                    f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
+                    f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
+                )
 
         # Primary KV cache allocation (model-agnostic, delegated to the
         # attention builder). Each builder owns its tensor layout: MLA →
@@ -1276,6 +1317,16 @@ class ModelRunner:
         )
         for name, value in main_kv.items():
             setattr(self, name, value)
+
+        # Heterogeneous draft (e.g. Eagle3 MHA alongside an MLA target) owns
+        # its own KV pool through a sibling builder; same protocol as above,
+        # tensors land under namespaced keys (eagle3_kv_cache, eagle3_kv_scale).
+        if hasattr(self, "eagle3_draft_builder"):
+            draft_kv = self.eagle3_draft_builder.allocate_kv_cache_tensors(
+                num_kv_heads, num_draft_layers
+            )
+            for name, value in draft_kv.items():
+                setattr(self, name, value)
 
         # Per-request cache allocation (model-agnostic, delegated to the
         # attention metadata builder). For GDN this returns
@@ -1302,10 +1353,12 @@ class ModelRunner:
         kv_cache_tensors = []
         layer_id = 0
         # Promote to self so the attention builder's build_kv_cache_tensor()
-        # can access it without recomputing from drafter state.
+        # can access it without recomputing from drafter state. Heterogeneous
+        # drafts (Eagle3) own their own layer space via their builder, so
+        # leave mtp_start_layer_idx at hf_config.num_hidden_layers in that mode.
         self.mtp_start_layer_idx = (
             self.drafter.model.model.mtp_start_layer_idx
-            if hasattr(self, "drafter")
+            if hasattr(self, "drafter") and not hasattr(self, "eagle3_draft_builder")
             else hf_config.num_hidden_layers
         )
         for model_name, model in models_to_bind:
@@ -1314,6 +1367,18 @@ class ModelRunner:
             )
 
             for module in model.modules():
+                # Drafts that own an independent KV pool (Eagle3) bind through
+                # their sibling builder first; for unrecognized modules it
+                # returns None and we fall through to the target builder.
+                if model_name == "draft" and hasattr(self, "eagle3_draft_builder"):
+                    kv_cache_tensor = self.eagle3_draft_builder.build_kv_cache_tensor(
+                        layer_id, module
+                    )
+                    if kv_cache_tensor is not None:
+                        kv_cache_tensors.append(kv_cache_tensor)
+                        layer_id += 1
+                        continue
+
                 # Per-attention-type binding is owned by the attention
                 # metadata builder; ModelRunner only walks modules and
                 # collects the resulting KVCacheTensor entries. The builder
@@ -1625,7 +1690,12 @@ class ModelRunner:
                 label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
             label += "]"
             with record_function(label):
-                hidden_states = self.model(input_ids, positions)
+                model_output = self.model(input_ids, positions)
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, self._aux_hidden_states = model_output
+                else:
+                    hidden_states = model_output
+                    self._aux_hidden_states = None
                 logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
@@ -1645,6 +1715,12 @@ class ModelRunner:
                 self.graphs[graph_key].replay()
                 num_tokens = context.batch_size * max_q_len
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
+                if graph_key in self.graph_aux_hidden:
+                    self._aux_hidden_states = [
+                        aux[:num_tokens] for aux in self.graph_aux_hidden[graph_key]
+                    ]
+                else:
+                    self._aux_hidden_states = None
                 if self.logits_in_graph:
                     logits = self.graph_logits[graph_key][:num_tokens]
                 else:
@@ -1833,6 +1909,7 @@ class ModelRunner:
             num_reject_tokens=num_reject_tokens,
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
+            aux_hidden_states=self._aux_hidden_states,
         )
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
@@ -1882,6 +1959,7 @@ class ModelRunner:
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
+        self.graph_aux_hidden: dict[tuple[int, int], list[torch.Tensor]] = dict()
         self.graph_pool = None
         is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
@@ -1932,9 +2010,13 @@ class ModelRunner:
                 )
 
                 # Warmup
-                outputs[:num_tokens] = self.model(
+                model_output = self.model(
                     input_ids[:num_tokens], positions[:num_tokens]
                 )
+                if self.use_aux_hidden_state_outputs:
+                    outputs[:num_tokens] = model_output[0]
+                else:
+                    outputs[:num_tokens] = model_output
                 if self.logits_in_graph:
                     self.model.compute_logits(outputs[:num_tokens])
 
@@ -1953,13 +2035,20 @@ class ModelRunner:
                             gc.stream,
                             output_buffer=outputs[:num_tokens],
                         )
+                        graph_aux = None
                     else:
                         # Standard single-stream capture
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
-                            outputs[:num_tokens] = self.model(
+                            model_output = self.model(
                                 input_ids[:num_tokens], positions[:num_tokens]
                             )
+                            if self.use_aux_hidden_state_outputs:
+                                outputs[:num_tokens] = model_output[0]
+                                graph_aux = model_output[1]
+                            else:
+                                outputs[:num_tokens] = model_output
+                                graph_aux = None
                             if self.logits_in_graph:
                                 graph_logits = self.model.compute_logits(
                                     outputs[:num_tokens]
@@ -1969,6 +2058,8 @@ class ModelRunner:
                 self.graphs[(bs, max_q_len)] = graph
                 if self.logits_in_graph and ubatch_slices is None:
                     self.graph_logits[(bs, max_q_len)] = graph_logits
+                if graph_aux is not None:
+                    self.graph_aux_hidden[(bs, max_q_len)] = graph_aux
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
 
