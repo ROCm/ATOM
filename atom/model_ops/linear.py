@@ -110,6 +110,26 @@ def _get_aiter_dynamic_per_tensor_quant():
     return fn if fn is not False else None
 
 
+def _get_aiter_dynamic_per_token_quant():
+    """Lazy import of aiter's per-token FP8 quant kernel.
+
+    Single triton kernel (vs the 2-kernel pair in dynamic_per_tensor_quant
+    which does atomic_max + apply). Per-token is also slightly more
+    accurate at the same FP8 dtype because each row gets its own scale.
+    gemm_a8w8 already accepts an (M, 1) per-row x_scale so we feed the
+    output directly with no reshape/expand needed.
+    """
+    fn = getattr(_get_aiter_dynamic_per_token_quant, "_cached", None)
+    if fn is None:
+        try:
+            from aiter.ops.triton.quant.quant import dynamic_per_token_quant_fp8_i8
+            fn = dynamic_per_token_quant_fp8_i8
+        except Exception:
+            fn = False
+        _get_aiter_dynamic_per_token_quant._cached = fn
+    return fn if fn is not False else None
+
+
 def _gfx1201_gemm_a8w8_config(M: int, N: int, K: int) -> dict:
     """Hand-tuned config for aiter triton `gemm_a8w8` on gfx1201 (RDNA4).
 
@@ -177,17 +197,19 @@ def _fp8_per_tensor_linear_triton(
     M, K = x.shape
     N = weight.shape[0]
 
-    # Dynamic per-tensor quant of x — fused triton kernel from aiter
-    # (one launch instead of abs/amax/clamp/div/cast chain).
-    # NOTE: the kernel uses tl.atomic_max to compute scale_out, so the
-    # buffer MUST be zero-initialized — torch.empty(1) leaves uninitialized
-    # memory and a >0 garbage value silently wins the atomic_max.
-    fused_quant = _get_aiter_dynamic_per_tensor_quant()
+    # Dynamic per-token (per-row) FP8 quant of x.
+    # Single-kernel: each program computes its own row's max + applies
+    # the scale in one pass. Replaces the 2-kernel per-tensor variant
+    # (dynamic_per_tensor: atomic_max -> static_quant) — saves ~1.4 ms
+    # per decode step on Mistral-3 (4 linear ops x 34 layers x ~10us
+    # static_quant launch overhead). Also slightly more accurate at the
+    # same FP8 dtype because each row gets its own scale.
+    # gemm_a8w8 accepts (M, 1) per-row x_scale natively, so we feed
+    # x_scale_full directly with no reshape/expand chain.
+    fused_quant = _get_aiter_dynamic_per_token_quant()
     x_q = torch.empty((M, K), dtype=fp8_dtype, device=x.device)
-    x_scale = torch.zeros(1, dtype=torch.float32, device=x.device)
-    fused_quant(x_q, x, x_scale)
-    # gemm_a8w8 wants x_scale shape (M, 1) — broadcast the scalar.
-    x_scale_full = x_scale.reshape(1, 1).expand(M, 1).contiguous()
+    x_scale_full = torch.empty((M, 1), dtype=torch.float32, device=x.device)
+    fused_quant(x_q, x, x_scale_full)
 
     # Reinterpret raw uint8 weight as FP8 (no copy).
     w_q = weight.view(fp8_dtype)
