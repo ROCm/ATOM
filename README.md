@@ -244,6 +244,7 @@ lm_eval --model local-completions \
 | Distributed | Tensor/data/expert parallelism, multi-GPU deployment | [Distributed Guide](docs/distributed_guide.md) |
 | Serving & Benchmarks | OpenAI API server, benchmarking, profiling, speculative decoding | [Serving Guide](docs/serving_benchmarking_guide.md) |
 | Environment Variables | All `ATOM_*` variable definitions | [Env Vars](docs/environment_variables.md) |
+| MTP BF16/Quant Bugfix | Root-cause analysis and validation notes for near-0% MTP accept rate | [MTP Entry Projection Bugfix](docs/mtp_entry_projection_quant_bf16_mismatch.md) |
 
 **Deployment Recipes:**
 
