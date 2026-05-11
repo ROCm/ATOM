@@ -17,15 +17,12 @@ from .attention_mla import MLAModules
 
 import logging
 
-from atom.plugin.prepare import is_plugin_mode, is_vllm
-from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
 from atom.utils.decorators import mark_trace
 from atom.model_ops.base_attention import cp_mha_gather_cache
 
 logger = logging.getLogger("atom")
 
 
-@PagedAttentionImplDecoratorForPluginMode
 class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
@@ -82,11 +79,9 @@ class PagedAttentionImpl(nn.Module):
         # for aiter triton unified_attention. AiterBackend keeps this False.
         self.use_flash_layout = False
 
-        # for plugin mode(vllm), the query quant is disabled for now
-        if is_vllm():
-            self.supports_quant_query_input = False
+        self.supports_quant_query_input = False
 
-    def forward_impl_server_mode(
+    def forward_impl(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -661,7 +656,6 @@ class PagedAttentionImpl(nn.Module):
 
     def forward(
         self,
-        layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -673,24 +667,6 @@ class PagedAttentionImpl(nn.Module):
         output: torch.Tensor = None,
         **kwargs,
     ):
-        if is_plugin_mode():
-            # forward impl method are added by the decorator
-            # PagedAttentionImplDecoratorForPluginMode
-            return self.forward_impl_plugin_mode(
-                layer=layer,
-                query=query,
-                key=key,
-                value=value,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
-                position=position,
-                q_scale=q_scale,
-                qkv=qkv,
-            )
-        else:
-            # only for server mode, keep the original method
-            o = self.forward_impl_server_mode(
-                q=query, k=key, v=value, position=position, q_scale=q_scale, qkv=qkv
-            )
-
-            return o
+        return self.forward_impl(
+            q=query, k=key, v=value, position=position, q_scale=q_scale, qkv=qkv
+        )

@@ -21,9 +21,20 @@ from atom.utils.selector import get_attn_backend
 # op in model file
 class Attention:
     def __new__(cls, *args, **kwargs):
-        from atom.model_ops import Attention
+        from atom.plugin.prepare import is_sglang, is_vllm
 
-        return Attention(*args, **kwargs)
+        if is_vllm():
+            from atom.plugin.vllm.attention.layer import AttentionForVllm
+
+            return AttentionForVllm(*args, **kwargs)
+        if is_sglang():
+            from atom.plugin.sglang.attention import AttentionForSGLang
+
+            return AttentionForSGLang(*args, **kwargs)
+
+        from atom.model_ops.paged_attention import Attention as AttentionForAtom
+
+        return AttentionForAtom(*args, **kwargs)
 
 
 # this triton kernel is used to fetch the stored kv in
@@ -257,7 +268,6 @@ def unified_attention_with_output_base(
     self = atom_config.compilation_config.static_forward_context[layer_name]
     if use_mla:
         return self.impl.forward(
-            layer=self,
             query=q,
             k_nope=k,
             k_rope=v,
@@ -266,7 +276,6 @@ def unified_attention_with_output_base(
         )
     else:
         return self.impl.forward(
-            layer=self,
             query=q,
             key=k,
             value=v,

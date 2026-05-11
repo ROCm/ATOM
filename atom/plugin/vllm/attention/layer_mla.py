@@ -1,135 +1,192 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+from typing import Optional
 
-"""
-Plugin mode extensions for MLAAttention.
-This module provides additional methods for MLAAttention when running in plugin mode.
-"""
-
-import os
-import torch
 import aiter
-from aiter import dtypes, QuantType
-from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
-
-from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
-    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
-)
+import torch
+from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
 from aiter.mla import mla_decode_fwd
-
-from functools import partial as functools_partial
 from atom.config import get_current_atom_config
-from atom.model_ops.linear import use_triton_gemm
-from atom.plugin.prepare import is_vllm
+from atom.model_ops.attention_mla import MLAAttention, MLAModules
+from atom.plugin.vllm.attention.backend import (
+    AiterMlaBackendForVllm,
+    AiterSparseMlaBackendForVllm,
+)
+from atom.plugin.vllm.attention.layer_common import (
+    _register_vllm_static_forward_context,
+)
+from atom.plugin.vllm.attention.mla_impl import (
+    _aiter_triton_fp8_bmm,
+    batched_gemm_a16wfp4,
+    fused_gemm_a8w8_blockscale_preshuffle_split_cat,
+    fused_gemm_afp4wfp4_preshuffle_split_cat,
+    functools_partial,
+    reorg_kvcache,
+    use_triton_gemm,
+)
+from atom.plugin.vllm.attention.mla_sparse_impl import fetch_id_to_ragged_triton
 from atom.utils import envs
+from torch import nn
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 
-import logging
+class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
+    attn_backend_cls = AiterMlaBackendForVllm
 
-logger = logging.getLogger("atom")
-
-
-if use_triton_gemm():
-    try:
-        from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
-            fused_gemm_a8w8_blockscale_preshuffle_split_cat,
-        )
-        from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import (
-            fused_gemm_afp4wfp4_preshuffle_split_cat,
-        )
-    except ImportError as e:
-        logger.warning(f"Triton fused GEMM split_cat not available: {e}")
-        fused_gemm_afp4wfp4_preshuffle_split_cat = None
-        fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
-
-
-def reorg_kvcache(
-    allgatered_kv_c_normed: torch.Tensor,
-    allgatered_k_pe: torch.Tensor,
-    padded_local_chunk_seq_lens_lst: list[int],
-    local_context_lens_allranks: list[list[int]],
-    sum_seq_len: int,
-    max_seq_len: int,
-    chunk_size: int,
-    chunk_idx: int,
-    toks: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    reorg and unpad kvcache after cp local gather to tp layout for attn kernel.
-    e.g.
-    allgatered_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T1_0, T1_1, ...,
-                              T0_4, T0_5, pad, pad, T1_2, pad, ...]
-    -> reorganized_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T0_4, T0_5,
-                                  T1_0, T1_1, T1_2, ...]
-    Args:
-        padded_local_chunk_seq_lens_lst: local chunk context lengths
-            under current CP rank.
-        local_context_lens_allranks: local context lengths on each CP rank.
-        sum_seq_len: the sum of cp_chunk_seq_lens_lst.
-        max_seq_len: the max value of cp_chunk_seq_lens_lst.
-        chunk_size: the local padded max context chunk from
-            chunked_context_metadata building.
-        chunk_idx: chunk idx of chunked_prefill.
-        toks: the number of tokens for local gather cache.
-    """
-    kv_c_segments = []
-    k_pe_segments = []
-    src_token_idx = 0
-    max_seq_len_check = 0
-    for padded_local_chunk_seq_len, local_context_lens in zip(
-        padded_local_chunk_seq_lens_lst, local_context_lens_allranks
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+        alibi_slopes: list[float] = None,
+        kv_cache_dtype="bf16",
+        layer_num=0,
+        mla_modules: Optional[MLAModules] = None,
+        sinks: Optional[nn.Parameter] = None,
+        prefix: Optional[str] = None,
+        **kwargs,
     ):
-        cur_seq_len = 0
-        for rank, local_context_len in enumerate(local_context_lens):
-            # Note(qcs): We split the context into multiple chunks,
-            # depending on the size of the workspace.
-            # local_context in dcp0:   |-----------------|
-            # local_context in dcp1:   |--------------|
-            # n*padded_local_chunk:    |-----|-----|-----|
-            # local_chunk_len in dcp1: |-----|-----|--|
-            # so we need update the last chunk length in dcp1.
-            local_chunk_len = min(
-                max(0, local_context_len - chunk_idx * chunk_size),
-                padded_local_chunk_seq_len,
-            )
-            if local_chunk_len != 0:
-                kv_c_segment = allgatered_kv_c_normed[
-                    rank * toks
-                    + src_token_idx : rank * toks
-                    + src_token_idx
-                    + local_chunk_len
-                ]
-                k_pe_segment = allgatered_k_pe[
-                    rank * toks
-                    + src_token_idx : rank * toks
-                    + src_token_idx
-                    + local_chunk_len
-                ]
-                kv_c_segments.append(kv_c_segment)
-                k_pe_segments.append(k_pe_segment)
-                cur_seq_len += local_chunk_len
-        max_seq_len_check = max(max_seq_len_check, cur_seq_len)
-        src_token_idx += padded_local_chunk_seq_len
-    reorganized_kv_c_normed = torch.cat(kv_c_segments, dim=0)
-    reorganized_k_pe = torch.cat(k_pe_segments, dim=0)
-    assert reorganized_kv_c_normed.shape[0] == sum_seq_len
-    assert reorganized_k_pe.shape[0] == sum_seq_len
-    assert max_seq_len_check == max_seq_len
-    return reorganized_kv_c_normed, reorganized_k_pe
+        from vllm.v1.attention.backend import AttentionType
+        from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
+        if mla_modules is None:
+            raise ValueError("mla_modules is required for vLLM MLA attention")
 
-class MLAAttentionImplPluginModeMethods:
-    """
-    Container class for plugin mode methods.
-    This class cannot be instantiated - it only serves as a namespace for methods
-    that will be added to PagedAttentionImpl via decorator.
-    """
+        atom_config = get_current_atom_config()
+        cache_config = atom_config.plugin_config.vllm_cache_config
+        quant_config = atom_config.plugin_config.vllm_quant_config
+        scheduler_config = atom_config.plugin_config.vllm_scheduler_config
 
-    def __init__(self):
-        raise TypeError(
-            "MLAAttentionImplPluginModeMethods cannot be instantiated. "
-            "It is only used as a method container for the decorator."
+        model_layer_name = prefix if prefix is not None else f"MLA_{layer_num}"
+        layer_name = f"{model_layer_name}.attn"
+        cache_dtype = cache_config.cache_dtype if cache_config is not None else kv_cache_dtype
+        calculate_kv_scales = (
+            cache_config.calculate_kv_scales if cache_config is not None else False
         )
+
+        MLAAttention.__init__(
+            self,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            kv_cache_dtype=cache_dtype,
+            layer_num=layer_num,
+            mla_modules=mla_modules,
+            dtype=torch.get_default_dtype(),
+            **kwargs,
+        )
+
+        self.model_layer_name = model_layer_name
+        self.layer_name = layer_name
+        self.attn_type = AttentionType.DECODER
+        self.attn_backend = self.attn_backend_cls
+        self.use_sparse = mla_modules.indexer is not None
+        self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+            cache_dtype, atom_config.plugin_config.vllm_config.model_config
+        )
+        self.calculate_kv_scales = calculate_kv_scales
+        self.quant_config = quant_config
+        self.kv_cache = torch.tensor([])
+        self._v_scale = getattr(self, "_v_scale", self.one_scale)
+        self._prob_scale = getattr(self, "_prob_scale", self.one_scale)
+        self._q_scale_float = 1.0
+        self._k_scale_float = 1.0
+        self._v_scale_float = 1.0
+        self._prob_scale_float = 1.0
+        self.q_range = torch.tensor(1.0, dtype=torch.float32)
+        self.k_range = torch.tensor(1.0, dtype=torch.float32)
+        self.v_range = torch.tensor(1.0, dtype=torch.float32)
+
+        from vllm.config import get_current_vllm_config
+        from vllm.forward_context import (
+            get_forward_context as get_vllm_forward_context,
+            is_forward_context_available,
+        )
+        from vllm.model_executor.layers.attention.mla_attention import (
+            MLACommonMetadataBuilder,
+        )
+
+        self.supports_quant_query_input = False
+        self.dcp_world_size = -1
+        self.chunked_prefill_workspace_size = (
+            MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
+                get_current_vllm_config()
+            )
+        )
+        self.cp_kv_cache_interleave_size = (
+            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+        )
+        self.is_aiter_triton_fp4_bmm_enabled = (
+            envs.ATOM_USE_TRITON_MXFP4_BMM
+            and self.kv_b_proj.weight.dtype == torch.bfloat16
+        )
+        self._use_persistent_decode = False
+        self._get_vllm_forward_context = get_vllm_forward_context
+        self._is_vllm_forward_context_available = is_forward_context_available
+        self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
+        self._pad_v = True
+        self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
+        if self.rotary_emb is not None:
+            rotary_emb_cos_sin_cache = torch.cat(
+                [
+                    self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2),
+                    self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2),
+                ],
+                dim=-1,
+            )
+            self.register_buffer(
+                "rotary_emb_cos_sin_cache",
+                rotary_emb_cos_sin_cache,
+                persistent=False,
+            )
+        self._is_sparse_mla = False
+
+        if getattr(self, "topk_indices_buffer", None) is not None:
+            self.supports_quant_query_input = False
+            self.dcp_world_size = -1
+            self.is_aiter_triton_fp4_bmm_enabled = (
+                envs.ATOM_USE_TRITON_MXFP4_BMM
+                and self.kv_b_proj.weight.dtype == torch.bfloat16
+            )
+            self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
+            from atom.model_ops.attention_mla import _MLA_MIN_HEADS
+
+            self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
+            self.head_repeat_factor = self.padded_num_heads // self.num_heads
+            assert self.topk_indices_buffer is not None, (
+                "topk_indices_buffer must be set for sparse MLA plugin mode. "
+                "Ensure the model's Indexer is properly initialized."
+            )
+            self._is_sparse_mla = True
+        self.q_pad_num_heads = getattr(self, "q_pad_num_heads", None)
+        _register_vllm_static_forward_context(self)
+
+        atom_static_context = atom_config.compilation_config.static_forward_context
+        atom_static_context[model_layer_name] = self
+        if "positions" not in atom_static_context:
+            max_num_tokens = scheduler_config.max_num_batched_tokens
+            atom_static_context["positions"] = torch.zeros(
+                max_num_tokens, dtype=torch.int64, device="cuda"
+            )
+
+    @property
+    def impl(self):
+        return self
+
+    def get_attn_backend(self):
+        return self.attn_backend
+
+    def process_weights_after_loading(
+        self, act_dtype: torch.dtype = torch.bfloat16
+    ) -> None:
+        try:
+            MLAAttention.process_weights_after_loading(self)
+        except TypeError:
+            MLAAttention.process_weights_after_loading(self, act_dtype)
+        self._q_scale_float = 1.0
+        self._k_scale_float = 1.0
+        self._v_scale_float = 1.0
+        self._prob_scale_float = 1.0
 
     def _concat_k_nope_k_pe_plugin_mode(
         self, k_nope: torch.Tensor, k_pe: torch.Tensor
@@ -550,7 +607,6 @@ class MLAAttentionImplPluginModeMethods:
         q,
         kv_c_and_k_pe_cache,
         attn_metadata,
-        layer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert isinstance(q, torch.Tensor)
         if self.head_repeat_factor > 1:
@@ -603,16 +659,15 @@ class MLAAttentionImplPluginModeMethods:
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            q_scale=layer._q_scale,
-            kv_scale=layer._k_scale,
+            q_scale=self._q_scale,
+            kv_scale=self._k_scale,
         )
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :]
         return o, None
 
-    def forward_impl_plugin_mode(
+    def forward_impl(
         self,
-        layer,
         q,
         k_c_normed,
         k_pe,
@@ -624,8 +679,7 @@ class MLAAttentionImplPluginModeMethods:
 
         # Dispatch using explicit sparse-mode marker set during plugin init.
         if getattr(self, "_is_sparse_mla", False):
-            return self.forward_impl_sparse_plugin_mode(
-                layer=layer,
+            return self.forward_impl_sparse(
                 q=q,
                 k_c_normed=k_c_normed,
                 k_pe=k_pe,
@@ -730,7 +784,7 @@ class MLAAttentionImplPluginModeMethods:
                     attn_metadata.plugin_metadata.slot_mapping,
                     kv_cache,
                     self.kv_cache_dtype,
-                    layer._k_scale,
+                    self._k_scale,
                 )
             else:
                 self.rotary_emb(positions, q[..., self.qk_nope_head_dim :], k_pe)
@@ -741,7 +795,7 @@ class MLAAttentionImplPluginModeMethods:
                         kv_cache,
                         attn_metadata.plugin_metadata.slot_mapping.flatten(),
                         kv_cache_dtype=self.kv_cache_dtype,
-                        scale=layer._k_scale,
+                        scale=self._k_scale,
                     )
 
         if fp8_attention:
@@ -754,7 +808,7 @@ class MLAAttentionImplPluginModeMethods:
                 prefill_k_pe,
                 kv_cache,
                 attn_metadata,
-                layer._k_scale,
+                self._k_scale,
                 output=output[num_decode_tokens:],
             )
 
@@ -782,7 +836,7 @@ class MLAAttentionImplPluginModeMethods:
                     self.W_K_scale,
                     transpose_bm=True,
                     prequant=True,
-                    y_scale=layer._q_scale if fp8_attention else None,
+                    y_scale=self._q_scale if fp8_attention else None,
                 )
             # elif self.is_aiter_triton_fp8_bmm_enabled:
             else:
@@ -819,8 +873,8 @@ class MLAAttentionImplPluginModeMethods:
                     ),
                     decode_q,
                     attn_metadata.plugin_metadata.slot_mapping,
-                    layer._k_scale,
-                    layer._q_scale,
+                    self._k_scale,
+                    self._q_scale,
                     positions,
                     self.rotary_emb.cos_cache,
                     self.rotary_emb.sin_cache,
@@ -832,8 +886,8 @@ class MLAAttentionImplPluginModeMethods:
                     assert decode_ql_nope.shape[0] == decode_q_pe.shape[0]
                     assert decode_ql_nope.shape[1] == decode_q_pe.shape[1]
                     if hasattr(layer, "_decode_concat_quant_fp8_op"):
-                        decode_q = layer._decode_concat_quant_fp8_op(
-                            decode_ql_nope, decode_q_pe, layer._q_scale
+                        decode_q = self._decode_concat_quant_fp8_op(
+                            decode_ql_nope, decode_q_pe, self._q_scale
                         )
                     else:
                         ql_nope_shape = decode_ql_nope.shape
@@ -853,7 +907,7 @@ class MLAAttentionImplPluginModeMethods:
 
                         decode_q, _ = ops.scaled_fp8_quant(
                             decode_q0.view(decode_q_shape[0], -1),
-                            layer._q_scale,
+                            self._q_scale,
                         )
                         decode_q = decode_q.view(decode_q_shape)
                 else:
@@ -866,7 +920,7 @@ class MLAAttentionImplPluginModeMethods:
 
             # call decode attn
             attn_out, lse = self._forward_decode_plugin_mode(
-                decode_q, kv_cache, attn_metadata, layer
+                decode_q, kv_cache, attn_metadata
             )
 
             # correct dcp attn_out with lse.
@@ -892,113 +946,278 @@ class MLAAttentionImplPluginModeMethods:
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
     ) -> None:
-        # The kv cache update will be handled by the forward_impl_plugin_mode
+        # The kv cache update is handled by the vLLM forward_impl path
         # side for doing fused qk rope and cache update.
         return
 
+    def _forward_sparse_bf16_kv(
+        self,
+        q: torch.Tensor,  # [sq, heads, d_qk]
+        kv_cache: torch.Tensor,  # [blocks, heads, d_qk]
+        topk_indices_global: torch.Tensor,  # [sq, topk]
+        attn_metadata,
+    ) -> torch.Tensor:
+        sparse_meta = attn_metadata.plugin_metadata
 
-def _mla_plugin_mode_init(self, *args, **kwargs):
-    """Extra initialization for MLAAttentionImpl in plugin mode (vllm)."""
-    if is_vllm():
-        from vllm.config import get_current_vllm_config
-        from vllm.forward_context import (
-            get_forward_context as get_vllm_forward_context,
-            is_forward_context_available,
-        )
-        from vllm.model_executor.layers.attention.mla_attention import (
-            MLACommonMetadataBuilder,
+        num_tokens = q.shape[0]
+        output = torch.empty(
+            [num_tokens, self.padded_num_heads, self.kv_lora_rank],
+            # dtype=q.dtype,
+            dtype=torch.bfloat16,
+            device=q.device,
         )
 
-        self.supports_quant_query_input = False
-        self.dcp_world_size: int = -1
-        self.chunked_prefill_workspace_size = (
-            MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
-                get_current_vllm_config()
+        seq_len = (topk_indices_global != -1).sum(dim=-1)
+        torch.cumsum(seq_len, dim=0, out=sparse_meta.paged_kv_indptr[1:])
+        sparse_meta.paged_kv_indptr_rest.fill_(sparse_meta.paged_kv_indptr[-1])
+        fetch_id_to_ragged_triton(
+            topk_indices_global,
+            sparse_meta.paged_kv_indptr,
+            sparse_meta.paged_kv_indices,
+            sparse_meta.topk_tokens,
+        )
+
+        kv_buffer = kv_cache.unsqueeze(2)
+
+        # TODO: Currently, persistent mode has memory access issues when input context is long
+        # in fp8 kv cache settings, so it is not used for now.
+        # Re-enable persistent mode when the issue is fixed.
+        mla_decode_fwd(
+            q,
+            kv_buffer.view(-1, 1, 1, q.shape[-1]),
+            output,
+            sparse_meta.qo_indptr,
+            sparse_meta.paged_kv_indptr,
+            sparse_meta.paged_kv_indices,
+            sparse_meta.paged_kv_last_page_len,
+            1,
+            sm_scale=self.scale,
+            q_scale=self._q_scale,
+            kv_scale=self._k_scale,
+            page_size=1,
+        )
+
+        if self.head_repeat_factor > 1:
+            output = output[:, :: self.head_repeat_factor, :].contiguous()
+
+        return output[:, : self.num_heads, :]
+
+    def forward_impl_sparse(
+        self,
+        q,
+        k_c_normed,
+        k_pe,
+        kv_cache,
+        attn_metadata,
+        output,
+    ):
+        assert output is not None, "Output tensor must be provided."
+
+        if attn_metadata is None:
+            # During the profile run try to simulate to worse case output size
+            # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
+            # since this can be large
+            _ = torch.empty(
+                (
+                    self.chunked_prefill_workspace_size,
+                    self.num_heads,
+                    self.qk_nope_head_dim + self.v_head_dim,
+                ),
+                device=k_c_normed.device,
+                dtype=k_c_normed.dtype,
             )
-        )
-        self.cp_kv_cache_interleave_size: int = (
-            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
-        )
-        self.is_aiter_triton_fp4_bmm_enabled = (
-            envs.ATOM_USE_TRITON_MXFP4_BMM
-            and self.kv_b_proj.weight.dtype == torch.bfloat16
-        )
-        self._use_persistent_decode = False
-        self._get_vllm_forward_context = get_vllm_forward_context
-        self._is_vllm_forward_context_available = is_forward_context_available
-        self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
-        self._pad_v = True
-        self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
-        if self.rotary_emb is not None:
-            rotary_emb_cos_sin_cache = torch.cat(
-                [
-                    self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2),
-                    self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2),
-                ],
-                dim=-1,
+
+            # The zero fill is required when used with DP + EP
+            # to ensure all ranks within a DP group compute the
+            # same expert outputs.
+            return output.fill_(0)
+
+        from vllm.distributed.parallel_state import get_dcp_group
+        from vllm.platforms import current_platform
+
+        if self.dcp_world_size == -1:
+            self.dcp_world_size = get_dcp_group().world_size
+
+        sparse_meta = attn_metadata.plugin_metadata
+
+        num_actual_toks = sparse_meta.num_actual_tokens
+
+        # Inputs and outputs may be padded for CUDA graphs
+        output_padded = output
+        output = output[:num_actual_toks, ...]
+        q = q[:num_actual_toks, ...]
+        k_c_normed = k_c_normed[:num_actual_toks, ...]
+        k_pe = k_pe[:num_actual_toks, ...].unsqueeze(1)
+
+        positions = None
+        if self._is_vllm_forward_context_available():
+            positions = self._get_vllm_forward_context().additional_kwargs.get(
+                "atom_positions"
             )
-            self.register_buffer(
-                "rotary_emb_cos_sin_cache",
-                rotary_emb_cos_sin_cache,
-                persistent=False,
+
+        if positions is None:
+            atom_config = get_current_atom_config()
+            positions = atom_config.compilation_config.static_forward_context[
+                "positions"
+            ]
+
+        positions = positions[:num_actual_toks]
+        fp8_attention = self.kv_cache_dtype.startswith("fp8")
+        if fp8_attention:
+            from vllm.platforms import current_platform
+
+            kv_cache = kv_cache.view(current_platform.fp8_dtype())
+
+        # Q absorption: q_nope -> W_K BMM -> ql_nope, then concat with q_pe
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # Convert from (B, N, P) to (N, B, P)
+        q_nope = q_nope.transpose(0, 1)
+
+        if self.q_pad_num_heads is not None:
+            B, N, L = q_pe.shape
+            pe_padded = q_pe.new_empty((B, self.q_pad_num_heads, L))
+            pe_padded.resize_((B, N, L))
+            pe_padded.copy_(q_pe)
+            q_pe = pe_padded
+
+        if self.is_aiter_triton_fp4_bmm_enabled:
+            ql_nope = batched_gemm_a16wfp4(
+                q_nope,
+                self.W_K,
+                self.W_K_scale,
+                transpose_bm=True,
+                prequant=True,
+                y_scale=self._q_scale if fp8_attention else None,
             )
-        # vllm kv_b_proj return two values (output, bias), so we need to wrap it.
-        if os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "1":
+        else:
+            # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
+            ql_nope = _aiter_triton_fp8_bmm(
+                q_nope,
+                self.W_K,
+                self.W_K_scale,
+                group_size=128,
+                transpose_bm=True,
+            )
 
-            def wrap_kv_b_proj(module_instance):
-                orig_impl = module_instance.forward
+        q_out = torch.empty(
+            (
+                ql_nope.shape[0],
+                self.num_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ),
+            dtype=ql_nope.dtype,
+            device=ql_nope.device,
+        )
+        if kv_cache.numel() > 0:
+            fused_qk_rope_concat_and_cache_mla(
+                ql_nope,
+                q_pe,
+                k_c_normed,
+                k_pe.squeeze(1),
+                kv_cache.view(
+                    kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                ),
+                q_out,
+                attn_metadata.slot_mapping,
+                self._k_scale,
+                self._q_scale,
+                positions,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                is_neox=self.rotary_emb.is_neox_style,
+                is_nope_first=True,
+            )
 
-                def new_forward(*args, **kwargs):
-                    out = orig_impl(*args, **kwargs)
-                    return out, None
+        if self.head_repeat_factor > 1:
+            q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
 
-                module_instance.forward = new_forward
-                return module_instance
+        assert self.topk_indices_buffer is not None
+        topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-            self.kv_b_proj = wrap_kv_b_proj(self.kv_b_proj)
-            quant_type = self.kv_b_proj.quant_type
-            # vllm will call get_and_maybe_dequant_weights to get the weights,
-            # so we need to set the quant_method value to workaround.
-            if quant_type == QuantType.No:
-                self.kv_b_proj.quant_method = None
-            else:
-                # TODO: support other quant types for fallback path
-                assert False, "Unsupported quant type"
+        try:
+            from vllm.v1.attention.backends.mla.sparse_utils import (
+                triton_convert_req_index_to_global_index,
+            )
+        except ImportError:
+            from vllm.v1.attention.backends.mla.flashmla_sparse import (
+                triton_convert_req_index_to_global_index,
+            )
 
-        self._is_sparse_mla = False
+        req_id_i32 = sparse_meta.req_id_per_token.to(dtype=torch.int32)
+        block_table_i32 = sparse_meta.block_table.to(dtype=torch.int32)
+        topk_indices_i32 = topk_indices.to(dtype=torch.int32)
+        topk_indices_global = triton_convert_req_index_to_global_index(
+            req_id_i32,  # sparse_meta.req_id_per_token,
+            block_table_i32,  # sparse_meta.block_table,
+            topk_indices_i32,  # topk_indices,
+            BLOCK_SIZE=sparse_meta.block_size,
+            NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
+        )
+        if fp8_attention:
+            from vllm import _custom_ops as ops
+
+            # Reshape to 2D for scaled_fp8_quant, then restore
+            q_flat, _ = ops.scaled_fp8_quant(
+                q_out.reshape(q_out.shape[0], -1),
+                self._q_scale,
+            )
+            q_out = q_flat.reshape(q_out.shape)
+        attn_out = self._forward_sparse_bf16_kv(
+            q_out, kv_cache, topk_indices_global, attn_metadata
+        )
+
+        # V up-projection
+        self._v_up_proj(attn_out, out=output[:num_actual_toks])
+
+        return output_padded
+
+    def calc_kv_scales(self, q, kv_c_normed, k_pe):
+        self._q_scale.copy_(torch.abs(q).max() / self.q_range)
+        kv_abs_max = torch.abs(kv_c_normed).max()
+        self._k_scale.copy_(kv_abs_max / self.k_range)
+        self._v_scale.copy_(kv_abs_max / self.v_range)
+        self._q_scale_float = self._q_scale.item()
+        self._k_scale_float = self._k_scale.item()
+        self._v_scale_float = self._v_scale.item()
+        self.calculate_kv_scales = False
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor = None,
+        q_scale: Optional[torch.Tensor] = None,
+        qkv: torch.Tensor = None,
+        **kwargs,
+    ):
+        kv_c_normed = key
+        k_pe = value
+        q = self.q_proj(query, q_scale)
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        if self.calculate_kv_scales:
+            self.calc_kv_scales(q, kv_c_normed, k_pe)
+        output = torch.ops.aiter.atom_vllm_mla_attention(
+            q,
+            kv_c_normed,
+            k_pe,
+            self.layer_name,
+            self.num_heads * self.v_head_dim,
+        )
+        return self.o_proj(output)
+
+    def get_kv_cache_spec(self, vllm_config):
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=self.head_size,
+            dtype=self.kv_cache_torch_dtype,
+            cache_dtype_str=self.kv_cache_dtype,
+        )
 
 
-def MLAAttentionImplDecoratorForPluginMode(cls):
-    method_names = [
-        "_concat_k_nope_k_pe_plugin_mode",
-        "_v_up_proj",
-        "_flash_attn_varlen_diff_headdims",
-        "_run_prefill_new_tokens_plugin_mode",
-        "_run_prefill_context_chunk_plugin_mode",
-        "_context_parallel_compute_prefill_context_plugin_mode",
-        "_compute_prefill_context_plugin_mode",
-        "_forward_prefill_plugin_mode",
-        "_forward_decode_plugin_mode",
-        "forward_impl_plugin_mode",
-        "do_kv_cache_update",
-    ]
-
-    logger.info("Use MLAAttentionImplDecoratorForPluginMode to decorate MLAAttention")
-
-    # Add all methods to the target class
-    for method_name in method_names:
-        method = getattr(MLAAttentionImplPluginModeMethods, method_name)
-        setattr(cls, method_name, method)
-
-    # Wrap __init__ to inject plugin-mode initialization
-    orig_init = cls.__init__
-
-    def new_init(self, *args, **kwargs):
-        if "head_size" in kwargs and "head_dim" not in kwargs:
-            kwargs["head_dim"] = kwargs.pop("head_size")
-        orig_init(self, *args, **kwargs)
-        _mla_plugin_mode_init(self, *args, **kwargs)
-
-    cls.__init__ = new_init
-
-    return cls
+class AttentionForVllmSparseMLA(AttentionForVllmMLA):
+    attn_backend_cls = AiterSparseMlaBackendForVllm
