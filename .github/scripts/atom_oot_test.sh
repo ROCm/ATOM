@@ -50,6 +50,7 @@ OOT_GPU_MEMORY_UTILIZATION=${OOT_GPU_MEMORY_UTILIZATION:-0.9}
 EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
+OOT_PROFILER_CONFIG=${OOT_PROFILER_CONFIG:-}
 OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LAST_VLLM_LOG_LINE=0
@@ -147,6 +148,7 @@ launch_one_model() {
   local model_path="$2"
   local extra_args="$3"
   local -a extra_arg_array=()
+  local -a serve_cmd=()
 
   local resolved_model_path
   resolved_model_path=$(resolve_model_path "${model_path}")
@@ -190,18 +192,25 @@ PY
 
   # Avoid importing a host-mounted source tree as a namespace package.
   cd /tmp
-  nohup vllm serve "${resolved_model_path}" \
-    --host "${VLLM_HOST}" \
-    --port "${VLLM_PORT}" \
-    --async-scheduling \
-    --load-format fastsafetensors \
-    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
-    --trust-remote-code \
-    --kv-cache-dtype fp8 \
-    "${extra_arg_array[@]}" \
-    --gpu-memory-utilization "${OOT_GPU_MEMORY_UTILIZATION}" \
-    --no-enable-prefix-caching \
-    > "${VLLM_LOG_FILE}" 2>&1 &
+  serve_cmd=(
+    vllm serve "${resolved_model_path}"
+    --host "${VLLM_HOST}"
+    --port "${VLLM_PORT}"
+    --async-scheduling
+    --load-format fastsafetensors
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+    --trust-remote-code
+    --kv-cache-dtype fp8
+  )
+  if [[ -n "${OOT_PROFILER_CONFIG}" ]]; then
+    serve_cmd+=(--profiler-config "${OOT_PROFILER_CONFIG}")
+  fi
+  serve_cmd+=(
+    "${extra_arg_array[@]}"
+    --gpu-memory-utilization "${OOT_GPU_MEMORY_UTILIZATION}"
+    --no-enable-prefix-caching
+  )
+  nohup "${serve_cmd[@]}" > "${VLLM_LOG_FILE}" 2>&1 &
   echo $! > "${VLLM_PID_FILE}"
   echo "Server PID: $(cat "${VLLM_PID_FILE}")"
 

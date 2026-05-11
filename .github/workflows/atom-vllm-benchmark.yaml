@@ -342,6 +342,30 @@ on:
         description: "Upload benchmark results to the LLM-Booster dashboard"
         type: boolean
         default: true
+      enable_model_profile:
+        description: "Also collect torch-profiler traces for the selected benchmark case(s) and publish kernel breakdown data to LLM-Booster."
+        type: boolean
+        default: false
+      profile_isl_osl_pairs:
+        description: |
+          Profile ISL/OSL pairs, independent from the main benchmark input.
+          Input as semicolon-separated `input_length,output_length` pairs.
+          Example: 1024,20;4096,20
+          Leave empty to reuse the benchmark job's ISL/OSL pair.
+        type: string
+        default: ""
+      profile_num_prompts:
+        description: "Optional profiled benchmark num-prompts override. Leave empty to use concurrency x 2."
+        type: string
+        default: ""
+      profile_layer:
+        description: "Target transformer layer index passed to tools/parse_vllm_trace.py."
+        type: string
+        default: "8"
+      profile_percentile:
+        description: "Iteration percentile (0-100) passed to tools/parse_vllm_trace.py."
+        type: string
+        default: "50"
 
 jobs:
   wait-for-older-manual-runs:
@@ -1172,6 +1196,12 @@ jobs:
       PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
       BENCHMARK_CLIENT: ${{ needs.resolve-atom-source.outputs.benchmark_client }}
+      ENABLE_MODEL_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_model_profile || false }}
+      PROFILE_ISL_OSL_PAIRS_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.profile_isl_osl_pairs || '' }}
+      PROFILE_NUM_PROMPTS_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.profile_num_prompts || '' }}
+      PROFILE_LAYER: ${{ github.event_name == 'workflow_dispatch' && inputs.profile_layer || '8' }}
+      PROFILE_PERCENTILE: ${{ github.event_name == 'workflow_dispatch' && inputs.profile_percentile || '50' }}
+      CONTAINER_PROFILE_DIR: /tmp/profile_dir
     steps:
       - name: Detect container engine
         run: |
@@ -1279,6 +1309,9 @@ jobs:
               "AITER_LOG_LEVEL=ERROR" \
               "AITER_TRITON_LOG_LEVEL=CRITICAL" \
               "AITER_LOG_MORE=0"
+            if [[ "${ENABLE_MODEL_PROFILE}" == "true" ]]; then
+              printf '%s\n' "VLLM_CUSTOM_SCOPES_FOR_PROFILING=1"
+            fi
           } | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//' > /tmp/oot_env_file.txt
 
           $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
@@ -1367,10 +1400,16 @@ jobs:
           STREAM_VLLM_LOGS: "1"
         run: |
           set -euo pipefail
+          OOT_PROFILER_CONFIG=""
+          if [[ "${ENABLE_MODEL_PROFILE}" == "true" ]]; then
+            OOT_PROFILER_CONFIG='{"profiler":"torch","torch_profiler_dir":"./profile_dir","torch_profiler_record_shapes":"True"}'
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "rm -rf '${CONTAINER_PROFILE_DIR}'"
+          fi
           $CONTAINER_ENGINE exec \
             -e OOT_MODEL_NAME="${MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e OOT_PROFILER_CONFIG="${OOT_PROFILER_CONFIG}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
@@ -1395,7 +1434,7 @@ jobs:
           fi
 
           {
-            echo "=== Benchmark config: ${MODEL_NAME} CLIENT=${BENCHMARK_CLIENT} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
+            echo "=== Benchmark config: ${MODEL_NAME} CLIENT=${BENCHMARK_CLIENT} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} NUM_PROMPTS=$(( CONC * 10 )) MODEL_PROFILE=${ENABLE_MODEL_PROFILE} ==="
             if [[ "${BENCHMARK_CLIENT}" == "InferenceMax bench" ]]; then
               $CONTAINER_ENGINE exec \
                 -e ISL="${ISL}" \
@@ -1678,6 +1717,386 @@ jobs:
           )
           PY
 
+      - name: Run OOT model profile client
+        id: run_model_profile_client
+        if: always() && env.ENABLE_MODEL_PROFILE == 'true' && steps.validate_benchmark_result.outcome == 'success'
+        timeout-minutes: 240
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          PROFILE_EFFECTIVE_NUM_PROMPTS="$(( CONC * 2 ))"
+          if [[ -n "${PROFILE_NUM_PROMPTS_INPUT}" ]]; then
+            if ! [[ "${PROFILE_NUM_PROMPTS_INPUT}" =~ ^[0-9]+$ ]] || (( PROFILE_NUM_PROMPTS_INPUT <= 0 )); then
+              echo "Invalid profile_num_prompts: ${PROFILE_NUM_PROMPTS_INPUT}. Expected a positive integer."
+              exit 2
+            fi
+            PROFILE_EFFECTIVE_NUM_PROMPTS="${PROFILE_NUM_PROMPTS_INPUT}"
+          fi
+
+          printf 'PROFILE_EFFECTIVE_NUM_PROMPTS=%s\n' "${PROFILE_EFFECTIVE_NUM_PROMPTS}" >> "$GITHUB_ENV"
+
+          PROFILE_PLAN_PATH="./${RESULT_FILENAME}.profile_pairs.json"
+          PROFILE_RAW_DIR="./${RESULT_FILENAME}.profile_raw"
+          PROFILE_ISL_OSL_TEXT="${PROFILE_ISL_OSL_PAIRS_INPUT}"
+          if [[ -z "${PROFILE_ISL_OSL_TEXT}" ]]; then
+            PROFILE_ISL_OSL_TEXT="${ISL},${OSL}"
+          fi
+
+          PROFILE_PLAN_PATH="${PROFILE_PLAN_PATH}" \
+          PROFILE_ISL_OSL_TEXT="${PROFILE_ISL_OSL_TEXT}" \
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def dedupe_preserve_order(values):
+              deduped = []
+              seen = set()
+              for value in values:
+                  marker = json.dumps(value, sort_keys=True)
+                  if marker in seen:
+                      continue
+                  seen.add(marker)
+                  deduped.append(value)
+              return deduped
+
+          pairs = []
+          for raw_pair in os.environ["PROFILE_ISL_OSL_TEXT"].split(";"):
+              pair = raw_pair.strip()
+              if not pair:
+                  continue
+              parts = [part.strip() for part in pair.split(",")]
+              if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                  raise SystemExit(
+                      f"Invalid profile ISL/OSL pair {pair!r}. Use semicolon-separated pairs like 1024,20;4096,20."
+                  )
+              isl = int(parts[0])
+              osl = int(parts[1])
+              if isl <= 0 or osl <= 0:
+                  raise SystemExit(
+                      f"Invalid profile ISL/OSL pair {pair!r}. Values must be positive integers."
+                  )
+              pairs.append(
+                  {
+                      "input_length": isl,
+                      "output_length": osl,
+                      "pair_tag": f"isl{isl}_osl{osl}",
+                  }
+              )
+
+          pairs = dedupe_preserve_order(pairs)
+          if not pairs:
+              raise SystemExit("At least one profile ISL/OSL pair is required.")
+
+          Path(os.environ["PROFILE_PLAN_PATH"]).write_text(
+              json.dumps(pairs, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          rm -rf "${PROFILE_RAW_DIR}"
+          mkdir -p "${PROFILE_RAW_DIR}"
+
+          TRUST_REMOTE_CODE_ARG=""
+          if [[ "${OOT_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
+            if [[ "${BENCHMARK_CLIENT}" == "vLLM bench" ]]; then
+              TRUST_REMOTE_CODE_ARG="--trust_remote_code"
+            else
+              TRUST_REMOTE_CODE_ARG="--trust-remote-code"
+            fi
+          fi
+
+          {
+            echo "=== Profile config: ${MODEL_NAME} CLIENT=${BENCHMARK_CLIENT} PAIRS=${PROFILE_ISL_OSL_TEXT} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} NUM_PROMPTS=${PROFILE_EFFECTIVE_NUM_PROMPTS} ==="
+            mapfile -t PROFILE_PAIR_LINES < <(
+              PROFILE_PLAN_PATH="${PROFILE_PLAN_PATH}" python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["PROFILE_PLAN_PATH"], encoding="utf-8") as f:
+              for pair in json.load(f):
+                  print(
+                      f"{pair['input_length']}\t{pair['output_length']}\t{pair['pair_tag']}"
+                  )
+          PY
+            )
+
+            for pair_line in "${PROFILE_PAIR_LINES[@]}"; do
+              IFS=$'\t' read -r PROFILE_ISL PROFILE_OSL PROFILE_PAIR_TAG <<< "${pair_line}"
+              PROFILE_RESULT_BASENAME="${RESULT_FILENAME}.profile_${PROFILE_PAIR_TAG}"
+              PROFILE_RESULT_PATH="${PROFILE_RAW_DIR}/${PROFILE_PAIR_TAG}.json"
+              PROFILE_TRACE_PATH="${PROFILE_RAW_DIR}/${PROFILE_PAIR_TAG}.trace.json.gz"
+
+              echo ""
+              echo "--- Profiling pair ${PROFILE_PAIR_TAG}: ISL=${PROFILE_ISL} OSL=${PROFILE_OSL} ---"
+
+              if [[ "${BENCHMARK_CLIENT}" == "InferenceMax bench" ]]; then
+                $CONTAINER_ENGINE exec \
+                  -e PROFILE_ISL="${PROFILE_ISL}" \
+                  -e PROFILE_OSL="${PROFILE_OSL}" \
+                  -e CONC="${CONC}" \
+                  -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+                  -e PROFILE_EFFECTIVE_NUM_PROMPTS="${PROFILE_EFFECTIVE_NUM_PROMPTS}" \
+                  -e PROFILE_RESULT_BASENAME="${PROFILE_RESULT_BASENAME}" \
+                  -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+                  "$CONTAINER_NAME" bash -lc "
+                    set -euo pipefail
+                    rm -rf \"${CONTAINER_PROFILE_DIR}\"
+                    mkdir -p \"${CONTAINER_PROFILE_DIR}\"
+                    PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
+                      --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                      --backend=vllm \
+                      --base-url=http://127.0.0.1:8000 \
+                      --dataset-name=random \
+                      --random-input-len=\"${PROFILE_ISL}\" \
+                      --random-output-len=\"${PROFILE_OSL}\" \
+                      --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                      --num-prompts=\"${PROFILE_EFFECTIVE_NUM_PROMPTS}\" \
+                      --max-concurrency=\"${CONC}\" \
+                      ${TRUST_REMOTE_CODE_ARG} \
+                      --num-warmups=\"$(( 2 * CONC ))\" \
+                      --request-rate=inf \
+                      --ignore-eos \
+                      --save-result \
+                      --profile \
+                      --percentile-metrics=\"ttft,tpot,itl,e2el\" \
+                      --result-dir=\"${CONTAINER_PROFILE_DIR}\" \
+                      --result-filename=\"${PROFILE_RESULT_BASENAME}.json\" \
+                      ${BENCH_EXTRA_ARGS:-}
+                  "
+              else
+                $CONTAINER_ENGINE exec \
+                  -e PROFILE_ISL="${PROFILE_ISL}" \
+                  -e PROFILE_OSL="${PROFILE_OSL}" \
+                  -e CONC="${CONC}" \
+                  -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+                  -e PROFILE_EFFECTIVE_NUM_PROMPTS="${PROFILE_EFFECTIVE_NUM_PROMPTS}" \
+                  -e PROFILE_RESULT_BASENAME="${PROFILE_RESULT_BASENAME}" \
+                  -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+                  "$CONTAINER_NAME" bash -lc "
+                    set -euo pipefail
+                    rm -rf \"${CONTAINER_PROFILE_DIR}\"
+                    mkdir -p \"${CONTAINER_PROFILE_DIR}\"
+                    vllm bench serve \
+                      --backend vllm \
+                      --base-url http://127.0.0.1:8000 \
+                      --endpoint /v1/completions \
+                      --model \"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                      --dataset-name random \
+                      --random-input-len \"${PROFILE_ISL}\" \
+                      --random-output-len \"${PROFILE_OSL}\" \
+                      --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                      --temperature 0.0 \
+                      --num-prompts \"${PROFILE_EFFECTIVE_NUM_PROMPTS}\" \
+                      --max-concurrency \"${CONC}\" \
+                      ${TRUST_REMOTE_CODE_ARG} \
+                      --num-warmups \"$(( 2 * CONC ))\" \
+                      --request-rate inf \
+                      --ignore-eos \
+                      --disable-tqdm \
+                      --save-result \
+                      --profile \
+                      --percentile-metrics ttft,tpot,itl,e2el \
+                      --result-dir \"${CONTAINER_PROFILE_DIR}\" \
+                      --result-filename \"${PROFILE_RESULT_BASENAME}.json\" \
+                      ${BENCH_EXTRA_ARGS:-}
+                  "
+              fi
+
+              CONTAINER_TRACE_PATH="$(
+                $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
+                  set -euo pipefail
+                  TRACE=\$(find '${CONTAINER_PROFILE_DIR}' -maxdepth 1 -type f -name '*rank0.*.pt.trace.json.gz' ! -name 'capture_graph_*' | sort | tail -1)
+                  if [ -z \"\$TRACE\" ]; then
+                    TRACE=\$(find '${CONTAINER_PROFILE_DIR}' -maxdepth 1 -type f -name '*.pt.trace.json.gz' ! -name 'capture_graph_*' | sort | tail -1)
+                  fi
+                  printf '%s' \"\$TRACE\"
+                "
+              )"
+              if [[ -z "${CONTAINER_TRACE_PATH}" ]]; then
+                echo "No profiler trace found for ${PROFILE_PAIR_TAG} under ${CONTAINER_PROFILE_DIR}."
+                exit 1
+              fi
+              if ! $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "test -f \"${CONTAINER_PROFILE_DIR}/${PROFILE_RESULT_BASENAME}.json\"" >/dev/null 2>&1; then
+                echo "Profile result JSON not found for ${PROFILE_PAIR_TAG}: ${CONTAINER_PROFILE_DIR}/${PROFILE_RESULT_BASENAME}.json"
+                exit 1
+              fi
+
+              $CONTAINER_ENGINE cp "${CONTAINER_NAME}:${CONTAINER_PROFILE_DIR}/${PROFILE_RESULT_BASENAME}.json" "${PROFILE_RESULT_PATH}"
+              $CONTAINER_ENGINE cp "${CONTAINER_NAME}:${CONTAINER_TRACE_PATH}" "${PROFILE_TRACE_PATH}"
+              $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "rm -rf '${CONTAINER_PROFILE_DIR}'" || true
+            done
+          } > "./${RESULT_FILENAME}.profile.client.log" 2>&1
+
+      - name: Extract kernel breakdown profile
+        id: extract_kernel_breakdown
+        if: always() && env.ENABLE_MODEL_PROFILE == 'true' && steps.run_model_profile_client.outcome == 'success'
+        continue-on-error: true
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet openpyxl >/dev/null 2>&1 || true
+
+          PROFILE_PLAN_PATH="./${RESULT_FILENAME}.profile_pairs.json"
+          PROFILE_RAW_DIR="./${RESULT_FILENAME}.profile_raw"
+          PROFILE_ARTIFACT_DIR="./${RESULT_FILENAME}.kernel_breakdown"
+
+          rm -rf "${PROFILE_ARTIFACT_DIR}"
+          mkdir -p "${PROFILE_ARTIFACT_DIR}"
+          if [[ ! -f "${PROFILE_PLAN_PATH}" ]]; then
+            echo "Profile pair plan not found: ${PROFILE_PLAN_PATH}"
+            exit 1
+          fi
+
+          mapfile -t PROFILE_PAIR_LINES < <(
+            PROFILE_PLAN_PATH="${PROFILE_PLAN_PATH}" python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["PROFILE_PLAN_PATH"], encoding="utf-8") as f:
+              for pair in json.load(f):
+                  print(
+                      f"{pair['input_length']}\t{pair['output_length']}\t{pair['pair_tag']}"
+                  )
+          PY
+          )
+
+          if [[ ${#PROFILE_PAIR_LINES[@]} -eq 0 ]]; then
+            echo "No profile pairs found in ${PROFILE_PLAN_PATH}"
+            exit 1
+          fi
+
+          for pair_line in "${PROFILE_PAIR_LINES[@]}"; do
+            IFS=$'\t' read -r PROFILE_ISL PROFILE_OSL PROFILE_PAIR_TAG <<< "${pair_line}"
+            LOCAL_TRACE_PATH="${PROFILE_RAW_DIR}/${PROFILE_PAIR_TAG}.trace.json.gz"
+            PROFILE_RESULT_PATH="${PROFILE_RAW_DIR}/${PROFILE_PAIR_TAG}.json"
+            OUTPUT_PREFIX="${PROFILE_ARTIFACT_DIR}/${RESULT_FILENAME}_${PROFILE_PAIR_TAG}"
+            XLSX_PATH="${OUTPUT_PREFIX}_trace_breakdown.xlsx"
+            MANIFEST_PATH="${PROFILE_ARTIFACT_DIR}/${RESULT_FILENAME}.${PROFILE_PAIR_TAG}.kernel_breakdown_manifest.json"
+
+            if [[ ! -f "${LOCAL_TRACE_PATH}" ]]; then
+              echo "Local profile trace not found for ${PROFILE_PAIR_TAG}: ${LOCAL_TRACE_PATH}"
+              exit 1
+            fi
+
+            python3 tools/parse_vllm_trace.py \
+              "${LOCAL_TRACE_PATH}" \
+              --layer "${PROFILE_LAYER}" \
+              --percentile "${PROFILE_PERCENTILE}" \
+              --output-prefix "${OUTPUT_PREFIX}" \
+              2>&1 | tee "${PROFILE_ARTIFACT_DIR}/${RESULT_FILENAME}.${PROFILE_PAIR_TAG}.kernel_breakdown.log"
+
+            if [[ ! -f "${XLSX_PATH}" ]]; then
+              echo "Kernel breakdown XLSX was not generated for ${PROFILE_PAIR_TAG}."
+              exit 1
+            fi
+
+            RESULT_PATH="${RESULT_FILENAME}.json" \
+            PROFILE_RESULT_PATH="${PROFILE_RESULT_PATH}" \
+            MANIFEST_PATH="${MANIFEST_PATH}" \
+            XLSX_PATH="${XLSX_PATH}" \
+            RESULT_FILENAME="${RESULT_FILENAME}" \
+            PROFILE_PAIR_TAG="${PROFILE_PAIR_TAG}" \
+            MODEL_NAME="${MODEL_NAME}" \
+            ISL="${PROFILE_ISL}" \
+            OSL="${PROFILE_OSL}" \
+            PROFILE_EFFECTIVE_NUM_PROMPTS="${PROFILE_EFFECTIVE_NUM_PROMPTS}" \
+            CONC="${CONC}" \
+            RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+            PROFILE_LAYER="${PROFILE_LAYER}" \
+            PROFILE_PERCENTILE="${PROFILE_PERCENTILE}" \
+            BENCHMARK_CLIENT="${BENCHMARK_CLIENT}" \
+            RUN_URL="${RUN_URL}" \
+            python3 - <<'PY'
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          def slugify(text: str) -> str:
+              return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "unknown"
+
+          def precision_from_text(*values: str):
+              merged = " ".join(str(v or "") for v in values).lower()
+              if "mxfp4" in merged or "fp4" in merged:
+                  return "fp4"
+              if "fp8" in merged:
+                  return "fp8"
+              if "bf16" in merged:
+                  return "bf16"
+              return None
+
+          result_path = Path(os.environ["RESULT_PATH"])
+          payload = json.loads(result_path.read_text(encoding="utf-8"))
+          profile_result_path = Path(os.environ["PROFILE_RESULT_PATH"])
+          profile_payload = {}
+          if profile_result_path.exists():
+              profile_payload = json.loads(profile_result_path.read_text(encoding="utf-8"))
+          model_name = payload.get("benchmark_model_name") or os.environ["MODEL_NAME"]
+          source_sha = str(payload.get("atom_source_sha", "") or "")
+          timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
+          day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+          profile_id = (
+              f"atom_vllm_profile_{day.replace('-', '')}_"
+              f"{slugify(model_name)}_isl{os.environ['ISL']}_osl{os.environ['OSL']}_"
+              f"c{os.environ['CONC']}_r{slugify(os.environ['RANDOM_RANGE_RATIO'])}_"
+              f"{slugify(source_sha[:7] or 'unknown')}_{slugify(os.environ['RESULT_FILENAME'])}"
+          )
+          manifest = {
+              "profile_id": profile_id,
+              "profile_pair_tag": os.environ["PROFILE_PAIR_TAG"],
+              "date": day,
+              "timestamp": timestamp,
+              "model": os.environ["MODEL_NAME"],
+              "dashboard_model": payload.get("benchmark_model_name") or "",
+              "source": "ATOM Dashboard",
+              "backend": "vLLM-ATOM",
+              "precision": payload.get("precision")
+              or precision_from_text(payload.get("benchmark_model_name"), os.environ["MODEL_NAME"]),
+              "hardware": "mi355x",
+              "benchmark_client": payload.get("benchmark_client")
+              or os.environ["BENCHMARK_CLIENT"],
+              "tensor_parallel_size": payload.get("tensor_parallel_size"),
+              "isl": int(os.environ["ISL"]),
+              "osl": int(os.environ["OSL"]),
+              "concurrency": int(os.environ["CONC"]),
+              "random_range_ratio": float(os.environ["RANDOM_RANGE_RATIO"]),
+              "num_prompts": profile_payload.get("num_prompts")
+              or int(os.environ["PROFILE_EFFECTIVE_NUM_PROMPTS"]),
+              "profile_layer": int(float(os.environ["PROFILE_LAYER"])),
+              "profile_percentile": float(os.environ["PROFILE_PERCENTILE"]),
+              "run_url": os.environ["RUN_URL"],
+              "atom_source_repository": payload.get("atom_source_repository"),
+              "atom_source_ref": payload.get("atom_source_ref"),
+              "atom_source_sha": source_sha,
+              "gpu_name": payload.get("gpu_name"),
+              "oot_image_tag": payload.get("oot_image_tag"),
+              "rocm_version": payload.get("rocm_version"),
+              "model_id": payload.get("model_id"),
+              "result_filename": os.environ["RESULT_FILENAME"],
+              "xlsx_file": Path(os.environ["XLSX_PATH"]).name,
+          }
+          Path(os.environ["MANIFEST_PATH"]).write_text(
+              json.dumps(manifest, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          done
+
+          rm -rf "${PROFILE_RAW_DIR}"
+          rm -f "${PROFILE_PLAN_PATH}"
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "rm -rf '${CONTAINER_PROFILE_DIR}'" || true
+
+      - name: Upload kernel breakdown artifacts
+        if: always() && env.ENABLE_MODEL_PROFILE == 'true' && steps.extract_kernel_breakdown.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: oot-kernel-breakdown-${{ env.RESULT_FILENAME }}
+          if-no-files-found: warn
+          path: ${{ env.RESULT_FILENAME }}.kernel_breakdown/
+
       - name: Upload benchmark artifacts
         if: always() && steps.validate_benchmark_result.outcome == 'success'
         uses: actions/upload-artifact@v7
@@ -1720,6 +2139,14 @@ jobs:
           pattern: 'oot-benchmark-*'
           merge-multiple: true
           path: .
+        continue-on-error: true
+
+      - name: Download kernel breakdown artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: 'oot-kernel-breakdown-*'
+          merge-multiple: true
+          path: kernel-breakdown-artifacts
         continue-on-error: true
 
       - name: Count downloaded benchmark results
@@ -2011,6 +2438,14 @@ jobs:
           print(f"Wrote {len(written_files)} LLM-Booster ATOM vLLM run files.")
           PY
 
+      - name: Build LLM-Booster kernel breakdown files
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        run: |
+          python3 -m pip install --quiet openpyxl >/dev/null 2>&1 || true
+          python3 .github/scripts/generate_vllm_atom_kernel_breakdown.py \
+            --artifact-dir kernel-breakdown-artifacts \
+            --dashboard-dir llm-booster-repo/dashboard
+
       - name: Upload LLM-Booster dashboard preview artifact
         if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
         uses: actions/upload-artifact@v7
@@ -2019,6 +2454,9 @@ jobs:
           path: |
             llm-booster-repo/dashboard/data/index.json
             llm-booster-repo/dashboard/data/vllm-atom/*.json
+            llm-booster-repo/dashboard/data/kernel-breakdown/index.json
+            llm-booster-repo/dashboard/data/kernel-breakdown/*.json
+            llm-booster-repo/dashboard/data/kernel-breakdown/files/*.xlsx
 
       - name: Push LLM-Booster dashboard data
         if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
@@ -2029,7 +2467,7 @@ jobs:
           GIT_COMMITTER_NAME: github-actions[bot]
           GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
         run: |
-          git add dashboard/data/index.json dashboard/data/vllm-atom
+          git add dashboard/data/index.json dashboard/data/vllm-atom dashboard/data/kernel-breakdown
           if git diff --cached --quiet; then
             echo "No LLM-Booster dashboard data changes to push."
             exit 0
