@@ -103,7 +103,7 @@ RANDOM_RANGE_RATIO=0.8
 RESULT_DIR=./benchmark-results
 RESULT_FILENAME=deepseek-r1-fp4-tp4-${ISL}-${OSL}-${CONC}-${RANDOM_RANGE_RATIO}.json
 
-python /tmp/bench_serving/benchmark_serving.py \
+python3 /tmp/bench_serving/benchmark_serving.py \
     --model=amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 \
     --backend=sglang \
     --base-url=http://127.0.0.1:8000 \
