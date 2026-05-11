@@ -1972,9 +1972,7 @@ class MoE(nn.Module):
         `forward_context.context.input_ids` before each forward, and
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
-        router_logits = self.gate(
-            x, otype=torch.float32
-        )  # [num_tokens, n_routed_experts]
+        router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
         return self.experts(hidden_states=x, router_logits=router_logits)
 
     def combine_outputs(
