@@ -73,6 +73,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         self.model = atom_model
         # Cache module layer maps once to avoid per-forward model.modules() traversal.
         self._rtp_layer_maps = RTPForwardContext.collect_layer_maps(model=self.model)
+        # Lazy-initialized on first forward once kv_cache is ready.
+        self._rtp_kv_cache_data: dict | None = None
 
     def load_weights(self):
         # ATOM weights should be loaded exactly once from ATOMQwen35Moe._create_python_model.
@@ -81,13 +83,13 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
     def _get_model_device(self) -> torch.device:
         first_param = next(self.model.parameters(), None)
         if first_param is None:
-            return torch.device("cuda")
+            raise RuntimeError("ATOM model has no parameters; cannot determine device.")
         return first_param.device
 
     def _get_model_dtype(self) -> torch.dtype:
         first_param = next(self.model.parameters(), None)
         if first_param is None:
-            return torch.bfloat16
+            raise RuntimeError("ATOM model has no parameters; cannot determine dtype.")
         return first_param.dtype
 
     def _get_token_num(self, inputs: PyModelInputs, input_ids: torch.Tensor | None) -> int:

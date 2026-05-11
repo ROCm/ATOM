@@ -804,10 +804,13 @@ class RTPForwardContext:
             positions=positions,
             seq_size_per_block=kernel_seq_size_per_block,
         )
-        kv_cache_data = cls._build_kv_cache_tensors(
-            runtime=runtime,
-            layer_maps=layer_maps or cls.collect_layer_maps(model),
-        )
+        kv_cache_data = getattr(runtime, "_rtp_kv_cache_data", None)
+        if kv_cache_data is None:
+            kv_cache_data = cls._build_kv_cache_tensors(
+                runtime=runtime,
+                layer_maps=layer_maps or cls.collect_layer_maps(model),
+            )
+            runtime._rtp_kv_cache_data = kv_cache_data
         input_lengths = cls._non_empty_int32(
             getattr(attn_inputs, "input_lengths", None),
             device=positions.device,
