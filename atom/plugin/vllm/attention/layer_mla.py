@@ -78,6 +78,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         self.model_layer_name = model_layer_name
         self.layer_name = layer_name
+        self.head_size = self.kv_lora_rank + self.qk_rope_head_dim
         self.attn_type = AttentionType.DECODER
         self.attn_backend = self.attn_backend_cls
         self.use_sparse = mla_modules.indexer is not None

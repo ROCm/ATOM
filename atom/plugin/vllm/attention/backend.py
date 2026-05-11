@@ -69,7 +69,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self.block_ratio = 1
 
         sliding_window_sizes: set[tuple[int, int] | None] = set()
-        layers = get_layers_from_vllm_config(config, AttentionLayerBase)
+        layers = get_layers_from_vllm_config(config, AttentionLayerBase, layer_names)
         for layer in layers.values():
             from atom.plugin.vllm.attention.layer import AttentionForVllmMHA
 
