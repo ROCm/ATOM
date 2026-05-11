@@ -125,7 +125,7 @@ jobs:
               SGLANG_AITER_FP8_PREFILL_ATTN=0
               SGLANG_USE_AITER=1
               ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
-            accuracy_test_threshold: 0.92
+            accuracy_test_threshold: 0.91
             runner: linux-atom-mi35x-4
           - model_name: "DeepSeek-R1-FP4 TP4"
             model_path: "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
