@@ -8,7 +8,7 @@ concurrency:
 on:
   schedule:
     # Nightly at 23:00 Beijing time (15:00 UTC)
-    - cron: '0 15 * * *'
+    - cron: '0 15 * * 0-4'
   workflow_dispatch:
     inputs:
       deepseek-r1-fp8-met:
