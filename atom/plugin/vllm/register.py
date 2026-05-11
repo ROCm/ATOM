@@ -5,6 +5,7 @@ import torch
 from atom.plugin.prepare import _set_framework_backbone
 from atom.utils import envs
 from atom.plugin.vllm.mla_patch import patch_vllm_mla_attention
+from atom.plugin.vllm.spec_decode_patch import apply_vllm_spec_decode_patch
 
 logger = logging.getLogger("atom")
 
@@ -27,6 +28,7 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "DeepseekV32ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "GlmMoeDsaForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "DeepSeekMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3NextForCausalLM": "atom.models.qwen3_next:Qwen3NextForCausalLMVllm",
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
@@ -126,6 +128,7 @@ def register_model() -> None:
 
     _patch_vllm_attention_process_weights_after_loading(Attention)
     _patch_vllm_attention_process_weights_after_loading(MLAAttention)
+    apply_vllm_spec_decode_patch()
 
     # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in fused_allreduce_rmsnorm when model uses aiter collectives
