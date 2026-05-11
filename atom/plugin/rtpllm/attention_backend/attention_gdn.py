@@ -103,6 +103,8 @@ def apply_attention_gdn_rtpllm_patch() -> None:
         rtp_seq_size_per_block = int(
             getattr(gdn_metadata, "rtp_seq_size_per_block", 0) or 0
         )
+        rtp_state_indices_cache = getattr(gdn_metadata, "rtp_state_indices_cache", None)
+        rtp_layer_group_map = getattr(gdn_metadata, "rtp_layer_group_map", None)
         if rtp_attn_inputs is not None and rtp_seq_size_per_block > 0:
             non_spec_state_indices_tensor = RTPForwardContext.state_indices_for_layer(
                 attn_inputs=rtp_attn_inputs,
@@ -110,6 +112,8 @@ def apply_attention_gdn_rtpllm_patch() -> None:
                 device=conv_state.device,
                 seq_size_per_block=rtp_seq_size_per_block,
                 layer_num=int(self.layer_num),
+                state_indices_cache=rtp_state_indices_cache,
+                layer_group_map=rtp_layer_group_map,
             )
 
         # ModelRunner cache is [slot, state_len, conv_dim] and needs transpose.

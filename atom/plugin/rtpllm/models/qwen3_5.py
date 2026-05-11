@@ -73,8 +73,6 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         self.model = atom_model
         # Cache module layer maps once to avoid per-forward model.modules() traversal.
         self._rtp_layer_maps = RTPForwardContext.collect_layer_maps(model=self.model)
-        # Lazy-initialized on first forward once kv_cache is ready.
-        self._rtp_kv_cache_data: dict | None = None
 
     def load_weights(self):
         # ATOM weights should be loaded exactly once from ATOMQwen35Moe._create_python_model.
@@ -83,13 +81,13 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
     def _get_model_device(self) -> torch.device:
         first_param = next(self.model.parameters(), None)
         if first_param is None:
-            raise RuntimeError("ATOM model has no parameters; cannot determine device.")
+            return torch.device("cuda")
         return first_param.device
 
     def _get_model_dtype(self) -> torch.dtype:
         first_param = next(self.model.parameters(), None)
         if first_param is None:
-            raise RuntimeError("ATOM model has no parameters; cannot determine dtype.")
+            return torch.bfloat16
         return first_param.dtype
 
     def _get_token_num(self, inputs: PyModelInputs, input_ids: torch.Tensor | None) -> int:
@@ -108,63 +106,67 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         input_lengths = getattr(attn_inputs, "input_lengths", None)
         if input_lengths is None or input_lengths.numel() == 0:
             return None
+        input_lengths_i32 = input_lengths.to(
+            device=model_device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
 
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         if is_prefill:
             prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
             if prefix_lengths is None or prefix_lengths.numel() == 0:
                 return None
-
-            parts: list[torch.Tensor] = []
-            input_lengths_cpu = input_lengths.detach().to(device="cpu")
-            prefix_lengths_cpu = prefix_lengths.detach().to(device="cpu")
-            for i, token_num in enumerate(input_lengths_cpu.tolist()):
-                token_num = int(token_num)
-                if token_num <= 0:
-                    continue
-                prefix = int(prefix_lengths_cpu[i].item())
-                parts.append(
-                    torch.arange(
-                        prefix,
-                        prefix + token_num,
-                        dtype=torch.int32,
-                        device=model_device,
-                    )
-                )
-            if not parts:
+            prefix_lengths_i32 = prefix_lengths.to(
+                device=model_device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
+            if int(prefix_lengths_i32.numel()) < int(input_lengths_i32.numel()):
                 return None
-            return torch.cat(parts, dim=0)
+            starts = prefix_lengths_i32[: int(input_lengths_i32.numel())]
+            token_starts = torch.repeat_interleave(starts, input_lengths_i32)
+            if token_starts.numel() == 0:
+                return None
+            per_seq_base = input_lengths_i32.cumsum(dim=0) - input_lengths_i32
+            token_ordinal = (
+                torch.cumsum(
+                    torch.repeat_interleave(
+                        torch.ones_like(input_lengths_i32), input_lengths_i32
+                    ),
+                    dim=0,
+                )
+                - 1
+            )
+            token_ordinal = token_ordinal - torch.repeat_interleave(
+                per_seq_base, input_lengths_i32
+            )
+            return (token_starts + token_ordinal).to(dtype=torch.int32).contiguous()
 
         sequence_lengths = getattr(attn_inputs, "sequence_lengths", None)
         if sequence_lengths is None or sequence_lengths.numel() == 0:
             return None
-
-        parts: list[torch.Tensor] = []
-        input_lengths_cpu = input_lengths.detach().to(device="cpu")
-        sequence_lengths_cpu = sequence_lengths.detach().to(device="cpu")
-        for i, token_num in enumerate(input_lengths_cpu.tolist()):
-            token_num = int(token_num)
-            if token_num <= 0:
-                continue
-            if i >= int(sequence_lengths_cpu.numel()):
-                return None
-            seq_idx = int(sequence_lengths_cpu[i].item())
-            if token_num == 1:
-                parts.append(
-                    torch.tensor([seq_idx], dtype=torch.int32, device=model_device)
-                )
-            else:
-                parts.append(
-                    torch.arange(
-                        seq_idx - token_num + 1,
-                        seq_idx + 1,
-                        dtype=torch.int32,
-                        device=model_device,
-                    )
-                )
-        if not parts:
+        sequence_lengths_i32 = sequence_lengths.to(
+            device=model_device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
+        if int(sequence_lengths_i32.numel()) < int(input_lengths_i32.numel()):
             return None
-        return torch.cat(parts, dim=0)
+        starts = (
+            sequence_lengths_i32[: int(input_lengths_i32.numel())] - input_lengths_i32 + 1
+        )
+        token_starts = torch.repeat_interleave(starts, input_lengths_i32)
+        if token_starts.numel() == 0:
+            return None
+        per_seq_base = input_lengths_i32.cumsum(dim=0) - input_lengths_i32
+        token_ordinal = (
+            torch.cumsum(
+                torch.repeat_interleave(
+                    torch.ones_like(input_lengths_i32), input_lengths_i32
+                ),
+                dim=0,
+            )
+            - 1
+        )
+        token_ordinal = token_ordinal - torch.repeat_interleave(
+            per_seq_base, input_lengths_i32
+        )
+        return (token_starts + token_ordinal).to(dtype=torch.int32).contiguous()
 
     def _extract_combo_positions(
         self, inputs: PyModelInputs, model_device: torch.device

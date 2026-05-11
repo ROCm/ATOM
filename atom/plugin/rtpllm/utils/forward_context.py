@@ -36,6 +36,8 @@ class RTPForwardContext:
     rtp_seq_size_per_block: int
     rtp_kernel_seq_size_per_block: int
     kv_cache_data: Dict[str, KVCacheTensor]
+    state_indices_cache: Dict[tuple[int, bool], torch.Tensor]
+    layer_group_map: Dict[int, int]
     context: Context
     num_tokens: int
     LayerMaps = tuple[Dict[int, GatedDeltaNet], Dict[int, Any]]
@@ -128,10 +130,12 @@ class RTPForwardContext:
         device: torch.device,
         seq_size_per_block: int,
         layer_num: int | None = None,
+        group_id: int | None = None,
     ) -> torch.Tensor:
         block_table = RTPForwardContext._select_block_table_for_layer(
             attn_inputs=attn_inputs,
             layer_num=layer_num,
+            group_id=group_id,
         )
         if block_table is None or block_table.numel() == 0:
             raise ValueError(
@@ -244,11 +248,12 @@ class RTPForwardContext:
     def _select_block_table_for_layer(
         attn_inputs: Any,
         layer_num: int | None,
+        group_id: int | None = None,
     ) -> torch.Tensor | None:
         by_group = getattr(attn_inputs, "kv_cache_kernel_block_id_device_by_group", None)
         if by_group is not None and len(by_group):
-            gid = 0
-            if layer_num is not None:
+            gid = int(group_id) if group_id is not None else 0
+            if group_id is None and layer_num is not None:
                 layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
                 if layer_to_group is not None and int(layer_to_group.numel()) > layer_num:
                     gid = int(layer_to_group[layer_num].item())
@@ -260,6 +265,33 @@ class RTPForwardContext:
         return getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
 
     @staticmethod
+    def _build_layer_group_map(attn_inputs: Any) -> Dict[int, int]:
+        layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
+        if layer_to_group is None or int(layer_to_group.numel()) == 0:
+            return {}
+        layer_to_group_cpu = layer_to_group.detach().to(device="cpu")
+        return {idx: int(gid) for idx, gid in enumerate(layer_to_group_cpu.tolist())}
+
+    @staticmethod
+    def _resolve_group_id(
+        *,
+        attn_inputs: Any,
+        layer_num: int | None,
+        layer_group_map: Dict[int, int] | None = None,
+    ) -> int:
+        by_group = getattr(attn_inputs, "kv_cache_kernel_block_id_device_by_group", None)
+        if by_group is None or not len(by_group):
+            return 0
+        if layer_num is None:
+            return 0
+        if layer_group_map is not None and layer_num in layer_group_map:
+            return int(layer_group_map[layer_num])
+        layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
+        if layer_to_group is not None and int(layer_to_group.numel()) > layer_num:
+            return int(layer_to_group[layer_num].item())
+        return 0
+
+    @staticmethod
     def state_indices_for_layer(
         *,
         attn_inputs: Any,
@@ -267,18 +299,39 @@ class RTPForwardContext:
         device: torch.device,
         seq_size_per_block: int,
         layer_num: int,
+        state_indices_cache: Dict[tuple[int, bool], torch.Tensor] | None = None,
+        layer_group_map: Dict[int, int] | None = None,
     ) -> torch.Tensor:
-        return RTPForwardContext._state_indices(
+        group_id = RTPForwardContext._resolve_group_id(
+            attn_inputs=attn_inputs,
+            layer_num=layer_num,
+            layer_group_map=layer_group_map,
+        )
+        cache_key = (int(group_id), bool(is_prefill))
+        if state_indices_cache is not None:
+            cached = state_indices_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        state_indices = RTPForwardContext._state_indices(
             attn_inputs=attn_inputs,
             is_prefill=is_prefill,
             device=device,
             seq_size_per_block=seq_size_per_block,
-            layer_num=layer_num,
+            layer_num=None,
+            group_id=group_id,
         )
+        if state_indices_cache is not None:
+            state_indices_cache[cache_key] = state_indices
+        return state_indices
 
     @staticmethod
     def _build_gdn_metadata(
-        attn_inputs: Any, *, seq_size_per_block: int
+        attn_inputs: Any,
+        *,
+        seq_size_per_block: int,
+        num_tokens: int,
+        state_indices_cache: Dict[tuple[int, bool], torch.Tensor] | None = None,
+        layer_group_map: Dict[int, int] | None = None,
     ) -> GDNAttentionMetadata:
         block_table = getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
         if block_table is None or block_table.numel() == 0:
@@ -290,13 +343,19 @@ class RTPForwardContext:
         query_start_loc = RTPForwardContext._query_start_loc(
             attn_inputs, device=target_device
         )
-        num_tokens = int(query_start_loc[-1].item())
         state_indices = RTPForwardContext._state_indices(
             attn_inputs=attn_inputs,
             is_prefill=is_prefill,
             device=target_device,
             seq_size_per_block=seq_size_per_block,
         )
+        if state_indices_cache is not None:
+            group_id = RTPForwardContext._resolve_group_id(
+                attn_inputs=attn_inputs,
+                layer_num=None,
+                layer_group_map=layer_group_map,
+            )
+            state_indices_cache[(int(group_id), bool(is_prefill))] = state_indices
 
         if is_prefill:
             prefix_lengths = RTPForwardContext._non_empty_int32(
@@ -524,10 +583,9 @@ class RTPForwardContext:
         qsl = RTPForwardContext._query_start_loc(attn_inputs, device=device)
         if qsl is not None and qsl.numel() == batch_size + 1:
             lengths = qsl[1:] - qsl[:-1]
-            if (
-                int(qsl[-1].item()) == int(num_tokens)
-                and bool(torch.all(lengths > 0))
-            ):
+            qsl_stats = torch.stack([qsl[-1], torch.min(lengths)], dim=0).to(device="cpu")
+            qsl_total_tokens, qsl_min_len = [int(v) for v in qsl_stats.tolist()]
+            if qsl_total_tokens == int(num_tokens) and qsl_min_len > 0:
                 return qsl.contiguous()
 
         # Fallback: derive from input_lengths when it is valid for this step.
@@ -536,10 +594,12 @@ class RTPForwardContext:
             device=device,
         )
         if input_lengths is not None and int(input_lengths.numel()) == batch_size:
-            if (
-                bool(torch.all(input_lengths > 0))
-                and int(input_lengths.sum().item()) == int(num_tokens)
-            ):
+            input_stats = torch.stack(
+                [torch.min(input_lengths), torch.sum(input_lengths)],
+                dim=0,
+            ).to(device="cpu")
+            min_input_len, total_input_len = [int(v) for v in input_stats.tolist()]
+            if min_input_len > 0 and total_input_len == int(num_tokens):
                 prefix = torch.zeros((1,), dtype=torch.int32, device=device)
                 return torch.cat([prefix, input_lengths.cumsum(dim=0)], dim=0).contiguous()
 
@@ -590,9 +650,18 @@ class RTPForwardContext:
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         batch_size = int(seq_lens.numel())
         num_actual_tokens = int(positions.numel())
-        max_query_len = int(torch.max(query_start_loc[1:] - query_start_loc[:-1]).item())
-        max_seq_len = int(torch.max(seq_lens).item())
-        num_actual_kv_tokens = int(seq_lens.sum().item())
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        stats = torch.stack(
+            [
+                torch.max(query_lens),
+                torch.max(seq_lens),
+                torch.sum(seq_lens),
+            ],
+            dim=0,
+        ).to(device="cpu")
+        max_query_len, max_seq_len, num_actual_kv_tokens = [
+            int(v) for v in stats.tolist()
+        ]
 
         decode_md = None
         prefill_md = None
@@ -791,26 +860,30 @@ class RTPForwardContext:
         )
         if kernel_seq_size_per_block <= 0:
             kernel_seq_size_per_block = int(seq_size_per_block)
+        state_indices_cache: Dict[tuple[int, bool], torch.Tensor] = {}
+        layer_group_map = cls._build_layer_group_map(attn_inputs)
         gdn_metadata = cls._build_gdn_metadata(
             attn_inputs,
             seq_size_per_block=seq_size_per_block,
+            num_tokens=int(positions.numel()),
+            state_indices_cache=state_indices_cache,
+            layer_group_map=layer_group_map,
         )
         # Keep raw RTP attention inputs in metadata so GDN can resolve per-layer
         # block-map/state-index semantics (same idea as RTP's select_block_map_for_layer).
         gdn_metadata.rtp_attn_inputs = attn_inputs
         gdn_metadata.rtp_seq_size_per_block = int(seq_size_per_block)
+        gdn_metadata.rtp_state_indices_cache = state_indices_cache
+        gdn_metadata.rtp_layer_group_map = layer_group_map
         attn_metadata = cls._build_plugin_attention_metadata(
             attn_inputs=attn_inputs,
             positions=positions,
             seq_size_per_block=kernel_seq_size_per_block,
         )
-        kv_cache_data = getattr(runtime, "_rtp_kv_cache_data", None)
-        if kv_cache_data is None:
-            kv_cache_data = cls._build_kv_cache_tensors(
-                runtime=runtime,
-                layer_maps=layer_maps or cls.collect_layer_maps(model),
-            )
-            runtime._rtp_kv_cache_data = kv_cache_data
+        kv_cache_data = cls._build_kv_cache_tensors(
+            runtime=runtime,
+            layer_maps=layer_maps or cls.collect_layer_maps(model),
+        )
         input_lengths = cls._non_empty_int32(
             getattr(attn_inputs, "input_lengths", None),
             device=positions.device,
@@ -833,6 +906,8 @@ class RTPForwardContext:
             rtp_seq_size_per_block=int(seq_size_per_block),
             rtp_kernel_seq_size_per_block=int(kernel_seq_size_per_block),
             kv_cache_data=kv_cache_data,
+            state_indices_cache=state_indices_cache,
+            layer_group_map=layer_group_map,
             context=context,
             num_tokens=int(positions.numel()),
         )
