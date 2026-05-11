@@ -186,6 +186,24 @@ def _triton_flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
         )
         return out
     except Exception as e:
+        # SDPA fallback below ignores sliding_window (it only handles causal
+        # masking). Falling back silently when sliding_window is active would
+        # turn windowed attention into full attention -> wrong outputs.
+        # Currently no caller hits this (Gemma 4 only routes here for full-
+        # attention layers where sliding_window=(-1,-1,0)), but guard
+        # explicitly to keep future callers safe.
+        wl_check = (
+            sliding_window[0]
+            if isinstance(sliding_window, (tuple, list))
+            else sliding_window
+        )
+        if wl_check is not None and wl_check > 0:
+            raise RuntimeError(
+                f"Triton FA2 varlen_fwd failed with active sliding_window="
+                f"{sliding_window} (head_dim={q.shape[-1]}); SDPA fallback "
+                f"does not support sliding window, so cannot silently fall "
+                f"back without changing attention semantics. Original error: {e}"
+            ) from e
         logger.warning("Triton FA2 varlen_fwd failed (head_dim=%s), "
                        "falling back to PyTorch SDPA: %s", q.shape[-1], e)
         return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
