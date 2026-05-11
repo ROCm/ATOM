@@ -155,6 +155,14 @@ RUN echo "========== [OOT] Restore base image triton ==========" && \
     rm -f /tmp/triton_pip_show.txt && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')"
 
+# Qwen3-next encounter accuracy issue with the triton from base image
+# we install verified good version triton==3.6.0 here as a temporary fix
+# this should be removed after the triton issue is resolved  
+RUN echo "========== [OOT] Reinstall known good triton ==========" && \
+    pip uninstall -y triton amd-triton && \
+    pip install triton==3.6.0
+RUN pip show triton || true
+
 RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
     "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
     "${VENV_PYTHON}" -m pip show transformers || true
@@ -389,6 +397,13 @@ RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
 # RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
 RUN pip install rocm-trace-lite && \
     rtl --version || true
+
+# Qwen3-next encounter accuracy issue with the triton from base image
+# we install verified good version triton==3.6.0 here as a temporary fix
+# this should be removed after the triton issue is resolved
+RUN pip uninstall -y triton amd-triton && \
+    pip install triton==3.6.0
+RUN pip show triton || true
 
 # ATOM: lightweight install (no compilation needed)
 # CACHEBUST invalidates only this layer so parallel stages stay cached

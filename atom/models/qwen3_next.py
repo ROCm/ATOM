@@ -20,19 +20,17 @@ from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
 from atom.model_ops.layernorm import RMSNormGated
 from atom.model_ops.linear import (
+    BAParallelLinear,
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     MergedReplicatedLinear,
     QKVGParallelLinear,
     QKVParallelLinear,
     QKVZBAParallelLinear,
+    QKVZParallelLinear,
     RowParallelLinear,
-)
+)  # noqa: F401
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.split_chunk import (
-    fused_split_chunk_qwen_next_qkvz_ba,
-    fused_split_chunk_qwen_next_qkvzba,
-)
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
@@ -594,102 +592,26 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 prefix=f"{self.prefix}.in_proj_qkvzba",
             )
         else:
-            self.in_proj_qkvz = self.create_qkvz_proj(
-                hidden_size=self.hidden_size,
-                key_dim=self.key_dim,
-                value_dim=self.value_dim,
-                quant_config=quant_config,
-                prefix=prefix,
-            )
-
-            self.in_proj_ba = self.create_ba_proj(
-                hidden_size=self.hidden_size,
+            # Non-fused path (FP8): deinterleave weights + scales at load
+            # time so the forward can use zero-copy torch.split.
+            self.in_proj_qkvz = QKVZParallelLinear(
+                input_size=self.hidden_size,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                num_k_heads=self.num_k_heads,
                 num_v_heads=self.num_v_heads,
+                bias=False,
                 quant_config=quant_config,
-                prefix=prefix,
+                prefix=f"{prefix}.in_proj_qkvz",
             )
-
-    def create_qkvz_proj(
-        self,
-        hidden_size: int,
-        key_dim: int,
-        value_dim: int,
-        quant_config: QuantizationConfig | None,
-        prefix: str,
-    ) -> MergedColumnParallelLinear:
-        return MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[sum((key_dim, key_dim, value_dim, value_dim))],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_qkvz",
-        )
-
-    def create_ba_proj(
-        self,
-        hidden_size: int,
-        num_v_heads: int,
-        quant_config: QuantizationConfig | None,
-        prefix: str,
-    ) -> MergedColumnParallelLinear:
-        return MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[num_v_heads, num_v_heads],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_ba",
-        )
-
-    def fix_query_key_value_ordering(
-        self,
-        mixed_qkvz: torch.Tensor,
-        mixed_ba: torch.Tensor,
-    ):
-        """
-        Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
-        """
-        new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
-            self.num_k_heads // self.tp_size,
-            (
-                self.head_k_dim
-                + self.head_k_dim
-                + (self.head_v_dim + self.head_v_dim)
-                * self.num_v_heads
-                // self.num_k_heads
-            ),
-        )
-        new_tensor_shape_ba = mixed_qkvz.size()[:-1] + (
-            self.num_k_heads // self.tp_size,
-            2 * self.num_v_heads // self.num_k_heads,
-        )
-
-        mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
-        mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
-
-        split_arg_list_qkvz = [
-            self.head_k_dim,
-            self.head_k_dim,
-            (self.num_v_heads // self.num_k_heads * self.head_v_dim),
-            (self.num_v_heads // self.num_k_heads * self.head_v_dim),
-        ]
-        split_arg_list_ba = [
-            self.num_v_heads // self.num_k_heads,
-            self.num_v_heads // self.num_k_heads,
-        ]
-
-        # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
-        # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn],
-        #  [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
-        query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
-        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=2)
-
-        # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
-        value = value.reshape(value.size(0), -1, self.head_v_dim)
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b = b.reshape(b.size(0), self.num_v_heads // self.tp_size)
-        a = a.reshape(a.size(0), self.num_v_heads // self.tp_size)
-
-        return query, key, value, z, b, a
+            self.in_proj_ba = BAParallelLinear(
+                input_size=self.hidden_size,
+                num_k_heads=self.num_k_heads,
+                num_v_heads=self.num_v_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_ba",
+            )
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
@@ -723,43 +645,42 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         3. Output projection
         """
 
+        num_tokens = hidden_states.shape[0]
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
+        v_heads_tp = self.num_v_heads // self.tp_size
+        qkv_size = self.conv_dim // self.tp_size
+        z_size = v_heads_tp * self.head_v_dim
+        b_size = v_heads_tp
+        a_size = v_heads_tp
+
         if hasattr(self, "in_proj_qkvzba"):
-            projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
-            k_heads_after_tp = self.num_k_heads // self.tp_size
-            v_heads_after_tp = self.num_v_heads // self.tp_size
-            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_qwen_next_qkvzba(
-                projected_states_qkvzba,
-                k_heads_after_tp,
-                v_heads_after_tp,
-                self.head_k_dim,
-                self.head_v_dim,
+            projected = self.in_proj_qkvzba(hidden_states)
+            # Output layout is [q|k|v|z|b|a] contiguous (deinterleaved at load)
+            mixed_qkv, z_flat, b, a = torch.split(
+                projected, [qkv_size, z_size, b_size, a_size], dim=-1
             )
+            z = z_flat.view(num_tokens, v_heads_tp, self.head_v_dim)
         else:
             if x_fp8 is not None:
-                projected_states_qkvz = self.in_proj_qkvz(x_fp8, x_scale=x_scale)
+                projected_qkvz = self.in_proj_qkvz(x_fp8, x_scale=x_scale)
             else:
-                projected_states_qkvz = self.in_proj_qkvz(hidden_states)
-            projected_states_ba = self.in_proj_ba(hidden_states)  # always BF16
-            # Use Triton kernel to process qkvz and ba
-            num_k_heads_tp = self.num_k_heads // self.tp_size
-            num_v_heads_tp = self.num_v_heads // self.tp_size
-            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_qwen_next_qkvz_ba(
-                projected_states_qkvz,
-                projected_states_ba,
-                num_k_heads_tp,
-                num_v_heads_tp,
-                self.head_k_dim,
-                self.head_v_dim,
+                projected_qkvz = self.in_proj_qkvz(hidden_states)
+            projected_ba = self.in_proj_ba(hidden_states)  # always BF16
+            # Weights deinterleaved at load → output is [q|k|v|z] and [b|a]
+            mixed_qkv = projected_qkvz[:, :qkv_size]
+            z = projected_qkvz[:, qkv_size:].view(
+                num_tokens, v_heads_tp, self.head_v_dim
             )
+            b = projected_ba[:, :b_size]
+            a = projected_ba[:, b_size:]
+
+        core_attn_out = torch.empty(z.shape, dtype=z.dtype, device=z.device)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
 
         core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
 

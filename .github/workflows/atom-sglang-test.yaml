@@ -35,7 +35,7 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
-      - name: Download and check pre-checkin signal
+      - name: Wait for Pre Checkin workflow
         run: bash ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -434,4 +434,3 @@ jobs:
           rm -f Dockerfile.mod || true
           docker rmi "atom_sglang_base:ci" || true
           docker rmi "atom_sglang:ci" || true
-

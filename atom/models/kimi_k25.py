@@ -40,6 +40,10 @@ class KimiK25ForCausalLM(nn.Module):
         "vision_tower.",
         "mm_projector.",
     ]
+    quant_exclude_name_mapping = {
+        "language_model.model.": "model.",
+        "language_model.lm_head": "lm_head",
+    }
 
     def __init__(
         self,
@@ -87,6 +91,12 @@ class KimiK25ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> Optional[torch.Tensor]:
         return self.language_model.compute_logits(hidden_states)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()

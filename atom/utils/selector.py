@@ -7,6 +7,7 @@ from typing import Type
 from atom.model_ops.attentions.backends import AttentionBackend
 from atom.utils import resolve_obj_by_qualname
 from atom.plugin.prepare import is_sglang, is_vllm
+from atom.utils import envs
 
 
 def get_attn_backend(
@@ -51,13 +52,9 @@ def get_attn_backend_cls(
     if use_v4:
         return "atom.model_ops.attentions.deepseek_v4_attn.DeepseekV4Backend"
     if use_mla:
-        # if block_size == 1:
-        return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"  # noqa: E501
-        # else:
-        #     raise ValueError(
-        #         f" The selected backend"
-        #         f"does not support block size {block_size}."
-        #         "(currently only supports block size 1)")
+        if envs.ATOM_USE_TRITON_MLA:
+            return "atom.model_ops.attentions.triton_mla.TritonMLABackend"
+        return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"
     if use_gdn:
         if use_vllm:
             return "atom.plugin.vllm.attention_backend.gdn_attn.GDNAttentionBackend"
@@ -68,7 +65,7 @@ def get_attn_backend_cls(
         return "atom.model_ops.attentions.gdn_attn.GDNAttentionBackend"
     # gfx1201 (RDNA4) lacks gfx-specific code objects in the AITER prebuilt
     # .so files shipped with rocm/atom-dev:latest, so fall back to the in-tree
-    # gfx1201 triton attention backend that does not load those modules.
+    # native triton attention backend that does not load those modules.
     # Also opt-in via ATOM_NATIVE_TRITON_ATTN=1 on any device for testing.
     try:
         from atom.model_ops.attentions.native_triton_attn import use_native_triton_attn
@@ -76,4 +73,6 @@ def get_attn_backend_cls(
             return "atom.model_ops.attentions.native_triton_attn.NativeTritonBackend"
     except Exception:
         pass
+    if envs.ATOM_USE_UNIFIED_ATTN:
+        return "atom.model_ops.attentions.triton_mha.TritonMHABackend"
     return "atom.model_ops.attentions.aiter_attention.AiterBackend"  # noqa: E501
