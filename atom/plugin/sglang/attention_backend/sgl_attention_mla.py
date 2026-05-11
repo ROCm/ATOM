@@ -27,6 +27,7 @@ from atom.model_ops.attention_mla import (
     fused_qk_rope_concat_and_cache_mla,
 )
 from atom.models.utils import maybe_prefix
+from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
 
 # sglang imports
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
@@ -129,7 +130,6 @@ def _fuse_qk_rmsnorm_and_q_quant(
     output_unquantized_q: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """Fuse q/k RMSNorm and q quant using ATOM's DeepSeek-V2 path."""
-    from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
 
     (q_quantized, q_scale), q_normed, k_nope_normed, _ = _fuse_rmsnorm_quant(
         q,
@@ -645,7 +645,6 @@ def forward_sgl_mha_prepare(
     hidden_states: torch.Tensor,
     **model_kwargs,
 ) -> SglMhaPrepareResult:
-    from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
 
     forward_batch = model_kwargs.get("forward_batch", None)
     if forward_batch is None:
