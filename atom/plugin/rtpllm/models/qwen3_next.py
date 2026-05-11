@@ -7,31 +7,9 @@ import logging
 
 import torch
 
-from atom.utils.forward_context import get_forward_context
-
 logger = logging.getLogger("atom.plugin.rtpllm.models.qwen3_next")
 
 _PATCHED = False
-
-
-def _current_is_prefill() -> bool:
-    fwd_ctx = get_forward_context()
-    if fwd_ctx is None:
-        return False
-    attn_md = getattr(fwd_ctx, "attn_metadata", None)
-    gdn_md = getattr(attn_md, "gdn_metadata", None)
-    attn_inputs = getattr(gdn_md, "rtp_attn_inputs", None)
-    return bool(getattr(attn_inputs, "is_prefill", False))
-
-
-def _current_attn_inputs():
-    fwd_ctx = get_forward_context()
-    if fwd_ctx is None:
-        return None
-    attn_md = getattr(fwd_ctx, "attn_metadata", None)
-    if attn_md is None:
-        return None
-    return getattr(attn_md, "rtp_attn_inputs", None)
 
 
 def apply_qwen3_next_rtpllm_patch() -> None:
@@ -101,9 +79,6 @@ def apply_qwen3_next_rtpllm_patch() -> None:
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        layer_idx = int(getattr(self, "layer_idx", -1))
-        is_prefill = _current_is_prefill()
-        dump_meta = {"is_prefill": is_prefill}
         if self.layer_type == "full_attention":
             pass
         if self.input_layernorm.use_fused_quant:
@@ -132,55 +107,17 @@ def apply_qwen3_next_rtpllm_patch() -> None:
 
         if self.layer_type == "linear_attention":
             pre_ln_hidden = hidden_bf16 if hidden_bf16 is not None else hidden_states
-            x_scale_to_dump = x_scale
-            if x_scale_to_dump is None:
-                x_scale_to_dump = torch.empty(
-                    (0,), dtype=torch.float32, device=pre_ln_hidden.device
-                )
-            proj_input_fp8 = (
-                hidden_states
-                if x_scale is not None
-                else torch.empty((0,), dtype=pre_ln_hidden.dtype, device=pre_ln_hidden.device)
-            )
-            proj_input_source_id = torch.tensor(
-                [1 if x_scale is not None else 0],
-                dtype=torch.int32,
-                device=pre_ln_hidden.device,
-            )
-            # Dump RTP-aligned projection tensors here as a stable fallback hook.
-            # This branch is always executed for linear-attn layers in decoder forward.
-            projected_qkvz = None
-            projected_ba = None
-            try:
-                if x_scale is not None:
-                    projected_qkvz = self.linear_attn.in_proj_qkvz(
-                        hidden_states, x_scale=x_scale
-                    )
-                else:
-                    projected_qkvz = self.linear_attn.in_proj_qkvz(pre_ln_hidden)
-                projected_ba = self.linear_attn.in_proj_ba(pre_ln_hidden)
-            except Exception:  # noqa: BLE001
-                projected_qkvz = None
-                projected_ba = None
             hidden_states = self.linear_attn(
                 hidden_states=pre_ln_hidden,
                 x_fp8=hidden_states if x_scale is not None else None,
                 x_scale=x_scale,
             )
         elif self.layer_type == "full_attention":
-            attn_inputs = _current_attn_inputs()
-            is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
-            dump_meta = {"is_prefill": is_prefill}
             use_rtp_fused_kv_write = (
                 os.getenv("ATOM_RTP_USE_RTP_FUSED_KV_WRITE", "0") == "1"
             )
             attn_positions = (
                 torch.zeros_like(positions) if use_rtp_fused_kv_write else positions
-            )
-            cu_seqlens_tag = (
-                "full_attn/cu_seqlens_prefill"
-                if bool(getattr(attn_inputs, "is_prefill", False))
-                else "full_attn/cu_seqlens_decode"
             )
             hidden_states = self.self_attn(
                 hidden_states=hidden_states,
@@ -226,14 +163,6 @@ def apply_qwen3_next_rtpllm_patch() -> None:
         x_fp8=None,
         x_scale=None,
     ):
-        layer_num = int(
-            getattr(
-                self,
-                "layer_num",
-                getattr(self, "debug_layer_idx", -1),
-            )
-        )
-        is_prefill = _current_is_prefill()
         if hasattr(self, "in_proj_qkvzba"):
             projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
             ba_dim = 2 * (self.num_v_heads // self.tp_size)
@@ -264,18 +193,7 @@ def apply_qwen3_next_rtpllm_patch() -> None:
                 self.head_k_dim,
                 self.head_v_dim,
             )
-
-        layer_cache = None
-        fwd_ctx = get_forward_context()
-        if fwd_ctx is not None:
-            kv_cache_data = getattr(fwd_ctx, "kv_cache_data", None)
-            if isinstance(kv_cache_data, dict):
-                layer_cache = kv_cache_data.get(f"layer_{layer_num}")
-        if layer_cache is not None:
-            pass
         core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
-        if layer_cache is not None:
-            pass
         core_attn_out, maybe_scale = self.norm(core_attn_out, z)
         output = self.out_proj(core_attn_out, x_scale=maybe_scale)
         return output

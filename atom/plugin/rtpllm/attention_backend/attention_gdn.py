@@ -9,7 +9,7 @@ import torch
 
 from atom.plugin.rtpllm.utils.forward_context import RTPForwardContext
 
-logger = logging.getLogger("atom.plugin.rtpllm.model_ops.attention_gdn")
+logger = logging.getLogger("atom.plugin.rtpllm.attention_backend.attention_gdn")
 
 _PATCHED = False
 
@@ -99,17 +99,11 @@ def apply_attention_gdn_rtpllm_patch() -> None:
         non_spec_token_indx = gdn_metadata.non_spec_token_indx
         spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor
         non_spec_state_indices_tensor = gdn_metadata.non_spec_state_indices_tensor
-        is_prefill = bool(int(gdn_metadata.num_prefills) > 0)
-        dump_meta = {"is_prefill": is_prefill}
         rtp_attn_inputs = getattr(gdn_metadata, "rtp_attn_inputs", None)
         rtp_seq_size_per_block = int(
             getattr(gdn_metadata, "rtp_seq_size_per_block", 0) or 0
         )
         if rtp_attn_inputs is not None and rtp_seq_size_per_block > 0:
-            layer_block_map = RTPForwardContext._select_block_table_for_layer(
-                attn_inputs=rtp_attn_inputs,
-                layer_num=int(self.layer_num),
-            )
             non_spec_state_indices_tensor = RTPForwardContext.state_indices_for_layer(
                 attn_inputs=rtp_attn_inputs,
                 is_prefill=bool(gdn_metadata.num_prefills > 0),
@@ -305,4 +299,3 @@ def apply_attention_gdn_rtpllm_patch() -> None:
     attention_gdn.GatedDeltaNet.forward = _patched_gdn_forward
     _PATCHED = True
     logger.info("Applied RTP patch for atom.model_ops.attention_gdn.GatedDeltaNet")
-

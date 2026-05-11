@@ -18,7 +18,7 @@ from atom.models.qwen3_5 import (
     get_fused_expert_mapping,
     load_fused_expert_weights,
 )
-from atom.plugin.rtpllm.model_ops import (
+from atom.plugin.rtpllm.attention_backend import (
     apply_attention_gdn_rtpllm_patch,
     apply_attention_mha_rtpllm_patch,
 )
