@@ -505,8 +505,6 @@ class LinearBase(nn.Module):
                 if hasattr(self, "_fp4_k_padded"):
                     k_orig = self._fp4_k_orig
                     k_pad = self._fp4_k_padded
-                    elem_size = x.element_size()
-                    fp4_elem_size = 1
                     x_k_target = x.shape[-1] * k_pad // k_orig
                     if x.shape[-1] != x_k_target:
                         if x.dtype in [dtypes.fp4x2, dtypes.i4x2, torch.uint8]:
