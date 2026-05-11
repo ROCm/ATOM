@@ -44,8 +44,8 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-from aiter.ops.triton.fusions.fused_clamp_act_mul_quant import (
-    fused_clamp_act_mul_fp8_group_quant,
+from aiter.ops.triton.fusions.fused_clamp_act_mul import (
+    fused_clamp_act_mul,
 )
 from aiter.ops.triton.fusions.fused_reduce_q_norm_qk_rope_swa_write import (
     fused_reduce_q_norm_qk_rope_swa_write,
@@ -1986,7 +1986,7 @@ class Expert(nn.Module):
         # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
         # quant through a single aiter triton kernel. The fused kernel emits
         # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
-        self.use_fused_clamp_act_mul_quant = _V4_USE_TRITON_FUSION
+        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
 
     def forward(
         self,
@@ -2000,8 +2000,8 @@ class Expert(nn.Module):
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
-        if self.use_fused_clamp_act_mul_quant:
-            x_fp8, x_scale = fused_clamp_act_mul_fp8_group_quant(
+        if self.use_fused_clamp_act_mul:
+            x_fp8, x_scale = fused_clamp_act_mul(
                 combined,
                 swiglu_limit=self.swiglu_limit,
                 activation="silu",
