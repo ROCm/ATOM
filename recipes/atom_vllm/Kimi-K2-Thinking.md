@@ -29,6 +29,8 @@ vllm serve amd/Kimi-K2-Thinking-MXFP4-AttnFP8 \
     --gpu_memory_utilization 0.9 \
     --async-scheduling \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
     --no-enable-prefix-caching
 ```
 
