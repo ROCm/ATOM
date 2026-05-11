@@ -64,12 +64,11 @@ export ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0
 * `--kv_cache_dtype bf16` — FP8 KV is a TODO; only BF16 is wired up.
 * `-tp 1` — multi-GPU TP not exercised against this backend yet.
 
-CUDAGraph capture is supported for **decode at bs ≤ 2 only**. Pass
-`--cudagraph-capture-sizes "[1,2]"` to opt in. Larger captured batches
-(bs ≥ 4) currently corrupt logits at replay (see Known caveats); the
-engine falls back to eager for any decode batch outside the captured
-set, so concurrency above 2 still works — it just doesn't get the
-graph speedup. Use `--enforce-eager` to disable cudagraph entirely.
+CUDAGraph capture works at all decode batch sizes (default `[1, 2, 4,
+8, 16, 32, 48, 64, 128, 256]`). The earlier `bs ≥ 3` corruption was a
+NaN-from-padding bug in `prepare_decode` (now fixed — see Known
+caveats for the diagnosis). Use `--enforce-eager` only if you want to
+disable cudagraph entirely.
 
 ## Smoke test
 
@@ -78,8 +77,7 @@ python3 -m atom.examples.simple_inference \
   --model /path/to/Ministral-3-8B-Instruct-2512 \
   --level 0 -tp 1 --kv_cache_dtype bf16 \
   --max-model-len 4096 --max-tokens 32 \
-  --gpu-memory-utilization 0.85 \
-  --cudagraph-capture-sizes "[1,2]"
+  --gpu-memory-utilization 0.85
 ```
 
 ## OpenAI-compatible server
@@ -89,8 +87,7 @@ python3 -m atom.entrypoints.openai_server \
   --model /path/to/Ministral-3-8B-Instruct-2512 \
   --level 0 --kv_cache_dtype bf16 \
   --max-model-len 4096 \
-  --server-port 30000 \
-  --cudagraph-capture-sizes "[1,2]"
+  --server-port 30000
 ```
 
 ## gsm8k via lm_eval (5-shot, generate-until)
@@ -162,20 +159,6 @@ Cumulative vs the original eager baseline: **35% TPOT reduction** and
 
 Remaining perf headroom worth pursuing:
 
-- **CUDAGraph at bs ≥ 3**: captured graphs at decode bs ≥ 3 corrupt
-  the first decode-step logits (see Known caveats). Bisected as far as
-  possible from outside the engine: every individual triton kernel
-  (RMSNorm, SiluMul, kv-write, gemm_a8w8, pa_decode_v1, pa_decode_v2)
-  passes a standalone capture-then-replay test at bs=4 with bitwise-
-  identical output, AND a 36-layer chained version of those kernels in
-  a single graph also passes at bs=4 — so the bug is not in any kernel
-  or in their composition under cudagraph. Bypassing RoPE entirely
-  does not fix it either (eager-no-rope → 0.633, cg-no-rope → 0.067 on
-  gsm8k n=30 nc=4; cudagraph still degrades the model far below the
-  RoPE-less baseline). The bug must therefore be in some interaction
-  between ATOM's engine flow and the captured replay that doesn't
-  reproduce in standalone — finding it would need engine-level
-  intermediate-state diffing per layer, which is out of scope here.
 - **TP=2**: blocked at host kernel level — both RCCL and aiter's
   CustomAllreduce fall over on the same root cause: HIP IPC requires
   `iommu=pt` (and `amd_iommu=on`) on the GRUB cmdline. PyNcclCommunicator
@@ -200,44 +183,40 @@ Remaining perf headroom worth pursuing:
   boot. Cosmetic — KV writes/reads work end-to-end.
 * `--max-model-len` must accommodate the chat-templated prompt (the
   Mistral system prompt is ~540 tokens).
-* **CUDAGraph at decode bs ≥ 3 is broken**: captured graphs at bs=3,4,8
-  all emit a wrong logit at the first decode step after prefill, almost
-  always sampling EOS or a stop token. bs=1 and bs=2 captured graphs
-  are correct. Eager mode at the same bs is correct (gsm8k 5-shot 0.785
-  at concurrent=4).
+* **(FIXED) CUDAGraph at decode bs ≥ 3 used to be broken** — diagnosed
+  and fixed. Root cause: `prepare_decode` padded `context_lens` to 0
+  for slots `[scheduled_bs:bs]` when the engine padded a partial
+  batch up to a captured cudagraph size. Aiter's pa_decode_v1/v2
+  kernels with `seq_len=0` run zero loop iterations and end with
+  `acc /= exp_sum` where `exp_sum` stayed 0 -> `0/0 = NaN`. That NaN
+  in the padded slot's attn_out then propagated through the per-tensor
+  FP8 quant of `attn_out` (`amax(... NaN ...) = NaN` -> the entire
+  batch's `x_scale` became NaN -> every downstream `gemm_a8w8` output
+  NaN), corrupting all real slots. Symptom: wrong logit at the first
+  decode step, model emitted a stop token, request finished after one
+  token.
 
-  Investigated and ruled out as causes:
-  - **v1 vs v2 pa_decode dispatch**: v1-only forced is also broken at
-    bs ≥ 3; bs ≥ 3 captured graphs replay incorrectly under both.
-  - **The prewarm helper**: engine reaches capture without it; bs ≥ 3
-    still breaks. (We keep the prewarm anyway since it follows the
-    SGLang / PyTorch idiom and is a robustness belt-and-suspenders.)
-  - **JIT-during-capture**: capture itself succeeds and the eager path
-    works fine at the same bs and same shapes.
-  - **Capture-stream alignment**: warmup now runs on `gc.stream`, twice,
-    per the SGLang / PyTorch CUDA-graphs idiom; bug persists.
-  - **FP8 GEMM split-K configs**: `_get_config` returns `NUM_KSPLIT=1`
-    across all our (M, N, K) so there's no per-bs binary divergence in
-    `gemm_a8w8`.
-  - **lm_head being captured**: `logits_in_graph=False` also broken at
-    bs ≥ 3.
-  - **Standalone capture-replay of every triton kernel** (RMSNorm,
-    SiluMul, kv-write, gemm_a8w8, pa_decode_v1, pa_decode_v2) at
-    bs=1..8: every kernel passes bitwise-identically.
-  - **Standalone 36-layer chained kernels** (full Mistral decoder
-    depth) at bs=4 captured + replayed: passes bitwise-identically.
-  - **RoPE bypass**: turning off RoPE entirely in ATOM still leaves
-    the cudagraph bs ≥ 3 path broken (eager-no-rope = 0.633 vs
-    cg-no-rope = 0.067 on gsm8k n=30 nc=4) — RoPE isn't the cause.
+  The reason a long simple bisection didn't find it earlier: when
+  scheduled_bs == captured_bs (e.g., the standalone 36-layer chain
+  test, or 4 simultaneous curl calls hitting the bs=4 graph), no
+  padding ever happens, so the bug doesn't reproduce. Only lm_eval
+  with its variable scheduled_bs over 200 requests reliably triggers
+  partial batches that get padded.
 
-  Conclusion: the bug is in some interaction between ATOM's full
-  engine flow at runtime and the captured-graph replay that doesn't
-  reproduce in standalone tests. Running it down would need
-  intermediate-state diffing per layer in the live engine — out of
-  scope here. Symptom is consistent with sglang#1558 / sglang#19799 and
-  pytorch#155684 (HIP graph capture is silent on illegal-during-capture
-  ops). Workaround: `--cudagraph-capture-sizes "[1,2]"`. Concurrency
-  > 2 still works via eager fallback.
+  Fix (in `prepare_decode`): pad `context_lens` to `1` instead of `0`
+  for `[scheduled_bs:bs]`. With seq_len=1 the kernel runs exactly one
+  loop iteration, reads one garbage K/V from `block_tables[i, 0] = 0`
+  (which points at real but unrelated KV — fine, the padded row's
+  output is discarded by the engine which only reads
+  `outputs[:scheduled_bs]`), and produces a finite attn_out. Slot
+  mapping stays at -1 so our kv-write kernel's sentinel still skips
+  the write (otherwise we'd overwrite slot 0's real KV).
+
+  Verification: gsm8k 5-shot, n=200 with the default cudagraph capture
+  set `[1, 2, 4, 8, 16, 32, 48, 64, 128, 256]`:
+    num_concurrent=4: strict 0.815, flex 0.815 (was 0.005)
+    num_concurrent=8: strict 0.760, flex 0.760 (was 0.005)
+  Both at or above the eager baseline of 0.785.
 * **TP=2 not yet usable on this host**: tried both transport paths;
   both fail on the same root cause — HIP IPC needs `iommu=pt` on the
   host kernel cmdline.

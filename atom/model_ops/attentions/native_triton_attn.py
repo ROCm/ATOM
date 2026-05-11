@@ -75,8 +75,11 @@ def _is_gfx1201() -> bool:
 
 
 def use_native_triton_attn() -> bool:
-    if os.environ.get("ATOM_NATIVE_TRITON_ATTN", "").lower() in ("1", "true"):
+    val = os.environ.get("ATOM_NATIVE_TRITON_ATTN", "").lower()
+    if val in ("1", "true"):
         return True
+    if val in ("0", "false"):
+        return False
     return _is_gfx1201()
 
 
@@ -396,6 +399,31 @@ class NativeTritonMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         sum_scheduled_tokens = batch.total_tokens_num_decode
+        # CUDAGRAPH PADDING (scheduled_bs < bs, e.g. when the engine pads
+        # a 3-seq batch up to a captured bs=4 graph): the padded slots
+        # must not trigger NaN-producing paths in pa_decode.
+        #
+        # With context_lens=0, aiter's pa_decode_v1/v2 kernels run zero
+        # loop iterations and end with `acc /= exp_sum` where exp_sum
+        # stayed 0 -> 0/0 = NaN. That NaN at slot[i>=scheduled_bs]
+        # propagates through the per-tensor FP8 quant of attn_out
+        # (`amax(... NaN ...) = NaN` -> the entire batch's x_scale
+        # becomes NaN -> every downstream gemm_a8w8 output is NaN),
+        # corrupting ALL real slots. Symptom: wrong logits at the first
+        # decode step, model emits a stop token, request finishes after
+        # one token. Reproduces in lm_eval (variable scheduled_bs) but
+        # NOT in `concurrent==captured_bs` curl tests where padding
+        # never kicks in.
+        #
+        # Fix: pad context_lens to 1 (a single garbage KV read,
+        # producing a FINITE attn_out for the padded row) and leave
+        # block_tables[padded_slot, 0] = 0 (the prepare_block_tables
+        # default points at block 0, which holds real but unrelated KV
+        # — fine for this purpose, the row's output is discarded
+        # downstream by the engine which only reads outputs[:scheduled_bs]).
+        # Keep slot_mapping = -1 for padded slots so our kv-write kernel's
+        # `if slot < 0: return` sentinel skips the write — otherwise we'd
+        # overwrite slot 0's real KV data.
         var["slot_mapping"].np[: bs * max_seqlen_q] = -1
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping[
@@ -403,7 +431,7 @@ class NativeTritonMetadataBuilder(CommonAttentionBuilder):
             ]
         var["positions"].np[:sum_scheduled_tokens] = positions[:sum_scheduled_tokens]
         var["context_lens"].np[:scheduled_bs] = context_lens[:scheduled_bs]
-        var["context_lens"].np[scheduled_bs:bs] = 0
+        var["context_lens"].np[scheduled_bs:bs] = 1  # was 0 -> 0/0 NaN in pa_decode
 
         vars_used = [
             ("slot_mapping", bs * max_seqlen_q),
