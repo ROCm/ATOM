@@ -1202,7 +1202,14 @@ class DeepseekV4Attention(nn.Module):
       - attn_sink: per-head learnable logit added only to softmax denominator
     """
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        compress_stream: Optional[torch.cuda.Stream] = None,
+    ):
         super().__init__()
         self.layer_id = layer_id
         self.dim = args.dim
@@ -1372,6 +1379,12 @@ class DeepseekV4Attention(nn.Module):
             self.indexer.rotary_emb = self.rotary_emb
             self.indexer.compressor.rotary_emb = self.rotary_emb
 
+        self.alt_stream = alt_stream
+        self.compress_stream = compress_stream
+        self._use_async_compress = (
+            self.alt_stream is not None and self.compressor is not None
+        )
+
         self.layer_name = prefix
         atom_config = get_current_atom_config()
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
@@ -1426,6 +1439,31 @@ class DeepseekV4Attention(nn.Module):
         # batched-FP8 kernel. See attention_mla.py:211 for reference.
         self.wo_a.quant_type = QuantType.No
 
+    def _launch_compressors_async(self, x, plan, state_slot_mapping, block_tables):
+        """Fire Compressor(s) on side streams, return immediately.
+
+        Main Compressor → alt_stream (CSA + HCA).
+        Indexer Compressor → compress_stream (CSA only).
+        Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us."""
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            self.compressor(
+                x,
+                plan=plan,
+                state_slot_mapping=state_slot_mapping,
+                block_tables=block_tables,
+            )
+        if self.indexer is not None and self.compress_stream is not None:
+            self.compress_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.compress_stream):
+                self.indexer.compressor(
+                    x,
+                    plan=plan,
+                    state_slot_mapping=state_slot_mapping,
+                    block_tables=block_tables,
+                )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1469,11 +1507,24 @@ class DeepseekV4Attention(nn.Module):
         if _V4_FORCE_UE8M0_QUANT:
             x = x.clone()
             act_quant_inplace(x, 128, "ue8m0")
-        # Single fused FP8 GEMM for [wq_a; wkv]; torch.split returns zero-copy views.
+
+        attn_md = cast("AttentionMetaData_DSV4", get_forward_context().attn_metadata)
+        compress_plans = attn_md.compress_plans
+        swa_write_indices = attn_md.swa_write_indices
+        v4_batch_id_per_token = attn_md.batch_id_per_token
+        block_tables_gpu = attn_md.block_tables
+        state_slot_mapping = attn_md.state_slot_mapping
+        plan_for_layer = compress_plans[ratio] if ratio else None
+
+        # ===== Triple-stream: Q/KV path + both Compressors in parallel =====
+        if self._use_async_compress:
+            self._launch_compressors_async(
+                x, plan_for_layer, state_slot_mapping, block_tables_gpu
+            )
+
+        # ----- Q/KV projections (main stream) -----
         qkv_a = self.wqkv_a(x)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        # q_norm is fused-quant: returns (qr_fp8, qr_scale) — shared by
-        # outer wq_b and Indexer.wq_b, both per_1x128 FP8 GEMMs.
         assert (
             not _V4_FORCE_UE8M0_QUANT
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
@@ -1490,61 +1541,41 @@ class DeepseekV4Attention(nn.Module):
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
-        # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
-        # All per-fwd state read once. Production prepare_decode/prefill
-        # always populates these; warmup goes through the same path
-        # (`_populate_state_slot_mapping` falls back to slot 0).
-        # Cast to V4 typed metadata so V4-specific attribute access (v4_*,
-        # compress_plans, swa_write_indices, ...) is well-typed for pyright.
-        attn_md = cast("AttentionMetaData_DSV4", get_forward_context().attn_metadata)
-        compress_plans = attn_md.compress_plans
-        swa_write_indices = attn_md.swa_write_indices
-        v4_batch_id_per_token = attn_md.batch_id_per_token
-        block_tables_gpu = attn_md.block_tables
-        state_slot_mapping = attn_md.state_slot_mapping
 
-        # ===== Batched compressor + Indexer (ONCE per layer) =====
-        # State cache reset on fresh prefill is redundant: SWA's start_pos==0
-        # path uses raw seq_kv, and fused_compress's state-cache reads are
-        # already masked by `s < 0` for fresh prefill (compress_plan.py:88 +
-        # fused_compress.py:124-127).
-        # Compressor's return value is unused — paged_decode/paged_prefill read
-        # the scattered compress entries from `unified_kv` via per-fwd indices.
-        # Called purely for its side-effect (scatter into self.kv_cache).
-        plan_for_layer = compress_plans[ratio] if ratio else None
-        if self.compressor is not None:  # i.e. CSA or HCA layer, compress_ratio > 0
-            self.compressor(
-                x,
-                plan=plan_for_layer,
-                state_slot_mapping=state_slot_mapping,
-                block_tables=block_tables_gpu,
-            )
-        if self.indexer is not None:  # i.e. CSA layer, compress_ratio == 4
-            # Indexer's inner Compressor populates the FP8 indexer kv_cache
-            # via the unified `fused_compress_attn` quant path (auto-detected
-            # by cache dtype). `block_tables_gpu` is the same as the Main
-            # Compressor's; the kernel resolves `physical_block * k_per_block
-            # + slot_in_block` internally — no separate slot_mapping needed.
-            # The outer `forward_batched` consumes `v4_indexer_meta` (built
-            # once per fwd) so per-layer H2D / CPU index math stays zero.
-            self.indexer.compressor(
-                x,
-                plan=plan_for_layer,
-                state_slot_mapping=state_slot_mapping,
-                block_tables=block_tables_gpu,
-            )
+        # ===== Compressor + Indexer =====
+        if not self._use_async_compress:
+            if self.compressor is not None:
+                self.compressor(
+                    x,
+                    plan=plan_for_layer,
+                    state_slot_mapping=state_slot_mapping,
+                    block_tables=block_tables_gpu,
+                )
+                if self.indexer is not None:
+                    self.indexer.compressor(
+                        x,
+                        plan=plan_for_layer,
+                        state_slot_mapping=state_slot_mapping,
+                        block_tables=block_tables_gpu,
+                    )
+        if self.indexer is not None:
+            if self._use_async_compress:
+                torch.cuda.current_stream().wait_stream(self.alt_stream)
+                torch.cuda.current_stream().wait_stream(self.compress_stream)
             indexer_topk_batched = self.indexer.forward_batched(
                 x_full=x,
                 qr_full=qr,
                 qr_full_scale=qr_scale,
                 positions=positions,
-            )  # raw seq-local [T, index_topk] int32, -1 sentinels in tail cols
+            )
             # Translate seq-local topk → physical paged offsets and write into
             # the CSA section of either:
             #   - decode buffer `kv_indices_csa` (is_pure_decode)
             #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
             # `_fill_csa_paged_compress` dispatches internally on is_pure_decode.
             self._fill_csa_paged_compress(attn_md, indexer_topk_batched, num_tokens)
+        elif self._use_async_compress:
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
 
         # ===== Sparse attention dispatch =====
         # Two paths over the unified KV pool. The order of `swa_write` vs
@@ -2024,11 +2055,18 @@ class Block(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        compress_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
-        self.attn = DeepseekV4Attention(layer_id, args, prefix=f"{prefix}.attn")
+        self.attn = DeepseekV4Attention(
+            layer_id,
+            args,
+            prefix=f"{prefix}.attn",
+            alt_stream=alt_stream,
+            compress_stream=compress_stream,
+        )
         self.ffn = MoE(layer_id, args, prefix=f"{prefix}.ffn", alt_stream=alt_stream)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -2347,10 +2385,14 @@ class DeepseekV4Model(nn.Module):
         # equals nn.Embedding's [vocab_size, dim] so dummy state_dicts load
         # directly. At TP>1 each rank holds vocab_size/tp rows.
         self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
-        # alt_stream for dual-stream MoE (shared_experts // routed_experts).
-        # Allocated once and shared across all blocks; MoE.__init__ decides
-        # per-layer whether to actually use it (env-gated, mismatched-dtype-aware).
+        # alt_stream: dual-stream MoE (shared_experts // routed_experts) AND
+        # Main Compressor overlap. compress_stream: Indexer Compressor overlap.
+        # Both allocated once, shared across all blocks. Attention runs before
+        # MoE in each block, so attn and MoE never contend for alt_stream.
         self.alt_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream() if torch.cuda.is_available() else None
+        )
+        self.compress_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
         self.layers = nn.ModuleList(
@@ -2360,6 +2402,7 @@ class DeepseekV4Model(nn.Module):
                     args,
                     prefix=f"layers.{layer_id}",
                     alt_stream=self.alt_stream,
+                    compress_stream=self.compress_stream,
                 )
                 for layer_id in range(args.n_layers)
             ]
