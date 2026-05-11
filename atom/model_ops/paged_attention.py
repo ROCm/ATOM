@@ -220,7 +220,7 @@ class PagedAttention(BaseAttention):
 
         # Torch-native fallback: backends without aiter prebuilt HIP modules
         # (e.g. gfx1201) route through self.impl.forward instead of the aiter op.
-        if self.attn_backend.get_name() == "GFX1201_TRITON_ATTENTION":
+        if self.attn_backend.get_name() == "NATIVE_TRITON_ATTENTION":
             return self.impl.forward(
                 query=query,
                 key=key,
