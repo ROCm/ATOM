@@ -110,6 +110,52 @@ def _get_aiter_dynamic_per_tensor_quant():
     return fn if fn is not False else None
 
 
+def _gfx1201_gemm_a8w8_config(M: int, N: int, K: int) -> dict:
+    """Hand-tuned config for aiter triton `gemm_a8w8` on gfx1201 (RDNA4).
+
+    aiter's `_get_config` returns a CDNA-tuned default (BLOCK_SIZE_M=64,
+    GROUP_SIZE_M=4). At decode bs=1 the GROUP_SIZE_M=4 schedule allocates
+    4 M-tiles of work per group when only 1 M-tile is real, wasting 75%
+    of M-dim launch slots. Cold-cache kernel bench on gfx1201 showed:
+
+        layer       default     +GM=1     +best
+        qkv         163 us      67 us     61 us  (M16_N128_K128, NW=8)
+        o            45 us      48 us     43 us  (M64_N64_K128,  NW=8)
+        gate_up     229 us     230 us    214 us  (M64_N64_K128,  NW=8)
+        down        107 us      47 us     43 us  (M16_N128_K128, NW=8)
+
+    Per-decode-step savings vs default: ~6 ms across 34 layers — TPOT
+    drops from ~22 ms to ~16 ms (45 -> 62 tok/s, 53% -> 72% of memory
+    roofline). The dominant lever is `GROUP_SIZE_M=1`; the BLOCK_SIZE_M
+    and `num_warps` choices add a few more us each.
+    """
+    # Pick by N (the output dim). The per-N optimum is stable across our M.
+    if N >= 16384:           # gate_up (28672) — large N, full M-tile pays
+        return {
+            "BLOCK_SIZE_M": 64,  "BLOCK_SIZE_N": 64,  "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,   "NUM_KSPLIT": 1,
+            "num_warps": 8, "num_stages": 2,
+            "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 1,
+            "cache_modifier": None, "SPLITK_BLOCK_SIZE": 4096,
+        }
+    if K >= 8192:            # down (K=14336) — narrow N, deep K
+        return {
+            "BLOCK_SIZE_M": 16,  "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,   "NUM_KSPLIT": 1,
+            "num_warps": 8, "num_stages": 2,
+            "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 1,
+            "cache_modifier": None, "SPLITK_BLOCK_SIZE": K,
+        }
+    # qkv (N=6144) and o (N=4096): default-ish tile, GROUP_SIZE_M=1
+    return {
+        "BLOCK_SIZE_M": 16,  "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,   "NUM_KSPLIT": 1,
+        "num_warps": 8, "num_stages": 2,
+        "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 1,
+        "cache_modifier": None, "SPLITK_BLOCK_SIZE": 4096,
+    }
+
+
 def _fp8_per_tensor_linear_triton(
     triton_gemm,
     x: torch.Tensor,
@@ -149,7 +195,11 @@ def _fp8_per_tensor_linear_triton(
     # Per-output-channel weight scale — cached on the layer (constant per fwd).
     w_scale_full = _build_w_scale_full(weight_scale, output_partition_sizes, N)
 
-    return triton_gemm(x_q, w_q, x_scale_full, w_scale_full, bias=bias, dtype=otype)
+    cfg = _gfx1201_gemm_a8w8_config(M, N, K)
+    return triton_gemm(
+        x_q, w_q, x_scale_full, w_scale_full,
+        bias=bias, dtype=otype, config=cfg,
+    )
 
 
 def _fp8_per_tensor_linear_gfx1201(
