@@ -1063,8 +1063,9 @@ def _get_current_atom_config_from_vllm_forward_context() -> Optional[Config]:
 
 
 def get_current_atom_config() -> Config:
-    forward_atom_config = _get_current_atom_config_from_vllm_forward_context()
-    if forward_atom_config is not None:
-        return forward_atom_config
+    if is_vllm():
+        forward_atom_config = _get_current_atom_config_from_vllm_forward_context()
+        if forward_atom_config is not None:
+            return forward_atom_config
     assert _current_atom_config is not None, "Current atom config is not set"
     return _current_atom_config
