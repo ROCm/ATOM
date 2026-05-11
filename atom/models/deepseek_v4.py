@@ -2623,8 +2623,6 @@ class DeepseekV4Model(nn.Module):
         self.compress_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
-        self.alt_stream = None
-        self.compress_stream = None
         self.layers = nn.ModuleList(
             [
                 Block(
