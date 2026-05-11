@@ -31,6 +31,7 @@ class PluginConfig:
     sglang_enable_torch_compile: bool = False
     sglang_disable_cuda_graph: bool = False
     sglang_enable_dp_attention: bool = False
+    sglang_aiter_rank_id: int = 0
     sglang_dist_init_addr: Optional[str] = None
     sglang_port_args: Any = None
 
@@ -148,6 +149,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.server_args import (
         get_global_server_args,
         PortArgs,
+        ZMQ_TCP_PORT_DELTA,
     )
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from sglang.srt.configs.modelopt_config import ModelOptConfig
@@ -212,7 +214,9 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # sglang uses the atom parallel config
     sgl_parallel_config = ParallelConfig(
         data_parallel_size=atom_data_parallel_size,
+        data_parallel_size_local=atom_data_parallel_size,
         data_parallel_rank=atom_data_parallel_rank,
+        data_parallel_rank_local=atom_data_parallel_rank,
     )
 
     # use sglang torch compile policy and cuda graph policy
@@ -223,6 +227,26 @@ def _generate_atom_config_from_sglang_config(config: Any):
         use_cudagraph=False,
         cudagraph_mode=None,
     )
+
+    sglang_dist_init_addr = server_args.dist_init_addr
+    # In single-node DP attention, synthesize the same TCP base address that
+    # SGLang uses for its DP-attention TCP port family. The primary purpose is
+    # to avoid calling PortArgs.init_new() again in ATOM plugin mode, because a
+    # second call would probe that fixed TCP range again and conflict with
+    # SGLang's existing allocation. In the current plugin path, this value
+    # should be treated as a compatibility/fallback hint rather than a
+    # guaranteed representation of the runtime default torch.distributed world
+    # rendezvous endpoint.
+    if (
+        sglang_dist_init_addr is None
+        and server_args.enable_dp_attention
+        and server_args.nnodes == 1
+    ):
+        sglang_dist_init_addr = f"127.0.0.1:{server_args.port + ZMQ_TCP_PORT_DELTA}"
+
+    sglang_port_args = None
+    if sglang_dist_init_addr is None:
+        sglang_port_args = PortArgs.init_new(server_args)
 
     plugin_config = PluginConfig(
         # common config
@@ -237,8 +261,9 @@ def _generate_atom_config_from_sglang_config(config: Any):
         sglang_enable_torch_compile=server_args.enable_torch_compile,
         sglang_disable_cuda_graph=server_args.disable_cuda_graph,
         sglang_enable_dp_attention=server_args.enable_dp_attention,
-        sglang_dist_init_addr=server_args.dist_init_addr,
-        sglang_port_args=PortArgs.init_new(server_args),
+        sglang_aiter_rank_id=sglang_aiter_rank_id,
+        sglang_dist_init_addr=sglang_dist_init_addr,
+        sglang_port_args=sglang_port_args,
     )
 
     # force max num batched tokens to 16K because sgl doesn't have
