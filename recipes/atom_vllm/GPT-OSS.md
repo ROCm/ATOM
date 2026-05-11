@@ -15,8 +15,8 @@ The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 GPT-OSS-120B is a single-GPU model, so `--tensor-parallel-size` defaults to 1 and can be omitted.
 
 ```bash
-export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
-
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1 \
+ATOM_MOE_GU_ITLV=1 \
 vllm serve openai/gpt-oss-120b \
     --host localhost \
     --port 8000 \
