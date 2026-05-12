@@ -7,6 +7,13 @@ concurrency:
 on:
   workflow_dispatch:
     inputs:
+      gpu_arch:
+        description: "Target GPU architecture"
+        type: choice
+        default: "MI355"
+        options:
+          - "MI355"
+          - "MI308"
       deepseek-r1-fp8-tp8:
         description: "DeepSeek-R1-0528 FP8 TP8"
         type: boolean
@@ -212,6 +219,7 @@ jobs:
       - uses: actions/checkout@v6
       - id: load
         env:
+          TARGET_GPU_ARCH: ${{ inputs.gpu_arch }}
           ENABLE_DEEPSEEK_R1_FP8_TP8: ${{ inputs.deepseek-r1-fp8-tp8 }}
           ENABLE_DEEPSEEK_R1_FP8_TP4: ${{ inputs.deepseek-r1-fp8-tp4 }}
           ENABLE_DEEPSEEK_R1_FP4_TP8: ${{ inputs.deepseek-r1-fp4-tp8 }}
@@ -220,20 +228,23 @@ jobs:
         run: |
           MODELS_JSON="$(jq -c '
             map(select(
-              (.prefix == "deepseek-r1-fp8-tp8" and env.ENABLE_DEEPSEEK_R1_FP8_TP8 == "true")
-              or (.prefix == "deepseek-r1-fp8-tp4" and env.ENABLE_DEEPSEEK_R1_FP8_TP4 == "true")
-              or (.prefix == "deepseek-r1-fp4-tp8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8 == "true")
-              or (.prefix == "deepseek-r1-fp4-tp4" and env.ENABLE_DEEPSEEK_R1_FP4_TP4 == "true")
-              or (.prefix == "deepseek-r1-fp4-tp8-ep8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8_EP8 == "true")
-            ))
+              (
+                (.prefix == "deepseek-r1-fp8-tp8" and env.ENABLE_DEEPSEEK_R1_FP8_TP8 == "true")
+                or (.prefix == "deepseek-r1-fp8-tp4" and env.ENABLE_DEEPSEEK_R1_FP8_TP4 == "true")
+                or (.prefix == "deepseek-r1-fp4-tp8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8 == "true")
+                or (.prefix == "deepseek-r1-fp4-tp4" and env.ENABLE_DEEPSEEK_R1_FP4_TP4 == "true")
+                or (.prefix == "deepseek-r1-fp4-tp8-ep8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8_EP8 == "true")
+              )
+              and (.runner[env.TARGET_GPU_ARCH] != null)
+            ) | .selected_runner_label = .runner[env.TARGET_GPU_ARCH].runner_label)
           ' .github/benchmark/sglang_benchmark_models.json)"
           echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
           if [ "${MODELS_JSON}" = "[]" ]; then
             echo "has_enabled_models=false" >> "$GITHUB_OUTPUT"
-            echo "No models selected for SGLang benchmark."
+            echo "No models selected for SGLang benchmark on ${TARGET_GPU_ARCH}."
           else
             echo "has_enabled_models=true" >> "$GITHUB_OUTPUT"
-            echo "Selected models: ${MODELS_JSON}"
+            echo "Selected ${TARGET_GPU_ARCH} models: ${MODELS_JSON}"
           fi
 
   build-benchmark-matrix:
@@ -423,7 +434,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.build-benchmark-matrix.outputs.benchmark_matrix) }}
-    runs-on: ${{ matrix.model.runner }}
+    runs-on: ${{ matrix.model.selected_runner_label }}
     timeout-minutes: 240
     permissions:
       actions: read
@@ -595,7 +606,7 @@ jobs:
       - name: Collect GPU info (inside container)
         if: steps.check.outputs.enabled == 'true'
         id: gpu-info
-        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.selected_runner_label }}"
 
       - name: Download model if needed
         if: steps.check.outputs.enabled == 'true'
