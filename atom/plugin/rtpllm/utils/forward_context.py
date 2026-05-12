@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Tuple
 
 import torch
 
@@ -54,18 +55,6 @@ class RTPForwardContext:
         return tensor.to(**kwargs).contiguous()
 
     @staticmethod
-    def _num_tokens_from_inputs(attn_inputs: Any, *, device: torch.device) -> int:
-        input_lengths = RTPForwardContext._non_empty_int32(
-            getattr(attn_inputs, "input_lengths", None),
-            device=device,
-        )
-        if input_lengths is None:
-            raise ValueError(
-                "RTP plugin requires attention_inputs.input_lengths for GDN metadata."
-            )
-        return int(input_lengths.sum().item())
-
-    @staticmethod
     def _query_start_loc(attn_inputs: Any, *, device: torch.device) -> torch.Tensor:
         input_lengths = RTPForwardContext._non_empty_int32(
             getattr(attn_inputs, "input_lengths", None),
@@ -78,7 +67,7 @@ class RTPForwardContext:
         if cu_seqlens is not None and cu_seqlens.numel() > 1:
             # Decode steps may carry placeholder [0, 0] cu_seqlens from upper layers.
             # Only trust cu_seqlens when it represents non-empty query tokens.
-            if int(cu_seqlens[-1].item()) > 0:
+            if bool((cu_seqlens[-1] > 0).item()):
                 if input_lengths is not None and cu_seqlens.numel() >= input_lengths.numel() + 1:
                     return cu_seqlens[: input_lengths.numel() + 1]
                 return cu_seqlens
@@ -253,10 +242,6 @@ class RTPForwardContext:
         by_group = getattr(attn_inputs, "kv_cache_kernel_block_id_device_by_group", None)
         if by_group is not None and len(by_group):
             gid = int(group_id) if group_id is not None else 0
-            if group_id is None and layer_num is not None:
-                layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
-                if layer_to_group is not None and int(layer_to_group.numel()) > layer_num:
-                    gid = int(layer_to_group[layer_num].item())
             if gid < 0 or gid >= len(by_group):
                 raise ValueError(
                     f"RTP plugin resolved invalid kv-cache group id {gid} for layer {layer_num}."
@@ -273,6 +258,16 @@ class RTPForwardContext:
         return {idx: int(gid) for idx, gid in enumerate(layer_to_group_cpu.tolist())}
 
     @staticmethod
+    def _layer_group_map_signature(attn_inputs: Any) -> tuple[Any, ...]:
+        layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
+        if layer_to_group is None:
+            return ("no_layer_to_group",)
+        return (
+            int(layer_to_group.data_ptr()),
+            int(layer_to_group.numel()),
+        )
+
+    @staticmethod
     def _resolve_group_id(
         *,
         attn_inputs: Any,
@@ -286,9 +281,6 @@ class RTPForwardContext:
             return 0
         if layer_group_map is not None and layer_num in layer_group_map:
             return int(layer_group_map[layer_num])
-        layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
-        if layer_to_group is not None and int(layer_to_group.numel()) > layer_num:
-            return int(layer_to_group[layer_num].item())
         return 0
 
     @staticmethod
@@ -527,14 +519,15 @@ class RTPForwardContext:
                 "RTP plugin block_table/query_start_loc batch mismatch "
                 f"(block_table={int(bt.shape[0])}, batch={batch_size})."
             )
-        if int(qsl[-1].item()) != num_tokens:
+        validate_slot_mapping = os.getenv("ATOM_VALIDATE_SLOT_MAPPING", "0") == "1"
+        if validate_slot_mapping and int(qsl[-1].item()) != num_tokens:
             raise ValueError(
                 "RTP plugin query_start_loc/positions token mismatch "
                 f"(query_start_loc[-1]={int(qsl[-1].item())}, positions={num_tokens})."
             )
 
         lengths = qsl[1:] - qsl[:-1]
-        if torch.any(lengths <= 0):
+        if validate_slot_mapping and torch.any(lengths <= 0):
             raise ValueError(
                 "RTP plugin query_start_loc contains non-positive sequence length."
             )
@@ -542,7 +535,7 @@ class RTPForwardContext:
             torch.arange(batch_size, device=device, dtype=torch.int64),
             lengths.to(dtype=torch.int64),
         )
-        if int(seq_id.numel()) != num_tokens:
+        if validate_slot_mapping and int(seq_id.numel()) != num_tokens:
             raise ValueError(
                 "RTP plugin internal seq_id construction mismatch for slot_mapping."
             )
@@ -552,14 +545,16 @@ class RTPForwardContext:
             int(seq_size_per_block),
             rounding_mode="floor",
         )
-        if torch.any(block_col < 0) or torch.any(block_col >= bt.shape[1]):
+        if validate_slot_mapping and (
+            torch.any(block_col < 0) or torch.any(block_col >= bt.shape[1])
+        ):
             raise ValueError(
                 "RTP plugin block-table index out of range for full-attn slot_mapping "
                 f"(max_col={int(bt.shape[1]) - 1})."
             )
 
         slot_base = bt[seq_id, block_col.to(dtype=torch.int64)]
-        if torch.any(slot_base < 0):
+        if validate_slot_mapping and torch.any(slot_base < 0):
             raise ValueError(
                 "RTP plugin resolved padded/invalid (-1) block slot for full-attn slot_mapping."
             )
@@ -634,6 +629,7 @@ class RTPForwardContext:
             )
         device = positions.device
         seq_lens = RTPForwardContext._build_seq_lens(attn_inputs, device=device)
+        seq_lens = seq_lens.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
         query_start_loc = RTPForwardContext._build_query_start_loc_for_plugin(
             attn_inputs=attn_inputs,
             seq_lens=seq_lens,
@@ -678,6 +674,9 @@ class RTPForwardContext:
                 query_start_loc=query_start_loc,
             )
 
+        block_table_i32 = block_table.to(
+            device=device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
         plugin_md = AiterFlashAttentionMetadataForPluginMode(
             num_actual_tokens=num_actual_tokens,
             num_actual_kv_tokens=num_actual_kv_tokens,
@@ -686,9 +685,7 @@ class RTPForwardContext:
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
             slot_mapping=slot_mapping,
-            block_table=block_table.to(
-                device=device, dtype=torch.int32, non_blocking=True
-            ).contiguous(),
+            block_table=block_table_i32,
             num_decodes=0 if is_prefill else batch_size,
             num_decode_tokens=0 if is_prefill else num_actual_tokens,
             num_prefills=batch_size if is_prefill else 0,
@@ -703,6 +700,13 @@ class RTPForwardContext:
             total_tokens=0,
             context=None,
         )
+        # Prefill-only fields shared across all full-attn layers in the step.
+        plugin_md.rtp_cu_seqlens_q = query_start_loc
+        prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
+        if prefix_lengths is not None and int(prefix_lengths.numel()) > 0:
+            plugin_md.rtp_has_prefix = bool((prefix_lengths > 0).any().item())
+        else:
+            plugin_md.rtp_has_prefix = False
         return AttentionMetaData(
             max_seqlen_q=max_query_len,
             max_seqlen_k=max_seq_len,
@@ -721,7 +725,7 @@ class RTPForwardContext:
             from atom.plugin.rtpllm.attention_backend import RTPAttention
 
             rtp_attention_cls = RTPAttention
-        except Exception:  # noqa: BLE001
+        except (ImportError, ModuleNotFoundError):
             rtp_attention_cls = None
 
         for module in model.modules():
@@ -780,8 +784,8 @@ class RTPForwardContext:
 
             conv_state = torch.as_strided(
                 cache_base,
-                (cache_base.shape[0], conv_kernel - 1, qkv_size),
-                (cache_base.stride()[0], qkv_size, 1),
+                (cache_base.shape[0], qkv_size, conv_kernel - 1),
+                (cache_base.stride()[0], 1, qkv_size),
                 storage_offset=ssm_state_size + cache_base.storage_offset(),
             )
             ssm_state = torch.as_strided(
@@ -839,6 +843,31 @@ class RTPForwardContext:
             )
         return cache_tensors
 
+    @staticmethod
+    def _kv_cache_signature(
+        runtime: Any,
+        layer_maps: LayerMaps,
+    ) -> Tuple[Any, ...]:
+        if runtime.kv_cache is None:
+            return ("no_kv_cache",)
+        gdn_layer_map, full_attn_layer_map = layer_maps
+        signature: list[Any] = [id(runtime.kv_cache)]
+        all_layer_nums = sorted(set(gdn_layer_map.keys()) | set(full_attn_layer_map.keys()))
+        for layer_num in all_layer_nums:
+            layer_cache = runtime.kv_cache.get_layer_cache(layer_num)
+            kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
+            if kv_cache_base is None:
+                signature.append((int(layer_num), None))
+                continue
+            signature.append(
+                (
+                    int(layer_num),
+                    int(kv_cache_base.data_ptr()),
+                    int(kv_cache_base.numel()),
+                )
+            )
+        return tuple(signature)
+
     @classmethod
     def build(
         cls,
@@ -861,7 +890,18 @@ class RTPForwardContext:
         if kernel_seq_size_per_block <= 0:
             kernel_seq_size_per_block = int(seq_size_per_block)
         state_indices_cache: Dict[tuple[int, bool], torch.Tensor] = {}
-        layer_group_map = cls._build_layer_group_map(attn_inputs)
+        layer_group_map_signature = cls._layer_group_map_signature(attn_inputs)
+        layer_group_map = getattr(runtime, "_rtp_layer_group_map", None)
+        cached_layer_group_map_signature = getattr(
+            runtime, "_rtp_layer_group_map_signature", None
+        )
+        if (
+            layer_group_map is None
+            or cached_layer_group_map_signature != layer_group_map_signature
+        ):
+            layer_group_map = cls._build_layer_group_map(attn_inputs)
+            runtime._rtp_layer_group_map = layer_group_map
+            runtime._rtp_layer_group_map_signature = layer_group_map_signature
         gdn_metadata = cls._build_gdn_metadata(
             attn_inputs,
             seq_size_per_block=seq_size_per_block,
@@ -880,19 +920,25 @@ class RTPForwardContext:
             positions=positions,
             seq_size_per_block=kernel_seq_size_per_block,
         )
-        kv_cache_data = cls._build_kv_cache_tensors(
+        resolved_layer_maps = layer_maps or cls.collect_layer_maps(model)
+        kv_cache_signature = cls._kv_cache_signature(
             runtime=runtime,
-            layer_maps=layer_maps or cls.collect_layer_maps(model),
+            layer_maps=resolved_layer_maps,
         )
-        input_lengths = cls._non_empty_int32(
-            getattr(attn_inputs, "input_lengths", None),
-            device=positions.device,
-        )
-        if input_lengths is None:
-            raise ValueError(
-                "RTP plugin requires attention_inputs.input_lengths for forward context."
+        kv_cache_data = getattr(runtime, "_rtp_kv_cache_data", None)
+        cached_signature = getattr(runtime, "_rtp_kv_cache_signature", None)
+        if kv_cache_data is None or cached_signature != kv_cache_signature:
+            kv_cache_data = cls._build_kv_cache_tensors(
+                runtime=runtime,
+                layer_maps=resolved_layer_maps,
             )
-        batch_size = int(input_lengths.numel())
+            runtime._rtp_kv_cache_data = kv_cache_data
+            runtime._rtp_kv_cache_signature = kv_cache_signature
+        batch_size = int(attn_metadata.plugin_metadata.num_prefills)
+        if batch_size <= 0:
+            batch_size = int(attn_metadata.plugin_metadata.num_decodes)
+        if batch_size <= 0:
+            raise ValueError("RTP plugin failed to derive non-zero batch size.")
         context = Context(
             positions=positions,
             is_prefill=bool(getattr(attn_inputs, "is_prefill", False)),
@@ -938,6 +984,7 @@ class RTPForwardContext:
         attn_md.rtp_kernel_seq_size_per_block = (
             forward_context.rtp_kernel_seq_size_per_block
         )
+        attn_md.rtp_layer_group_map = forward_context.layer_group_map
         try:
             set_kv_cache_data(forward_context.kv_cache_data)
             set_forward_context(
