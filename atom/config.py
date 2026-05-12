@@ -717,6 +717,12 @@ class ParallelConfig:
         # self.data_parallel_master_port = get_open_port()
 
 
+# MTP draft architectures whose model __init__ rejects prefix caching.
+# Used by Config.__post_init__ to auto-disable prefix caching for these
+# rather than crashing at model construction.
+_MTP_NO_PREFIX_CACHE = {"Qwen3NextMTPModel", "Qwen3_5MTPModel"}
+
+
 @dataclass
 class SpeculativeConfig:
     method: Optional[str] = ""
@@ -986,6 +992,28 @@ class Config:
                 raise ValueError(
                     f"num_speculative_tokens must be between 1 and 4, got {num_spec}."
                 )
+
+            # Auto-disable prefix caching for MTP draft architectures that
+            # don't support it, so `enable_prefix_caching=True` (the new
+            # default) doesn't crash MTP runs at model init. The assertion
+            # in the model __init__ stays as a defensive last-line check.
+            if self.enable_prefix_caching:
+                draft_arch = (
+                    getattr(
+                        self.speculative_config.draft_model_hf_config,
+                        "architectures",
+                        None,
+                    )
+                    or [""]
+                )[0]
+                if draft_arch in _MTP_NO_PREFIX_CACHE:
+                    logger.warning(
+                        f"{draft_arch} does not support prefix caching; "
+                        "auto-disabling for this run. Pass "
+                        "--no-enable-prefix-caching explicitly to silence "
+                        "this warning."
+                    )
+                    self.enable_prefix_caching = False
 
         # DeepSeek V4: paper §3.6.1 mandates classical KV cache block_size =
         # lcm(m, m'). For V4-Pro / V4-Flash this is lcm(4, 128) = 128 original

@@ -404,6 +404,8 @@ During `allocate()`, for each full block:
 
 Prefix caching is enabled by default (`enable_prefix_caching=True` in `Config`). Set it to `False` (or pass `--no-enable-prefix-caching` on the CLI) to disable; the hash lookup in `allocate()` is then skipped entirely (`block_id` is always `-1`).
 
+**MTP exception.** `Qwen3NextMTP` and `Qwen3_5MTP` draft models do not support prefix caching and assert on it in their `__init__`. To keep the default ergonomic, `Config.__post_init__` auto-disables `enable_prefix_caching` (with a warning) when the speculative draft architecture is `Qwen3NextMTPModel` or `Qwen3_5MTPModel`. Pass `--no-enable-prefix-caching` explicitly to silence the warning.
+
 ---
 
 ## 5. Postprocessing

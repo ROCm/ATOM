@@ -26,6 +26,7 @@ if ATOM_ROOT not in sys.path:
 _atom_pkg = types.ModuleType("atom")
 _atom_pkg.__path__ = [os.path.join(ATOM_ROOT, "atom")]
 _atom_pkg.__package__ = "atom"
+_atom_pkg.LLMEngine = MagicMock()
 sys.modules["atom"] = _atom_pkg
 
 # ── 3. Stub `atom.config` to avoid HuggingFace / torch heavy imports ──────
@@ -57,6 +58,8 @@ class _StubParallelConfig:
 _atom_config.Config = _StubConfig
 _atom_config.KVCacheTensor = _StubKVCacheTensor
 _atom_config.ParallelConfig = _StubParallelConfig
+_atom_config.CompilationConfig = MagicMock()
+_atom_config.SpeculativeConfig = MagicMock()
 sys.modules["atom.config"] = _atom_config
 
 # ── 4. Stub zmq / zmq.asyncio if not installed ────────────────────────────
@@ -115,7 +118,7 @@ class MockConfig:
         defaults = dict(
             kv_cache_block_size=4,
             num_kvcache_blocks=10,
-            enable_prefix_caching=False,
+            enable_prefix_caching=True,
             max_num_seqs=4,
             max_num_batched_tokens=64,
             bos_token_id=1,
