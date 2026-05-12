@@ -55,15 +55,15 @@ RESULT_FILENAME=${model}-tp${tp}-${ISL}-${OSL}-${CONC}-${RANDOM_RANGE_RATIO}.jso
 python3 -m sglang.bench_serving --backend sglang-oai-chat \
     --model ${model_path} \
     --base-url=http://127.0.0.1:30000 \
-    --max-concurrency 16 \ 
-    --num-prompts "$(( CONC * 5 ))" \ 
+    --max-concurrency 16 \
+    --num-prompts "$(( CONC * 5 ))" \
     --request-rate inf \
     --dataset-name random \
     --random-input-len ${ISL} \
     --random-output-len ${OSL} \
     --random-range-ratio ${RANDOM_RANGE_RATIO} \
     --warmup-requests $(( CONC * 2 )) \
-    --disable-ignore-eos \ 
+    --disable-ignore-eos \
     --output-file ${RESULT_FILENAME} \
     --trust-remote-code
 ```
@@ -86,10 +86,9 @@ Then append `--profile` to the `sglang.bench_serving` command in Step 3.
 ```bash
 
 lm_eval --model local-completions \
-        --model_args model=${model_path},base_url=http://localhost:30000/v1/completions,num_concurrent=256,max_retries=2,tokenized_requests=False,trust_remote_code=True \
+        --model_args model=${model_path},base_url=http://localhost:30000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
         --tasks gsm8k \
-        --batch_size auto \
-        --num_fewshot 5 \
+        --num_fewshot 3 \
         --trust_remote_code
 ```
 
