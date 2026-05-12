@@ -57,7 +57,7 @@
           "display": "gpt-oss-120b TP1 (AW)",
           "dashboard_model": "gpt-oss-120b-aw-tp1",
           "prefix": "gpt-oss-120b-aw-tp1",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
         },
@@ -66,7 +66,7 @@
           "display": "gpt-oss-120b TP2 (AW)",
           "dashboard_model": "gpt-oss-120b-aw-tp2",
           "prefix": "gpt-oss-120b-aw-tp2",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
         },
@@ -75,7 +75,7 @@
           "display": "gpt-oss-120b TP8 (AW)",
           "dashboard_model": "gpt-oss-120b-aw-tp8",
           "prefix": "gpt-oss-120b-aw-tp8",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
         }
@@ -149,7 +149,7 @@
           "display": "Kimi-K2.5-MXFP4 TP4 (AW)",
           "dashboard_model": "Kimi-K2.5-MXFP4-aw-tp4",
           "prefix": "kimi-k2-5-mxfp4-aw-tp4",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         },
@@ -158,7 +158,7 @@
           "display": "Kimi-K2.5-MXFP4 TP8 (AW)",
           "dashboard_model": "Kimi-K2.5-MXFP4-aw-tp8",
           "prefix": "kimi-k2-5-mxfp4-aw-tp8",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         }
@@ -247,7 +247,7 @@
           "display": "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
           "dashboard_model": "Qwen3-Next-80B-A3B-Instruct-FP8-aw-tp1",
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-aw-tp1",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384",
           "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0"
         },
@@ -256,7 +256,7 @@
           "display": "Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)",
           "dashboard_model": "Qwen3-Next-80B-A3B-Instruct-FP8-aw-tp2",
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-aw-tp2",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 32768 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0"
         },
@@ -265,7 +265,7 @@
           "display": "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)",
           "dashboard_model": "Qwen3-Next-80B-A3B-Instruct-FP8-aw-tp4",
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-aw-tp4",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0"
         }
@@ -283,7 +283,7 @@
           "display": "DeepSeek-V3.2 FP8 TP4 (AW)",
           "dashboard_model": "DeepSeek-V3.2-FP8-aw-tp4",
           "prefix": "deepseek-v3-2-fp8-aw-tp4",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --kv-cache-dtype auto --block-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         },
@@ -292,7 +292,7 @@
           "display": "DeepSeek-V3.2 FP8 TP8 (AW)",
           "dashboard_model": "DeepSeek-V3.2-FP8-aw-tp8",
           "prefix": "deepseek-v3-2-fp8-aw-tp8",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --block-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         }
@@ -310,7 +310,7 @@
           "display": "GLM-4.7-FP8 TP4 (AW)",
           "dashboard_model": "GLM-4.7-FP8-aw-tp4",
           "prefix": "glm-4-7-fp8-aw-tp4",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         },
@@ -319,7 +319,7 @@
           "display": "GLM-4.7-FP8 TP8 (AW)",
           "dashboard_model": "GLM-4.7-FP8-aw-tp8",
           "prefix": "glm-4-7-fp8-aw-tp8",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         }
@@ -337,7 +337,7 @@
           "display": "MiniMax-M2.5 TP2 (AW)",
           "dashboard_model": "MiniMax-M2.5-aw-tp2",
           "prefix": "minimax-m2-5-aw-tp2",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 2 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
         },
@@ -346,7 +346,7 @@
           "display": "MiniMax-M2.5 TP4 (AW)",
           "dashboard_model": "MiniMax-M2.5-aw-tp4",
           "prefix": "minimax-m2-5-aw-tp4",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
         },
@@ -355,7 +355,7 @@
           "display": "MiniMax-M2.5 TP8 (AW)",
           "dashboard_model": "MiniMax-M2.5-aw-tp8",
           "prefix": "minimax-m2-5-aw-tp8",
-          "bench_args": "--random-range-ratio 1",
+          "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
         }

@@ -985,7 +985,7 @@ jobs:
                           aws_param = dict(param)
                           aws_param["input_length"] = input_length
                           aws_param["output_length"] = output_length
-                          aws_param["random_range_ratio"] = "1"
+                          aws_param["random_range_ratio"] = ""
                           base_params.append(aws_param)
 
                   variants = []
@@ -1453,7 +1453,7 @@ jobs:
                     --dataset-name random \
                     --random-input-len \"${ISL}\" \
                     --random-output-len \"${OSL}\" \
-                    --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                    ${RANDOM_RANGE_RATIO:+--random-range-ratio \"${RANDOM_RANGE_RATIO}\"} \
                     --temperature 0.0 \
                     --num-prompts \"$(( CONC * 10 ))\" \
                     --max-concurrency \"${CONC}\" \
