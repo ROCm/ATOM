@@ -47,8 +47,8 @@ from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
-from aiter.ops.triton.fusions.fused_reduce_q_norm_qk_rope_swa_write import (
-    fused_reduce_q_norm_qk_rope_swa_write,
+from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
+    fused_reduce_qk_norm_rope_swa_write,
 )
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
@@ -78,7 +78,6 @@ from atom.model_ops.sparse_attn_v4 import (
 )
 from atom.model_ops.utils import atom_parameter
 from atom.utils import envs, mark_spliting_op
-from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
 # (shared with deepseek_v2) and `torch.ops.aiter.indexer_score_topk` (V4-only).
@@ -136,7 +135,7 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
     return rmsnorm2d_fwd_(x, ones, eps, dim)
 
 
-def _fused_q_norm_qk_rope_swa_write_fake(
+def _fused_qk_norm_rope_swa_write_fake(
     q: torch.Tensor,
     kv: torch.Tensor,
     cos_cache: torch.Tensor,
@@ -160,8 +159,8 @@ def _fused_q_norm_qk_rope_swa_write_fake(
     )
 
 
-@torch_compile_guard(gen_fake=_fused_q_norm_qk_rope_swa_write_fake)
-def fused_q_norm_qk_rope_swa_write(
+@torch_compile_guard(gen_fake=_fused_qk_norm_rope_swa_write_fake)
+def fused_qk_norm_rope_swa_write(
     q: torch.Tensor,
     kv: torch.Tensor,
     cos_cache: torch.Tensor,
@@ -192,10 +191,12 @@ def fused_q_norm_qk_rope_swa_write(
             dtype=torch.bfloat16,
             device=q.device,
         )
-        fused_reduce_q_norm_qk_rope_swa_write(
+        fused_reduce_qk_norm_rope_swa_write(
             q,
             kv,
             None,
+            None,
+            eps,
             eps,
             rope_head_dim,
             cos_cache,
@@ -1679,32 +1680,15 @@ class DeepseekV4Attention(nn.Module):
         # ----- Q/KV projections (main stream) -----
         qkv_a = self.wqkv_a(x)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+        assert (
+            not _V4_FORCE_UE8M0_QUANT
+        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        qr, qr_scale = self.q_norm(q_lora)
+        q = self.wq_b(qr, x_scale=qr_scale)
         if (
             attn_md.is_pure_decode
             and self.use_fuse_qknorm_quant_q_norm_qk_rope_swa_write
         ):
-            (
-                (qr, qr_scale),
-                _,
-                kv,
-                _,
-            ) = _fuse_rmsnorm_quant(
-                q_lora,
-                self.q_norm.weight,
-                self.q_norm.eps,
-                kv_pre,
-                self.kv_norm.weight,
-                self.kv_norm.eps,
-                None,
-                dtype_quant=self.quant_dtype,
-                shuffle=False,
-                scale_shuffle_padding=False,
-                group_size=128,
-                quant_type=self.quant_dtype_value,
-                output_unquantized_inp1=False,
-                transpose_scale=True,
-            )
-            q = self.wq_b(qr, x_scale=qr_scale)
             # Fused: wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw
             # + RoPE on q tail + RoPE on kv tail (+ SWA write) in one triton
             # kernel. KV RMSNorm stays out (kernel doesn't apply weighted norm
@@ -1721,9 +1705,9 @@ class DeepseekV4Attention(nn.Module):
                 batch_id = None
                 slot_map = None
                 swa_kv_buf = None
-            q = fused_q_norm_qk_rope_swa_write(
+            q = fused_qk_norm_rope_swa_write(
                 q,
-                kv,
+                kv_pre,
                 cos_cache,
                 sin_cache,
                 positions,
@@ -1738,16 +1722,11 @@ class DeepseekV4Attention(nn.Module):
                 swa_kv=swa_kv_buf,
             )
         else:
-            assert (
-                not _V4_FORCE_UE8M0_QUANT
-            ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
-            qr, qr_scale = self.q_norm(q_lora)
             # Flat q_flat is [num_tokens, n_local_heads * head_dim]; DualRMSNorm
             # views internally to per-head shape and returns flat. Single Triton
             # launch fuses per-head Q RMSNorm (weightless) + KV RMSNorm (both
             # head_dim=128), replacing the prior `_rmsnorm_nw + kv_norm` pair.
-            q_flat = self.wq_b(qr, x_scale=qr_scale)
-            q_flat, kv = self.qk_norm(q_flat, kv_pre)
+            q_flat, kv = self.qk_norm(q, kv_pre)
             q = q_flat.view(num_tokens, self.n_local_heads, self.head_dim)
             # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
             # to (1, num_tokens, ...) for aiter's per-position rope kernel.
