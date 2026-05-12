@@ -273,6 +273,10 @@ class ATOMFlux2TransformerBlock(Flux2TransformerBlock):
 
 
 class ATOMFlux2Transformer2DModel(Flux2Transformer2DModel):
+    _repeated_blocks = [
+        "ATOMFlux2TransformerBlock",
+        "ATOMFlux2SingleTransformerBlock",
+    ]
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
