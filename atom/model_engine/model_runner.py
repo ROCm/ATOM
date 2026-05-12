@@ -688,9 +688,6 @@ class ModelRunner:
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
-        self._fence_event: Optional[torch.cuda.Event] = (
-            None  # for cross-partition fence
-        )
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
 
