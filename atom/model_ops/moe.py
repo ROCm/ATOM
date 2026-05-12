@@ -2266,13 +2266,6 @@ class FusedMoE(torch.nn.Module):
         if need_dequant:
             del old_w13_scale, old_w2_scale
 
-        # print(
-        #     f"[online_quant] {self.layer_name}: "
-        #     f"w13={self.w13_weight.shape} {self.w13_weight.dtype}, "
-        #     f"w13_scale={self.w13_weight_scale.shape} {self.w13_weight_scale.dtype}, "
-        #     f"w2={self.w2_weight.shape} {self.w2_weight.dtype}, "
-        #     f"w2_scale={self.w2_weight_scale.shape} {self.w2_weight_scale.dtype}"
-        # )
         self._online_quant_info = {
             "layer": self.layer_name,
             "quant_type": online_quant_type.name,

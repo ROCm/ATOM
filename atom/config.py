@@ -299,7 +299,10 @@ class QuantizationConfig:
         # Online quantization: re-quantize float / FP8 / MXFP4 models at load time
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
-        if online_quant_config is not None and self.quant_method in [
+        self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
+        self.online_layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
+        self.online_exclude_layers: list[str] = []
+        if online_quant_config and self.quant_method in [
             "",
             "fp8",
             "mxfp4",

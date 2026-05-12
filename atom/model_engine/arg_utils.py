@@ -223,9 +223,6 @@ class EngineArgs:
             "--online_quant_config",
             type=json.loads,
             default=None,
-            # default= '{"global_quant_config": "ptpc_fp8", "layer_quant_config": {"*expert*": "mxfp4"}, "exclude_layer": "lm_head"}',
-            # default= '{"global_quant_config": "ptpc_fp8", "layer_quant_config": {"*expert*": "mxfp4"}, "exclude_layer": "lm_head, *.gate.*"}',
-            # default= '{"global_quant_config": "ptpc_fp8", "layer_quant_config": {"*expert*": "ptpc_fp8"}, "exclude_layer": "lm_head, *.gate.*"}',
             help=(
                 "Online quantization config as a JSON string. "
                 "Supported quantization formats: ptpc_fp8, mxfp4. "
