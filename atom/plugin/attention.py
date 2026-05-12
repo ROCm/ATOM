@@ -2317,23 +2317,7 @@ def unified_attention_with_output_base_for_plugin_mode(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    current_atom_config = None
-    try:
-        from vllm.forward_context import (
-            get_forward_context as get_vllm_forward_context,
-            is_forward_context_available,
-        )
-
-        if is_forward_context_available():
-            current_atom_config = get_vllm_forward_context().additional_kwargs.get(
-                "atom_config"
-            )
-    except Exception:
-        # Keep backward compatibility when vLLM forward_context is unavailable.
-        current_atom_config = None
-
-    if current_atom_config is None:
-        current_atom_config = get_current_atom_config()
+    current_atom_config = get_current_atom_config()
     static_forward_context = (
         current_atom_config.compilation_config.static_forward_context
     )
