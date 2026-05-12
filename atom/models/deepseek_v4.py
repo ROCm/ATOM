@@ -1496,27 +1496,7 @@ class DeepseekV4Attention(nn.Module):
             self.alt_stream is not None and self.compressor is not None
         )
 
-        # Switch: route wq_b GEMM + per-head RMSNorm + Q/KV RoPE-tail through
-        # the aiter fused triton kernel. SWA write stays as a separate call —
-        # the fused kernel's SWA path uses `write_indices[pid_m]` as the kv row
-        # to RoPE on, which is incompatible with ATOM's sentinel-padded
-        # `swa_write_indices` (would OOB on -1 entries). HAS_SWA=False makes
-        # the kernel iterate over all M rows for kv RoPE, matching the eager
-        # path.
-        self.quant_dtype = None
-        self.quant_dtype_value = None
-        quant_dtype = qc.get_layer_quant_config(f"{p}.wq_b").quant_dtype
-        if (
-            qc is not None
-            and ENABLE_DS_QKNORM_QUANT_FUSION
-            and not _V4_FORCE_UE8M0_QUANT
-        ):
-            if quant_dtype == dtypes.fp8 or quant_dtype == dtypes.fp4x2:
-                self.quant_dtype = quant_dtype
-                self.quant_dtype_value = self.wq_b.quant_type.value
-                self.use_fuse_qknorm_quant_q_norm_qk_rope_swa_write = (
-                    _V4_USE_TRITON_FUSION
-                )
+        self.use_fuse_qk_norm_rope_swa_write = _V4_USE_TRITON_FUSION
 
         self.layer_name = prefix
         atom_config = get_current_atom_config()
@@ -1685,10 +1665,7 @@ class DeepseekV4Attention(nn.Module):
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
         qr, qr_scale = self.q_norm(q_lora)
         q = self.wq_b(qr, x_scale=qr_scale)
-        if (
-            attn_md.is_pure_decode
-            and self.use_fuse_qknorm_quant_q_norm_qk_rope_swa_write
-        ):
+        if attn_md.is_pure_decode and self.use_fuse_qk_norm_rope_swa_write:
             # Fused: wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw
             # + RoPE on q tail + RoPE on kv tail (+ SWA write) in one triton
             # kernel. KV RMSNorm stays out (kernel doesn't apply weighted norm
@@ -1790,7 +1767,7 @@ class DeepseekV4Attention(nn.Module):
         #   ring read; swa_write order is irrelevant in that subcase.
         q_sa = q.contiguous()
         if attn_md.is_pure_decode:
-            if not self.use_fuse_qknorm_quant_q_norm_qk_rope_swa_write:
+            if not self.use_fuse_qk_norm_rope_swa_write:
                 swa_write(
                     kv,
                     swa_write_indices,
