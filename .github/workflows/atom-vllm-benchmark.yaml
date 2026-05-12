@@ -11,114 +11,293 @@ on:
     - cron: '0 15 * * 0-4'
   workflow_dispatch:
     inputs:
-      deepseek-r1-fp8-met:
-        description: "DeepSeek-R1 FP8 TP8 (MET)"
-        type: boolean
-        default: false
-      deepseek-r1-mxfp4-met:
-        description: "DeepSeek-R1 MXFP4 TP8 (MET)"
-        type: boolean
-        default: false
-      gpt-oss-120b-met:
-        description: "gpt-oss-120b TP1 (MET)"
-        type: boolean
-        default: false
-      glm-5-1-fp8-tp8-oob:
-        description: "GLM-5.1-FP8 TP8 (OOB)"
-        type: boolean
-        default: false
-      kimi-k2-thinking-mxfp4-tp4-met:
-        description: "Kimi-K2-Thinking-MXFP4 TP4 (MET)"
-        type: boolean
-        default: false
-      kimi-k2-thinking-mxfp4-tp8-met:
-        description: "Kimi-K2-Thinking-MXFP4 TP8 (MET)"
-        type: boolean
-        default: false
-      kimi-k25-mxfp4-tp4-met:
-        description: "Kimi-K2.5-MXFP4 TP4 (MET)"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-oob:
-        description: "Qwen3.5-397B-A17B TP8 (OOB)"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8-tp4-oob:
-        description: "Qwen3.5-397B-A17B-FP8 TP4 (OOB)"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8-oob:
-        description: "Qwen3.5-397B-A17B-FP8 TP8 (OOB)"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-tp1-met:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-tp4-met:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-aw-tp1:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-aw-tp2:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-aw-tp4:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)"
-        type: boolean
-        default: false
-      deepseek-v3-2-fp8-aw-tp4:
-        description: "DeepSeek-V3.2 FP8 TP4 (AW)"
-        type: boolean
-        default: false
-      deepseek-v3-2-fp8-aw-tp8:
-        description: "DeepSeek-V3.2 FP8 TP8 (AW)"
-        type: boolean
-        default: false
-      glm-4-7-fp8-aw-tp4:
-        description: "GLM-4.7-FP8 TP4 (AW)"
-        type: boolean
-        default: false
-      glm-4-7-fp8-aw-tp8:
-        description: "GLM-4.7-FP8 TP8 (AW)"
-        type: boolean
-        default: false
-      gpt-oss-120b-aw-tp1:
-        description: "gpt-oss-120b TP1 (AW)"
-        type: boolean
-        default: false
-      gpt-oss-120b-aw-tp2:
-        description: "gpt-oss-120b TP2 (AW)"
-        type: boolean
-        default: false
-      gpt-oss-120b-aw-tp8:
-        description: "gpt-oss-120b TP8 (AW)"
-        type: boolean
-        default: false
-      kimi-k2-5-mxfp4-aw-tp4:
-        description: "Kimi-K2.5-MXFP4 TP4 (AW)"
-        type: boolean
-        default: false
-      kimi-k2-5-mxfp4-aw-tp8:
-        description: "Kimi-K2.5-MXFP4 TP8 (AW)"
-        type: boolean
-        default: false
-      minimax-m2-5-aw-tp2:
-        description: "MiniMax-M2.5 TP2 (AW)"
-        type: boolean
-        default: false
-      minimax-m2-5-aw-tp4:
-        description: "MiniMax-M2.5 TP4 (AW)"
-        type: boolean
-        default: false
-      minimax-m2-5-aw-tp8:
-        description: "MiniMax-M2.5 TP8 (AW)"
-        type: boolean
-        default: false
+      benchmark_client:
+        description: "Benchmark client command. `InferenceMax bench` uses the repo benchmark script. `vLLM bench` uses the vLLM CLI benchmark command."
+        type: choice
+        default: InferenceMax bench
+        options:
+          - InferenceMax bench
+          - vLLM bench
+      model_slot_1:
+        description: "Manual selection slot 1: choose a model + TP size candidate."
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8 TP8 (MET)
+          - DeepSeek-R1 MXFP4 TP8 (MET)
+          - gpt-oss-120b TP1 (MET)
+          - GLM-5.1-FP8 TP8 (OOB)
+          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
+          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
+          - Kimi-K2.5-MXFP4 TP4 (MET)
+          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
+          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
+          - Qwen3.5-397B-A17B TP8 (OOB)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP8 (AW)
+          - GLM-4.7-FP8 TP4 (AW)
+          - GLM-4.7-FP8 TP8 (AW)
+          - gpt-oss-120b TP1 (AW)
+          - gpt-oss-120b TP2 (AW)
+          - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP4 (AW)
+          - Kimi-K2.5-MXFP4 TP8 (AW)
+          - MiniMax-M2.5 TP2 (AW)
+          - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
+      model_slot_2:
+        description: "Manual selection slot 2: choose a model + TP size candidate."
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8 TP8 (MET)
+          - DeepSeek-R1 MXFP4 TP8 (MET)
+          - gpt-oss-120b TP1 (MET)
+          - GLM-5.1-FP8 TP8 (OOB)
+          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
+          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
+          - Kimi-K2.5-MXFP4 TP4 (MET)
+          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
+          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
+          - Qwen3.5-397B-A17B TP8 (OOB)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP8 (AW)
+          - GLM-4.7-FP8 TP4 (AW)
+          - GLM-4.7-FP8 TP8 (AW)
+          - gpt-oss-120b TP1 (AW)
+          - gpt-oss-120b TP2 (AW)
+          - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP4 (AW)
+          - Kimi-K2.5-MXFP4 TP8 (AW)
+          - MiniMax-M2.5 TP2 (AW)
+          - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
+      model_slot_3:
+        description: "Manual selection slot 3: choose a model + TP size candidate."
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8 TP8 (MET)
+          - DeepSeek-R1 MXFP4 TP8 (MET)
+          - gpt-oss-120b TP1 (MET)
+          - GLM-5.1-FP8 TP8 (OOB)
+          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
+          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
+          - Kimi-K2.5-MXFP4 TP4 (MET)
+          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
+          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
+          - Qwen3.5-397B-A17B TP8 (OOB)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP8 (AW)
+          - GLM-4.7-FP8 TP4 (AW)
+          - GLM-4.7-FP8 TP8 (AW)
+          - gpt-oss-120b TP1 (AW)
+          - gpt-oss-120b TP2 (AW)
+          - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP4 (AW)
+          - Kimi-K2.5-MXFP4 TP8 (AW)
+          - MiniMax-M2.5 TP2 (AW)
+          - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
+      model_slot_4:
+        description: "Manual selection slot 4: choose a model + TP size candidate."
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8 TP8 (MET)
+          - DeepSeek-R1 MXFP4 TP8 (MET)
+          - gpt-oss-120b TP1 (MET)
+          - GLM-5.1-FP8 TP8 (OOB)
+          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
+          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
+          - Kimi-K2.5-MXFP4 TP4 (MET)
+          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
+          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
+          - Qwen3.5-397B-A17B TP8 (OOB)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP8 (AW)
+          - GLM-4.7-FP8 TP4 (AW)
+          - GLM-4.7-FP8 TP8 (AW)
+          - gpt-oss-120b TP1 (AW)
+          - gpt-oss-120b TP2 (AW)
+          - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP4 (AW)
+          - Kimi-K2.5-MXFP4 TP8 (AW)
+          - MiniMax-M2.5 TP2 (AW)
+          - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
+      model_slot_5:
+        description: "Manual selection slot 5: choose a model + TP size candidate."
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8 TP8 (MET)
+          - DeepSeek-R1 MXFP4 TP8 (MET)
+          - gpt-oss-120b TP1 (MET)
+          - GLM-5.1-FP8 TP8 (OOB)
+          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
+          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
+          - Kimi-K2.5-MXFP4 TP4 (MET)
+          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
+          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
+          - Qwen3.5-397B-A17B TP8 (OOB)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP8 (AW)
+          - GLM-4.7-FP8 TP4 (AW)
+          - GLM-4.7-FP8 TP8 (AW)
+          - gpt-oss-120b TP1 (AW)
+          - gpt-oss-120b TP2 (AW)
+          - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP4 (AW)
+          - Kimi-K2.5-MXFP4 TP8 (AW)
+          - MiniMax-M2.5 TP2 (AW)
+          - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
+      model_slot_6:
+        description: "Manual selection slot 6: choose a model + TP size candidate."
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8 TP8 (MET)
+          - DeepSeek-R1 MXFP4 TP8 (MET)
+          - gpt-oss-120b TP1 (MET)
+          - GLM-5.1-FP8 TP8 (OOB)
+          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
+          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
+          - Kimi-K2.5-MXFP4 TP4 (MET)
+          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
+          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
+          - Qwen3.5-397B-A17B TP8 (OOB)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP8 (AW)
+          - GLM-4.7-FP8 TP4 (AW)
+          - GLM-4.7-FP8 TP8 (AW)
+          - gpt-oss-120b TP1 (AW)
+          - gpt-oss-120b TP2 (AW)
+          - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP4 (AW)
+          - Kimi-K2.5-MXFP4 TP8 (AW)
+          - MiniMax-M2.5 TP2 (AW)
+          - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
+      model_slot_7:
+        description: "Manual selection slot 7: choose a model + TP size candidate."
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8 TP8 (MET)
+          - DeepSeek-R1 MXFP4 TP8 (MET)
+          - gpt-oss-120b TP1 (MET)
+          - GLM-5.1-FP8 TP8 (OOB)
+          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
+          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
+          - Kimi-K2.5-MXFP4 TP4 (MET)
+          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
+          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
+          - Qwen3.5-397B-A17B TP8 (OOB)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP8 (AW)
+          - GLM-4.7-FP8 TP4 (AW)
+          - GLM-4.7-FP8 TP8 (AW)
+          - gpt-oss-120b TP1 (AW)
+          - gpt-oss-120b TP2 (AW)
+          - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP4 (AW)
+          - Kimi-K2.5-MXFP4 TP8 (AW)
+          - MiniMax-M2.5 TP2 (AW)
+          - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
+      model_slot_8:
+        description: "Manual selection slot 8: choose a model + TP size candidate."
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8 TP8 (MET)
+          - DeepSeek-R1 MXFP4 TP8 (MET)
+          - gpt-oss-120b TP1 (MET)
+          - GLM-5.1-FP8 TP8 (OOB)
+          - Kimi-K2-Thinking-MXFP4 TP4 (MET)
+          - Kimi-K2-Thinking-MXFP4 TP8 (MET)
+          - Kimi-K2.5-MXFP4 TP4 (MET)
+          - Qwen3.5-397B-A17B-FP8 TP4 (OOB)
+          - Qwen3.5-397B-A17B-FP8 TP8 (OOB)
+          - Qwen3.5-397B-A17B TP8 (OOB)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP4 (AW)
+          - DeepSeek-V3.2 FP8 TP8 (AW)
+          - GLM-4.7-FP8 TP4 (AW)
+          - GLM-4.7-FP8 TP8 (AW)
+          - gpt-oss-120b TP1 (AW)
+          - gpt-oss-120b TP2 (AW)
+          - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP4 (AW)
+          - Kimi-K2.5-MXFP4 TP8 (AW)
+          - MiniMax-M2.5 TP2 (AW)
+          - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
+      isl_osl_pairs:
+        description: |
+          Benchmark ISL/OSL pairs.
+          Input as semicolon-separated `input_length,output_length` pairs.
+          Example: 1024,1024;1024,8192;8192,1024
+          Additional copy-ready example: 1000,100;5000,500;10000,1000
+        type: string
+        default: "1024,1024;1024,8192;8192,1024"
+      concurrency_values:
+        description: "Benchmark concurrency values. Use comma-separated values from 4,8,16,32,64,128,256,512. The workflow will benchmark exactly the values you provide."
+        type: string
+        default: "4,8,16,32,64,128,256,512"
+      random_range_ratios:
+        description: "Benchmark random range ratios. Use comma-separated values like 0.8,1.0."
+        type: string
+        default: "0.8"
       oot_image:
         description: "Optional OOT benchmark image override. Leave empty to resolve main to the same-digest published nightly tag behind vllm-latest, or rebuild from the selected non-main branch."
         type: string
@@ -127,15 +306,10 @@ on:
         description: "Upload benchmark results to the dashboard"
         type: boolean
         default: true
-      param_lists:
-        description: |
-          "Benchmark parameter lists.
-          Input as a single or multiple sets (comma-separated, semicolon between sets),
-          format: input_length,output_length,concurrency,random_range_ratio.
-          Example (single set): 1024,1024,64,0.8
-          Example (multiple sets): 1024,1024,64,0.8;2048,1024,32,0.7"
-        type: string
-        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
+      upload_to_custom_dashboard:
+        description: "Upload benchmark results to the LLM-Booster dashboard"
+        type: boolean
+        default: true
 
 jobs:
   wait-for-older-manual-runs:
@@ -267,6 +441,8 @@ jobs:
       oot_base_image: ${{ steps.resolve.outputs.oot_base_image }}
       oot_image_source: ${{ steps.resolve.outputs.oot_image_source }}
       publish_to_dashboard: ${{ steps.resolve.outputs.publish_to_dashboard }}
+      upload_to_custom_dashboard: ${{ steps.resolve.outputs.upload_to_custom_dashboard }}
+      benchmark_client: ${{ steps.resolve.outputs.benchmark_client }}
     steps:
       - name: Checkout selected branch
         uses: actions/checkout@v6
@@ -276,6 +452,8 @@ jobs:
         env:
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
+          INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
+          INPUT_BENCHMARK_CLIENT: ${{ inputs.benchmark_client || 'InferenceMax bench' }}
         run: |
           set -euo pipefail
 
@@ -297,9 +475,13 @@ jobs:
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             PUBLISH_TO_DASHBOARD=true
+            UPLOAD_TO_CUSTOM_DASHBOARD=true
           else
             PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
+            UPLOAD_TO_CUSTOM_DASHBOARD="${INPUT_UPLOAD_TO_CUSTOM_DASHBOARD:-true}"
           fi
+
+          BENCHMARK_CLIENT="${INPUT_BENCHMARK_CLIENT:-InferenceMax bench}"
 
           mapfile -t VLLM_META < <(python3 - <<'PY'
           import re
@@ -372,6 +554,8 @@ jobs:
             echo "oot_base_image=${OOT_BASE_IMAGE}"
             echo "oot_image_source=${OOT_IMAGE_SOURCE}"
             echo "publish_to_dashboard=${PUBLISH_TO_DASHBOARD}"
+            echo "upload_to_custom_dashboard=${UPLOAD_TO_CUSTOM_DASHBOARD}"
+            echo "benchmark_client=${BENCHMARK_CLIENT}"
           } >> "$GITHUB_OUTPUT"
 
           printf '### OOT benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
@@ -426,53 +610,140 @@ jobs:
             esac
           fi
 
-          printf -- '- Upload to dashboard: `%s`\n' \
-            "${PUBLISH_TO_DASHBOARD}" >> "$GITHUB_STEP_SUMMARY"
+          printf -- '- Benchmark client: `%s`\n- Upload to dashboard: `%s`\n- Upload to custom dashboard: `%s`\n' \
+            "${BENCHMARK_CLIENT}" \
+            "${PUBLISH_TO_DASHBOARD}" \
+            "${UPLOAD_TO_CUSTOM_DASHBOARD}" >> "$GITHUB_STEP_SUMMARY"
 
           if [[ "${PUBLISH_TO_DASHBOARD}" != "true" ]]; then
             printf '\nDashboard upload is disabled by workflow input, so results are kept in artifacts and run summaries only.\n' \
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          if [[ "${UPLOAD_TO_CUSTOM_DASHBOARD}" != "true" ]]; then
+            printf 'Custom dashboard payload upload is disabled by workflow input.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   parse-param-lists:
-    name: Parse parameter lists
+    name: Parse benchmark parameter inputs
     needs: [wait-for-older-manual-runs]
     runs-on: ubuntu-latest
     outputs:
-      matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
-      param_lists: ${{ steps.parse-param-lists.outputs.param_lists }}
+      matrix_json: ${{ steps.parse-benchmark-params.outputs.matrix_json }}
+      isl_osl_pairs: ${{ steps.parse-benchmark-params.outputs.isl_osl_pairs }}
+      concurrency_values: ${{ steps.parse-benchmark-params.outputs.concurrency_values }}
+      random_range_ratios: ${{ steps.parse-benchmark-params.outputs.random_range_ratios }}
     steps:
-      - name: Parse parameter lists
-        id: parse-param-lists
+      - name: Parse benchmark parameter inputs
+        id: parse-benchmark-params
+        env:
+          ISL_OSL_PAIRS: ${{ inputs.isl_osl_pairs || '1024,1024;1024,8192;8192,1024' }}
+          CONCURRENCY_VALUES: ${{ inputs.concurrency_values || '4,8,16,32,64,128,256,512' }}
+          RANDOM_RANGE_RATIOS: ${{ inputs.random_range_ratios || '0.8' }}
         run: |
-          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8' }}"
-          echo "Using param_lists: ${PARAM_LISTS}"
-          printf 'param_lists=%s\n' "${PARAM_LISTS}" >> "$GITHUB_OUTPUT"
-          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
-          MATRIX_JSON="["
-          SEP=""
-          for SET in "${SETS[@]}"; do
-            IFS=',' read -ra PARAMS <<< "$SET"
-            INPUT_LEN="${PARAMS[0]}"
-            OUTPUT_LEN="${PARAMS[1]}"
-            CONCURRENCY="${PARAMS[2]}"
-            RANDOM_RANGE_RATIO="${PARAMS[3]}"
-            case "${CONCURRENCY}" in
-              4|8|16|32|64|128|256|512) ;;
-              *)
-                echo "Unsupported concurrency: ${CONCURRENCY}. Allowed values: 4,8,16,32,64,128,256,512"
-                exit 1
-                ;;
-            esac
-            MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
-            SEP=","
-          done
-          MATRIX_JSON="${MATRIX_JSON}]"
-          echo "matrix_json=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          echo "Using isl_osl_pairs: ${ISL_OSL_PAIRS}"
+          echo "Using concurrency_values: ${CONCURRENCY_VALUES}"
+          echo "Using random_range_ratios: ${RANDOM_RANGE_RATIOS:-<default 0.8>}"
+          printf 'isl_osl_pairs=%s\n' "${ISL_OSL_PAIRS}" >> "$GITHUB_OUTPUT"
+          printf 'concurrency_values=%s\n' "${CONCURRENCY_VALUES}" >> "$GITHUB_OUTPUT"
+          printf 'random_range_ratios=%s\n' "${RANDOM_RANGE_RATIOS}" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
 
-      - name: Print matrix JSON
+          allowed_concurrencies = {4, 8, 16, 32, 64, 128, 256, 512}
+
+          def dedupe_preserve_order(values):
+              deduped = []
+              seen = set()
+              for value in values:
+                  marker = (
+                      json.dumps(value, sort_keys=True) if isinstance(value, dict) else value
+                  )
+                  if marker in seen:
+                      continue
+                  seen.add(marker)
+                  deduped.append(value)
+              return deduped
+
+          pairs = []
+          for raw_pair in os.environ["ISL_OSL_PAIRS"].split(";"):
+              pair = raw_pair.strip()
+              if not pair:
+                  continue
+              parts = [part.strip() for part in pair.split(",")]
+              if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                  raise SystemExit(
+                      f"Invalid ISL/OSL pair {pair!r}. Use semicolon-separated pairs like 1024,1024;2048,1024."
+                  )
+              pairs.append(
+                  {
+                      "input_length": int(parts[0]),
+                      "output_length": int(parts[1]),
+                  }
+              )
+          if not pairs:
+              raise SystemExit("At least one ISL/OSL pair is required.")
+          pairs = dedupe_preserve_order(pairs)
+
+          concurrencies = []
+          for raw_value in os.environ["CONCURRENCY_VALUES"].split(","):
+              value = raw_value.strip()
+              if not value:
+                  continue
+              if not value.isdigit():
+                  raise SystemExit(
+                      f"Invalid concurrency {value!r}. Allowed values: 4,8,16,32,64,128,256,512"
+                  )
+              parsed = int(value)
+              if parsed not in allowed_concurrencies:
+                  raise SystemExit(
+                      f"Unsupported concurrency: {parsed}. Allowed values: 4,8,16,32,64,128,256,512"
+                  )
+              concurrencies.append(parsed)
+          if not concurrencies:
+              raise SystemExit("At least one concurrency value is required.")
+          concurrencies = dedupe_preserve_order(concurrencies)
+
+          ratio_text = os.environ["RANDOM_RANGE_RATIOS"].strip()
+          if not ratio_text:
+              ratios = ["0.8"]
+          else:
+              ratios = []
+              for raw_ratio in ratio_text.split(","):
+                  ratio = raw_ratio.strip()
+                  if not ratio:
+                      continue
+                  try:
+                      float(ratio)
+                  except ValueError as exc:
+                      raise SystemExit(
+                          f"Invalid random range ratio {ratio!r}. Use values like 0.8 or 1.0."
+                      ) from exc
+                  ratios.append(ratio)
+              ratios = dedupe_preserve_order(ratios) or ["0.8"]
+
+          matrix = []
+          for pair in pairs:
+              for concurrency in concurrencies:
+                  for ratio in ratios:
+                      matrix.append(
+                          {
+                              "input_length": pair["input_length"],
+                              "output_length": pair["output_length"],
+                              "concurrency": concurrency,
+                              "random_range_ratio": ratio,
+                          }
+                      )
+
+          print(f"matrix_json={json.dumps(matrix, separators=(',', ':'))}")
+          PY
+
+      - name: Print benchmark parameter matrix JSON
         run: |
-          echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
+          echo "Matrix JSON: ${{ steps.parse-benchmark-params.outputs.matrix_json }}"
 
   load-models:
     name: Load OOT model configs
@@ -489,141 +760,170 @@ jobs:
       - uses: actions/checkout@v6
       - id: load
         env:
-          ENABLE_DEEPSEEK_R1_FP8: ${{ inputs.deepseek-r1-fp8-met }}
-          ENABLE_DEEPSEEK_R1_MXFP4: ${{ inputs.deepseek-r1-mxfp4-met }}
-          ENABLE_GPT_OSS_120B: ${{ inputs.gpt-oss-120b-met }}
-          ENABLE_GLM_5_1_FP8_TP8: ${{ inputs.glm-5-1-fp8-tp8-oob }}
-          ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4-met }}
-          ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8-met }}
-          ENABLE_KIMI_K25_TP4: ${{ inputs.kimi-k25-mxfp4-tp4-met }}
-          ENABLE_QWEN3_5_397B_A17B: ${{ inputs.qwen3-5-397b-a17b-oob }}
-          ENABLE_QWEN3_5_397B_A17B_FP8_TP4: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4-oob }}
-          ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8-oob }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1-met }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4-met }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp1 }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP2: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp2 }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp4 }}
-          ENABLE_DEEPSEEK_V3_2_FP8_AW_TP4: ${{ inputs.deepseek-v3-2-fp8-aw-tp4 }}
-          ENABLE_DEEPSEEK_V3_2_FP8_AW_TP8: ${{ inputs.deepseek-v3-2-fp8-aw-tp8 }}
-          ENABLE_GLM_4_7_FP8_AW_TP4: ${{ inputs.glm-4-7-fp8-aw-tp4 }}
-          ENABLE_GLM_4_7_FP8_AW_TP8: ${{ inputs.glm-4-7-fp8-aw-tp8 }}
-          ENABLE_GPT_OSS_120B_AW_TP1: ${{ inputs.gpt-oss-120b-aw-tp1 }}
-          ENABLE_GPT_OSS_120B_AW_TP2: ${{ inputs.gpt-oss-120b-aw-tp2 }}
-          ENABLE_GPT_OSS_120B_AW_TP8: ${{ inputs.gpt-oss-120b-aw-tp8 }}
-          ENABLE_KIMI_K2_5_MXFP4_AW_TP4: ${{ inputs.kimi-k2-5-mxfp4-aw-tp4 }}
-          ENABLE_KIMI_K2_5_MXFP4_AW_TP8: ${{ inputs.kimi-k2-5-mxfp4-aw-tp8 }}
-          ENABLE_MINIMAX_M2_5_AW_TP2: ${{ inputs.minimax-m2-5-aw-tp2 }}
-          ENABLE_MINIMAX_M2_5_AW_TP4: ${{ inputs.minimax-m2-5-aw-tp4 }}
-          ENABLE_MINIMAX_M2_5_AW_TP8: ${{ inputs.minimax-m2-5-aw-tp8 }}
+          MODEL_SLOT_1: ${{ inputs.model_slot_1 || 'none' }}
+          MODEL_SLOT_2: ${{ inputs.model_slot_2 || 'none' }}
+          MODEL_SLOT_3: ${{ inputs.model_slot_3 || 'none' }}
+          MODEL_SLOT_4: ${{ inputs.model_slot_4 || 'none' }}
+          MODEL_SLOT_5: ${{ inputs.model_slot_5 || 'none' }}
+          MODEL_SLOT_6: ${{ inputs.model_slot_6 || 'none' }}
+          MODEL_SLOT_7: ${{ inputs.model_slot_7 || 'none' }}
+          MODEL_SLOT_8: ${{ inputs.model_slot_8 || 'none' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            SCHEDULE_CREATED_AT="$(
+              python3 - <<'PY'
+          import json
+          import os
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          token = os.environ.get("GITHUB_TOKEN", "")
+          request = Request(
+              f"{api_url}/repos/{repository}/actions/runs/{run_id}",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "User-Agent": "atom-vllm-benchmark-nightly-rotation",
+              },
+          )
+          try:
+              with urlopen(request, timeout=30) as response:
+                  payload = json.load(response)
+          except HTTPError as exc:
+              detail = exc.read().decode("utf-8", errors="replace").strip()
+              raise RuntimeError(
+                  f"Failed to fetch workflow run metadata: HTTP {exc.code} {detail}"
+              ) from exc
+          except URLError as exc:
+              raise RuntimeError(
+                  f"Failed to reach GitHub API for workflow run metadata: {exc}"
+              ) from exc
+
+          created_at = payload.get("created_at")
+          if not created_at:
+              raise RuntimeError("Workflow run metadata did not include created_at")
+          print(created_at)
+          PY
+            )"
+            export SCHEDULE_CREATED_AT
+          else
+            export SCHEDULE_CREATED_AT=""
+          fi
+
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           import os
           import sys
           from datetime import datetime, timedelta, timezone
           from pathlib import Path
-          from urllib.error import HTTPError, URLError
-          from urllib.request import Request, urlopen
 
-          models = json.loads(
-              Path(".github/benchmark/oot_benchmark_models.json").read_text(encoding="utf-8")
-          )
-          event = os.environ["GITHUB_EVENT_NAME"]
+          none_choice = "none"
 
-          manual_toggles = {
-              "deepseek-r1-fp8-met": os.environ.get("ENABLE_DEEPSEEK_R1_FP8", "").lower() == "true",
-              "deepseek-r1-mxfp4-met": os.environ.get("ENABLE_DEEPSEEK_R1_MXFP4", "").lower() == "true",
-              "gpt-oss-120b-met": os.environ.get("ENABLE_GPT_OSS_120B", "").lower() == "true",
-              "glm-5-1-fp8-tp8-oob": os.environ.get("ENABLE_GLM_5_1_FP8_TP8", "").lower() == "true",
-              "kimi-k2-thinking-mxfp4-tp4-met": os.environ.get("ENABLE_KIMI_K2_TP4", "").lower() == "true",
-              "kimi-k2-thinking-mxfp4-tp8-met": os.environ.get("ENABLE_KIMI_K2_TP8", "").lower() == "true",
-              "kimi-k25-mxfp4-tp4-met": os.environ.get("ENABLE_KIMI_K25_TP4", "").lower() == "true",
-              "qwen3-5-397b-a17b-oob": os.environ.get("ENABLE_QWEN3_5_397B_A17B", "").lower() == "true",
-              "qwen3-5-397b-a17b-fp8-tp4-oob": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP4", "").lower() == "true",
-              "qwen3-5-397b-a17b-fp8-oob": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8", "").lower() == "true",
-              "qwen3-next-80b-a3b-instruct-fp8-tp1-met": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1", "").lower() == "true",
-              "qwen3-next-80b-a3b-instruct-fp8-tp4-met": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4", "").lower() == "true",
-              "qwen3-next-80b-a3b-instruct-fp8-aw-tp1": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP1", "").lower() == "true",
-              "qwen3-next-80b-a3b-instruct-fp8-aw-tp2": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP2", "").lower() == "true",
-              "qwen3-next-80b-a3b-instruct-fp8-aw-tp4": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_AW_TP4", "").lower() == "true",
-              "deepseek-v3-2-fp8-aw-tp4": os.environ.get("ENABLE_DEEPSEEK_V3_2_FP8_AW_TP4", "").lower() == "true",
-              "deepseek-v3-2-fp8-aw-tp8": os.environ.get("ENABLE_DEEPSEEK_V3_2_FP8_AW_TP8", "").lower() == "true",
-              "glm-4-7-fp8-aw-tp4": os.environ.get("ENABLE_GLM_4_7_FP8_AW_TP4", "").lower() == "true",
-              "glm-4-7-fp8-aw-tp8": os.environ.get("ENABLE_GLM_4_7_FP8_AW_TP8", "").lower() == "true",
-              "gpt-oss-120b-aw-tp1": os.environ.get("ENABLE_GPT_OSS_120B_AW_TP1", "").lower() == "true",
-              "gpt-oss-120b-aw-tp2": os.environ.get("ENABLE_GPT_OSS_120B_AW_TP2", "").lower() == "true",
-              "gpt-oss-120b-aw-tp8": os.environ.get("ENABLE_GPT_OSS_120B_AW_TP8", "").lower() == "true",
-              "kimi-k2-5-mxfp4-aw-tp4": os.environ.get("ENABLE_KIMI_K2_5_MXFP4_AW_TP4", "").lower() == "true",
-              "kimi-k2-5-mxfp4-aw-tp8": os.environ.get("ENABLE_KIMI_K2_5_MXFP4_AW_TP8", "").lower() == "true",
-              "minimax-m2-5-aw-tp2": os.environ.get("ENABLE_MINIMAX_M2_5_AW_TP2", "").lower() == "true",
-              "minimax-m2-5-aw-tp4": os.environ.get("ENABLE_MINIMAX_M2_5_AW_TP4", "").lower() == "true",
-              "minimax-m2-5-aw-tp8": os.environ.get("ENABLE_MINIMAX_M2_5_AW_TP8", "").lower() == "true",
-          }
-
-          def fetch_run_created_at() -> datetime:
-              api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
-              repository = os.environ["GITHUB_REPOSITORY"]
-              run_id = os.environ["GITHUB_RUN_ID"]
-              token = os.environ.get("GITHUB_TOKEN", "")
-              request = Request(
-                  f"{api_url}/repos/{repository}/actions/runs/{run_id}",
-                  headers={
-                      "Accept": "application/vnd.github+json",
-                      "Authorization": f"Bearer {token}",
-                      "User-Agent": "atom-vllm-benchmark-nightly-rotation",
-                  },
+          catalog = json.loads(
+              Path(".github/benchmark/oot_benchmark_models.json").read_text(
+                  encoding="utf-8"
               )
-              try:
-                  with urlopen(request, timeout=30) as response:
-                      payload = json.load(response)
-              except HTTPError as exc:
-                  detail = exc.read().decode("utf-8", errors="replace").strip()
-                  raise RuntimeError(
-                      f"Failed to fetch workflow run metadata: HTTP {exc.code} {detail}"
-                  ) from exc
-              except URLError as exc:
-                  raise RuntimeError(
-                      f"Failed to reach GitHub API for workflow run metadata: {exc}"
-                  ) from exc
+          )
+          families = catalog.get("families")
+          if not isinstance(families, list):
+              raise SystemExit("Benchmark catalog must define a 'families' list.")
 
-              created_at = payload.get("created_at")
-              if not created_at:
-                  raise RuntimeError("Workflow run metadata did not include created_at")
-              return datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+          def flatten_variant(family, variant):
+              flattened = {
+                  key: value
+                  for key, value in family.items()
+                  if key not in {"choice_label", "variants"}
+              }
+              flattened.update(variant)
+              return flattened
 
           selected_group = ""
-          if event == "schedule":
-              beijing_tz = timezone(timedelta(hours=8))
-              beijing_dt = fetch_run_created_at().astimezone(beijing_tz)
-              beijing_weekday = beijing_dt.weekday()  # Monday=0 ... Sunday=6
+          event = os.environ["GITHUB_EVENT_NAME"]
+          selected = []
 
-              if beijing_weekday in (0, 2):  # Monday / Wednesday
+          all_variants = []
+          for family in families:
+              for variant in family["variants"]:
+                  all_variants.append(flatten_variant(family, variant))
+
+          if event == "schedule":
+              created_at = os.environ.get("SCHEDULE_CREATED_AT", "")
+              if not created_at:
+                  raise SystemExit(
+                      "Scheduled selection requires a run creation timestamp."
+                  )
+              beijing_tz = timezone(timedelta(hours=8))
+              run_date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+              beijing_dt = run_date.astimezone(beijing_tz)
+              beijing_weekday = beijing_dt.weekday()
+
+              if beijing_weekday in (0, 2):
                   selected_group = "A-MET"
                   selected = [
-                      model
-                      for model in models
-                      if str(model.get("prefix", "")).endswith("-met")
+                      m for m in all_variants
+                      if str(m.get("prefix", "")).endswith("-met")
                   ]
-              elif beijing_weekday in (1, 3):  # Tuesday / Thursday
+              elif beijing_weekday in (1, 3):
                   selected_group = "B-AW"
                   selected = [
-                      model for model in models if "-aw-" in str(model.get("prefix", ""))
+                      m for m in all_variants
+                      if "-aw-" in str(m.get("prefix", ""))
                   ]
-              elif beijing_weekday == 4:  # Friday
+              elif beijing_weekday == 4:
                   selected_group = "C-ALL"
-                  selected = list(models)
-              else:  # Saturday / Sunday
+                  selected = list(all_variants)
+              else:
                   selected_group = "SKIP-WEEKEND"
                   selected = []
                   print(
-                      f"Weekend schedule in Beijing ({beijing_dt.date()}); no benchmark group configured."
+                      f"Weekend schedule in Beijing ({beijing_dt.date()}); no benchmark group configured.",
+                      file=sys.stderr,
                   )
           else:
-              selected = [
-                  model for model in models if manual_toggles.get(model["prefix"], False)
-              ]
+              variant_map = {}
+              for family in families:
+                  for variant in family["variants"]:
+                      variant_map[str(variant["display"])] = flatten_variant(
+                          family, variant
+                      )
+
+              seen_prefixes = set()
+              for slot_idx in range(1, 9):
+                  label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
+                  if not label or label == none_choice:
+                      continue
+                  selected_variant = variant_map.get(label)
+                  if selected_variant is None:
+                      available = ", ".join(sorted(variant_map))
+                      raise SystemExit(
+                          f"Unknown benchmark model variant choice {label!r}. Available choices: {available}"
+                      )
+                  prefix = str(selected_variant["prefix"])
+                  if prefix in seen_prefixes:
+                      continue
+                  selected.append(selected_variant)
+                  seen_prefixes.add(prefix)
+
+          if selected_group:
+              print(
+                  f"Scheduled nightly benchmark group: {selected_group}",
+                  file=sys.stderr,
+              )
+          if not selected:
+              print("No benchmark model variants were selected.", file=sys.stderr)
+          else:
+              print("Selected benchmark model variants:", file=sys.stderr)
+              for model in selected:
+                  print(
+                      f" - {model['display']} ({model['prefix']})",
+                      file=sys.stderr,
+                  )
 
           print(f"models_json={json.dumps(selected, separators=(',', ':'))}")
           print(f"selected_group={selected_group}")
@@ -675,7 +975,6 @@ jobs:
               excluded_pairs = set(model.get("excluded_input_output_pairs", []))
               model_params = []
               seen = set()
-              # Run all benchmark cases at the two highest supported concurrency levels too.
               extra_concurrency = (128, 256)
 
               for param in params:
@@ -686,6 +985,7 @@ jobs:
                           aws_param = dict(param)
                           aws_param["input_length"] = input_length
                           aws_param["output_length"] = output_length
+                          aws_param["random_range_ratio"] = "1"
                           base_params.append(aws_param)
 
                   variants = []
@@ -857,7 +1157,6 @@ jobs:
       MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
       MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
       OOT_EXTRA_ARGS: ${{ matrix.model.extra_args }}
-      BENCH_CLIENT: ${{ contains(matrix.model.prefix, '-aw-') && 'vllm-bench' || 'benchmark_serving.py' }}
       BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
       RESULT_PREFIX: ${{ matrix.model.prefix }}
       ISL: ${{ matrix.params.input_length }}
@@ -876,6 +1175,8 @@ jobs:
       VLLM_COMMIT_USED: ${{ needs.resolve-atom-source.outputs.selected_vllm_commit }}
       VLLM_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_vllm_version }}
       PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
+      UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
+      BENCHMARK_CLIENT: ${{ contains(matrix.model.prefix, '-aw-') && 'vLLM bench' || needs.resolve-atom-source.outputs.benchmark_client }}
     steps:
       - name: Detect container engine
         run: |
@@ -890,47 +1191,7 @@ jobs:
             exit 1
           fi
 
-      - name: Check if model is enabled
-        id: check
-        run: |
-          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          case "${{ matrix.model.prefix }}" in
-            deepseek-r1-fp8-met) echo "enabled=${{ inputs.deepseek-r1-fp8-met }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-mxfp4-met) echo "enabled=${{ inputs.deepseek-r1-mxfp4-met }}" >> "$GITHUB_OUTPUT" ;;
-            gpt-oss-120b-met) echo "enabled=${{ inputs.gpt-oss-120b-met }}" >> "$GITHUB_OUTPUT" ;;
-            glm-5-1-fp8-tp8-oob) echo "enabled=${{ inputs.glm-5-1-fp8-tp8-oob }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-thinking-mxfp4-tp4-met) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4-met }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-thinking-mxfp4-tp8-met) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8-met }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k25-mxfp4-tp4-met) echo "enabled=${{ inputs.kimi-k25-mxfp4-tp4-met }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-oob) echo "enabled=${{ inputs.qwen3-5-397b-a17b-oob }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8-tp4-oob) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp4-oob }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8-oob) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-oob }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-tp1-met) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1-met }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-tp4-met) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4-met }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-aw-tp1) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp1 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-aw-tp2) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp2 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-aw-tp4) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-aw-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-v3-2-fp8-aw-tp4) echo "enabled=${{ inputs.deepseek-v3-2-fp8-aw-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-v3-2-fp8-aw-tp8) echo "enabled=${{ inputs.deepseek-v3-2-fp8-aw-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            glm-4-7-fp8-aw-tp4) echo "enabled=${{ inputs.glm-4-7-fp8-aw-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            glm-4-7-fp8-aw-tp8) echo "enabled=${{ inputs.glm-4-7-fp8-aw-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            gpt-oss-120b-aw-tp1) echo "enabled=${{ inputs.gpt-oss-120b-aw-tp1 }}" >> "$GITHUB_OUTPUT" ;;
-            gpt-oss-120b-aw-tp2) echo "enabled=${{ inputs.gpt-oss-120b-aw-tp2 }}" >> "$GITHUB_OUTPUT" ;;
-            gpt-oss-120b-aw-tp8) echo "enabled=${{ inputs.gpt-oss-120b-aw-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-5-mxfp4-aw-tp4) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-aw-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-5-mxfp4-aw-tp8) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-aw-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            minimax-m2-5-aw-tp2) echo "enabled=${{ inputs.minimax-m2-5-aw-tp2 }}" >> "$GITHUB_OUTPUT" ;;
-            minimax-m2-5-aw-tp4) echo "enabled=${{ inputs.minimax-m2-5-aw-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            minimax-m2-5-aw-tp8) echo "enabled=${{ inputs.minimax-m2-5-aw-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
-          esac
-
       - name: Clean up containers and workspace
-        if: steps.check.outputs.enabled == 'true'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$($CONTAINER_ENGINE ps -q)
@@ -941,7 +1202,6 @@ jobs:
           $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged docker.io/rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
 
       - name: Checkout benchmark ATOM source
-        if: steps.check.outputs.enabled == 'true'
         uses: actions/checkout@v6
         with:
           repository: ${{ env.ATOM_SOURCE_REPOSITORY }}
@@ -949,14 +1209,12 @@ jobs:
           fetch-depth: 1
 
       - name: Record benchmark source revision
-        if: steps.check.outputs.enabled == 'true'
         run: |
           SOURCE_SHA="$(git rev-parse HEAD)"
           echo "ATOM_SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
           echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${OOT_IMAGE_SOURCE} image ${OOT_IMAGE_TAG}"
 
       - name: Container Engine Login
-        if: steps.check.outputs.enabled == 'true'
         run: |
           # Podman requires an explicit registry when registries.conf has no search list;
           # Docker Hub short names (e.g. rocm/foo) must use docker.io here.
@@ -968,11 +1226,9 @@ jobs:
           echo "${{ secrets.DOCKER_PASSWORD }}" | $CONTAINER_ENGINE login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
       - name: Set HF_TOKEN
-        if: steps.check.outputs.enabled == 'true'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Pull OOT benchmark image
-        if: steps.check.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           IMG="${OOT_IMAGE_TAG}"
@@ -991,7 +1247,6 @@ jobs:
           $CONTAINER_ENGINE pull "${IMG}"
 
       - name: Prepare model cache mount
-        if: steps.check.outputs.enabled == 'true'
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
@@ -1013,7 +1268,6 @@ jobs:
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
       - name: Start OOT benchmark container
-        if: steps.check.outputs.enabled == 'true'
         run: |
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
@@ -1050,12 +1304,10 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Collect GPU info (inside container)
-        if: steps.check.outputs.enabled == 'true'
         id: gpu-info
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
 
       - name: Download model if needed
-        if: steps.check.outputs.enabled == 'true'
         run: |
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
@@ -1078,7 +1330,6 @@ jobs:
           fi
 
       - name: Resolve OOT model path
-        if: steps.check.outputs.enabled == 'true'
         run: |
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
@@ -1098,12 +1349,9 @@ jobs:
             echo "Using model id: ${MODEL_SOURCE_PATH}"
           fi
 
-      - name: Prepare OOT benchmark runner in container
-        if: steps.check.outputs.enabled == 'true'
+      - name: Prepare benchmark client in container
         run: |
-          if [[ "${BENCH_CLIENT}" == "vllm-bench" ]]; then
-            echo "Skipping bench_serving repo setup for vllm bench client."
-          else
+          if [[ "${BENCHMARK_CLIENT}" == "InferenceMax bench" ]]; then
             $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
               rm -rf \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
@@ -1111,10 +1359,14 @@ jobs:
               git clone --depth 1 \"${BENCH_SERVING_REPO_URL}\" \"${CONTAINER_BENCH_SERVING_DIR}\"
               test -f \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\"
             "
+          else
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              command -v vllm
+            "
           fi
 
       - name: Launch OOT benchmark server
-        if: steps.check.outputs.enabled == 'true'
         env:
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
@@ -1134,53 +1386,22 @@ jobs:
 
       - name: Run OOT benchmark client
         id: run_benchmark_client
-        if: steps.check.outputs.enabled == 'true'
         timeout-minutes: 240
         continue-on-error: true
         run: |
           set -euo pipefail
           TRUST_REMOTE_CODE_ARG=""
           if [[ "${OOT_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
-            TRUST_REMOTE_CODE_ARG="--trust-remote-code"
+            if [[ "${BENCHMARK_CLIENT}" == "vLLM bench" ]]; then
+              TRUST_REMOTE_CODE_ARG="--trust_remote_code"
+            else
+              TRUST_REMOTE_CODE_ARG="--trust-remote-code"
+            fi
           fi
 
           {
-            echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} CLIENT=${BENCH_CLIENT} ==="
-            if [[ "${BENCH_CLIENT}" == "vllm-bench" ]]; then
-              $CONTAINER_ENGINE exec \
-                -e ISL="${ISL}" \
-                -e OSL="${OSL}" \
-                -e CONC="${CONC}" \
-                -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
-                -e RESULT_FILENAME="${RESULT_FILENAME}" \
-                -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
-                "$CONTAINER_NAME" bash -lc "
-                  set -euo pipefail
-                  rm -rf \"${CONTAINER_RESULT_DIR}\"
-                  mkdir -p \"${CONTAINER_RESULT_DIR}\"
-                  vllm bench serve \
-                    --backend vllm \
-                    --host 127.0.0.1 \
-                    --port 8000 \
-                    --model \"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
-                    --dataset-name random \
-                    --random-input-len \"${ISL}\" \
-                    --random-output-len \"${OSL}\" \
-                    --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
-                    --max-concurrency \"${CONC}\" \
-                    --num-prompts \"$(( CONC * 10 ))\" \
-                    --num-warmups \"$(( 2 * CONC ))\" \
-                    --seed 42 \
-                    --ignore-eos \
-                    ${TRUST_REMOTE_CODE_ARG} \
-                    --percentile-metrics ttft,tpot,itl,e2el \
-                    --ready-check-timeout-sec 7200 \
-                    --save-result \
-                    --result-dir \"${CONTAINER_RESULT_DIR}\" \
-                    --result-filename \"${RESULT_FILENAME}.json\" \
-                    ${BENCH_EXTRA_ARGS:-}
-                "
-            else
+            echo "=== Benchmark config: ${MODEL_NAME} CLIENT=${BENCHMARK_CLIENT} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
+            if [[ "${BENCHMARK_CLIENT}" == "InferenceMax bench" ]]; then
               $CONTAINER_ENGINE exec \
                 -e ISL="${ISL}" \
                 -e OSL="${OSL}" \
@@ -1212,11 +1433,46 @@ jobs:
                     --result-filename=\"${RESULT_FILENAME}.json\" \
                     ${BENCH_EXTRA_ARGS:-}
                 "
+            else
+              $CONTAINER_ENGINE exec \
+                -e ISL="${ISL}" \
+                -e OSL="${OSL}" \
+                -e CONC="${CONC}" \
+                -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+                -e RESULT_FILENAME="${RESULT_FILENAME}" \
+                -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+                "$CONTAINER_NAME" bash -lc "
+                  set -euo pipefail
+                  rm -rf \"${CONTAINER_RESULT_DIR}\"
+                  mkdir -p \"${CONTAINER_RESULT_DIR}\"
+                  vllm bench serve \
+                    --backend vllm \
+                    --base-url http://127.0.0.1:8000 \
+                    --endpoint /v1/completions \
+                    --model \"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                    --dataset-name random \
+                    --random-input-len \"${ISL}\" \
+                    --random-output-len \"${OSL}\" \
+                    --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                    --temperature 0.0 \
+                    --num-prompts \"$(( CONC * 10 ))\" \
+                    --max-concurrency \"${CONC}\" \
+                    ${TRUST_REMOTE_CODE_ARG} \
+                    --num-warmups \"$(( 2 * CONC ))\" \
+                    --request-rate inf \
+                    --ignore-eos \
+                    --disable-tqdm \
+                    --save-result \
+                    --percentile-metrics ttft,tpot,itl,e2el \
+                    --result-dir \"${CONTAINER_RESULT_DIR}\" \
+                    --result-filename \"${RESULT_FILENAME}.json\" \
+                    ${BENCH_EXTRA_ARGS:-}
+                "
             fi
           } > "./${RESULT_FILENAME}.client.log" 2>&1
 
       - name: Copy OOT benchmark outputs
-        if: always() && steps.check.outputs.enabled == 'true'
+        if: always()
         run: |
           set -euo pipefail
           if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "test -f \"${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json\"" >/dev/null 2>&1; then
@@ -1227,7 +1483,7 @@ jobs:
           fi
 
       - name: Enrich copied benchmark result
-        if: always() && steps.check.outputs.enabled == 'true'
+        if: always()
         run: |
           set -euo pipefail
           if [ ! -f "${RESULT_FILENAME}.json" ]; then
@@ -1247,6 +1503,8 @@ jobs:
           OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
           OOT_IMAGE_TAG_USED="${OOT_IMAGE_TAG}" \
           PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
+          UPLOAD_TO_CUSTOM_DASHBOARD="${UPLOAD_TO_CUSTOM_DASHBOARD}" \
+          BENCHMARK_CLIENT="${BENCHMARK_CLIENT}" \
           python3 - <<'PY'
           import json
           import os
@@ -1278,8 +1536,12 @@ jobs:
           data["vllm_version"] = os.environ.get("VLLM_VERSION_USED", "")
           data["oot_image_source"] = os.environ.get("OOT_IMAGE_SOURCE", "")
           data["oot_image_tag"] = os.environ.get("OOT_IMAGE_TAG_USED", "")
+          data["benchmark_client"] = os.environ.get("BENCHMARK_CLIENT", "")
           data["dashboard_publish_allowed"] = (
               os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
+          )
+          data["custom_dashboard_publish_allowed"] = (
+              os.environ.get("UPLOAD_TO_CUSTOM_DASHBOARD", "false").lower() == "true"
           )
 
           with open(result_path, "w", encoding="utf-8") as f:
@@ -1287,7 +1549,7 @@ jobs:
           PY
 
       - name: Dump OOT benchmark diagnostics
-        if: always() && steps.check.outputs.enabled == 'true'
+        if: always()
         run: |
           set -euo pipefail
           RESULT_PATH="${RESULT_FILENAME}.json"
@@ -1342,7 +1604,6 @@ jobs:
           echo "::endgroup::"
 
       - name: Inject GPU metadata into benchmark results
-        if: steps.check.outputs.enabled == 'true'
         run: |
           shopt -s nullglob
           for f in "${RESULT_PREFIX}"-*.json; do
@@ -1365,7 +1626,6 @@ jobs:
 
       - name: Validate benchmark result completeness
         id: validate_benchmark_result
-        if: steps.check.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           RESULT_PATH="${RESULT_FILENAME}.json"
@@ -1424,7 +1684,7 @@ jobs:
           PY
 
       - name: Upload benchmark artifacts
-        if: always() && steps.check.outputs.enabled == 'true' && steps.validate_benchmark_result.outcome == 'success'
+        if: always() && steps.validate_benchmark_result.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
           name: oot-benchmark-${{ env.RESULT_FILENAME }}
@@ -1435,7 +1695,7 @@ jobs:
             ${{ env.RESULT_FILENAME }}.vllm.log
 
       - name: Clean up OOT benchmark container
-        if: always() && steps.check.outputs.enabled == 'true'
+        if: always()
         run: |
           $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
           $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
@@ -1477,16 +1737,28 @@ jobs:
 
       - name: Note summary behavior
         run: |
+          printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table.\n- Benchmark client: `%s`\n- Upload to dashboard: `%s`\n- Upload to custom dashboard: `%s`\n' \
+            "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
+            "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
+            "${{ needs.resolve-atom-source.outputs.oot_image_source }}" \
+            "${{ needs.resolve-atom-source.outputs.benchmark_client }}" \
+            "${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}" \
+            "${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}" >> "$GITHUB_STEP_SUMMARY"
+
           if [[ "${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}" == "true" ]]; then
-            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table. Because dashboard upload is enabled for this run, this final Ubuntu summary job collects benchmark artifacts from all completed GPU cases and publishes the available successful results in one pass, then reconciles the completed run for regression comparison.\n' \
-              "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
-              "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+            printf '\nDashboard upload is enabled for this run, so this final Ubuntu summary job also reconciles the completed run for regression comparison and publishes dashboard data.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
           else
-            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table only. Dashboard upload is disabled for this run.\n' \
-              "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
-              "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+            printf '\nDashboard upload is disabled for this run.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ "${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}" == "true" ]]; then
+            printf 'LLM-Booster dashboard publish is enabled for this run.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'LLM-Booster dashboard publish is disabled for this run.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Generate OOT benchmark summary table
@@ -1517,6 +1789,265 @@ jobs:
           name: oot-benchmark-summary
           path: oot_benchmark_summary.json
 
+      - name: Note skipped LLM-Booster dashboard publish
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases == '0'
+        run: |
+          printf '\nNo successful benchmark result JSONs were produced, so LLM-Booster dashboard publish was skipped.\n' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check LLM-Booster deploy key
+        id: llmbooster-key
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        env:
+          LLM_BOOSTER_DEPLOY_KEY: ${{ secrets.LLM_BOOSTER_DEPLOY_KEY }}
+        run: |
+          if [[ -n "${LLM_BOOSTER_DEPLOY_KEY}" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::LLM_BOOSTER_DEPLOY_KEY is not configured; skipping LLM-Booster dashboard publish."
+            printf '\nLLM-Booster dashboard publish skipped because secret `LLM_BOOSTER_DEPLOY_KEY` is not configured.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Checkout LLM-Booster dashboard repo
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: ROCm/LLM-Booster
+          ref: main
+          path: llm-booster-repo
+          ssh-key: ${{ secrets.LLM_BOOSTER_DEPLOY_KEY }}
+          fetch-depth: 1
+
+      - name: Build LLM-Booster dashboard files
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
+          ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
+          OOT_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.oot_image_source }}
+          BENCHMARK_CLIENT: ${{ needs.resolve-atom-source.outputs.benchmark_client }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(".")
+          llm_booster_dashboard = root / "llm-booster-repo" / "dashboard"
+          llm_booster_data_dir = llm_booster_dashboard / "data" / "vllm-atom"
+          llm_booster_data_dir.mkdir(parents=True, exist_ok=True)
+
+          sys.path.insert(0, str(llm_booster_dashboard))
+          from update_data import index_root_for, rebuild_index  # noqa: E402
+
+          catalog = json.loads(
+              (root / ".github" / "benchmark" / "oot_benchmark_models.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          def slugify(text: str) -> str:
+              return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "unknown"
+
+          def precision_from_model(model: str):
+              upper = model.upper()
+              if "MXFP4" in upper or "FP4" in upper:
+                  return "fp4"
+              if "FP8" in upper:
+                  return "fp8"
+              return None
+
+          def model_name_for_variant(variant: dict) -> str:
+              if variant.get("dashboard_model"):
+                  return str(variant["dashboard_model"])
+              display = str(variant["display"])
+              return display.replace(" TP", "-tp").replace(" ", "-")
+
+          prefix_map = {}
+          for family in catalog["families"]:
+              base = {k: v for k, v in family.items() if k not in {"choice_label", "variants"}}
+              for variant in family["variants"]:
+                  item = dict(base)
+                  item.update(variant)
+                  prefix_map[str(variant["prefix"])] = item
+
+          def parse_result_filename(path: Path):
+              stem = path.stem
+              prefix, isl, osl, concurrency, ratio = stem.rsplit("-", 4)
+              return prefix, int(isl), int(osl), int(concurrency), float(ratio)
+
+          default_benchmark_client = os.environ["BENCHMARK_CLIENT"]
+
+          def resolve_client(payload):
+              bc = str(payload.get("benchmark_client", default_benchmark_client))
+              slug = "vllmbench" if bc == "vLLM bench" else "inferencemax"
+              label = "vllm bench" if bc == "vLLM bench" else "inferencemax"
+              return slug, label
+
+          grouped = defaultdict(list)
+          for path in sorted(root.glob("*.json")):
+              if path.name in {"oot_benchmark_summary.json", "regression_report.json"}:
+                  continue
+              try:
+                  payload = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                  continue
+              if "output_throughput" not in payload:
+                  continue
+              custom_dashboard_flag = str(
+                  payload.get("custom_dashboard_publish_allowed", True)
+              ).strip().lower()
+              if custom_dashboard_flag in {"0", "false", "no"}:
+                  continue
+
+              prefix, isl, osl, concurrency, ratio = parse_result_filename(path)
+              variant = prefix_map.get(prefix)
+              if variant is None:
+                  raise SystemExit(f"Unknown benchmark prefix in result file {path.name}: {prefix}")
+
+              model = model_name_for_variant(variant)
+              precision = precision_from_model(model)
+              atom_source_sha = str(payload.get("atom_source_sha", "")) or "unknown"
+              sha7 = atom_source_sha[:7] if atom_source_sha else "unknown"
+              day = time.strftime("%Y-%m-%d", time.gmtime())
+              client_slug, _ = resolve_client(payload)
+              grouped[(day, sha7, model, isl, osl, client_slug)].append((path, payload, precision, concurrency, ratio))
+
+          written_files = set()
+          for (day, sha7, model, isl, osl, client_slug), entries in sorted(grouped.items()):
+              entries.sort(key=lambda item: (item[3], item[4]))
+              client_label = "vllm bench" if client_slug == "vllmbench" else "inferencemax"
+              timestamp_ms = int(time.time() * 1000)
+              precision = entries[0][2]
+              first_payload = entries[0][1]
+              tp = first_payload.get("tensor_parallel_size")
+              tp_label = f"_tp{int(tp)}" if tp not in (None, "", 0) else ""
+              model_slug = slugify(model)
+              run_id = (
+                  f"atom_vllm_{day.replace('-', '')}_{model_slug}_isl{isl}_osl{osl}_"
+                  f"{sha7}_{os.environ['GITHUB_RUN_ID']}_{client_slug}"
+              )
+              config_label = f"atom-vllm_{model_slug}"
+              if precision:
+                  config_label += f"_{precision}"
+              if tp not in (None, "", 0):
+                  config_label += tp_label
+              if client_slug == "inferencemax":
+                  config_label += "_inferencemax"
+
+              points = []
+              for _, payload, precision, concurrency, ratio in entries:
+                  output_tput = payload.get("output_throughput")
+                  total_tput = payload.get("total_token_throughput")
+                  total_gpu = payload.get("tensor_parallel_size")
+                  try:
+                      total_gpu = int(total_gpu) if total_gpu is not None else None
+                  except (TypeError, ValueError):
+                      total_gpu = None
+                  points.append(
+                      {
+                          "isl": isl,
+                          "osl": osl,
+                          "concurrency": concurrency,
+                          "ratio": ratio,
+                          "client_bench": client_label,
+                          "ttft_ms": payload.get("mean_ttft_ms"),
+                          "ttft_p99": payload.get("p99_ttft_ms"),
+                          "tpot_ms": payload.get("mean_tpot_ms"),
+                          "tpot_p99": payload.get("p99_tpot_ms"),
+                          "itl_ms": payload.get("mean_itl_ms"),
+                          "e2el_ms": payload.get("mean_e2el_ms"),
+                          "interactivity": (output_tput / concurrency) if output_tput and concurrency else None,
+                          "tput_per_gpu": (total_tput / total_gpu) if total_tput and total_gpu else None,
+                          "output_tput_per_gpu": (output_tput / total_gpu) if output_tput and total_gpu else None,
+                          "input_tput_per_gpu": None,
+                          "output_tput": output_tput,
+                          "total_tput": total_tput,
+                          "req_tput": payload.get("request_throughput"),
+                          "completed": payload.get("completed"),
+                          "duration": payload.get("duration"),
+                          "num_prompts": payload.get("num_prompts"),
+                          "prefill_tp": None,
+                          "decode_tp": None,
+                          "tensor_parallel_size": total_gpu,
+                          "num_prefill_gpu": None,
+                          "num_decode_gpu": None,
+                          "total_gpu": total_gpu,
+                          "gpu_name": payload.get("gpu_name"),
+                          "image": payload.get("oot_image_tag") or payload.get("docker_image"),
+                          "rocm": payload.get("rocm_version"),
+                          "run_url": os.environ["RUN_URL"],
+                          "model_path": payload.get("model_id"),
+                          "point_date": day,
+                          "precision": precision,
+                          "hardware": "mi355x",
+                      }
+                  )
+
+              run = {
+                  "run_id": run_id,
+                  "date": day,
+                  "timestamp": timestamp_ms,
+                  "model": model,
+                  "backend": "vLLM-ATOM",
+                  "config_label": config_label,
+                  "precision": precision,
+                  "source": "ATOM Dashboard",
+                  "client_bench": client_label,
+                  "hardware": "mi355x",
+                  "commit": {
+                      "id": first_payload.get("atom_source_sha"),
+                      "message": f"ATOM benchmark run {os.environ['GITHUB_RUN_ID']}",
+                      "timestamp": datetime.now(timezone.utc).isoformat(),
+                      "url": f"https://github.com/{os.environ['ATOM_SOURCE_REPOSITORY']}/commit/{first_payload.get('atom_source_sha', '')}",
+                      "author": {},
+                      "committer": {},
+                  },
+                  "points": points,
+                  "gsm8k": None,
+              }
+
+              run_file = llm_booster_data_dir / f"{run_id}.json"
+              run_file.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+              written_files.add(run_file)
+
+          rebuild_index(index_root_for(llm_booster_data_dir))
+          print(f"Wrote {len(written_files)} LLM-Booster ATOM vLLM run files.")
+          PY
+
+      - name: Upload LLM-Booster dashboard preview artifact
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: oot-benchmark-llm-booster-preview
+          path: |
+            llm-booster-repo/dashboard/data/index.json
+            llm-booster-repo/dashboard/data/vllm-atom/*.json
+
+      - name: Push LLM-Booster dashboard data
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        working-directory: llm-booster-repo
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
+        run: |
+          git add dashboard/data/index.json dashboard/data/vllm-atom
+          if git diff --cached --quiet; then
+            echo "No LLM-Booster dashboard data changes to push."
+            exit 0
+          fi
+          git commit -m "Update ATOM vLLM benchmark dashboard data"
+          git push origin HEAD:main
+
       - name: Download baseline from previous successful main run
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         id: baseline
@@ -1526,7 +2057,7 @@ jobs:
           mapfile -t CANDIDATE_RUN_IDS < <(
             {
               gh run list \
-                --workflow="ATOM vLLM OOT Benchmark" \
+                --workflow="ATOM vLLM Benchmark" \
                 --branch=main \
                 --event=workflow_dispatch \
                 --status=success \
