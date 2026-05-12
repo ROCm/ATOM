@@ -2139,6 +2139,7 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
             from vllm.utils.platform_utils import num_compute_units
         except ImportError:
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
+        from atom.models.utils import extract_layer_index
         from vllm.v1.worker.cp_utils import get_total_cp_world_size
         from vllm.utils.math_utils import cdiv
 
@@ -2160,8 +2161,11 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
         # num_speculative_tokens should be 0 for its builders.
         _is_draft_layer = False
         if layer_names:
-            if len(layer_names) < config.model_config.hf_config.num_hidden_layers:
-                _is_draft_layer = True
+            num_hidden_layers = config.model_config.hf_config.num_hidden_layers
+            layer_indices = [
+                extract_layer_index(layer_name) for layer_name in layer_names
+            ]
+            _is_draft_layer = all(idx >= num_hidden_layers for idx in layer_indices)
         if _is_draft_layer:
             self.num_speculative_tokens = 0
         else:
