@@ -302,9 +302,6 @@ class MLASparseAttentionImplPluginModeMethods:
 
         kv_buffer = kv_cache.unsqueeze(2)
 
-        # TODO: Currently, persistent mode has memory access issues when input context is long
-        # in fp8 kv cache settings, so it is not used for now.
-        # Re-enable persistent mode when the issue is fixed.
         mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
@@ -318,6 +315,12 @@ class MLASparseAttentionImplPluginModeMethods:
             q_scale=layer._q_scale,
             kv_scale=layer._k_scale,
             page_size=1,
+            work_meta_data=sparse_meta.work_meta_data,
+            work_indptr=sparse_meta.work_indptr,
+            work_info_set=sparse_meta.work_info_set,
+            reduce_indptr=sparse_meta.reduce_indptr,
+            reduce_final_map=sparse_meta.reduce_final_map,
+            reduce_partial_map=sparse_meta.reduce_partial_map,
         )
 
         if self.head_repeat_factor > 1:

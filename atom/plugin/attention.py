@@ -1752,6 +1752,15 @@ class AiterMLASparseMetadataForPluginMode:
     block_size: int = 1
     topk_tokens: int = 2048
 
+    # Persistent MLA metadata (only populated when persistent mode is enabled,
+    # i.e. when the aiter sparse decode kernel supports work-stealing splits).
+    work_meta_data: torch.Tensor | None = None
+    work_indptr: torch.Tensor | None = None
+    work_info_set: torch.Tensor | None = None
+    reduce_indptr: torch.Tensor | None = None
+    reduce_final_map: torch.Tensor | None = None
+    reduce_partial_map: torch.Tensor | None = None
+
 
 class vllmMLASparseAttentionMetadataBuilderMethods:
     def __init__(self):
@@ -1799,6 +1808,31 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
 
+        # ----- Compute persistent MLA metadata -----
+        # The aiter sparse decode kernel uses qseqlen=1 (each query token is
+        # treated as its own batch entry), so persistent metadata can always
+        # be precomputed here. The kernel switches to the persistent
+        # work-stealing path automatically when work_meta_data is non-None.
+        get_mla_metadata_v1(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_last_page_len,
+            self.padded_num_heads,
+            1,
+            True,
+            self._mla_work_meta_data,
+            self._mla_work_info_set,
+            self._mla_work_indptr,
+            self._mla_reduce_indptr,
+            self._mla_reduce_final_map,
+            self._mla_reduce_partial_map,
+            page_size=1,
+            kv_granularity=16,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+        )
+
         attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -1816,6 +1850,12 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
+            work_meta_data=self._mla_work_meta_data,
+            work_indptr=self._mla_work_indptr,
+            work_info_set=self._mla_work_info_set,
+            reduce_indptr=self._mla_reduce_indptr,
+            reduce_final_map=self._mla_reduce_final_map,
+            reduce_partial_map=self._mla_reduce_partial_map,
         )
 
         attn_metadata = AttentionMetaData(
@@ -2273,6 +2313,52 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         )
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
+        )
+
+        # ----- Persistent MLA metadata buffers -----
+        # The aiter sparse decode kernel supports a "persistent" path that
+        # uses precomputed work-splitting metadata for better load balancing
+        # across CUs. Mirrors the approach used in rocm_aiter_mla.py.
+        #
+        # In the sparse case each query token is its own "batch" entry in the
+        # qo_indptr (qo_indptr = [0, 1, 2, ..., num_tokens]) and max_qo_len=1.
+        # We pad get_mla_metadata_info_v1's batch_size to max_num_batched_tokens
+        # so the buffers are large enough for any decode shape we might see.
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = get_mla_metadata_info_v1(
+            max_num_batched_tokens,
+            1,
+            self.padded_num_heads,
+            torch.bfloat16,
+            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            is_sparse=True,
+            fast_mode=True,
+        )
+        self._mla_work_meta_data = torch.empty(
+            work_meta_data_size, dtype=work_meta_data_type, device=device
+        )
+        self._mla_work_indptr = torch.empty(
+            work_indptr_size, dtype=work_indptr_type, device=device
+        )
+        self._mla_work_info_set = torch.empty(
+            work_info_set_size, dtype=work_info_set_type, device=device
+        )
+        self._mla_reduce_indptr = torch.empty(
+            reduce_indptr_size, dtype=reduce_indptr_type, device=device
+        )
+        self._mla_reduce_final_map = torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type, device=device
+        )
+        self._mla_reduce_partial_map = torch.empty(
+            reduce_partial_map_size,
+            dtype=reduce_partial_map_type,
+            device=device,
         )
 
     return init_method_under_plugin_mode
