@@ -886,7 +886,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 if fp8_attention:
                     assert decode_ql_nope.shape[0] == decode_q_pe.shape[0]
                     assert decode_ql_nope.shape[1] == decode_q_pe.shape[1]
-                    if hasattr(layer, "_decode_concat_quant_fp8_op"):
+                    if hasattr(self, "_decode_concat_quant_fp8_op"):
                         decode_q = self._decode_concat_quant_fp8_op(
                             decode_ql_nope, decode_q_pe, self._q_scale
                         )
