@@ -6,9 +6,9 @@ from typing import Type
 import torch
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
 from atom.plugin.vllm.attention.metadata import (
+    AiterMlaSparseIndexerMetadataBuilderMethodsForVllm,
+    AiterMlaSparseMetadataBuilderMethodsForVllm,
     get_max_prefill_buffer_size,
-    vllmMLASparseAttentionMetadataBuilderMethods,
-    vllmMLASparseIndexerAttentionMetadataBuilderMethods,
 )
 from atom.plugin.vllm.attention.backend import AiterMlaBackendForVllm
 from vllm.v1.attention.backend import (
@@ -43,7 +43,7 @@ class AiterMLASparseBackend(AiterMlaBackendForVllm):
 
 
 class AiterMLASparseMetadataBuilder(
-    vllmMLASparseAttentionMetadataBuilderMethods, AttentionMetadataBuilder
+    AiterMlaSparseMetadataBuilderMethodsForVllm, AttentionMetadataBuilder
 ):
     """vLLM-only metadata builder for sparse MLA main attention."""
 
@@ -132,7 +132,7 @@ class AiterMLASparseIndexerBackend(AiterMlaBackendForVllm):
 
 
 class AiterMLASparseIndexerMetadataBuilder(
-    vllmMLASparseIndexerAttentionMetadataBuilderMethods, AttentionMetadataBuilder
+    AiterMlaSparseIndexerMetadataBuilderMethodsForVllm, AttentionMetadataBuilder
 ):
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     reorder_batch_threshold = 1

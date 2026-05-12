@@ -1,4 +1,4 @@
-from typing import Generic, Optional, TypeVar
+from typing import Optional
 import logging
 
 from dataclasses import dataclass
@@ -17,14 +17,10 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 
 
 @dataclass
-class AiterFlashAttentionPhaseMetadata:
+class AiterMhaPhaseMetadata:
     max_query_len: int
     max_seq_len: int
     query_start_loc: torch.Tensor
-
-
-AiterFlashAttentionDecodeMetadata = AiterFlashAttentionPhaseMetadata
-AiterFlashAttentionPrefillMetadata = AiterFlashAttentionPhaseMetadata
 
 
 @dataclass
@@ -88,8 +84,8 @@ class AiterMhaMetadataForVllm:
     num_extend_tokens: int
     dropout_p: float = 0.0
 
-    decode_metadata: Optional[AiterFlashAttentionDecodeMetadata] = None
-    prefill_metadata: Optional[AiterFlashAttentionPrefillMetadata] = None
+    decode_metadata: Optional[AiterMhaPhaseMetadata] = None
+    prefill_metadata: Optional[AiterMhaPhaseMetadata] = None
     extend_metadata: Optional[AiterFlashAttentionChunkPrefillMetadata] = None
 
     use_cascade: bool = False
@@ -99,17 +95,11 @@ class AiterMhaMetadataForVllm:
     context: Optional[Context] = None
 
 
-
-# for MLA attention metadata for plugin mode
 @dataclass
-class AiterMLACommonDecodeMetadataForPluginMode:
+class AiterMlaDecodeMetadataForVllm:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     dcp_tot_seq_lens: torch.Tensor | None
-
-
-@dataclass
-class AiterMLADecodeMetadataForPluginMode(AiterMLACommonDecodeMetadataForPluginMode):
     # The indptr of the paged kv cache, shape: [batch_size + 1]
     paged_kv_indptr: torch.Tensor | None = None
     # The page indices of the paged kv cache
@@ -126,7 +116,7 @@ class AiterMLADecodeMetadataForPluginMode(AiterMLACommonDecodeMetadataForPluginM
 
 
 @dataclass
-class AiterMLAPersistentMetadataForVllm:
+class AiterMlaPersistentMetadataForVllm:
     work_meta_data: torch.Tensor
     work_indptr: torch.Tensor
     work_info_set: torch.Tensor
@@ -136,11 +126,11 @@ class AiterMLAPersistentMetadataForVllm:
 
 
 @dataclass
-class AiterMLACommonPrefillMetadataForPluginMode:
+class AiterMlaPrefillMetadataForVllm:
     """Prefill Specific Metadata"""
 
     @dataclass
-    class AiterMLAChunkedContextMetadataForPluginMode:
+    class AiterMlaChunkedContextMetadataForVllm:
         # New for MLA (compared to FlashAttention)
         # For handling chunked prefill
         cu_seq_lens: torch.Tensor
@@ -162,19 +152,16 @@ class AiterMLACommonPrefillMetadataForPluginMode:
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
     max_query_len: int
-    chunked_context: AiterMLAChunkedContextMetadataForPluginMode | None = None
+    chunked_context: AiterMlaChunkedContextMetadataForVllm | None = None
     query_seq_lens: torch.Tensor | None = None
     workspace_buffer: torch.Tensor | None = None
     q_data_type: torch.dtype | None = None
     output_dtype: torch.dtype | None = None
 
 
-D = TypeVar("D", bound=AiterMLACommonDecodeMetadataForPluginMode)
-
-
 @dataclass
-class AiterMLACommonMetadataForPluginMode(Generic[D]):
-    """Metadata for MLACommon.
+class AiterMlaMetadataForVllm:
+    """vLLM metadata for ATOM MLA attention.
 
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -205,21 +192,13 @@ class AiterMLACommonMetadataForPluginMode(Generic[D]):
     # The dimension of the attention heads
     head_dim: int | None = None
 
-    decode: D | None = None
-    prefill: AiterMLACommonPrefillMetadataForPluginMode | None = None
-    persistent_metadata: AiterMLAPersistentMetadataForVllm | None = None
-
-    def __post_init__(self):
-        pass
-        # if self.head_dim is not None and not MLACommonBackend.supports_head_size(
-        #     self.head_dim
-        # ):
-        #     raise ValueError(f"Head dimension {self.head_dim} is not supported by MLA.")
-
+    decode: AiterMlaDecodeMetadataForVllm | None = None
+    prefill: AiterMlaPrefillMetadataForVllm | None = None
+    persistent_metadata: AiterMlaPersistentMetadataForVllm | None = None
 
 
 @dataclass
-class vllmDeepseekV32IndexerPrefillChunkMetadata:
+class VllmDeepseekV32IndexerPrefillChunkMetadata:
     block_table: torch.Tensor
     cu_seqlen_ks: torch.Tensor
     cu_seqlen_ke: torch.Tensor
@@ -232,12 +211,12 @@ class vllmDeepseekV32IndexerPrefillChunkMetadata:
 
 
 @dataclass
-class vllmDeepseekV32IndexerPrefillMetadata:
-    chunks: list[vllmDeepseekV32IndexerPrefillChunkMetadata]
+class VllmDeepseekV32IndexerPrefillMetadata:
+    chunks: list[VllmDeepseekV32IndexerPrefillChunkMetadata]
 
 
 @dataclass
-class vllmDeepseekV32IndexerDecodeMetadata:
+class VllmDeepseekV32IndexerDecodeMetadata:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     decode_lens: torch.Tensor
@@ -248,7 +227,7 @@ class vllmDeepseekV32IndexerDecodeMetadata:
 
 
 @dataclass
-class vllmDeepseekV32IndexerMetadata:
+class VllmDeepseekV32IndexerMetadata:
     # FIXME (zyongye)
     # hacky way to access the data now, need to be in chunked meta
     seq_lens: torch.Tensor
@@ -270,8 +249,8 @@ class vllmDeepseekV32IndexerMetadata:
     num_prefills: int
     num_prefill_tokens: int
 
-    decode: vllmDeepseekV32IndexerDecodeMetadata | None = None
-    prefill: vllmDeepseekV32IndexerPrefillMetadata | None = None
+    decode: VllmDeepseekV32IndexerDecodeMetadata | None = None
+    prefill: VllmDeepseekV32IndexerPrefillMetadata | None = None
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
@@ -352,7 +331,7 @@ def get_max_prefill_buffer_size(max_model_len: int):
 
 
 @dataclass
-class AiterMLASparseMetadataForPluginMode:
+class AiterMlaSparseMetadataForVllm:
     num_reqs: int
     max_query_len: int
     max_seq_len: int
@@ -376,7 +355,7 @@ class AiterMLASparseMetadataForPluginMode:
     topk_tokens: int = 2048
 
 
-class vllmMLASparseAttentionMetadataBuilderMethods:
+class AiterMlaSparseMetadataBuilderMethodsForVllm:
     def __init__(self):
         raise TypeError(
             f"{self.__class__.__name__} is a utility class and should not be instantiated. "
@@ -405,7 +384,7 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
         paged_kv_indptr_rest = self.paged_kv_indptr[num_tokens + 1 :]
 
-        attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
+        attn_metadata = AiterMlaSparseMetadataForVllm(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
@@ -424,11 +403,11 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
             paged_kv_indptr_rest=paged_kv_indptr_rest,
         )
 
-        return attn_metadata_for_plugin_mode
+        return attn_metadata
 
 
-class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
-    """Mixin for DeepseekV32IndexerCache: builds vllmDeepseekV32IndexerMetadata only."""
+class AiterMlaSparseIndexerMetadataBuilderMethodsForVllm:
+    """Mixin for DeepseekV32IndexerCache: builds VllmDeepseekV32IndexerMetadata only."""
 
     def __init__(self):
         raise TypeError(
@@ -464,7 +443,7 @@ class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
             .to(torch.int32)
             .to(self.device)
         )
-        return vllmDeepseekV32IndexerPrefillChunkMetadata(
+        return VllmDeepseekV32IndexerPrefillChunkMetadata(
             cu_seqlen_ks=cu_seqlen_ks,
             cu_seqlen_ke=cu_seqlen_ke,
             cu_seq_lens=cu_seq_lens,
@@ -481,7 +460,7 @@ class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
         common_prefix_len: int,
         common_attn_metadata=None,
         fast_build: bool = False,
-    ) -> vllmDeepseekV32IndexerMetadata:
+    ) -> VllmDeepseekV32IndexerMetadata:
         from vllm.v1.attention.backends.utils import (
             split_decodes_and_prefills,
             split_prefill_chunks,
@@ -522,7 +501,7 @@ class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
                 )
                 for reqs_start, reqs_end in chunk_seq_ids
             ]
-            prefill_metadata = vllmDeepseekV32IndexerPrefillMetadata(
+            prefill_metadata = VllmDeepseekV32IndexerPrefillMetadata(
                 chunks=chunks,
             )
 
@@ -627,7 +606,7 @@ class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
             _is_large_context = common_attn_metadata.max_seq_len > 8192
             use_large_context_topk = batch_size <= 128 and _is_large_context
 
-            decode_metadata = vllmDeepseekV32IndexerDecodeMetadata(
+            decode_metadata = VllmDeepseekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
@@ -637,7 +616,7 @@ class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
                 offsets=offsets,
             )
 
-        indexer_metadata = vllmDeepseekV32IndexerMetadata(
+        indexer_metadata = VllmDeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,

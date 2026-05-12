@@ -13,13 +13,12 @@ from atom.plugin.vllm.attention.metadata import (
     AiterChunkContextMetadata,
     AiterChunkSlidingWindowMetadata,
     AiterFlashAttentionChunkPrefillMetadata,
-    AiterFlashAttentionDecodeMetadata,
-    AiterFlashAttentionPrefillMetadata,
-    AiterMLACommonMetadataForPluginMode,
-    AiterMLACommonPrefillMetadataForPluginMode,
-    AiterMLADecodeMetadataForPluginMode,
-    AiterMLAPersistentMetadataForVllm,
+    AiterMlaDecodeMetadataForVllm,
+    AiterMlaMetadataForVllm,
+    AiterMlaPersistentMetadataForVllm,
+    AiterMlaPrefillMetadataForVllm,
     AiterMhaMetadataForVllm,
+    AiterMhaPhaseMetadata,
 )
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
@@ -188,14 +187,14 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         extend_metadata = None
 
         if num_prefills > 0:
-            prefill_metadata = AiterFlashAttentionPrefillMetadata(
+            prefill_metadata = AiterMhaPhaseMetadata(
                 max_query_len=prefill_max_query_len,
                 max_seq_len=prefill_max_seq_len,
                 query_start_loc=prefill_query_start_loc,
             )
 
         if num_decodes > 0:
-            decode_metadata = AiterFlashAttentionDecodeMetadata(
+            decode_metadata = AiterMhaPhaseMetadata(
                 max_query_len=decode_max_query_len,
                 max_seq_len=decode_max_seq_len,
                 query_start_loc=decode_query_start_loc,
@@ -659,7 +658,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
         self.mla_persistent_metadata.update(ctx_mla_ps)
 
-        attn_metadata = AiterMLADecodeMetadataForPluginMode(
+        attn_metadata = AiterMlaDecodeMetadataForVllm(
             block_table=block_table_tensor,
             seq_lens=seq_lens_device,
             paged_kv_indptr=paged_kv_indptr,
@@ -859,7 +858,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                     )
 
                 chunked_context_metadata_cls = (
-                    AiterMLACommonPrefillMetadataForPluginMode.AiterMLAChunkedContextMetadataForPluginMode
+                    AiterMlaPrefillMetadataForVllm.AiterMlaChunkedContextMetadataForVllm
                 )
                 if self.dcp_world_size > 1:
                     chunked_context_metadata = chunked_context_metadata_cls(
@@ -903,7 +902,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                     <= self.chunked_prefill_workspace_size
                 )
 
-            prefill_metadata = AiterMLACommonPrefillMetadataForPluginMode(
+            prefill_metadata = AiterMlaPrefillMetadataForVllm(
                 block_table=block_table_tensor[reqs_start:, ...],
                 query_start_loc=prefill_query_start_loc,
                 max_query_len=max_query_len,
@@ -937,7 +936,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
             )
 
-        attn_metadata_for_plugin_mode = AiterMLACommonMetadataForPluginMode(
+        attn_metadata = AiterMlaMetadataForVllm(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=max_seq_len,
@@ -945,7 +944,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             query_start_loc=query_start_loc,
             slot_mapping=slot_mapping,
             head_dim=self.model_config.get_head_size(),
-            # MLACommonMetadata Chunk prefill specific
+            # MLA metadata chunk prefill specific
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
@@ -954,12 +953,12 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         )
 
         # TODO: support mtp
-        persistent_metadata = AiterMLAPersistentMetadataForVllm(
+        persistent_metadata = AiterMlaPersistentMetadataForVllm(
             **self.mla_persistent_metadata
         )
 
-        attn_metadata_for_plugin_mode.persistent_metadata = persistent_metadata
-        return attn_metadata_for_plugin_mode
+        attn_metadata.persistent_metadata = persistent_metadata
+        return attn_metadata
 
 
 class AiterMhaBackendForVllm:

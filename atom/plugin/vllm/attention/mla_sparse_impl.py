@@ -119,7 +119,7 @@ def sparse_attn_indexer_plugin_mode(
     if layer_meta is None:
         return weights
 
-    # vLLM sparse indexer builders return vllmDeepseekV32IndexerMetadata directly
+    # vLLM sparse indexer builders return VllmDeepseekV32IndexerMetadata directly
     indexer_meta = layer_meta
     slot_mapping = indexer_meta.slot_mapping
     has_decode = indexer_meta.num_decodes > 0
