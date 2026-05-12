@@ -1747,7 +1747,7 @@ class AiterMLASparseMetadataForPluginMode:
     paged_kv_last_page_len: torch.Tensor
     paged_kv_indices: torch.Tensor
     paged_kv_indptr: torch.Tensor
-    paged_kv_indptr_rest: torch.Tensor
+    attn_out_dtype: torch.dtype
 
     block_size: int = 1
     topk_tokens: int = 2048
@@ -1769,18 +1769,35 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         )
         # Zero-fill for cudagraphs
         self.req_id_per_token_buffer.fill_(0)
+        self.paged_kv_indices.fill_(0)
+        self.paged_kv_indptr.fill_(0)
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
             req_id_per_token, non_blocking=True
         )
-        self.paged_kv_indices.fill_(0)
-        self.paged_kv_indptr.fill_(0)
+        query_lens = (
+            common_attn_metadata.query_start_loc[1:]
+            - common_attn_metadata.query_start_loc[:-1]
+        )
+        seq_lens = common_attn_metadata.seq_lens
+
+        from atom.plugin.attention_mla_sparse import generate_sparse_seqlen_triton
+        sparse_seqlen = generate_sparse_seqlen_triton(
+            query_lens,
+            seq_lens,
+            common_attn_metadata.query_start_loc,
+            self.topk_tokens,
+            num_tokens,
+            common_attn_metadata.max_query_len,
+        )
+
+        torch.cumsum(sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1])
+        self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
         qo_indptr = self.qo_indptr[: num_tokens + 1]
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
         paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
-        paged_kv_indptr_rest = self.paged_kv_indptr[num_tokens + 1 :]
 
         attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
             num_reqs=common_attn_metadata.num_reqs,
@@ -1793,12 +1810,12 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
+            attn_out_dtype=self.model_dtype,
             topk_tokens=self.topk_tokens,
             qo_indptr=qo_indptr,
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indptr_rest=paged_kv_indptr_rest,
         )
 
         attn_metadata = AttentionMetaData(
@@ -2066,14 +2083,12 @@ class vllmAiterMLASparseBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        return [1]
+        return [1, 64]
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
-        # ATOM's sparse MLA plugin path assumes kernel/page block size == 1
-        # throughout metadata construction and KV-cache indexing, so force that
-        # value when vLLM 0.19 negotiates the backend-specific cache block size.
-        return 1
+        # Prefer block_size == 64 so the indexer's preshuffled path is taken
+        return 64
 
     @staticmethod
     def get_kv_cache_shape(
@@ -2219,6 +2234,7 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
 
         self.vllm_config = config
         self.model_config = config.model_config
+        self.model_dtype = self.model_config.dtype
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
@@ -2228,9 +2244,6 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = config.model_config.hf_config.index_topk
-        self.topk_tokens_tensor = torch.tensor(
-            [self.topk_tokens], device=device, dtype=torch.int32
-        )
         self.max_model_len_tensor = torch.tensor(
             [self.model_config.max_model_len], device=device, dtype=torch.int32
         )
