@@ -171,10 +171,15 @@ def _gfx1201_gemm_a8w8_config(M: int, N: int, K: int) -> dict:
             "cache_modifier": None,
             "SPLITK_BLOCK_SIZE": 4096,
         }
-    if K >= 8192:  # down (K=14336) — narrow N, deep K
+    if K >= 8192:  # down (K=14336) — deep K, modest N
+        # Re-tuned across bs=1..32 (scripts/gfx1201/gemm_a8w8_sweep.py):
+        # M32_N64 is consistent-or-better than M16_N128 (0-12 percent
+        # faster at bs=4..32, equal at bs=1,2,8,16). Critical: SPLITK_BLOCK_SIZE
+        # MUST be >= K (with NUM_KSPLIT=1) — a smaller value silently truncates
+        # the K-loop and produces wrong output (cost us a debug cycle).
         return {
-            "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
             "BLOCK_SIZE_K": 128,
             "GROUP_SIZE_M": 1,
             "NUM_KSPLIT": 1,
@@ -184,7 +189,7 @@ def _gfx1201_gemm_a8w8_config(M: int, N: int, K: int) -> dict:
             "matrix_instr_nonkdim": 16,
             "kpack": 1,
             "cache_modifier": None,
-            "SPLITK_BLOCK_SIZE": K,
+            "SPLITK_BLOCK_SIZE": K,  # MUST cover all of K
         }
     # qkv (N=6144) and o (N=4096): default-ish tile, GROUP_SIZE_M=1
     return {
