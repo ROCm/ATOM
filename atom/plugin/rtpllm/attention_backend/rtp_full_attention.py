@@ -1,9 +1,30 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Optional
+from typing import Optional
 
 import torch
+try:
+    import aiter
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - runtime fallback
+    aiter = None
+
+try:
+    from rtp_llm.models_py.modules.factory.attention.common import reshape_paged_kv_cache
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - runtime fallback
+    reshape_paged_kv_cache = None
+
+try:
+    from rtp_llm.ops import AttentionConfigs, KvCacheDataType
+    from rtp_llm.ops.compute_ops import (
+        FusedRopeKVCacheDecodeOpNonAsm,
+        FusedRopeKVCachePrefillOpNonAsm,
+    )
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - runtime fallback
+    AttentionConfigs = None
+    KvCacheDataType = None
+    FusedRopeKVCacheDecodeOpNonAsm = None
+    FusedRopeKVCachePrefillOpNonAsm = None
 
 from atom.model_ops.base_attention import BaseAttention
 from atom.plugin.prepare import is_plugin_mode, is_rtpllm
@@ -15,10 +36,10 @@ def _align_kv_heads_for_cache(
     key: torch.Tensor,
     value: torch.Tensor,
     target_kv_heads: int,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     current_kv_heads = int(key.shape[1])
     if current_kv_heads == int(target_kv_heads):
-        return key, value, 1
+        return key, value
     if current_kv_heads <= 0 or int(target_kv_heads) <= 0:
         raise ValueError(
             f"invalid kv head count: current={current_kv_heads}, target={target_kv_heads}"
@@ -30,10 +51,58 @@ def _align_kv_heads_for_cache(
     dup_factor = int(target_kv_heads) // current_kv_heads
     key_aligned = key.repeat_interleave(dup_factor, dim=1)
     value_aligned = value.repeat_interleave(dup_factor, dim=1)
-    return key_aligned, value_aligned, dup_factor
+    return key_aligned, value_aligned
 
 
-def _resolve_block_tables_for_layer(attn_inputs: object, layer_num: int) -> torch.Tensor | None:
+def _write_kv_cache_with_rtp_fused_kernel(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_cache: object,
+    attn_inputs: object,
+    tokens_per_block: int,
+    qkv_buffer: torch.Tensor | None = None,
+    fused_op: object | None = None,
+) -> bool:
+    if fused_op is None:
+        return False
+
+    q_flat = query.reshape(query.shape[0], -1)
+    k_flat = key.reshape(key.shape[0], -1)
+    v_flat = value.reshape(value.shape[0], -1)
+    total_dim = int(q_flat.shape[1] + k_flat.shape[1] + v_flat.shape[1])
+    if (
+        qkv_buffer is None
+        or qkv_buffer.device != query.device
+        or qkv_buffer.dtype != query.dtype
+        or int(qkv_buffer.shape[0]) != int(query.shape[0])
+        or int(qkv_buffer.shape[1]) != total_dim
+    ):
+        qkv = torch.empty(
+            (int(query.shape[0]), total_dim),
+            dtype=query.dtype,
+            device=query.device,
+        )
+    else:
+        qkv = qkv_buffer
+    q_end = int(q_flat.shape[1])
+    k_end = q_end + int(k_flat.shape[1])
+    qkv[:, :q_end].copy_(q_flat)
+    qkv[:, q_end:k_end].copy_(k_flat)
+    qkv[:, k_end:].copy_(v_flat)
+    op = fused_op
+    params = op.prepare(attn_inputs)
+    _ = op.forward(qkv, layer_cache, params)
+    return True
+
+
+def _resolve_block_tables_for_layer(
+    attn_inputs: object,
+    layer_num: int,
+    *,
+    layer_group_map: dict[int, int] | None = None,
+) -> torch.Tensor | None:
     # Mirror RTP select_block_map_for_layer semantics:
     # 1) compute gid from kv_cache_layer_to_group[layer]
     # 2) if by-group block map exists, select by gid
@@ -41,13 +110,11 @@ def _resolve_block_tables_for_layer(attn_inputs: object, layer_num: int) -> torc
     current = getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
     by_group = getattr(attn_inputs, "kv_cache_kernel_block_id_device_by_group", None)
 
-    gid = 0
-    layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
-    if layer_to_group is not None:
-        try:
-            gid = int(layer_to_group[layer_num].item())
-        except Exception:
-            gid = 0
+    gid = (
+        int(layer_group_map[layer_num])
+        if (layer_group_map is not None and layer_num in layer_group_map)
+        else 0
+    )
 
     if isinstance(by_group, (list, tuple)) and len(by_group) > gid:
         t = by_group[gid]
@@ -63,9 +130,10 @@ def _run_nonasm_paged_attention(
     kv_scale_base: torch.Tensor | None,
     seq_lens: torch.Tensor,
     block_tables: torch.Tensor,
-    layer_num: int,
+    max_seq_len: int,
 ) -> torch.Tensor:
-    import aiter
+    if aiter is None:
+        raise ValueError("RTPAttention requires aiter for nonasm paged attention.")
 
     key_cache = paged_kv_cache.select(1, 0)
     value_cache = paged_kv_cache.select(1, 1)
@@ -73,7 +141,7 @@ def _run_nonasm_paged_attention(
     head_size = query.shape[2]
     num_seqs, num_heads, _ = query.shape
     block_size = value_cache.shape[2]
-    max_seq_len = int(seq_lens.max().item()) if int(seq_lens.numel()) > 0 else 1
+    max_seq_len = int(max_seq_len)
     scale = 1.0 / math.sqrt(head_size)
 
     partition_size = 256
@@ -158,50 +226,113 @@ class RTPFullAttention(BaseAttention):
         self.num_kv_heads = int(num_kv_heads)
         self.scale = float(scale)
         self.layer_num = int(layer_num)
-        # Cached reshape view — invalidated when kv_cache_base is reallocated.
+        self._fused_qkv_buf: torch.Tensor | None = None
         self._paged_kv_cache: torch.Tensor | None = None
-        self._raw_kv_data_ptr: int = 0
-        self._raw_kv_numel: int = 0
-        self._kernel_seq_size_per_block: int = 0
-        # Cached fused KV write ops — built once on first forward.
-        self._fused_prefill_op: Any | None = None
-        self._fused_decode_op: Any | None = None
+        self._paged_kv_cache_sig: tuple[int, int, int, int, int] | None = None
+        self._fused_kv_op_cache: dict[
+            tuple[torch.dtype, str, int, int, int, int, bool], object
+        ] = {}
+        self._backend_ready = aiter is not None and reshape_paged_kv_cache is not None
 
-    def _ensure_fused_ops(
+    def _get_fused_qkv_buffer(
         self,
-        layer_cache: object,
-        kv_head_num: int,
-        kernel_seq_size_per_block: int,
+        *,
+        num_tokens: int,
+        total_dim: int,
+        device: torch.device,
         dtype: torch.dtype,
-    ) -> None:
-        if self._fused_prefill_op is not None:
-            return
-        from rtp_llm.ops import AttentionConfigs, KvCacheDataType
-        from rtp_llm.ops.compute_ops import (
-            FusedRopeKVCacheDecodeOpNonAsm,
-            FusedRopeKVCachePrefillOpNonAsm,
+    ) -> torch.Tensor:
+        buf = self._fused_qkv_buf
+        if (
+            buf is None
+            or buf.device != device
+            or buf.dtype != dtype
+            or int(buf.shape[0]) != int(num_tokens)
+            or int(buf.shape[1]) != int(total_dim)
+        ):
+            buf = torch.empty((num_tokens, total_dim), dtype=dtype, device=device)
+            self._fused_qkv_buf = buf
+        return buf
+
+    def _get_paged_kv_cache(
+        self,
+        *,
+        raw: torch.Tensor,
+        tokens_per_block: int,
+    ) -> torch.Tensor:
+        signature = (
+            int(raw.data_ptr()),
+            int(raw.numel()),
+            int(self.num_kv_heads),
+            int(self.head_dim),
+            int(tokens_per_block),
         )
+        cached = self._paged_kv_cache
+        if cached is None or self._paged_kv_cache_sig != signature:
+            cached = reshape_paged_kv_cache(
+                raw,
+                num_kv_heads=self.num_kv_heads,
+                tokens_per_block=tokens_per_block,
+                head_dim=self.head_dim,
+            )
+            self._paged_kv_cache = cached
+            self._paged_kv_cache_sig = signature
+        return cached
+
+    def _get_fused_kv_op(
+        self,
+        *,
+        query_dtype: torch.dtype,
+        kv_cache_dtype: torch.dtype | None,
+        tokens_per_block: int,
+        num_kv_heads: int,
+        is_prefill: bool,
+    ) -> object | None:
+        if (
+            AttentionConfigs is None
+            or KvCacheDataType is None
+            or FusedRopeKVCacheDecodeOpNonAsm is None
+            or FusedRopeKVCachePrefillOpNonAsm is None
+        ):
+            return None
+        kv_dtype_key = (
+            "fp8"
+            if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            else "base"
+        )
+        cache_key = (
+            query_dtype,
+            kv_dtype_key,
+            int(tokens_per_block),
+            int(num_kv_heads),
+            bool(is_prefill),
+        )
+        op = self._fused_kv_op_cache.get(cache_key)
+        if op is not None:
+            return op
         attn_configs = AttentionConfigs()
-        attn_configs.head_num = self.num_heads
-        # Use post-alignment kv head count so the fused-write op interprets the
-        # qkv strides consistently with how we lay out the (already-aligned) k/v.
-        attn_configs.kv_head_num = int(kv_head_num)
-        attn_configs.size_per_head = self.head_dim
-        attn_configs.tokens_per_block = kernel_seq_size_per_block
-        attn_configs.kernel_tokens_per_block = kernel_seq_size_per_block
+        attn_configs.head_num = int(self.num_heads)
+        attn_configs.kv_head_num = int(num_kv_heads)
+        attn_configs.size_per_head = int(self.head_dim)
+        attn_configs.tokens_per_block = int(tokens_per_block)
+        attn_configs.kernel_tokens_per_block = int(tokens_per_block)
         attn_configs.is_causal = True
         attn_configs.use_mla = False
         attn_configs.q_scaling = 1.0
-        attn_configs.dtype = dtype
-        kv_dtype = getattr(getattr(layer_cache, "kv_cache_base", None), "dtype", None)
-        attn_configs.kv_cache_dtype = (
-            KvCacheDataType.FP8
-            if kv_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-            else KvCacheDataType.BASE
-        )
+        attn_configs.dtype = query_dtype
+        if kv_dtype_key == "fp8":
+            attn_configs.kv_cache_dtype = KvCacheDataType.FP8
+        else:
+            attn_configs.kv_cache_dtype = KvCacheDataType.BASE
+        # Keep RoPE mocked on ATOM side for this experiment;
+        # we only reuse RTP fused address/write semantics here.
         attn_configs.need_rope_kv_cache = False
-        self._fused_prefill_op = FusedRopeKVCachePrefillOpNonAsm(attn_configs)
-        self._fused_decode_op = FusedRopeKVCacheDecodeOpNonAsm(attn_configs)
+        if is_prefill:
+            op = FusedRopeKVCachePrefillOpNonAsm(attn_configs)
+        else:
+            op = FusedRopeKVCacheDecodeOpNonAsm(attn_configs)
+        self._fused_kv_op_cache[cache_key] = op
+        return op
 
     def _forward_impl_plugin_mode(
         self,
@@ -211,24 +342,24 @@ class RTPFullAttention(BaseAttention):
         positions: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        import aiter
-
-        from rtp_llm.models_py.modules.factory.attention.common import reshape_paged_kv_cache
-
         del positions, kwargs
+        if not self._backend_ready:
+            raise ValueError(
+                "RTPAttention requires aiter and reshape_paged_kv_cache in plugin mode."
+            )
         fwd_ctx = get_forward_context()
         if fwd_ctx is None:
             raise ValueError("RTPAttention requires forward context in plugin mode.")
 
-        attn_metadata = getattr(fwd_ctx, "attn_metadata", None)
+        attn_metadata = fwd_ctx.attn_metadata
         if attn_metadata is None:
             raise ValueError("RTPAttention requires attn_metadata in forward context.")
 
-        attn_inputs = getattr(attn_metadata, "rtp_attn_inputs", None)
+        attn_inputs = attn_metadata.rtp_attn_inputs
         if attn_inputs is None:
             raise ValueError("RTPAttention requires rtp_attn_inputs in attn_metadata.")
 
-        kv_cache_data = getattr(fwd_ctx, "kv_cache_data", None)
+        kv_cache_data = fwd_ctx.kv_cache_data
         if kv_cache_data is None:
             raise ValueError("RTPAttention requires kv_cache_data in forward context.")
         layer_cache_entry = kv_cache_data.get(f"layer_{self.layer_num}")
@@ -248,82 +379,77 @@ class RTPFullAttention(BaseAttention):
                 f"RTPAttention layer_{self.layer_num} missing kv_cache_base."
             )
         kernel_seq_size_per_block = int(
-            getattr(attn_metadata, "rtp_kernel_seq_size_per_block", 0)
-            or getattr(layer_cache, "kernel_seq_size_per_block", 0)
-            or getattr(layer_cache, "seq_size_per_block", 0)
-            or 16
+            getattr(attn_metadata, "rtp_kernel_seq_size_per_block", 0) or 16
         )
-        # Invalidate cached view when the underlying buffer is reallocated (more blocks added).
-        if (
-            self._paged_kv_cache is None
-            or raw.data_ptr() != self._raw_kv_data_ptr
-            or raw.numel() != self._raw_kv_numel
-        ):
-            paged_kv = reshape_paged_kv_cache(
-                raw,
-                num_kv_heads=self.num_kv_heads,
-                tokens_per_block=kernel_seq_size_per_block,
-                head_dim=self.head_dim,
+        paged_kv = self._get_paged_kv_cache(
+            raw=raw,
+            tokens_per_block=kernel_seq_size_per_block,
+        )
+        if paged_kv.dim() != 5 or int(paged_kv.shape[1]) != 2:
+            raise ValueError(
+                f"RTPAttention expects paged kv cache [num_blocks,2,H,T,D], got {tuple(paged_kv.shape)}"
             )
-            if paged_kv.dim() != 5 or int(paged_kv.shape[1]) != 2:
-                raise ValueError(
-                    f"RTPAttention expects paged kv cache [num_blocks,2,H,T,D], "
-                    f"got {tuple(paged_kv.shape)}"
-                )
-            self._paged_kv_cache = paged_kv
-            self._raw_kv_data_ptr = raw.data_ptr()
-            self._raw_kv_numel = raw.numel()
-            self._kernel_seq_size_per_block = kernel_seq_size_per_block
 
-        paged_kv = self._paged_kv_cache
         key_cache = paged_kv.select(1, 0)
         value_cache = paged_kv.select(1, 1)
         target_kv_heads = int(key_cache.shape[1])
-        k, v, _ = _align_kv_heads_for_cache(
-            key=k,
-            value=v,
-            target_kv_heads=target_kv_heads,
+        if target_kv_heads != self.num_kv_heads:
+            k, v = _align_kv_heads_for_cache(
+                key=k,
+                value=v,
+                target_kv_heads=target_kv_heads,
+            )
+        layer_group_map = getattr(attn_metadata, "rtp_layer_group_map", None)
+        block_tables = _resolve_block_tables_for_layer(
+            attn_inputs,
+            int(self.layer_num),
+            layer_group_map=layer_group_map,
         )
-        seq_lens = getattr(attn_metadata.plugin_metadata, "seq_lens", None)
-        if seq_lens is None:
-            raise ValueError("RTPAttention requires seq_lens in plugin_metadata.")
-        block_tables = _resolve_block_tables_for_layer(attn_inputs, int(self.layer_num))
         if block_tables is None or block_tables.numel() == 0:
             raise ValueError(
                 f"RTPAttention requires block table for layer_{self.layer_num}."
             )
-        block_tables = block_tables.to(device=q.device, dtype=torch.int32, non_blocking=True)
-        seq_lens = seq_lens.to(device=q.device, dtype=torch.int32, non_blocking=True)
-
-        self._ensure_fused_ops(
-            layer_cache,
-            int(k.shape[1]),
-            self._kernel_seq_size_per_block,
-            q.dtype,
+        plugin_md = attn_metadata.plugin_metadata
+        seq_lens = plugin_md.seq_lens
+        if seq_lens is None:
+            raise ValueError("RTPAttention requires block tables and sequence lengths.")
+        fused_qkv_dim = int(
+            self.num_heads * self.head_dim + 2 * int(k.shape[1]) * self.head_dim
         )
-        op = self._fused_prefill_op if is_prefill else self._fused_decode_op
-        qkv = torch.cat(
-            [
-                q.reshape(q.shape[0], -1),
-                k.reshape(k.shape[0], -1),
-                v.reshape(v.shape[0], -1),
-            ],
-            dim=-1,
-        ).contiguous()
-        params = op.prepare(attn_inputs)
-        op.forward(qkv, layer_cache, params)
-        cu_seqlens_q = getattr(attn_inputs, "cu_seqlens", None)
+        fused_qkv_buf = self._get_fused_qkv_buffer(
+            num_tokens=int(q.shape[0]),
+            total_dim=fused_qkv_dim,
+            device=q.device,
+            dtype=q.dtype,
+        )
+        used_fused_write = _write_kv_cache_with_rtp_fused_kernel(
+            query=q,
+            key=k,
+            value=v,
+            layer_cache=layer_cache,
+            attn_inputs=attn_inputs,
+            tokens_per_block=kernel_seq_size_per_block,
+            qkv_buffer=fused_qkv_buf,
+            fused_op=self._get_fused_kv_op(
+                query_dtype=q.dtype,
+                kv_cache_dtype=getattr(raw, "dtype", None),
+                tokens_per_block=kernel_seq_size_per_block,
+                num_kv_heads=int(k.shape[1]),
+                is_prefill=is_prefill,
+            ),
+        )
+        if not used_fused_write:
+            raise RuntimeError(
+                "RTP fused KV write is required but unavailable; "
+                "fallback slot_mapping path is removed."
+            )
+        cu_seqlens_q = getattr(plugin_md, "rtp_cu_seqlens_q", None)
         if is_prefill and cu_seqlens_q is not None and cu_seqlens_q.numel() > 1:
-            cu_seqlens_q = cu_seqlens_q.to(device=q.device, dtype=torch.int32, non_blocking=True)
             q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32)
             num_seqs = int(q_lens.numel())
-            max_q_len = int(q_lens.max().item()) if num_seqs > 0 else 0
-            prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
-            has_prefix = bool(
-                prefix_lengths is not None
-                and prefix_lengths.numel() > 0
-                and int(prefix_lengths.max().item()) > 0
-            )
+            max_q_len = int(plugin_md.max_query_len)
+            max_seq_len = int(plugin_md.max_seq_len)
+            has_prefix = bool(getattr(plugin_md, "rtp_has_prefix", False))
             if has_prefix:
                 key_cache_aiter = key_cache
                 value_cache_aiter = value_cache
@@ -352,7 +478,7 @@ class RTPFullAttention(BaseAttention):
                     kv_indptr,
                     kv_page_indices,
                     max_q_len,
-                    int(seq_lens[:num_seqs].max().item()) if num_seqs > 0 else 1,
+                    max_seq_len,
                     causal=True,
                     block_table=block_tables[:num_seqs],
                     seqlen_k=seq_lens[:num_seqs],
@@ -372,9 +498,7 @@ class RTPFullAttention(BaseAttention):
                     dropout_p=0.0,
                     causal=True,
                 )
-            output = output.reshape(int(q.shape[0]), self.num_heads * self.head_dim)
-            output = output.view(-1, self.num_heads * self.head_dim)
-            return output
+            return output.reshape(int(q.shape[0]), self.num_heads * self.head_dim)
 
         num_seqs = int(q.shape[0])
         output = _run_nonasm_paged_attention(
@@ -383,7 +507,7 @@ class RTPFullAttention(BaseAttention):
             kv_scale_base=getattr(layer_cache, "kv_scale_base", None),
             seq_lens=seq_lens[:num_seqs],
             block_tables=block_tables[:num_seqs],
-            layer_num=int(self.layer_num),
+            max_seq_len=int(plugin_md.max_seq_len),
         )
         output = output.view(num_seqs, -1)
         return output
