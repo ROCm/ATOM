@@ -32,7 +32,6 @@ _NATIVE_SAMPLING_WARNING_ISSUED = False
 SAMPLER_EPS = 1e-10
 
 
-@lru_cache(maxsize=1)
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     """Returns a tensor of shape (1, vocab_size) filled with exponential random values.
     This is key to deterministic inference, as it ensures that the same random values are used for each token across different runs.

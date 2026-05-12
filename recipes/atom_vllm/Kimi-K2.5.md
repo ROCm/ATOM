@@ -14,12 +14,13 @@ docker pull rocm/atom-dev:vllm-latest
 ## Step 2: Launch vLLM Server
 
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
+We adopt [amd/Kimi-K2.5-MXFP4-AttnFP8](https://huggingface.co/amd/Kimi-K2.5-MXFP4-AttnFP8) for better performance by leveraging FP8 weights for attention layers.
 
 ```bash
 # use quick allreduce to reduce TTFT
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
-vllm serve amd/Kimi-K2.5-MXFP4 \
+vllm serve amd/Kimi-K2.5-MXFP4-AttnFP8 \
     --host localhost \
     --port 8000 \
     --async-scheduling \
@@ -28,6 +29,8 @@ vllm serve amd/Kimi-K2.5-MXFP4 \
     --gpu_memory_utilization 0.9 \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --kv-cache-dtype fp8 \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
     --no-enable-prefix-caching
 ```
 
@@ -51,7 +54,7 @@ IMAGE_BASE64=$(base64 -w 0 ATOM/recipes/atom_vllm/dog.png)
 curl -X POST "http://localhost:8000/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "amd/Kimi-K2.5-MXFP4",
+    "model": "amd/Kimi-K2.5-MXFP4-AttnFP8",
     "messages": [
       {
         "role": "user",
@@ -82,7 +85,7 @@ The expected response:
     "id": "chatcmpl-941a3736cc5cce95",
     "object": "chat.completion",
     "created": 1774365813,
-    "model": "amd/Kimi-K2.5-MXFP4",
+    "model": "amd/Kimi-K2.5-MXFP4-AttnFP8",
     "choices": [
         {
             "index": 0,
@@ -122,7 +125,7 @@ Users can use the default vllm bench command for performance benchmarking.
 vllm bench serve \
     --host localhost \
     --port 8000 \
-    --model amd/Kimi-K2.5-MXFP4 \
+    --model amd/Kimi-K2.5-MXFP4-AttnFP8 \
     --dataset-name random \
     --random-input-len 8000 \
     --random-output-len 1000 \
@@ -137,15 +140,15 @@ vllm bench serve \
 The accuracy can be verified on gsm8k dataset with command:
 ```bash
 lm_eval --model local-completions \
-        --model_args model=amd/Kimi-K2.5-MXFP4,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+        --model_args model=amd/Kimi-K2.5-MXFP4-AttnFP8,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
         --tasks gsm8k \
         --num_fewshot 3
 ```
 The reference values of corresponding metrics:
 ```bash
-local-completions ({'model': '/workspace/shared/data/models/Kimi-K2.5-MXFP4', 'base_url': 'http://localhost:8000/v1/completions', 'num_concurrent': 64, 'max_retries': 3, 'tokenized_requests': False}), gen_kwargs: ({}), limit: None, num_fewshot: 3, batch_size: 1
+local-completions ({'model': 'amd/Kimi-K2.5-MXFP4-AttnFP8', 'base_url': 'http://localhost:8000/v1/completions', 'num_concurrent': 64, 'max_retries': 3, 'tokenized_requests': False}), gen_kwargs: ({}), limit: None, num_fewshot: 3, batch_size: 1
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     3|exact_match|↑  |0.9401|±  |0.0065|
-|     |       |strict-match    |     3|exact_match|↑  |0.9386|±  |0.0066|
+|gsm8k|      3|flexible-extract|     3|exact_match|↑  |0.9325|±  |0.0061|
+|     |       |strict-match    |     3|exact_match|↑  |0.9240|±  |0.0062|
 ```
