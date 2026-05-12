@@ -536,6 +536,11 @@ jobs:
       - name: Check if model is enabled
         id: check
         run: |
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           case "${{ matrix.model.prefix }}" in
             deepseek-r1-fp8-tp8) echo "enabled=${{ inputs.deepseek-r1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp8-tp4) echo "enabled=${{ inputs.deepseek-r1-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
