@@ -148,7 +148,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         # Apply ds model-specific sglang patches (attn dispatch, weight hooks, etc.)
         # TODO: will remove this after sglang supports atom attention backend
         if self.model_arch_spec.apply_deepseek_patch:
-            from atom.plugin.sglang.attention_backend.sgl_attention_mla import (
+            from atom.plugin.sglang.models.deepseek_mla import (
                 setup_deepseek_for_sglang,
             )
 

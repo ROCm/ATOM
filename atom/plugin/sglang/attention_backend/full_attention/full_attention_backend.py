@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-# sglang-specific attention backend replacing sglang's built-in AiterAttnBackend.
-# Shared by ALL models (DeepSeek, Qwen3, etc.) — handles KV cache writes,
-# page-table fixup, pa_persistent_fwd decode path, and MLA prefill kernels.
-# Sits at the lowest layer of the attention stack: sglang's RadixAttention
-# delegates the actual kernel dispatch here.
+# SGLang full-attention backend replacing sglang's built-in AiterAttnBackend.
+# Shared by ALL full-attention models (DeepSeek, Qwen3, etc.) — handles KV
+# cache writes, page-table fixup, pa_persistent_fwd decode path, and MLA
+# prefill kernels. Sits at the lowest layer of the attention stack:
+# sglang's RadixAttention delegates the actual kernel dispatch here.
 #
 # TODO: rewrite this file once sglang's attention flow is unified into ATOM's
 # attention layer — KV cache management and attention kernel dispatch will then
@@ -41,7 +41,7 @@ try:
 except ImportError as e:
     raise ImportError(
         "Failed to import 'aiter', which provides AMD-specific attention kernels "
-        "required by sgl_attn_backend. Please ensure 'aiter' is installed and "
+        "required by full_attention_backend. Please ensure 'aiter' is installed and "
         f"available on your AMD system. Original import error: {e}"
     ) from e
 

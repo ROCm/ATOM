@@ -1,17 +1,19 @@
-"""Sglang-specific MLA forward and weight processing for DeepseekV2/V3.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-DeepSeek MLA (Multi-Latent Attention) forward logic for sglang plugin mode:
+"""Model-specific DeepSeek MLA helpers for SGLang plugin mode.
+
+DeepSeek MLA (Multi-Latent Attention) forward logic for SGLang plugin mode:
 absorbed BMM computation, MHA/MLA path dispatch (prefill -> MHA, decode -> MLA),
-kv_b_proj weight splitting (w_kc/w_vc), and monkey-patch setup via
-setup_deepseek_for_sglang().
+and kv_b_proj weight splitting (w_kc/w_vc).
 
-This module is lazily imported from base_model_wrapper.py only when running in
-sglang plugin mode (``is_sglang() == True``).  Keeping all sglang-dependent
-imports here avoids crashing when sglang is not installed.
+This module lives under ``atom.plugin.sglang.models`` because the logic is
+DeepSeek-model-specific rather than a generic SGLang attention backend.
 
 TODO: rewrite this file once sglang's attention flow is unified into ATOM's
-attention layer — the MLA absorbed path and MHA dispatch will then be handled
-natively by ATOM's attention ops, making this sglang-specific module unnecessary.
+attention layer - the MLA absorbed path and MHA dispatch will then be handled
+natively by ATOM's attention ops, making this sglang-specific module
+unnecessary.
 """
 
 from __future__ import annotations
@@ -29,7 +31,6 @@ from atom.model_ops.attention_mla import (
 )
 from atom.models.utils import maybe_prefix
 
-# sglang imports
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -59,7 +60,6 @@ if TYPE_CHECKING:
     from atom.models.deepseek_v2 import DeepseekV2MLAAttention
 
 
-# bmm_fp8 custom-op wrapper (adapted from sglang forward_mla.py)
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
     from sglang.srt.utils.custom_op import register_custom_op
@@ -90,7 +90,6 @@ else:
         raise RuntimeError("bmm_fp8 requires CUDA (sgl_kernel)")
 
 
-# NamedTuple for prepare → core data flow
 class SglPrepareResult(NamedTuple):
     q_pe: torch.Tensor
     k_pe: torch.Tensor
@@ -177,7 +176,6 @@ def _prepare_weight_for_bmm(
     )
 
 
-# Init helpers
 def init_sgl_attrs(
     attn: DeepseekV2MLAAttention,
     config,
@@ -211,7 +209,6 @@ def init_sgl_attrs(
         attn.attn_mha.attn.kv_b_proj = None
 
 
-# Absorbed batched-matmul (shared by prepare and core)
 def mla_absorbed_bmm(
     attn: DeepseekV2MLAAttention,
     inp: torch.Tensor,
@@ -220,12 +217,7 @@ def mla_absorbed_bmm(
     weight_scale_k: Optional[torch.Tensor],
     out_dim: int,
 ) -> torch.Tensor:
-    """Batched matmul for MLA absorbed weights (w_kc / w_vc).
-
-    Handles deep_gemm, mxfp4, fp8-triton, fp8-cublas, and bf16 fallback paths.
-    inp: (num_tokens, num_heads, in_dim) — token-major
-    Returns: (num_tokens, num_heads, out_dim) — token-major
-    """
+    """Batched matmul for MLA absorbed weights (w_kc / w_vc)."""
     effective_weight_scale = (
         weight_scale_k if weight_scale_k is not None else weight_scale
     )
@@ -294,7 +286,6 @@ def mla_absorbed_bmm(
         )
         return out.transpose(0, 1)
 
-    # CUDA fp8 path
     if weight.dtype == torch.float8_e4m3fn:
         val, scale = per_tensor_quant_mla_fp8(
             inp.transpose(0, 1),
@@ -303,7 +294,6 @@ def mla_absorbed_bmm(
         out = bmm_fp8(val, weight, scale, effective_weight_scale, torch.bfloat16)
         return out.transpose(0, 1)
 
-    # bf16 fallback
     return torch.bmm(inp.transpose(0, 1), weight).transpose(0, 1)
 
 
@@ -347,14 +337,13 @@ def mla_v_up_proj(
     ).flatten(1, 2)
 
 
-# Forward: prepare → core
 def forward_sgl_prepare(
     attn: DeepseekV2MLAAttention,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     **model_kwargs,
 ) -> SglPrepareResult:
-    """Prepare QKV for sglang MLA attention (adapted from sglang forward_absorb_prepare)."""
+    """Prepare QKV for sglang MLA attention."""
     hidden_states_scale = None
     if isinstance(hidden_states, tuple):
         hidden_states, hidden_states_scale = hidden_states
@@ -396,9 +385,6 @@ def forward_sgl_prepare(
         k_nope = latent_cache[..., : attn.kv_lora_rank]
         q_scale = None
 
-        # Reuse native ATOM gating for q/k RMSNorm fusion. Quant fusion is used
-        # when DeepSeek enables qknorm-quant; otherwise keep the non-quant fused
-        # path aligned with native ATOM before falling back to plain layernorm.
         if getattr(attn, "fuse_qknorm_quant", False):
             q, q_scale, q_lora, k_nope = _fuse_qk_rmsnorm_and_q_quant(
                 attn,
@@ -408,7 +394,6 @@ def forward_sgl_prepare(
             )
         elif getattr(attn, "fuse_qknorm", False):
             q, k_nope = _fuse_qk_rmsnorm(attn, q, k_nope)
-        # Otherwise keep the original overlap path for unfused qk norm.
         elif attn.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
             attn.alt_stream.wait_stream(current_stream)
@@ -420,11 +405,9 @@ def forward_sgl_prepare(
             q = attn.q_a_layernorm(q)
             k_nope = attn.kv_a_layernorm(k_nope)
 
-        if attn.use_nsa:
-            if q_lora is None:
-                q_lora = q
+        if attn.use_nsa and q_lora is None:
+            q_lora = q
 
-        # overlap q_b_proj and indexer during decode
         if (
             attn.alt_stream is not None
             and get_is_capture_mode()
@@ -501,7 +484,7 @@ def forward_sgl_core(
     attn: DeepseekV2MLAAttention,
     prepared: SglPrepareResult,
 ) -> torch.Tensor:
-    """Core MLA attention computation for sglang (adapted from sglang forward_absorb_core)."""
+    """Core MLA attention computation for sglang."""
     save_kv_cache = True
 
     if attn.use_fused_qk_rope_concat_and_cache_mla:
@@ -540,7 +523,6 @@ def forward_sgl_core(
             is_neox=attn.rotary_emb.is_neox_style,
             is_nope_first=True,
         )
-        # Decode/speculative MLA consumes q plus packed MLA cache directly.
         k = None
         v = None
         save_kv_cache = False
@@ -566,7 +548,6 @@ def forward_sgl_core(
     )
     attn_output = attn_output.view(-1, attn.num_local_heads, attn.kv_lora_rank)
 
-    # up-proj by w_vc
     attn_bmm_output = mla_v_up_proj(
         attn, attn_output, attn.w_vc, attn.w_scale, attn.w_scale_v, attn.v_head_dim
     )
@@ -575,15 +556,7 @@ def forward_sgl_core(
 
 
 def _dispatch_sgl_plugin_attn_path(forward_batch) -> str:
-    """Decide the attention algorithm for this batch based on forward_mode.
-
-    Returns "mha" for extend/prefill (uses standard Q×K×V with flash_attn)
-    or "mla" for decode (uses absorbed weights + mla_decode_fwd).
-
-    This is the per-batch *routing* decision, distinct from
-    ``_can_run_sgl_mha_now`` which is a *capability* gate checking whether
-    the model configuration supports the MHA path at all.
-    """
+    """Decide the attention algorithm for this batch based on forward_mode."""
     if forward_batch.forward_mode.is_extend_without_speculative():
         return "mha"
     return "mla"
@@ -620,12 +593,7 @@ def _set_mla_kv_buffer_for_mha(
 
 
 def _can_run_sgl_mha_now(attn: DeepseekV2MLAAttention, forward_batch) -> bool:
-    """Check if the model configuration supports the MHA attention path.
-
-    This is a *capability* gate — NSA models and MXFP4-quantised weights
-    (uint8) cannot use the MHA path. Distinct from
-    ``_dispatch_sgl_plugin_attn_path`` which routes each batch.
-    """
+    """Check if the model configuration supports the MHA attention path."""
     del forward_batch
     if attn.use_nsa:
         return False
@@ -801,8 +769,6 @@ def prepare_qkv_latent(
         hidden_states, hidden_states_scale = hidden_states
     qkv_lora = attn.fused_qkv_a_proj(hidden_states, hidden_states_scale)
 
-    # Fallback: when communicator does not enable input_scattered gather,
-    # force qkv latent token dimension to align with positions.
     expected_tokens = 0
     if hasattr(forward_batch, "positions") and forward_batch.positions is not None:
         expected_tokens = int(forward_batch.positions.shape[0])
@@ -825,7 +791,6 @@ def prepare_qkv_latent(
     return qkv_lora
 
 
-# Top-level forward entry point
 def forward_sgl_plugin_mode(
     attn: DeepseekV2MLAAttention,
     positions: torch.Tensor,
@@ -866,7 +831,6 @@ def forward_sgl_plugin_mode(
         raise ValueError(f"Unsupported plugin attention path: {attn_path}")
 
 
-# Weight post-processing: decomposed into sub-functions
 def _read_kv_b_proj_weight(attn: DeepseekV2MLAAttention) -> torch.Tensor:
     """Read kv_b_proj weight, handling AWQ and fnuz dtypes."""
     if hasattr(attn.kv_b_proj, "qweight"):
@@ -883,8 +847,6 @@ def _read_kv_b_proj_weight(attn: DeepseekV2MLAAttention) -> torch.Tensor:
     else:
         w = attn.kv_b_proj.weight
 
-    # On ROCm, ATOM creates parameters with fnuz dtype but loads fn bytes.
-    # View-cast back to fn so the normalize path works correctly.
     if _is_fp8_fnuz and w.dtype == torch.float8_e4m3fnuz:
         w = w.view(torch.float8_e4m3fn)
 
@@ -908,10 +870,7 @@ def _process_fp8_weight(
     w: torch.Tensor,
     weight_block_size: Optional[list[int]],
 ) -> tuple[torch.Tensor, bool, Optional[torch.Tensor]]:
-    """Process FP8 weights for kv_b_proj.
-
-    Returns (w, use_deep_gemm_bmm, block_scale).
-    """
+    """Process FP8 weights for kv_b_proj."""
     from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz
     from sglang.srt.layers.quantization.fp8_utils import (
         block_quant_dequant,
@@ -1043,7 +1002,6 @@ def _split_and_assign_kc_vc(
         [attn.qk_nope_head_dim, attn.v_head_dim], dim=1
     )
 
-    # quark fp4 special path
     quant_method = getattr(attn.kv_b_proj, "quant_method", None)
     quant_config = getattr(quant_method, "quant_config", None)
     if (
@@ -1066,8 +1024,6 @@ def _split_and_assign_kc_vc(
             w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             w_vc = w_vc.contiguous().transpose(1, 2)
 
-        # Align bf16 kv_b_proj post-load handling with vLLM: split first, then
-        # quantize kc/vc independently for the fp8 BMM path.
         if w.dtype == torch.bfloat16 and (_is_hip or _is_cuda):
             w_kc, w_scale_k = dynamic_per_batched_tensor_quant(w_kc, dtype=dtypes.fp8)
             w_vc, w_scale_v = dynamic_per_batched_tensor_quant(w_vc, dtype=dtypes.fp8)
@@ -1099,89 +1055,19 @@ def _split_and_assign_kc_vc(
 
 
 def process_mla_kv_b_proj_after_loading(attn: DeepseekV2MLAAttention) -> None:
-    """Process kv_b_proj weights after loading for sglang MLA mode.
-
-    Orchestrates reading, quantization handling, and splitting of
-    kv_b_proj into absorbed w_kc / w_vc weights.
-    """
+    """Process kv_b_proj weights after loading for sglang MLA mode."""
     w = _read_kv_b_proj_weight(attn)
     weight_block_size = _get_weight_block_size(attn)
 
     use_deep_gemm_bmm = False
     block_scale = None
 
-    # fp8 path
     if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
         w, use_deep_gemm_bmm, block_scale = _process_fp8_weight(
             attn, w, weight_block_size
         )
 
-    # int8 path
     if w.dtype == torch.int8:
         w = _process_int8_weight(attn, w, weight_block_size)
 
-    # split and assign kc/vc
     _split_and_assign_kc_vc(attn, w, use_deep_gemm_bmm, block_scale, weight_block_size)
-
-
-# One-time model setup (called from base_model_wrapper.py)
-def setup_deepseek_for_sglang(model) -> None:
-    """Patch a DeepseekV2/V3 model for sglang plugin mode.
-
-    - Initialises sglang TP context
-    - Patches each MLAAttention.forward to dispatch to the sglang MLA path
-    - Registers process_weights_after_loading hooks
-    - Stores atom_config on the model
-    """
-    config = model.config
-
-    # Store atom_config (needed by load_weights in the OOT wrapper)
-    if not hasattr(model, "atom_config"):
-        from atom.config import get_current_atom_config
-
-        model.atom_config = get_current_atom_config()
-
-    kv_cache_dtype = model.atom_config.kv_cache_dtype
-
-    # Initialise sglang TP context for MLA gather/scatter
-    from sglang.srt.configs.model_config import is_deepseek_nsa
-    from sglang.srt.layers.communicator import get_attn_tp_context
-
-    get_attn_tp_context().init_context(config.q_lora_rank, is_deepseek_nsa(config))
-
-    # Patch each MLAAttention instance
-    from atom.models.deepseek_v2 import DeepseekV2MLAAttention
-
-    for module in model.modules():
-        if isinstance(module, DeepseekV2MLAAttention):
-            _patch_mla_attention_for_sglang(module, config, kv_cache_dtype)
-
-
-def _patch_mla_attention_for_sglang(attn, config, kv_cache_dtype: str = "bf16") -> None:
-    """Patch a single DeepseekV2MLAAttention for sglang plugin mode.
-
-    We patch attn.forward (rather than relying solely on ops.Attention =
-    RadixAttention) because MLA's absorbed-weight forward path replaces the
-    *entire* forward method — including RoPE, and absorbed
-    BMM — not just the attention backend.  ops.Attention = RadixAttention
-    handles the backend layer (flash_attn / paged_attn dispatch) and is
-    already set via set_attn_cls(); this patch sits above that layer.
-    """
-    init_sgl_attrs(attn, config, kv_cache_dtype)
-
-    def patched_forward(
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        from atom.plugin.sglang.models.base_model_wrapper import (
-            get_current_forward_batch,
-        )
-
-        kwargs["forward_batch"] = get_current_forward_batch()
-        return forward_sgl_plugin_mode(attn, positions, hidden_states, **kwargs)
-
-    attn.forward = patched_forward
-    attn.process_weights_after_loading = lambda: process_mla_kv_b_proj_after_loading(
-        attn
-    )
