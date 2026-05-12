@@ -58,7 +58,9 @@ class AiterMLASparseMetadataBuilder(
         device=None,
         model_runner=None,
     ):
-        super().__init__(kv_cache_spec, layer_names, config, device)
+        AttentionMetadataBuilder.__init__(
+            self, kv_cache_spec, layer_names, config, device
+        )
         from vllm.config import VllmConfig
         from vllm.model_executor.layers.attention.mla_attention import (
             get_mla_dims,
@@ -143,7 +145,9 @@ class AiterMLASparseIndexerMetadataBuilder(
         device=None,
         model_runner=None,
     ):
-        super().__init__(kv_cache_spec, layer_names, config, device)
+        AttentionMetadataBuilder.__init__(
+            self, kv_cache_spec, layer_names, config, device
+        )
         from vllm.config import VllmConfig
 
         try:
