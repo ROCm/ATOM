@@ -1952,6 +1952,23 @@ class MoE(nn.Module):
             fwd_input_ids is not None
         ), "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
         ids = fwd_input_ids.flatten()
+        # Under DP-attention gather/scatter, forward_impl_graph gathers
+        # hidden_states and gating_output across DP ranks before calling
+        # select_experts → _hash_topk.  input_ids is still local (not
+        # gathered), so topk_ids would be [local_bs, topk] while the
+        # gathered gating_output is [local_bs*dp, n_experts].  Gather
+        # input_ids to match.
+        num_tokens = gating_output.shape[0]
+        if ids.shape[0] < num_tokens:
+            from atom.model_ops.moe import pad_for_all_gather
+
+            ids_2d = ids.unsqueeze(-1)
+            ids_2d, _ = pad_for_all_gather(ids_2d)
+            from aiter.dist.parallel_state import get_dp_group
+
+            ids_2d = get_dp_group().all_gather(ids_2d, dim=0)
+            ids = ids_2d[:num_tokens].flatten()
+            ids = ids.clamp(0, self.gate.tid2eid.shape[0] - 1)
         topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
         scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
         topk_weights = scores.gather(dim=-1, index=topk_ids.long())

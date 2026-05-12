@@ -77,7 +77,7 @@
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
+    "env_vars": "ATOM_MOE_GU_ITLV=1"
   },
   {
     "display": "Kimi-K2.5-MXFP4",
