@@ -1,6 +1,8 @@
 from collections.abc import Iterable
 
+import functools
 import importlib
+import types
 import torch
 import torch.nn as nn
 from aiter.dist.parallel_state import (
@@ -139,11 +141,17 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         self.vllm_config = vllm_config
         self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
+        self.is_mtp = False
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is not None:
+            spec_method = speculative_config.method
+            self.is_mtp = spec_method == "mtp"
 
         _prepare_env(atom_config=self.atom_config)
 
         main_model_arch = vllm_config.model_config.architectures[0]
         model_arch = _select_model_arch(vllm_config)
+        self.is_mtp_draft_model = self.is_mtp and model_arch != main_model_arch
         self.model_arch = model_arch
         model_cls = _get_atom_model_cls(model_arch)
         module_remapping = getattr(model_cls, "packed_modules_mapping", {})
@@ -174,6 +182,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
         self.model = model_cls(self.atom_config)
+        self._adapt_mtp_layers_for_vllm()
         # Mirror nested attributes required by vLLM speculative decoding.
         self._expose_spec_decode_attrs()
 
@@ -308,6 +317,51 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     f"Indexer cache {prefix} already in vLLM "
                     f"static_forward_context, skipping"
                 )
+
+    def _adapt_mtp_layers_for_vllm(self) -> None:
+        """Install vLLM-only MTP input masking without changing model code."""
+        if not self.is_mtp_draft_model:
+            return
+
+        inner_model = getattr(self.model, "model", None)
+        layers = (
+            getattr(inner_model, "layers", None) if inner_model is not None else None
+        )
+        if layers is None:
+            return
+
+        layer_iter = layers.values() if isinstance(layers, nn.ModuleDict) else layers
+        for layer in layer_iter:
+            if getattr(layer, "_atom_vllm_mtp_masked", False):
+                continue
+
+            layer.forward = types.MethodType(
+                self._make_vllm_mtp_layer_forward(layer.forward),
+                layer,
+            )
+            layer._atom_vllm_mtp_masked = True
+
+    @staticmethod
+    def _make_vllm_mtp_layer_forward(original_forward):
+        @functools.wraps(original_forward)
+        def masked_forward(
+            self_layer,
+            input_ids,
+            positions,
+            previous_hidden_states,
+            inputs_embeds,
+            spec_step_index=0,
+        ):
+            inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
+            return original_forward(
+                input_ids,
+                positions,
+                previous_hidden_states,
+                inputs_embeds,
+                spec_step_index,
+            )
+
+        return masked_forward
 
     def forward(
         self,
