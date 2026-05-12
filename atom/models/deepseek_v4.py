@@ -144,6 +144,7 @@ def _fused_qk_norm_rope_swa_write_fake(
     n_local_heads: int,
     head_dim: int,
     rope_head_dim: int,
+    kv_weight: torch.Tensor,
     eps: float,
     win: int,
     swa_write_indices: Optional[torch.Tensor] = None,
@@ -169,6 +170,7 @@ def fused_qk_norm_rope_swa_write(
     n_local_heads: int,
     head_dim: int,
     rope_head_dim: int,
+    kv_weight: torch.Tensor,
     eps: float,
     win: int,
     swa_write_indices: Optional[torch.Tensor] = None,
@@ -195,7 +197,7 @@ def fused_qk_norm_rope_swa_write(
             q,
             kv,
             None,
-            None,
+            kv_weight,
             eps,
             eps,
             rope_head_dim,
@@ -214,6 +216,7 @@ def fused_qk_norm_rope_swa_write(
     else:
         q = q.view(num_tokens, n_local_heads, head_dim)
         q_out = _rmsnorm_nw(q, eps, head_dim)
+        kv = rmsnorm2d_fwd_(kv, kv_weight, eps, kv.shape[-1])
         aiter.rope_cached_positions_2c_fwd_inplace(
             q_out[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
             kv[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
@@ -224,7 +227,7 @@ def fused_qk_norm_rope_swa_write(
             reuse_freqs_front_part=True,
             nope_first=False,
         )
-        if not swa_write_indices:
+        if swa_write_indices is not None:
             swa_write(
                 kv,
                 swa_write_indices,
@@ -1691,6 +1694,7 @@ class DeepseekV4Attention(nn.Module):
                 self.n_local_heads,
                 self.head_dim,
                 rd,
+                self.kv_norm.weight,
                 self.eps,
                 win,
                 swa_write_indices=write_indices,
