@@ -64,6 +64,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_dsr1_fp8_dp8_ep8:
+        description: "DeepSeek-R1-FP8 DP8+EP8"
+        required: false
+        type: boolean
+        default: false
       run_dsr1_fp4_tp8:
         description: "DeepSeek-R1-0528-MXFP4 TP8"
         required: false
@@ -145,6 +150,7 @@ jobs:
           RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
           RUN_KIMI_K25_TP8: ${{ inputs.run_kimi_k25_tp8 }}
           RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
+          RUN_DSR1_FP8_DP8_EP8: ${{ inputs.run_dsr1_fp8_dp8_ep8 }}
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
           RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
@@ -260,6 +266,15 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
+                  "runner": "linux-atom-mi35x-8",
+              },
+              {
+                  "toggle_env": "RUN_DSR1_FP8_DP8_EP8",
+                  "model_name": "DeepSeek-R1-FP8 DP8+EP8",
+                  "model_path": "deepseek-ai/DeepSeek-R1-0528",
+                  "extra_args": "--data-parallel-size 8 --enable-expert-parallel",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "MORI_SHMEM_MODE=ISOLATION",
                   "runner": "linux-atom-mi35x-8",
               },
               {

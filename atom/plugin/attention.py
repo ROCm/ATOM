@@ -5,15 +5,19 @@ from dataclasses import dataclass
 
 import torch
 
-from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
-from aiter.dist.parallel_state import get_tp_group
+from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
+from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
+from atom.plugin.attention_mla import (
+    disabled_mla_persistent_metadata,
+    get_mla_persistent_metadata_dtypes,
+)
 from atom.plugin.prepare import is_vllm, is_sglang
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.config import get_current_atom_config
 from atom.utils.forward_context import Context, AttentionMetaData
 from atom.model_ops.attention_mha import PagedAttentionImpl
-from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
 
 logger = logging.getLogger("atom")
 
@@ -805,6 +809,8 @@ class vllmMLAAttentionMetadataBuilderMethods:
             reduce_final_map,
             reduce_partial_map,
             page_size=self.block_size,
+            dtype_q=self.dtype_q,
+            dtype_kv=self.dtype_kv,
             **split_params,
         )
         return {
@@ -882,8 +888,11 @@ class vllmMLAAttentionMetadataBuilderMethods:
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
-        self.mla_persistent_metadata.update(ctx_mla_ps)
+        # Disable persistent MLA in DP mode: pre-computed metadata buffers
+        # are invalid when request counts vary across DP ranks each step.
+        if get_dp_group().world_size <= 1:
+            ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
+            self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(
             block_table=block_table_tensor,
@@ -1180,7 +1189,11 @@ class vllmMLAAttentionMetadataBuilderMethods:
         )
 
         # TODO: support mtp
-        ctx_mla_ps = self.mla_persistent_metadata
+        ctx_mla_ps = (
+            self.mla_persistent_metadata
+            if get_dp_group().world_size <= 1
+            else disabled_mla_persistent_metadata()
+        )
 
         attn_metadata = AttentionMetaData(
             max_seqlen_q=common_attn_metadata.max_query_len,
@@ -1236,6 +1249,9 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
+        self.dtype_q, self.dtype_kv = get_mla_persistent_metadata_dtypes(
+            config.cache_config.cache_dtype
+        )
 
         # Preparing persistent buffers
         # TODO: we can disambiguate between decode and mixed-prefill decode here
@@ -1268,8 +1284,8 @@ def create_mla_attn_metadata_builder_init_method(base_class):
             max_num_reqs,
             1,
             self.padded_num_attention_heads,
-            torch.bfloat16,
-            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            self.dtype_q,
+            self.dtype_kv,
             is_sparse=False,  # TODO: support sparse
             fast_mode=True,
         )

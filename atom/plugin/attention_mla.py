@@ -10,6 +10,7 @@ import os
 import torch
 import aiter
 from aiter import dtypes, QuantType
+from aiter.dist.parallel_state import get_dp_group
 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
@@ -27,6 +28,26 @@ from atom.utils import envs
 import logging
 
 logger = logging.getLogger("atom")
+
+_MLA_PERSISTENT_METADATA_FIELDS = (
+    "work_meta_data",
+    "work_indptr",
+    "work_info_set",
+    "reduce_indptr",
+    "reduce_final_map",
+    "reduce_partial_map",
+)
+
+
+def get_mla_persistent_metadata_dtypes(
+    cache_dtype: str,
+) -> tuple[torch.dtype, torch.dtype]:
+    dtype_kv = dtypes.d_dtypes[cache_dtype]
+    return dtype_kv, dtype_kv
+
+
+def disabled_mla_persistent_metadata() -> dict[str, None]:
+    return {field: None for field in _MLA_PERSISTENT_METADATA_FIELDS}
 
 
 if use_triton_gemm():
@@ -566,7 +587,11 @@ class MLAAttentionImplPluginModeMethods:
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        use_persistent_mode = not (
+        # Persistent MLA pre-computes fixed work/reduce metadata buffers at init
+        # time, but DP splits requests across ranks with varying counts per step,
+        # making those fixed buffers invalid. Disable when dp_size > 1.
+        dp_size = get_dp_group().world_size
+        use_persistent_mode = dp_size <= 1 and not (
             self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
         )
         if not use_persistent_mode:

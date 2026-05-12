@@ -22,7 +22,6 @@ from atom.plugin.attention import (
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import (
-    block_table_convert_triton,
     kv_indices_generate_triton,
 )
 from atom.utils.forward_context import AttentionMetaData, Context

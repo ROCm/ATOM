@@ -89,7 +89,7 @@ def _setup_ca_comm_signal(adapter: Any, tensor_model_parallel_size: int) -> None
     ca_comm.register_input_buffer(signal)
 
 
-def init_aiter_tp_from_vllm(tensor_model_parallel_size: int) -> bool:
+def init_aiter_dist_from_vllm(tensor_model_parallel_size: int) -> bool:
     """
     Initialize aiter's TP group by reusing vLLM's TP and injecting aiter's ca_comm.
 
