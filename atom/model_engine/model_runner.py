@@ -1889,10 +1889,6 @@ class ModelRunner:
             return KVConnectorOutput(finished_sending=[], finished_recving=[])
         done_sending, done_recving = connector.get_finished()
 
-        # GPU memory fence for RDMA-written KV blocks — disabled for
-        # same-partition deployments.  See gpu_memory_fence() in
-        # atom/kv_transfer/disaggregation/utils.py for cross-partition use.
-
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
         )
