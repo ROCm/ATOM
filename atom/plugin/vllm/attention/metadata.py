@@ -6,9 +6,8 @@ from dataclasses import dataclass
 import torch
 
 from aiter import get_mla_metadata_v1
-from atom.plugin.prepare import is_vllm, is_sglang
 from atom.utils.block_convert import kv_indices_generate_triton
-from atom.utils.forward_context import Context, AttentionMetaData
+from atom.utils.forward_context import Context
 from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
 
 logger = logging.getLogger("atom")
@@ -62,7 +61,7 @@ class AiterFlashAttentionChunkPrefillMetadata:
 
 
 @dataclass
-class AiterFlashAttentionMetadataForPluginMode:
+class AiterMhaMetadataForVllm:
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
     # |---------- N-1 iteration --------|
     # |---------------- N iteration ---------------------|
@@ -87,6 +86,7 @@ class AiterFlashAttentionMetadataForPluginMode:
     num_prefill_tokens: int
     num_extends: int
     num_extend_tokens: int
+    dropout_p: float = 0.0
 
     decode_metadata: Optional[AiterFlashAttentionDecodeMetadata] = None
     prefill_metadata: Optional[AiterFlashAttentionPrefillMetadata] = None
@@ -123,6 +123,16 @@ class AiterMLADecodeMetadataForPluginMode(AiterMLACommonDecodeMetadataForPluginM
     attn_out_dtype: torch.dtype = torch.bfloat16
     # The max query output length: int
     max_qo_len: int | None = None
+
+
+@dataclass
+class AiterMLAPersistentMetadataForVllm:
+    work_meta_data: torch.Tensor
+    work_indptr: torch.Tensor
+    work_info_set: torch.Tensor
+    reduce_indptr: torch.Tensor
+    reduce_final_map: torch.Tensor
+    reduce_partial_map: torch.Tensor
 
 
 @dataclass
@@ -197,6 +207,7 @@ class AiterMLACommonMetadataForPluginMode(Generic[D]):
 
     decode: D | None = None
     prefill: AiterMLACommonPrefillMetadataForPluginMode | None = None
+    persistent_metadata: AiterMLAPersistentMetadataForVllm | None = None
 
     def __post_init__(self):
         pass
@@ -413,13 +424,7 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
             paged_kv_indptr_rest=paged_kv_indptr_rest,
         )
 
-        attn_metadata = AttentionMetaData(
-            max_seqlen_q=common_attn_metadata.max_query_len,
-            block_tables=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            plugin_metadata=attn_metadata_for_plugin_mode,
-        )
-        return attn_metadata
+        return attn_metadata_for_plugin_mode
 
 
 class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
@@ -657,12 +662,4 @@ class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
             common_attn_metadata,
             fast_build,
         )
-        return AttentionMetaData(
-            max_seqlen_q=common_attn_metadata.max_query_len,
-            block_tables=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            plugin_metadata=indexer_metadata,
-        )
-
-
-
+        return indexer_metadata

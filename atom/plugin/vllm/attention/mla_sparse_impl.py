@@ -119,10 +119,8 @@ def sparse_attn_indexer_plugin_mode(
     if layer_meta is None:
         return weights
 
-    # In plugin mode, plugin_metadata is vllmDeepseekV32IndexerMetadata from
-    # AiterMLASparseIndexerMetadataBuilder.
-    plugin_meta = layer_meta.plugin_metadata
-    indexer_meta = plugin_meta
+    # vLLM sparse indexer builders return vllmDeepseekV32IndexerMetadata directly
+    indexer_meta = layer_meta
     slot_mapping = indexer_meta.slot_mapping
     has_decode = indexer_meta.num_decodes > 0
     has_prefill = indexer_meta.num_prefills > 0

@@ -18,7 +18,9 @@ from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 if TYPE_CHECKING:
-    from atom.utils.forward_context import AttentionMetaData
+    from atom.plugin.vllm.attention.metadata import (
+        AiterMhaMetadataForVllm,
+    )
 
 _QWEN_GLUON_PA_DECODE_BS = 64
 _NO_PS_FIXED_SPLITS = 64
@@ -151,7 +153,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         v: torch.Tensor,
         qkv: torch.Tensor,
         position: torch.Tensor,
-        attention_metadata: "AttentionMetaData",
+        attention_metadata: "AiterMhaMetadataForVllm",
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         k_scale: torch.Tensor,
@@ -329,7 +331,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         v_scale: torch.Tensor,
         num_decodes: int,
         out: torch.Tensor,
-        attn_metadata: "AttentionMetaData",
+        attn_metadata: "AiterMhaMetadataForVllm",
         ps: bool = True,
     ):
         # q.shape[0] == num_decodes * max_query_len for MTP (one row per decode
@@ -340,12 +342,12 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # the max_qlen multiplier — mirroring server-mode `paged_attention_triton`.
         _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-        decode_metadata = attn_metadata.plugin_metadata.decode_metadata
+        decode_metadata = attn_metadata.decode_metadata
         max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
         assert num_q_heads_total % num_kv_heads == 0
 
-        seq_lens = attn_metadata.plugin_metadata.seq_lens[:num_decodes]
-        block_tables = attn_metadata.plugin_metadata.block_table[:num_decodes]
+        seq_lens = attn_metadata.seq_lens[:num_decodes]
+        block_tables = attn_metadata.block_table[:num_decodes]
 
         query_group_size = max_qlen * (num_q_heads_total // num_kv_heads)
         context_partition_size = 256
@@ -427,10 +429,10 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         v_scale: torch.Tensor,
         num_decodes: int,
         num_decode_tokens: int,
-        attn_metadata: "AttentionMetaData",
+        attn_metadata: "AiterMhaMetadataForVllm",
         out: torch.Tensor,
     ):
-        decode_metadata = attn_metadata.plugin_metadata.decode_metadata
+        decode_metadata = attn_metadata.decode_metadata
         max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
         qo_indptr = (
             decode_metadata.query_start_loc if decode_metadata is not None else None
@@ -439,11 +441,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             Q=q,
             K=k_cache,
             V=v_cache,
-            block_tables=attn_metadata.plugin_metadata.block_table[:num_decodes],
-            context_lens=attn_metadata.plugin_metadata.seq_lens[:num_decodes],
-            block_tables_stride0=attn_metadata.plugin_metadata.block_table[
-                :num_decodes
-            ].stride(0),
+            block_tables=attn_metadata.block_table[:num_decodes],
+            context_lens=attn_metadata.seq_lens[:num_decodes],
+            block_tables_stride0=attn_metadata.block_table[:num_decodes].stride(0),
             max_qlen=max_qlen,
             K_QScale=k_scale,
             V_QScale=v_scale,
@@ -456,7 +456,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
     def extend_for_sliding_window(
         self,
-        attn_metadata: "AttentionMetaData",
+        attn_metadata: "AiterMhaMetadataForVllm",
         query: torch.Tensor,
         key_cache,
         value_cache,
@@ -467,14 +467,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         k_scale: Optional[torch.Tensor],
         v_scale: Optional[torch.Tensor],
     ):
-        assert attn_metadata.plugin_metadata.extend_metadata is not None
-        assert (
-            attn_metadata.plugin_metadata.extend_metadata.chunk_context_metadata
-            is not None
-        )
-        chunked_metadata = (
-            attn_metadata.plugin_metadata.extend_metadata.chunk_context_metadata
-        )
+        assert attn_metadata.extend_metadata is not None
+        assert attn_metadata.extend_metadata.chunk_context_metadata is not None
+        chunked_metadata = attn_metadata.extend_metadata.chunk_context_metadata
         swa_metadata = chunked_metadata.swa_metadata
         assert swa_metadata is not None
         swa_cu_seqlens = swa_metadata.swa_cu_seqlens
@@ -530,7 +525,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
     def extend_forward(
         self,
-        attn_metadata: "AttentionMetaData",
+        attn_metadata: "AiterMhaMetadataForVllm",
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -578,10 +573,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             alibi_slopes=self.alibi_slopes,
             return_lse=True,
         )
-        assert attn_metadata.plugin_metadata.extend_metadata is not None
-        chunk_context_metadata = (
-            attn_metadata.plugin_metadata.extend_metadata.chunk_context_metadata
-        )
+        assert attn_metadata.extend_metadata is not None
+        chunk_context_metadata = attn_metadata.extend_metadata.chunk_context_metadata
         num_chunks = chunk_context_metadata.num_chunks
         workspace = chunk_context_metadata.workspace
         cu_seqlens_kv = chunk_context_metadata.cu_seq_lens_chunk
@@ -665,7 +658,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: "AttentionMetaData" = None,
+        attn_metadata: "AiterMhaMetadataForVllm" = None,
         position: torch.Tensor = None,
         q_scale: torch.Tensor = None,
         qkv: torch.Tensor = None,
@@ -702,7 +695,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         value = value.view(-1, self.num_kv_heads, self.head_dim)
         output = output.view(-1, self.num_heads, self.head_dim)
 
-        num_actual_tokens = attn_metadata.plugin_metadata.num_actual_tokens
+        num_actual_tokens = attn_metadata.num_actual_tokens
         k_cache, v_cache = kv_cache.unbind(0)
         num_blocks, block_size, num_kv_heads, _ = k_cache.shape
 
@@ -758,12 +751,12 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         )
         query, key, value, k_cache, v_cache, k_scale, v_scale = result
 
-        num_decodes = attn_metadata.plugin_metadata.num_decodes
-        num_prefills = attn_metadata.plugin_metadata.num_prefills
-        num_extends = attn_metadata.plugin_metadata.num_extends
+        num_decodes = attn_metadata.num_decodes
+        num_prefills = attn_metadata.num_prefills
+        num_extends = attn_metadata.num_extends
 
-        num_decode_tokens = attn_metadata.plugin_metadata.num_decode_tokens
-        num_extend_tokens = attn_metadata.plugin_metadata.num_extend_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_extend_tokens = attn_metadata.num_extend_tokens
 
         num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
         x = 16 // k_cache.element_size()
@@ -775,7 +768,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         )
         # calculate for prefills
         if num_prefills > 0:
-            assert attn_metadata.plugin_metadata.prefill_metadata is not None
+            assert attn_metadata.prefill_metadata is not None
 
             # prefill part is after decode and extend
             prefill_query = query[num_decode_tokens + num_extend_tokens :]
@@ -792,10 +785,10 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 q=prefill_query,
                 k=prefill_key,
                 v=prefill_value,
-                cu_seqlens_q=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.plugin_metadata.prefill_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.plugin_metadata.prefill_metadata.max_seq_len,
+                cu_seqlens_q=attn_metadata.prefill_metadata.query_start_loc,
+                cu_seqlens_k=attn_metadata.prefill_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.prefill_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.prefill_metadata.max_seq_len,
                 min_seqlen_q=1,
                 dropout_p=attn_metadata.dropout_p,
                 softmax_scale=self.scale,
@@ -808,7 +801,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
         # calculate for extends
         if num_extends > 0:
-            assert attn_metadata.plugin_metadata.extend_metadata is not None
+            assert attn_metadata.extend_metadata is not None
             extend_tokens_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_extend_tokens
             )
@@ -817,12 +810,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             extend_keys = key[extend_tokens_slice]
             extend_values = value[extend_tokens_slice]
             extend_outputs = output[extend_tokens_slice]
-            extend_block_table = attn_metadata.plugin_metadata.block_table[
-                extend_reqs_slice
-            ]
-            extend_slot_mapping = attn_metadata.plugin_metadata.slot_mapping[
-                extend_tokens_slice
-            ]
+            extend_block_table = attn_metadata.block_table[extend_reqs_slice]
+            extend_slot_mapping = attn_metadata.slot_mapping[extend_tokens_slice]
             self.extend_forward(
                 attn_metadata=attn_metadata,
                 query=extend_querys,
@@ -831,9 +820,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 key_cache=new_key_cache,
                 value_cache=new_value_cache,
                 output=extend_outputs,
-                cu_seqlens_q=attn_metadata.plugin_metadata.extend_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.plugin_metadata.extend_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.plugin_metadata.extend_metadata.max_seq_len,
+                cu_seqlens_q=attn_metadata.extend_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.extend_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.extend_metadata.max_seq_len,
                 min_seqlen_q=1,
                 block_table=extend_block_table,
                 slot_mapping=extend_slot_mapping,
@@ -843,7 +832,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
         # calculate for decodes
         if num_decodes > 0:
-            assert attn_metadata.plugin_metadata.decode_metadata is not None
+            assert attn_metadata.decode_metadata is not None
 
             if self.use_triton_attn:
                 self.paged_attention_triton(

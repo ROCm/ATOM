@@ -7,18 +7,19 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import kv_indices_generate_triton
-from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils.forward_context import Context
 from atom.plugin.vllm.attention.metadata import (
     _CP_TOKENS_PER_ITER_ROCM,
     AiterChunkContextMetadata,
     AiterChunkSlidingWindowMetadata,
     AiterFlashAttentionChunkPrefillMetadata,
     AiterFlashAttentionDecodeMetadata,
-    AiterFlashAttentionMetadataForPluginMode,
     AiterFlashAttentionPrefillMetadata,
     AiterMLACommonMetadataForPluginMode,
     AiterMLACommonPrefillMetadataForPluginMode,
     AiterMLADecodeMetadataForPluginMode,
+    AiterMLAPersistentMetadataForVllm,
+    AiterMhaMetadataForVllm,
 )
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
@@ -346,7 +347,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             graph_bs=context_graph_bs,
         )
 
-        attn_metadata_for_plugin_mode = AiterFlashAttentionMetadataForPluginMode(
+        attn_metadata = AiterMhaMetadataForVllm(
             num_actual_tokens=num_actual_tokens,
             num_actual_kv_tokens=num_actual_kv_tokens,
             max_query_len=common_attn_metadata.max_query_len,
@@ -361,6 +362,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             num_extends=num_extends,
             num_extend_tokens=num_extend_tokens,
+            dropout_p=0.0,
             decode_metadata=decode_metadata,
             prefill_metadata=prefill_metadata,
             extend_metadata=extend_metadata,
@@ -368,13 +370,6 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             common_prefix_len=common_prefix_len,
             total_tokens=self.total_tokens,
             context=context,
-        )
-
-        attn_metadata = AttentionMetaData(
-            max_seqlen_q=common_attn_metadata.max_query_len,
-            block_tables=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            plugin_metadata=attn_metadata_for_plugin_mode,
         )
 
         return attn_metadata
@@ -959,16 +954,12 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         )
 
         # TODO: support mtp
-        ctx_mla_ps = self.mla_persistent_metadata
-
-        attn_metadata = AttentionMetaData(
-            max_seqlen_q=common_attn_metadata.max_query_len,
-            block_tables=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            plugin_metadata=attn_metadata_for_plugin_mode,
-            **ctx_mla_ps,
+        persistent_metadata = AiterMLAPersistentMetadataForVllm(
+            **self.mla_persistent_metadata
         )
-        return attn_metadata
+
+        attn_metadata_for_plugin_mode.persistent_metadata = persistent_metadata
+        return attn_metadata_for_plugin_mode
 
 
 class AiterMhaBackendForVllm:

@@ -292,8 +292,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         dcp_world_size,
     ):
         assert k_scale is None, "DCP not support scaled kvcache now."
-        assert attn_metadata.plugin_metadata.prefill is not None
-        prefill_metadata = attn_metadata.plugin_metadata.prefill
+        assert attn_metadata.prefill is not None
+        prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.chunked_context is not None
         assert prefill_metadata.chunked_context.padded_local_chunk_seq_lens is not None
         assert prefill_metadata.chunked_context.local_context_lens_allranks is not None
@@ -318,7 +318,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
                     i
                 ],
-                batch_size=attn_metadata.plugin_metadata.num_prefills,
+                batch_size=attn_metadata.num_prefills,
                 seq_starts=prefill_metadata.chunked_context.starts[i],
             )
             # workspace
@@ -398,8 +398,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         attn_metadata,
         k_scale,
     ):
-        assert attn_metadata.plugin_metadata.prefill is not None
-        prefill_metadata = attn_metadata.plugin_metadata.prefill
+        assert attn_metadata.prefill is not None
+        prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.chunked_context is not None
 
         output = None
@@ -469,11 +469,11 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         k_scale,
         output,
     ):
-        # TODO (zyongye): Prefill function hereplugin_metadata
-        assert attn_metadata.plugin_metadata.prefill is not None
+        # TODO (zyongye): Prefill function here.
+        assert attn_metadata.prefill is not None
         assert self.dcp_world_size != -1
 
-        has_context = attn_metadata.plugin_metadata.prefill.chunked_context is not None
+        has_context = attn_metadata.prefill.chunked_context is not None
 
         if use_triton_gemm():
             weight = self.kv_b_proj.weight
@@ -560,7 +560,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
         output_prefill = self._run_prefill_new_tokens_plugin_mode(
-            prefill=attn_metadata.plugin_metadata.prefill,
+            prefill=attn_metadata.prefill,
             q=q,
             k=k,
             v=v,
@@ -617,7 +617,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             B,
             self.padded_num_heads,
             self.kv_lora_rank,
-            dtype=attn_metadata.plugin_metadata.decode.attn_out_dtype,
+            dtype=attn_metadata.decode.attn_out_dtype,
             device=q.device,
         )
 
@@ -634,25 +634,27 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             reduce_final_map = None
             reduce_partial_map = None
         else:
-            work_meta_data = attn_metadata.work_meta_data
-            work_indptr = attn_metadata.work_indptr
-            work_info_set = attn_metadata.work_info_set
-            reduce_indptr = attn_metadata.reduce_indptr
-            reduce_final_map = attn_metadata.reduce_final_map
-            reduce_partial_map = attn_metadata.reduce_partial_map
+            persistent_metadata = attn_metadata.persistent_metadata
+            assert persistent_metadata is not None
+            work_meta_data = persistent_metadata.work_meta_data
+            work_indptr = persistent_metadata.work_indptr
+            work_info_set = persistent_metadata.work_info_set
+            reduce_indptr = persistent_metadata.reduce_indptr
+            reduce_final_map = persistent_metadata.reduce_final_map
+            reduce_partial_map = persistent_metadata.reduce_partial_map
 
-        paged_kv_indptr = attn_metadata.plugin_metadata.decode.paged_kv_indptr
-        paged_kv_indices = attn_metadata.plugin_metadata.decode.paged_kv_indices
+        paged_kv_indptr = attn_metadata.decode.paged_kv_indptr
+        paged_kv_indices = attn_metadata.decode.paged_kv_indices
 
         mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
-            attn_metadata.plugin_metadata.decode.qo_indptr,
+            attn_metadata.decode.qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
-            attn_metadata.plugin_metadata.decode.paged_kv_last_page_len,
-            attn_metadata.plugin_metadata.decode.max_qo_len,
+            attn_metadata.decode.paged_kv_last_page_len,
+            attn_metadata.decode.max_qo_len,
             sm_scale=self.scale,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
@@ -729,18 +731,18 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
-        num_actual_toks = attn_metadata.plugin_metadata.num_actual_tokens
+        num_actual_toks = attn_metadata.num_actual_tokens
 
         # Inputs and outputs may be padded for CUDA graphs
         assert (
-            attn_metadata.plugin_metadata.num_decodes is not None
-            and attn_metadata.plugin_metadata.num_prefills is not None
-            and attn_metadata.plugin_metadata.num_decode_tokens is not None
+            attn_metadata.num_decodes is not None
+            and attn_metadata.num_prefills is not None
+            and attn_metadata.num_decode_tokens is not None
         )
 
-        has_decode = attn_metadata.plugin_metadata.num_decodes > 0
-        has_prefill = attn_metadata.plugin_metadata.num_prefills > 0
-        num_decode_tokens = attn_metadata.plugin_metadata.num_decode_tokens
+        has_decode = attn_metadata.num_decodes > 0
+        has_prefill = attn_metadata.num_prefills > 0
+        num_decode_tokens = attn_metadata.num_decode_tokens
 
         positions = None
         if self._is_vllm_forward_context_available():
@@ -782,7 +784,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     k_c_normed,
                     self.rotary_emb_cos_sin_cache,
                     self.rotary_emb.is_neox_style,
-                    attn_metadata.plugin_metadata.slot_mapping,
+                    attn_metadata.slot_mapping,
                     kv_cache,
                     self.kv_cache_dtype,
                     self._k_scale,
@@ -794,7 +796,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         k_c_normed,
                         k_pe.squeeze(1),
                         kv_cache,
-                        attn_metadata.plugin_metadata.slot_mapping.flatten(),
+                        attn_metadata.slot_mapping.flatten(),
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=self._k_scale,
                     )
@@ -814,7 +816,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
 
         if has_decode:
-            assert attn_metadata.plugin_metadata.decode is not None
+            assert attn_metadata.decode is not None
 
             decode_q_nope, decode_q_pe = decode_q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -873,7 +875,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
                     ),
                     decode_q,
-                    attn_metadata.plugin_metadata.slot_mapping,
+                    attn_metadata.slot_mapping,
                     self._k_scale,
                     self._q_scale,
                     positions,
@@ -958,7 +960,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         topk_indices_global: torch.Tensor,  # [sq, topk]
         attn_metadata,
     ) -> torch.Tensor:
-        sparse_meta = attn_metadata.plugin_metadata
+        sparse_meta = attn_metadata
 
         num_tokens = q.shape[0]
         output = torch.empty(
@@ -1039,7 +1041,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         if self.dcp_world_size == -1:
             self.dcp_world_size = get_dcp_group().world_size
 
-        sparse_meta = attn_metadata.plugin_metadata
+        sparse_meta = attn_metadata
 
         num_actual_toks = sparse_meta.num_actual_tokens
 
@@ -1120,7 +1122,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
                 ),
                 q_out,
-                attn_metadata.slot_mapping,
+                sparse_meta.slot_mapping,
                 self._k_scale,
                 self._q_scale,
                 positions,
