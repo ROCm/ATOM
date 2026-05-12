@@ -8,13 +8,12 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_softplus
+from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_weight, shuffle_scale
-from aiter.utility import fp4_utils
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -859,51 +858,32 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale = None
             return
 
-        # quark method for moe, split it out?
-        elif self.quant_method == "quark":
-            shuffle_weights(layer.w13_weight, layer.w2_weight)
-            s0, s1, _ = layer.w13_weight_scale.shape
-            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-            w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
-            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+        # shuffle weight
+        layer.w13_weight.data = shuffle_weight(
+            layer.w13_weight,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=True,
+        )
+        layer.w2_weight.data = shuffle_weight(
+            layer.w2_weight,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=False,
+        )
+        layer.w13_weight.is_shuffled = True
+        layer.w2_weight.is_shuffled = True
 
-            s0, s1, _ = layer.w2_weight_scale.shape
-            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-            w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
-            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
-            return
-        else:
-            # shuffle weight
-            layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight,
-                is_guinterleave=self.is_guinterleave,
-                gate_up=True,
-            )
-            layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight,
-                is_guinterleave=self.is_guinterleave,
-                gate_up=False,
-            )
+        # shuffle scale
+        w13_scale_2d = layer.w13_weight_scale.reshape(
+            -1, layer.w13_weight_scale.shape[-1]
+        )
+        w2_scale_2d = layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1])
 
-            # shuffle scale
-            if self.is_guinterleave:
-                w13_scale_2d = layer.w13_weight_scale.view(
-                    -1, layer.w13_weight_scale.shape[-1]
-                )
-                w2_scale_2d = layer.w2_weight_scale.view(
-                    -1, layer.w2_weight_scale.shape[-1]
-                )
-            else:
-                w13_scale_2d = layer.w13_weight_scale.view(self.num_experts, -1)
-                w2_scale_2d = layer.w2_weight_scale.view(self.num_experts, -1)
-
-            shuffled_w13_scale = shuffle_scale(
-                w13_scale_2d, self.num_experts, self.is_guinterleave, True
-            )
-            shuffled_w2_scale = shuffle_scale(
-                w2_scale_2d, self.num_experts, self.is_guinterleave, False
-            )
-
+        shuffled_w13_scale = shuffle_scale(
+            w13_scale_2d, self.num_experts, self.is_guinterleave, True
+        )
+        shuffled_w2_scale = shuffle_scale(
+            w2_scale_2d, self.num_experts, self.is_guinterleave, False
+        )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
@@ -2664,13 +2644,14 @@ class FusedMoE(torch.nn.Module):
                 topk_weights = torch.empty(
                     tokens_num, top_k, dtype=torch.float32, device=router_logits.device
                 )
-                topk_softplus(
+                topk_gating(
                     topk_weights,
                     topk_ids,
                     router_logits,
                     e_score_correction_bias,
                     renormalize,
                     routed_scaling_factor,
+                    score_func="sqrtsoftplus",
                 )
             else:
                 raise ValueError(

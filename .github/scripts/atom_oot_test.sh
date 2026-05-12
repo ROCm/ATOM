@@ -46,22 +46,17 @@ RESULT_DIR=${RESULT_DIR:-/tmp/oot_accuracy_results}
 ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/oot_accuracy_output.txt}
 STREAM_VLLM_LOGS=${STREAM_VLLM_LOGS:-1}
 KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
+OOT_GPU_MEMORY_UTILIZATION=${OOT_GPU_MEMORY_UTILIZATION:-0.9}
 EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
 EXPLICIT_CLIENT_COMMAND=${OOT_CLIENT_COMMAND:-}
-OOT_GPU_MEMORY_UTILIZATION=${OOT_GPU_MEMORY_UTILIZATION:-0.9}
 OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LAST_VLLM_LOG_LINE=0
 
 if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
   echo "Invalid LM_EVAL_NUM_FEWSHOT: ${LM_EVAL_NUM_FEWSHOT}. Expected a non-negative integer."
-  exit 2
-fi
-
-if ! [[ "${OOT_GPU_MEMORY_UTILIZATION}" =~ ^[0-9]*\.?[0-9]+$ ]]; then
-  echo "Invalid OOT_GPU_MEMORY_UTILIZATION: ${OOT_GPU_MEMORY_UTILIZATION}. Expected a numeric value."
   exit 2
 fi
 
@@ -86,14 +81,6 @@ resolve_model_path() {
   else
     echo "${model_path}"
   fi
-}
-
-# gpt-oss OpenAI weights require Chat Completions (messages); local-completions sends "prompt" and vLLM returns 400.
-is_gpt_oss_model() {
-  local name_lc path_lc
-  name_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  path_lc="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
-  [[ "${name_lc}" == *gpt-oss* || "${path_lc}" == *gpt-oss* ]]
 }
 
 emit_new_vllm_logs() {
@@ -186,7 +173,6 @@ PY
   echo "Model name: ${model_name}"
   echo "Model path: ${resolved_model_path}"
   echo "Extra args: ${extra_args}"
-  echo "GPU memory utilization: ${OOT_GPU_MEMORY_UTILIZATION}"
 
   export SAFETENSORS_FAST_GPU=1
   export VLLM_RPC_TIMEOUT=1800000
@@ -213,7 +199,6 @@ PY
     --trust-remote-code \
     --kv-cache-dtype fp8 \
     "${extra_arg_array[@]}" \
-    --gpu-memory-utilization "${OOT_GPU_MEMORY_UTILIZATION}" \
     --no-enable-prefix-caching \
     > "${VLLM_LOG_FILE}" 2>&1 &
   echo $! > "${VLLM_PID_FILE}"
@@ -247,6 +232,10 @@ accuracy_one_model() {
   echo "========== Running OOT gsm8k accuracy =========="
   echo "Model name: ${model_name}"
   echo "Few-shot count: ${LM_EVAL_NUM_FEWSHOT}"
+
+  if [[ "${client_command}" == "null" ]]; then
+    client_command=""
+  fi
 
   if [[ -n "${client_command}" ]]; then
     local -a client_command_args=()
@@ -298,29 +287,16 @@ PY
     echo "Using custom lm-eval command from client_command: ${client_command}"
     "${client_command_args[@]}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
   else
+    echo "Using default lm-eval command."
     local lm_args=(
       --model_args
       model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
     )
-    if is_gpt_oss_model "${model_name}" "${model_path}"; then
-      echo "Using chat completions + apply_chat_template for gpt-oss (OpenAI-compatible messages API)."
-      lm_args=(
-        --model_args
-        model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/chat/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
-      )
-      lm_eval --model local-chat-completions \
-        --apply_chat_template \
-        "${lm_args[@]}" \
-        --tasks gsm8k \
-        --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
-        --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
-    else
-      lm_eval --model local-completions \
-        "${lm_args[@]}" \
-        --tasks gsm8k \
-        --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
-        --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
-    fi
+    lm_eval --model local-completions \
+      "${lm_args[@]}" \
+      --tasks gsm8k \
+      --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+      --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
   fi
 
   # lm-eval output layout differs across versions: output_path may be a file
