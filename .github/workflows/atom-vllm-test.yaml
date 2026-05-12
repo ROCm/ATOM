@@ -214,7 +214,7 @@ jobs:
             model_path: "openai/gpt-oss-120b"
             extra_args: "--tensor-parallel-size 1 --gpu-memory-utilization 0.5"
             client_command: "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}"
-            env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_MOE_GU_ITLV=1"
+            env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
             accuracy_test_threshold: 0.88
             runner: linux-atom-mi35x-1
           - display_name: "Kimi-K2-Thinking-MXFP4 TP4"
