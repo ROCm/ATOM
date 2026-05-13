@@ -90,9 +90,9 @@
     "env_vars": ""
   },
   {
-    "display": "MiniMax-M2.5",
-    "path": "MiniMaxAI/MiniMax-M2.5",
-    "prefix": "MiniMax-M2.5",
+    "display": "MiniMax-M2.7",
+    "path": "MiniMaxAI/MiniMax-M2.7",
+    "prefix": "MiniMax-M2.7",
     "args": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
     "bench_args": "",
     "suffix": "",
@@ -100,9 +100,9 @@
     "env_vars": ""
   },
   {
-    "display": "MiniMax-M2.5-MXFP4",
-    "path": "amd/MiniMax-M2.5-MXFP4",
-    "prefix": "MiniMax-M2.5-MXFP4",
+    "display": "MiniMax-M2.7-MXFP4",
+    "path": "amd/MiniMax-M2.7-MXFP4",
+    "prefix": "MiniMax-M2.7-MXFP4",
     "args": "--kv_cache_dtype fp8 -tp 1 --trust-remote-code",
     "bench_args": "",
     "suffix": "",
