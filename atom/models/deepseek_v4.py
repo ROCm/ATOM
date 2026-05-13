@@ -2486,89 +2486,15 @@ class ParallelHead(ParallelLMHead):
         return self.get_logits(norm(x))  # [bs, vocab]
 
 
-class MTPBlock(Block):
-    """MTP block: V4 dense block + e_proj/h_proj/enorm/hnorm + own hc_head params + LM head.
-
-    Port of inference/model.py:739-767. Subclass of Block reusing all HC + Attention + FFN
-    machinery; adds a token-embed projection (`e_proj`), a hidden-state projection
-    (`h_proj`), per-input RMSNorms, and its own `hc_head_fn/base/scale` parameters
-    for the final LM head reduction.
-
-    `embed` and `head` are assigned externally by `DeepseekV4Model` (shared with
-    the main model's embedding and LM head).
-    """
-
-    def __init__(self, layer_id: int, args: DeepseekV4Args, prefix: str = ""):
-        super().__init__(layer_id, args, prefix=prefix)
-        # e_proj / h_proj are FP8 on disk per index; ATOM Linear with V4QuantConfig
-        # picks per_1x128 automatically. nn.Linear at construction works for the
-        # toy/dummy path; for real-checkpoint loading, switch to ReplicatedLinear.
-        qc = args.quant_config
-        if qc is None:
-            self.e_proj = nn.Linear(args.dim, args.dim, bias=False)
-            self.h_proj = nn.Linear(args.dim, args.dim, bias=False)
-        else:
-            self.e_proj = ReplicatedLinear(
-                args.dim,
-                args.dim,
-                bias=False,
-                quant_config=qc,
-                prefix=f"{prefix}.e_proj",
-            )
-            self.h_proj = ReplicatedLinear(
-                args.dim,
-                args.dim,
-                bias=False,
-                quant_config=qc,
-                prefix=f"{prefix}.h_proj",
-            )
-        self.enorm = RMSNorm(args.dim, args.norm_eps)
-        self.hnorm = RMSNorm(args.dim, args.norm_eps)
-        self.norm = RMSNorm(args.dim, args.norm_eps)
-        # Per-MTP hc_head params (distinct from Block's hc_attn/hc_ffn params).
-        hc_mult = args.hc_mult
-        hc_dim = hc_mult * args.dim
-        self.hc_head_fn = atom_parameter(
-            torch.empty(hc_mult, hc_dim, dtype=torch.float32)
-        )
-        self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
-        self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
-        # Externally-assigned by DeepseekV4Model (shared with main model).
-        self.embed: Optional[nn.Module] = None
-        self.head: Optional[ParallelHead] = None
-
-    def forward(
-        self,
-        x: torch.Tensor,  # [num_tokens, hc, dim]  residual stream from main model
-        positions: torch.Tensor,  # [num_tokens] int  absolute positions
-        input_ids: torch.Tensor,  # [num_tokens] int
-    ) -> torch.Tensor:  # [bs, vocab]  last-token logits via self.head
-        assert (
-            self.embed is not None and self.head is not None
-        ), "MTPBlock requires .embed and .head to be assigned by the parent model"
-        e = self.enorm(self.embed(input_ids))  # [num_tokens, dim]
-        x = self.hnorm(x)  # [num_tokens, hc, dim]
-        # Mix token-embed + hidden into a fresh residual. e_proj output is
-        # [num_tokens, dim]; unsqueeze adds the hc axis so it broadcasts
-        # against h_proj(x) [num_tokens, hc, dim].
-        x = self.e_proj(e).unsqueeze(-2) + self.h_proj(x)  # [num_tokens, hc, dim]
-        x = super().forward(x, positions)  # [num_tokens, hc, dim]
-        return self.head(
-            x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
-        )
-
-
 @support_torch_compile
 class DeepseekV4Model(nn.Module):
     """Full model: embed -> expand to hc_mult copies -> N blocks -> hc_head -> logits.
 
-    Port of inference/model.py:Transformer (770-810). MTP blocks are constructed
-    and have their `.embed` and `.head` linked to the main model's, but they are
-    NOT called from the main forward path — PR5 will integrate them into ATOM's
-    EagleProposer via `self.mtp[k].forward(...)` from outside.
-
-    PR1 single-rank: uses plain `nn.Embedding` for `self.embed` (state_dict-compatible
-    with reference's `ParallelEmbedding` since both store a single `weight` parameter).
+    Port of inference/model.py:Transformer (770-810). MTP blocks live in the
+    EagleProposer wrapper (`atom.models.deepseek_v4_mtp.DeepseekV4MTP`), not
+    on this target. The ckpt's `mtp.*` weights are filtered out at
+    `loader.load_model(spec_decode=False)` via the auto-detected
+    `need_load_mtp` flag (target has no `mtp.*` params).
     """
 
     def __init__(
@@ -2613,14 +2539,6 @@ class DeepseekV4Model(nn.Module):
         self.norm = RMSNorm(args.dim, self.norm_eps)
         self.head = ParallelHead(args.vocab_size, args.dim, self.norm_eps, self.hc_eps)
 
-        # MTP blocks: constructed and linked, but only invoked externally (PR5).
-        self.mtp = nn.ModuleList()
-        for layer_id in range(args.n_mtp_layers):
-            blk = MTPBlock(args.n_layers + layer_id, args, prefix=f"mtp.{layer_id}")
-            blk.embed = self.embed
-            blk.head = self.head
-            self.mtp.append(blk)
-
         # Top-level hc_head params used to reduce the final hc_mult residual stack
         # before the LM head linear projection.
         hc_mult = args.hc_mult
@@ -2635,14 +2553,13 @@ class DeepseekV4Model(nn.Module):
         self,
         input_ids: torch.Tensor,  # [num_tokens] int  flat ragged-batch token ids
         positions: torch.Tensor,  # [num_tokens] int  abs positions (required)
-    ) -> (
-        torch.Tensor
-    ):  # [num_tokens, dim]  hidden_states (vocab head deferred to compute_logits)
+    ) -> torch.Tensor:  # [num_tokens, hc, dim]  pre-hc_head residual stream
         """Forward over `num_tokens` flat ragged-batch tokens.
 
-        Returns hidden_states `[num_tokens, dim]` — the vocab projection is
-        deferred to `compute_logits` to satisfy ATOM's CUDAGraph contract
-        (capture buffer is sized to hidden_size, not vocab).
+        Returns the mHC residual stack `[num_tokens, hc, dim]` BEFORE hc_head
+        reduction — `hc_head + RMSNorm + LM head` are all deferred to
+        `compute_logits`. Returning the hc-shaped residual lets the (future)
+        MTP draft consume it without re-expanding from a dim-reduced state.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         h = self.embed(input_ids)  # [num_tokens, dim]
@@ -2652,12 +2569,7 @@ class DeepseekV4Model(nn.Module):
         for layer in self.layers:
             h = layer(h, positions)  # [num_tokens, hc, dim]
 
-        # Reduce the mHC residual stack (hc_head + final RMSNorm); leave the
-        # vocab projection to compute_logits.
-        x_hc = self.head.hc_head(  # [num_tokens, dim]
-            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
-        )
-        return self.norm(x_hc)
+        return h
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -2700,7 +2612,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             "norm.weight": "model.norm.weight",
             "head.weight": "model.head.weight",
             "hc_head_": "model.hc_head_",
-            "mtp.": "model.mtp.",
         }
     )
     weights_mapping = {
@@ -2728,6 +2639,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         # this still works — base spec is QuantType.No.
         self.args.quant_config = make_v4_quant_config(self.hf_config)
         self.model = DeepseekV4Model(atom_config=config, args=self.args)
+        # Tell ModelRunner to size the CG outputs buffer as
+        # [max_num_batched_tokens, hc_mult, hidden_size] instead of the
+        # default [max_num_batched_tokens, hidden_size]. forward returns
+        # the un-reduced mHC residual stack [N, hc, dim].
+        self.extra_output_dims: tuple[int, ...] = (self.args.hc_mult,)
 
     def forward(
         self,
@@ -2746,12 +2662,21 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def compute_logits(
         self,
-        hidden_states: torch.Tensor,  # [num_tokens, dim]  post hc_head + final norm
+        hidden_states: torch.Tensor,  # [num_tokens, hc, dim]  pre-hc_head residual
     ) -> torch.Tensor:  # [bs, vocab]
-        # Vocab projection is split off from `model.forward` so the latter
-        # returns hidden_size-shaped tensors — required by ATOM's CUDAGraph
-        # capture contract (outputs buffer is sized to hidden_size, not vocab).
-        return self.model.head.get_logits(hidden_states)
+        # mHC reduce + final RMSNorm + LM head are all here so `model.forward`
+        # can return the un-reduced [N, hc, dim] residual stream — the future
+        # MTP draft consumes it directly without re-expanding from a dim-reduced
+        # state. CG output buffer is sized [N, hc, dim] in ModelRunner via the
+        # `extra_output_dims = (hc_mult,)` hook on this class.
+        x = self.model.head.hc_head(
+            hidden_states,
+            self.model.hc_head_fn,
+            self.model.hc_head_scale,
+            self.model.hc_head_base,
+        )
+        x = self.model.norm(x)
+        return self.model.head.get_logits(x)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Return (param_name, weight_name, expert_id, shard_id) tuples for FusedMoE.

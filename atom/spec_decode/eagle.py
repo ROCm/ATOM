@@ -18,6 +18,7 @@ logger = logging.getLogger("atom")
 
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
+    "DeepseekV4MTPModel": "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
     "MiMoV2FlashMTPModel": "atom.models.mimo_v2_flash_mtp.MiMoV2FlashMTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
@@ -259,6 +260,15 @@ class EagleProposer:
 
         # Resolve the base model (unwrap multimodal wrapper if present)
         target_base = getattr(target_model, "language_model", target_model)
+
+        # Model-specific share hook escape valve. Models whose embed/lm_head
+        # naming doesn't match the standard `model.embed_tokens` /
+        # `lm_head` convention (e.g. DeepSeek-V4 uses `model.embed` /
+        # `model.head`) implement `share_with_target(target_base)` to do
+        # their own setattr-rebinding and short-circuit the default path.
+        if hasattr(self.model, "share_with_target"):
+            self.model.share_with_target(target_base, loaded)
+            return
 
         # Share embed_tokens with the target model
         if (

@@ -737,7 +737,10 @@ class ModelRunner:
     def is_deepseek_v4(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        return self.hf_text_config.model_type == "deepseek_v4"
+        # `deepseek_v4_mtp` is the model_type the SpeculativeConfig stamps onto
+        # the draft hf_config when V4 is run with --method mtp. It must take the
+        # same V4-specific runner / builder paths as the target.
+        return self.hf_text_config.model_type in ("deepseek_v4", "deepseek_v4_mtp")
 
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -1082,8 +1085,15 @@ class ModelRunner:
             "top_ks": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "top_ps": CpuGpuBuffer(self.max_bs, **f32_kwargs),
             # Keep enough space for MTP decode (max_q_len > 1).
+            # `extra_output_dims` lets a model insert dims between N and dim
+            # (e.g. DeepSeek-V4 returns the un-reduced mHC residual
+            # [N, hc_mult, dim] from forward, with hc_head + LM head deferred
+            # to compute_logits). Default `()` keeps the standard 2D layout.
             "outputs": torch.empty(
-                self.max_num_batched_tokens, hidden_size, dtype=hidden_type
+                self.max_num_batched_tokens,
+                *getattr(self.model, "extra_output_dims", ()),
+                hidden_size,
+                dtype=hidden_type,
             ),
         }
         if hasattr(self, "drafter"):
