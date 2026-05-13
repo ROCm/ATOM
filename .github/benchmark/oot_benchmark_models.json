@@ -67,7 +67,7 @@
           "dashboard_model": "gpt-oss-120b-aw-tp2",
           "prefix": "gpt-oss-120b-aw-tp2",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 2 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
         },
         {
@@ -76,7 +76,7 @@
           "dashboard_model": "gpt-oss-120b-aw-tp8",
           "prefix": "gpt-oss-120b-aw-tp8",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
         }
       ]
