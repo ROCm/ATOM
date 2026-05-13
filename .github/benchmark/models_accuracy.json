@@ -288,5 +288,29 @@
     "accuracy_baseline": 0.9401,
     "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
     "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows MXFP4=0.9256, baseline=0.9401"
+  },
+  {
+    "model_name": "MiMo-V2-Flash",
+    "model_path": "XiaomiMiMo/MiMo-V2-Flash",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code --gpu-memory-utilization 0.8",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.81,
+    "accuracy_baseline": 0.8294,
+    "accuracy_baseline_model": "XiaomiMiMo/MiMo-V2-Flash",
+    "_baseline_note": "CI measured GSM8K 5-shot flexible-extract = 0.8294 (±0.0104) under MTP1 greedy decoding (see MiMo-V2-Flash MTP entry); base-only number is identical because MTP only proposes speculative drafts that the target verifies. tp pinned to 4 to match the MTP entry's setup (no separate base measurement)."
+  },
+  {
+    "model_name": "MiMo-V2-Flash MTP",
+    "model_path": "XiaomiMiMo/MiMo-V2-Flash",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code --gpu-memory-utilization 0.8 --method mtp --num-speculative-tokens 1",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.81,
+    "accuracy_baseline": 0.8294,
+    "accuracy_baseline_model": "XiaomiMiMo/MiMo-V2-Flash",
+    "_baseline_note": "CI measured GSM8K 5-shot flexible-extract = 0.8294 (±0.0104) on FP8 KV + MTP1. tp MUST be 4 and num-speculative-tokens MUST be 1: ATOM only constructs MTP layer 0 (matches vLLM _MIMO_V2_FLASH_NUM_MTP_LAYERS=1); driving more spec tokens would route through layers 1/2 whose KV is never populated and accept rate craters."
   }
 ]
