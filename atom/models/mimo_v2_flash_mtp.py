@@ -11,7 +11,7 @@ from atom.config import Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import ReplicatedLinear
-from atom.models.utils import IntermediateTensors, maybe_prefix
+from atom.models.utils import IntermediateTensors, ckpt_has_tensor_suffix, maybe_prefix
 from atom.utils.decorators import support_torch_compile
 
 from .mimo_v2_flash import MiMoV2Attention, MiMoV2MLP
@@ -220,6 +220,40 @@ class MiMoV2FlashMTP(nn.Module):
         super().__init__()
         self.config = atom_config.hf_config
         self._draft_hf_config = atom_config.speculative_config.draft_model_hf_config
+        num_spec = atom_config.speculative_config.num_speculative_tokens
+        assert num_spec == 1, (
+            f"MiMo-V2-Flash MTP only supports --num-speculative-tokens=1 now "
+            f"(got {num_spec})."
+        )
+
+        # See deepseek_mtp.DeepSeekMTP for the full rationale: MTP eh_proj is
+        # commonly stored as BF16 with no weight_scale even when the model's
+        # global quant_config is FP8/MXFP4. Skip quantization for eh_proj only
+        # when the checkpoint actually has no scale tensor for it.
+        if atom_config.quant_config is not None and not ckpt_has_tensor_suffix(
+            atom_config.model, "eh_proj.weight_scale"
+        ):
+            atom_config.quant_config.apply_default_exclude_layers(["*.eh_proj"])
+        # MiMo additionally keeps every self_attn.o_proj as BF16. Its HF
+        # `ignored_layers` covers all 48 base-model o_proj entries but
+        # forgets the MTP-layer ones (model.mtp.layers.0..2.self_attn.o_proj).
+        # Without this exclude, MTP o_proj falls back to the global FP8 spec,
+        # weight_scale stays at torch.empty junk memory, and accept rate
+        # collapses — same corruption chain as the eh_proj case above.
+        # Detect from disk: if the ckpt has no o_proj.weight_scale[_inv] for
+        # any layer, exclude *.self_attn.o_proj globally (HF entries dedup).
+        if (
+            atom_config.quant_config is not None
+            and not ckpt_has_tensor_suffix(
+                atom_config.model, "self_attn.o_proj.weight_scale_inv"
+            )
+            and not ckpt_has_tensor_suffix(
+                atom_config.model, "self_attn.o_proj.weight_scale"
+            )
+        ):
+            atom_config.quant_config.apply_default_exclude_layers(
+                ["*.self_attn.o_proj"]
+            )
 
         self.model = MiMoV2FlashMultiTokenPredictor(
             atom_config=atom_config, prefix=maybe_prefix(prefix, "model")
