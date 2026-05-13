@@ -248,6 +248,8 @@ class MiniMaxM2Attention(nn.Module):
                 k = (k * torch.rsqrt(k_var + self.rms_norm_eps) * self.k_norm.weight).to(
                     orig_dtype
                 )
+        else:
+            q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         attn_output = self.attn(
             query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
