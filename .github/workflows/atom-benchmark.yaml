@@ -507,8 +507,34 @@ jobs:
           DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
           MODEL_MOUNT=""
           [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
+          IB_FLAG=""
+          [ -e "/dev/infiniband" ] && IB_FLAG="--device=/dev/infiniband"
 
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          # NIC detection for RDMA userspace libs (ported from mori)
+          NIC_MOUNTS=""
+          NIC_TYPE="mlx5"
+          if [ -d /sys/class/infiniband ]; then
+            for dev in /sys/class/infiniband/*; do
+              name=$(basename "$dev")
+              case "$name" in bnxt_re*) NIC_TYPE="bnxt"; break ;; ionic*) NIC_TYPE="ionic"; break ;; esac
+            done
+          fi
+          if [ "$NIC_TYPE" = "bnxt" ]; then
+            for c in /usr/lib64/libibverbs.so.1 /lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so.1; do
+              resolved=$(readlink -f "$c" 2>/dev/null || true)
+              if [ -f "$resolved" ]; then NIC_MOUNTS="$NIC_MOUNTS -v $resolved:/lib/x86_64-linux-gnu/libibverbs.so.1"; break; fi
+            done
+            for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
+              [ -f "$lib" ] && NIC_MOUNTS="$NIC_MOUNTS -v $lib:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename $lib)"
+            done
+            for lib in /usr/local/lib/libbnxt_re.so; do
+              [ -f "$lib" ] && NIC_MOUNTS="$NIC_MOUNTS -v $lib:/usr/lib/x86_64-linux-gnu/$(basename $lib)"
+            done
+            [ -d /etc/libibverbs.d ] && NIC_MOUNTS="$NIC_MOUNTS -v /etc/libibverbs.d:/etc/libibverbs.d:ro"
+          fi
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG $IB_FLAG \
+            $NIC_MOUNTS \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
             -w /workspace --ipc=host --group-add video \
             --shm-size=16G --privileged --cap-add=SYS_PTRACE \
@@ -539,6 +565,11 @@ jobs:
             docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-pd-prefill bash -lc \
               "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}" || exit 1
           fi
+
+      - name: Install PD dependencies (prefill node)
+        run: |
+          docker exec atom-pd-prefill bash -lc \
+            "pip install msgpack msgspec quart mooncake-transfer-engine"
 
       - name: Launch all PD components
         timeout-minutes: 60

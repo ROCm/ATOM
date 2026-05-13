@@ -42,6 +42,72 @@ DECODE_HOSTS_FILE="/tmp/atom_pd_decode_hosts"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes"
 
+# ── RDMA NIC detection (ported from mori/docker/ci_run.sh) ─────────
+
+detect_nic_type() {
+    if [[ -n "${MORI_NIC_TYPE:-}" ]]; then echo "$MORI_NIC_TYPE"; return; fi
+    local bnxt=0 mlx5=0 ionic=0
+    if [[ -d /sys/class/infiniband ]]; then
+        for dev in /sys/class/infiniband/*; do
+            local name; name=$(basename "$dev")
+            case "$name" in
+                bnxt_re*) ((bnxt++)) ;; mlx5*) ((mlx5++)) ;; ionic*) ((ionic++)) ;;
+                *)
+                    local drv; drv=$(basename "$(readlink -f "$dev/device/driver" 2>/dev/null)" 2>/dev/null || true)
+                    case "$drv" in bnxt*) ((bnxt++)) ;; mlx5*) ((mlx5++)) ;; ionic*) ((ionic++)) ;; esac ;;
+            esac
+        done
+    fi
+    if (( bnxt >= mlx5 && bnxt >= ionic && bnxt > 0 )); then echo "bnxt"
+    elif (( ionic >= mlx5 && ionic > 0 )); then echo "ionic"
+    else echo "mlx5"; fi
+}
+
+find_host_ibverbs() {
+    for c in /usr/lib64/libibverbs.so.1 /lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so.1; do
+        local resolved; resolved=$(readlink -f "$c" 2>/dev/null || true)
+        if [[ -f "$resolved" ]]; then echo "$resolved"; return; fi
+    done
+}
+
+nic_mount_flags() {
+    local nic_type="$1" flags=()
+    case "$nic_type" in
+        bnxt)
+            local hib; hib=$(find_host_ibverbs)
+            [[ -n "$hib" ]] && flags+=(-v "$hib:/lib/x86_64-linux-gnu/libibverbs.so.1")
+            for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
+                [[ -f "$lib" ]] && flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename "$lib")")
+            done
+            for lib in /usr/local/lib/libbnxt_re.so; do
+                [[ -f "$lib" ]] && flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
+            done
+            [[ -d /etc/libibverbs.d ]] && flags+=(-v /etc/libibverbs.d:/etc/libibverbs.d:ro)
+            ;;
+        ionic)
+            local hib; hib=$(find_host_ibverbs)
+            [[ -n "$hib" ]] && flags+=(-v "$hib:/lib/x86_64-linux-gnu/libibverbs.so.1")
+            for dir in /usr/local/lib /usr/lib/x86_64-linux-gnu; do
+                for lib in "$dir"/libionic*.so; do
+                    if [[ -f "$lib" ]]; then
+                        local real; real=$(readlink -f "$lib")
+                        [[ -f "$real" ]] && flags+=(-v "$real:$real")
+                        flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
+                    fi
+                done
+            done
+            local pdir=/usr/lib/x86_64-linux-gnu/libibverbs
+            if [[ -d "$pdir" ]]; then
+                for lib in "$pdir"/libionic-rdmav*.so; do
+                    [[ -f "$lib" ]] && flags+=(-v "$lib:$lib")
+                done
+            fi
+            [[ -d /etc/libibverbs.d ]] && flags+=(-v /etc/libibverbs.d:/etc/libibverbs.d:ro)
+            ;;
+    esac
+    echo "${flags[@]}"
+}
+
 # ── Node discovery ──────────────────────────────────────────────────
 
 get_local_hostname() {
@@ -209,8 +275,34 @@ fi
 DEVICE_FLAG=\$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
 MODEL_MOUNT=""
 [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
+IB_FLAG=""
+[ -e "/dev/infiniband" ] && IB_FLAG="--device=/dev/infiniband"
 
-docker run -dt --device=/dev/kfd \$DEVICE_FLAG \
+# NIC detection for RDMA userspace libs (ported from mori)
+NIC_MOUNTS=""
+NIC_TYPE="mlx5"
+if [ -d /sys/class/infiniband ]; then
+    for dev in /sys/class/infiniband/*; do
+        name=\$(basename "\$dev")
+        case "\$name" in bnxt_re*) NIC_TYPE="bnxt"; break ;; ionic*) NIC_TYPE="ionic"; break ;; esac
+    done
+fi
+if [ "\$NIC_TYPE" = "bnxt" ]; then
+    for c in /usr/lib64/libibverbs.so.1 /lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so.1; do
+        resolved=\$(readlink -f "\$c" 2>/dev/null || true)
+        if [ -f "\$resolved" ]; then NIC_MOUNTS="\$NIC_MOUNTS -v \$resolved:/lib/x86_64-linux-gnu/libibverbs.so.1"; break; fi
+    done
+    for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
+        [ -f "\$lib" ] && NIC_MOUNTS="\$NIC_MOUNTS -v \$lib:/usr/lib/x86_64-linux-gnu/libibverbs/\$(basename \$lib)"
+    done
+    for lib in /usr/local/lib/libbnxt_re.so; do
+        [ -f "\$lib" ] && NIC_MOUNTS="\$NIC_MOUNTS -v \$lib:/usr/lib/x86_64-linux-gnu/\$(basename \$lib)"
+    done
+    [ -d /etc/libibverbs.d ] && NIC_MOUNTS="\$NIC_MOUNTS -v /etc/libibverbs.d:/etc/libibverbs.d:ro"
+fi
+
+docker run -dt --device=/dev/kfd \$DEVICE_FLAG \$IB_FLAG \
+    \$NIC_MOUNTS \
     \$MODEL_MOUNT \
     -w /workspace --ipc=host --group-add video \
     --shm-size=16G --privileged --cap-add=SYS_PTRACE \
@@ -229,6 +321,9 @@ if [ -d "/models" ]; then
 fi
 
 docker exec ${container_name} bash -lc "rm -rf ~/.cache/atom/*"
+
+docker exec ${container_name} bash -lc \
+    "pip install msgpack msgspec quart mooncake-transfer-engine"
 
 docker exec -d ${container_name} bash -lc "
     ATOM_DISABLE_MMAP=true \\
