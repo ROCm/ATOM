@@ -27,6 +27,13 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
         config: Qwen3NextConfig = atom_config.hf_config
 
         self.config = config
+        # Qwen3NextDecoderLayer's MoE block needs these attributes, which
+        # Qwen3NextModel.__init__ sets but which are absent from the raw
+        # HF config.  Set them here so the MTP predictor works standalone.
+        if not hasattr(config, "n_shared_experts"):
+            config.n_shared_experts = 1
+        if not hasattr(config, "n_routed_experts"):
+            config.n_routed_experts = config.num_experts
 
         self.vocab_size = config.vocab_size
 
@@ -38,6 +45,10 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             config.hidden_size,
         )
 
+        # Pass the layer's HF-style prefix so the quant_config exclude list
+        # (which contains "mtp.fc" in Qwen3-Next FP8 checkpoints) is honored;
+        # without it the lookup uses "" and falls back to the global FP8 spec,
+        # which makes fc FP8 even though the source weight is BF16.
         self.fc = ColumnParallelLinear(
             self.config.hidden_size * 2,
             self.config.hidden_size,
@@ -46,16 +57,18 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
 
+        # Use 0-indexed prefix (matches checkpoint's mtp.layers.0.* weight
+        # names and vLLM's reference impl), but keep layer_num as the
+        # absolute index so the attention layer gets a KV cache slot that
+        # doesn't collide with the target model's layers.
         self.layers = torch.nn.ModuleList(
             Qwen3NextDecoderLayer(
                 atom_config,
                 layer_type="full_attention",
                 prefix=f"{prefix}.layers.{idx}",
-                layer_num=idx,
+                layer_num=self.mtp_start_layer_idx + idx,
             )
-            for idx in range(
-                self.mtp_start_layer_idx, self.mtp_start_layer_idx + self.num_mtp_layers
-            )
+            for idx in range(self.num_mtp_layers)
         )
 
         self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -131,6 +144,10 @@ class Qwen3NextMTP(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         config = atom_config.hf_config
+        if not hasattr(config, "n_shared_experts"):
+            config.n_shared_experts = 1
+        if not hasattr(config, "n_routed_experts"):
+            config.n_routed_experts = config.num_experts
         if atom_config.enable_prefix_caching:
             raise ValueError("Qwen3NextMTP currently does not support prefix caching")
         self.config = config
@@ -171,9 +188,19 @@ class Qwen3NextMTP(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        # Mirror target's get_expert_mapping: when shared-expert fusion is on,
+        # the loader rewrites `mlp.shared_expert.*` to `mlp.experts.{N}.*`
+        # (where N == n_routed_experts), so the expert_mapping must include
+        # an extra slot for that fused shared-expert. Without this, MTP's
+        # shared_expert weights get silently dropped during loading.
+        from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+
+        n_routed = getattr(self.config, "n_routed_experts", self.config.num_experts)
+        n_shared = getattr(self.config, "n_shared_experts", 0)
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=n_routed
+            + (n_shared if is_rocm_aiter_fusion_shared_expert_enabled() else 0),
         )

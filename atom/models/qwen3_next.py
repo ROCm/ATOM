@@ -279,6 +279,7 @@ class Qwen3NextAttention(nn.Module):
         atom_config,
         quant_config=None,
         prefix: str = "",
+        layer_num: int | None = None,
     ) -> None:
         super().__init__()
         if hasattr(atom_config.hf_config, "text_config"):
@@ -380,6 +381,15 @@ class Qwen3NextAttention(nn.Module):
                 k_norm=self.k_norm,
             )
 
+        # For MTP, the prefix is e.g. "mtp.layers.0.self_attn" so
+        # extract_layer_index(prefix) returns 0, which would collide with the
+        # target model's layer 0 KV cache slot. Allow callers (e.g.
+        # Qwen3NextDecoderLayer) to pass an explicit `layer_num` so MTP can
+        # use absolute indices (mtp_start_layer_idx + idx) and get its own
+        # KV cache slot.
+        attn_layer_num = (
+            layer_num if layer_num is not None else extract_layer_index(prefix)
+        )
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -388,7 +398,7 @@ class Qwen3NextAttention(nn.Module):
             kv_cache_dtype=atom_config.kv_cache_dtype,
             quant_config=quant_config,
             use_mla=False,
-            layer_num=extract_layer_index(prefix),
+            layer_num=attn_layer_num,
             config=atom_config,
             prefix=f"{prefix}",
             **fusion_kwargs,
@@ -486,6 +496,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.speculative_config = speculative_config
+        # When running as a vLLM plugin, Qwen3NextDecoderLayer instantiates
+        # this module without forwarding speculative_config. That left
+        # self.num_spec=0 even with MTP enabled, so get_state_shape() (the
+        # instance method vLLM's MambaBase.get_kv_cache_spec uses to size each
+        # layer's KV cache) allocated conv_state with only `kernel_size-1`
+        # token rows. During spec decode, causal_conv1d_update writes
+        # `kernel_size-1 + num_spec` rows per slot and the extra row spilled
+        # into the page-adjacent ssm_state, corrupting layer 0's recurrent
+        # state. Pull the spec config from the vLLM config as a fallback.
+        if is_vllm() and self.speculative_config is None:
+            vllm_spec_config = get_current_vllm_config().speculative_config
+            if vllm_spec_config is not None:
+                self.speculative_config = vllm_spec_config
         self.num_spec = (
             self.speculative_config.num_speculative_tokens
             if self.speculative_config
@@ -779,6 +802,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 atom_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
+                layer_num=layer_num,
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
@@ -863,7 +887,6 @@ class Qwen3NextDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-
         if self.input_layernorm.use_fused_quant:
             if residual is None:
                 residual = hidden_states
@@ -1059,6 +1082,11 @@ class Qwen3NextForCausalLM(nn.Module):
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
+        # Expose embed_tokens at this level for vLLM MTP embedding sharing.
+        # vLLM's proposer accesses target_wrapper.model.embed_tokens, where
+        # target_wrapper.model = this class (Qwen3NextForCausalLM).
+        self.embed_tokens = self.model.embed_tokens
+
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -1132,6 +1160,7 @@ if is_vllm():
                 if vllm_config.speculative_config
                 else 0
             )
+
             return MambaStateShapeCalculator.gated_delta_net_state_shape(
                 tp_size,
                 hf_config.linear_num_key_heads,
