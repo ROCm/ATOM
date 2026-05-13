@@ -3,20 +3,20 @@
 
 """Model-level DeepSeek MLA patching for SGLang plugin mode.
 
-This module owns the monkey-patch entrypoints that adapt DeepSeek MLA models to
-SGLang plugin mode. The heavy DeepSeek-specific forward and weight helpers live
-in `atom.plugin.sglang.models.deepseek_mla_forward`.
+This module owns the install-time hooks that adapt DeepSeek MLA models to
+SGLang plugin mode. The heavy DeepSeek-specific runtime helpers live in
+`atom.plugin.sglang.models.deepseek_mla_forward`.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import torch
-
+from atom.plugin.sglang.models.deepseek_mla_attention import (
+    SGLangDeepseekMLAAttention,
+)
 from atom.plugin.sglang.models.deepseek_mla_forward import (
     _patch_kv_b_proj_for_sglang_mxfp4,
-    forward_sgl_plugin_mode,
     init_sgl_attrs,
     process_mla_kv_b_proj_after_loading,
 )
@@ -58,20 +58,8 @@ def _patch_mla_attention_for_sglang(
     """Patch one DeepSeek MLA layer for SGLang plugin mode."""
     init_sgl_attrs(attn, config, kv_cache_dtype)
     _patch_kv_b_proj_for_sglang_mxfp4(attn)
-
-    def patched_forward(
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        from atom.plugin.sglang.models.base_model_wrapper import (
-            get_current_forward_batch,
-        )
-
-        kwargs["forward_batch"] = get_current_forward_batch()
-        return forward_sgl_plugin_mode(attn, positions, hidden_states, **kwargs)
-
-    attn.forward = patched_forward
+    if not isinstance(attn.mla_attn, SGLangDeepseekMLAAttention):
+        attn.mla_attn = SGLangDeepseekMLAAttention(attn, attn.mla_attn)
     attn.process_weights_after_loading = lambda: process_mla_kv_b_proj_after_loading(
         attn
     )
