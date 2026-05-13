@@ -17,7 +17,7 @@ from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
 from .deepseek_v2 import DeepseekV2DecoderLayer
-from .utils import maybe_prefix
+from .utils import ckpt_has_tensor_suffix, maybe_prefix
 
 
 class SharedHead(nn.Module):
@@ -176,6 +176,20 @@ class DeepSeekMTP(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         self.config = atom_config.hf_config
+
+        # Several MTP checkpoints (DeepSeek R1/V3/V3.2 FP8 + the Quark mixed
+        # MXFP4/FP8 variants) store eh_proj as BF16 with no weight_scale even
+        # though their HF quantization_config does not list eh_proj in the
+        # exclude set. Without this guard ReplicatedLinear is built with the
+        # global FP8/MXFP4 spec, the BF16 weight is cast into the FP8 slot
+        # against an uninitialized weight_scale, and MTP accept rate collapses.
+        # GLM-FP8 ckpts already list eh_proj explicitly (this becomes a no-op);
+        # GLM-5.1-MXFP4 truly quantizes eh_proj and ships weight_scale on disk
+        # so the check below leaves the global spec in effect.
+        if atom_config.quant_config is not None and not ckpt_has_tensor_suffix(
+            atom_config.model, "eh_proj.weight_scale"
+        ):
+            atom_config.quant_config.apply_default_exclude_layers(["*.eh_proj"])
 
         if hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None:
             self.packed_modules_mapping = {
