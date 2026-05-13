@@ -466,7 +466,7 @@ if [ "$TYPE" == "pick-nodes" ]; then
     echo ""
     echo "========== Node Assignment =========="
     echo "  Prefill: $(get_local_hostname) (${local_ip})"
-    local idx=0
+    idx=0
     while IFS= read -r dh; do
         [ -z "$dh" ] && continue
         dip=$(get_remote_ip "$dh")
@@ -495,7 +495,7 @@ if [ "$TYPE" == "launch-all" ]; then
     sleep 2
 
     # Launch consumer on each decode node (different port per node)
-    local idx=0
+    idx=0
     while IFS= read -r decode_host; do
         [ -z "$decode_host" ] && continue
         consumer_port=$((CONSUMER_BASE_PORT + idx))
@@ -614,7 +614,7 @@ if [ "$TYPE" == "dump-logs" ]; then
     echo ""
     echo "========== Producer Log =========="
     cat "$PRODUCER_LOG" 2>/dev/null || echo "(no producer log)"
-    local idx=0
+    idx=0
     while IFS= read -r decode_host; do
         [ -z "$decode_host" ] && continue
         container_name="atom-pd-consumer-${idx}"
