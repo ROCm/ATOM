@@ -102,6 +102,51 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
     ),
+    "ATOM_MTP_TAIL_CHEAP_DRAFT_MIN_COMPLETION_TOKENS": lambda: int(
+        os.getenv("ATOM_MTP_TAIL_CHEAP_DRAFT_MIN_COMPLETION_TOKENS", "0")
+    ),
+    "ATOM_MTP_TAIL_CHEAP_DRAFT_MODE": lambda: os.getenv(
+        "ATOM_MTP_TAIL_CHEAP_DRAFT_MODE", "repeat_next"
+    ),
+    "ATOM_MTP_BLIND_ACCEPT_NO_ARGMAX_MIN_COMPLETION_TOKENS": lambda: int(
+        os.getenv("ATOM_MTP_BLIND_ACCEPT_NO_ARGMAX_MIN_COMPLETION_TOKENS", "0")
+    ),
+    "ATOM_MTP_PARTIAL_BLIND_ACCEPT_NO_ARGMAX": lambda: (
+        os.getenv("ATOM_MTP_PARTIAL_BLIND_ACCEPT_NO_ARGMAX", "0") == "1"
+    ),
+    # Exact proposal reranking experiment. This only changes draft proposals;
+    # the target verifier still accepts/rejects normally.
+    "ATOM_MTP_DRAFT_TOPK_SELECT": lambda: (
+        os.getenv("ATOM_MTP_DRAFT_TOPK_SELECT", "0") == "1"
+    ),
+    "ATOM_MTP_DRAFT_TOPK_SELECT_K": lambda: int(
+        os.getenv("ATOM_MTP_DRAFT_TOPK_SELECT_K", "2")
+    ),
+    "ATOM_MTP_DRAFT_TOPK_SELECT_RANK": lambda: int(
+        os.getenv("ATOM_MTP_DRAFT_TOPK_SELECT_RANK", "2")
+    ),
+    "ATOM_MTP_DRAFT_TOPK_SELECT_GAP": lambda: float(
+        os.getenv("ATOM_MTP_DRAFT_TOPK_SELECT_GAP", "0.0")
+    ),
+    "ATOM_MTP_DRAFT_TOPK_SELECT_POSITIONS": lambda: os.getenv(
+        "ATOM_MTP_DRAFT_TOPK_SELECT_POSITIONS", ""
+    ),
+    # Opt-in exact TP decode fast path: for all-greedy speculative decode,
+    # compute distributed argmax token ids from local lm_head shards instead of
+    # all-gathering full vocab logits.
+    "ATOM_TP_GREEDY_ARGMAX_NO_GATHER": lambda: (
+        os.getenv("ATOM_TP_GREEDY_ARGMAX_NO_GATHER", "0") == "1"
+    ),
+    # --- MLA decode experiments ---
+    "ATOM_MLA_MAX_SPLIT_PER_BATCH": lambda: int(
+        os.getenv("ATOM_MLA_MAX_SPLIT_PER_BATCH", "16")
+    ),
+    "ATOM_MLA_DIRECT_STAGE1_REDUCE": lambda: (
+        os.getenv("ATOM_MLA_DIRECT_STAGE1_REDUCE", "0") == "1"
+    ),
+    "ATOM_MLA_DIRECT_STAGE1_REDUCE_MAX_BATCH": lambda: int(
+        os.getenv("ATOM_MLA_DIRECT_STAGE1_REDUCE_MAX_BATCH", "32")
+    ),
     # --- Gradient Control ---
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
     # is correct for inference; set to "1" only for training / fine-tuning.

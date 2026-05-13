@@ -190,3 +190,6 @@ class ParallelLMHead(VocabParallelEmbedding):
             # dist.gather(logits, all_logits, 0)
             # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
+
+    def forward_local(self, x: torch.Tensor):
+        return tgemm.mm(x, self.weight, self.bias)

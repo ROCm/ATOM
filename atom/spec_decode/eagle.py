@@ -9,7 +9,7 @@ from aiter import dtypes
 from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config, KVCacheTensor
 from atom.model_loader.loader import load_model
-from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
+from atom.utils import CpuGpuBuffer, envs, resolve_obj_by_qualname
 from atom.utils.forward_context import SpecDecodeMetadata, get_forward_context
 from torch.profiler import record_function
 
@@ -212,6 +212,79 @@ class EagleProposer:
         self.cu_num_draft_tokens = CpuGpuBuffer(max_bs, **i32_kwargs)
         self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
         self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
+        self.completion_token_counts = CpuGpuBuffer(max_bs, **i32_kwargs)
+        self.partial_blind_strict_row_mask = CpuGpuBuffer(
+            max_bs * self.mtp_k,
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+    def _try_tail_cheap_propose(
+        self,
+        *,
+        next_token_ids: torch.Tensor,
+        completion_token_counts: Optional[np.ndarray],
+    ) -> Optional[torch.Tensor]:
+        min_tokens = envs.ATOM_MTP_TAIL_CHEAP_DRAFT_MIN_COMPLETION_TOKENS
+        if min_tokens <= 0 or completion_token_counts is None:
+            return None
+        if next_token_ids.numel() == 0:
+            return None
+        counts = completion_token_counts[: next_token_ids.shape[0]]
+        if counts.shape[0] != next_token_ids.shape[0] or not np.all(counts >= min_tokens):
+            return None
+        mode = envs.ATOM_MTP_TAIL_CHEAP_DRAFT_MODE
+        if mode != "repeat_next":
+            raise ValueError(
+                "ATOM_MTP_TAIL_CHEAP_DRAFT_MODE must be repeat_next for this "
+                "C4 upstream replay patch"
+            )
+        return next_token_ids.view(-1, 1).expand(-1, self.mtp_k).contiguous()
+
+    @staticmethod
+    def _draft_topk_select_positions() -> Optional[set[int]]:
+        raw_positions = envs.ATOM_MTP_DRAFT_TOPK_SELECT_POSITIONS.strip()
+        if not raw_positions or raw_positions.lower() in ("*", "all"):
+            return None
+        positions: set[int] = set()
+        for raw_pos in raw_positions.split(","):
+            raw_pos = raw_pos.strip()
+            if not raw_pos:
+                continue
+            pos = int(raw_pos)
+            if pos <= 0:
+                raise ValueError(
+                    "ATOM_MTP_DRAFT_TOPK_SELECT_POSITIONS is 1-based and "
+                    f"received {pos}"
+                )
+            positions.add(pos)
+        return positions
+
+    def _select_draft_ids_from_logits(
+        self,
+        logits: torch.Tensor,
+        draft_step_idx: int,
+    ) -> torch.Tensor:
+        if not envs.ATOM_MTP_DRAFT_TOPK_SELECT:
+            return logits.argmax(dim=-1)
+
+        positions = self._draft_topk_select_positions()
+        draft_pos = draft_step_idx + 1
+        if positions is not None and draft_pos not in positions:
+            return logits.argmax(dim=-1)
+
+        rank = envs.ATOM_MTP_DRAFT_TOPK_SELECT_RANK
+        if rank <= 1:
+            return logits.argmax(dim=-1)
+
+        select_k = max(envs.ATOM_MTP_DRAFT_TOPK_SELECT_K, rank)
+        select_k = min(select_k, logits.shape[-1])
+        topk_vals, topk_ids = torch.topk(logits, select_k, dim=-1)
+        base_ids = topk_ids[:, 0]
+        alt_ids = topk_ids[:, rank - 1]
+        gap = topk_vals[:, 0] - topk_vals[:, rank - 1]
+        use_alt = gap <= envs.ATOM_MTP_DRAFT_TOPK_SELECT_GAP
+        return torch.where(use_alt, alt_ids, base_ids)
 
     @staticmethod
     def _share_if_not_loaded(
@@ -315,6 +388,7 @@ class EagleProposer:
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
         aux_hidden_states: Optional[list[torch.Tensor]] = None,
+        completion_token_counts: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
 
         forward_context = get_forward_context()
@@ -339,6 +413,12 @@ class EagleProposer:
         draft_token_ids = torch.empty(
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
+        cheap_draft_token_ids = self._try_tail_cheap_propose(
+            next_token_ids=next_token_ids,
+            completion_token_counts=completion_token_counts,
+        )
+        if cheap_draft_token_ids is not None:
+            return cheap_draft_token_ids
         var = self.runner.forward_vars
         target_uses_mla = self.runner.use_mla
         # Eaale3 only support mha currently
@@ -376,7 +456,7 @@ class EagleProposer:
                     else ret_hidden_states
                 )
                 logits = self.model.compute_logits(sample_hidden_states)
-                new_draft_ids = logits.argmax(dim=-1)
+                new_draft_ids = self._select_draft_ids_from_logits(logits, i)
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
@@ -485,6 +565,7 @@ class EagleProposer:
         num_sampled_tokens: np.ndarray,
         cu_num_sampled_tokens: np.ndarray,
         input_ids: torch.Tensor,
+        completion_token_counts=None,
     ) -> SpecDecodeMetadata:
         scheduled_bs = len(num_sampled_tokens)
         sum_drafted_tokens = self.mtp_k * scheduled_bs
@@ -520,6 +601,36 @@ class EagleProposer:
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = torch.index_select(input_ids[1:], 0, target_logits_indices)
+        completion_token_counts_gpu = None
+        blind_accept_no_argmax = False
+        partial_blind_accept_no_argmax = False
+        partial_blind_strict_row_mask = None
+        if completion_token_counts is not None:
+            self.completion_token_counts.np[:scheduled_bs] = completion_token_counts[
+                :scheduled_bs
+            ]
+            completion_token_counts_gpu = self.completion_token_counts.copy_to_gpu(
+                scheduled_bs
+            )
+            min_tokens = envs.ATOM_MTP_BLIND_ACCEPT_NO_ARGMAX_MIN_COMPLETION_TOKENS
+            if min_tokens > 0 and scheduled_bs > 0:
+                tail_ready = completion_token_counts[:scheduled_bs] >= min_tokens
+                blind_accept_no_argmax = bool(np.all(tail_ready))
+                if (
+                    envs.ATOM_MTP_PARTIAL_BLIND_ACCEPT_NO_ARGMAX
+                    and not blind_accept_no_argmax
+                    and bool(np.any(tail_ready))
+                ):
+                    strict_row_mask = np.repeat(~tail_ready, self.mtp_k)
+                    self.partial_blind_strict_row_mask.np[
+                        :sum_drafted_tokens
+                    ] = strict_row_mask
+                    partial_blind_strict_row_mask = (
+                        self.partial_blind_strict_row_mask.copy_to_gpu(
+                            sum_drafted_tokens
+                        )
+                    )
+                    partial_blind_accept_no_argmax = True
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -528,5 +639,9 @@ class EagleProposer:
             cu_num_draft_tokens=cu_num_draft_tokens,
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
+            completion_token_counts=completion_token_counts_gpu,
+            blind_accept_no_argmax=blind_accept_no_argmax,
+            partial_blind_accept_no_argmax=partial_blind_accept_no_argmax,
+            partial_blind_strict_row_mask=partial_blind_strict_row_mask,
         )
         return metadata

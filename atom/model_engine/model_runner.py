@@ -308,7 +308,12 @@ class tokenIDProcessor:
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
             if self.use_spec:
+                tokens_per_seq = self.num_spec_tokens + 1
+                token_ids = token_ids.reshape(
+                    batch.total_seqs_num_decode, tokens_per_seq
+                )
                 token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
+                token_ids = token_ids.reshape(-1)
 
             self.input_ids.np[:total_tokens_decode] = token_ids
             return self.input_ids.copy_to_gpu(total_tokens_decode)
@@ -325,10 +330,14 @@ class tokenIDProcessor:
             tokens_per_seq = self.num_spec_tokens + 1
             num_deferred_tokens = num_deferred_seqs * tokens_per_seq
             num_new_tokens = num_new_seqs * tokens_per_seq
+            decode_token_rows = scheduled_tokens[
+                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
+            ].reshape(batch.total_seqs_num_decode, tokens_per_seq)
         else:
             tokens_per_seq = 1
             num_deferred_tokens = num_deferred_seqs
             num_new_tokens = num_new_seqs
+            decode_token_rows = None
 
         # Receive and map bonus_list to current batch order
         self.num_rejected = batch.num_rejected
@@ -421,28 +430,32 @@ class tokenIDProcessor:
                         num_new_tokens : num_new_tokens + num_deferred_tokens
                     ] = gathered_tokens
                 if num_new_tokens > 0:
-                    token_ids = scheduled_tokens[
-                        total_tokens_prefill : total_tokens_prefill + num_new_tokens
-                    ].reshape(num_new_seqs, tokens_per_seq)
                     if self.use_spec:
+                        token_ids = decode_token_rows[new_curr_indices].copy()
                         token_ids[:, 1:] = batch.scheduled_spec_decode_tokens[
-                            :num_new_seqs
+                            new_curr_indices
                         ]
+                    else:
+                        token_ids = scheduled_tokens[
+                            total_tokens_prefill : total_tokens_prefill + num_new_tokens
+                        ].reshape(num_new_seqs, tokens_per_seq)
                     self.input_ids.np[:num_new_tokens] = token_ids.flatten()
                     self.input_ids.copy_to_gpu(num_new_tokens)
             else:
                 # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
                 if num_new_tokens > 0:
-                    new_token_ids = scheduled_tokens[new_curr_indices].reshape(
-                        num_new_seqs, tokens_per_seq
-                    )
                     if self.use_spec:
+                        new_token_ids = decode_token_rows[new_curr_indices].copy()
                         # MTP mode: combine scheduled_tokens and draft_tokens
                         # For new_decode_front=False, use new_curr_indices to get the right sequences
                         draft_tokens = batch.scheduled_spec_decode_tokens[
                             new_curr_indices
                         ]
                         new_token_ids[:, 1:] = draft_tokens
+                    else:
+                        new_token_ids = scheduled_tokens[new_curr_indices].reshape(
+                            num_new_seqs, tokens_per_seq
+                        )
                     self.input_ids.np[:num_new_tokens] = new_token_ids.flatten()
                     self.input_ids.gpu[
                         num_deferred_tokens : num_deferred_tokens + num_new_tokens
@@ -1577,6 +1590,7 @@ class ModelRunner:
                 num_scheduled_tokens[:scheduled_bs],
                 cu_seqlens_q[:scheduled_bs],
                 input_ids,
+                batch.completion_lens[:scheduled_bs],
             )
 
         ubatch_slices = self._maybe_create_tbo_slices(
@@ -1669,7 +1683,8 @@ class ModelRunner:
         self,
         input_ids: torch.Tensor,
         batch: Optional[ScheduledBatch] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        skip_logits: bool = False,
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.batch_size
@@ -1696,7 +1711,7 @@ class ModelRunner:
                 else:
                     hidden_states = model_output
                     self._aux_hidden_states = None
-                logits = self.model.compute_logits(hidden_states)
+                logits = None if skip_logits else self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
             label = f"decode[bs={bs}"
@@ -1723,15 +1738,67 @@ class ModelRunner:
                     self._aux_hidden_states = None
                 if self.logits_in_graph:
                     logits = self.graph_logits[graph_key][:num_tokens]
+                elif skip_logits:
+                    logits = None
                 else:
                     logits = self.model.compute_logits(hidden_states)
 
         return logits, hidden_states
 
+    def _can_use_tp_greedy_argmax_no_gather(
+        self,
+        batch: ScheduledBatch,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
+        all_greedy: bool,
+    ) -> bool:
+        if not envs.ATOM_TP_GREEDY_ARGMAX_NO_GATHER:
+            return False
+        if get_tp_group().world_size <= 1:
+            return False
+        if not all_greedy or top_ks is not None or top_ps is not None:
+            return False
+        if batch.total_seqs_num_prefill > 0 or batch.num_spec_step <= 0:
+            return False
+        if self.enforce_eager:
+            return False
+        if getattr(envs, "ATOM_ENABLE_MTP_DIAGNOSTICS", False) or getattr(
+            envs,
+            "ATOM_MTP_DRAFT_TOPK_DIAGNOSTICS",
+            False,
+        ):
+            return False
+        return True
+
+    def _tp_global_argmax_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states.contiguous()
+        local_logits = self.model.lm_head.forward_local(hidden_states)
+        local_vals, local_ids = torch.max(local_logits, dim=-1)
+        local_ids = local_ids.to(torch.int64) + int(self.model.lm_head.vocab_start_idx)
+
+        local_pack = torch.stack(
+            (local_vals.to(torch.float32), local_ids.to(torch.float32)),
+            dim=0,
+        ).contiguous()
+        tp_group = get_tp_group()
+        all_pack = tp_group.all_gather(
+            local_pack,
+            # The normal lm-head path gathers logits along the vocab dimension.
+            # This shortcut gathers a tiny (value, token_id) packet along dim=0;
+            # use the standard distributed path to avoid custom all-gather layout
+            # differences across AITER versions.
+            use_custom=False,
+            dim=0,
+        )
+        all_vals = all_pack[0::2, :]
+        all_ids = all_pack[1::2, :]
+        winner = all_vals.argmax(dim=0).view(1, -1)
+        return all_ids.gather(0, winner).view(-1).to(torch.int32).contiguous()
+
     def postprocess(
         self,
         batch: ScheduledBatch,
-        logits: torch.Tensor,
+        logits: Optional[torch.Tensor],
         temperatures: torch.Tensor,
         top_ks: torch.Tensor | None,
         top_ps: torch.Tensor | None,
@@ -1754,34 +1821,58 @@ class ModelRunner:
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
         else:
-            assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
-            target_logits = torch.index_select(logits, 0, target_logits_indices)
-            bonus_token_ids = self.sampler(
-                logits=bonus_logits,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise,
-            )
-            # Validate shapes match expectations
-            if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
-                raise ValueError(
-                    f"Shape mismatch: target_logits.shape[0]={target_logits.shape[0]} "
-                    f"but len(draft_token_ids)={len(spec_decode_metadata.draft_token_ids)}. "
-                    f"target_logits_indices shape={spec_decode_metadata.target_logits_indices.shape}, "
-                    f"logits.shape[0]={logits.shape[0]}"
+            if logits is None:
+                bonus_hidden = torch.index_select(hidden_states, 0, bonus_logits_indices)
+                if spec_decode_metadata.blind_accept_no_argmax:
+                    bonus_token_ids = self._tp_global_argmax_from_hidden(bonus_hidden)
+                    target_argmax = (
+                        spec_decode_metadata.draft_token_ids.to(torch.int32).contiguous()
+                    )
+                else:
+                    target_hidden = torch.index_select(
+                        hidden_states, 0, target_logits_indices
+                    )
+                    combined_argmax = self._tp_global_argmax_from_hidden(
+                        torch.cat((bonus_hidden, target_hidden), dim=0)
+                    )
+                    bonus_rows = bonus_hidden.shape[0]
+                    bonus_token_ids = combined_argmax[:bonus_rows]
+                    target_argmax = combined_argmax[bonus_rows:]
+                sampled_tokens, num_bonus_tokens = (
+                    self.rejection_sampler.forward_argmax_only(
+                        spec_decode_metadata,
+                        target_argmax,
+                        bonus_token_ids,
+                    )
                 )
+            else:
+                bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+                target_logits = torch.index_select(logits, 0, target_logits_indices)
+                bonus_token_ids = self.sampler(
+                    logits=bonus_logits,
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=all_greedy,
+                    needs_independent_noise=needs_independent_noise,
+                )
+                # Validate shapes match expectations
+                if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
+                    raise ValueError(
+                        f"Shape mismatch: target_logits.shape[0]={target_logits.shape[0]} "
+                        f"but len(draft_token_ids)={len(spec_decode_metadata.draft_token_ids)}. "
+                        f"target_logits_indices shape={spec_decode_metadata.target_logits_indices.shape}, "
+                        f"logits.shape[0]={logits.shape[0]}"
+                    )
 
-            sampled_tokens, num_bonus_tokens = self.rejection_sampler.forward(
-                spec_decode_metadata,
-                target_logits,
-                bonus_token_ids,
-            )
+                sampled_tokens, num_bonus_tokens = self.rejection_sampler.forward(
+                    spec_decode_metadata,
+                    target_logits,
+                    bonus_token_ids,
+                )
             num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
             next_token_locs = num_bonus_tokens
 
@@ -1850,7 +1941,17 @@ class ModelRunner:
             all_greedy,
             needs_independent_noise,
         ) = self.prepare_model(batch)
-        logits, hidden_states = self.run_model(input_ids, batch)
+        skip_logits = self._can_use_tp_greedy_argmax_no_gather(
+            batch,
+            top_ks,
+            top_ps,
+            all_greedy,
+        )
+        logits, hidden_states = self.run_model(
+            input_ids,
+            batch,
+            skip_logits=skip_logits,
+        )
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -1910,6 +2011,7 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
             aux_hidden_states=self._aux_hidden_states,
+            completion_token_counts=batch.completion_lens[: batch.total_seqs_num],
         )
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 

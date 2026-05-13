@@ -38,6 +38,36 @@ class RejectionSampler(nn.Module):
                 f"{expected_num_tokens} (len(draft_token_ids)), but got {target_logits.shape[0]}"
             )
 
+        if metadata.blind_accept_no_argmax:
+            output_token_ids, num_bonus_tokens = rejection_sample_argmax_only(
+                metadata.draft_token_ids,
+                metadata.num_spec_steps,
+                metadata.cu_num_draft_tokens,
+                metadata.draft_token_ids.to(torch.int32).contiguous(),
+                bonus_token_ids,
+            )
+            return output_token_ids, num_bonus_tokens
+        if metadata.partial_blind_accept_no_argmax:
+            strict_row_mask = metadata.partial_blind_strict_row_mask
+            if strict_row_mask is None:
+                raise ValueError(
+                    "partial_blind_accept_no_argmax requires "
+                    "partial_blind_strict_row_mask"
+                )
+            target_argmax = target_logits.argmax(dim=-1).to(torch.int32).contiguous()
+            relaxed_row_mask = ~strict_row_mask
+            target_argmax[relaxed_row_mask] = metadata.draft_token_ids[
+                relaxed_row_mask
+            ].to(torch.int32)
+            output_token_ids, num_bonus_tokens = rejection_sample_argmax_only(
+                metadata.draft_token_ids,
+                metadata.num_spec_steps,
+                metadata.cu_num_draft_tokens,
+                target_argmax,
+                bonus_token_ids,
+            )
+            return output_token_ids, num_bonus_tokens
+
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
             # metadata.num_draft_tokens_np,
@@ -48,6 +78,26 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
         )
         return output_token_ids
+
+    def forward_argmax_only(
+        self,
+        metadata: SpecDecodeMetadata,
+        target_argmax: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_num_tokens = len(metadata.draft_token_ids)
+        if target_argmax.shape[0] != expected_num_tokens:
+            raise ValueError(
+                f"target_argmax shape mismatch: expected first dimension to be "
+                f"{expected_num_tokens} (len(draft_token_ids)), but got {target_argmax.shape[0]}"
+            )
+        return rejection_sample_argmax_only(
+            metadata.draft_token_ids,
+            metadata.num_spec_steps,
+            metadata.cu_num_draft_tokens,
+            target_argmax.to(torch.int32).contiguous(),
+            bonus_token_ids.to(torch.int32).contiguous(),
+        )
 
 
 def rejection_sample(
@@ -124,6 +174,41 @@ def rejection_sample(
             num_warps=1,
         )
 
+    return output_token_ids, num_bonus_tokens
+
+
+def rejection_sample_argmax_only(
+    draft_token_ids: torch.Tensor,
+    num_spec_steps: int,
+    cu_num_draft_tokens: torch.Tensor,
+    target_argmax: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert draft_token_ids.ndim == 1
+    assert cu_num_draft_tokens.ndim == 1
+    assert target_argmax.ndim == 1
+    assert draft_token_ids.is_contiguous()
+    assert target_argmax.is_contiguous()
+    assert target_argmax.shape[0] == draft_token_ids.shape[0]
+
+    batch_size = len(cu_num_draft_tokens)
+    device = target_argmax.device
+    output_token_ids = torch.empty(
+        (batch_size, num_spec_steps + 1),
+        dtype=torch.int32,
+        device=device,
+    )
+    num_bonus_tokens = torch.empty(batch_size, dtype=torch.int32, device=device)
+    rejection_greedy_sample_kernel[(batch_size,)](
+        output_token_ids,
+        num_bonus_tokens,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        target_argmax,
+        bonus_token_ids,
+        num_spec_steps,
+        num_warps=1,
+    )
     return output_token_ids, num_bonus_tokens
 
 
