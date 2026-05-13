@@ -1790,6 +1790,7 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         seq_lens = common_attn_metadata.seq_lens
 
         from atom.plugin.attention_mla_sparse import generate_sparse_seqlen_triton
+
         sparse_seqlen = generate_sparse_seqlen_triton(
             query_lens,
             seq_lens,

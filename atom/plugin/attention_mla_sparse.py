@@ -132,9 +132,9 @@ def triton_convert_req_index_to_global_index(
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible byBLOCK_N ({BLOCK_N})"
-    )
+    assert (
+        NUM_TOPK_TOKENS % BLOCK_N == 0
+    ), f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible byBLOCK_N ({BLOCK_N})"
     # print("req_id: ", req_id, flush=True)
     num_tokens = req_id.shape[0]
     _, max_num_blocks_per_req = block_table.shape
@@ -483,9 +483,7 @@ class MLASparseAttentionImplPluginModeMethods:
                 layer._q_scale,
             )
             q_out = q_flat.reshape(q_out.shape)
-        attn_out = self._forward_sparse_mla(
-            q_out, kv_cache, attn_metadata, layer
-        )
+        attn_out = self._forward_sparse_mla(q_out, kv_cache, attn_metadata, layer)
 
         # V up-projection
         self._v_up_proj(attn_out, out=output[:num_actual_toks])
