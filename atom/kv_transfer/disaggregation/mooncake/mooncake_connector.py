@@ -328,6 +328,8 @@ class MooncakeConnector(KVConnectorBase):
         self._completed_prefills: dict[ReqId, list[int]] = {}
         self._completed_prefills_lock = threading.Lock()
         self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
+        self._transfer_refcount: dict[ReqId, int] = {}
+        self._transfer_refcount_lock = threading.Lock()
 
         # --- Consumer: pending receive tracking ---
         self._pending_recv: set[ReqId] = set()
@@ -663,15 +665,21 @@ class MooncakeConnector(KVConnectorBase):
         )
 
         for req_id, meta in metadata.reqs_to_recv.items():
+            remote_tp_size = meta.tp_size
+            if remote_tp_size != self.tp_size:
+                remote_tp_rank = self.tp_rank % remote_tp_size
+            else:
+                remote_tp_rank = self.tp_rank
             remote_port = meta.remote_handshake_port + _port_offset(
-                meta.remote_dp_rank, self.tp_rank, self.tp_size
+                meta.remote_dp_rank, remote_tp_rank, remote_tp_size
             )
             remote_addr = make_zmq_path("tcp", meta.remote_host, remote_port)
 
             unique_bpb = sorted(set(self._per_block_bytes_list))
             logger.info(
                 "[CONSUMER] Sending write_request for req %s (transfer_id=%s) "
-                "to %s (handshake_port=%d, dp_rank=%d, tp_rank=%d), "
+                "to %s (handshake_port=%d, dp_rank=%d, "
+                "local_tp=%d, remote_tp=%d/%d), "
                 "dst_block_ids=%s, num_regions=%d, "
                 "bytes/block=%s, num_blocks=%d",
                 req_id,
@@ -680,6 +688,8 @@ class MooncakeConnector(KVConnectorBase):
                 meta.remote_handshake_port,
                 meta.remote_dp_rank,
                 self.tp_rank,
+                remote_tp_rank,
+                remote_tp_size,
                 meta.local_block_ids[:10],
                 len(self.kv_caches_base_addr),
                 unique_bpb,
@@ -696,6 +706,7 @@ class MooncakeConnector(KVConnectorBase):
                     "dst_block_ids": meta.local_block_ids,
                     "notify_host": self.local_ip,
                     "notify_port": self._notification_port,
+                    "consumer_tp_size": self.tp_size,
                 }
             )
 
@@ -792,6 +803,8 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids = request_data["dst_block_ids"]
         notify_host = request_data["notify_host"]
         notify_port = request_data["notify_port"]
+        consumer_tp_size = request_data.get("consumer_tp_size", self.tp_size)
+        consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
 
         logger.info(
             "[PRODUCER] _execute_transfer: req_id=%s, transfer_id=%s, "
@@ -945,15 +958,33 @@ class MooncakeConnector(KVConnectorBase):
             total_entries,
         )
 
-        with self._completion_lock:
-            self.done_sending.add(transfer_id)
-
-        # Remove from cache (keyed by transfer_id = prefill's seq.id)
-        with self._completed_prefills_lock:
-            self._completed_prefills.pop(transfer_id, None)
-
-        # Notify consumer
+        # Notify this consumer immediately — its data is written.
         self._send_write_done(notify_host, notify_port, req_id)
+
+        # Track how many consumers still need this transfer_id's blocks.
+        # Only mark done_sending (which triggers block deallocation on the
+        # scheduler) after ALL consumers sharing this producer rank have
+        # completed their transfers.
+        all_done = False
+        with self._transfer_refcount_lock:
+            if transfer_id not in self._transfer_refcount:
+                self._transfer_refcount[transfer_id] = consumers_per_rank
+            self._transfer_refcount[transfer_id] -= 1
+            if self._transfer_refcount[transfer_id] <= 0:
+                self._transfer_refcount.pop(transfer_id)
+                all_done = True
+
+        if all_done:
+            with self._completion_lock:
+                self.done_sending.add(transfer_id)
+            with self._completed_prefills_lock:
+                self._completed_prefills.pop(transfer_id, None)
+            logger.info(
+                "[PRODUCER] All %d consumers served for transfer_id=%s, "
+                "blocks released",
+                consumers_per_rank,
+                transfer_id,
+            )
 
     def _wait_for_prefill_blocks(self, req_id: str) -> list[int] | None:
         """Wait until prefill block_ids are available for this request."""

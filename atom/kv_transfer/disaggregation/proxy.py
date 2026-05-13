@@ -369,6 +369,7 @@ async def handle_request():
 
         req_data["kv_transfer_params"]["remote_dp_size"] = prefill_ep["dp_size"]
         req_data["kv_transfer_params"]["remote_tp_size"] = prefill_ep["tp_size"]
+        req_data["kv_transfer_params"]["tp_size"] = prefill_ep["tp_size"]
 
         if selected_prefill_dp_rank is not None:
             req_data["kv_transfer_params"]["remote_dp_rank"] = selected_prefill_dp_rank
@@ -396,6 +397,33 @@ async def handle_request():
 
 
 _DEFAULT_DISCOVERY_PORT = 36367
+
+
+@app.route("/start_profile", methods=["POST"])
+@app.route("/stop_profile", methods=["POST"])
+async def proxy_profile():
+    """Forward profiler start/stop to all registered prefill and decode instances."""
+    path = request.path  # "/start_profile" or "/stop_profile"
+    results = {}
+    async with aiohttp.ClientSession() as session:
+        for tag, instances in [
+            ("prefill", prefill_instances),
+            ("decode", decode_instances),
+        ]:
+            for i, ep in enumerate(instances):
+                ip, port = _extract_ip_port(ep["request_address"])
+                url = f"http://{ip}:{port}{path}"
+                try:
+                    async with session.post(
+                        url, timeout=aiohttp.ClientTimeout(total=600)
+                    ) as resp:
+                        results[f"{tag}_{i}"] = {
+                            "status": resp.status,
+                            "body": await resp.json(),
+                        }
+                except Exception as e:
+                    results[f"{tag}_{i}"] = {"status": "error", "detail": str(e)}
+    return results
 
 
 def main(port: int = 10001):
