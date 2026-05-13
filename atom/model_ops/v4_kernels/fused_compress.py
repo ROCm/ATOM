@@ -10,12 +10,14 @@ SGLang plan-style batched dispatch (vs. the earlier per-seq launcher):
   Each compression boundary across the entire fwd is one row in
   `compress_plan_gpu` — a packed `[num_compress, 4] int32` tensor where each
   row is `[ragged_id, batch_id, position, window_len]`. The kernel grid is
-  `num_compress` (zero waste, no early-exit), and each program does ONE 4×i32
-  load to get all the metadata it needs:
+  the caller-supplied slice length (decode CG: `_decode_compress_cap[ratio]`
+  / eager prefill: `n_compress`); inactive plan rows are sentinel-marked
+  (`position == -1`) and bail at the top of the kernel. Each program does
+  ONE 4×i32 load to get all the metadata it needs:
 
     ragged_id  → row index in the ragged kv_in / score_in stream
     batch_id   → seq index → state_slot_mapping[batch_id], block_table[batch_id]
-    position   → absolute token position (drives RoPE + paged scatter)
+    position   → absolute token position (drives RoPE + paged scatter); -1 = skip
     window_len → number of leading K-loop iterations that read state cache
                  (instead of the ragged input). K = STATE_SIZE.
 
@@ -32,18 +34,21 @@ Correctness invariant (caller-side):
   the caller MUST invoke this kernel BEFORE `update_compressor_states` runs
   (which would overwrite the historic positions this kernel needs).
 
-Output:
-  Returns `[num_compress, head_dim]` BF16 tensor. Rows are in plan order
-  (= ragged_id ascending = per-seq grouped). Caller slices per seq via
-  `plan.cu_compress_cpu[i]:plan.cu_compress_cpu[i+1]`.
+Quant modes (constexpr-selected by the `quant` arg of the Python wrapper):
+  - quant=False (CSA Main / HCA Main): writes BF16 rows into the paged BF16
+    `kv_cache` at compressed slot `position // ratio`.
+  - quant=True (CSA Indexer-inner): per-row amax → ue8m0 (or raw) scale →
+    fp8 cast → preshuffled (MFMA 16x16 tile) write into the FP8 `kv_cache`,
+    plus fp32 scale into the per-block scale region (`cache_scale` — a
+    strided view of the same allocation built by the V4 builder). Bit-exact
+    match for `indexer_k_quant_and_cache` /
+    `cp_gather_indexer_k_quant_cache` (cache_kernels.cu:1145+).
 
-  Also writes valid rows into the paged kv_cache at compressed index
-  `position // RATIO` (when `block_table` is provided).
-
-TODO: FP8/FP4 quant fusion. Currently stores raw BF16 (no act_quant). The
-`scale_fmt="ue8m0"` round-to-even f32→e8m0 path requires porting aiter's
-`f32_to_e8m0` bit manipulation into Triton (~20 lines per quant block).
-Skipping for this PR; follow-up PR will add it.
+Output: side-effecting only — cache scatter IS the only output. The earlier
+caller-visible `[num_compress, head_dim]` BF16 return tensor was vestigial
+(paged_decode/paged_prefill read the scattered compress entries directly
+from `unified_kv` (Main) or the FP8 indexer pool, not from the kernel
+return).
 """
 
 from typing import Optional
@@ -83,15 +88,14 @@ def _fused_compress_attn_kernel(
     sin_cache_ptr,
     cos_sin_pos_stride,  # = rope_head_dim // 2
     # ── KV cache scatter (paged) ────────────────────────────────────────
-    kv_cache_ptr,  # [num_blocks, k_per_block, head_dim] bf16
+    kv_cache_ptr,  # bf16: [NB, k_per_block, head_dim] / fp8: [NB, k_per_block, head_dim]
     kv_cache_block_stride,
     kv_cache_token_stride,
+    cache_scale_ptr,  # fp32 [NB, k_per_block] (QUANT path only; dummy ptr otherwise)
+    cache_scale_block_stride,  # fp32 elements per block (= k_per_block * cache_stride / 4)
     block_table_ptr,  # [bs, max_blocks_per_seq] int32
     block_table_seq_stride,  # row stride
     k_per_block,
-    # ── output to caller (post norm+rope BF16 for sparse_attn input) ────
-    out_ptr,  # [num_compress, head_dim] bf16
-    out_token_stride,
     head_dim,
     rope_head_dim,
     # ── constexpr ───────────────────────────────────────────────────────
@@ -102,10 +106,19 @@ def _fused_compress_attn_kernel(
     STATE_SIZE: tl.constexpr,  # = 2*RATIO if OVERLAP else RATIO
     K: tl.constexpr,  # = STATE_SIZE (softmax-pool reduce dim)
     HAS_BLOCK_TABLE: tl.constexpr,
+    QUANT: tl.constexpr,  # 0 = raw BF16 (CSA/HCA Main), 1 = FP8 e4m3 + ue8m0 scale (Indexer)
+    USE_UE8M0: tl.constexpr,  # round scale to power-of-2 (only when QUANT == 1)
+    PRESHUFFLE: tl.constexpr,  # MFMA 16x16 preshuffled FP8 layout (only when QUANT == 1)
+    # E4M3 max (=448 for E4M3FN, =240 for E4M3FNUZ). Constexpr so the clamp
+    # bounds and reciprocal fold to compile-time constants.  Ignored when
+    # QUANT == 0 (caller passes 1.0 as a placeholder).
+    FP8_MAX: tl.constexpr = 1.0,
 ):
-    """One program per boundary in the plan. Grid = plan capacity (CUDAGraph-
-    safe fixed grid); inactive rows are sentinel-marked (position == -1) and
-    bail before any load/store/scatter."""
+    """One program per boundary in the plan. Grid = caller-supplied slice
+    length (decode CG: `_decode_compress_cap[ratio]` for capture/replay
+    address stability; eager prefill: tight `n_compress`). Inactive rows
+    are sentinel-marked (position == -1) and bail before any load /
+    store / scatter."""
     pid = tl.program_id(0)
     plan_base = plan_ptr + pid * 4
     ragged_id = tl.load(plan_base + 0)
@@ -122,57 +135,41 @@ def _fused_compress_attn_kernel(
     d_mask = d < head_dim
 
     # ── 1. Per-source-position load + online softmax-pool ──────────────
+    # Two-phase split (vs. the older single masked loop): for each program
+    # `is_input = k_static >= window_len` partitions the K iterations into
+    # a leading state-cache-only run and a trailing input-only run. Issuing
+    # only the live side's loads (rather than masked-off both) cuts HBM
+    # bandwidth ~40% on AMD CDNA where masked tl.load still issues the LD
+    # instruction (predicate only suppresses register write-back).
+    #
+    # Padding invariant: padding (`s < 0` ⟺ `k_static < K-1-position`) lies
+    # entirely within `k_static < window_len` because
+    # `window_len = K - min(j_in_seq+1, K) ≥ K - 1 - j_in_seq ≥ K - 1 - position`
+    # (`position = prefix_len + j_in_seq`, `prefix_len ≥ 0`). The input phase
+    # therefore needs no padding mask.
     NEG_INF: tl.constexpr = float("-inf")
     m_acc = tl.full([BLOCK_D], NEG_INF, tl.float32)
     kv_acc = tl.zeros([BLOCK_D], tl.float32)
     w_acc = tl.zeros([BLOCK_D], tl.float32)
 
-    # Dynamic loop (NOT unrolled) — K=128 (HCA) would otherwise blow up hsaco.
-    for k_static in tl.range(K):
+    # ── Phase 1: state cache (k_static ∈ [0, window_len)) ──
+    # Dynamic bound (window_len is per-program, not constexpr) — Triton
+    # cannot static-unroll this. Loop body issues only state-side loads.
+    for k_static in tl.range(0, window_len):
         s = position - K + 1 + k_static
         is_padding = s < 0
-        is_input = k_static >= window_len
-        # is_state = (~is_input) & (~is_padding)
-
-        # B-side (k < RATIO): cols [:head_dim]   (= col_off=0)
-        # A-side (k >= RATIO): cols [head_dim:]  (= col_off=head_dim)
-        # HCA (no overlap, K=RATIO): col_off=0 always (k_static < RATIO).
+        # B-side (k >= RATIO): cols [head_dim:]; A-side (k < RATIO): cols [:head_dim].
+        # HCA (no overlap, K=RATIO): col_off=0 always.
         col_off = (k_static >= RATIO) * head_dim if OVERLAP else 0
-        ape_row = k_static % RATIO  # [0, RATIO) — same for B/A sides
 
-        # Input source: row index in ragged stream.
-        # k_static = K-1 corresponds to s = position (the boundary token itself,
-        # = ragged_id row). Earlier k_static values map to earlier ragged rows.
-        in_row = ragged_id - (K - 1 - k_static)
-        kv_a = tl.load(
-            kv_in_ptr + in_row * kv_in_row_stride + col_off + d,
-            mask=is_input & d_mask,
-            other=0.0,
-        )
-
-        # State cache source: ring slot indexed by absolute s.
         s_safe = tl.maximum(s, 0)
         ring = s_safe % STATE_SIZE
+        state_row_off = (
+            slot * kv_state_slot_stride + ring * kv_state_pos_stride + col_off
+        )
         kv_b = tl.load(
-            kv_state_ptr
-            + slot * kv_state_slot_stride
-            + ring * kv_state_pos_stride
-            + col_off
-            + d,
-            mask=(~is_input) & (~is_padding) & d_mask,
-            other=0.0,
-        )
-        kv_k = kv_a + kv_b  # exactly one path active per source pos
-
-        # ── score_k load ──
-        score_a = tl.load(
-            score_in_ptr + in_row * score_in_row_stride + col_off + d,
-            mask=is_input & d_mask,
-            other=NEG_INF,
-        )
-        ape_v = tl.load(
-            ape_ptr + ape_row * dim_full + col_off + d,
-            mask=is_input & d_mask,
+            kv_state_ptr + state_row_off + d,
+            mask=(~is_padding) & d_mask,
             other=0.0,
         )
         score_b = tl.load(
@@ -181,16 +178,55 @@ def _fused_compress_attn_kernel(
             + ring * score_state_pos_stride
             + col_off
             + d,
-            mask=(~is_input) & (~is_padding) & d_mask,
+            mask=(~is_padding) & d_mask,
             other=NEG_INF,
         )
-        score_k = tl.where(is_input, score_a + ape_v, score_b)
 
-        # ── Online softmax-pool accumulate ──
+        m_new = tl.maximum(m_acc, score_b)
+        scale = tl.where(m_acc == NEG_INF, 0.0, tl.exp(m_acc - m_new))
+        # Padding lanes have score_b = NEG_INF → w_k = 0, contributes nothing.
+        w_k = tl.where(score_b == NEG_INF, 0.0, tl.exp(score_b - m_new))
+        kv_acc = kv_acc * scale + w_k * kv_b
+        w_acc = w_acc * scale + w_k
+        m_acc = m_new
+
+    # ── Phase 2: ragged input (k_static ∈ [window_len, K)) ──
+    # No padding here (per invariant above). All loads unconditional in
+    # the position dimension; only the head_dim mask remains.
+    for k_static in tl.range(window_len, K):
+        col_off = (k_static >= RATIO) * head_dim if OVERLAP else 0
+        ape_row = k_static % RATIO
+        # k_static = K-1 → s = position (the boundary token itself,
+        # = ragged_id row). Earlier k_static map to earlier ragged rows.
+        in_row = ragged_id - (K - 1 - k_static)
+
+        # kv_in / score_in: single-use per program → evict_first to keep
+        # state-cache lines (small, possibly shared across programs) hot.
+        kv_a = tl.load(
+            kv_in_ptr + in_row * kv_in_row_stride + col_off + d,
+            mask=d_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+        score_a = tl.load(
+            score_in_ptr + in_row * score_in_row_stride + col_off + d,
+            mask=d_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+        ape_v = tl.load(
+            ape_ptr + ape_row * dim_full + col_off + d,
+            mask=d_mask,
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        score_k = score_a + ape_v
+
         m_new = tl.maximum(m_acc, score_k)
         scale = tl.where(m_acc == NEG_INF, 0.0, tl.exp(m_acc - m_new))
-        w_k = tl.where(score_k == NEG_INF, 0.0, tl.exp(score_k - m_new))
-        kv_acc = kv_acc * scale + w_k * kv_k
+        # score_k always finite in input phase → no NEG_INF guard needed.
+        w_k = tl.exp(score_k - m_new)
+        kv_acc = kv_acc * scale + w_k * kv_a
         w_acc = w_acc * scale + w_k
         m_acc = m_new
 
@@ -231,26 +267,80 @@ def _fused_compress_attn_kernel(
     new_odd = odd_v * cos_per_pair + even_v * sin_per_pair
     rotated = tl.interleave(new_even, new_odd)  # [BLOCK_D] fp32
 
-    # ── 4. Cast to BF16 + store ────────────────────────────────────────
-    rotated_bf16 = rotated.to(tl.bfloat16)
-
-    # Output: row pid (plan order = per-seq grouped, caller uses cu_compress).
-    tl.store(out_ptr + pid * out_token_stride + d, rotated_bf16, mask=d_mask)
-
-    # KV cache scatter (paged): block_table[batch_id, ci // k_per_block][ci % k_per_block]
+    # ── 4. Cache scatter (paged) ───────────────────────────────────────
+    # The Compressor's BF16 return value was historically consumed by sparse
+    # attention but is now vestigial — paged_decode/paged_prefill read the
+    # scattered compress entries directly from `unified_kv` (Main) or the FP8
+    # indexer pool. So no caller-visible `out` write; the cache scatter IS
+    # the only output.
     if HAS_BLOCK_TABLE:
+        # block_table[batch_id, ci // k_per_block] → physical_block.
+        # slot_in_block = ci % k_per_block. Same address resolution as
+        # `indexer_k_quant_and_cache` (which used a pre-flattened slot_mapping
+        # = physical_block * k_per_block + slot_in_block).
         ci = position // RATIO
         block_in_seq = ci // k_per_block
         slot_in_block = ci % k_per_block
         physical_block = tl.load(
             block_table_ptr + batch_id * block_table_seq_stride + block_in_seq
         ).to(tl.int64)
-        cache_addr = (
-            physical_block * kv_cache_block_stride
-            + slot_in_block * kv_cache_token_stride
-            + d
-        )
-        tl.store(kv_cache_ptr + cache_addr, rotated_bf16, mask=d_mask)
+
+        if QUANT:
+            # FP8 e4m3 quantization: per-row amax → ue8m0 (or raw) scale →
+            # clamp+cast to fp8 → write preshuffled (MFMA 16x16 tile) or
+            # linear layout into the FP8 region; write the fp32 scale into
+            # the per-block scale region (separate `cache_scale_ptr` view).
+            # Bit-exact match for `indexer_k_quant_and_cache` /
+            # `cp_gather_indexer_k_quant_cache` (cache_kernels.cu:1145+).
+            #
+            # Quant pattern follows aiter's `_fp8_quant_op` /
+            # `_fused_rms_gated_fp8_group_quant_kernel` — the explicit
+            # `fp_downcast_rounding="rtne"` is intentionally NOT used here:
+            # on AMD it forces a slow software-RTNE path and bypasses the
+            # `v_cvt_pk_fp8_f32` HW intrinsic (which already rounds RTNE).
+            # The pre-cast `tl.clamp` saturates intermediate overflow and
+            # mirrors aiter's hand-tuned HIP `aiter::scaled_cast`.
+            rotated_for_amax = tl.where(d_mask, tl.abs(rotated), 0.0)
+            amax = tl.max(rotated_for_amax, axis=0)  # scalar (per row)
+            scale = tl.maximum(amax, 1e-4) * (1.0 / FP8_MAX)
+            if USE_UE8M0:
+                scale = tl.exp2(tl.ceil(tl.log2(scale)))
+            inv_scale = 1.0 / scale
+            scaled = tl.clamp(rotated * inv_scale, -FP8_MAX, FP8_MAX)
+            fp8_val = scaled.to(kv_cache_ptr.dtype.element_ty)
+            if PRESHUFFLE:
+                TILE: tl.constexpr = 16
+                token_tile_id = slot_in_block // TILE
+                token_in_tile = slot_in_block % TILE
+                col_tile_id = d // TILE
+                col_in_tile = d % TILE
+                fp8_offset = (
+                    physical_block * kv_cache_block_stride
+                    + token_tile_id * (TILE * head_dim)
+                    + col_tile_id * (TILE * TILE)
+                    + token_in_tile * TILE
+                    + col_in_tile
+                )
+            else:
+                fp8_offset = (
+                    physical_block * kv_cache_block_stride
+                    + slot_in_block * head_dim
+                    + d
+                )
+            # Streaming write — these slots aren't reread inside this kernel.
+            tl.store(
+                kv_cache_ptr + fp8_offset, fp8_val, mask=d_mask, cache_modifier=".cs"
+            )
+            # Scale: one fp32 per row, packed at end of block.
+            scale_offset = physical_block * cache_scale_block_stride + slot_in_block
+            tl.store(cache_scale_ptr + scale_offset, scale, cache_modifier=".cs")
+        else:
+            cache_addr = (
+                physical_block * kv_cache_block_stride
+                + slot_in_block * kv_cache_token_stride
+                + d
+            )
+            tl.store(kv_cache_ptr + cache_addr, rotated.to(tl.bfloat16), mask=d_mask)
 
 
 def fused_compress_attn(
@@ -270,7 +360,9 @@ def fused_compress_attn(
     cos_cache: torch.Tensor,  # [max_seq, ..., rope_head_dim/2] bf16/fp16
     sin_cache: torch.Tensor,  # same shape
     # KV cache scatter
-    kv_cache: Optional[torch.Tensor],  # [num_blocks, k_per_block, head_dim] bf16
+    kv_cache: Optional[
+        torch.Tensor
+    ],  # bf16: [NB, k_per_block, head_dim] / fp8: same shape, fp8
     block_tables: Optional[torch.Tensor],  # [bs, max_blocks_per_seq] int32
     k_per_block: int,
     # Geometry
@@ -278,32 +370,42 @@ def fused_compress_attn(
     ratio: int,
     head_dim: int,
     rope_head_dim: int,
-    out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    """Batched fused per-source-position pool + RMSNorm + RoPE + bf16 kv_cache
-    scatter, dispatched via SGLang-style packed plan.
+    # FP8 quant fusion (Indexer-inner Compressor path)
+    quant: bool = False,
+    cache_scale: Optional[
+        torch.Tensor
+    ] = None,  # fp32 [NB, k_per_block]; required when quant=True
+    use_ue8m0: bool = True,  # round scale to power-of-2 (UE8M0); only when quant=True
+    preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
+    fp8_max: Optional[float] = None,  # E4M3 max; required when quant=True
+) -> None:
+    """Batched fused per-source-position pool + RMSNorm + RoPE + cache scatter,
+    dispatched via SGLang-style packed plan.
 
-    Returns `[num_compress, head_dim]` BF16 tensor in plan order (= ragged_id
-    ascending = per-seq grouped). Caller uses `plan.cu_compress_cpu[i:i+2]` to
-    slice per-seq chunks.
+    Two scatter modes (constexpr-selected by `quant`):
 
-    Returns None if `plan.num_compress == 0` AND no `out` buffer is provided.
-    When `out` is supplied (CUDAGraph path), kernel ALWAYS launches at full
-    plan capacity — inactive rows are sentinel-skipped inside the kernel —
-    and `out` is returned unchanged when `num_compress == 0`.
+      - quant=False (CSA Main / HCA Main): writes BF16 rows into the paged
+        BF16 kv_cache (compressed slot = `position // ratio`).
+
+      - quant=True (CSA Indexer-inner): per-row amax → ue8m0 scale → fp8 cast
+        → preshuffled (MFMA 16x16 tile) write into the FP8 kv_cache, plus
+        fp32 scale into `cache_scale` (the per-block scale region of the
+        same allocation). Bit-exact match for `indexer_k_quant_and_cache` /
+        `cp_gather_indexer_k_quant_cache` (cache_kernels.cu:1145+).
+
+    Side-effecting: cache scatter IS the only output (Main path's BF16
+    return tensor was vestigial — paged_decode/paged_prefill read directly
+    from `unified_kv` and the indexer FP8 pool, not from the kernel return).
+    Grid is always `plan_capacity` (CUDAGraph-safe); inactive plan rows are
+    sentinel-skipped (`position == -1`) inside the kernel.
 
     Caller MUST invoke BEFORE `update_compressor_states` (state cache reads
     must see previous-fwd data).
     """
-    device = kv_in.device
-    num_compress = plan.num_compress
     plan_capacity = plan.compress_plan_gpu.shape[0]
+    num_compress = plan.num_compress
     if plan_capacity == 0:
-        return out  # nothing to do; out (or None) returned as-is.
-    if num_compress == 0 and out is None:
-        # Eager path: nothing to do, no caller buffer to fill.
-        return None
+        return  # nothing to do — no plan rows ever populated.
 
     # Validate shapes
     dim_full = (2 if overlap else 1) * head_dim
@@ -345,30 +447,45 @@ def fused_compress_attn(
     else:
         bt_seq_stride = 0
 
-    if out is None:
-        # Eager path: allocate output sized to the actual num_compress so the
-        # returned tensor has the legacy [num_compress, head_dim] shape.
-        out = torch.empty(num_compress, head_dim, dtype=out_dtype, device=device)
-    else:
-        # CUDAGraph path: caller-provided buffer of capacity ≥ plan_capacity.
-        # Validate shape; kernel will write into rows [0:num_compress) and
-        # leave [num_compress:plan_capacity) untouched (those plan rows are
-        # sentinel-skipped). Inactive output rows therefore carry stale data
-        # but no consumer reads them (caller slices via cu_compress_cpu).
+    # Quant validation. quant=True is FP8 cache write (Indexer-inner path);
+    # requires a valid block_tables (slot resolution) AND a paired fp32 scale
+    # view of the same allocation (see Compressor.forward for how to slice it).
+    if quant:
+        assert has_bt, "quant=True requires block_tables for slot resolution"
         assert (
-            out.shape[0] >= plan_capacity and out.shape[1] == head_dim
-        ), f"out {tuple(out.shape)}, expected ≥ ({plan_capacity}, {head_dim})"
-        assert out.dtype == out_dtype
-        assert out.is_contiguous() or out.stride(1) == 1
+            kv_cache.dtype != torch.bfloat16
+        ), f"quant=True expects an FP8/uint8 kv_cache; got {kv_cache.dtype}"
+        assert (
+            cache_scale is not None and cache_scale.dtype == torch.float32
+        ), "quant=True requires `cache_scale` (fp32 [NB, k_per_block])"
+        assert cache_scale.dim() == 2 and cache_scale.shape[0] == kv_cache.shape[0]
+        assert fp8_max is not None and fp8_max > 0
+        if preshuffle:
+            assert (
+                head_dim % 16 == 0
+            ), f"preshuffle requires head_dim%16==0, got {head_dim}"
+            assert (
+                k_per_block % 16 == 0
+            ), f"preshuffle requires k_per_block%16==0, got {k_per_block}"
 
     BLOCK_D = triton.next_power_of_2(head_dim)
     HALF_ROPE = rope_head_dim // 2
     K = state_size
 
+    # Cache-scale args (only consumed by the quant path; pass placeholders
+    # otherwise so the constexpr branch is never taken).
+    if quant:
+        cache_scale_arg = cache_scale
+        cache_scale_block_stride_arg = cache_scale.stride(0)
+        fp8_max_arg = float(fp8_max)
+    else:
+        cache_scale_arg = state_slot_mapping  # placeholder int32 ptr (unused)
+        cache_scale_block_stride_arg = 0
+        fp8_max_arg = 1.0  # placeholder; FP8_MAX is constexpr, must be > 0
+
     # Fixed grid for CUDAGraph compat: launch one program per plan row;
-    # sentinel rows (position=-1) skipped inside the kernel. When out is
-    # eager-allocated above, grid still shrinks to num_compress (no pad).
-    grid = (plan_capacity if out.shape[0] >= plan_capacity else num_compress,)
+    # sentinel rows (position=-1) skip inside the kernel.
+    grid = (plan_capacity,)
     _fused_compress_attn_kernel[grid](
         kv_in,
         kv_in.stride(0),
@@ -392,11 +509,11 @@ def fused_compress_attn(
         kv_cache if has_bt else cos_cache,  # placeholder when no scatter
         kv_cache.stride(0) if has_bt else 0,
         kv_cache.stride(1) if has_bt else 0,
+        cache_scale_arg,
+        cache_scale_block_stride_arg,
         block_tables if has_bt else state_slot_mapping,  # placeholder
         bt_seq_stride,
         k_per_block,
-        out,
-        out.stride(0),
         head_dim,
         rope_head_dim,
         BLOCK_D=BLOCK_D,
@@ -406,9 +523,11 @@ def fused_compress_attn(
         STATE_SIZE=state_size,
         K=K,
         HAS_BLOCK_TABLE=int(has_bt),
+        QUANT=int(quant),
+        FP8_MAX=fp8_max_arg,
+        USE_UE8M0=int(use_ue8m0),
+        PRESHUFFLE=int(preshuffle),
     )
-
-    return out  # [num_compress, head_dim]
 
 
 def fused_compress_attn_reference(

@@ -17,7 +17,7 @@
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "ATOM_USE_TRITON_MOE=1"
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
   },
   {
     "display": "DeepSeek-R1-0528 MTP3",
@@ -73,7 +73,7 @@
     "display": "gpt-oss-120b",
     "path": "openai/gpt-oss-120b",
     "prefix": "gpt-oss-120b",
-    "args": "--kv_cache_dtype fp8",
+    "args": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5",
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",

@@ -5,6 +5,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 on:
+  schedule:
+    # Nightly at 01:00 Beijing time (17:00 UTC on the previous day)
+    - cron: '0 17 * * *'
   workflow_dispatch:
     inputs:
       deepseek-r1-fp8-tp8:
@@ -83,6 +86,10 @@ jobs:
           REBUILD_SGLANG_IMAGE=false
           SGLANG_IMAGE_SOURCE="prebuilt"
           USER_PROVIDED_SGLANG_IMAGE=false
+          RESOLVED_PREBUILT_ALIAS=""
+          RESOLVED_PREBUILT_DIGEST=""
+          PREBUILT_RESOLUTION_TYPE=""
+          RESOLVED_NIGHTLY_TAG=""
           if [[ -n "${INPUT_SGLANG_IMAGE}" ]]; then
             PREBUILT_SGLANG_IMAGE="${INPUT_SGLANG_IMAGE}"
             SGLANG_IMAGE_SOURCE="user-provided"
@@ -115,6 +122,39 @@ jobs:
 
           SELECTED_SGLANG_REF="${VLLM_META[0]}"
           SELECTED_SGLANG_VERSION="${VLLM_META[1]}"
+
+          if [[ "${SGLANG_IMAGE_SOURCE}" == "prebuilt" ]]; then
+            if RESOLUTION_JSON="$(
+              python3 .github/scripts/resolve_atom_image.py \
+                --repository rocm/atom-dev \
+                --reference-tag sglang-latest \
+                --preferred-version "${SELECTED_SGLANG_VERSION}"
+            )"; then
+              mapfile -t RESOLVED_IMAGE_META < <(
+                RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          print(resolution["reference_image"])
+          print(resolution["reference_digest"])
+          print(resolution["match_type"])
+          print(resolution.get("matched_tag", ""))
+          PY
+              )
+              PREBUILT_SGLANG_IMAGE="${RESOLVED_IMAGE_META[0]}"
+              RESOLVED_PREBUILT_ALIAS="${RESOLVED_IMAGE_META[1]}"
+              RESOLVED_PREBUILT_DIGEST="${RESOLVED_IMAGE_META[2]}"
+              PREBUILT_RESOLUTION_TYPE="${RESOLVED_IMAGE_META[3]}"
+              RESOLVED_NIGHTLY_TAG="${RESOLVED_IMAGE_META[4]}"
+            else
+              echo "::warning::Failed to resolve rocm/atom-dev:sglang-latest to an immutable digest; falling back to the floating tag."
+              PREBUILT_SGLANG_IMAGE="rocm/atom-dev:sglang-latest"
+              RESOLVED_PREBUILT_ALIAS="rocm/atom-dev:sglang-latest"
+              PREBUILT_RESOLUTION_TYPE="resolution-failed"
+            fi
+          fi
 
           {
             echo "atom_repository=${ATOM_REPOSITORY}"
@@ -153,6 +193,32 @@ jobs:
               "${PREBUILT_SGLANG_IMAGE}" \
               "${SELECTED_SGLANG_VERSION}" \
               "${SELECTED_SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
+            if [[ -n "${RESOLVED_PREBUILT_ALIAS}" ]]; then
+              printf -- '- Floating alias: `%s`\n' \
+                "${RESOLVED_PREBUILT_ALIAS}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            if [[ -n "${RESOLVED_PREBUILT_DIGEST}" ]]; then
+              printf -- '- Resolved digest: `%s`\n' \
+                "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            case "${PREBUILT_RESOLUTION_TYPE}" in
+              matched-nightly-tag)
+                printf -- '- Resolution: reverse-matched same digest to nightly tag `%s`\n' \
+                  "${RESOLVED_NIGHTLY_TAG}" >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              digest-pinned-latest)
+                printf -- '- Resolution: no nightly tag with the same digest was found, so this run pins `sglang-latest` to its current digest instead.\n' \
+                  >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              reverse-lookup-failed-digest-pinned-latest)
+                printf -- '- Resolution: reverse lookup could not complete, so this run pins `sglang-latest` to its current digest instead of falling back to the floating tag.\n' \
+                  >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              resolution-failed)
+                printf -- '- Resolution: digest pinning itself failed, so this run falls back to floating `sglang-latest`.\n' \
+                  >> "$GITHUB_STEP_SUMMARY"
+                ;;
+            esac
           fi
 
           printf -- '- Upload to dashboard: `%s`\n' \
@@ -220,7 +286,8 @@ jobs:
         run: |
           MODELS_JSON="$(jq -c '
             map(select(
-              (.prefix == "deepseek-r1-fp8-tp8" and env.ENABLE_DEEPSEEK_R1_FP8_TP8 == "true")
+              env.GITHUB_EVENT_NAME == "schedule"
+              or (.prefix == "deepseek-r1-fp8-tp8" and env.ENABLE_DEEPSEEK_R1_FP8_TP8 == "true")
               or (.prefix == "deepseek-r1-fp8-tp4" and env.ENABLE_DEEPSEEK_R1_FP8_TP4 == "true")
               or (.prefix == "deepseek-r1-fp4-tp8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8 == "true")
               or (.prefix == "deepseek-r1-fp4-tp4" and env.ENABLE_DEEPSEEK_R1_FP4_TP4 == "true")
@@ -469,6 +536,11 @@ jobs:
       - name: Check if model is enabled
         id: check
         run: |
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           case "${{ matrix.model.prefix }}" in
             deepseek-r1-fp8-tp8) echo "enabled=${{ inputs.deepseek-r1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp8-tp4) echo "enabled=${{ inputs.deepseek-r1-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;

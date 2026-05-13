@@ -190,13 +190,11 @@ jobs:
           MODEL_MOUNT=""
           [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
 
-          # Build env var flags from model config
-          ENV_FLAGS=""
-          if [ -n "${{ matrix.model.env_vars }}" ]; then
-            for ev in ${{ matrix.model.env_vars }}; do
-              ENV_FLAGS="$ENV_FLAGS -e $ev"
-            done
-          fi
+          # Write env_vars via env block (avoids expression injection — newlines
+          # in `matrix.model.env_vars` would otherwise break the host bash).
+          # Empty file when MODEL_ENV_VARS unset is fine — docker --env-file
+          # accepts it.
+          printenv MODEL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_benchmark_env.txt || true
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
@@ -210,11 +208,12 @@ jobs:
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
             -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
-            $ENV_FLAGS \
+            --env-file /tmp/atom_benchmark_env.txt \
             --name atom-benchmark \
             ${{ inputs.image || 'rocm/atom-dev:latest' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          MODEL_ENV_VARS: ${{ matrix.model.env_vars }}
 
       - name: Collect GPU info (inside container)
         id: gpu-info
@@ -559,13 +558,9 @@ jobs:
           MODEL_MOUNT=""
           [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
 
-          # Build env var flags from model config
-          ENV_FLAGS=""
-          if [ -n "${{ matrix.cell.env_vars }}" ]; then
-            for ev in ${{ matrix.cell.env_vars }}; do
-              ENV_FLAGS="$ENV_FLAGS -e $ev"
-            done
-          fi
+          # Write env_vars via env block (avoids expression injection — newlines
+          # in `matrix.cell.env_vars` would otherwise break the host bash).
+          printenv CELL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_regression_env.txt || true
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
@@ -575,11 +570,12 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
             -e ATOM_DISABLE_MMAP=true \
-            $ENV_FLAGS \
+            --env-file /tmp/atom_regression_env.txt \
             --name atom-regression \
             ${{ inputs.image || 'rocm/atom-dev:latest' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          CELL_ENV_VARS: ${{ matrix.cell.env_vars }}
 
       - name: Download model
         run: |
@@ -595,8 +591,12 @@ jobs:
           if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
           else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
 
+          # cell.env_vars are already injected into the container env via
+          # --env-file in "Start CI container" — `docker exec` inherits them,
+          # so no need to re-prefix them on the command line (the previous
+          # inline form silently dropped the first var when env_vars contained
+          # a literal newline).
           docker exec atom-regression bash -lc "set -euo pipefail
-            ${{ matrix.cell.env_vars }} \
             ENABLE_TORCH_PROFILER=1 \
             .github/scripts/atom_test.sh launch $MODEL_DIR ${{ matrix.cell.server_args }}"
 

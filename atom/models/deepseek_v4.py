@@ -33,11 +33,15 @@ from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
     get_hip_quant,
-    indexer_k_quant_and_cache,
+    silu_and_mul as aiter_silu_and_mul,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+)
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -49,8 +53,8 @@ from atom.config import (
     get_current_atom_config,
 )
 from atom.model_loader.loader import WeightsMapper
-from atom.model_ops.embed_head import VocabParallelEmbedding
-from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.layernorm import DualRMSNorm, RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -120,6 +124,22 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
+
+
+def _make_weightless_rmsnorm(dim: int, eps: float) -> RMSNorm:
+    """Build an `RMSNorm(dim, eps)` whose `.weight` is `None`.
+
+    Drops the learnable Parameter so `state_dict()` is empty for this
+    submodule and `load_model` doesn't expect a weight from disk (no
+    "unloaded parameter" warning).  `DualRMSNorm` recognizes the
+    sentinel `weight is None` and instructs the fused kernel to skip
+    both the q_weight load and the multiply (Q_HAS_WEIGHT=False),
+    matching the prior `_rmsnorm_nw(x, eps, dim)` behavior.
+    """
+    norm = RMSNorm(dim, eps)
+    del norm.weight  # remove Parameter from `_parameters`
+    norm.weight = None  # sentinel for downstream consumers
+    return norm
 
 
 def _hc_head_reduce_fake(
@@ -664,12 +684,10 @@ class Compressor(nn.Module):
         # External tensors — assigned by the owning Attention / Indexer at first forward.
         self.kv_cache: Optional[torch.Tensor] = None
         self.rotary_emb: Optional[_V4RoPE] = None
-        # Shared compress-output buffer (set by V4 builder.build_kv_cache_tensor
-        # to a per-kind torch.empty pre-allocation in `forward_vars`). When
-        # present, fused_compress_attn writes into it via `out=` so the GPU
-        # pointer stays stable across captures (CUDAGraph requirement); when
-        # None, falls back to the eager fresh-allocation path.
-        self.compress_out: Optional[torch.Tensor] = None
+        # FP8 quant path only: strided fp32 view of the per-block scale region
+        # of `self.kv_cache`. Bound by the V4 builder when `kv_cache.dtype` is
+        # FP8 (Indexer-inner Compressor); None for BF16 cache (Main path).
+        self.cache_scale: Optional[torch.Tensor] = None
 
         # State cache (per paper §3.6.1 "uncompressed tail + B-side overlap
         # window" portion). Indexed as a single ring buffer of size
@@ -711,45 +729,41 @@ class Compressor(nn.Module):
         plan: "CompressPlan",
         state_slot_mapping: torch.Tensor,  # [bs] int32
         block_tables: Optional[torch.Tensor] = None,  # [bs, max_blocks_per_seq] int32
-        out_dtype: Optional[torch.dtype] = None,
-        idx_slot_mapping: Optional[torch.Tensor] = None,  # [num_compress] int64
-    ) -> Optional[torch.Tensor]:  # [num_compress, head_dim] BF16  (None if plan empty)
+    ) -> None:
         """Batched plan-style compress: one fused kernel call for the whole
         fwd's batch (across all seqs).
 
-        Single fused Triton kernel does pool + RMSNorm + RoPE + bf16 kv_cache
-        scatter in one launch. Each compression boundary across the batch is
-        one row in `plan.compress_plan_gpu`. State cache update fires after
-        (write order critical — fused kernel reads state-cache-as-of-previous-
-        fwd; update_compressor_states overwrites for next fwd).
+        Single fused Triton kernel does pool + RMSNorm + RoPE + cache scatter
+        in one launch. Each compression boundary across the batch is one row
+        in `plan.compress_plan_gpu`. State cache update fires after (write
+        order critical — fused kernel reads state-cache-as-of-previous-fwd;
+        `update_compressor_states` overwrites for next fwd).
 
-        TODO: quant (FP8 ue8m0 for CSA Main, FP4 + Hadamard for Indexer) is
-        NOT applied for the Main path; see class docstring. The Indexer-inner
-        path *does* apply FP8 quantization via `indexer_k_quant_and_cache`
-        when `idx_slot_mapping` is provided.
+        Quant mode is auto-selected by `self.kv_cache.dtype`:
+          - BF16 cache (CSA Main / HCA Main): raw BF16 row write into
+            `self.kv_cache` (consumed by paged_decode/paged_prefill via
+            `unified_kv` per-fwd indices).
+          - FP8 cache (Indexer-inner): per-row amax → ue8m0 scale → fp8 cast
+            → preshuffled (MFMA 16x16 tile) write into `self.kv_cache`, plus
+            fp32 scale into `self.cache_scale` (a strided view of the same
+            allocation built by the V4 builder). Bit-exact with
+            `indexer_k_quant_and_cache` / `cp_gather_indexer_k_quant_cache`
+            (cache_kernels.cu:1145+).
+
+        Side-effecting only — no return value (cache scatter IS the output).
+
+        TODO: QAT for the BF16 Main path (FP8 round-trip per Compressor
+        docstring) is not yet fused. End-to-end accuracy unaffected today
+        because the input act_quant simulation is applied upstream.
 
         Args:
             x:           [num_tokens, dim] flat ragged batch hidden state.
             plan:        CompressPlan from attn_metadata.compress_plans[ratio]
                          (or a synthetic bs=1 plan during warmup).
-            state_slot_mapping: [bs] int32 — per-seq state cache slot
-                         (attn_metadata.state_slot_mapping).
+            state_slot_mapping: [bs] int32 — per-seq state cache slot.
             block_tables: [bs, max_blocks_per_seq] int32 — physical block IDs
                          per seq; None during warmup (skips kv_cache scatter).
-            out_dtype:   override kernel output dtype. Defaults to bf16.
-            idx_slot_mapping: [num_compress] int64 — global flat slot in the
-                         FP8 indexer cache pool, one per compress row (kernel
-                         signature requires int64). When provided, the fused
-                         kernel skips its BF16 scatter and we instead call
-                         `indexer_k_quant_and_cache` to FP8-quantize+write each
-                         row into `self.kv_cache` (interleaved [head_dim] FP8 +
-                         4-byte fp32 scale per row, dtypes.fp8 storage).
-                         Only set by the CSA-inner-Compressor caller.
-
-        Returns:
-            Compressed KV `[num_compress, head_dim]` post-norm post-rope BF16,
-            in plan order (= per-seq grouped by `plan.cu_compress_cpu`).
-            Returns None if `plan.num_compress == 0`.
+                         Required for the Indexer FP8 path (slot resolution).
         """
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
         assert (
@@ -759,15 +773,15 @@ class Compressor(nn.Module):
         overlap = self.overlap
         d = self.head_dim
         rd = self.rope_head_dim
-        if out_dtype is None:
-            out_dtype = torch.bfloat16 if x.dtype == torch.float32 else x.dtype
 
-        # Single fused BF16 GEMM via tgemm; otype=fp32 keeps softmax-pool
-        # accumulator in fp32. torch.split returns zero-copy strided views;
-        # downstream kernels (fused_compress_attn, update_compressor_states)
-        # accept strided kv/score (only inner stride must be 1).
+        # Single fused BF16 GEMM via tgemm. (Probing whether dropping the
+        # otype=fp32 upcast — relying on fused_compress_attn's internal fp32
+        # accumulator instead — is accuracy-neutral.) torch.split returns
+        # zero-copy strided views; downstream kernels (fused_compress_attn,
+        # update_compressor_states) accept strided kv/score (only inner
+        # stride must be 1).
         coff_d = (1 + overlap) * d
-        combined = self.wkv_gate(x, otype=torch.float32)
+        combined = self.wkv_gate(x)
         kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
@@ -775,29 +789,21 @@ class Compressor(nn.Module):
         # PREVIOUS-fwd. `update_compressor_states` overwrites them with this
         # fwd's data for the NEXT fwd's overlap — must run AFTER the fused
         # kernel.
-        #
-        # The kernel does pool + RMSNorm + RoPE + (optional) BF16 store to
-        # kv_cache. For the Indexer-inner path (`idx_slot_mapping is not None`)
-        # we bypass the kernel scatter and instead call
-        # `indexer_k_quant_and_cache` separately, which FP8-quantizes the
-        # post-process K row and writes the (FP8 + scale) interleaved layout
-        # into the uint8 indexer pool.
         cos_cache, sin_cache = self.rotary_emb._caches(x.device)
-        is_idx_fp8 = idx_slot_mapping is not None
-        # Warmup runs through the same path: kv_cache is None until the V4
-        # builder binds it post-warmup, so the kernel skips the scatter.
-        # Indexer-FP8 path always skips the kernel scatter (separate write).
-        scatter_kv_cache = (
-            None
-            if is_idx_fp8
-            else (self.kv_cache if block_tables is not None else None)
-        )
-        scatter_block_tables = (
-            None
-            if is_idx_fp8
-            else (block_tables if scatter_kv_cache is not None else None)
-        )
-        out = fused_compress_attn(
+        # Quant path triggers when the bound cache is FP8 (Indexer-inner).
+        # `self.cache_scale` is bound alongside `self.kv_cache` by the V4
+        # builder when the cache is FP8 (strided fp32 view of the per-block
+        # scale region).
+        is_quant = self.kv_cache is not None and self.kv_cache.dtype != torch.bfloat16
+        # Skip the kernel's cache scatter during warmup (kv_cache/block_tables
+        # not yet bound).
+        if block_tables is None or self.kv_cache is None:
+            scatter_kv_cache = None
+            scatter_block_tables = None
+        else:
+            scatter_kv_cache = self.kv_cache
+            scatter_block_tables = block_tables
+        fused_compress_attn(
             kv_in=kv,
             score_in=score,
             kv_state=self.kv_state,
@@ -816,21 +822,12 @@ class Compressor(nn.Module):
             ratio=ratio,
             head_dim=d,
             rope_head_dim=rd,
-            out_dtype=out_dtype,
-            out=self.compress_out,
+            quant=is_quant,
+            cache_scale=self.cache_scale if is_quant else None,
+            use_ue8m0=(self.scale_fmt == "ue8m0"),
+            preshuffle=True,
+            fp8_max=(torch.finfo(self.kv_cache.dtype).max if is_quant else None),
         )
-        # Indexer-FP8 path: quantize the post-RoPE BF16 K rows into the uint8
-        # FP8+scale layout of `self.kv_cache`. `out` is [num_compress, head_dim]
-        # BF16 in plan order (matches `idx_slot_mapping` row order).
-        if is_idx_fp8 and out is not None and self.kv_cache is not None:
-            indexer_k_quant_and_cache(
-                out,
-                self.kv_cache,
-                idx_slot_mapping,
-                d,  # quant_block_size = head_dim (one fp32 scale per row)
-                self.scale_fmt,
-                preshuffle=True,
-            )
         update_compressor_states(
             kv,
             score,
@@ -843,7 +840,6 @@ class Compressor(nn.Module):
             ratio=ratio,
             overlap=overlap,
         )
-        return out
 
 
 class Indexer(nn.Module):
@@ -931,8 +927,11 @@ class Indexer(nn.Module):
     def forward_batched(
         self,
         x_full: torch.Tensor,  # [total_tokens, dim]
-        qr_full: torch.Tensor,  # [total_tokens, q_lora_rank]
+        qr_full: torch.Tensor,  # [total_tokens, q_lora_rank] — fp8 when qr_full_scale given
         positions: torch.Tensor,  # [total_tokens]
+        qr_full_scale: Optional[
+            torch.Tensor
+        ] = None,  # per_1x128 scale paired with qr_full
     ) -> torch.Tensor:
         """Q proj + RoPE + FP8-quant + weights compute (have module state),
         then dispatch to `torch.ops.aiter.indexer_score_topk`, which calls
@@ -957,7 +956,9 @@ class Indexer(nn.Module):
         # Q proj + RoPE + rotate (batched). rotary_emb internally reshapes
         # to (1, num_tokens, -1, rotary_dim) so the input doesn't need an
         # explicit batch dim. rotate_activation is last-dim-only.
-        q = self.wq_b(qr_full).view(total_tokens, self.n_heads, self.head_dim)
+        q = self.wq_b(qr_full, x_scale=qr_full_scale).view(
+            total_tokens, self.n_heads, self.head_dim
+        )
         # self.rotary_emb(positions, q[..., -rd:])
         # q = rotate_activation(q)
         cos, sin = self.rotary_emb._caches(q.device)
@@ -1134,13 +1135,18 @@ class Indexer(nn.Module):
         kv_cache_4d = self.kv_cache.unsqueeze(
             -2
         )  # [num_blocks, k1_csa, 1, head_dim+scale_dim] uint8
-        # Pre-allocated decode logits buffer (sized [max_bs, max_model_len_idx]
-        # in builder, sliced here to [total_tokens, max_model_len_idx]).
-        # No `fill_(-inf)` needed — `top_k_per_row_decode` bounds each row
-        # by `n_committed_per_seq[batch]` so unwritten cols are never picked.
-        logits = indexer_meta["decode_logits_gpu"][
-            :total_tokens
-        ]  # [total_tokens, max_model_len_idx] fp32
+        # Per-fwd write-once GPU scratch — no CPU mirror, no cross-fwd state.
+        # Under CUDAGraph capture, torch allocates from the graph's private
+        # memory pool and the address is stable across replays at this
+        # captured `total_tokens`. No `fill_(-inf)` needed —
+        # `top_k_per_row_decode` bounds each row by `n_committed_per_seq[batch]`
+        # so unwritten cols are never picked.
+        logits = torch.empty(
+            total_tokens,
+            self._max_model_len_idx,
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
         deepgemm_fp8_paged_mqa_logits(
             q_4d,
             kv_cache_4d,
@@ -1152,13 +1158,12 @@ class Indexer(nn.Module):
             KVBlockSize=self.kv_cache.size(1),  # k1_csa = 32
             Preshuffle=True,
         )
-        # Pre-allocated indices buffer — fixed [max_bs, index_topk] int32 in
-        # builder, sliced to [total_tokens, index_topk] for this fwd. Kernel
-        # writes exactly `index_topk` ints per row (valid seq-local indices
-        # then -1 sentinels), no overflow risk.
-        topk_local = indexer_meta["decode_topk_indices_gpu"][
-            :total_tokens
-        ]  # [total_tokens, index_topk] int32
+        # Per-fwd write-once int32 scratch. Kernel writes exactly `index_topk`
+        # ints per row (valid seq-local indices then -1 sentinels). CG-safe
+        # for the same reason as `logits` above.
+        topk_local = torch.empty(
+            total_tokens, self.index_topk, dtype=torch.int32, device=q_fp8.device
+        )
         top_k_per_row_decode(
             logits,
             next_n,
@@ -1197,7 +1202,14 @@ class DeepseekV4Attention(nn.Module):
       - attn_sink: per-head learnable logit added only to softmax denominator
     """
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        compress_stream: Optional[torch.cuda.Stream] = None,
+    ):
         super().__init__()
         self.layer_id = layer_id
         self.dim = args.dim
@@ -1242,8 +1254,22 @@ class DeepseekV4Attention(nn.Module):
             quant_config=qc,
             prefix=f"{p}.wqkv_a",
         )
-        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.q_norm2 = RMSNorm(self.head_dim, self.eps)
+        # Fuse q_norm + per_1x128 FP8 quant: kernel emits (qr_fp8, qr_scale)
+        # in one launch, both wq_b consumers (outer ColumnParallel + Indexer
+        # ReplicatedLinear) skip their own input quant.
+        self.q_norm = RMSNorm(
+            self.q_lora_rank,
+            self.eps,
+            fused_quant=True,
+            quant_config=qc,
+            prefix=f"{p}.q_norm",
+        )
+        # q_norm2: per-head Q normalization. The checkpoint has no
+        # `q_norm2.weight` entry, so the module is constructed with
+        # `weight=None` (no learnable Parameter) — `DualRMSNorm` reads the
+        # sentinel and tells the kernel to skip the q_weight load entirely.
+        # Behavior is identical to the prior `_rmsnorm_nw(q, eps, head_dim)`.
+        self.q_norm2 = _make_weightless_rmsnorm(self.head_dim, self.eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1252,6 +1278,19 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{p}.wq_b",
         )
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
+        # Fused per-head Q RMSNorm (identity weight) + KV RMSNorm — both have
+        # feature dim = head_dim, single Triton kernel via DualRMSNorm.
+        # `q_norm2.weight is None` tells the kernel's Q_HAS_WEIGHT=False
+        # path to skip the q_weight load (Q side has no learnable weight;
+        # equivalent to the prior `_rmsnorm_nw` helper).
+        self.qk_norm = DualRMSNorm(
+            self.q_norm2,
+            self.kv_norm,
+            num_q_heads=self.n_local_heads,
+            num_kv_heads=1,
+            head_dim=self.head_dim,
+            prefix=f"{p}.qk_norm",
+        )
         # wo_a: grouped LoRA — V4QuantConfig forces this BF16 even though disk is FP8.
         # The grouped einsum (`bsgd,grd->bsgr`) needs BF16 weights; aiter has no FP8 einsum.
         self.wo_a = ColumnParallelLinear(
@@ -1340,6 +1379,12 @@ class DeepseekV4Attention(nn.Module):
             self.indexer.rotary_emb = self.rotary_emb
             self.indexer.compressor.rotary_emb = self.rotary_emb
 
+        self.alt_stream = alt_stream
+        self.compress_stream = compress_stream
+        self._use_async_compress = (
+            self.alt_stream is not None and self.compressor is not None
+        )
+
         self.layer_name = prefix
         atom_config = get_current_atom_config()
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
@@ -1394,6 +1439,31 @@ class DeepseekV4Attention(nn.Module):
         # batched-FP8 kernel. See attention_mla.py:211 for reference.
         self.wo_a.quant_type = QuantType.No
 
+    def _launch_compressors_async(self, x, plan, state_slot_mapping, block_tables):
+        """Fire Compressor(s) on side streams, return immediately.
+
+        Main Compressor → alt_stream (CSA + HCA).
+        Indexer Compressor → compress_stream (CSA only).
+        Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us."""
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            self.compressor(
+                x,
+                plan=plan,
+                state_slot_mapping=state_slot_mapping,
+                block_tables=block_tables,
+            )
+        if self.indexer is not None and self.compress_stream is not None:
+            self.compress_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.compress_stream):
+                self.indexer.compressor(
+                    x,
+                    plan=plan,
+                    state_slot_mapping=state_slot_mapping,
+                    block_tables=block_tables,
+                )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1437,75 +1507,75 @@ class DeepseekV4Attention(nn.Module):
         if _V4_FORCE_UE8M0_QUANT:
             x = x.clone()
             act_quant_inplace(x, 128, "ue8m0")
-        # Single fused FP8 GEMM for [wq_a; wkv]; torch.split returns zero-copy views.
-        qkv_a = self.wqkv_a(x)
-        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        qr = self.q_norm(q_lora)  # [num_tokens, q_lora_rank]  shared with Indexer
-        if _V4_FORCE_UE8M0_QUANT:
-            qr = qr.clone()
-            act_quant_inplace(qr, 128, "ue8m0")
-        q = self.wq_b(qr).view(num_tokens, self.n_local_heads, self.head_dim)
-        q = _rmsnorm_nw(q, self.eps, self.head_dim)
-        # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
-        # to (1, num_tokens, ...) for aiter's per-position rope kernel.
-        kv = self.kv_norm(kv_pre)
-        self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
-        if _V4_USE_REF_QUANT:
-            act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
-        # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
-        # All per-fwd state read once. Production prepare_decode/prefill
-        # always populates these; warmup goes through the same path
-        # (`_populate_state_slot_mapping` falls back to slot 0).
-        # Cast to V4 typed metadata so V4-specific attribute access (v4_*,
-        # compress_plans, swa_write_indices, ...) is well-typed for pyright.
+
         attn_md = cast("AttentionMetaData_DSV4", get_forward_context().attn_metadata)
         compress_plans = attn_md.compress_plans
-        v4_indexer_meta = attn_md.indexer_meta
         swa_write_indices = attn_md.swa_write_indices
         v4_batch_id_per_token = attn_md.batch_id_per_token
         block_tables_gpu = attn_md.block_tables
         state_slot_mapping = attn_md.state_slot_mapping
-
-        # ===== Batched compressor + Indexer (ONCE per layer) =====
-        # State cache reset on fresh prefill is redundant: SWA's start_pos==0
-        # path uses raw seq_kv, and fused_compress's state-cache reads are
-        # already masked by `s < 0` for fresh prefill (compress_plan.py:88 +
-        # fused_compress.py:124-127).
-        # Compressor's return value is unused — paged_decode/paged_prefill read
-        # the scattered compress entries from `unified_kv` via per-fwd indices.
-        # Called purely for its side-effect (scatter into self.kv_cache).
         plan_for_layer = compress_plans[ratio] if ratio else None
-        if ratio:
-            self.compressor(
-                x,
-                plan=plan_for_layer,
-                state_slot_mapping=state_slot_mapping,
-                block_tables=block_tables_gpu,
+
+        # ===== Triple-stream: Q/KV path + both Compressors in parallel =====
+        if self._use_async_compress:
+            self._launch_compressors_async(
+                x, plan_for_layer, state_slot_mapping, block_tables_gpu
             )
-        if self.indexer is not None:  # i.e. CSA layer, compress_ratio == 4
-            # Indexer's inner compressor populates the indexer kv_cache (FP8
-            # via indexer_k_quant_and_cache when idx_slot_mapping is set);
-            # the outer `forward_batched` reads `v4_indexer_meta` (built once
-            # per fwd) so it has zero per-layer H2D / CPU index math.
-            idx_slot_mapping = v4_indexer_meta.get("compress_slot_mapping_gpu")
-            self.indexer.compressor(
-                x,
-                plan=plan_for_layer,
-                state_slot_mapping=state_slot_mapping,
-                block_tables=block_tables_gpu,
-                idx_slot_mapping=idx_slot_mapping,
-            )
+
+        # ----- Q/KV projections (main stream) -----
+        qkv_a = self.wqkv_a(x)
+        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+        assert (
+            not _V4_FORCE_UE8M0_QUANT
+        ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+        qr, qr_scale = self.q_norm(q_lora)
+        # Flat q_flat is [num_tokens, n_local_heads * head_dim]; DualRMSNorm
+        # views internally to per-head shape and returns flat. Single Triton
+        # launch fuses per-head Q RMSNorm (weightless) + KV RMSNorm (both
+        # head_dim=128), replacing the prior `_rmsnorm_nw + kv_norm` pair.
+        q_flat = self.wq_b(qr, x_scale=qr_scale)
+        q_flat, kv = self.qk_norm(q_flat, kv_pre)
+        q = q_flat.view(num_tokens, self.n_local_heads, self.head_dim)
+        # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
+        # to (1, num_tokens, ...) for aiter's per-position rope kernel.
+        self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
+        if _V4_USE_REF_QUANT:
+            act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
+
+        # ===== Compressor + Indexer =====
+        if not self._use_async_compress:
+            if self.compressor is not None:
+                self.compressor(
+                    x,
+                    plan=plan_for_layer,
+                    state_slot_mapping=state_slot_mapping,
+                    block_tables=block_tables_gpu,
+                )
+                if self.indexer is not None:
+                    self.indexer.compressor(
+                        x,
+                        plan=plan_for_layer,
+                        state_slot_mapping=state_slot_mapping,
+                        block_tables=block_tables_gpu,
+                    )
+        if self.indexer is not None:
+            if self._use_async_compress:
+                torch.cuda.current_stream().wait_stream(self.alt_stream)
+                torch.cuda.current_stream().wait_stream(self.compress_stream)
             indexer_topk_batched = self.indexer.forward_batched(
                 x_full=x,
                 qr_full=qr,
+                qr_full_scale=qr_scale,
                 positions=positions,
-            )  # raw seq-local [T, index_topk] int32, -1 sentinels in tail cols
+            )
             # Translate seq-local topk → physical paged offsets and write into
             # the CSA section of either:
             #   - decode buffer `kv_indices_csa` (is_pure_decode)
             #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
             # `_fill_csa_paged_compress` dispatches internally on is_pure_decode.
             self._fill_csa_paged_compress(attn_md, indexer_topk_batched, num_tokens)
+        elif self._use_async_compress:
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
 
         # ===== Sparse attention dispatch =====
         # Two paths over the unified KV pool. The order of `swa_write` vs
@@ -1705,18 +1775,24 @@ class Expert(nn.Module):
         x: torch.Tensor,  # [num_tokens, dim]
         weights: Optional[torch.Tensor] = None,  # [num_tokens, 1]  optional gate
     ) -> torch.Tensor:  # [num_tokens, dim]
+
         dtype = x.dtype
-        # Single fused GEMM, then chunk(2) along last dim so TP-sharded per-rank
-        # output (inter_dim_per_tp * 2) is split correctly regardless of tp_size.
-        combined = self.gate_up_proj(x).float()  # [num_tokens, 2*inter_dim_per_tp]
-        gate, up = combined.chunk(2, dim=-1)  # each [num_tokens, inter_dim_per_tp]
-        if self.swiglu_limit > 0:
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-        x = F.silu(gate) * up  # [num_tokens, inter_dim_per_tp]
+        # Single fused GEMM. Layout is [gate | up] concat on last dim — matches
+        # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
+        # silu/clamp/mul in fp32 internally regardless of input dtype, so we
+        # feed the bf16 GEMM output directly.
+        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        out = torch.empty(
+            (combined.shape[0], combined.shape[-1] // 2),
+            dtype=dtype,
+            device=combined.device,
+        )
+        # limit > 0 enables in-kernel clamp (gate≤limit, up∈[-limit,limit]) via
+        # ROCm v_med3_f32 — same semantics as the prior torch.clamp pair.
+        aiter_silu_and_mul(out, combined, self.swiglu_limit)
         if weights is not None:
-            x = weights * x
-        return self.w2(x.to(dtype))  # [num_tokens, dim]
+            out = weights.to(dtype) * out
+        return self.w2(out)  # [num_tokens, dim]
 
 
 class MoE(nn.Module):
@@ -1783,10 +1859,25 @@ class MoE(nn.Module):
             # (set by ModelRunner). torch.compile silently drops NNModule
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
-
+        assert args.n_shared_experts == 1
+        # aiter can fuse shared expert into the routed FusedMoE kernel ONLY
+        # when shared and routed have the same quant dtype.
+        # `is_rocm_aiter_fusion_shared_expert_enabled` compares shared vs
+        # GLOBAL (=base dtype), but V4-Pro has routed=FP4 (per-layer override
+        # for `.ffn.experts`) and shared=FP8 (=global). The function returns
+        # True for V4 because shared matches global, missing the routed-shared
+        # mismatch. Direct comparison: get routed and shared specs and compare.
+        routed_dtype = qc.get_layer_quant_config(f"{prefix}.experts").quant_dtype
+        shared_dtype = qc.get_layer_quant_config(f"{prefix}.shared_experts").quant_dtype
+        self._fuse_shared_into_routed = (
+            routed_dtype == shared_dtype
+            and is_rocm_aiter_fusion_shared_expert_enabled()
+        )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
-            n_shared_experts=args.n_shared_experts,
+            n_shared_experts=(
+                args.n_shared_experts if self._fuse_shared_into_routed else 0
+            ),
         )
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -1803,21 +1894,9 @@ class MoE(nn.Module):
             config=moe_cfg,
         )
         self.experts.swiglu_limit = args.swiglu_limit
-        assert args.n_shared_experts == 1
-        # aiter can fuse shared expert into the routed FusedMoE kernel ONLY
-        # when shared and routed have the same quant dtype.
-        # `is_rocm_aiter_fusion_shared_expert_enabled` compares shared vs
-        # GLOBAL (=base dtype), but V4-Pro has routed=FP4 (per-layer override
-        # for `.ffn.experts`) and shared=FP8 (=global). The function returns
-        # True for V4 because shared matches global, missing the routed-shared
-        # mismatch. Direct comparison: get routed and shared specs and compare.
-        routed_dtype = qc.get_layer_quant_config(f"{prefix}.experts").quant_dtype
-        shared_dtype = qc.get_layer_quant_config(f"{prefix}.shared_experts").quant_dtype
-        self._fuse_shared_into_routed = (
-            routed_dtype == shared_dtype
-            and is_rocm_aiter_fusion_shared_expert_enabled()
-        )
+
         if not self._fuse_shared_into_routed:
+            # self.experts.num_fused_shared_experts = 0
             self.shared_experts = Expert(
                 args.dim,
                 args.moe_inter_dim,
@@ -1873,6 +1952,23 @@ class MoE(nn.Module):
             fwd_input_ids is not None
         ), "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
         ids = fwd_input_ids.flatten()
+        # Under DP-attention gather/scatter, forward_impl_graph gathers
+        # hidden_states and gating_output across DP ranks before calling
+        # select_experts → _hash_topk.  input_ids is still local (not
+        # gathered), so topk_ids would be [local_bs, topk] while the
+        # gathered gating_output is [local_bs*dp, n_experts].  Gather
+        # input_ids to match.
+        num_tokens = gating_output.shape[0]
+        if ids.shape[0] < num_tokens:
+            from atom.model_ops.moe import pad_for_all_gather
+
+            ids_2d = ids.unsqueeze(-1)
+            ids_2d, _ = pad_for_all_gather(ids_2d)
+            from aiter.dist.parallel_state import get_dp_group
+
+            ids_2d = get_dp_group().all_gather(ids_2d, dim=0)
+            ids = ids_2d[:num_tokens].flatten()
+            ids = ids.clamp(0, self.gate.tid2eid.shape[0] - 1)
         topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
         scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
         topk_weights = scores.gather(dim=-1, index=topk_ids.long())
@@ -1893,9 +1989,7 @@ class MoE(nn.Module):
         `forward_context.context.input_ids` before each forward, and
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
-        router_logits = self.gate(
-            x, otype=torch.float32
-        )  # [num_tokens, n_routed_experts]
+        router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
         return self.experts(hidden_states=x, router_logits=router_logits)
 
     def combine_outputs(
@@ -1976,11 +2070,18 @@ class Block(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        compress_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
-        self.attn = DeepseekV4Attention(layer_id, args, prefix=f"{prefix}.attn")
+        self.attn = DeepseekV4Attention(
+            layer_id,
+            args,
+            prefix=f"{prefix}.attn",
+            alt_stream=alt_stream,
+            compress_stream=compress_stream,
+        )
         self.ffn = MoE(layer_id, args, prefix=f"{prefix}.ffn", alt_stream=alt_stream)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -2104,10 +2205,12 @@ class Block(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  updated residual stream
         # ----- Attention sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
-        x, post, comb = (
-            self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-            )
+        (
+            x,
+            post,
+            comb,
+        ) = self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)  # [num_tokens, dim]
         x = self.attn(x, positions)  # [num_tokens, dim]
@@ -2125,58 +2228,43 @@ class Block(nn.Module):
         return x
 
 
-class ParallelHead(nn.Module):
-    """LM head with mHC reduction.
+class ParallelHead(ParallelLMHead):
+    """V4 LM head with mHC reduction; vocab-parallel sharded across TP ranks.
 
-    Port of inference/model.py:704-736. Unlike `Block.hc_pre` (which uses
-    Sinkhorn projection on the combination matrix), `hc_head` uses simple
-    `Sigmoid(mix*scale + base) + eps` weights to reduce the [num_tokens, hc, dim]
-    residual to [num_tokens, dim] before applying the LM head linear projection.
+    Port of inference/model.py:704-736. Inherits from `ParallelLMHead` so the
+    vocab-axis sharding, `weight_loader`, last-token slicing, bf16 a16w16 GEMM
+    (`tgemm.mm`), and TP all-gather come for free. V4 only adds:
 
-    `get_logits` projects only the last token of each sequence (decode mode);
-    for prefill the caller should slice the desired positions before passing
-    through.
+    - `forward(...)` taking the mHC residual + hc_head params + final norm
+    - `get_logits(...)` so `compute_logits` can call it directly on the
+      hidden-state output of `model.forward` (CUDAGraph contract)
+    - `hc_head(...)` Sigmoid-gated mHC reduction (vs `Block.hc_pre`'s Sinkhorn)
+
+    Note on weight dtype: the V4 reference (model.py:713-714) keeps the LM head
+    in fp32 because the disk weight is bf16; on AMD CDNA3/CDNA4 the bf16 MFMA
+    instruction accumulates in fp32 natively, so a bf16 GEMM with the
+    bf16-on-disk weight has the same effective precision as the reference's
+    fp32 path while halving VRAM and using the faster a16w16 kernel.
     """
 
     def __init__(
         self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6
     ):
-        super().__init__()
-        self.vocab_size = vocab_size
+        super().__init__(vocab_size, dim, bias=False)
         self.dim = dim
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
-        # PR1 single-rank: full vocab on this rank.
-        self.weight = atom_parameter(
-            torch.empty(self.vocab_size, self.dim, dtype=torch.float32)
-        )
 
     def get_logits(
         self, x: torch.Tensor  # [num_tokens, dim]
     ) -> torch.Tensor:  # [bs, vocab]
-        """Project the last-token-per-seq slice of `x` to vocab logits.
-
-        Picks the last token of each sequence using `cu_seqlens_q` from the
-        forward_context. Falls back to `x[-1:]` (single-seq) when no
-        forward_context is set (warmup / standalone).
+        """Project to vocab logits via the inherited `ParallelLMHead.forward`,
+        which handles last-token slicing (prefill) + tgemm.mm + all-gather.
         """
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"get_logits expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
-        ctx = get_forward_context()
-        cu_seqlens_q = (
-            ctx.attn_metadata.cu_seqlens_q
-            if ctx is not None and ctx.attn_metadata is not None
-            else None
-        )
-        if cu_seqlens_q is not None and cu_seqlens_q.numel() >= 2:
-            # Last-token positions per seq: cu_seqlens_q[1:bs+1] - 1.
-            # block_tables tells us the actual scheduled bs (cu_seqlens_q
-            # may have trailing zeros from the CpuGpuBuffer pool).
-            bs = ctx.attn_metadata.block_tables.size(0)
-            last_idx = cu_seqlens_q[1 : bs + 1] - 1
-            return F.linear(x.index_select(0, last_idx.long()).float(), self.weight)
-        return F.linear(x[-1:].float(), self.weight)
+        return super().forward(x)
 
     def hc_head(
         self,
@@ -2206,9 +2294,8 @@ class ParallelHead(nn.Module):
         norm: nn.Module,
     ) -> torch.Tensor:  # [bs, vocab]
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)  # [num_tokens, dim]
-        logits = self.get_logits(norm(x))  # [bs, vocab]
-        # PR1 single-rank: skip all_gather
-        return logits
+        # get_logits handles the per-rank vocab shard + all-gather internally.
+        return self.get_logits(norm(x))  # [bs, vocab]
 
 
 class MTPBlock(Block):
@@ -2313,10 +2400,14 @@ class DeepseekV4Model(nn.Module):
         # equals nn.Embedding's [vocab_size, dim] so dummy state_dicts load
         # directly. At TP>1 each rank holds vocab_size/tp rows.
         self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
-        # alt_stream for dual-stream MoE (shared_experts // routed_experts).
-        # Allocated once and shared across all blocks; MoE.__init__ decides
-        # per-layer whether to actually use it (env-gated, mismatched-dtype-aware).
+        # alt_stream: dual-stream MoE (shared_experts // routed_experts) AND
+        # Main Compressor overlap. compress_stream: Indexer Compressor overlap.
+        # Both allocated once, shared across all blocks. Attention runs before
+        # MoE in each block, so attn and MoE never contend for alt_stream.
         self.alt_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream() if torch.cuda.is_available() else None
+        )
+        self.compress_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
         self.layers = nn.ModuleList(
@@ -2326,6 +2417,7 @@ class DeepseekV4Model(nn.Module):
                     args,
                     prefix=f"layers.{layer_id}",
                     alt_stream=self.alt_stream,
+                    compress_stream=self.compress_stream,
                 )
                 for layer_id in range(args.n_layers)
             ]
