@@ -269,10 +269,11 @@ CMD ["/bin/bash"]
 # ATOM image: multi-stage parallel build
 #
 # BuildKit runs independent stages in parallel:
-#   base ──┬── build_mori   ──┐
-#          ├── build_rccl   ──┤
-#          ├── build_triton ──┼── atom_image (merge + ATOM install)
-#          └── build_aiter  ──┘
+#   base ──┬── build_mori     ──┐
+#          ├── build_rccl     ──┤
+#          ├── build_triton   ──┼── atom_image (merge + ATOM install)
+#          ├── build_aiter    ──┤
+#          └── build_mooncake ──┘
 # ====================================================================
 
 # --------------------------------------------------------------------
@@ -357,7 +358,50 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
     GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 
 # --------------------------------------------------------------------
-# Stage 5: Final merge — collect all build artifacts + install ATOM
+# Stage 5: Mooncake — parallel
+# --------------------------------------------------------------------
+FROM base AS build_mooncake
+ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
+
+RUN echo "========== [Parallel] Building Mooncake ==========" && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        zip unzip wget gcc make libtool autoconf cmake \
+        librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool \
+        libibverbs-dev rdma-core \
+        openssh-server openmpi-bin openmpi-common libopenmpi-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get remove -y golang golang-go 2>/dev/null || true && \
+    rm -rf /usr/local/go && \
+    wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
+    tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
+    rm go1.22.2.linux-amd64.tar.gz
+
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+RUN git clone https://github.com/kvcache-ai/Mooncake.git /app/mooncake && \
+    cd /app/mooncake && \
+    git checkout $MOONCAKE_COMMIT && \
+    git submodule update --init --recursive
+
+RUN cd /app/mooncake && bash dependencies.sh -y
+
+RUN cd /app/mooncake && \
+    mkdir -p build && cd build && \
+    cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig
+
+RUN cd /app/mooncake/mooncake-wheel && \
+    pip install . && \
+    MOONCAKE_DIR=$(python -c "import mooncake; print(mooncake.__path__[0])") && \
+    cp /app/mooncake/build/mooncake-integration/engine.cpython-*-linux-gnu.so "$MOONCAKE_DIR/" && \
+    python -c "from mooncake.engine import TransferEngine; print('Mooncake ROCm OK')"
+
+# --------------------------------------------------------------------
+# Stage 6: Final merge — collect all build artifacts + install ATOM
 # --------------------------------------------------------------------
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
@@ -393,6 +437,22 @@ RUN --mount=from=build_triton,source=/opt/venv/lib/python3.12/site-packages,targ
 COPY --from=build_aiter /app/aiter-test /app/aiter-test
 RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
     pip show amd-aiter
+
+# Mooncake: copy built libraries, etcd/gRPC runtime, and Python package
+COPY --from=build_mooncake /usr/local/lib/libmooncake* /usr/local/lib/
+COPY --from=build_mooncake /usr/local/lib/libgrpc* /usr/local/lib/
+COPY --from=build_mooncake /usr/local/lib/libprotobuf* /usr/local/lib/
+COPY --from=build_mooncake /usr/local/lib/libabsl* /usr/local/lib/
+COPY --from=build_mooncake /usr/local/lib/libupb* /usr/local/lib/
+COPY --from=build_mooncake /usr/local/lib/libre2* /usr/local/lib/
+COPY --from=build_mooncake /usr/local/bin/etcd /usr/local/bin/etcdctl /usr/local/bin/
+COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake /opt/venv/lib/python3.12/site-packages/mooncake
+COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake-*.dist-info /opt/venv/lib/python3.12/site-packages/
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends librdmacm-dev libibverbs-dev rdma-core && \
+    rm -rf /var/lib/apt/lists/* && \
+    ldconfig && \
+    python -c "from mooncake.engine import TransferEngine; print('Mooncake ROCm OK')"
 
 # RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
 RUN pip install rocm-trace-lite && \
