@@ -41,8 +41,8 @@ class MoRIIOWrapper:
     consumer code paths share this wrapper.
 
     Thread-safety:
-        ``transfer_status``, ``done_req_ids``, and ``done_write_cache_req_ids``
-        are guarded by ``self.lock``.  The ZMQ socket cache ``self._sockets``
+        ``transfer_status``, ``done_req_ids``, ``done_write_cache_req_ids``,
+        and ``done_remote_allocate_req_dict`` are guarded by ``self.lock``.  The ZMQ socket cache ``self._sockets``
         is *not* thread-safe — callers must ensure ``send_notify`` is invoked
         from a single thread.
 
@@ -76,6 +76,7 @@ class MoRIIOWrapper:
         self.lock = threading.Lock()
         self.done_req_ids: list[str] = []
         self.done_write_cache_req_ids: list[str] = []
+        self.done_remote_allocate_req_dict: dict[str, Any] = {}
         self.notify_thread: threading.Thread | None = None
 
         # ZMQ socket cache keyed by endpoint path
