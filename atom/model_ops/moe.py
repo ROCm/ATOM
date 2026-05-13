@@ -978,8 +978,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # logger.warning(layer.config)
         #TODO -- implement layer.config activations
         # if layer.config or something has fp8 activations, return w4a8 version of below
-        logger.warning("self.moe.a_quant_dtype checkkkkkk")
-        logger.warning(self.moe.a_quant_dtype)
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
             
@@ -1026,6 +1024,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 triton_kernel_fused_experts,
                 fused_routing_from_topk_triton,
             )
+
+            logger.warning("x")
+            logger.warning(x)
 
             # Check if the model needs custom routing that triton routing()
             # does not support (grouped topk, sigmoid scoring, bias correction).
@@ -1109,13 +1110,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 activation=activation,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
                 w1_bias=layer.w13_bias,
                 w2_bias=layer.w2_bias,
                 expert_map=expert_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 x_q_dtype=x_q_dtype,
-                static_scale=self.moe.static_scale
             )
 
         topk_weights, topk_ids = FusedMoE.select_experts(
@@ -2165,7 +2167,7 @@ class FusedMoE(torch.nn.Module):
             has_bias=self.has_bias,
             # is_act_and_mul=True,
             is_lora_enabled=False,
-            static_scale=torch.tensor(1e-4, device="cuda:0")
+            static_scale=torch.tensor(6.7e-3, device="cuda:0") # TODO adjust
         )
         self.moe_config = moe
         self.quant_config = quant_config
@@ -3073,6 +3075,9 @@ class FusedMoE(torch.nn.Module):
             if _tbo:
                 tbo_switch_to_compute_sync()
 
+        logger.warning("completely fresh x")
+        logger.warning(hidden_states)
+
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
@@ -3131,6 +3136,8 @@ class FusedMoE(torch.nn.Module):
             hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
             router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
 
+        logger.warning("completely fresh x")
+        logger.warning(hidden_states)
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,

@@ -37,6 +37,24 @@ def quantize(x, dtype):
         x, scale = downcast_to_mxfp(x.to(torch.bfloat16), torch.uint8, axis=1)
         return x, scale
 
+
+# # Process static FP8 input scales (reduce to scalar, warn if not uniform)
+#         w13_input_scale = layer.w13_input_scale
+#         w2_input_scale = layer.w2_input_scale
+#         if w13_input_scale is None or w2_input_scale is None:
+#             raise ValueError(
+#                 "W4A8 (AITER_MXFP4_FP8) requires static input scales, but found "
+#                 "w13_input_scale or w2_input_scale is None."
+#             )
+#         if not all_close_1d(w13_input_scale) or not all_close_1d(w2_input_scale):
+#             logger.warning_once(
+#                 "Found input_scales that are not equal for "
+#                 "fp8 MoE layer. Using the maximum across experts "
+#                 "for each layer."
+#             )
+#         w13_input_scale = w13_input_scale.max().to(torch.float32)
+#         w2_input_scale = w2_input_scale.max().to(torch.float32)
+
 # #moe
 # class FlexCtx:
 #     lhs_data: InFlexData = InFlexData()
