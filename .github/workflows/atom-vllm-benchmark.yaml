@@ -1884,7 +1884,7 @@ jobs:
           def parse_result_filename(path: Path):
               stem = path.stem
               prefix, isl, osl, concurrency, ratio = stem.rsplit("-", 4)
-              return prefix, int(isl), int(osl), int(concurrency), float(ratio)
+              return prefix, int(isl), int(osl), int(concurrency), float(ratio) if ratio else 0.0
 
           default_benchmark_client = os.environ["BENCHMARK_CLIENT"]
 
