@@ -43,6 +43,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             self.config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.fc",
         )
 
         self.layers = torch.nn.ModuleList(
@@ -107,6 +108,8 @@ class Qwen3NextMTP(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
     }
     weights_mapping = {"mtp.": "model."}
 
