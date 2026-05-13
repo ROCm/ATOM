@@ -12,6 +12,7 @@ set -euo pipefail
 # Optional environment variables:
 #   SGLANG_EXTRA_ARGS
 #   SGLANG_ENV_VARS
+#   SGLANG_DEFAULT_SERVER_ARGS
 #   SGLANG_PORT
 #   SGLANG_HOST
 #   MAX_WAIT_RETRIES
@@ -146,11 +147,6 @@ launch_server() {
   local resolved_model_path
   resolved_model_path=$(resolve_model_path "${MODEL_PATH}")
 
-  local -a extra_arg_array=()
-  if [[ -n "${MODEL_EXTRA_ARGS}" ]]; then
-    read -r -a extra_arg_array <<< "${MODEL_EXTRA_ARGS}"
-  fi
-
   prepare_runtime_paths
 
   export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT4}"
@@ -168,6 +164,19 @@ launch_server() {
     done <<< "$(printf '%b' "${MODEL_ENV_VARS}")"
   fi
 
+  local default_server_args
+  default_server_args=${SGLANG_DEFAULT_SERVER_ARGS---trust-remote-code --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --page-size 1 --disable-radix-cache}
+
+  local -a default_arg_array=()
+  if [[ -n "${default_server_args}" ]]; then
+    read -r -a default_arg_array <<< "${default_server_args}"
+  fi
+
+  local -a extra_arg_array=()
+  if [[ -n "${MODEL_EXTRA_ARGS}" ]]; then
+    read -r -a extra_arg_array <<< "${MODEL_EXTRA_ARGS}"
+  fi
+
   rm -rf /root/.cache
 
   rm -f "${SGLANG_PID_FILE}" "${SGLANG_LOG_FILE}" || true
@@ -182,11 +191,7 @@ launch_server() {
     --model-path "${resolved_model_path}" \
     --host "${SGLANG_HOST}" \
     --port "${SGLANG_PORT}" \
-    --trust-remote-code \
-    --kv-cache-dtype fp8_e4m3 \
-    --mem-fraction-static 0.8 \
-    --page-size 1 \
-    --disable-radix-cache \
+    "${default_arg_array[@]}" \
     "${extra_arg_array[@]}" \
     > "${SGLANG_LOG_FILE}" 2>&1 &
 
