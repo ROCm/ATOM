@@ -776,6 +776,17 @@ class Scheduler:
 
             num_tokens = seq.num_tokens - self.mtp_k - num_rejected
             leave_reason = None
+            # MTP edge case: `rejection_sampler` does NOT inspect EOS — it
+            # only compares draft vs target_argmax for acceptance. So when
+            # the verified token is EOS the kernel still emits 1+ accepted
+            # bonus tokens after EOS (often BOS, since the model naturally
+            # starts a new sentence). Without truncating, those post-EOS
+            # tokens leak into the detokenized output (e.g. "...6.<EOS><BOS>").
+            # Empirically confirmed via DIAG: `token_ids=[EOS=1, BOS=0]`,
+            # `eos_idx=0`, `num_new=2`, `num_rejected=0` for V4-Pro MTP-1.
+            # Track the earliest stop position so `num_tokens` can drop the
+            # spurious tail below.
+            stop_at_idx: Optional[int] = None
             # Check if sequence ends with any stop sequence
             for stop_seq in seq.stop_token_sequences:
                 stop_len = len(stop_seq)
@@ -785,6 +796,10 @@ class Scheduler:
                         offset = num_tokens - i
                         if seq.token_ids[offset - stop_len : offset] == stop_seq:
                             is_stop = True
+                            # `i` counts back from the last sampled token
+                            # (i=0 = last). Truncate to include this stop
+                            # sequence (drop everything after it).
+                            stop_at_idx = num_new_token - 1 - i
                             break
                     if is_stop:
                         leave_reason = "stop_sequence"
@@ -793,15 +808,22 @@ class Scheduler:
                 # Check the last token in the list for EOS
                 if token_ids and not seq.ignore_eos and self.eos_token_id in token_ids:
                     leave_reason = "eos"
+                    stop_at_idx = token_ids.index(self.eos_token_id)
                 elif not seq.ignore_eos and any(
                     t in self.stop_token_ids for t in token_ids
                 ):
-                    first_stop_token = next(
-                        t for t in token_ids if t in self.stop_token_ids
+                    stop_at_idx = next(
+                        i for i, t in enumerate(token_ids) if t in self.stop_token_ids
                     )
-                    leave_reason = f"stop_{first_stop_token}"
+                    leave_reason = f"stop_{token_ids[stop_at_idx]}"
                 elif seq.num_completion_tokens >= seq.max_tokens:
                     leave_reason = "max_tokens"
+
+            # Drop accepted-draft tokens past the stop position (MTP only —
+            # for non-spec the sampler emits exactly 1 token so this is a
+            # no-op).
+            if stop_at_idx is not None and stop_at_idx < num_new_token - 1:
+                num_tokens -= (num_new_token - 1) - stop_at_idx
 
             # Prepare stream output
             if stream_output_queue is not None and new_tokens:

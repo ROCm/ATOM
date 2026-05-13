@@ -9,13 +9,16 @@ inside the kernel — no `.item()` syncs.
 
 Currently implemented:
 - `swa_write`: writes `swa_kv[state_slot_per_seq[batch_id_per_token[t]],
-  positions[t] % win, :] = kv[t, :]` for each src row id `t` selected by
-  `write_indices`. The kernel does ALL gathers (kv row, position, batch id,
-  state slot) itself — caller passes only stable forward_vars buffers (full
-  `kv`, full `positions`, full `batch_id_per_token`, per-seq `state_slot`).
-  Race-free for long prefill via the `write_indices` filter (only the last
-  `win` tokens per seq selected); CUDAGraph-safe via sentinel skip
-  (`write_indices[pid] < 0` → bail).
+  positions[t] % cache_size, :] = kv[t, :]` for each src row id `t` selected
+  by `write_indices`. The kernel does ALL gathers (kv row, position, batch
+  id, state slot) itself — caller passes only stable forward_vars buffers
+  (full `kv`, full `positions`, full `batch_id_per_token`, per-seq
+  `state_slot`). Race-free for long prefill via the `write_indices` filter
+  (only the last `cache_size` tokens per seq selected); CUDAGraph-safe via
+  sentinel skip (`write_indices[pid] < 0` → bail). `cache_size` is
+  `window_size + max_spec_steps` — for non-MTP this reduces to `window_size`
+  (no behavioral change); for MTP-k draft tokens get their own ring slots
+  separate from the verified token's slot.
 - `update_compressor_states`: unified in-place update of Compressor's
   per-request `kv_state` + `score_state` ring buffers, covering both prefill
   (B-side overlap context + tail) and decode (every token at `pos % STATE_SIZE`
@@ -31,17 +34,19 @@ Caller contract (`swa_write`):
 - `kv`                  [T, head_dim] flat — full per-fwd KV (forward_vars).
 - `write_indices`       [W] int — src row ids into `kv` / `positions` /
                         `batch_id_per_token`. Sentinel = -1 → kernel skips.
-                        For long prefill (`seqlen > win`) builder pre-filters
-                        to the last `win` rows per seq to avoid `pos % win`
-                        collisions. For decode/MTP every row is written.
+                        For long prefill (`seqlen > cache_size`) builder
+                        pre-filters to the last `cache_size` rows per seq to
+                        avoid `pos % cache_size` collisions. For decode/MTP
+                        every row is written.
 - `positions`           [T] int — full positions buffer (forward_vars).
 - `batch_id_per_token`  [T] int — Phase-B `v4_batch_id_per_token` mapping;
                         kernel does `state_slot_per_seq[batch_id]` for the
                         per-seq state-cache slot. Single per-token mapping
                         principle (no per-token slot alias).
 - `state_slot_per_seq`  [bs] int — `state_slot_mapping_gpu_i32`.
-- `swa_kv`              [num_slots, win, head_dim] in-place buffer.
-- `win`                 int sliding-window size (e.g. 128).
+- `swa_kv`              [num_slots, cache_size, head_dim] in-place buffer.
+- `cache_size`          int ring-slot count = `window_size + max_spec_steps`
+                        (e.g. 128 + 0 = 128 non-MTP; 128 + 1 = 129 MTP-1).
 
 Grid = `write_indices.shape[0]`; each program processes one src row id.
 """
@@ -58,11 +63,11 @@ def _swa_write_kernel(
     positions_ptr,  # [T] int — full positions
     batch_id_per_token_ptr,  # [T] int — v4_batch_id_per_token
     state_slot_per_seq_ptr,  # [bs] int — state_slot_mapping_gpu_i32
-    swa_kv_ptr,  # [num_slots, win, head_dim]
-    swa_kv_slot_stride,  # = win * head_dim
+    swa_kv_ptr,  # [num_slots, cache_size, head_dim]
+    swa_kv_slot_stride,  # = cache_size * head_dim
     swa_kv_pos_stride,  # = head_dim
     head_dim,
-    win,
+    cache_size,
     BLOCK_D: tl.constexpr,
 ):
     """One program per write_indices entry. Sentinel skip via write_indices < 0.
@@ -78,7 +83,7 @@ def _swa_write_kernel(
     pos = tl.load(positions_ptr + src_id)
     bid = tl.load(batch_id_per_token_ptr + src_id)
     slot = tl.load(state_slot_per_seq_ptr + bid)
-    ring_idx = pos % win
+    ring_idx = pos % cache_size
 
     d_offsets = tl.arange(0, BLOCK_D)
     d_mask = d_offsets < head_dim
@@ -103,10 +108,11 @@ def swa_write(
     batch_id_per_token: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
     swa_kv: torch.Tensor,
-    win: int,
+    cache_size: int,
 ) -> None:
-    """In-place write `swa_kv[state_slot_per_seq[bid], pos % win, :] = kv[r, :]`
-    for each `r = write_indices[pid]` (skip pid where `write_indices[pid] < 0`).
+    """In-place write
+    `swa_kv[state_slot_per_seq[bid], pos % cache_size, :] = kv[r, :]` for
+    each `r = write_indices[pid]` (skip pid where `write_indices[pid] < 0`).
 
     Per-token quantities (`pos`, `bid`) are gathered inside the kernel via
     `positions[r]` / `batch_id_per_token[r]`; per-seq `state_slot_per_seq`
@@ -122,21 +128,25 @@ def swa_write(
         positions: [T] int — full forward_vars["positions"].
         batch_id_per_token: [T] int — v4_batch_id_per_token mapping.
         state_slot_per_seq: [bs] int — per-seq state cache slot.
-        swa_kv: [num_slots, win, head_dim] in-place ring buffer.
-        win: sliding-window size.
+        swa_kv: [num_slots, cache_size, head_dim] in-place ring buffer.
+        cache_size: ring-slot count = `window_size + max_spec_steps`.
+            For non-MTP this equals `window_size` and the kernel is bytewise
+            identical to the pre-MTP behavior.
     """
     assert kv.dim() == 2, f"kv must be [T, D], got {kv.shape}"
     assert write_indices.dim() == 1
     assert positions.dim() == 1
     assert batch_id_per_token.dim() == 1
     assert state_slot_per_seq.dim() == 1
-    assert swa_kv.dim() == 3, f"swa_kv must be [S, W, D], got {swa_kv.shape}"
+    assert swa_kv.dim() == 3, f"swa_kv must be [S, C, D], got {swa_kv.shape}"
     T, head_dim = kv.shape
     assert positions.shape[0] >= T, f"positions {positions.shape[0]} < kv T={T}"
     assert (
         batch_id_per_token.shape[0] >= T
     ), f"batch_id_per_token {batch_id_per_token.shape[0]} < kv T={T}"
-    assert swa_kv.shape[1] == win
+    assert (
+        swa_kv.shape[1] == cache_size
+    ), f"swa_kv ring dim {swa_kv.shape[1]} != cache_size {cache_size}"
     assert swa_kv.shape[2] == head_dim
     assert kv.is_contiguous() and swa_kv.is_contiguous()
 
@@ -158,7 +168,7 @@ def swa_write(
         swa_kv.stride(0),
         swa_kv.stride(1),
         head_dim,
-        win,
+        cache_size,
         BLOCK_D=BLOCK_D,
     )
 
@@ -170,7 +180,7 @@ def swa_write_reference(
     batch_id_per_token: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
     swa_kv: torch.Tensor,
-    win: int,
+    cache_size: int,
 ) -> None:
     """Pure-PyTorch reference equivalent of `swa_write`. For tests / dump-bisect.
 
@@ -185,7 +195,7 @@ def swa_write_reference(
     src_pos = positions[src_ids]
     bids = batch_id_per_token[src_ids].long()
     slots = state_slot_per_seq[bids].long()
-    ring_idx = src_pos % win
+    ring_idx = src_pos % cache_size
     swa_kv[slots, ring_idx] = src_kv
 
 

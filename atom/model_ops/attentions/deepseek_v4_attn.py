@@ -141,7 +141,9 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     (= `win + n_committed_hca[bid]`). Padded tail = last value."""
     swa_pages: int = 0
     """Boundary in `unified_kv`: index < swa_pages → SWA region; index >=
-    swa_pages → compress region. Equal to `max_per_req_cache_slots * win`."""
+    swa_pages → compress region. Equal to
+    `max_per_req_cache_slots * win_with_spec` (per-slot SWA region holds
+    `win + mtp_k` ring entries; reduces to `win` when MTP is off)."""
 
     # ----- Indexer / sparse-layout side metadata -----
     indexer_meta: Optional[Dict[str, Any]] = None
@@ -234,93 +236,48 @@ def _segment_indices(
     return token_seq_ids, local_pos
 
 
-def _build_window_topk_batched(
-    positions: torch.Tensor,  # [total_tokens] int (abs token positions)
-    start_pos_per_token: torch.Tensor,  # [total_tokens] int (each token's seq start_pos)
+def _build_window_topk_np(
+    positions: np.ndarray,  # [total_tokens] int (abs token positions)
     window_size: int,
-    out: Optional[
-        torch.Tensor
-    ] = None,  # [total_tokens, window_size] int32 — CG-stable buffer
-) -> torch.Tensor:  # [total_tokens, window_size] int32
+    cache_size: int,  # = window_size + max_spec_steps; SWA ring slot count
+) -> np.ndarray:  # [total_tokens, window_size] int32
     """Per-token sliding-window topk indices for the whole batch.
 
-    Three-branch semantics:
-      - sp == 0 (fresh prefill): matrix entries = abs positions in the window
-        [pos-win+1, pos] clamped to [0, pos]; mask future via -1.
-      - 0 < sp < win-1 (prefix mode): all tokens in the seq share a single
-        matrix [0..sp, -1, ..., -1] (matches original semantics, including
-        MTP-N where the same start_pos is reused).
-      - sp >= win-1 (cyclic mode): cyclic ring offsets starting at sp+1 mod win.
+    Single unified formula (was three branches pre-MTP-fix; case_a/b/c all
+    collapse to the same per-row ring expression — see plan
+    v4-swa-mtp-fix.md §5.2):
 
-    `out`: when supplied, the final int32 result is written into `out`
-    (sliced to `[total_tokens, window_size]`) so its storage address is
-    stable across captures — required for CUDAGraph replay correctness.
-    Intermediates remain transient (not consumed by the captured graph).
-    """
-    device = positions.device
-    total = positions.size(0)
-    arange_w = torch.arange(window_size, device=device, dtype=positions.dtype).view(
-        1, window_size
-    )
-    pos_col = positions.view(total, 1)
-    sp_col = start_pos_per_token.view(total, 1)
-    neg1 = positions.new_full((), -1)
+        idx[t, w] = (positions[t] - W + 1 + w) % cache_size  for w in [0, W)
+        mask -1 if absolute position is < 0 or > positions[t]
 
-    # Case A: sp == 0 (fresh prefill) — abs positions [pos-win+1, pos] clamped.
-    case_a = (pos_col - window_size + 1).clamp(min=0) + arange_w
-    case_a = torch.where(case_a > pos_col, neg1, case_a)
+    Why this works for all three legacy cases:
+      - sp == 0 (fresh prefill): abs ∈ [pos-W+1, pos]; w with abs<0 masked
+        (= old case_a's clamp+future-mask). Mod cache_size is a no-op here
+        because pos < cache_size. Bytewise equivalent to old case_a (modulo
+        the ordering of -1 entries vs valid entries — the consumer kernel
+        is set-based, position-mask-free, so order doesn't matter).
+      - 0 < sp < W-1 (prefix): per-row formula correctly bounds reads to
+        positions actually written by prior fwds (old case_b's shared-per-
+        seq form leaked future KV under MTP — root bug from plan §3).
+      - sp >= W-1 (cyclic): same per-row formula, modulo cache_size puts
+        each token in its own ring window. cs > W guarantees no in-window
+        self-collision; MTP draft slots don't alias verified slots.
 
-    # Case B: 0 < sp < win-1 (prefix mode) — shared per-seq matrix.
-    case_b = arange_w.expand(total, window_size).clone()
-    case_b = torch.where(arange_w > sp_col, neg1, case_b)
+    `cache_size` (= win_with_spec) MUST match the SWA ring dim
+    (`swa_kv.shape[1]`). Using `window_size` here corrupts MTP cache reads.
 
-    # Case C: sp >= win-1 (cyclic mode) — ring offsets.
-    sp_mod = sp_col % window_size
-    case_c = (sp_mod + 1 + arange_w) % window_size
-
-    sp_eq_0 = sp_col == 0
-    sp_in_prefix = (sp_col > 0) & (sp_col < window_size - 1)
-
-    res = case_c
-    res = torch.where(sp_in_prefix.expand_as(res), case_b, res)
-    res = torch.where(sp_eq_0.expand_as(res), case_a, res)
-    if out is None:
-        return res.to(torch.int32)
-    out[:total].copy_(res, non_blocking=True)
-    return out[:total]
-
-
-def _build_window_topk_np(
-    positions: np.ndarray,
-    start_pos_per_token: np.ndarray,
-    window_size: int,
-) -> np.ndarray:
-    """CPU numpy equivalent of ``_build_window_topk_batched``.
-
-    For small decode batches the ~25 GPU kernel launches dominate; this
-    numpy version runs in microseconds on CPU and feeds a single H2D copy.
+    For decode batches the ~25 GPU kernel launches in the GPU equivalent
+    dominate; this numpy version runs in microseconds on CPU and feeds a
+    single H2D copy via the CG-stable `v4_meta_window_topk` buffer.
     """
     total = positions.shape[0]
     arange_w = np.arange(window_size, dtype=np.int64).reshape(1, window_size)
     pos_col = positions.reshape(total, 1)
-    sp_col = start_pos_per_token.reshape(total, 1)
 
-    case_a = np.maximum(pos_col - window_size + 1, 0) + arange_w
-    case_a = np.where(case_a > pos_col, -1, case_a)
-
-    case_b = np.broadcast_to(arange_w, (total, window_size)).copy()
-    case_b = np.where(arange_w > sp_col, -1, case_b)
-
-    sp_mod = sp_col % window_size
-    case_c = (sp_mod + 1 + arange_w) % window_size
-
-    sp_eq_0 = sp_col == 0
-    sp_in_prefix = (sp_col > 0) & (sp_col < window_size - 1)
-
-    res = case_c
-    res = np.where(sp_in_prefix, case_b, res)
-    res = np.where(sp_eq_0, case_a, res)
-    return res.astype(np.int32)
+    abs_pos = pos_col - window_size + 1 + arange_w  # [total, W] absolute positions
+    ring_idx = abs_pos % cache_size
+    ring_idx = np.where((abs_pos < 0) | (abs_pos > pos_col), -1, ring_idx)
+    return ring_idx.astype(np.int32)
 
 
 class DeepseekV4Backend(AttentionBackend):
@@ -416,6 +373,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             int(model_runner.drafter.mtp_k) if hasattr(model_runner, "drafter") else 0
         )
         self.max_decode_tokens = self.max_bs * (1 + self.max_spec_steps)
+        # SWA ring-buffer slots per req. Distinct from `window_size`:
+        #   * `window_size`  = SWA attention window = topk count per token
+        #     (each query attends to W consecutive K/V positions).
+        #   * `win_with_spec` = `window_size + max_spec_steps` = ring-buffer
+        #     slot count per req. With MTP-k the per-fwd writes the verified
+        #     token + k draft tokens at positions [p_0..p_k]; if the cache
+        #     were only sized W, draft slots `p_(i+1)..p_k` would alias into
+        #     [p_0-W+1..p_0] and the verified query at `p_0` would read
+        #     future tokens (silent correctness bug). MTP off → max_spec_steps
+        #     == 0 → win_with_spec == window_size, identical bytes layout.
+        # Used as: SWA `unified_kv` per-slot stride, `swa_kv` ring-buffer dim,
+        # `swa_write` modulo, and the per-row case_c modulo in window_topk.
+        self.win_with_spec = self.window_size + self.max_spec_steps
         # Worst-case HCA per-token committed compress count
         # (= max_model_len // 128 for V4-Pro = 8192 at 1M context).
         self.max_committed_hca = model_runner.config.max_model_len // 128
@@ -449,8 +419,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         csa_main = self._numel(self.csa_main_state_shape) * 2 * elem_state
         csa_idx = self._numel(self.csa_idx_state_shape) * 2 * elem_state
         hca_main = self._numel(self.hca_main_state_shape) * 2 * elem_state
-        # SWA window per layer.
-        swa_per_layer = self.window_size * self.head_dim * elem_swa
+        # SWA window per layer. Cache holds `win_with_spec = win + mtp_k`
+        # slots so MTP draft tokens don't alias verified-token slots.
+        swa_per_layer = self.win_with_spec * self.head_dim * elem_swa
         return (
             len(self.csa_layers) * (csa_main + csa_idx)
             + len(self.hca_layers) * hca_main
@@ -458,7 +429,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def slots_per_req(self) -> int:
-        # No spec decoding lookahead in V4 (pre-PR3-main).
+        # State cache is one slot per req regardless of MTP. The MTP draft
+        # lookahead bytes are absorbed into per-slot SWA size via
+        # `win_with_spec` (above), not into a slots_per_req multiplier.
         return 1
 
     def compute_block_bytes(self) -> int:
@@ -518,10 +491,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         Per-layer `unified_kv` layout (decode-time paged_decode kernel reads
         a single base ptr; offsets `[0, swa_pages)` are SWA, `[swa_pages, ..)`
-        are compress):
-            Dense layer: [num_slots*win,            head_dim] BF16
-            CSA   layer: [num_slots*win + NB*k1,    head_dim] BF16
-            HCA   layer: [num_slots*win + NB*k2,    head_dim] BF16
+        are compress). Per-slot SWA region is `win_with_spec = win + mtp_k`
+        (extra slack so MTP draft tokens don't overwrite the verified token's
+        ring slot mid-fwd):
+            Dense layer: [num_slots*win_with_spec,            head_dim] BF16
+            CSA   layer: [num_slots*win_with_spec + NB*k1,    head_dim] BF16
+            HCA   layer: [num_slots*win_with_spec + NB*k2,    head_dim] BF16
 
         `build_kv_cache_tensor` slices per-layer views to bind into
         `attn.swa_kv` (SWA portion, reshape to [num_slots, win, head_dim])
@@ -544,7 +519,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         num_blocks = self.model_runner.num_physical_kvcache_blocks
         n_csa = len(self.csa_layers)
         n_hca = len(self.hca_layers)
-        swa_pages = num_slots * self.window_size
+        swa_pages = num_slots * self.win_with_spec
         head_dim = self.head_dim
         dtype = self._swa_dtype
 
@@ -614,18 +589,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         runner = self.model_runner
         num_slots = self.model_runner.max_per_req_cache_slots
-        swa_pages = num_slots * self.window_size
+        swa_pages = num_slots * self.win_with_spec
 
         if isinstance(module, _V4Attention):
             # Bind both:
             #   - `attn.unified_kv`: the full per-layer pool (paged_decode reads).
-            #   - `attn.swa_kv`: a [num_slots, win, head_dim] view onto the
-            #     SWA prefix (compatibility with `swa_write` and the existing
-            #     prefill/non-CG path that index_select's by state slot).
+            #   - `attn.swa_kv`: a [num_slots, win_with_spec, head_dim] view
+            #     onto the SWA prefix. Per-slot dim is `win + mtp_k` so MTP
+            #     draft tokens have their own ring slots; `swa_write` modulo
+            #     and `paged_decode` per-row case_c modulo both use this
+            #     dim (= `swa_kv.shape[1]`).
             unified = runner.v4_unified_kv[module.layer_id]
             module.unified_kv = unified
             module.swa_kv = unified[:swa_pages].view(
-                num_slots, self.window_size, self.head_dim
+                num_slots, self.win_with_spec, self.head_dim
             )
             return None
 
@@ -879,6 +856,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs = batch.total_seqs_num_decode
         context_lens_np = np.asarray(batch.context_lens, dtype=np.int32)
         max_seqlen_q = batch.num_spec_step + 1
+        # MTP: roll back ctx by `num_rejected` so this fwd's positions overwrite
+        # last fwd's rejected-draft slots (matches aiter_mla.py:701 /
+        # aiter_attention.py:542). `batch.context_lens` = `seq.num_tokens`
+        # which the scheduler advances by `mtp_k - num_rejected` placeholders
+        # per fwd (scheduler.py:789); without this rollback, MTP-k positions
+        # would skip ahead by `num_rejected` and the rejected slots would
+        # never be overwritten with the corrected K/V. `num_rejected` is None
+        # on dummy runs and on the first fwd before any sampler output.
+        # Bound n_committed_csa/hca via the rolled-back ctx (n_committed_* =
+        # ctx // 4 / 128 in `_attach_v4_paged_decode_meta`), so block_tables
+        # truncation isn't needed here — the per-token kv_len already shrinks.
+        if not batch.is_dummy_run and max_seqlen_q > 1:
+            num_rejected = self.model_runner.tokenID_processor.num_rejected
+            if num_rejected is not None:
+                context_lens_np = context_lens_np - num_rejected.astype(np.int32)
         positions_np = np.tile(
             np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
         ) + np.repeat(context_lens_np - max_seqlen_q, max_seqlen_q)
@@ -1273,12 +1265,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             wi_buf.np[num_write:padded_total_tokens].fill(-1)
 
         # ---- Build window_topk on CPU (avoids ~25 small GPU kernels) ----
-        if is_decode_only:
-            sp_per_token = start_pos_per_seq_np
-        else:
-            sp_per_token = np.repeat(start_pos_per_seq_np, token_num_per_seq)
+        # Per-row formula needs only `positions` + `cache_size` after
+        # case_a/b/c unification (plan v4-swa-mtp-fix.md §5.2): each row's
+        # window is fully determined by its own position. No `start_pos`
+        # broadcast needed.
         positions_long = positions_np[:total_tokens].astype(np.int64)
-        window_topk_np = _build_window_topk_np(positions_long, sp_per_token, win)
+        window_topk_np = _build_window_topk_np(positions_long, win, self.win_with_spec)
         wt_buf = var["v4_meta_window_topk"]
         wt_buf.np[:total_tokens, :win] = window_topk_np
 
@@ -1373,10 +1365,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return
 
         var = self.model_runner.forward_vars
-        win = self.window_size
-        # swa_pages = num_slots * win, layer-invariant; matches the boundary
+        win = self.window_size  # per-token topk count (W indices per token)
+        cs = self.win_with_spec  # SWA region per-slot stride (W + mtp_k)
+        # swa_pages = num_slots * cs, layer-invariant; matches the boundary
         # between SWA and compress regions in unified_kv (Phase A).
-        swa_pages = self.model_runner.max_per_req_cache_slots * win
+        swa_pages = self.model_runner.max_per_req_cache_slots * cs
 
         T = total_tokens
 
@@ -1486,9 +1479,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `window_topk_gpu` [T, win] int32 — passed in from caller
         # (`_attach_v4_per_fwd_meta` builds it once per fwd). Builder-internal
         # intermediate; not exposed on attn_metadata since no kernel reads it.
+        # Stride into unified_kv SWA region is `cs = win_with_spec`, NOT `win`.
+        # `window_topk_gpu` values are 0..cs-1 (case_c modulo cs); each slot
+        # holds `cs` ring entries.
         swa_paged_2d = torch.where(
             window_topk_gpu >= 0,
-            state_slot_per_token_gpu[:, None] * win + window_topk_gpu,
+            state_slot_per_token_gpu[:, None] * cs + window_topk_gpu,
             torch.full_like(window_topk_gpu, -1),
         )  # [T, win] int32
         swa_paged_flat = swa_paged_2d.reshape(-1)  # [T*win] int32
@@ -1583,7 +1579,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return
 
         device = self.device
-        win = self.window_size
+        win = self.window_size  # per-token topk count
+        cs = self.win_with_spec  # SWA region per-slot stride (W + mtp_k)
         index_topk = self.index_topk
         T = total_tokens
         # warmup_model runs BEFORE allocate_kv_cache binds the paged pool
@@ -1594,7 +1591,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         num_slots = getattr(self.model_runner, "max_per_req_cache_slots", 0)
         if num_slots == 0:
             return
-        swa_pages = num_slots * win
+        swa_pages = num_slots * cs
 
         # ----- Per-token quantities (CPU numpy) -----
         cu_seqlens_q_arr = np.asarray(
@@ -1673,7 +1670,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # For each token's prefix SWA segment: positions
         # `[swa_window_low_global[t] + k for k in range(prefix_swa_count[t])]`,
         # paged into `unified_kv` SWA region:
-        #   paged = state_slot[bid] * win + (global_pos % win)
+        #   paged = state_slot[bid] * cs + (global_pos % cs)
+        # where cs = win_with_spec (per-slot ring size). MUST match the same
+        # stride/modulo used by `swa_write` and the decode-path
+        # `_attach_v4_paged_decode_meta`, otherwise prefill prefix reads would
+        # land in the wrong slot once MTP makes cs > win.
         swa_seg_tok, swa_seg_k = _segment_indices(
             np.arange(T, dtype=np.int64), prefix_swa_count_np
         )
@@ -1684,8 +1685,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             swa_window_low_global[swa_seg_tok] + swa_seg_k
         )  # [sum prefix_swa_count] int64
         prefix_swa_paged_np = (
-            state_slot_arr[batch_id_per_token_np[swa_seg_tok]] * win
-            + (prefix_swa_global_pos % win)
+            state_slot_arr[batch_id_per_token_np[swa_seg_tok]] * cs
+            + (prefix_swa_global_pos % cs)
         ).astype(np.int32)
 
         # ----- HCA compress paged offsets (layer-invariant, fully built here) -----
@@ -2020,12 +2021,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_meta_token_num_per_seq"] = CpuGpuBuffer(bs, **i64)
         bufs["v4_meta_state_slot_groups"] = CpuGpuBuffer(bs, **i32)
         bufs["v4_meta_swa_write_indices"] = CpuGpuBuffer(mnbt, **i64)
-        # Window-topk batched output buffer (per-token sliding-window indices).
-        # Sized [mnbt, win] int32 — `_build_window_topk_batched(out=)` writes
-        # into this; the [total_tokens, win] view feeds `_attach_v4_paged_decode_meta`'s
-        # SWA paged-offsets derivation. Builder-internal intermediate, but the
-        # buffer must be CG-capture-stable since it backs a tensor read by the
-        # captured graph (the SWA paged offsets derived from it land in
+        # Window-topk output buffer (per-token sliding-window ring indices).
+        # Sized [mnbt, win] int32 — `_build_window_topk_np` fills the
+        # [total_tokens, win] head; `_attach_v4_paged_decode_meta` derives
+        # SWA paged offsets from it. Builder-internal intermediate, but the
+        # buffer must be CG-capture-stable since it backs a tensor read by
+        # the captured graph (the SWA paged offsets derived from it land in
         # `kv_indices_swa/csa/hca` which the captured kernels do read).
         bufs["v4_meta_window_topk"] = CpuGpuBuffer(mnbt, win, **i32)
 

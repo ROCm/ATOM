@@ -1612,7 +1612,12 @@ class DeepseekV4Attention(nn.Module):
         if get_forward_context().context.is_dummy_run:
             return torch.zeros_like(x)
         num_tokens = x.size(0)
-        win = self.window_size
+        # SWA ring-slot count per req (= window_size + max_spec_steps for
+        # MTP-aware cache). Sourced from the bound cache to avoid threading
+        # `max_spec_steps` through V4Args; for non-MTP this equals
+        # `self.window_size`. Used as the modulo in `swa_write` (and matches
+        # the per-row case_c modulo in window_topk).
+        cache_size = self.swa_kv.shape[1]
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
@@ -1755,17 +1760,18 @@ class DeepseekV4Attention(nn.Module):
         # `sparse_attn` differs because the two kernels read SWA differently:
         #
         # decode (is_pure_decode==True):
-        #   `paged_decode` reads SWA from `unified_kv` ring slot `pos % win`.
-        #   The current decode token's K must be present in the ring before
-        #   attn fires, otherwise the token can't see its own K. So:
+        #   `paged_decode` reads SWA from `unified_kv` ring slot
+        #   `pos % cache_size`. The current decode token's K must be present
+        #   in the ring before attn fires, otherwise the token can't see its
+        #   own K. So:
         #     swa_write → paged_decode
         #
         # prefill / mixed (is_pure_decode==False):
         #   `paged_prefill` reads in-chunk K from per-fwd `kv` tensor (extend
         #   region) and prior-chunk K from `unified_kv` ring (prefix region).
-        #   `swa_write` writes the LAST `win` tokens of THIS fwd into ring
-        #   slots `pos % win`, which OVERLAP with prior-chunk slots that the
-        #   prefix SWA region wants to read (chunked prefill). So:
+        #   `swa_write` writes the LAST `cache_size` tokens of THIS fwd into
+        #   ring slots `pos % cache_size`, which OVERLAP with prior-chunk
+        #   slots that the prefix SWA region wants to read (chunked prefill):
         #     paged_prefill → swa_write
         #   Pure prefill (chunk_start==0) has prefix_swa_count==0 so no prior
         #   ring read; swa_write order is irrelevant in that subcase.
@@ -1779,7 +1785,7 @@ class DeepseekV4Attention(nn.Module):
                     v4_batch_id_per_token,
                     state_slot_mapping,
                     self.swa_kv,
-                    win,
+                    cache_size,
                 )
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
@@ -1824,7 +1830,7 @@ class DeepseekV4Attention(nn.Module):
             )  # [S, H, head_dim]
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see
             # prior-chunk's ring contents (current swa_write would overwrite
-            # ring slots `pos % win` for positions in this chunk's tail).
+            # ring slots `pos % cache_size` for positions in this chunk's tail).
             swa_write(
                 kv,
                 swa_write_indices,
@@ -1832,7 +1838,7 @@ class DeepseekV4Attention(nn.Module):
                 v4_batch_id_per_token,
                 state_slot_mapping,
                 self.swa_kv,
-                win,
+                cache_size,
             )
 
         # Inverse RoPE on output's rope dims to remove absolute-position
