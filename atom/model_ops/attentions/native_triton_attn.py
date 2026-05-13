@@ -294,6 +294,98 @@ def _kv_cache_write_triton(
     )
 
 
+@triton.jit
+def _rope_neox_kernel(
+    Q_PTR,
+    K_PTR,
+    Q_OUT_PTR,
+    K_OUT_PTR,
+    POS_PTR,
+    COS_PTR,
+    SIN_PTR,
+    q_stride_t,
+    q_stride_h,
+    k_stride_t,
+    k_stride_h,
+    cos_stride_pos,
+    T: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_K_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROTARY_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_heads = NUM_Q_HEADS + NUM_K_HEADS
+    token_id = pid // total_heads
+    head_id = pid % total_heads
+
+    d = tl.arange(0, BLOCK_D)
+    half = ROTARY_DIM // 2
+    is_first_half = d < half
+    rot_mask = d < ROTARY_DIM
+    pair_d = tl.where(is_first_half, d + half, d - half)
+    cos_d = tl.where(is_first_half, d, d - half)
+    sign = tl.where(is_first_half, -1.0, 1.0)
+
+    pos = tl.load(POS_PTR + token_id)
+    cos = tl.load(COS_PTR + pos * cos_stride_pos + cos_d, mask=rot_mask, other=1.0)
+    sin = tl.load(SIN_PTR + pos * cos_stride_pos + cos_d, mask=rot_mask, other=0.0)
+
+    if head_id < NUM_Q_HEADS:
+        base = token_id * q_stride_t + head_id * q_stride_h
+        x = tl.load(Q_PTR + base + d).to(tl.float32)
+        x_pair = tl.load(Q_PTR + base + pair_d, mask=rot_mask, other=0.0).to(tl.float32)
+        y = tl.where(rot_mask, x * cos + sign * x_pair * sin, x)
+        out_base = token_id * (NUM_Q_HEADS * HEAD_DIM) + head_id * HEAD_DIM
+        tl.store(Q_OUT_PTR + out_base + d, y.to(Q_OUT_PTR.dtype.element_ty))
+    else:
+        kv_head = head_id - NUM_Q_HEADS
+        base = token_id * k_stride_t + kv_head * k_stride_h
+        x = tl.load(K_PTR + base + d).to(tl.float32)
+        x_pair = tl.load(K_PTR + base + pair_d, mask=rot_mask, other=0.0).to(tl.float32)
+        y = tl.where(rot_mask, x * cos + sign * x_pair * sin, x)
+        out_base = token_id * (NUM_K_HEADS * HEAD_DIM) + kv_head * HEAD_DIM
+        tl.store(K_OUT_PTR + out_base + d, y.to(K_OUT_PTR.dtype.element_ty))
+
+
+def _rope_neox_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    positions: torch.Tensor,
+    rotary_emb,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Neox RoPE to Q/K without torch split/mul/cat kernels."""
+    if not getattr(rotary_emb, "is_neox_style", True):
+        raise RuntimeError("native triton RoPE currently supports Neox style only")
+    T, num_q_heads, head_dim = q.shape
+    _, num_k_heads, _ = k.shape
+    rotary_dim = min(int(rotary_emb.cos_cache.shape[-1]) * 2, head_dim)
+    q_out = torch.empty((T, num_q_heads, head_dim), dtype=q.dtype, device=q.device)
+    k_out = torch.empty((T, num_k_heads, head_dim), dtype=k.dtype, device=k.device)
+    _rope_neox_kernel[(T * (num_q_heads + num_k_heads),)](
+        q,
+        k,
+        q_out,
+        k_out,
+        positions,
+        rotary_emb.cos_cache,
+        rotary_emb.sin_cache,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        rotary_emb.cos_cache.stride(0),
+        T=T,
+        NUM_Q_HEADS=num_q_heads,
+        NUM_K_HEADS=num_k_heads,
+        HEAD_DIM=head_dim,
+        ROTARY_DIM=rotary_dim,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+    )
+    return q_out, k_out
+
+
 class NativeTritonBackend(AttentionBackend):
     """AITER-free attention backend (torch + selectively triton)."""
 
@@ -730,11 +822,7 @@ class NativeTritonAttentionImpl(AttentionImpl):
         v = value.view(total_tokens, self.num_kv_heads, self.head_dim)
 
         if self.rotary_emb is not None and positions is not None:
-            q_flat = q.reshape(total_tokens, self.num_heads * self.head_dim)
-            k_flat = k.reshape(total_tokens, self.num_kv_heads * self.head_dim)
-            q_flat, k_flat = self.rotary_emb(positions, q_flat, k_flat)
-            q = q_flat.view(total_tokens, self.num_heads, self.head_dim)
-            k = k_flat.view(total_tokens, self.num_kv_heads, self.head_dim)
+            q, k = _rope_neox_triton(q, k, positions, self.rotary_emb)
 
         slot_mapping = attn_md.slot_mapping
         if (

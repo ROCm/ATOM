@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from functools import partial as functools_partial
 from typing import Callable, Optional
 
@@ -136,6 +137,54 @@ def _get_aiter_dynamic_per_token_quant():
     return fn if fn is not False else None
 
 
+def _gfx1201_parse_gemm_config_value(value: str, K: int):
+    value = value.strip()
+    if value.lower() == "k":
+        return K
+    if value.lower() in ("none", "null"):
+        return None
+    return int(value)
+
+
+def _gfx1201_apply_gemm_config_spec(cfg: dict, spec: str, K: int) -> dict:
+    if not spec:
+        return cfg
+
+    aliases = {
+        "bm": "BLOCK_SIZE_M",
+        "bn": "BLOCK_SIZE_N",
+        "bk": "BLOCK_SIZE_K",
+        "gm": "GROUP_SIZE_M",
+        "nw": "num_warps",
+        "ns": "num_stages",
+        "weu": "waves_per_eu",
+        "splitk": "SPLITK_BLOCK_SIZE",
+        "ksplit": "NUM_KSPLIT",
+        "minstr": "matrix_instr_nonkdim",
+        "kpack": "kpack",
+    }
+    tuned = dict(cfg)
+    for raw_token in spec.replace(";", ",").split(","):
+        token = raw_token.strip()
+        if not token or token.lower() in ("auto", "default", "base", "current"):
+            continue
+        if "=" in token:
+            key, value = token.split("=", 1)
+            alias = key.strip().lower()
+            if alias not in aliases:
+                raise ValueError(f"Unknown gemm_a8w8 config key: {key!r}")
+            tuned[aliases[alias]] = _gfx1201_parse_gemm_config_value(value, K)
+            continue
+        compact = token.lower()
+        for prefix, key in aliases.items():
+            if compact.startswith(prefix):
+                tuned[key] = _gfx1201_parse_gemm_config_value(token[len(prefix) :], K)
+                break
+        else:
+            raise ValueError(f"Unknown gemm_a8w8 config token: {token!r}")
+    return tuned
+
+
 def _gfx1201_gemm_a8w8_config(M: int, N: int, K: int) -> dict:
     """Hand-tuned config for aiter triton `gemm_a8w8` on gfx1201 (RDNA4).
 
@@ -145,21 +194,71 @@ def _gfx1201_gemm_a8w8_config(M: int, N: int, K: int) -> dict:
     of M-dim launch slots. Cold-cache kernel bench on gfx1201 showed:
 
         layer       default     +GM=1     +best
-        qkv         163 us      67 us     61 us  (M16_N128_K128, NW=8)
-        o            45 us      48 us     43 us  (M64_N64_K128,  NW=8)
-        gate_up     229 us     230 us    214 us  (M64_N64_K128,  NW=8)
-        down        107 us      47 us     43 us  (M16_N128_K128, NW=8)
+        qkv         163 us      67 us     ~52 us (M16_N16_K128,  NW=4)
+        o            45 us      48 us     ~35 us (M64_N32_K128,  NW=8)
+        gate_up     229 us     230 us    ~204 us (M64_N32_K128,  NW=4)
+        down        107 us      47 us     ~42 us (M16_N64_K128,  NW=4)
 
-    Per-decode-step savings vs default: ~6 ms across 34 layers — TPOT
-    drops from ~22 ms to ~16 ms (45 -> 62 tok/s, 53% -> 72% of memory
-    roofline). The dominant lever is `GROUP_SIZE_M=1`; the BLOCK_SIZE_M
-    and `num_warps` choices add a few more us each.
+    The dominant lever is `GROUP_SIZE_M=1`; the N tile and warp choices
+    below are the best measured full-profile defaults on RX 9070 XT. A
+    naive M=1 vector GEMV prototype was correct but slower than this
+    matrix-core path, so the default stays on aiter's GEMM kernel.
     """
     # Pick by N (the output dim). The per-N optimum is stable across our M.
     if N >= 16384:  # gate_up (28672) — large N, full M-tile pays
-        return {
+        shape = "gate_up"
+        cfg = {
             "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "NUM_KSPLIT": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+            "cache_modifier": None,
+            "SPLITK_BLOCK_SIZE": 4096,
+        }
+    elif K >= 8192:  # down (K=14336) — narrow N, deep K
+        shape = "down"
+        cfg = {
+            "BLOCK_SIZE_M": 16,
             "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "NUM_KSPLIT": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+            "cache_modifier": None,
+            "SPLITK_BLOCK_SIZE": K,
+        }
+    elif N >= 6144:  # qkv
+        shape = "qkv"
+        cfg = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 16,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "NUM_KSPLIT": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+            "cache_modifier": None,
+            "SPLITK_BLOCK_SIZE": 4096,
+        }
+    else:
+        # o_proj (N=4096): narrower N tile wins on gfx1201.
+        shape = "o"
+        cfg = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 32,
             "BLOCK_SIZE_K": 128,
             "GROUP_SIZE_M": 1,
             "NUM_KSPLIT": 1,
@@ -171,41 +270,13 @@ def _gfx1201_gemm_a8w8_config(M: int, N: int, K: int) -> dict:
             "cache_modifier": None,
             "SPLITK_BLOCK_SIZE": 4096,
         }
-    if K >= 8192:  # down (K=14336) — deep K, modest N
-        # Re-tuned across bs=1..32 (scripts/gfx1201/gemm_a8w8_sweep.py):
-        # M32_N64 is consistent-or-better than M16_N128 (0-12 percent
-        # faster at bs=4..32, equal at bs=1,2,8,16). Critical: SPLITK_BLOCK_SIZE
-        # MUST be >= K (with NUM_KSPLIT=1) — a smaller value silently truncates
-        # the K-loop and produces wrong output (cost us a debug cycle).
-        return {
-            "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 1,
-            "NUM_KSPLIT": 1,
-            "num_warps": 8,
-            "num_stages": 2,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 1,
-            "cache_modifier": None,
-            "SPLITK_BLOCK_SIZE": K,  # MUST cover all of K
-        }
-    # qkv (N=6144) and o (N=4096): default-ish tile, GROUP_SIZE_M=1
-    return {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 1,
-        "NUM_KSPLIT": 1,
-        "num_warps": 8,
-        "num_stages": 2,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
-        "kpack": 1,
-        "cache_modifier": None,
-        "SPLITK_BLOCK_SIZE": 4096,
-    }
+
+    cfg = _gfx1201_apply_gemm_config_spec(
+        cfg, os.getenv("ATOM_GFX1201_GEMM_A8W8_CONFIG", ""), K
+    )
+    return _gfx1201_apply_gemm_config_spec(
+        cfg, os.getenv(f"ATOM_GFX1201_GEMM_A8W8_CONFIG_{shape.upper()}", ""), K
+    )
 
 
 def _fp8_per_tensor_linear_triton(
@@ -238,16 +309,16 @@ def _fp8_per_tensor_linear_triton(
     # same FP8 dtype because each row gets its own scale.
     # gemm_a8w8 accepts (M, 1) per-row x_scale natively, so we feed
     # x_scale_full directly with no reshape/expand chain.
-    fused_quant = _get_aiter_dynamic_per_token_quant()
-    x_q = torch.empty((M, K), dtype=fp8_dtype, device=x.device)
-    x_scale_full = torch.empty((M, 1), dtype=torch.float32, device=x.device)
-    fused_quant(x_q, x, x_scale_full)
-
     # Reinterpret raw uint8 weight as FP8 (no copy).
     w_q = weight.view(fp8_dtype)
 
     # Per-output-channel weight scale — cached on the layer (constant per fwd).
     w_scale_full = _build_w_scale_full(weight_scale, output_partition_sizes, N)
+
+    fused_quant = _get_aiter_dynamic_per_token_quant()
+    x_q = torch.empty((M, K), dtype=fp8_dtype, device=x.device)
+    x_scale_full = torch.empty((M, 1), dtype=torch.float32, device=x.device)
+    fused_quant(x_q, x, x_scale_full)
 
     cfg = _gfx1201_gemm_a8w8_config(M, N, K)
     return triton_gemm(

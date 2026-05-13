@@ -18,9 +18,11 @@ except ImportError:
     # models still import cleanly.
     def topk_gating(*args, **kwargs):
         raise RuntimeError(
-            'aiter.topk_gating is not available in this aiter build; '
-            'DeepSeek-V4 MoE routing path is unsupported here'
+            "aiter.topk_gating is not available in this aiter build; "
+            "DeepSeek-V4 MoE routing path is unsupported here"
         )
+
+
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
@@ -34,12 +36,11 @@ except ImportError:
     # MoE paths that need it will raise on call; non-MoE models load fine.
     def shuffle_scale(*args, **kwargs):
         raise RuntimeError(
-            'aiter.ops.shuffle.shuffle_scale is not available in this aiter '
-            'build; MoE blockscale path is unsupported here'
+            "aiter.ops.shuffle.shuffle_scale is not available in this aiter "
+            "build; MoE blockscale path is unsupported here"
         )
 
 
-from aiter.utility import fp4_utils
 from atom.config import (
     Config,
     QuantizationConfig,

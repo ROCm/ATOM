@@ -39,6 +39,7 @@ This document describes the environment variables used in the ATOM project.
 |----------|------|---------|-------------|
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
+| **ATOM_GFX1201_LM_HEAD_FP8** | bool | 1 (true) | On gfx1201/RDNA4, quantize BF16 `lm_head` weights once and run logits projection through Triton `gemm_a8w8`. Set to `0` to force the BF16 `tgemm` path. |
 
 ---
 
