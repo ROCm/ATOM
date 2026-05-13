@@ -7,8 +7,8 @@ concurrency:
 
 on:
   schedule:
-    # Nightly at 23:00 Beijing time (15:00 UTC)
-    - cron: '0 15 * * 0-4'
+    # Nightly at 21:00 Beijing time (13:00 UTC)
+    - cron: '0 13 * * 0-4'
   workflow_dispatch:
     inputs:
       benchmark_client:
@@ -931,11 +931,14 @@ jobs:
           PY
 
       - name: Print selected models
+        env:
+          SELECTED_GROUP: ${{ steps.load.outputs.selected_group }}
+          MODELS_JSON: ${{ steps.load.outputs.models_json }}
         run: |
-          if [ -n "${{ steps.load.outputs.selected_group }}" ]; then
-            echo "Scheduled nightly benchmark group: ${{ steps.load.outputs.selected_group }}"
+          if [[ -n "${SELECTED_GROUP}" ]]; then
+            echo "Scheduled nightly benchmark group: ${SELECTED_GROUP}"
           fi
-          echo "Selected models: ${{ steps.load.outputs.models_json }}"
+          printf 'Selected models: %s\n' "${MODELS_JSON}"
 
   build-benchmark-matrix:
     name: Build OOT benchmark matrix
@@ -1881,7 +1884,7 @@ jobs:
           def parse_result_filename(path: Path):
               stem = path.stem
               prefix, isl, osl, concurrency, ratio = stem.rsplit("-", 4)
-              return prefix, int(isl), int(osl), int(concurrency), float(ratio)
+              return prefix, int(isl), int(osl), int(concurrency), float(ratio) if ratio else 0.0
 
           default_benchmark_client = os.environ["BENCHMARK_CLIENT"]
 
