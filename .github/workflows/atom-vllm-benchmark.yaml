@@ -7,8 +7,8 @@ concurrency:
 
 on:
   schedule:
-    # Nightly at 23:00 Beijing time (15:00 UTC)
-    - cron: '0 15 * * 0-4'
+    # Nightly at 21:00 Beijing time (13:00 UTC)
+    - cron: '0 13 * * 0-4'
   workflow_dispatch:
     inputs:
       benchmark_client:
