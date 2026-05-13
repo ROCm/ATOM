@@ -840,11 +840,8 @@ class vllmMLAAttentionMetadataBuilderMethods:
         )
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
 
-        max_qo_len = (
-            (query_start_loc_cpu[-1] - query_start_loc_cpu[-2]).item()
-            if query_start_loc_cpu.numel() > 1
-            else 1
-        )
+        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_qo_len = qo_len.max().item()
         kv_indices_generate_triton(
             block_table_tensor,
             self.paged_kv_indices,
@@ -881,9 +878,6 @@ class vllmMLAAttentionMetadataBuilderMethods:
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        # MTP/spec decode can verify multiple decode tokens per request in one
-        # forward pass. The persistent MLA metadata must use the actual query
-        # length rather than assuming single-token decode.
         ctx_mla_ps = self._set_mla_persistent_worker_buffers(
             num_reqs, qo_indptr, max_qo_len
         )
