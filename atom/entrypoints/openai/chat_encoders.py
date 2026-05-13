@@ -16,9 +16,20 @@ import logging
 import os
 from typing import Any, Callable, List, Optional
 
+from huggingface_hub import snapshot_download
+
 logger = logging.getLogger("atom")
 
 MessageEncoder = Callable[..., str]
+
+
+def _resolve_model_path(model: str) -> str:
+    if os.path.isdir(model):
+        return model
+    try:
+        return snapshot_download(model, local_files_only=True, allow_patterns=[])
+    except Exception:
+        return model
 
 
 def _load_encoder_from_dir(model_path: str) -> Optional[MessageEncoder]:
@@ -71,7 +82,7 @@ def load_custom_message_encoder(model_path: str) -> Optional[MessageEncoder]:
     ``chat_template`` path. Result should be cached by the caller — this does
     filesystem IO and a Python import.
     """
-    return _load_encoder_from_dir(model_path)
+    return _load_encoder_from_dir(_resolve_model_path(model_path))
 
 
 def apply_chat_template(

@@ -207,13 +207,13 @@ def _fused_compress_attn_kernel(
             mask=d_mask,
             other=0.0,
             eviction_policy="evict_first",
-        )
+        ).to(tl.float32)
         score_a = tl.load(
             score_in_ptr + in_row * score_in_row_stride + col_off + d,
             mask=d_mask,
             other=0.0,
             eviction_policy="evict_first",
-        )
+        ).to(tl.float32)
         ape_v = tl.load(
             ape_ptr + ape_row * dim_full + col_off + d,
             mask=d_mask,

@@ -44,6 +44,12 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.fusions.fused_clamp_act_mul import (
+    fused_clamp_act_mul,
+)
+from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
+    fused_reduce_qk_norm_rope_swa_write,
+)
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
     Config,
@@ -117,6 +123,9 @@ _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
 # forward burns syscalls (V4-Pro: 64 layers × multiple sites per call).
 _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
+# Fused-kernel switches. Default off; flip via env to A/B against the eager path.
+_V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -124,6 +133,111 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
+
+
+def _fused_qk_norm_rope_swa_write_fake(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    kv_weight: torch.Tensor,
+    eps: float,
+    win: int,
+    swa_write_indices: Optional[torch.Tensor] = None,
+    batch_id_per_token: Optional[torch.Tensor] = None,
+    state_slot_mapping: Optional[torch.Tensor] = None,
+    swa_kv: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    M = q.shape[0]
+    return torch.empty(
+        (M, n_local_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+
+
+@torch_compile_guard(gen_fake=_fused_qk_norm_rope_swa_write_fake)
+def fused_qk_norm_rope_swa_write(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    kv_weight: torch.Tensor,
+    eps: float,
+    win: int,
+    swa_write_indices: Optional[torch.Tensor] = None,
+    batch_id_per_token: Optional[torch.Tensor] = None,
+    state_slot_mapping: Optional[torch.Tensor] = None,
+    swa_kv: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw + RoPE on
+    q/kv tail (+ SWA write) in a single triton kernel.
+
+    `kv` must already be kv_norm-applied; the kernel does not weight-norm kv.
+    `kv` is RoPE-mutated in place. When all SWA tensors are provided, the
+    kernel also writes the windowed kv into `swa_kv`; the caller must then
+    skip the standalone `swa_write` for those rows.
+    """
+    num_tokens = q.shape[0]
+    if num_tokens <= 64:
+        q_out = torch.empty(
+            (num_tokens, n_local_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        fused_reduce_qk_norm_rope_swa_write(
+            q,
+            kv,
+            None,
+            kv_weight,
+            eps,
+            eps,
+            rope_head_dim,
+            cos_cache,
+            sin_cache,
+            positions,
+            q_out=q_out,
+            is_neox=False,
+            dtype=torch.bfloat16,
+            write_indices=swa_write_indices,
+            batch_id_per_token=batch_id_per_token,
+            state_slot_mapping=state_slot_mapping,
+            swa_kv=swa_kv,
+            win=win,
+        )
+    else:
+        q = q.view(num_tokens, n_local_heads, head_dim)
+        q_out = _rmsnorm_nw(q, eps, head_dim)
+        kv = rmsnorm2d_fwd_(kv, kv_weight, eps, kv.shape[-1])
+        aiter.rope_cached_positions_2c_fwd_inplace(
+            q_out[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
+            kv[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
+            cos_cache,
+            sin_cache,
+            positions.view(1, num_tokens),
+            1,
+            reuse_freqs_front_part=True,
+            nope_first=False,
+        )
+        if swa_write_indices is not None:
+            swa_write(
+                kv,
+                swa_write_indices,
+                positions,
+                batch_id_per_token,
+                state_slot_mapping,
+                swa_kv,
+                win,
+            )
+    return q_out
 
 
 def _make_weightless_rmsnorm(dim: int, eps: float) -> RMSNorm:
@@ -1385,6 +1499,8 @@ class DeepseekV4Attention(nn.Module):
             self.alt_stream is not None and self.compressor is not None
         )
 
+        self.use_fuse_qk_norm_rope_swa_write = _V4_USE_TRITON_FUSION
+
         self.layer_name = prefix
         atom_config = get_current_atom_config()
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
@@ -1500,6 +1616,28 @@ class DeepseekV4Attention(nn.Module):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
+        # Idempotent one-time plumb of rotary_emb into compressor / indexer
+        # (and the indexer's inner compressor). `rotary_emb` is set by the
+        # owning layer after __init__, so this can't move into __init__.
+        if self.compress_ratio and self.compressor.rotary_emb is None:
+            self.compressor.rotary_emb = self.rotary_emb
+            if self.indexer is not None:
+                self.indexer.rotary_emb = self.rotary_emb
+                self.indexer.compressor.rotary_emb = self.rotary_emb
+
+        # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
+        # All per-fwd state read once. Production prepare_decode/prefill
+        # always populates these; warmup goes through the same path
+        # (`_populate_state_slot_mapping` falls back to slot 0).
+        # Cast to V4 typed metadata so V4-specific attribute access (v4_*,
+        # compress_plans, swa_write_indices, ...) is well-typed for pyright.
+        attn_md = cast("AttentionMetaData_DSV4", get_forward_context().attn_metadata)
+        compress_plans = attn_md.compress_plans
+        swa_write_indices = attn_md.swa_write_indices
+        v4_batch_id_per_token = attn_md.batch_id_per_token
+        block_tables_gpu = attn_md.block_tables
+        state_slot_mapping = attn_md.state_slot_mapping
+
         # ----- Batched ops on full flat tensors -----
         # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
         # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
@@ -1529,16 +1667,51 @@ class DeepseekV4Attention(nn.Module):
             not _V4_FORCE_UE8M0_QUANT
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
         qr, qr_scale = self.q_norm(q_lora)
-        # Flat q_flat is [num_tokens, n_local_heads * head_dim]; DualRMSNorm
-        # views internally to per-head shape and returns flat. Single Triton
-        # launch fuses per-head Q RMSNorm (weightless) + KV RMSNorm (both
-        # head_dim=128), replacing the prior `_rmsnorm_nw + kv_norm` pair.
-        q_flat = self.wq_b(qr, x_scale=qr_scale)
-        q_flat, kv = self.qk_norm(q_flat, kv_pre)
-        q = q_flat.view(num_tokens, self.n_local_heads, self.head_dim)
-        # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
-        # to (1, num_tokens, ...) for aiter's per-position rope kernel.
-        self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
+        q = self.wq_b(qr, x_scale=qr_scale)
+        if attn_md.is_pure_decode and self.use_fuse_qk_norm_rope_swa_write:
+            # Fused: wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw
+            # + RoPE on q tail + RoPE on kv tail (+ SWA write) in one triton
+            # kernel. KV RMSNorm stays out (kernel doesn't apply weighted norm
+            # to kv); the standalone swa_write below is gated off when this
+            # path runs since the kernel already wrote the window slots.
+            cos_cache, sin_cache = self.rotary_emb._caches(x.device)
+            if swa_write_indices is not None:
+                write_indices = swa_write_indices
+                batch_id = v4_batch_id_per_token
+                slot_map = state_slot_mapping
+                swa_kv_buf = self.swa_kv
+            else:
+                write_indices = None
+                batch_id = None
+                slot_map = None
+                swa_kv_buf = None
+            q = fused_qk_norm_rope_swa_write(
+                q,
+                kv_pre,
+                cos_cache,
+                sin_cache,
+                positions,
+                self.n_local_heads,
+                self.head_dim,
+                rd,
+                self.kv_norm.weight,
+                self.eps,
+                win,
+                swa_write_indices=write_indices,
+                batch_id_per_token=batch_id,
+                state_slot_mapping=slot_map,
+                swa_kv=swa_kv_buf,
+            )
+        else:
+            # Flat q_flat is [num_tokens, n_local_heads * head_dim]; DualRMSNorm
+            # views internally to per-head shape and returns flat. Single Triton
+            # launch fuses per-head Q RMSNorm (weightless) + KV RMSNorm (both
+            # head_dim=128), replacing the prior `_rmsnorm_nw + kv_norm` pair.
+            q_flat, kv = self.qk_norm(q, kv_pre)
+            q = q_flat.view(num_tokens, self.n_local_heads, self.head_dim)
+            # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
+            # to (1, num_tokens, ...) for aiter's per-position rope kernel.
+            self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
@@ -1598,15 +1771,16 @@ class DeepseekV4Attention(nn.Module):
         #   ring read; swa_write order is irrelevant in that subcase.
         q_sa = q.contiguous()
         if attn_md.is_pure_decode:
-            swa_write(
-                kv,
-                swa_write_indices,
-                positions,
-                v4_batch_id_per_token,
-                state_slot_mapping,
-                self.swa_kv,
-                win,
-            )
+            if not self.use_fuse_qk_norm_rope_swa_write:
+                swa_write(
+                    kv,
+                    swa_write_indices,
+                    positions,
+                    v4_batch_id_per_token,
+                    state_slot_mapping,
+                    self.swa_kv,
+                    win,
+                )
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
                 kv_indptr = attn_md.kv_indptr_swa
@@ -1769,6 +1943,10 @@ class Expert(nn.Module):
             prefix=f"{prefix}.w2",
         )
         self.swiglu_limit = swiglu_limit
+        # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
+        # quant through a single aiter triton kernel. The fused kernel emits
+        # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
+        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
 
     def forward(
         self,
@@ -1782,6 +1960,16 @@ class Expert(nn.Module):
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        if self.use_fused_clamp_act_mul:
+            x_fp8, x_scale = fused_clamp_act_mul(
+                combined,
+                swiglu_limit=self.swiglu_limit,
+                activation="silu",
+                weights=weights,
+                dtype_quant=dtypes.fp8,
+                transpose_scale=True,
+            )
+            return self.w2(x_fp8, x_scale=x_scale)
         out = torch.empty(
             (combined.shape[0], combined.shape[-1] // 2),
             dtype=dtype,
