@@ -558,9 +558,11 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
+            cached_per_req = [s.num_cached_tokens for s in scheduled_seqs.values()]
             logger.info(
                 f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
-                f"{total_tokens_num_prefill} tokens, "
+                f"{total_tokens_num_prefill} new tokens "
+                f"(cached: {cached_per_req}, new: {num_scheduled_tokens}), "
                 f"req_ids: {tuple(scheduled_seqs.keys())}"
             )
             self.prev_prompt = True

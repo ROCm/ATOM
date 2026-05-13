@@ -754,7 +754,7 @@ class SpeculativeConfig:
         # For multimodal models, extract text_config
         if hasattr(self.draft_model_hf_config, "text_config"):
             self.draft_model_hf_config = self.draft_model_hf_config.text_config
-        self.hf_config_override(self.draft_model_hf_config)
+        self.hf_config_override(self.draft_model_hf_config, self.model)
 
         if self.method == "eagle3":
             if getattr(self.draft_model_hf_config, "kv_lora_rank", None):
@@ -778,7 +778,9 @@ class SpeculativeConfig:
                 self.use_aux_hidden_state = True
 
     @staticmethod
-    def hf_config_override(hf_config: PretrainedConfig) -> None:
+    def hf_config_override(
+        hf_config: PretrainedConfig, model_path: Optional[str] = None
+    ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
         if arch == "LlamaForCausalLMEagle3":
@@ -806,10 +808,33 @@ class SpeculativeConfig:
                 "num_nextn_predict_layers": n_predict,
                 "architectures": [arch],
             }
-            # Qwen3.5 MTP needs expert counts for MoE layer construction
-            if hf_config.model_type == "qwen3_5_mtp":
-                updates["n_shared_experts"] = 1
-                updates["n_routed_experts"] = getattr(hf_config, "num_experts", 0)
+            # Naming differs across families:
+            #   DeepSeek / GLM       → already have `n_routed_experts`
+            #   Qwen3.5 / Qwen3-Next → only carry `num_experts`
+            #   non-MoE / unknown    → leave unset (no MoE = no field)
+            n_routed = getattr(
+                hf_config,
+                "n_routed_experts",
+                getattr(hf_config, "num_experts", None),
+            )
+            if n_routed is not None:
+                updates["n_routed_experts"] = n_routed
+            # n_shared_experts: prefer the field's own value if it exists
+            # (DeepSeek / GLM ship it natively); else scan the checkpoint
+            # for `shared_expert` weights and use the parsed count (1 for
+            # the flat-block layout every released model uses). Leaving
+            # the field unset for ckpts without shared experts avoids
+            # fabricating a phantom shared block (e.g. R1 MTP eh_proj
+            # would otherwise pull a stale BF16 weight_scale).
+            existing_n_shared = getattr(hf_config, "n_shared_experts", None)
+            if existing_n_shared is not None:
+                updates["n_shared_experts"] = existing_n_shared
+            else:
+                from atom.models.utils import ckpt_shared_expert_count
+
+                n_shared = ckpt_shared_expert_count(model_path)
+                if n_shared > 0:
+                    updates["n_shared_experts"] = n_shared
 
             hf_config.update(updates)
 
@@ -853,7 +878,7 @@ class Config:
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool = True
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -996,6 +1021,16 @@ class Config:
             v4_block_size = 128
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+            # TODO: V4's per-request SWA buffer cannot be restored from the classical
+            # KV pool on prefix cache hit, so disable prefix caching silently.
+            if self.enable_prefix_caching:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "DeepSeek-V4 does not support prefix caching "
+                    "(SWA buffer is not cacheable); disabling automatically."
+                )
+                self.enable_prefix_caching = False
 
     def compute_hash(self) -> str:
         """

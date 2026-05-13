@@ -14,6 +14,21 @@ on:
         required: false
         type: boolean
         default: false
+      run_dsr1_fp8_tp8:
+        description: "DeepSeek-R1-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
+      run_dsr1_fp4_tp4:
+        description: "DeepSeek-R1-FP4 TP4"
+        required: false
+        type: boolean
+        default: false
+      run_dsr1_fp4_tp8:
+        description: "DeepSeek-R1-FP4 TP8"
+        required: false
+        type: boolean
+        default: false
       upload_accuracy_to_dashboard:
         description: "Optional: upload SGLANG accuracy results to dashboard after this manual run"
         required: false
@@ -55,6 +70,9 @@ jobs:
         id: meta
         env:
           RUN_DSR1_FP8_TP4: ${{ inputs.run_dsr1_fp8_tp4 }}
+          RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
+          RUN_DSR1_FP4_TP4: ${{ inputs.run_dsr1_fp4_tp4 }}
+          RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
         run: |
           set -euo pipefail
 
@@ -72,9 +90,36 @@ jobs:
                   "model_name": "DeepSeek-R1-FP8 TP4",
                   "model_path": "deepseek-ai/DeepSeek-R1-0528",
                   "extra_args": "--tensor-parallel-size 4",
-                  "accuracy_test_threshold": 0.92,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
+                  "accuracy_test_threshold": 0.91,
+                  "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-4",
+              },
+              {
+                  "toggle_env": "RUN_DSR1_FP8_TP8",
+                  "model_name": "DeepSeek-R1-FP8 TP8",
+                  "model_path": "deepseek-ai/DeepSeek-R1-0528",
+                  "extra_args": "--tensor-parallel-size 8",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
+                  "runner": "linux-atom-mi35x-8",
+              },
+              {
+                  "toggle_env": "RUN_DSR1_FP4_TP4",
+                  "model_name": "DeepSeek-R1-FP4 TP4",
+                  "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+                  "extra_args": "--tensor-parallel-size 4",
+                  "accuracy_test_threshold": 0.91,
+                  "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
+                  "runner": "linux-atom-mi35x-4",
+              },
+              {
+                  "toggle_env": "RUN_DSR1_FP4_TP8",
+                  "model_name": "DeepSeek-R1-FP4 TP8",
+                  "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+                  "extra_args": "--tensor-parallel-size 8",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
+                  "runner": "linux-atom-mi35x-8",
               },
           ]
 

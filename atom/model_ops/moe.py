@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_softplus
+from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
@@ -2644,13 +2644,14 @@ class FusedMoE(torch.nn.Module):
                 topk_weights = torch.empty(
                     tokens_num, top_k, dtype=torch.float32, device=router_logits.device
                 )
-                topk_softplus(
+                topk_gating(
                     topk_weights,
                     topk_ids,
                     router_logits,
                     e_score_correction_bias,
                     renormalize,
                     routed_scaling_factor,
+                    score_func="sqrtsoftplus",
                 )
             else:
                 raise ValueError(

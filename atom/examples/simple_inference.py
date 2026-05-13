@@ -2,9 +2,12 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import os
 
 from atom import SamplingParams
+from atom.entrypoints.openai.chat_encoders import (
+    apply_chat_template,
+    load_custom_message_encoder,
+)
 from atom.model_engine.arg_utils import EngineArgs
 from transformers import AutoTokenizer
 
@@ -61,41 +64,11 @@ def main():
         temperature=args.temperature, max_tokens=args.max_tokens
     )
 
-    # Apply chat template. DeepSeek-V4 ships without a HuggingFace
-    # chat_template; use its custom encoding_dsv4.py if available.
-    if getattr(tokenizer, "chat_template", None):
-        prompts = [
-            tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=True,
-            )
-            for prompt in prompts
-        ]
-    else:
-        try:
-            import importlib.util
-
-            enc_path = os.path.join(args.model, "encoding", "encoding_dsv4.py")
-            if os.path.exists(enc_path):
-                spec = importlib.util.spec_from_file_location("encoding_dsv4", enc_path)
-                enc_mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(enc_mod)
-                prompts = [
-                    enc_mod.encode_messages(
-                        [{"role": "user", "content": p}], thinking_mode="chat"
-                    )
-                    for p in prompts
-                ]
-                print(
-                    f"  (applied V4 encoding_dsv4, prompt tokens: "
-                    f"{[len(tokenizer.encode(p)) for p in prompts]})"
-                )
-            else:
-                print("  (tokenizer has no chat_template — feeding raw prompts as-is)")
-        except Exception as e:
-            print(f"  (V4 encoding failed: {e} — feeding raw prompts as-is)")
+    custom_encoder = load_custom_message_encoder(args.model)
+    prompts = [
+        apply_chat_template(tokenizer, custom_encoder, [{"role": "user", "content": p}])
+        for p in prompts
+    ]
     print("This is prompts:", prompts)
     # print("Warming up...")
     # _ = llm.generate(["warmup"], sampling_params)
