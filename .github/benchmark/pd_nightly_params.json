@@ -1,0 +1,15 @@
+[
+    {
+      "isl": 1024,
+      "osl": 1024,
+      "concurrency": [32, 64, 128, 256, 512, 1024, 2048],
+      "random_range_ratio": 0.8
+    },
+    {
+      "isl": 8192,
+      "osl": 1024,
+      "concurrency": [32, 64, 128, 256, 512, 1024, 2048],
+      "random_range_ratio": 0.8
+    }
+  ]
+  

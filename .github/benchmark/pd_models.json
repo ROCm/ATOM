@@ -1,0 +1,23 @@
+[
+    {
+      "display": "DeepSeek-R1-PD-1P4-1D8",
+      "path": "deepseek-ai/DeepSeek-R1-0528",
+      "prefix": "deepseek-r1-pd-1p4-1d8",
+      "prefill_args": "--kv_cache_dtype fp8 -tp 4",
+      "decode_args": "--kv_cache_dtype fp8 -tp 8",
+      "num_decode_nodes": 1,
+      "bench_args": "",
+      "env_vars": ""
+    },
+    {
+      "display": "DeepSeek-R1-PD-1P8-2D8",
+      "path": "deepseek-ai/DeepSeek-R1-0528",
+      "prefix": "deepseek-r1-pd-1p8-2d8",
+      "prefill_args": "--kv_cache_dtype fp8 -tp 8 --cudagraph-capture-sizes 1,2,4,8,16,32,64,128,256,512,1024,2048",
+      "decode_args": "--kv_cache_dtype fp8 -tp 8 --cudagraph-capture-sizes 1,2,4,8,16,32,64,128,256,512,1024,2048",
+      "num_decode_nodes": 2,
+      "bench_args": "",
+      "env_vars": ""
+    }
+  ]
+  

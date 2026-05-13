@@ -54,6 +54,17 @@ on:
         description: "Benchmark Llama-3.3-70B-Instruct-MXFP4"
         type: boolean
         default: true
+      pd-benchmark:
+        description: "Run PD disaggregation benchmark (multi-node, requires PD_NODE_LIST secret)"
+        type: boolean
+        default: true
+      pd_param_lists:
+        description: |
+          "PD benchmark parameter lists (overrides pd_nightly_params.json).
+          Format: input_length,output_length,concurrency,random_range_ratio.
+          Example: 1024,1024,128,0.8;8192,1024,256,0.8"
+        type: string
+        default: ""
       extra_args:
         description: "Extra arguments to pass to the ATOM server"
         type: string
@@ -352,10 +363,291 @@ jobs:
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true
 
+  # ========== PD Disaggregation Benchmark (multi-node) ==========
+  # Runs after single-node benchmarks finish to avoid resource contention.
+  # The coordinator lands on any node, SSH-picks N peers for decode.
+
+  parse-pd-params:
+    name: Parse PD parameter lists
+    if: >-
+      !cancelled()
+      && (github.event_name == 'schedule'
+          || inputs.pd-benchmark != false)
+    needs: [benchmark]
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.parse.outputs.matrix_json }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Parse PD parameter lists
+        id: parse
+        run: |
+          PD_PARAMS="${{ inputs.pd_param_lists || '' }}"
+          if [ -z "$PD_PARAMS" ]; then
+            echo "Using nightly PD params from .github/benchmark/pd_nightly_params.json"
+            MATRIX_JSON=$(jq -c '[.[] | . as $group | .concurrency[] | {input_length: $group.isl, output_length: $group.osl, concurrency: ., random_range_ratio: $group.random_range_ratio}]' .github/benchmark/pd_nightly_params.json)
+          else
+            echo "Using custom PD params: ${PD_PARAMS}"
+            IFS=';' read -ra SETS <<< "${PD_PARAMS}"
+            MATRIX_JSON="["
+            SEP=""
+            for SET in "${SETS[@]}"; do
+              IFS=',' read -ra P <<< "$SET"
+              MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${P[0]},\"output_length\":${P[1]},\"concurrency\":${P[2]},\"random_range_ratio\":${P[3]}}"
+              SEP=","
+            done
+            MATRIX_JSON="${MATRIX_JSON}]"
+          fi
+          echo "PD Matrix: ${MATRIX_JSON}"
+          echo "matrix_json=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+
+  load-pd-models:
+    name: Load PD model configs
+    if: >-
+      !cancelled()
+      && (github.event_name == 'schedule'
+          || inputs.pd-benchmark != false)
+    needs: [benchmark]
+    runs-on: ubuntu-latest
+    outputs:
+      models_json: ${{ steps.load.outputs.models_json }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: load
+        run: |
+          MODELS=$(jq -c . .github/benchmark/pd_models.json)
+          echo "models_json=${MODELS}" >> $GITHUB_OUTPUT
+          echo "Loaded $(echo "$MODELS" | jq length) PD model config(s)"
+
+  pd-benchmark:
+    name: PD ${{ matrix.model.display }} (isl=${{ matrix.config.input_length }} osl=${{ matrix.config.output_length }} c=${{ matrix.config.concurrency }})
+    needs: [parse-pd-params, load-pd-models]
+    if: >-
+      !cancelled()
+      && needs.parse-pd-params.result == 'success'
+      && needs.load-pd-models.result == 'success'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        model: ${{ fromJson(needs.load-pd-models.outputs.models_json) }}
+        config: ${{ fromJson(needs.parse-pd-params.outputs.matrix_json) }}
+
+    runs-on: atom-mi300-8gpu
+    timeout-minutes: 120
+
+    env:
+      MODEL_PATH: ${{ matrix.model.path }}
+      PREFILL_ARGS: ${{ matrix.model.prefill_args }}
+      DECODE_ARGS: ${{ matrix.model.decode_args }}
+      NUM_DECODE_NODES: ${{ matrix.model.num_decode_nodes || '1' }}
+      ISL: ${{ matrix.config.input_length }}
+      OSL: ${{ matrix.config.output_length }}
+      CONC: ${{ matrix.config.concurrency }}
+      RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
+      RESULT_FILENAME: ${{ matrix.model.prefix }}-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}-${{ matrix.config.random_range_ratio }}
+      ATOM_DOCKER_IMAGE: ${{ inputs.image || 'rocm/atom-dev:latest' }}
+      PD_NODE_LIST: ${{ secrets.PD_NODE_LIST }}
+
+    steps:
+      - name: Validate PD_NODE_LIST secret
+        run: |
+          if [ -z "${{ secrets.PD_NODE_LIST }}" ]; then
+            echo "::error::Secret PD_NODE_LIST is not set."
+            echo "Set it to comma-separated CI node hostnames, e.g.:"
+            echo "  mia1-p01-g33,mia1-p01-g34,mia1-p01-g40,mia1-p01-g41,mia1-p01-g42,mia1-p01-g45"
+            exit 1
+          fi
+
+      - name: Clean up previous local runs
+        run: |
+          echo "=== Hostname: $(hostname) ==="
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
+            rocm/pytorch:latest bash -lc "find /workspace -mindepth 1 -delete" || true
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ -n "${{ secrets.PD_SSH_KEY }}" ]; then
+            echo "${{ secrets.PD_SSH_KEY }}" > ~/.ssh/id_rsa
+            chmod 600 ~/.ssh/id_rsa
+          fi
+          IFS=',' read -ra NODES <<< "$PD_NODE_LIST"
+          for node in "${NODES[@]}"; do
+            ssh-keyscan -H "$(echo "$node" | xargs)" >> ~/.ssh/known_hosts 2>/dev/null || true
+          done
+
+      - name: Pick decode nodes
+        id: nodes
+        run: |
+          NUM_DECODE_NODES=${{ env.NUM_DECODE_NODES }} \
+          bash .github/scripts/atom_pd_test.sh pick-nodes
+
+      - name: Clean up decode nodes
+        run: |
+          DECODE_HOSTS="${{ steps.nodes.outputs.DECODE_HOSTS }}"
+          IFS=',' read -ra HOSTS <<< "$DECODE_HOSTS"
+          for i in "${!HOSTS[@]}"; do
+            echo "Cleaning decode node: ${HOSTS[$i]}"
+            ssh -o StrictHostKeyChecking=no "${HOSTS[$i]}" bash -l <<EOF || true
+            docker stop atom-pd-consumer-${i} 2>/dev/null || true
+            docker rm atom-pd-consumer-${i} 2>/dev/null || true
+          EOF
+          done
+
+      - name: Start local CI container (proxy + producer)
+        run: |
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          MODEL_MOUNT=""
+          [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
+            -w /workspace --ipc=host --group-add video \
+            --shm-size=16G --privileged --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
+            --network=host \
+            -e ATOM_DISABLE_MMAP=true \
+            -e NCCL_SOCKET_IFNAME=lo \
+            -e AITER_LOG_LEVEL=WARNING \
+            -e DECODE_HOSTS="${{ steps.nodes.outputs.DECODE_HOSTS }}" \
+            -e NUM_DECODE_NODES=${{ env.NUM_DECODE_NODES }} \
+            -e PREFILL_ARGS="${{ matrix.model.prefill_args }}" \
+            -e DECODE_ARGS="${{ matrix.model.decode_args }}" \
+            -e ATOM_DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}" \
+            -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} \
+            -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
+            -v ~/.ssh:/root/.ssh:ro \
+            --name atom-pd-prefill \
+            ${{ inputs.image || 'rocm/atom-dev:latest' }}
+
+      - name: Collect GPU info
+        id: gpu-info
+        run: bash .github/scripts/collect_gpu_info.sh atom-pd-prefill docker "atom-mi300-8gpu"
+
+      - name: Download model (prefill node)
+        run: |
+          if [ -d "/models" ]; then
+            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-pd-prefill bash -lc \
+              "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}" || exit 1
+          fi
+
+      - name: Launch all PD components
+        timeout-minutes: 60
+        run: |
+          if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
+          else model_path="${{ env.MODEL_PATH }}"; fi
+
+          docker exec atom-pd-prefill bash -lc "set -euo pipefail
+            .github/scripts/atom_pd_test.sh launch-all $model_path ${{ inputs.extra_args || '' }}"
+
+      - name: Run PD benchmark
+        timeout-minutes: 30
+        run: |
+          if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
+          else model_path="${{ env.MODEL_PATH }}"; fi
+
+          docker exec atom-pd-prefill bash -lc "set -euo pipefail
+            RESULT_FILENAME=${{ env.RESULT_FILENAME }} \
+            PREFILL_ARGS='${{ matrix.model.prefill_args }}' \
+            DECODE_ARGS='${{ matrix.model.decode_args }}' \
+            NUM_DECODE_NODES=${{ env.NUM_DECODE_NODES }} \
+            BENCH_EXTRA_ARGS='${{ matrix.model.bench_args }}' \
+            .github/scripts/atom_pd_test.sh benchmark $model_path"
+
+      - name: Inject GPU metadata into PD result
+        run: |
+          docker exec \
+            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            -e DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}" \
+            -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
+            -e DISPLAY_NAME="${{ matrix.model.display }}" \
+            atom-pd-prefill python3 -c "
+          import json, os
+          p = os.environ['RESULT_PATH']
+          if not os.path.exists(p):
+              print(f'{p} not found, skipping')
+          else:
+              with open(p) as f:
+                  d = json.load(f)
+              d['gpu_name'] = os.environ.get('GPU_NAME', '')
+              d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
+              d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
+              d['docker_image'] = os.environ.get('DOCKER_IMAGE', '')
+              display_name = os.environ.get('DISPLAY_NAME', '')
+              if display_name:
+                  d['benchmark_model_name'] = display_name
+              with open(p, 'w') as f:
+                  json.dump(d, f, indent=2)
+          "
+
+      - name: Dump proxy log
+        if: always()
+        run: docker exec atom-pd-prefill cat /tmp/atom_proxy.log 2>/dev/null || true
+
+      - name: Dump producer log
+        if: always()
+        run: docker exec atom-pd-prefill cat /tmp/atom_producer.log 2>/dev/null || true
+
+      - name: Dump consumer logs (remote)
+        if: always()
+        run: |
+          DECODE_HOSTS="${{ steps.nodes.outputs.DECODE_HOSTS }}"
+          IFS=',' read -ra HOSTS <<< "$DECODE_HOSTS"
+          for i in "${!HOSTS[@]}"; do
+            echo "========== Consumer-${i} (${HOSTS[$i]}) =========="
+            ssh -o StrictHostKeyChecking=no "${HOSTS[$i]}" \
+              "docker exec atom-pd-consumer-${i} cat /tmp/atom_consumer.log 2>/dev/null" || echo "(no log)"
+          done
+
+      - name: Upload PD benchmark result
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-${{ env.RESULT_FILENAME }}
+          path: ${{ env.RESULT_FILENAME }}.json
+
+      - name: Stop all PD components
+        if: always()
+        run: |
+          docker exec \
+            -e DECODE_HOSTS="${{ steps.nodes.outputs.DECODE_HOSTS }}" \
+            -e NUM_DECODE_NODES=${{ env.NUM_DECODE_NODES }} \
+            atom-pd-prefill bash -lc \
+            ".github/scripts/atom_pd_test.sh stop-all" || true
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
+            ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
+          docker stop atom-pd-prefill || true
+          docker rm atom-pd-prefill || true
+
+          DECODE_HOSTS="${{ steps.nodes.outputs.DECODE_HOSTS }}"
+          if [ -n "$DECODE_HOSTS" ]; then
+            IFS=',' read -ra HOSTS <<< "$DECODE_HOSTS"
+            for i in "${!HOSTS[@]}"; do
+              ssh -o StrictHostKeyChecking=no "${HOSTS[$i]}" bash -l <<EOF || true
+              docker stop atom-pd-consumer-${i} 2>/dev/null || true
+              docker rm atom-pd-consumer-${i} 2>/dev/null || true
+            EOF
+            done
+          fi
+
   summarize-benchmark-result:
     if: always()
     name: Summarize benchmark result
-    needs: [benchmark]
+    needs: [benchmark, pd-benchmark]
     runs-on: ubuntu-latest
     outputs:
       has_regression: ${{ steps.check-regression.outputs.has_regression }}
@@ -472,6 +764,11 @@ jobs:
           python3 -c "
           import json
           models = json.loads(open('.github/benchmark/models.json').read())
+          # Include PD model configs in dashboard mapping
+          try:
+              models += json.loads(open('.github/benchmark/pd_models.json').read())
+          except FileNotFoundError:
+              pass
           mapping = {}
           for m in models:
               display = m.get('display','')
