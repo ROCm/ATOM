@@ -1117,45 +1117,45 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # relevant rows live at [rs.start:rs.stop], not [0:ub_num_reqs].
         # Temporarily place the ubatch's slices at the front so helpers
         # see the right values.
-        saved_ctx = var["context_lens"].np[:ub_num_reqs].copy()
-        var["context_lens"].np[:ub_num_reqs] = context_lens_np
-
         bt = var["block_tables"].np
+        saved_ctx = var["context_lens"].np[:ub_num_reqs].copy()
         saved_bt = bt[:ub_num_reqs].copy()
-        bt[:ub_num_reqs] = bt[rs.start : rs.stop].copy()
+        try:
+            var["context_lens"].np[:ub_num_reqs] = context_lens_np
+            bt[:ub_num_reqs] = bt[rs.start : rs.stop].copy()
 
-        self._attach_v4_per_fwd_meta(
-            ub_attn,
-            positions_np,
-            ub_cu,
-            ub_attn.start_pos_per_seq_cpu,
-            ub_attn.state_slot_mapping_cpu,
-            ub_num_reqs,
-            ub_num_tokens,
-        )
+            self._attach_v4_per_fwd_meta(
+                ub_attn,
+                positions_np,
+                ub_cu,
+                ub_attn.start_pos_per_seq_cpu,
+                ub_attn.state_slot_mapping_cpu,
+                ub_num_reqs,
+                ub_num_tokens,
+            )
 
-        positions_gpu = var["positions"].gpu[ts.start : ts.stop]
-        self._attach_v4_indexer_meta(
-            ub_attn,
-            ub_cu,
-            ub_attn.start_pos_per_seq_cpu,
-            ub_num_reqs,
-            ub_num_tokens,
-            positions_gpu=positions_gpu,
-        )
+            positions_gpu = var["positions"].gpu[ts.start : ts.stop]
+            self._attach_v4_indexer_meta(
+                ub_attn,
+                ub_cu,
+                ub_attn.start_pos_per_seq_cpu,
+                ub_num_reqs,
+                ub_num_tokens,
+                positions_gpu=positions_gpu,
+            )
 
-        self._build_paged_prefill_meta(
-            ub_attn,
-            positions_np,
-            ub_cu,
-            ub_attn.start_pos_per_seq_cpu,
-            ub_attn.state_slot_mapping_cpu,
-            ub_num_reqs,
-            ub_num_tokens,
-        )
-
-        bt[:ub_num_reqs] = saved_bt
-        var["context_lens"].np[:ub_num_reqs] = saved_ctx
+            self._build_paged_prefill_meta(
+                ub_attn,
+                positions_np,
+                ub_cu,
+                ub_attn.start_pos_per_seq_cpu,
+                ub_attn.state_slot_mapping_cpu,
+                ub_num_reqs,
+                ub_num_tokens,
+            )
+        finally:
+            bt[:ub_num_reqs] = saved_bt
+            var["context_lens"].np[:ub_num_reqs] = saved_ctx
 
         # Clone all GPU tensors that are views into shared CpuGpuBuffers.
         # Without this, building the next ubatch overwrites this ubatch's
