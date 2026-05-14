@@ -45,14 +45,23 @@ use crate::{
     },
     routers::{
         error,
-        grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
-        shared::placement_response::placement_err_to_response,
+        shared::{
+            metrics_utils::{error_type_from_status, route_to_endpoint},
+            placement_response::placement_err_to_response,
+        },
         RouterTrait,
     },
 };
 
-use super::pd_types::api_path;
+/// Construct a full API URL from a base URL and path.
+fn api_path(url: &str, api_path: &str) -> String {
+    if api_path.starts_with('/') {
+        format!("{}{}", url, api_path)
+    } else {
+        format!("{}/{}", url, api_path)
+    }
+}
 
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,

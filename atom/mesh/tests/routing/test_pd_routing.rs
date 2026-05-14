@@ -4,7 +4,7 @@ mod pd_routing_unit_tests {
         app_context::AppContext,
         config::{PolicyConfig, RouterConfig, RoutingMode},
         core::{BasicWorkerBuilder, Worker, WorkerType},
-        routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
+        routers::RouterFactory,
         tokenizer::registry::TokenizerRegistry,
     };
     use serde_json::json;
@@ -79,36 +79,6 @@ mod pd_routing_unit_tests {
         match regular_worker.worker_type() {
             WorkerType::Regular => (),
             _ => panic!("Expected Regular worker type"),
-        }
-    }
-
-    #[test]
-    fn test_pd_selection_policies() {
-        // Note: These policies are only used when pd_disaggregation=true
-        let policies = vec![
-            PDSelectionPolicy::Random,
-            PDSelectionPolicy::PowerOfTwo,
-            PDSelectionPolicy::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-            },
-        ];
-
-        for policy in policies {
-            match &policy {
-                PDSelectionPolicy::Random => {
-                    assert!(matches!(policy, PDSelectionPolicy::Random));
-                }
-                PDSelectionPolicy::PowerOfTwo => {
-                    assert!(matches!(policy, PDSelectionPolicy::PowerOfTwo));
-                }
-                PDSelectionPolicy::CacheAware {
-                    cache_threshold, ..
-                } => {
-                    assert!(*cache_threshold >= 0.0 && *cache_threshold <= 1.0);
-                }
-            }
         }
     }
 
@@ -447,29 +417,6 @@ mod pd_routing_unit_tests {
         assert_eq!(received_loads.get("http://prefill2:8080"), Some(&20));
         assert_eq!(received_loads.get("http://decode1:8080"), Some(&5));
         assert_eq!(received_loads.get("http://decode2:8080"), Some(&15));
-    }
-
-    #[test]
-    fn test_load_monitoring_configuration() {
-        let policies = vec![
-            (PDSelectionPolicy::Random, false),
-            (PDSelectionPolicy::PowerOfTwo, true),
-            (
-                PDSelectionPolicy::CacheAware {
-                    cache_threshold: 0.5,
-                    balance_abs_threshold: 32,
-                    balance_rel_threshold: 1.1,
-                },
-                false,
-            ),
-        ];
-
-        for (policy, should_monitor) in policies {
-            match policy {
-                PDSelectionPolicy::PowerOfTwo => assert!(should_monitor),
-                _ => assert!(!should_monitor),
-            }
-        }
     }
 
     #[tokio::test]
@@ -893,20 +840,4 @@ mod pd_routing_unit_tests {
         }
     }
 
-    #[test]
-    fn test_policy_type_to_pd_selection_policy_mapping() {
-        let pd_policy_count = 3; // Random, PowerOfTwo, CacheAware
-        assert_eq!(
-            pd_policy_count, 3,
-            "PDSelectionPolicy should have exactly 3 variants"
-        );
-
-        let _random = PDSelectionPolicy::Random;
-        let _po2 = PDSelectionPolicy::PowerOfTwo;
-        let _cache_aware = PDSelectionPolicy::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-        };
-    }
 }

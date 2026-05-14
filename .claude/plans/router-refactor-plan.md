@@ -191,7 +191,7 @@ pub trait BackendAdapter: Send + Sync {
 | P3 | gRPC 切换 (WorkerSelectionStage 调 planner) | 1 天 | ✅ done | gRPC 走新 planner，H04/H05/H06 全绿 |
 | P4 | HTTP Regular 切换 | 1 天 | ✅ done | http_router.rs 走 planner，`routers/http/router.rs` 现有 15 个测试全绿 |
 | P5 | HTTP PD 切换 (含 BackendAdapter wiring) | 2 天 | ✅ done | http_pd_router.rs 走 planner + adapter，pd_router 16/16 + placement 106/106 全绿 |
-| P6 | 清理: 死代码删除 / 反向依赖修 / 文件扁平化 / clippy clean | 1 天 | pending | clippy 无 warning，cargo test 全绿 |
+| P6 | 清理: 死代码删除 / 反向依赖修 / 文件扁平化 / clippy clean | 1 天 | ✅ done | 文件扁平化 + pd_types 删除 + metrics_utils 抽出，554 全绿，0 新 clippy |
 | **合计** | | **10-10.5 天** | | |
 
 ### 5.2 P1 实际产出（已落地）
@@ -353,6 +353,36 @@ pub trait BackendAdapter: Send + Sync {
 - H10 测试当前覆盖 planner-input 一致性，`Arc<HeaderMap>` 改造时需扩展断言到 retry-clone 边界
 - D 系测试 PD 全 unhealthy 覆盖空缺：`MockWorkerSource` 不过滤 healthy；建议加 `d_pd_all_unhealthy_returns_no_available_workers` 走 planner+health filter 完整路径
 - vLLM background task 选择 `unbounded_channel`（pre-existing）— 慢客户端可能内存增长；与 P5 无关，独立工程
+
+### 5.7 P6 实际产出（已落地）
+
+实现：
+
+| 操作 | 内容 |
+|------|------|
+| 文件移动 (`git mv`) | `routers/http/router.rs` → `routers/http_router.rs`；`routers/http/pd_router.rs` → `routers/http_pd_router.rs` |
+| 文件删除 | `routers/http/mod.rs`；`routers/http/pd_types.rs`（六项全删：`PDRouterError` / `RequestWithBootstrap` / `BatchRequestWithBootstrap` / `PDSelectionPolicy` / 重复的 `generate_room_id` / `api_path`）；空目录 `routers/http/` 移除 |
+| 文件新增 | `routers/shared/metrics_utils.rs` — verbatim 上调 `route_to_endpoint` + `error_type_from_status` |
+| 文件编辑 | `routers/shared/mod.rs` 加 `pub mod metrics_utils;`；`routers/mod.rs` 改 `pub mod http;` + `pub use http::{...};` 为 `pub mod http_router; pub mod http_pd_router;`；`routers/factory.rs` 切 import 路径；`routers/grpc/utils.rs` 函数体替成 `pub(crate) use crate::routers::shared::metrics_utils::error_type_from_status;`（grpc 内部只用 error_type_from_status，不再 re-export route_to_endpoint），删除 now-unused `http::StatusCode` / `metrics_labels` import；`http_router.rs` + `http_pd_router.rs` 切 metrics util import 到 shared；`http_pd_router.rs` 内 inline 一个私有 `api_path` helper（单一调用点，原 sole consumer）；`tests/routing/test_pd_routing.rs` 删 3 个仅测 `PDSelectionPolicy` 形状的测试（无对应迁移目标，否则文件无法编译） |
+
+**当下 baseline**:
+- `cargo build --package atom-mesh` 干净
+- `cargo test --package atom-mesh --lib` → 554 passed / 0 failed（与 P5 baseline 一致，flatten 不增减测试）
+- `cargo clippy --package atom-mesh --lib --tests` → 3 pre-existing warning，0 新
+- `routers/http/` 目录消失；HTTP routers 不再 `use ...grpc::...`
+
+**Subagent review 1 轮**（rust-reviewer 0 BLOCK / 0 HIGH / 0 MEDIUM / 1 LOW）：
+- LOW `api_path(url: &str, api_path: &str)` 参数与函数同名 shadow — pre-existing 形状，verbatim inline 自 pd_types.rs，未在 P6 引入；按 surgical-changes 不动
+- 9 项验收检查全 PASS（HTTP 不依赖 grpc / pd_types 删除 / 文件扁平 / api_path 双分支保留 / generate_room_id sglang 副本一致 / route_to_endpoint 不需 re-export / 可见性最小化保持 pub(crate) / 测试删除范围正确 / factory 是唯一外部 consumer）
+
+**遗留进入 follow-up**（plan scope 外，独立工程）:
+- §6.5 三项 deferred bug：HTTP PD 4xx/5xx 状态码透传；`Arc<HeaderMap>` retry；`WorkerRegistryAdapter`+`PolicyRegistryAdapter` 在 Router::new + PDRouter::new 重复构造可抽 helper
+- §11.6 PD path Authorization header 注入（A 路线已删字段，跟踪 issue 待开）
+- §11.7 `NoPrefill/NoDecodeWorkers` 区分（post-health 一律返 NoAvailableWorkers，观察性可拆 schema）
+- D 系测试 PD 全 unhealthy 覆盖空缺（`MockWorkerSource` 不过滤 healthy；建议加 `d_pd_all_unhealthy_returns_no_available_workers`）
+- vLLM background task pre-existing `unbounded_channel`（与 refactor 无关）
+- 3 个 pre-existing clippy warning 清理（`useless_conversion` ×2 / `while_let_loop` ×1）
+- DynamicRouter 合并（独立 plan：`dynamic-router-plan.md`）
 
 ### 5.1 P0b 实际产出（已落地，后续 phase 直接消费）
 
