@@ -72,6 +72,7 @@ _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
 _request_start_times: Dict[str, float] = {}
+_stream_decode_states: Dict[Tuple[str, int], Dict[str, Any]] = {}
 _request_logger: Optional[logging.Logger] = None
 
 
@@ -159,16 +160,64 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
     return n
 
 
+def _common_prefix_len(left: str, right: str) -> int:
+    """Return the character prefix shared by two decoded text snapshots."""
+    limit = min(len(left), len(right))
+    idx = 0
+    while idx < limit and left[idx] == right[idx]:
+        idx += 1
+    return idx
+
+
+def _decode_stream_delta(
+    state_key: Tuple[str, int],
+    new_token_ids: List[int],
+    finished: bool,
+) -> str:
+    """Decode streaming output with request-local token context.
+
+    The scheduler sends only newly generated token ids. Decoding that slice
+    directly can split byte-fallback or multi-token Unicode sequences and
+    emit U+FFFD. Keep cumulative token ids per stream and return only the
+    newly decoded suffix, similar to vLLM's incremental detokenizer.
+    """
+    global tokenizer
+
+    state = _stream_decode_states.setdefault(
+        state_key,
+        {"token_ids": [], "sent_text": ""},
+    )
+    state["token_ids"].extend(new_token_ids)
+
+    decoded_text = tokenizer.decode(state["token_ids"], skip_special_tokens=True)
+    sent_text = state["sent_text"]
+    if decoded_text.startswith(sent_text):
+        delta = decoded_text[len(sent_text) :]
+    else:
+        # Tokenizers may normalize whitespace around special tokens. Fall back
+        # to the changed suffix instead of replaying the entire decoded text.
+        prefix_len = _common_prefix_len(decoded_text, sent_text)
+        delta = decoded_text[prefix_len:]
+
+    if delta.endswith("\ufffd") and not finished:
+        return ""
+
+    state["sent_text"] = decoded_text
+    return delta
+
+
 def _send_stream_chunk_direct(
     request_output: RequestOutput,
     request_id: str,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
 ) -> None:
-    """Send stream chunk directly to the queue."""
-    global tokenizer
-
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
+    """Send a stream chunk decoded with cumulative token context."""
+    new_text = _decode_stream_delta(
+        (request_id, 0),
+        request_output.output_tokens,
+        request_output.finished,
+    )
     started_at = _request_start_times.get(request_id)
     chunk_data = {
         "text": new_text,
@@ -185,6 +234,7 @@ def _send_stream_chunk_direct(
 
 def _send_stream_chunk_tagged(
     request_output: RequestOutput,
+    request_id: str,
     sibling_index: int,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
@@ -195,9 +245,11 @@ def _send_stream_chunk_tagged(
     queue so the merge-stream consumer in :mod:`serving_chat` /
     :mod:`serving_completion` can demultiplex by index.
     """
-    global tokenizer
-
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
+    new_text = _decode_stream_delta(
+        (request_id, sibling_index),
+        request_output.output_tokens,
+        request_output.finished,
+    )
     chunk_data = {
         "text": new_text,
         "token_ids": request_output.output_tokens,
@@ -462,12 +514,14 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     dicts use ``dict.pop(..., None)`` so repeated removal is a no-op.
     """
     global engine, _stream_queues, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
+    global _stream_loops, _request_start_times, _stream_decode_states
 
     _stream_queues.pop(request_id, None)
     _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
+    for key in [key for key in _stream_decode_states if key[0] == request_id]:
+        _stream_decode_states.pop(key, None)
     engine.io_processor.requests.pop(seq_id, None)
 
 
@@ -497,7 +551,9 @@ async def setup_streaming_request_fanout(
 
     def make_callback(idx: int):
         def _cb(request_output: RequestOutput) -> None:
-            _send_stream_chunk_tagged(request_output, idx, shared_queue, stream_loop)
+            _send_stream_chunk_tagged(
+                request_output, request_id, idx, shared_queue, stream_loop
+            )
 
         return _cb
 

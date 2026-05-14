@@ -258,6 +258,26 @@ class InputOutputProcessor:
             if isinstance(prompt_or_tokens, str)
             else prompt_or_tokens
         )
+        prompt_len = len(tokens)
+        max_model_len = self.config.max_model_len
+        if max_model_len is not None and prompt_len > max_model_len:
+            raise ValueError(
+                f"Input has {prompt_len} tokens, which exceeds "
+                f"max_model_len={max_model_len}. Shorten the prompt or "
+                "restart the server with a larger --max-model-len."
+            )
+        max_tokens = max(0, int(getattr(sampling_params, "max_tokens", 0)))
+        if (
+            max_model_len is not None
+            and prompt_len + max_tokens > max_model_len
+        ):
+            raise ValueError(
+                f"Requested context length is {prompt_len + max_tokens} "
+                f"tokens ({prompt_len} input + {max_tokens} max output), "
+                f"which exceeds max_model_len={max_model_len}. Shorten the "
+                "prompt, lower max_tokens, or restart the server with a "
+                "larger --max-model-len."
+            )
 
         stop_token_sequences = []
         if sampling_params.stop_strings:

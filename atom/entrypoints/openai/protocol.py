@@ -3,6 +3,7 @@
 
 """Pydantic request/response models for the OpenAI-compatible API."""
 
+import json
 import time
 from typing import Any, Dict, List, Optional, Union
 
@@ -48,6 +49,29 @@ class ChatMessage(BaseModel):
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
 
+    @staticmethod
+    def _normalize_tool_calls(tool_calls: Any) -> Any:
+        """Decode OpenAI JSON-string tool arguments for chat templates."""
+        if not isinstance(tool_calls, list):
+            return tool_calls
+
+        normalized = []
+        for item in tool_calls:
+            if not isinstance(item, dict):
+                raise TypeError(f"tool_calls entries must be dicts, got {type(item)!r}")
+
+            call = dict(item)
+            function = dict(call.get("function") or {})
+            arguments = function.get("arguments")
+            if arguments:
+                if not isinstance(arguments, (dict, list)):
+                    function["arguments"] = json.loads(arguments)
+            else:
+                function["arguments"] = {}
+            call["function"] = function
+            normalized.append(call)
+        return normalized
+
     def to_template_dict(self) -> Dict[str, Any]:
         """Convert to dict for chat template, preserving tool-related fields.
 
@@ -59,7 +83,10 @@ class ChatMessage(BaseModel):
         extras = self.model_extra or {}
         for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
             if key in extras:
-                d[key] = extras[key]
+                value = extras[key]
+                if key == "tool_calls":
+                    value = self._normalize_tool_calls(value)
+                d[key] = value
         return d
 
 
