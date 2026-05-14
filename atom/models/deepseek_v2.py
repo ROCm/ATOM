@@ -1247,8 +1247,11 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
     def _maybe_load_pending_wk(self) -> None:
         if self._wk_pending_weight is None or self._wk_pending_scale is None:
             return
+        wk_weight_fp8 = self._wk_pending_weight
+        if wk_weight_fp8.device != self._wk_pending_scale.device:
+            wk_weight_fp8 = wk_weight_fp8.to(self._wk_pending_scale.device)
         wk_weight = _dequant_fp8_block_to_bf16(
-            self._wk_pending_weight,
+            wk_weight_fp8,
             self._wk_pending_scale,
         )
         super().weight_loader(self.weight, wk_weight, 0)
