@@ -71,7 +71,6 @@ vllm serve amd/Qwen3.5-397B-A17B-MXFP4 \
 
 **Important**: The following three environment variables are required for Qwen3.5:
 
-- `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`: Disables ATOM attention plugin to use vLLM's implementation for full attention layers (required because Qwen3.5 uses a hybrid architecture with both linear attention (GatedDeltaNet) and full attention layers)
 - `ATOM_USE_CUSTOM_ALL_GATHER=0`: Disables custom all-gather for compatibility with Qwen3.5 model architecture
 - `AITER_QUICK_REDUCE_QUANTIZATION=INT4`: **Performance optimization** - enables INT4 quantization for quick reduce operations, which can significantly improve TTFT (Time To First Token) performance. **Note**: This optimization may introduce a risk of accuracy degradation. For accuracy-critical workloads, consider validating with your specific use case.
 
@@ -133,7 +132,6 @@ Reference result (TP=4):
 
 ## Key Environment Variables
 
-- `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`: **Required** - disables ATOM attention plugin to use vLLM's implementation for full attention layers
 - `ATOM_USE_CUSTOM_ALL_GATHER=0`: **Required** - disables custom all-gather for compatibility with Qwen3.5 model architecture
 - `AITER_QUICK_REDUCE_QUANTIZATION=INT4`: **Performance optimization** - enables INT4 quantization for quick reduce operations
   - **Benefit**: Significantly improves TTFT (Time To First Token) performance by reducing communication overhead during tensor parallelism all-reduce operations
