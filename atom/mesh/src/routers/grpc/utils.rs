@@ -3,7 +3,6 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::response::Response;
-use http::StatusCode;
 use mesh_grpc::sglang_proto::{InputLogProbs, OutputLogProbs};
 use serde_json::{json, Map, Value};
 use tracing::{error, warn};
@@ -17,7 +16,6 @@ use super::{
 };
 use crate::{
     core::Worker,
-    observability::metrics::metrics_labels,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::{
@@ -1018,27 +1016,7 @@ pub(crate) fn parse_finish_reason(
 // Metrics helper functions (shared by HTTP routers and gRPC pipeline)
 // ============================================================================
 
-/// Map route path to endpoint label for metrics
-pub(crate) fn route_to_endpoint(route: &str) -> &'static str {
-    match route {
-        "/v1/chat/completions" => metrics_labels::ENDPOINT_CHAT,
-        "/generate" => metrics_labels::ENDPOINT_GENERATE,
-        "/v1/completions" => metrics_labels::ENDPOINT_COMPLETIONS,
-        "/v1/responses" => metrics_labels::ENDPOINT_RESPONSES,
-        _ => "other",
-    }
-}
-
-/// Map HTTP status code to error type label for metrics
-pub(crate) fn error_type_from_status(status: StatusCode) -> &'static str {
-    match status.as_u16() {
-        400 => metrics_labels::ERROR_VALIDATION,
-        404 => metrics_labels::ERROR_NO_WORKERS,
-        408 | 504 => metrics_labels::ERROR_TIMEOUT,
-        500..=599 => metrics_labels::ERROR_BACKEND,
-        _ => metrics_labels::ERROR_INTERNAL,
-    }
-}
+pub(crate) use crate::routers::shared::metrics_utils::error_type_from_status;
 
 #[cfg(test)]
 mod tests {
