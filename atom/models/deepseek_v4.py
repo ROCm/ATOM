@@ -50,6 +50,7 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import (
 from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
 )
+from aiter.ops.triton.fusions.mhc import mhc_post_pre as _triton_mhc_post_pre
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
     Config,
@@ -282,6 +283,124 @@ def _hc_head_reduce(
     pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
     y = torch.sum(pre.unsqueeze(-1) * x, dim=-2)
     return y.to(x.dtype)
+
+
+# Fused mHC sub-layer transition: close current sub-layer with hc_post and
+# open the next sub-layer with hc_pre, sharing the updated residual stream
+# between the two operations. Replaces the post→pre pair at the attn→ffn
+# boundary in Block.forward.
+#
+# Threshold mirrors `fused_qk_norm_rope_swa_write`: at small token counts the
+# Triton ``mhc_post_pre`` kernel beats the HIP chain (residual lives in
+# registers between post and pre's GEMM); at larger M the HIP pair pulls
+# ahead.
+_V4_FUSED_HC_POST_PRE_M_THRESHOLD = 64
+
+
+def _fused_hc_post_pre_fake(
+    x: torch.Tensor,  # [num_tokens, dim]      attn/ffn output
+    residual: torch.Tensor,  # [num_tokens, hc, dim]  pre-post residual
+    post: torch.Tensor,  # [num_tokens, hc]       prev pre's post-gate
+    comb: torch.Tensor,  # [num_tokens, hc, hc]   prev pre's comb matrix
+    hc_fn_t: torch.Tensor,  # [hc*dim, mix_hc] fp32  Triton phi (= hc_fn.T view)
+    hc_fn: torch.Tensor,  # [mix_hc, hc*dim] fp32  HIP fn
+    hc_scale: torch.Tensor,  # [3] fp32 — both alphas (Triton) and HIP hc_scale
+    hc_base: torch.Tensor,  # [mix_hc] fp32
+    n: int,
+    norm_eps: float,
+    hc_eps: float,
+    hc_post_mult: float,
+    sinkhorn_iters: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, dim = x.shape
+    device = x.device
+    dtype = residual.dtype
+    return (
+        torch.empty(num_tokens, n, dim, dtype=dtype, device=device),
+        torch.empty(num_tokens, dim, dtype=dtype, device=device),
+        torch.empty(num_tokens, n, dtype=torch.float32, device=device),
+        torch.empty(num_tokens, n, n, dtype=torch.float32, device=device),
+    )
+
+
+@torch_compile_guard(gen_fake=_fused_hc_post_pre_fake, mutates_args=[])
+def fused_hc_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    hc_fn_t: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    n: int,
+    norm_eps: float,
+    hc_eps: float,
+    hc_post_mult: float,
+    sinkhorn_iters: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused mHC ``hc_post → hc_pre`` for a sub-layer transition.
+
+    At ``num_tokens <= 64`` runs the Triton ``mhc_post_pre`` kernel; otherwise
+    falls back to the HIP ``aiter.mhc_post → aiter.mhc_pre`` chain. Returns
+    ``(new_residual, layer_input_out, new_post, new_comb)``:
+
+    - ``new_residual`` ([num_tokens, hc, dim]): residual after the post mix,
+      consumed by the next ``hc_post`` of the same block.
+    - ``layer_input_out`` ([num_tokens, dim]): sub-layer input for the next
+      norm + op.
+    - ``new_post`` ([num_tokens, hc]) fp32: post-gate for the next ``hc_post``.
+    - ``new_comb`` ([num_tokens, hc, hc]) fp32: comb matrix for the next
+      ``hc_post``.
+
+    The HIP ``mhc_post`` kernel reinterprets ``post``/``comb`` as ``float*``
+    (mhc_kernels.cu:874), so the Triton branch pre-allocates fp32 buffers and
+    hands them to the kernel — no downstream cast, no bf16↔fp32 round-trip.
+    Likewise ``hc_scale`` (the (3,) fp32 parameter tensor) is passed straight
+    through: the Triton kernel ``tl.load``s alphas at offsets 0/1/2, so no
+    CPU sync from ``.tolist()`` or ``.item()``.
+    """
+    num_tokens = x.shape[0]
+    if num_tokens <= _V4_FUSED_HC_POST_PRE_M_THRESHOLD:
+        # Pre-allocate fp32 h_post/h_res for the next layer's HIP `mhc_post`.
+        # The Triton kernel implicit-casts on store, so providing fp32 buffers
+        # avoids the bf16→fp32 cast we used to do after the kernel returned.
+        new_post = torch.empty(num_tokens, n, dtype=torch.float32, device=x.device)
+        new_comb = torch.empty(num_tokens, n, n, dtype=torch.float32, device=x.device)
+        _, _, layer_input_out, new_residual = _triton_mhc_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn_t,
+            hc_scale,
+            hc_base,
+            n,
+            norm_eps,
+            hc_eps,
+            hc_post_mult,
+            sinkhorn_iters,
+            h_post=new_post,
+            h_res=new_comb,
+        )
+        return new_residual, layer_input_out, new_post, new_comb
+
+    # HIP fallback: hc_post followed by hc_pre. `residual.dtype == x.dtype`
+    # (bf16 end-to-end in Block.forward), so `out` inherits the right dtype.
+    new_residual = torch.empty_like(residual)
+    aiter.mhc_post(new_residual, x, residual, post.unsqueeze(-1), comb)
+    new_post_3d, new_comb, layer_input_out = aiter.mhc_pre(
+        new_residual,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        norm_eps,
+        hc_eps,
+        hc_eps,
+        hc_post_mult,
+        sinkhorn_iters,
+    )
+    return new_residual, layer_input_out, new_post_3d.squeeze(-1), new_comb
 
 
 def _v4_attention_fake(
@@ -2402,11 +2521,23 @@ class Block(nn.Module):
         )
         x = self.attn_norm(x)  # [num_tokens, dim]
         x = self.attn(x, positions)  # [num_tokens, dim]
-        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-        # ----- FFN sub-layer with mHC mixing -----
-        residual = x  # [num_tokens, hc, dim]
-        x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        # ----- Fused attn→ffn transition: hc_post (close attn) + hc_pre (open ffn) -----
+        # `hc_ffn_fn.T` is a stride-swapped view (no copy); `hc_ffn_scale` is
+        # passed unchanged — the Triton kernel `tl.load`s the alphas itself.
+        residual, x, post, comb = fused_hc_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            self.hc_ffn_fn.T,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.hc_mult,
+            self.norm_eps,
+            self.hc_eps,
+            self.HC_POST_MULT,
+            self.hc_sinkhorn_iters,
         )
         x = self.ffn_norm(x)  # [num_tokens, dim]
         x = self.ffn(
