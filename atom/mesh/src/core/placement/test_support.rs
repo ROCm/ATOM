@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-// Some helpers are only used by tests not yet written.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,13 +13,19 @@ use crate::core::{
 };
 use crate::policies::{LoadBalancingPolicy, RoundRobinPolicy, SelectWorkerInfo};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RecordedSelectInfo {
     pub request_text: Option<String>,
     pub tokens: Option<Vec<u32>>,
     pub headers: Option<HeaderMap>,
-    pub hash_ring_present: bool,
+    pub hash_ring: Option<Arc<HashRing>>,
     pub candidate_urls: Vec<String>,
+}
+
+impl RecordedSelectInfo {
+    pub fn hash_ring_present(&self) -> bool {
+        self.hash_ring.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -64,6 +69,9 @@ impl WorkerSource for MockWorkerSource {
                 None => true,
             })
             .filter(|w| match &worker_type {
+                Some(WorkerType::Prefill { .. }) => {
+                    matches!(w.worker_type(), WorkerType::Prefill { .. })
+                }
                 Some(wt) => w.worker_type() == wt,
                 None => true,
             })
@@ -186,7 +194,7 @@ impl LoadBalancingPolicy for RecordingPolicy {
             request_text: info.request_text.map(|s| s.to_string()),
             tokens: info.tokens.map(|t| t.to_vec()),
             headers: info.headers.cloned(),
-            hash_ring_present: info.hash_ring.is_some(),
+            hash_ring: info.hash_ring.clone(),
             candidate_urls: workers.iter().map(|w| w.url().to_string()).collect(),
         });
         self.inner.select_worker(workers, info).await
@@ -341,6 +349,34 @@ pub fn make_decode_http(url: &str, model_id: &str) -> Arc<dyn Worker> {
         Some(model_id),
         None,
         ConnectionMode::Http,
+        RuntimeType::Sglang,
+    )
+}
+
+pub fn make_prefill_grpc(
+    url: &str,
+    model_id: &str,
+    bootstrap_port: Option<u16>,
+) -> Arc<dyn Worker> {
+    make_worker(
+        url,
+        WorkerType::Prefill { bootstrap_port },
+        true,
+        Some(model_id),
+        None,
+        ConnectionMode::Grpc { port: None },
+        RuntimeType::Sglang,
+    )
+}
+
+pub fn make_decode_grpc(url: &str, model_id: &str) -> Arc<dyn Worker> {
+    make_worker(
+        url,
+        WorkerType::Decode,
+        true,
+        Some(model_id),
+        None,
+        ConnectionMode::Grpc { port: None },
         RuntimeType::Sglang,
     )
 }
