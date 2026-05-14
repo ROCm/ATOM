@@ -359,7 +359,6 @@ impl PDRouter {
             tokens: None,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
-            return_logprob: context.return_logprob,
         };
 
         let (prefill, decode, prefill_policy, decode_policy) =

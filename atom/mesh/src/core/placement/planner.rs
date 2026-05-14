@@ -5,7 +5,7 @@ use tracing::debug;
 
 use super::policy_apply::apply_policy;
 use super::traits::{PdPlanner, PolicySource, WorkerSource};
-use super::types::{PlacementError, PlacementPlan, PlacementTrace, Protocol, RequestDescriptor};
+use super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
 use crate::core::{ConnectionMode, HashRing, Worker, WorkerType};
 
 fn health_filter(pool: Vec<Arc<dyn Worker>>) -> Vec<Arc<dyn Worker>> {
@@ -38,7 +38,6 @@ impl DefaultPlanner {
         req: &RequestDescriptor<'_>,
         regular_pool_raw: Vec<Arc<dyn Worker>>,
     ) -> Result<PlacementPlan, PlacementError> {
-        let pool_size = regular_pool_raw.len();
         let candidates = health_filter(regular_pool_raw);
         if candidates.is_empty() {
             return Err(PlacementError::NoAvailableWorkers);
@@ -48,18 +47,9 @@ impl DefaultPlanner {
         let hash_ring = self.hash_ring_for(req.model_id);
         let chosen = apply_policy(&candidates, policy.as_ref(), req, hash_ring).await?;
 
-        let trace = PlacementTrace::for_single(
-            req.model_id,
-            pool_size,
-            candidates.len(),
-            chosen.url(),
-            policy.name(),
-            req.model_id,
-        );
         Ok(PlacementPlan::Single {
             worker: chosen,
             policy_name: policy.name(),
-            trace,
         })
     }
 
@@ -69,7 +59,6 @@ impl DefaultPlanner {
         prefill_pool_raw: Vec<Arc<dyn Worker>>,
         decode_pool_raw: Vec<Arc<dyn Worker>>,
     ) -> Result<PlacementPlan, PlacementError> {
-        let pool_size = prefill_pool_raw.len() + decode_pool_raw.len();
         let prefill_candidates = health_filter(prefill_pool_raw);
         if prefill_candidates.is_empty() {
             return Err(PlacementError::NoAvailableWorkers);
@@ -100,22 +89,11 @@ impl DefaultPlanner {
         let decode =
             apply_policy(&decode_candidates, decode_policy.as_ref(), req, hash_ring).await?;
 
-        let trace = PlacementTrace::for_pair(
-            req.model_id,
-            pool_size,
-            prefill_candidates.len() + decode_candidates.len(),
-            prefill.url(),
-            decode.url(),
-            prefill_policy.name(),
-            decode_policy.name(),
-            req.model_id,
-        );
         Ok(PlacementPlan::Pair {
             prefill,
             decode,
             prefill_policy: prefill_policy.name(),
             decode_policy: decode_policy.name(),
-            trace,
         })
     }
 }
