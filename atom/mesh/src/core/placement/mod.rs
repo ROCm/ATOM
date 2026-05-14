@@ -2,6 +2,7 @@ pub mod backend;
 pub mod candidate;
 pub mod planner;
 pub mod policy_apply;
+pub mod registry_adapters;
 pub mod trace;
 pub mod traits;
 pub mod types;
