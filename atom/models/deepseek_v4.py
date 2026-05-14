@@ -50,7 +50,10 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import (
 from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
 )
+import triton
+
 from aiter.ops.triton.fusions.mhc import mhc_post_pre as _triton_mhc_post_pre
+from aiter.ops.triton.utils.mhc_config_utils import get_mhc_config
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
     Config,
@@ -297,6 +300,59 @@ def _hc_head_reduce(
 _V4_FUSED_HC_POST_PRE_M_THRESHOLD = 64
 
 
+# Persistent buffers for the Triton `mhc_post_pre` path. We pre-allocate all
+# scratch + output tensors and pass them in on every call so their data_ptrs
+# stay fixed across CUDAGraph captures and replays. `torch.empty` inside the
+# kernel wrapper would otherwise allocate fresh memory on every call, and the
+# split-K `acc_partial` / `acc_sq_partial` partials in particular need stable
+# addresses — without this, captured graphs read stale data on replay (the
+# 0-accuracy regression at `--cudagraph-capture-sizes [1..64]`).
+#
+# Keyed by (M, dim, n, device). One entry per CUDAGraph capture size.
+_V4_FUSED_HC_POST_PRE_CACHE: dict = {}
+
+
+def _get_fused_hc_post_pre_buffers(
+    M: int,
+    dim: int,
+    n: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> dict:
+    """Return persistent buffers for one `(M, dim, n, device)` shape, allocating
+    on first miss. Pulls `BLOCK_K` from the same tuned config the Triton kernel
+    uses (`get_mhc_config("MHC_FUSED", M, dim, mode="sinkhorn")`), so the cached
+    `acc_partial` / `acc_sq_partial` shapes match the kernel's expectation.
+    """
+    key = (M, dim, n, device)
+    bufs = _V4_FUSED_HC_POST_PRE_CACHE.get(key)
+    if bufs is not None:
+        return bufs
+
+    N_total = 2 * n + n * n
+
+    cfg, _ = get_mhc_config("MHC_FUSED", M, dim, mode="sinkhorn")
+    BLOCK_K = cfg.get("BLOCK_K", min(512, triton.next_power_of_2(n * dim)))
+    BLOCK_K = min(BLOCK_K, triton.next_power_of_2(n * dim))
+    BLOCK_C_SPLIT = BLOCK_K // n
+    NUM_KSPLIT = triton.cdiv(dim, BLOCK_C_SPLIT)
+
+    bufs = {
+        "residual_out": torch.empty(M, n, dim, dtype=dtype, device=device),
+        "layer_input_out": torch.empty(M, dim, dtype=dtype, device=device),
+        "h_post": torch.empty(M, n, dtype=torch.float32, device=device),
+        "h_res": torch.empty(M, n, n, dtype=torch.float32, device=device),
+        "acc_partial": torch.empty(
+            NUM_KSPLIT, M, N_total, dtype=torch.float32, device=device
+        ),
+        "acc_sq_partial": torch.empty(
+            NUM_KSPLIT, M, dtype=torch.float32, device=device
+        ),
+    }
+    _V4_FUSED_HC_POST_PRE_CACHE[key] = bufs
+    return bufs
+
+
 def _fused_hc_post_pre_fake(
     x: torch.Tensor,  # [num_tokens, dim]      attn/ffn output
     residual: torch.Tensor,  # [num_tokens, hc, dim]  pre-post residual
@@ -362,11 +418,14 @@ def fused_hc_post_pre(
     """
     num_tokens = x.shape[0]
     if num_tokens <= _V4_FUSED_HC_POST_PRE_M_THRESHOLD:
-        # Pre-allocate fp32 h_post/h_res for the next layer's HIP `mhc_post`.
-        # The Triton kernel implicit-casts on store, so providing fp32 buffers
-        # avoids the bf16→fp32 cast we used to do after the kernel returned.
-        new_post = torch.empty(num_tokens, n, dtype=torch.float32, device=x.device)
-        new_comb = torch.empty(num_tokens, n, n, dtype=torch.float32, device=x.device)
+        # Look up persistent scratch + output buffers for this M (allocated on
+        # first miss, reused thereafter). All buffers — including the split-K
+        # `acc_partial` / `acc_sq_partial` partials — have stable `.data_ptr()`,
+        # which is required for CUDAGraph replay to read the same memory each
+        # time. Without this, captured graphs see stale partials on replay.
+        bufs = _get_fused_hc_post_pre_buffers(
+            num_tokens, x.shape[1], n, residual.dtype, x.device
+        )
         _, _, layer_input_out, new_residual = _triton_mhc_post_pre(
             x,
             residual,
@@ -380,10 +439,14 @@ def fused_hc_post_pre(
             hc_eps,
             hc_post_mult,
             sinkhorn_iters,
-            h_post=new_post,
-            h_res=new_comb,
+            residual_out=bufs["residual_out"],
+            h_post=bufs["h_post"],
+            h_res=bufs["h_res"],
+            layer_input_out=bufs["layer_input_out"],
+            acc_partial=bufs["acc_partial"],
+            acc_sq_partial=bufs["acc_sq_partial"],
         )
-        return new_residual, layer_input_out, new_post, new_comb
+        return new_residual, layer_input_out, bufs["h_post"], bufs["h_res"]
 
     # HIP fallback: hc_post followed by hc_pre. `residual.dtype == x.dtype`
     # (bf16 end-to-end in Block.forward), so `out` inherits the right dtype.
