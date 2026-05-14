@@ -84,6 +84,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_glm4_7_fp8_mtp_tp8:
+        description: "GLM-4.7-FP8 MTP TP8"
+        required: false
+        type: boolean
+        default: false
       run_glm5_1_fp8_tp8:
         description: "GLM-5.1-FP8 TP8"
         required: false
@@ -149,6 +154,7 @@ jobs:
           RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
           RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
+          RUN_GLM4_7_FP8_MTP_TP8: ${{ inputs.run_glm4_7_fp8_mtp_tp8 }}
           RUN_GLM5_1_FP8_TP8: ${{ inputs.run_glm5_1_fp8_tp8 }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
         run: |
@@ -300,6 +306,15 @@ jobs:
                   "accuracy_test_threshold": 0.88,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-4",
+              },
+              {
+                  "toggle_env": "RUN_GLM4_7_FP8_MTP_TP8",
+                  "model_name": "GLM-4.7-FP8 MTP TP8",
+                  "model_path": "zai-org/GLM-4.7-FP8",
+                  "extra_args": "--tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "runner": "linux-atom-mi35x-8",
               },
               {
                   "toggle_env": "RUN_GLM5_1_FP8_TP8",
