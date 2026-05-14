@@ -22,6 +22,10 @@ on:
         description: "Benchmark GLM-5-FP8"
         type: boolean
         default: true
+      glm-5.1-fp4:
+        description: "Benchmark GLM-5.1-MXFP4"
+        type: boolean
+        default: true
       deepseek-r1-0528-mxfp4:
         description: "Benchmark DeepSeek-R1-0528 MXFP4 (+ MXFP4-MTP3)"
         type: boolean
@@ -34,8 +38,8 @@ on:
         description: "Benchmark Kimi-K2.5-MXFP4"
         type: boolean
         default: true
-      MiniMax-M2.5:
-        description: "Benchmark MiniMax-M2.5"
+      MiniMax-M2.7:
+        description: "Benchmark MiniMax-M2.7 (+ MXFP4)"
         type: boolean
         default: true
       qwen35-397b-fp8:

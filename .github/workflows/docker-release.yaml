@@ -110,6 +110,7 @@ jobs:
       - name: Echo environment variables
         run: |
           echo "ATOM_REPO: ${{ inputs.atom_repo || env.ATOM_REPO }}"
+          echo "ATOM_BRANCH: ${{ github.ref_name }}"
           echo "ATOM_COMMIT: ${{ inputs.atom_commit || env.ATOM_COMMIT }}"
           echo "AITER_REPO: ${{ inputs.aiter_repo || env.AITER_REPO }}"
           echo "AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}"
@@ -123,12 +124,19 @@ jobs:
       - name: Build Docker image
         timeout-minutes: 180
         run: |
+          ATOM_COMMIT="${{ inputs.atom_commit || env.ATOM_COMMIT }}"
+          if [ "${ATOM_COMMIT}" = "HEAD" ]; then
+            ATOM_CHECKOUT="${{ github.ref_name }}"
+          else
+            ATOM_CHECKOUT="${ATOM_COMMIT}"
+          fi
+          echo "ATOM checkout ref: ${ATOM_CHECKOUT} (branch: ${{ github.ref_name }})"
           DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
           --target atom_image \
           --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
           --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
-          --build-arg ATOM_COMMIT="${{ inputs.atom_commit || env.ATOM_COMMIT }}" \
+          --build-arg ATOM_COMMIT="${ATOM_CHECKOUT}" \
           --build-arg AITER_REPO="${{ inputs.aiter_repo || env.AITER_REPO }}" \
           --build-arg AITER_COMMIT="${{ inputs.aiter_commit || env.AITER_COMMIT }}" \
           --build-arg RCCL_REPO="${{ inputs.rccl_repo || env.RCCL_REPO }}" \
@@ -189,12 +197,21 @@ jobs:
       - name: Push Docker image
         if: ${{ success() && inputs.only_release_oot != true && inputs.only_release_sglang != true }}
         run: |
-          # Push both the versioned tag and update the 'latest' tag for the Docker image
+          BRANCH="${{ github.ref_name }}"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
           TAG=nightly_$(date +%Y%m%d%H%M)
-          docker tag atom_release:ci rocm/atom-dev:latest
-          docker push rocm/atom-dev:latest
-          docker tag atom_release:ci rocm/atom-dev:${TAG}
-          docker push rocm/atom-dev:${TAG}
+          if [ "${BRANCH}" != "${DEFAULT_BRANCH}" ]; then
+            SAFE_BRANCH=$(echo "${BRANCH}" | sed 's/[^A-Za-z0-9._-]/-/g')
+            TAG="${TAG}-${SAFE_BRANCH}"
+            docker tag atom_release:ci rocm/atom-dev:${TAG}
+            docker push rocm/atom-dev:${TAG}
+            echo "Branch '${BRANCH}'; tag: rocm/atom-dev:${TAG}. Skipping latest update."
+          else
+            docker tag atom_release:ci rocm/atom-dev:latest
+            docker push rocm/atom-dev:latest
+            docker tag atom_release:ci rocm/atom-dev:${TAG}
+            docker push rocm/atom-dev:${TAG}
+          fi
 
       - name: Build OOT Docker image
         if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
