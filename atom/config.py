@@ -1075,6 +1075,30 @@ def set_current_atom_config(atom_config: Config):
     _current_atom_config = atom_config
 
 
+def _get_current_atom_config_from_vllm_forward_context() -> Optional[Config]:
+    # In vLLM plugin mode (especially speculative decode), main/draft models
+    # can coexist in one process. Resolve per-forward config first to avoid
+    # reading a stale global singleton.
+    try:
+        from vllm.forward_context import (
+            get_forward_context as get_vllm_forward_context,
+            is_forward_context_available,
+        )
+    except Exception:
+        return None
+    if not is_forward_context_available():
+        return None
+    try:
+        return get_vllm_forward_context().additional_kwargs.get("atom_config")
+    except Exception:
+        return None
+
+
 def get_current_atom_config() -> Config:
+    # Try to get the atom config from forward context first in vLLM plugin mode.
+    if is_vllm():
+        forward_atom_config = _get_current_atom_config_from_vllm_forward_context()
+        if forward_atom_config is not None:
+            return forward_atom_config
     assert _current_atom_config is not None, "Current atom config is not set"
     return _current_atom_config

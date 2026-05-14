@@ -840,12 +840,8 @@ class vllmMLAAttentionMetadataBuilderMethods:
         )
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
 
-        max_qo_len = (
-            (query_start_loc_cpu[-1] - query_start_loc_cpu[-2]).item()
-            if query_start_loc_cpu.numel() > 1
-            else 1
-        )
-
+        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_qo_len = qo_len.max().item()
         kv_indices_generate_triton(
             block_table_tensor,
             self.paged_kv_indices,
@@ -882,7 +878,9 @@ class vllmMLAAttentionMetadataBuilderMethods:
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
+        ctx_mla_ps = self._set_mla_persistent_worker_buffers(
+            num_reqs, qo_indptr, max_qo_len
+        )
         self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(
@@ -936,7 +934,6 @@ class vllmMLAAttentionMetadataBuilderMethods:
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
-
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
@@ -2136,6 +2133,7 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
             from vllm.utils.platform_utils import num_compute_units
         except ImportError:
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
+        from atom.models.utils import extract_layer_index
         from vllm.v1.worker.cp_utils import get_total_cp_world_size
         from vllm.utils.math_utils import cdiv
 
@@ -2146,16 +2144,30 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(
             self.model_config.max_model_len
         )
-        self.num_speculative_tokens = (
-            self.vllm_config.speculative_config.num_speculative_tokens
-            if self.vllm_config.speculative_config
-            else 0
-        )
-        self.reorder_batch_threshold += self.num_speculative_tokens
+        # Determine if this builder is for draft model layers (MTP).
+        # Draft model layers have layer indices >= num_hidden_layers.
+        # The draft model itself does not do speculative decoding, so
+        # num_speculative_tokens should be 0 for its builders.
+        _is_draft_layer = False
+        if layer_names:
+            num_hidden_layers = config.model_config.hf_config.num_hidden_layers
+            layer_indices = [
+                extract_layer_index(layer_name) for layer_name in layer_names
+            ]
+            _is_draft_layer = all(idx >= num_hidden_layers for idx in layer_indices)
+        if _is_draft_layer:
+            self.num_speculative_tokens = 0
+        else:
+            self.num_speculative_tokens = (
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config
+                else 0
+            )
 
         sm_count = num_compute_units(self.device.index)
         self.num_sms = sm_count
@@ -2222,6 +2234,7 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         parallel_config = config.parallel_config
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
@@ -2275,8 +2288,9 @@ def setup_mla_sparse_attn_metadata_builder_base_class_and_attributes(class_dict:
     generic_base = AttentionMetadataBuilder
     needs_generic = True
 
-    # align with vllm ROCMAiterMLASparseMetadataBuilder
-    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # The plugin sparse MLA path builds per-token ragged metadata, so uniform
+    # spec-decode batches from the main model can use full decode cudagraphs.
+    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_BATCH
     # For indexer metadata, not present in vllm sparse MLA
     class_dict["reorder_batch_threshold"] = 1
 
@@ -2297,12 +2311,16 @@ def unified_attention_with_output_base_for_plugin_mode(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    atom_config = get_current_atom_config()
+    current_atom_config = get_current_atom_config()
+    static_forward_context = (
+        current_atom_config.compilation_config.static_forward_context
+    )
+
     if use_mla:
         # raise NotImplementedError("MLA is not supported for plugin mode for now")
         kv_c_normed = k
         k_pe = v
-        self = atom_config.compilation_config.static_forward_context[layer_name]
+        self = static_forward_context[layer_name]
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
@@ -2321,8 +2339,7 @@ def unified_attention_with_output_base_for_plugin_mode(
         )
         return self.o_proj(output)
     else:
-        self = atom_config.compilation_config.static_forward_context[layer_name]
-
+        self = static_forward_context[layer_name]
         # here is the standard vllm attention impl interface
         # when using fusion, we need to pass the qkv and positions through the q,k,v
         # [watch out] accept_output_buffer must be False for plugin mode
