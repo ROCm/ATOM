@@ -5,7 +5,7 @@ use crate::core::{ConnectionMode, HashRing, Worker, WorkerRegistry, WorkerType};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 
 pub struct WorkerRegistryAdapter {
-    pub registry: Arc<WorkerRegistry>,
+    registry: Arc<WorkerRegistry>,
 }
 
 impl WorkerRegistryAdapter {
@@ -47,7 +47,7 @@ impl WorkerSource for WorkerRegistryAdapter {
 }
 
 pub struct PolicyRegistryAdapter {
-    pub registry: Arc<PolicyRegistry>,
+    registry: Arc<PolicyRegistry>,
 }
 
 impl PolicyRegistryAdapter {

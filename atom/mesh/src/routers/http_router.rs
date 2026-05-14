@@ -46,7 +46,6 @@ use crate::{
     },
 };
 
-/// Regular router that uses injected load balancing policies
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     planner: Arc<dyn PdPlanner>,
@@ -67,7 +66,6 @@ impl std::fmt::Debug for Router {
 }
 
 impl Router {
-    /// Create a new router with injected policy and client
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
             Arc::new(WorkerRegistryAdapter::new(ctx.worker_registry.clone())),
@@ -228,7 +226,6 @@ impl Router {
             tokens: None,
             headers,
             stream: is_stream,
-            return_logprob: false,
         };
 
         let (worker, policy_name) = match self.planner.plan(&descriptor).await {
