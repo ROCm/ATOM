@@ -1,114 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778768589388,
+  "lastUpdate": 1778771069734,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "email": "zejun.chen@amd.com",
-            "name": "zejunchen-zejun",
-            "username": "zejunchen-zejun"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "3b6ce1da415c04279483169465e5175eba896ffd",
-          "message": "[atom-vllm benchmark][docker release] refine docker release and atom-vllm benchmark details (#671)\n\n* [atom-vllm benchmark] remove flydsl gdr kernel for\nq3next TP1 benchmark case\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n* update the model\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n* update k2.5 model source\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n* add suffix name\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n* add con 128 and 256 for kimi-k2/k2.5 model\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n* enable job pending\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n* add image input for atom-vllm nightly\nadd qwen3next tp1 for atom-vllm nightly\nremove rocm aiter fa attn backend\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n* change the k2/k2.5 to the new model\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n* add con 128 and 256\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n* remove 2 qwen3.5 cases in atom-vllm bench\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n* remove the auto cancel\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>\n\n---------\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>",
-          "timestamp": "2026-05-06T14:39:53+08:00",
-          "tree_id": "73cbbc6054d0ba8d77de85883a02b163f27fe82d",
-          "url": "https://github.com/ROCm/ATOM/commit/3b6ce1da415c04279483169465e5175eba896ffd"
-        },
-        "date": 1778053475153,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-R1-0528 accuracy (GSM8K)",
-            "value": 0.9462,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP accuracy (GSM8K)",
-            "value": 0.9447,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP MTP acceptance (%)",
-            "value": 62.47,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP avg toks/fwd (tok/fwd)",
-            "value": 2.87,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
-            "value": 0.9439,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9401 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
-            "value": 0.9371,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.931 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP MTP acceptance (%)",
-            "value": 58.87,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.931 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP avg toks/fwd (tok/fwd)",
-            "value": 2.77,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::GLM-5.1-FP8 accuracy (GSM8K)",
-            "value": 0.8969,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.875 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5.1 | BaselineNote: CI uses 3-shot, not comparable to HF 5-shot baseline | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9469 | fewshot: 3 | Model: /models/zai-org/GLM-5.1-FP8"
-          },
-          {
-            "name": "ATOM::GLM-5.1-MXFP4 accuracy (GSM8K)",
-            "value": 0.881,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.87 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5.1 | BaselineNote: CI uses 3-shot, not comparable to HF 5-shot baseline | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9303 | fewshot: 3 | Model: /models/amd/GLM-5.1-MXFP4"
-          },
-          {
-            "name": "ATOM::Kimi-K2.5-MXFP4 accuracy (GSM8K)",
-            "value": 0.9401,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.92 | Baseline: 0.9409 | BaselineModel: moonshotai/Kimi-K2.5 | BaselineNote: HF: amd/Kimi-K2.5-MXFP4 card shows Kimi-K2.5 baseline=0.9409 | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9401 | fewshot: 3 | Model: /models/amd/Kimi-K2.5-MXFP4"
-          },
-          {
-            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
-            "value": 0.9045,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.6293 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
-          },
-          {
-            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-FP8 accuracy (GSM8K)",
-            "value": 0.8992,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.8832 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
-            "value": 0.4026,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25420423350 | Threshold: 0.39 | Baseline: 0.41 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202605051603 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.232 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -67756,6 +67650,118 @@ window.BENCHMARK_DATA = {
             "name": "ATOM-vLLM::Qwen3-Next-80B-A3B-Instruct-FP8-tp4 8192/1024 c=64 _tp",
             "value": 4,
             "unit": ""
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jiayyu@amd.com",
+            "name": "Jiayun",
+            "username": "jiayyu"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e77a5ce1afdf71bd4d3acb6324709b9ba21c3e80",
+          "message": "fix prefix default on (#784)\n\n* fix all tokens hit issue\n\n* refine",
+          "timestamp": "2026-05-14T22:16:42+08:00",
+          "tree_id": "fcb3e68809cf2e6b1ef3c031aa175f58867954d3",
+          "url": "https://github.com/ROCm/ATOM/commit/e77a5ce1afdf71bd4d3acb6324709b9ba21c3e80"
+        },
+        "date": 1778771066024,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
+            "value": 0.934,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:latest@sha256:cb1a406e37af50f4b8b8fc2b9389b36b6ad859103e9103da1c563676badcd5a2 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9303 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
+            "value": 0.9386,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202605131605 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9356 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP MTP acceptance (%)",
+            "value": 61.09,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202605131605 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9356 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP avg toks/fwd (tok/fwd)",
+            "value": 2.83,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro accuracy (GSM8K)",
+            "value": 0.956,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.92 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Local 4-run average GSM8K-100 3-shot flexible-extract = 0.96 (runs: 0.96/0.98/0.96/0.94, stderr ~0.024). ATOM_USE_TRITON_MOE=1 is required — without it accuracy drops to ~0.6. Threshold set 4pp below local baseline to absorb full-eval (1319 samples) noise; refresh after first CI measurement. | Docker: rocm/atom-dev:nightly_202605131605 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9568 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOM::GLM-5.1-FP8 accuracy (GSM8K)",
+            "value": 0.8961,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.875 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5.1 | BaselineNote: CI uses 3-shot, not comparable to HF 5-shot baseline | Docker: rocm/atom-dev:nightly_202605131605 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9477 | fewshot: 3 | Model: /models/zai-org/GLM-5.1-FP8"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 accuracy (GSM8K)",
+            "value": 0.8832,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.87 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5.1 | BaselineNote: CI uses 3-shot, not comparable to HF 5-shot baseline | Docker: rocm/atom-dev:nightly_202605131605 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9303 | fewshot: 3 | Model: /models/amd/GLM-5.1-MXFP4"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 MTP accuracy (GSM8K)",
+            "value": 0.8931,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.87 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5.1 | BaselineNote: CI uses 3-shot, not comparable to HF 5-shot baseline | Docker: rocm/atom-dev:nightly_202605131605 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9333 | fewshot: 3 | Model: /models/amd/GLM-5.1-MXFP4"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 MTP MTP acceptance (%)",
+            "value": 53.32,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.87 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5.1 | BaselineNote: CI uses 3-shot, not comparable to HF 5-shot baseline | Docker: rocm/atom-dev:nightly_202605131605 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9333 | fewshot: 3 | Model: /models/amd/GLM-5.1-MXFP4"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 MTP avg toks/fwd (tok/fwd)",
+            "value": 2.6,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 accuracy (GSM8K)",
+            "value": 0.9333,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.92 | Baseline: 0.9409 | BaselineModel: moonshotai/Kimi-K2.5 | BaselineNote: HF: amd/Kimi-K2.5-MXFP4 card shows Kimi-K2.5 baseline=0.9409 | Docker: rocm/atom-dev:nightly_202605131605 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.934 | fewshot: 3 | Model: /models/amd/Kimi-K2.5-MXFP4"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
+            "value": 0.9045,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | Docker: rocm/atom-dev:nightly_202605131605 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.6232 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
+          },
+          {
+            "name": "ATOM::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7574,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202605131605 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.3 | strict-match: 0.7536 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          },
+          {
+            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
+            "value": 0.6929,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.65 | Baseline: 0.69 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | Docker: rocm/atom-dev:latest@sha256:cb1a406e37af50f4b8b8fc2b9389b36b6ad859103e9103da1c563676badcd5a2 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.7945 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 accuracy (GSM8K)",
+            "value": 0.8279,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/25865144667 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605 (FP8 tp=4, 3-shot completions API, thinking mode active). HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:latest@sha256:cb1a406e37af50f4b8b8fc2b9389b36b6ad859103e9103da1c563676badcd5a2 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.8158 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
           }
         ]
       }
