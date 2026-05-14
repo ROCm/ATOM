@@ -422,7 +422,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         draft_hf_config = None
         if is_mtp_draft_model:
             draft_model_config = getattr(
-                getattr(self.vllm_config, "speculative_config", None),
+                getattr(self.atom_config, "speculative_config", None),
                 "draft_model_config",
                 None,
             )
