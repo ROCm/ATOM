@@ -6,12 +6,16 @@
 #   1. `amd-smi static --asic` MARKET_NAME
 #   2. `rocm-smi --showproductname` Card Series
 #   3. `rocminfo` Marketing Name
-#   4. <runner_hint> pattern match (mi355 / mi325 / mi300 / mi250)
+#   4. <runner_hint> pattern match (mi355 / mi35x / mi325 / mi300 / mi250)
 #
 # Step 4 is needed because on freshly-released ASICs (currently MI355X) every
 # in-container SMI tool can still report "Radeon Graphics" until the
 # marketing-name table is patched. The CI runner name is operator-asserted
 # and reliable, so we use it as the final tie-breaker for the dashboard label.
+#
+# Note: `mi35x` is the family-style label used by accuracy-validation runners
+# (`linux-atom-mi35x-1` / `-4` / `-8`). The MI35 series in ATOM CI currently
+# only contains MI355X, so we map both `mi355` and `mi35x` to MI355X.
 #
 # Usage:
 #   collect_gpu_info.sh                                          # local host
@@ -58,7 +62,7 @@ if { [ -z "${GPU_NAME:-}" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; } 
     && [ -n "${RUNNER_HINT:-}" ]; then
     hint_lc=$(echo "$RUNNER_HINT" | tr '[:upper:]' '[:lower:]')
     case "$hint_lc" in
-        *mi355*) GPU_NAME="AMD Instinct MI355X" ;;
+        *mi355*|*mi35x*) GPU_NAME="AMD Instinct MI355X" ;;
         *mi325*) GPU_NAME="AMD Instinct MI325X" ;;
         *mi300x*|*mi300*) GPU_NAME="AMD Instinct MI300X" ;;
         *mi250x*|*mi250*) GPU_NAME="AMD Instinct MI250X" ;;
