@@ -7,6 +7,11 @@ use crate::core::{ConnectionMode, HashRing, Worker, WorkerType};
 use crate::policies::LoadBalancingPolicy;
 
 pub trait WorkerSource: Send + Sync {
+    /// `worker_type` is matched by variant: `Prefill { bootstrap_port: _ }` returns
+    /// any prefill regardless of bootstrap_port. Other variants match exactly.
+    /// Adapters wrapping `WorkerRegistry` (which uses strict `PartialEq` on the full
+    /// `WorkerType` value) must dispatch Prefill queries through
+    /// `WorkerRegistry::get_prefill_workers()` to honor this contract.
     fn workers_filtered(
         &self,
         model_id: Option<&str>,
