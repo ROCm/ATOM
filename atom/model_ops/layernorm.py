@@ -64,9 +64,12 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
 
 def _detect_gfx1201() -> bool:
     try:
-        return (torch.cuda.get_device_properties(0).gcnArchName or "").startswith("gfx1201")
+        return (torch.cuda.get_device_properties(0).gcnArchName or "").startswith(
+            "gfx1201"
+        )
     except Exception:
         return False
+
 
 _IS_GFX1201: bool = _detect_gfx1201()
 

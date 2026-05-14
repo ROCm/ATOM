@@ -194,7 +194,9 @@ class PagedAttention(BaseAttention):
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError("Duplicate layer: {}".format(self.layer_name))
         compilation_config.static_forward_context[self.layer_name] = self
-        self._use_native_triton = (self.attn_backend.get_name() == "NATIVE_TRITON_ATTENTION")
+        self._use_native_triton = (
+            self.attn_backend.get_name() == "NATIVE_TRITON_ATTENTION"
+        )
 
     def forward(
         self,
