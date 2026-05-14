@@ -604,10 +604,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if attn_metadata.has_cached:
                 # Full context (cached + new): use cu_seqlens_k for indexer
                 var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
-                    var["cu_seqlens_k"].np[:-1], counts
+                    var["cu_seqlens_k"].np[:bs], counts
                 )
                 var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = np.repeat(
-                    var["cu_seqlens_k"].np[1:], counts
+                    var["cu_seqlens_k"].np[1 : bs + 1], counts
                 )
             else:
                 var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (

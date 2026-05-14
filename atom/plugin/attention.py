@@ -846,11 +846,8 @@ class vllmMLAAttentionMetadataBuilderMethods:
         )
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
 
-        max_qo_len = (
-            (query_start_loc_cpu[-1] - query_start_loc_cpu[-2]).item()
-            if query_start_loc_cpu.numel() > 1
-            else 1
-        )
+        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_qo_len = qo_len.max().item()
         kv_indices_generate_triton(
             block_table_tensor,
             self.paged_kv_indices,
@@ -887,9 +884,6 @@ class vllmMLAAttentionMetadataBuilderMethods:
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        # MTP/spec decode can verify multiple decode tokens per request in one
-        # forward pass. The persistent MLA metadata must use the actual query
-        # length rather than assuming single-token decode.
         ctx_mla_ps = self._set_mla_persistent_worker_buffers(
             num_reqs, qo_indptr, max_qo_len
         )
@@ -2155,6 +2149,7 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
             from vllm.utils.platform_utils import num_compute_units
         except ImportError:
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
+        from atom.models.utils import extract_layer_index
         from vllm.v1.worker.cp_utils import get_total_cp_world_size
         from vllm.utils.math_utils import cdiv
 
@@ -2176,8 +2171,11 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
         # num_speculative_tokens should be 0 for its builders.
         _is_draft_layer = False
         if layer_names:
-            if len(layer_names) < config.model_config.hf_config.num_hidden_layers:
-                _is_draft_layer = True
+            num_hidden_layers = config.model_config.hf_config.num_hidden_layers
+            layer_indices = [
+                extract_layer_index(layer_name) for layer_name in layer_names
+            ]
+            _is_draft_layer = all(idx >= num_hidden_layers for idx in layer_indices)
         if _is_draft_layer:
             self.num_speculative_tokens = 0
         else:
@@ -2329,23 +2327,7 @@ def unified_attention_with_output_base_for_plugin_mode(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    current_atom_config = None
-    try:
-        from vllm.forward_context import (
-            get_forward_context as get_vllm_forward_context,
-            is_forward_context_available,
-        )
-
-        if is_forward_context_available():
-            current_atom_config = get_vllm_forward_context().additional_kwargs.get(
-                "atom_config"
-            )
-    except Exception:
-        # Keep backward compatibility when vLLM forward_context is unavailable.
-        current_atom_config = None
-
-    if current_atom_config is None:
-        current_atom_config = get_current_atom_config()
+    current_atom_config = get_current_atom_config()
     static_forward_context = (
         current_atom_config.compilation_config.static_forward_context
     )
@@ -2374,7 +2356,6 @@ def unified_attention_with_output_base_for_plugin_mode(
         return self.o_proj(output)
     else:
         self = static_forward_context[layer_name]
-
         # here is the standard vllm attention impl interface
         # when using fusion, we need to pass the qkv and positions through the q,k,v
         # [watch out] accept_output_buffer must be False for plugin mode

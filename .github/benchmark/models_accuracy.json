@@ -125,7 +125,7 @@
     "model_path": "openai/gpt-oss-120b",
     "extraArgs": "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --enable-tbo all --gpu-memory-utilization 0.5",
     "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
-    "env_vars": "",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
     "runner": "linux-atom-mi35x-4",
     "test_level": "main",
     "accuracy_threshold": 0.88,
@@ -266,27 +266,51 @@
     "_baseline_note": "CI baseline=0.8605 (FP8 tp=4, 3-shot completions API, thinking mode active). HF card reports 0.9538 but uses chat API with reasoning_parser"
   },
   {
-    "model_name": "MiniMax-M2.5",
-    "model_path": "MiniMaxAI/MiniMax-M2.5",
+    "model_name": "MiniMax-M2.7",
+    "model_path": "MiniMaxAI/MiniMax-M2.7",
     "extraArgs": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "nightly",
-    "accuracy_threshold": 0.92,
-    "accuracy_baseline": 0.9401,
-    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
-    "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows baseline=0.9401"
+    "accuracy_threshold": 0.8872,
+    "accuracy_baseline": 0.9022,
+    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.7",
+    "_baseline_note": "ATOM CI measured: 0.9022 (gsm8k 3-shot flexible-extract). Threshold = baseline - 0.015."
   },
   {
-    "model_name": "MiniMax-M2.5-MXFP4",
-    "model_path": "amd/MiniMax-M2.5-MXFP4",
+    "model_name": "MiniMax-M2.7-MXFP4",
+    "model_path": "amd/MiniMax-M2.7-MXFP4",
     "extraArgs": "--kv_cache_dtype fp8 --trust-remote-code",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "nightly",
-    "accuracy_threshold": 0.91,
-    "accuracy_baseline": 0.9401,
-    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
-    "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows MXFP4=0.9256, baseline=0.9401"
+    "accuracy_threshold": 0.8872,
+    "accuracy_baseline": 0.9022,
+    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.7",
+    "_baseline_note": "ATOM CI measured BF16=0.9022 (gsm8k 3-shot flexible-extract). HF amd/MiniMax-M2.7-MXFP4: MXFP4=91.89, baseline=91.81 (percentage)."
+  },
+  {
+    "model_name": "MiMo-V2-Flash",
+    "model_path": "XiaomiMiMo/MiMo-V2-Flash",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code --gpu-memory-utilization 0.8",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.81,
+    "accuracy_baseline": 0.8294,
+    "accuracy_baseline_model": "XiaomiMiMo/MiMo-V2-Flash",
+    "_baseline_note": "CI measured GSM8K 5-shot flexible-extract = 0.8294 (±0.0104) under MTP1 greedy decoding (see MiMo-V2-Flash MTP entry); base-only number is identical because MTP only proposes speculative drafts that the target verifies. tp pinned to 4 to match the MTP entry's setup (no separate base measurement)."
+  },
+  {
+    "model_name": "MiMo-V2-Flash MTP",
+    "model_path": "XiaomiMiMo/MiMo-V2-Flash",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code --gpu-memory-utilization 0.8 --method mtp --num-speculative-tokens 1",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.81,
+    "accuracy_baseline": 0.8294,
+    "accuracy_baseline_model": "XiaomiMiMo/MiMo-V2-Flash",
+    "_baseline_note": "CI measured GSM8K 5-shot flexible-extract = 0.8294 (±0.0104) on FP8 KV + MTP1. tp MUST be 4 and num-speculative-tokens MUST be 1: ATOM only constructs MTP layer 0 (matches vLLM _MIMO_V2_FLASH_NUM_MTP_LAYERS=1); driving more spec tokens would route through layers 1/2 whose KV is never populated and accept rate craters."
   }
 ]

@@ -82,14 +82,6 @@ resolve_model_path() {
   fi
 }
 
-# gpt-oss OpenAI weights require Chat Completions (messages); local-completions sends "prompt" and vLLM returns 400.
-is_gpt_oss_model() {
-  local name_lc path_lc
-  name_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  path_lc="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
-  [[ "${name_lc}" == *gpt-oss* || "${path_lc}" == *gpt-oss* ]]
-}
-
 emit_new_vllm_logs() {
   if [[ "${STREAM_VLLM_LOGS}" != "1" || ! -f "${VLLM_LOG_FILE}" ]]; then
     return 0
@@ -206,7 +198,6 @@ PY
     --trust-remote-code \
     --kv-cache-dtype fp8 \
     "${extra_arg_array[@]}" \
-    --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching \
     > "${VLLM_LOG_FILE}" 2>&1 &
   echo $! > "${VLLM_PID_FILE}"
@@ -240,6 +231,10 @@ accuracy_one_model() {
   echo "========== Running OOT gsm8k accuracy =========="
   echo "Model name: ${model_name}"
   echo "Few-shot count: ${LM_EVAL_NUM_FEWSHOT}"
+
+  if [[ "${client_command}" == "null" ]]; then
+    client_command=""
+  fi
 
   if [[ -n "${client_command}" ]]; then
     local -a client_command_args=()
@@ -291,29 +286,16 @@ PY
     echo "Using custom lm-eval command from client_command: ${client_command}"
     "${client_command_args[@]}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
   else
+    echo "Using default lm-eval command."
     local lm_args=(
       --model_args
       model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
     )
-    if is_gpt_oss_model "${model_name}" "${model_path}"; then
-      echo "Using chat completions + apply_chat_template for gpt-oss (OpenAI-compatible messages API)."
-      lm_args=(
-        --model_args
-        model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/chat/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
-      )
-      lm_eval --model local-chat-completions \
-        --apply_chat_template \
-        "${lm_args[@]}" \
-        --tasks gsm8k \
-        --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
-        --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
-    else
-      lm_eval --model local-completions \
-        "${lm_args[@]}" \
-        --tasks gsm8k \
-        --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
-        --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
-    fi
+    lm_eval --model local-completions \
+      "${lm_args[@]}" \
+      --tasks gsm8k \
+      --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+      --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
   fi
 
   # lm-eval output layout differs across versions: output_path may be a file

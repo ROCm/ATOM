@@ -264,7 +264,7 @@ def _build_window_topk_batched(
     )
     pos_col = positions.view(total, 1)
     sp_col = start_pos_per_token.view(total, 1)
-    neg1 = torch.tensor(-1, device=device, dtype=positions.dtype)
+    neg1 = positions.new_full((), -1)
 
     # Case A: sp == 0 (fresh prefill) — abs positions [pos-win+1, pos] clamped.
     case_a = (pos_col - window_size + 1).clamp(min=0) + arange_w
@@ -1060,6 +1060,122 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             sum_scheduled_tokens,
         )
         return attn_metadata, positions
+
+    def build_ubatch_prefill_metadata(
+        self,
+        attn_metadata: AttentionMetaData,
+        ub_slice,
+        padded_bs: int,
+    ) -> AttentionMetaData_DSV4:
+        """Split prefill AttentionMetaData for V4 TBO micro-batches."""
+        from atom.utils.tbo.ubatch_splitting import split_attn_metadata
+
+        ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+        ub_attn.__class__ = AttentionMetaData_DSV4
+
+        src = cast(AttentionMetaData_DSV4, attn_metadata)
+        rs = ub_slice.request_slice
+        ts = ub_slice.token_slice
+        ub_num_reqs = rs.stop - rs.start
+        ub_num_tokens = ts.stop - ts.start
+
+        if src.state_slot_mapping is not None:
+            ub_attn.state_slot_mapping = src.state_slot_mapping[rs]
+        if src.state_slot_mapping_cpu is not None:
+            ub_attn.state_slot_mapping_cpu = src.state_slot_mapping_cpu[rs]
+        if src.start_pos_per_seq_cpu is not None:
+            ub_attn.start_pos_per_seq_cpu = src.start_pos_per_seq_cpu[rs]
+
+        var = self.model_runner.forward_vars
+        positions_np = np.asarray(var["positions"].np[ts.start : ts.stop])
+        full_cu = var["cu_seqlens_q"].np
+        ub_cu = np.asarray(full_cu[rs.start : rs.stop + 1], dtype=np.int32).copy()
+        ub_cu -= ub_cu[0]
+
+        extend_lens_np = (ub_cu[1:] - ub_cu[:ub_num_reqs]).astype(np.int32)
+        context_lens_np = (ub_attn.start_pos_per_seq_cpu + extend_lens_np).astype(
+            np.int32
+        )
+        device = src.state_slot_mapping.device
+
+        from atom.model_ops.v4_kernels import make_compress_plans
+
+        if self._unique_compress_ratios_overlap:
+            ub_attn.compress_plans = make_compress_plans(
+                np.ascontiguousarray(extend_lens_np, dtype=np.int32),
+                np.ascontiguousarray(context_lens_np, dtype=np.int32),
+                self._unique_compress_ratios_overlap,
+                device,
+                plan_buffers=None,
+                decode_capacity_per_ratio=None,
+            )
+        else:
+            ub_attn.compress_plans = {}
+
+        # Multiple helpers read context_lens and block_tables from
+        # forward_vars by position [0:scheduled_bs]. For ubatch 1 the
+        # relevant rows live at [rs.start:rs.stop], not [0:ub_num_reqs].
+        # Temporarily place the ubatch's slices at the front so helpers
+        # see the right values.
+        bt = var["block_tables"].np
+        saved_ctx = var["context_lens"].np[:ub_num_reqs].copy()
+        saved_bt = bt[:ub_num_reqs].copy()
+        try:
+            var["context_lens"].np[:ub_num_reqs] = context_lens_np
+            bt[:ub_num_reqs] = bt[rs.start : rs.stop].copy()
+
+            self._attach_v4_per_fwd_meta(
+                ub_attn,
+                positions_np,
+                ub_cu,
+                ub_attn.start_pos_per_seq_cpu,
+                ub_attn.state_slot_mapping_cpu,
+                ub_num_reqs,
+                ub_num_tokens,
+            )
+
+            positions_gpu = var["positions"].gpu[ts.start : ts.stop]
+            self._attach_v4_indexer_meta(
+                ub_attn,
+                ub_cu,
+                ub_attn.start_pos_per_seq_cpu,
+                ub_num_reqs,
+                ub_num_tokens,
+                positions_gpu=positions_gpu,
+            )
+
+            self._build_paged_prefill_meta(
+                ub_attn,
+                positions_np,
+                ub_cu,
+                ub_attn.start_pos_per_seq_cpu,
+                ub_attn.state_slot_mapping_cpu,
+                ub_num_reqs,
+                ub_num_tokens,
+            )
+        finally:
+            bt[:ub_num_reqs] = saved_bt
+            var["context_lens"].np[:ub_num_reqs] = saved_ctx
+
+        # Clone all GPU tensors that are views into shared CpuGpuBuffers.
+        # Without this, building the next ubatch overwrites this ubatch's
+        # data via the same underlying buffer.
+        if ub_attn.batch_id_per_token is not None:
+            ub_attn.batch_id_per_token = ub_attn.batch_id_per_token.clone()
+        if ub_attn.n_committed_csa_per_seq is not None:
+            ub_attn.n_committed_csa_per_seq = ub_attn.n_committed_csa_per_seq.clone()
+        if ub_attn.swa_write_indices is not None:
+            ub_attn.swa_write_indices = ub_attn.swa_write_indices.clone()
+        if ub_attn.indexer_meta is not None:
+            im = ub_attn.indexer_meta
+            if im.get("cu_committed_gpu") is not None:
+                im["cu_committed_gpu"] = im["cu_committed_gpu"].clone()
+            if im.get("batch_id_per_token_gpu") is not None:
+                im["batch_id_per_token_gpu"] = im["batch_id_per_token_gpu"].clone()
+            if im.get("n_committed_per_seq_gpu") is not None:
+                im["n_committed_per_seq_gpu"] = im["n_committed_per_seq_gpu"].clone()
+
+        return ub_attn
 
     def _attach_v4_per_fwd_meta(
         self,

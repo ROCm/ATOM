@@ -29,6 +29,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.fusions.fused_routing_from_topk import (
     fused_routing_from_topk as _aiter_fused_routing_from_topk,
 )
+from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from atom.model_ops.utils import has_triton_kernels
 
 logger = logging.getLogger("atom")
@@ -372,13 +373,14 @@ def triton_kernel_fused_experts(
                 gammas=gammas if apply_router_weight_on_input else None,
             )
             raw_2d = raw_intermediate.view(M * topk, N)
-            gate = raw_2d[:, :half_N]
-            up = raw_2d[:, half_N:]
-            if swiglu_limit > 0:
-                gate = gate.clamp(max=swiglu_limit)
-                up = up.clamp(-swiglu_limit, swiglu_limit)
             intermediate_cache = intermediate_cache.view(M * topk, half_N)
-            intermediate_cache.copy_(torch.nn.functional.silu(gate) * up)
+            fused_clamp_act_mul(
+                raw_2d,
+                out=intermediate_cache,
+                swiglu_limit=swiglu_limit,
+                activation="silu",
+                dtype_quant=None,
+            )
             intermediate_cache = intermediate_cache.view(batch_dim, M * topk, half_N)
 
         matmul_ogs(
