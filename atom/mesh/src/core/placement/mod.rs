@@ -1,16 +1,12 @@
 pub mod backend;
-pub mod candidate;
 pub mod planner;
 pub mod policy_apply;
 pub mod registry_adapters;
-pub mod trace;
 pub mod traits;
 pub mod types;
 
 pub use traits::{PdPlanner, PolicySource, WorkerSource};
-pub use types::{
-    AdapterError, PlacementError, PlacementPlan, PlacementTrace, Protocol, RequestDescriptor,
-};
+pub use types::{AdapterError, PlacementError, PlacementPlan, Protocol, RequestDescriptor};
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -25,8 +21,6 @@ mod tests_regular_planning;
 mod tests_pd_planning;
 #[cfg(test)]
 mod tests_adapter;
-#[cfg(test)]
-mod tests_trace;
 #[cfg(test)]
 mod tests_error;
 #[cfg(test)]

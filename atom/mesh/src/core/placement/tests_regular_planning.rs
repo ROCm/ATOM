@@ -113,7 +113,6 @@ async fn c05_hash_ring_called_with_real_model_id() {
             tokens: Some(&[1u32, 2, 3]),
             headers: None,
             stream: false,
-            return_logprob: false,
         })
         .await
         .unwrap();
@@ -146,7 +145,6 @@ async fn c06_grpc_single_worker_excludes_http() {
             tokens: None,
             headers: None,
             stream: false,
-            return_logprob: false,
         })
         .await
         .unwrap();
@@ -170,7 +168,6 @@ async fn c07_grpc_model_id_none_falls_back_to_default() {
             tokens: None,
             headers: None,
             stream: false,
-            return_logprob: false,
         })
         .await
         .unwrap();
