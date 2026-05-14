@@ -92,7 +92,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
-    headers: Option<HeaderMap>,
+    headers: Option<Arc<HeaderMap>>,
 }
 
 impl PDRouter {
@@ -149,33 +149,11 @@ impl PDRouter {
             Ok(res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                // Use the status code to determine which error function to use
-                match status {
-                    StatusCode::BAD_REQUEST => error::bad_request(
-                        "server_bad_request",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::NOT_FOUND => error::not_found(
-                        "server_not_found",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
-                        "server_internal_error",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
-                        "server_unavailable",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::BAD_GATEWAY => error::bad_gateway(
-                        "server_bad_gateway",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    _ => error::internal_error(
-                        "server_error",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                }
+                error::create_error(
+                    status,
+                    "server_error",
+                    format!("Server returned status: {}", res.status()),
+                )
             }
             Err(e) => {
                 error!("Failed to proxy request server: {}", e);
@@ -379,7 +357,7 @@ impl PDRouter {
             protocol: Some(Protocol::Http),
             text: context.request_text.as_deref(),
             tokens: None,
-            headers: context.headers.as_ref(),
+            headers: context.headers.as_deref(),
             stream: context.is_stream,
             return_logprob: context.return_logprob,
         };
@@ -875,47 +853,13 @@ impl PDRouter {
 
                     let status_code = StatusCode::from_u16(status.as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match status_code {
-                        StatusCode::BAD_REQUEST => {
-                            error::bad_request("decode_bad_request", error_message)
-                        }
-                        StatusCode::NOT_FOUND => {
-                            error::not_found("decode_not_found", error_message)
-                        }
-                        StatusCode::INTERNAL_SERVER_ERROR => {
-                            error::internal_error("decode_internal_error", error_message)
-                        }
-                        StatusCode::SERVICE_UNAVAILABLE => {
-                            error::service_unavailable("decode_unavailable", error_message)
-                        }
-                        StatusCode::BAD_GATEWAY => {
-                            error::bad_gateway("decode_bad_gateway", error_message)
-                        }
-                        _ => error::internal_error("decode_error", error_message),
-                    }
+                    error::create_error(status_code, "decode_error", error_message)
                 }
                 Err(e) => {
                     let error_message = format!("Decode server error: {}", e);
                     let status_code = StatusCode::from_u16(status.as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match status_code {
-                        StatusCode::BAD_REQUEST => {
-                            error::bad_request("decode_read_failed", error_message)
-                        }
-                        StatusCode::NOT_FOUND => {
-                            error::not_found("decode_read_failed", error_message)
-                        }
-                        StatusCode::INTERNAL_SERVER_ERROR => {
-                            error::internal_error("decode_read_failed", error_message)
-                        }
-                        StatusCode::SERVICE_UNAVAILABLE => {
-                            error::service_unavailable("decode_read_failed", error_message)
-                        }
-                        StatusCode::BAD_GATEWAY => {
-                            error::bad_gateway("decode_read_failed", error_message)
-                        }
-                        _ => error::internal_error("decode_read_failed", error_message),
-                    }
+                    error::create_error(status_code, "decode_read_failed", error_message)
                 }
             }
         }
@@ -1244,33 +1188,11 @@ impl PDRouter {
                 prefill_url, prefill_status, error_msg
             );
 
-            // Map prefill_status to appropriate error function
-            let error_response = match prefill_status {
-                StatusCode::BAD_REQUEST => error::bad_request(
-                    "prefill_bad_request",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::NOT_FOUND => error::not_found(
-                    "prefill_not_found",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
-                    "prefill_internal_error",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
-                    "prefill_unavailable",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::BAD_GATEWAY => error::bad_gateway(
-                    "prefill_bad_gateway",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                _ => error::internal_error(
-                    "prefill_error",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-            };
+            let error_response = error::create_error(
+                prefill_status,
+                "prefill_error",
+                format!("Prefill server error ({}): {}", prefill_status, error_msg),
+            );
             return Err(error_response);
         }
 
@@ -1530,7 +1452,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
-            headers: headers.cloned(),
+            headers: headers.cloned().map(Arc::new),
         };
 
         self.dispatch_pd(headers, body, context).await
@@ -1572,7 +1494,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
-            headers: headers.cloned(),
+            headers: headers.cloned().map(Arc::new),
         };
 
         self.dispatch_pd(headers, body, context).await
@@ -1605,7 +1527,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
-            headers: headers.cloned(),
+            headers: headers.cloned().map(Arc::new),
         };
 
         self.dispatch_pd(headers, body, context).await
@@ -1902,5 +1824,49 @@ mod tests {
     fn test_router_type() {
         let router = create_test_pd_router();
         assert_eq!(router.router_type(), "pd");
+    }
+
+    #[test]
+    fn test_pd_request_context_headers_arc_shared_across_retries() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-trace", HeaderValue::from_static("abc"));
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            request_text: None,
+            model_id: Some("m"),
+            headers: Some(Arc::new(headers)),
+        };
+
+        let attempt_1 = context.clone();
+        let attempt_2 = context.clone();
+
+        let original = context.headers.as_ref().expect("headers set");
+        let a1 = attempt_1.headers.as_ref().expect("headers set");
+        let a2 = attempt_2.headers.as_ref().expect("headers set");
+        assert!(Arc::ptr_eq(original, a1));
+        assert!(Arc::ptr_eq(original, a2));
+        assert_eq!(Arc::strong_count(original), 3);
+    }
+
+    #[test]
+    fn test_upstream_status_preserved_for_4xx_5xx() {
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let response = error::create_error(status, "decode_error", "upstream rejected");
+            assert_eq!(
+                response.status(),
+                status,
+                "upstream status {} must pass through unchanged",
+                status
+            );
+        }
     }
 }
