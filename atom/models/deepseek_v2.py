@@ -130,51 +130,24 @@ _FP8_DTYPES = tuple(
 )
 
 
-def _can_fuse_indexer_wk_quant_config(wk_quant_config) -> bool:
-    if wk_quant_config.quant_type == QuantType.No:
-        return True
-    return wk_quant_config.quant_dtype == dtypes.fp8
-
-
-def _iter_indexer_prefixes(
-    config: PretrainedConfig,
-    model_prefix: str,
-) -> list[str]:
-    attn_module_list_cfg = getattr(config, "attn_module_list_cfg", None)
-    if isinstance(attn_module_list_cfg, (list, tuple)):
-        prefixes = [
-            f"{model_prefix}.layers.{layer_idx}.self_attn.indexer"
-            for layer_idx, layer_cfg in enumerate(attn_module_list_cfg)
-            if isinstance(layer_cfg, dict) and layer_cfg.get("attn_index") is not None
-        ]
-        if prefixes:
-            return prefixes
-    return [f"{model_prefix}.layers.0.self_attn.indexer"]
-
-
 def _can_fuse_indexer_wk_weights_proj(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
-    indexer_prefix: str,
+    indexer_prefixes: list[str],
 ) -> bool:
     if not hasattr(config, "index_topk"):
         return False
     if quant_config is None:
         return True
 
-    wk_quant_config = quant_config.get_layer_quant_config(f"{indexer_prefix}.wk")
-    return _can_fuse_indexer_wk_quant_config(wk_quant_config)
-
-
-def _can_fuse_model_indexer_wk_weights_proj(
-    config: PretrainedConfig,
-    quant_config: Optional[QuantizationConfig],
-    model_prefix: str,
-) -> bool:
-    return all(
-        _can_fuse_indexer_wk_weights_proj(config, quant_config, indexer_prefix)
-        for indexer_prefix in _iter_indexer_prefixes(config, model_prefix)
-    )
+    for indexer_prefix in indexer_prefixes:
+        wk_quant_config = quant_config.get_layer_quant_config(f"{indexer_prefix}.wk")
+        if (
+            wk_quant_config.quant_type != QuantType.No
+            and wk_quant_config.quant_dtype != dtypes.fp8
+        ):
+            return False
+    return True
 
 
 def _fuse_rmsnorm_fp4_quant_fake(
@@ -1676,7 +1649,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     _can_fuse_indexer_wk_weights_proj(
                         config,
                         model_quant_config,
-                        f"{prefix}.indexer",
+                        [f"{prefix}.indexer"],
                     )
                     if use_indexer_wk_weights_proj_fusion is None
                     else use_indexer_wk_weights_proj_fusion
@@ -2174,10 +2147,21 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.quant_config = quant_config
 
         model_prefix = maybe_prefix(prefix, "model")
-        use_indexer_wk_weights_proj_fusion = _can_fuse_model_indexer_wk_weights_proj(
+        attn_module_list_cfg = getattr(config, "attn_module_list_cfg", None)
+        indexer_prefixes = []
+        if isinstance(attn_module_list_cfg, (list, tuple)):
+            indexer_prefixes = [
+                f"{model_prefix}.layers.{layer_idx}.self_attn.indexer"
+                for layer_idx, layer_cfg in enumerate(attn_module_list_cfg)
+                if isinstance(layer_cfg, dict)
+                and layer_cfg.get("attn_index") is not None
+            ]
+        if not indexer_prefixes:
+            indexer_prefixes = [f"{model_prefix}.layers.0.self_attn.indexer"]
+        use_indexer_wk_weights_proj_fusion = _can_fuse_indexer_wk_weights_proj(
             config,
             quant_config,
-            model_prefix,
+            indexer_prefixes,
         )
         if hasattr(config, "q_lora_rank") and config.q_lora_rank is not None:
             self.packed_modules_mapping = {
