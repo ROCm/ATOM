@@ -37,6 +37,91 @@ class Attention:
         return AttentionForAtom(*args, **kwargs)
 
 
+def run_pa_fwd_asm(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    max_qlen: Optional[int] = None,
+    high_precision: int = 0,
+):
+    """Run the AITER paged-attention ASM kernel with explicit metadata."""
+
+    import aiter
+
+    return aiter.pa_fwd_asm(
+        Q=q,
+        K=k_cache,
+        V=v_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        block_tables_stride0=block_tables.stride(0),
+        max_qlen=max_qlen,
+        K_QScale=k_scale,
+        V_QScale=v_scale,
+        out_=out,
+        qo_indptr=qo_indptr,
+        high_precision=high_precision,
+    )
+
+
+def run_pa_decode_gluon(
+    output: torch.Tensor,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    max_seqlen_q: int,
+    max_context_partition_num: int,
+    context_partition_size: int,
+    compute_type: torch.dtype,
+    q_scale: Optional[torch.Tensor],
+    k_scale: Optional[torch.Tensor],
+    v_scale: Optional[torch.Tensor],
+    *,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    temporary_output: torch.Tensor,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: int = -1,
+    ps: bool = True,
+):
+    """Run the AITER paged-attention Gluon decode kernel."""
+
+    return torch.ops.aiter.pa_decode_gluon(
+        output,
+        q,
+        k_cache,
+        v_cache,
+        context_lens,
+        block_tables,
+        softmax_scale,
+        max_seqlen_q,
+        max_context_partition_num,
+        context_partition_size,
+        compute_type,
+        q_scale,
+        k_scale,
+        v_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        alibi_slopes=alibi_slopes,
+        sinks=sinks,
+        sliding_window=sliding_window,
+        ps=ps,
+    )
+
+
 # this triton kernel is used to fetch the stored kv in
 # kv cache for computing the extend path(chunked prefill)
 # and it can be used for both server mode and plugin mode

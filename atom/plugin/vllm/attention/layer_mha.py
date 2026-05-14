@@ -7,7 +7,11 @@ from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
-from atom.model_ops.base_attention import cp_mha_gather_cache
+from atom.model_ops.base_attention import (
+    cp_mha_gather_cache,
+    run_pa_decode_gluon,
+    run_pa_fwd_asm,
+)
 from atom.plugin.vllm.attention.backend import AiterMhaBackendForVllm
 from atom.plugin.vllm.attention.layer_common import (
     _init_vllm_layer_state,
@@ -395,21 +399,21 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # Internally it derives batch_size = q.shape[0] // query_length and reshapes
         # to [batch, query_length, num_kv_heads, group, head_size]. See
         # aiter/aiter/ops/triton/gluon/pa_decode_gluon.py:5371-5377 and 5542-5544.
-        torch.ops.aiter.pa_decode_gluon(
-            out,
-            q,
-            k_cache,
-            v_cache,
-            seq_lens,
-            block_tables,
-            self.scale,
-            max_qlen,  # query_length — handles multi-token causal mask internally
-            max_context_partition_num,
-            context_partition_size,
-            compute_type,
-            None,
-            None if self.kv_cache_dtype == "bf16" else k_scale,
-            None if self.kv_cache_dtype == "bf16" else v_scale,
+        run_pa_decode_gluon(
+            output=out,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            context_lens=seq_lens,
+            block_tables=block_tables,
+            softmax_scale=self.scale,
+            max_seqlen_q=max_qlen,  # query_length handles multi-token causal mask.
+            max_context_partition_num=max_context_partition_num,
+            context_partition_size=context_partition_size,
+            compute_type=compute_type,
+            q_scale=None,
+            k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
+            v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
@@ -437,18 +441,17 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         qo_indptr = (
             decode_metadata.query_start_loc if decode_metadata is not None else None
         )
-        aiter.pa_fwd_asm(
-            Q=q,
-            K=k_cache,
-            V=v_cache,
+        run_pa_fwd_asm(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
             block_tables=attn_metadata.block_table[:num_decodes],
             context_lens=attn_metadata.seq_lens[:num_decodes],
-            block_tables_stride0=attn_metadata.block_table[:num_decodes].stride(0),
-            max_qlen=max_qlen,
-            K_QScale=k_scale,
-            V_QScale=v_scale,
-            out_=out[:num_decode_tokens],
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out=out[:num_decode_tokens],
             qo_indptr=qo_indptr,
+            max_qlen=max_qlen,
             high_precision=0,
         )
 

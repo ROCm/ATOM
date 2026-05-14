@@ -18,7 +18,11 @@ from .attention_mla import MLAModules
 import logging
 
 from atom.utils.decorators import mark_trace
-from atom.model_ops.base_attention import cp_mha_gather_cache
+from atom.model_ops.base_attention import (
+    cp_mha_gather_cache,
+    run_pa_decode_gluon,
+    run_pa_fwd_asm,
+)
 
 logger = logging.getLogger("atom")
 
@@ -467,21 +471,21 @@ class PagedAttentionImpl(nn.Module):
             compute_type = (
                 torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
             )
-            torch.ops.aiter.pa_decode_gluon(
-                o,
-                q,
-                k_cache,
-                v_cache,
-                attn_metadata.context_lens,
-                attn_metadata.block_tables,
-                self.scale,
-                attn_metadata.max_seqlen_q,
-                max_context_partition_num,
-                context_partition_size,
-                compute_type,
-                None,  # q_scale
-                None if self.kv_cache_dtype == "bf16" else k_scale,
-                None if self.kv_cache_dtype == "bf16" else v_scale,
+            run_pa_decode_gluon(
+                output=o,
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                context_lens=attn_metadata.context_lens,
+                block_tables=attn_metadata.block_tables,
+                softmax_scale=self.scale,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_context_partition_num=max_context_partition_num,
+                context_partition_size=context_partition_size,
+                compute_type=compute_type,
+                q_scale=None,
+                k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
+                v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
                 exp_sums=exp_sums,
                 max_logits=max_logits,
                 temporary_output=temporary_output,
@@ -499,19 +503,16 @@ class PagedAttentionImpl(nn.Module):
     ):
 
         attn_metadata = fwd_ctx.attn_metadata
-        o = aiter.pa_fwd_asm(
-            q,
-            k_cache,
-            v_cache,
-            attn_metadata.block_tables,
-            attn_metadata.context_lens,
-            attn_metadata.block_tables.stride(0),
+        o = run_pa_fwd_asm(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=attn_metadata.block_tables,
+            context_lens=attn_metadata.context_lens,
+            k_scale=k_scale,
+            v_scale=v_scale,
             max_qlen=attn_metadata.max_seqlen_q,
-            K_QScale=k_scale,
-            V_QScale=v_scale,
-            out_=None,
             qo_indptr=attn_metadata.cu_seqlens_q,
-            high_precision=0,
         )
 
         return o
