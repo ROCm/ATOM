@@ -103,7 +103,7 @@ async fn h03_http_regular_model_not_found_returns_503_with_model_name() {
 
 #[tokio::test]
 async fn h04_grpc_stage_regular_writes_single_worker_selection() {
-    use crate::core::placement::types::{PlacementPlan, PlacementTrace};
+    use crate::core::placement::types::PlacementPlan;
     use crate::routers::grpc::context::WorkerSelection;
     use crate::routers::grpc::common::stages::worker_selection::plan_to_worker_selection;
 
@@ -111,7 +111,6 @@ async fn h04_grpc_stage_regular_writes_single_worker_selection() {
     let plan = PlacementPlan::Single {
         worker: worker.clone(),
         policy_name: "round_robin",
-        trace: PlacementTrace::for_single(Some("m"), 1, 1, worker.url(), "round_robin", Some("m")),
     };
 
     let selection = plan_to_worker_selection(plan);
@@ -125,7 +124,7 @@ async fn h04_grpc_stage_regular_writes_single_worker_selection() {
 
 #[tokio::test]
 async fn h05_grpc_stage_pd_writes_dual_worker_selection() {
-    use crate::core::placement::types::{PlacementPlan, PlacementTrace};
+    use crate::core::placement::types::PlacementPlan;
     use crate::routers::grpc::context::WorkerSelection;
     use crate::routers::grpc::common::stages::worker_selection::plan_to_worker_selection;
 
@@ -136,16 +135,6 @@ async fn h05_grpc_stage_pd_writes_dual_worker_selection() {
         decode: decode.clone(),
         prefill_policy: "round_robin",
         decode_policy: "round_robin",
-        trace: PlacementTrace::for_pair(
-            Some("m"),
-            2,
-            2,
-            prefill.url(),
-            decode.url(),
-            "round_robin",
-            "round_robin",
-            Some("m"),
-        ),
     };
 
     let selection = plan_to_worker_selection(plan);
@@ -359,7 +348,6 @@ async fn h10_http_pd_retry_preserves_text_headers_tokens() {
         tokens: Some(&tokens),
         headers: Some(&headers),
         stream: false,
-        return_logprob: false,
     };
 
     for _ in 0..2 {
