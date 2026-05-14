@@ -1012,10 +1012,6 @@ pub(crate) fn parse_finish_reason(
     }
 }
 
-// ============================================================================
-// Metrics helper functions (shared by HTTP routers and gRPC pipeline)
-// ============================================================================
-
 pub(crate) use crate::routers::shared::metrics_utils::error_type_from_status;
 
 #[cfg(test)]

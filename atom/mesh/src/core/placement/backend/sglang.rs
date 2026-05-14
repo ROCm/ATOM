@@ -13,10 +13,6 @@ pub struct SglangPairCtx {
     pub bootstrap_room: u64,
 }
 
-const KEY_BOOTSTRAP_HOST: &str = "bootstrap_host";
-const KEY_BOOTSTRAP_PORT: &str = "bootstrap_port";
-const KEY_BOOTSTRAP_ROOM: &str = "bootstrap_room";
-
 fn downcast(ctx: &PairCtx) -> Result<&SglangPairCtx, AdapterError> {
     ctx.downcast_ref::<SglangPairCtx>()
         .ok_or(AdapterError::CtxTypeMismatch)
@@ -54,11 +50,11 @@ impl BackendAdapter for SglangAdapter {
         let ctx = downcast(ctx)?;
         let obj = body.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
         obj.insert(
-            KEY_BOOTSTRAP_HOST.to_string(),
+            "bootstrap_host".to_string(),
             Value::from(ctx.bootstrap_host.as_str()),
         );
-        obj.insert(KEY_BOOTSTRAP_PORT.to_string(), port_to_value(ctx.bootstrap_port));
-        obj.insert(KEY_BOOTSTRAP_ROOM.to_string(), Value::from(ctx.bootstrap_room));
+        obj.insert("bootstrap_port".to_string(), port_to_value(ctx.bootstrap_port));
+        obj.insert("bootstrap_room".to_string(), Value::from(ctx.bootstrap_room));
         Ok(())
     }
 
@@ -88,9 +84,9 @@ impl BackendAdapter for SglangAdapter {
         let rooms: Vec<Value> = (0..batch_size)
             .map(|_| Value::from(generate_room_id()))
             .collect();
-        obj.insert(KEY_BOOTSTRAP_HOST.to_string(), Value::Array(hosts));
-        obj.insert(KEY_BOOTSTRAP_PORT.to_string(), Value::Array(ports));
-        obj.insert(KEY_BOOTSTRAP_ROOM.to_string(), Value::Array(rooms));
+        obj.insert("bootstrap_host".to_string(), Value::Array(hosts));
+        obj.insert("bootstrap_port".to_string(), Value::Array(ports));
+        obj.insert("bootstrap_room".to_string(), Value::Array(rooms));
         Ok(())
     }
 

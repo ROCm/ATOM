@@ -394,7 +394,6 @@ pub fn make_descriptor<'a>(
         tokens,
         headers,
         stream: false,
-        return_logprob: false,
     }
 }
 

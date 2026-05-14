@@ -1,6 +1,20 @@
-use super::candidate::filter_candidates;
+use std::sync::Arc;
+
 use super::test_support::*;
-use crate::core::{ConnectionMode, WorkerType};
+use super::traits::WorkerSource;
+use crate::core::{ConnectionMode, Worker, WorkerType};
+
+fn filter_candidates(
+    src: &dyn WorkerSource,
+    model_id: Option<&str>,
+    worker_type: Option<WorkerType>,
+    connection_mode: Option<ConnectionMode>,
+) -> Vec<Arc<dyn Worker>> {
+    src.workers_filtered(model_id, worker_type, connection_mode)
+        .into_iter()
+        .filter(|w| w.is_available())
+        .collect()
+}
 
 #[test]
 fn a01_filters_to_specified_model_only() {
