@@ -4,17 +4,101 @@ use super::test_support::*;
 
 #[tokio::test]
 async fn h01_http_regular_planner_single_dispatches_to_worker_url() {
-    todo!()
+    use std::sync::Arc;
+    use crate::core::placement::planner::DefaultPlanner;
+    use crate::core::placement::traits::PdPlanner;
+    use crate::core::placement::types::{PlacementPlan, Protocol, RequestDescriptor};
+
+    let src = MockWorkerSource::new().add_worker(make_regular_http("http://w-1:8000", "m"));
+    let policies = MockPolicySource::new();
+    let planner = DefaultPlanner::new(Arc::new(src), Arc::new(policies));
+
+    let descriptor = RequestDescriptor {
+        model_id: Some("m"),
+        protocol: Some(Protocol::Http),
+        ..Default::default()
+    };
+
+    let plan = planner.plan(&descriptor).await.expect("plan should succeed");
+    match plan {
+        PlacementPlan::Single { worker, .. } => {
+            assert_eq!(worker.url(), "http://w-1:8000");
+        }
+        _ => panic!("expected Single"),
+    }
 }
 
 #[tokio::test]
 async fn h02_http_regular_no_workers_returns_503() {
-    todo!()
+    use std::sync::Arc;
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use crate::core::placement::planner::DefaultPlanner;
+    use crate::core::placement::traits::PdPlanner;
+    use crate::core::placement::types::{PlacementError, Protocol, RequestDescriptor};
+    use crate::routers::shared::placement_response::placement_err_to_response;
+
+    let src = MockWorkerSource::new();
+    let policies = MockPolicySource::new();
+    let planner = DefaultPlanner::new(Arc::new(src), Arc::new(policies));
+
+    let descriptor = RequestDescriptor {
+        model_id: None,
+        protocol: Some(Protocol::Http),
+        ..Default::default()
+    };
+
+    let err = planner.plan(&descriptor).await.expect_err("plan should fail");
+    assert_eq!(err, PlacementError::NoWorkers);
+
+    let resp = placement_err_to_response(err, None);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body_str = std::str::from_utf8(&body).unwrap();
+    assert!(
+        body_str.contains("no_workers"),
+        "expected body to contain 'no_workers', got: {}",
+        body_str
+    );
 }
 
 #[tokio::test]
 async fn h03_http_regular_model_not_found_returns_503_with_model_name() {
-    todo!()
+    use std::sync::Arc;
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use crate::core::placement::planner::DefaultPlanner;
+    use crate::core::placement::traits::PdPlanner;
+    use crate::core::placement::types::{PlacementError, Protocol, RequestDescriptor};
+    use crate::routers::shared::placement_response::placement_err_to_response;
+
+    let src = MockWorkerSource::new().add_worker(make_regular_http("http://w-other:8000", "other"));
+    let policies = MockPolicySource::new();
+    let planner = DefaultPlanner::new(Arc::new(src), Arc::new(policies));
+
+    let descriptor = RequestDescriptor {
+        model_id: Some("requested_model"),
+        protocol: Some(Protocol::Http),
+        ..Default::default()
+    };
+
+    let err = planner.plan(&descriptor).await.expect_err("plan should fail");
+    assert_eq!(
+        err,
+        PlacementError::ModelNotFound {
+            model_id: "requested_model".to_string()
+        }
+    );
+
+    let resp = placement_err_to_response(err, Some("requested_model"));
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body_str = std::str::from_utf8(&body).unwrap();
+    assert!(
+        body_str.contains("requested_model"),
+        "expected body to contain 'requested_model', got: {}",
+        body_str
+    );
 }
 
 #[tokio::test]
@@ -79,7 +163,7 @@ async fn h06_grpc_stage_planner_err_returns_service_unavailable() {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use crate::core::placement::types::PlacementError;
-    use crate::routers::grpc::common::stages::worker_selection::placement_err_to_response;
+    use crate::routers::shared::placement_response::placement_err_to_response;
 
     let resp = placement_err_to_response(
         PlacementError::NoAvailableWorkers,
