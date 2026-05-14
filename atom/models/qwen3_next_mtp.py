@@ -27,13 +27,6 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
         config: Qwen3NextConfig = atom_config.hf_config
 
         self.config = config
-        # Qwen3NextDecoderLayer's MoE block needs these attributes, which
-        # Qwen3NextModel.__init__ sets but which are absent from the raw
-        # HF config.  Set them here so the MTP predictor works standalone.
-        if not hasattr(config, "n_shared_experts"):
-            config.n_shared_experts = 1
-        if not hasattr(config, "n_routed_experts"):
-            config.n_routed_experts = config.num_experts
 
         self.vocab_size = config.vocab_size
 
@@ -196,7 +189,7 @@ class Qwen3NextMTP(nn.Module):
         from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 
         n_routed = getattr(self.config, "n_routed_experts", self.config.num_experts)
-        n_shared = getattr(self.config, "n_shared_experts", 0)
+        n_shared = getattr(self.config, "n_shared_experts", 1)
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
