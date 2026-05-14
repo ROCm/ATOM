@@ -2609,6 +2609,77 @@ class Block(nn.Module):
         x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
         return x
 
+    def forward_carry(
+        self,
+        x: torch.Tensor,  # first layer: [num_tokens, hc, dim] residual; otherwise [num_tokens, dim] prev FFN output
+        residual_carry: Optional[
+            torch.Tensor
+        ],  # [num_tokens, hc, dim] or None on first layer
+        post_carry: Optional[torch.Tensor],  # [num_tokens, hc] or None
+        comb_carry: Optional[torch.Tensor],  # [num_tokens, hc, hc] or None
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cross-block-fused variant of forward. Returns
+        ``(x_ffn_out, residual, post, comb)``: the FFN output of this layer plus
+        the carries needed to close it via the *next* layer's attn-open
+        ``fused_hc_post_pre`` (or, after the last layer, via a standalone
+        ``hc_post`` in ``DeepseekV4Model.forward``).
+
+        First layer (``residual_carry is None``): opens with the standalone
+        ``hc_pre`` — nothing prior to close. Subsequent layers: open by fusing
+        the prev layer's FFN-close with this layer's attn-open in a single
+        ``fused_hc_post_pre`` call (saves one full residual HBM roundtrip per
+        layer boundary).
+
+        Legacy ``Block.forward`` is unchanged so MTPBlock keeps working.
+        """
+        if residual_carry is None:
+            # First-layer opening: no prior sub-layer to close.
+            residual = x
+            x, post, comb = self.hc_pre(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+        else:
+            # Cross-block fused open: close prev layer's FFN + open this attn.
+            residual, x, post, comb = fused_hc_post_pre(
+                x,
+                residual_carry,
+                post_carry,
+                comb_carry,
+                self.hc_attn_fn.T,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.hc_mult,
+                self.norm_eps,
+                self.hc_eps,
+                self.HC_POST_MULT,
+                self.hc_sinkhorn_iters,
+            )
+        x = self.attn_norm(x)
+        x = self.attn(x, positions)
+        # Within-block fused attn→ffn transition (same call as legacy forward).
+        residual, x, post, comb = fused_hc_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            self.hc_ffn_fn.T,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.hc_mult,
+            self.norm_eps,
+            self.hc_eps,
+            self.HC_POST_MULT,
+            self.hc_sinkhorn_iters,
+        )
+        x = self.ffn_norm(x)
+        x = self.ffn(x)
+        # No closing hc_post — defer to the next layer's forward_carry, or to
+        # DeepseekV4Model.forward after the last layer.
+        return x, residual, post, comb
+
 
 class ParallelHead(ParallelLMHead):
     """V4 LM head with mHC reduction; vocab-parallel sharded across TP ranks.
@@ -2843,8 +2914,22 @@ class DeepseekV4Model(nn.Module):
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
+        # Cross-block-fused loop: each block's closing hc_post fuses with the
+        # next block's opening hc_pre into a single `fused_hc_post_pre` call.
+        # First layer opens standalone (no prior FFN to close); after the loop
+        # we close the last layer's FFN with a standalone hc_post. See
+        # `Block.forward_carry`. Aliasing across layers is safe — the shared
+        # cached buffers from `_get_fused_hc_post_pre_buffers` are written
+        # in-place per CTA on disjoint `(m, *, c)` tiles.
+        residual_carry: Optional[torch.Tensor] = None
+        post_carry: Optional[torch.Tensor] = None
+        comb_carry: Optional[torch.Tensor] = None
         for layer in self.layers:
-            h = layer(h, positions)  # [num_tokens, hc, dim]
+            h, residual_carry, post_carry, comb_carry = layer.forward_carry(
+                h, residual_carry, post_carry, comb_carry, positions
+            )
+        # Close the final layer's FFN (no next layer to fuse with).
+        h = self.layers[-1].hc_post(h, residual_carry, post_carry, comb_carry)
 
         # Reduce the mHC residual stack (hc_head + final RMSNorm); leave the
         # vocab projection to compute_logits.
