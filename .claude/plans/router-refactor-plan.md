@@ -190,7 +190,7 @@ pub trait BackendAdapter: Send + Sync {
 | P2 | 实现 BackendAdapter (SGLang + vLLM) | 1.5 天 (含 §11.13 +0.5) | ✅ done | E 类测试全绿 |
 | P3 | gRPC 切换 (WorkerSelectionStage 调 planner) | 1 天 | ✅ done | gRPC 走新 planner，H04/H05/H06 全绿 |
 | P4 | HTTP Regular 切换 | 1 天 | ✅ done | http_router.rs 走 planner，`routers/http/router.rs` 现有 15 个测试全绿 |
-| P5 | HTTP PD 切换 (含 BackendAdapter wiring) | 2 天 | pending | http_pd_router.rs 走 planner + adapter，HTTP PD 25 测试全绿 |
+| P5 | HTTP PD 切换 (含 BackendAdapter wiring) | 2 天 | ✅ done | http_pd_router.rs 走 planner + adapter，pd_router 16/16 + placement 106/106 全绿 |
 | P6 | 清理: 死代码删除 / 反向依赖修 / 文件扁平化 / clippy clean | 1 天 | pending | clippy 无 warning，cargo test 全绿 |
 | **合计** | | **10-10.5 天** | | |
 
@@ -318,6 +318,41 @@ pub trait BackendAdapter: Send + Sync {
 - 同 P3 遗留（§11.6 api_key A 路线 / NoPrefill 区分 / Pair trace 拆分）
 - HTTP regular `Pair` 防御 arm 当前 500 with `model_id` 缺失，P5 wire HTTP PD 时若 invariant 重新分析可统一改 503 + model log
 - `WorkerRegistryAdapter` + `PolicyRegistryAdapter` 在 `Router::new` 与 P5 `PDRouter::new` 会重复构造，P6 cleanup 可抽 helper
+
+### 5.6 P5 实际产出（已落地）
+
+实现：
+
+| 文件 | 改动 | 关键决策 |
+|------|------|---------|
+| `routers/http/pd_router.rs` | -345 LOC（679 行变更，net -345）：`PDRouter` 加 `planner: Arc<dyn PdPlanner>` + `adapter: Arc<dyn BackendAdapter>` 字段；`api_key` 字段 + 本地 `VllmPrefillInfo` struct 删除（vllm 信息走 `placement::backend::vllm::VllmPrefillInfo`）；`PDRouter::new` 按 `BackendType` enum 选 `SglangAdapter` 或 `VllmAdapter::new(info)`，construct `DefaultPlanner` over registry adapters；新增 `plan_pd_pair(&context)` helper（runs planner，defensive `unexpected_single_plan` 500 on Single，`placement_err_to_response` on Err，records P+D `record_worker_selection`，calls `adapter.prepare_pair`）；3 处 `select_pd_pair` 生产调用替换（vLLM retry / SGLang retry / health_generate）；`select_pd_pair` / `pick_worker_by_policy_arc` / `inject_bootstrap_into_value` / `inject_kv_transfer_params` / `handle_server_selection_error` / 3 个 `BOOTSTRAP_*_KEY` const 删除；vLLM 背景 task 注入 `correlation_id` 参数 + 三条 log 行（`vLLM prefill {url} request_id={id_or_unknown} status=...`）恢复观察性 | §11.6 决策 A：`api_key` 字段 + Authorization 注入留给跟踪 issue；§11.13 trait 全部走 `Arc<dyn BackendAdapter>`，无 concrete cast |
+| `core/placement/backend/mod.rs` | trait 加 required `correlation_id(&self, ctx: &PairCtx) -> Option<String>` | required（无 default）— 加新 backend 强制做出决定 |
+| `core/placement/backend/sglang.rs` | `bootstrap_room` 生成上调到 `prepare_pair`（`SglangPairCtx` 持稳定 `bootstrap_room: u64`）；`inject_prefill_fields` 读 ctx；`inject_batch_prefill_fields` 仍内部生成 n 个 distinct rooms（batch 语义需要）；`correlation_id` 返 ctx room | 单发路径下旧代码 inject 一次 + body clone 给 P/D，已经是相同 room — 上调到 prepare_pair 仅显化 invariant，无行为变更 |
+| `core/placement/backend/vllm.rs` | `correlation_id` 返 `Some(ctx.transfer_id.clone())` | — |
+| `core/placement/tests_integration.rs` | H07-H10 实现：H07 SGLang Pair → adapter inject 写 bootstrap_*，decode body 不变；H08 vLLM Pair → 验证 prefill/decode body 共享同一个 `transfer_id`；H09 SGLang batch → 三个长度 N 数组；H10 retry preserves text/tokens/headers — 用 `RecordingPolicy.calls` 在 4 次 calls × 2 attempts × P+D 上断言一致 | helper-level 风格，不起 HTTP server（mirror H01-H06） |
+| `core/placement/tests_adapter.rs` | 新增 E13/E14 — `vllm_correlation_id_matches_transfer_id` + `sglang_correlation_id_matches_bootstrap_room` 锁 contract | round-trip：`inject_*_fields` 写入 body 后 extract 出来与 `correlation_id` 比对 |
+
+测试覆盖 (4 H + 2 E + 9 删除 = net +6)：
+- H07-H10 (HTTP PD 集成 — 4 个 placeholder → 全绿)
+- E13/E14 (correlation contract — 2 个新)
+- 删除 9 个 pd_router::tests（§11.12 — `test_select_healthy_prefill_worker` ⇄ D04/G02、`test_empty_worker_lists` ⇄ G03、`test_select_pd_pair_no_decode_workers` ⇄ G04/D09、`test_select_pd_pair_all_unhealthy` ⇄ G02/c10、`test_select_pd_pair_multiple_workers` ⇄ D01-D03、`test_inject_bootstrap_no_batch` ⇄ E01、`test_inject_bootstrap_with_batch` ⇄ E04、`test_inject_bootstrap_non_object` ⇄ E06、`test_handle_server_selection_error` — function 已删）；保留 16 个 PD-router-specific 测试（load tracking / batch 助手 / logprob merge / `policies_need_request_text` / `handle_serialization_error` / `router_type`）
+
+**当下 baseline** (P6 启动前必须保持)：
+- `cargo build --package atom-mesh` 干净
+- `cargo test --package atom-mesh --lib` → 554 passed / 0 failed（106 placement + 16 pd_router + 432 其他）
+- `cargo clippy --package atom-mesh --lib --tests` → 3 pre-existing warning，placement / http_pd_router / shared 0 新 warning
+
+**Subagent review 2 轮**（rust-reviewer）：
+- 轮 1：1 BLOCK/HIGH（vLLM `transfer_id` 日志相关性丢失）+ 2 MEDIUM（H10 命名 overclaim §6.5 / `test_select_pd_pair_all_unhealthy` 删除后 D 系测试存在覆盖空缺）+ 6 LOW
+- 修：BLOCK 修（`BackendAdapter::correlation_id` + 三条 log 行恢复 + E13/E14 contract test）；MEDIUM 1 暂留 — H10 测试本身覆盖 planner-input 一致性，§6.5 `Arc<HeaderMap>` retry 改造 P6 跟踪；MEDIUM 2 暂留 — 跟踪到 P6 cleanup 列表
+- 轮 2：BLOCK 已解；新发现 1 MEDIUM（pre-existing unbounded streaming channel — 非 P5 scope，留给 follow-up）+ 2 LOW（cosmetic 命名 / batch ctx unused 注释）— 全部按 surgical-changes 不动
+
+**遗留进入 P6 跟踪**：
+- 同 P3-P4 遗留三项（§11.6 api_key A 路线已落，跟踪 issue 待开 / NoPrefill 区分 / Pair trace 拆分）
+- §6.5 三项 P5 deferred bug：HTTP PD 4xx/5xx 状态码透传 / `Arc<HeaderMap>` retry / `WorkerRegistryAdapter`+`PolicyRegistryAdapter` 在 Router::new + PDRouter::new 重复构造可抽 helper
+- H10 测试当前覆盖 planner-input 一致性，`Arc<HeaderMap>` 改造时需扩展断言到 retry-clone 边界
+- D 系测试 PD 全 unhealthy 覆盖空缺：`MockWorkerSource` 不过滤 healthy；建议加 `d_pd_all_unhealthy_returns_no_available_workers` 走 planner+health filter 完整路径
+- vLLM background task 选择 `unbounded_channel`（pre-existing）— 慢客户端可能内存增长；与 P5 无关，独立工程
 
 ### 5.1 P0b 实际产出（已落地，后续 phase 直接消费）
 

@@ -35,4 +35,6 @@ pub trait BackendAdapter: Send + Sync {
         ctx: &PairCtx,
         batch_size: usize,
     ) -> Result<(), AdapterError>;
+
+    fn correlation_id(&self, ctx: &PairCtx) -> Option<String>;
 }

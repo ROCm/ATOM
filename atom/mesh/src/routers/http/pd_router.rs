@@ -14,20 +14,29 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
-use super::pd_types::api_path;
 use crate::{
     config::types::{BackendType, RetryConfig},
     core::{
-        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
-        UNKNOWN_MODEL_ID,
+        is_retryable_status,
+        placement::{
+            backend::{
+                sglang::SglangAdapter,
+                vllm::{VllmAdapter, VllmPrefillInfo},
+                BackendAdapter, PairCtx,
+            },
+            planner::DefaultPlanner,
+            registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
+            traits::PdPlanner,
+            types::{PlacementPlan, Protocol, RequestDescriptor},
+        },
+        RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{InputIds, StringOrArray},
@@ -37,37 +46,33 @@ use crate::{
     routers::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        header_utils,
+        shared::placement_response::placement_err_to_response,
+        RouterTrait,
     },
 };
 
-/// vLLM Mooncake mode: cached prefill node metadata fetched once at startup
-/// from each prefill worker's bootstrap `/query` endpoint.
-pub struct VllmPrefillInfo {
-    /// prefill worker URL → bootstrap HTTP address (e.g. "http://10.0.0.1:8998")
-    pub bootstrap_addrs: HashMap<String, String>,
-    /// prefill worker URL → { dp_rank → engine_id }
-    pub engine_ids: HashMap<String, HashMap<usize, String>>,
-}
+use super::pd_types::api_path;
 
-impl std::fmt::Debug for VllmPrefillInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VllmPrefillInfo")
-            .field("prefill_count", &self.bootstrap_addrs.len())
-            .finish()
-    }
-}
-
-#[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub client: Client,
     pub retry_config: RetryConfig,
-    pub api_key: Option<String>,
     pub backend: BackendType,
-    /// Some(_) iff backend == Vllm; populated at startup from prefill bootstrap /query
-    pub vllm_prefill_info: Option<Arc<VllmPrefillInfo>>,
+    pub planner: Arc<dyn PdPlanner>,
+    pub adapter: Arc<dyn BackendAdapter>,
+}
+
+impl std::fmt::Debug for PDRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PDRouter")
+            .field("worker_registry", &self.worker_registry)
+            .field("client", &self.client)
+            .field("retry_config", &self.retry_config)
+            .field("backend", &self.backend)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -176,29 +181,33 @@ impl PDRouter {
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
         let backend = ctx.router_config.backend;
         let worker_registry = Arc::clone(&ctx.worker_registry);
+        let policy_registry = Arc::clone(&ctx.policy_registry);
         let client = ctx.client.clone();
 
-        let vllm_prefill_info = if backend == BackendType::Vllm {
-            Some(Arc::new(
-                Self::fetch_vllm_prefill_info(&worker_registry, &client).await?,
-            ))
-        } else {
-            None
+        let adapter: Arc<dyn BackendAdapter> = match backend {
+            BackendType::Sglang => Arc::new(SglangAdapter),
+            BackendType::Vllm => {
+                let info = Arc::new(Self::fetch_vllm_prefill_info(&worker_registry, &client).await?);
+                Arc::new(VllmAdapter::new(info))
+            }
         };
+
+        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
+            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
+        ));
 
         Ok(PDRouter {
             worker_registry,
-            policy_registry: Arc::clone(&ctx.policy_registry),
+            policy_registry,
             client,
             retry_config: ctx.router_config.effective_retry_config(),
-            api_key: ctx.router_config.api_key.clone(),
             backend,
-            vllm_prefill_info,
+            planner,
+            adapter,
         })
     }
 
-    /// vLLM Mooncake mode: query each prefill node's bootstrap `/query` endpoint to cache
-    /// `dp_rank -> engine_id` mapping. Called once at startup; not refreshed dynamically.
     async fn fetch_vllm_prefill_info(
         worker_registry: &WorkerRegistry,
         client: &Client,
@@ -299,14 +308,6 @@ impl PDRouter {
         })
     }
 
-    fn handle_server_selection_error(error: String) -> Response {
-        error!("Failed to select PD pair error={}", error);
-        error::service_unavailable(
-            "server_selection_failed",
-            format!("No available servers: {}", error),
-        )
-    }
-
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
         error::internal_error("serialization_failed", "Failed to serialize request")
@@ -340,71 +341,6 @@ impl PDRouter {
         None
     }
 
-    // Static key strings to avoid per-request allocations
-    const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
-    const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
-    const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
-
-    fn inject_bootstrap_into_value(
-        mut original: Value,
-        prefill_worker: &dyn Worker,
-        batch_size: Option<usize>,
-    ) -> Result<Value, String> {
-        let obj = original
-            .as_object_mut()
-            .ok_or_else(|| "Request must be a JSON object".to_string())?;
-
-        if let Some(n) = batch_size {
-            let mut hosts = Vec::with_capacity(n);
-            let mut ports = Vec::with_capacity(n);
-            let mut rooms = Vec::with_capacity(n);
-            for _ in 0..n {
-                hosts.push(prefill_worker.bootstrap_host());
-                ports.push(prefill_worker.bootstrap_port());
-                rooms.push(super::pd_types::generate_room_id());
-            }
-            // Use static string keys to avoid per-request allocations
-            obj.insert(
-                Self::BOOTSTRAP_HOST_KEY.to_string(),
-                Value::Array(hosts.into_iter().map(Value::from).collect()),
-            );
-            obj.insert(
-                Self::BOOTSTRAP_PORT_KEY.to_string(),
-                Value::Array(
-                    ports
-                        .into_iter()
-                        .map(|p| match p {
-                            Some(v) => Value::from(v),
-                            None => Value::Null,
-                        })
-                        .collect(),
-                ),
-            );
-            obj.insert(
-                Self::BOOTSTRAP_ROOM_KEY.to_string(),
-                Value::Array(rooms.into_iter().map(Value::from).collect()),
-            );
-        } else {
-            // Use static string keys to avoid per-request allocations
-            obj.insert(
-                Self::BOOTSTRAP_HOST_KEY.to_string(),
-                Value::from(prefill_worker.bootstrap_host()),
-            );
-            obj.insert(
-                Self::BOOTSTRAP_PORT_KEY.to_string(),
-                match prefill_worker.bootstrap_port() {
-                    Some(v) => Value::from(v),
-                    None => Value::Null,
-                },
-            );
-            obj.insert(
-                Self::BOOTSTRAP_ROOM_KEY.to_string(),
-                Value::from(super::pd_types::generate_room_id()),
-            );
-        }
-        Ok(original)
-    }
-
     /// Dispatch a request based on backend type. SGLang uses dual-dispatch+bootstrap;
     /// vLLM uses Mooncake fire-and-forget P + streamed D with kv_transfer_params.
     async fn dispatch_pd<T: Serialize + Clone>(
@@ -425,27 +361,57 @@ impl PDRouter {
         }
     }
 
-    /// Inject `kv_transfer_params` into a request JSON.
-    /// When `force_prefill` is true, also forces single-token, non-streaming behavior
-    /// for the prefill phase (vLLM Mooncake protocol).
-    fn inject_kv_transfer_params(
-        mut request: Value,
-        kv_transfer_params: Value,
-        force_prefill: bool,
-    ) -> Result<Value, String> {
-        let obj = request
-            .as_object_mut()
-            .ok_or_else(|| "Request must be a JSON object".to_string())?;
-        obj.insert("kv_transfer_params".to_string(), kv_transfer_params);
-        if force_prefill {
-            obj.insert("stream".to_string(), Value::Bool(false));
-            obj.insert("max_tokens".to_string(), json!(1));
-            if obj.contains_key("max_completion_tokens") {
-                obj.insert("max_completion_tokens".to_string(), json!(1));
-            }
-            obj.remove("stream_options");
-        }
-        Ok(request)
+    async fn plan_pd_pair(
+        &self,
+        context: &PDRequestContext<'_>,
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, PairCtx), Response> {
+        let descriptor = RequestDescriptor {
+            model_id: context.model_id,
+            protocol: Some(Protocol::Http),
+            text: context.request_text.as_deref(),
+            tokens: None,
+            headers: context.headers.as_ref(),
+            stream: context.is_stream,
+            return_logprob: context.return_logprob,
+        };
+
+        let (prefill, decode, prefill_policy, decode_policy) =
+            match self.planner.plan(&descriptor).await {
+                Ok(PlacementPlan::Pair {
+                    prefill,
+                    decode,
+                    prefill_policy,
+                    decode_policy,
+                    ..
+                }) => (prefill, decode, prefill_policy, decode_policy),
+                Ok(PlacementPlan::Single { .. }) => {
+                    return Err(error::internal_error(
+                        "unexpected_single_plan",
+                        "Planner returned Single plan for PD router",
+                    ));
+                }
+                Err(err) => return Err(placement_err_to_response(err, context.model_id)),
+            };
+
+        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_PREFILL,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            prefill_policy,
+        );
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_DECODE,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            decode_policy,
+        );
+
+        let ctx = self
+            .adapter
+            .prepare_pair(prefill.as_ref(), decode.as_ref())
+            .map_err(Self::handle_serialization_error)?;
+        Ok((prefill, decode, ctx))
     }
 
     /// vLLM Mooncake mode: fire prefill request as background task, stream decode response.
@@ -479,16 +445,9 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode) = match self
-                            .select_pd_pair(
-                                context.request_text.as_deref(),
-                                context.model_id,
-                                context.headers.as_ref(),
-                            )
-                            .await
-                        {
-                            Ok(pair) => pair,
-                            Err(e) => return Self::handle_server_selection_error(e),
+                        let (prefill, decode, ctx) = match self.plan_pd_pair(&context).await {
+                            Ok(t) => t,
+                            Err(resp) => return resp,
                         };
 
                         debug!(
@@ -498,18 +457,28 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let json_request = match serde_json::to_value(shared_request.as_ref()) {
+                        let mut prefill_request_json = match serde_json::to_value(shared_request.as_ref()) {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+                        let mut decode_request_json = prefill_request_json.clone();
+                        if let Err(e) = self.adapter.inject_prefill_fields(&mut prefill_request_json, &ctx) {
+                            return Self::handle_serialization_error(e);
+                        }
+                        if let Err(e) = self.adapter.inject_decode_fields(&mut decode_request_json, &ctx) {
+                            return Self::handle_serialization_error(e);
+                        }
+                        let correlation_id = self.adapter.correlation_id(&ctx);
 
                         self.dispatch_vllm_mooncake_internal(
                             headers,
-                            json_request,
+                            prefill_request_json,
+                            decode_request_json,
                             context,
                             Arc::clone(&prefill),
                             Arc::clone(&decode),
                             start_time,
+                            correlation_id,
                         )
                         .await
                     }
@@ -552,89 +521,19 @@ impl PDRouter {
         response
     }
 
-    /// Core vLLM Mooncake dispatch: build P/D requests with kv_transfer_params,
-    /// fire P as background task, stream D response back to client.
+    /// Core vLLM Mooncake dispatch: fire P as background task, stream D response back to client.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_vllm_mooncake_internal(
         &self,
         headers: Option<&HeaderMap>,
-        json_request: Value,
+        prefill_request_json: Value,
+        decode_request_json: Value,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         _start_time: Instant,
+        correlation_id: Option<String>,
     ) -> Response {
-        let info = match self.vllm_prefill_info.as_ref() {
-            Some(info) => info,
-            None => {
-                error!("vLLM mode but vllm_prefill_info is None (router not initialized)");
-                return error::internal_error(
-                    "vllm_prefill_info_missing",
-                    "vLLM PD router not initialized with prefill bootstrap info",
-                );
-            }
-        };
-
-        let prefill_url = prefill.url().to_string();
-        let bootstrap_addr = match info.bootstrap_addrs.get(&prefill_url) {
-            Some(addr) => addr.clone(),
-            None => {
-                error!("No bootstrap_addr cached for prefill {}", prefill_url);
-                return error::internal_error(
-                    "bootstrap_addr_missing",
-                    format!("No bootstrap_addr cached for prefill {}", prefill_url),
-                );
-            }
-        };
-        // Mooncake DP rank: use worker's dp_rank if set, otherwise default to 0.
-        let dp_rank = prefill.dp_rank().unwrap_or(0);
-        let engine_id = match info
-            .engine_ids
-            .get(&prefill_url)
-            .and_then(|m| m.get(&dp_rank))
-        {
-            Some(eid) => eid.clone(),
-            None => {
-                error!(
-                    "No engine_id for prefill {} dp_rank {}",
-                    prefill_url, dp_rank
-                );
-                return error::internal_error(
-                    "engine_id_missing",
-                    format!(
-                        "No engine_id for prefill {} dp_rank {}",
-                        prefill_url, dp_rank
-                    ),
-                );
-            }
-        };
-
-        let request_id = Uuid::new_v4();
-        let transfer_id = format!("xfer-{}", request_id);
-
-        let prefill_kv = json!({
-            "do_remote_decode": true,
-            "do_remote_prefill": false,
-            "transfer_id": transfer_id,
-        });
-        let decode_kv = json!({
-            "do_remote_decode": false,
-            "do_remote_prefill": true,
-            "remote_bootstrap_addr": bootstrap_addr,
-            "remote_engine_id": engine_id,
-            "transfer_id": transfer_id,
-        });
-
-        let prefill_request_json =
-            match Self::inject_kv_transfer_params(json_request.clone(), prefill_kv, true) {
-                Ok(v) => v,
-                Err(e) => return Self::handle_serialization_error(e),
-            };
-        let decode_request_json =
-            match Self::inject_kv_transfer_params(json_request, decode_kv, false) {
-                Ok(v) => v,
-                Err(e) => return Self::handle_serialization_error(e),
-            };
-
         // Load tracking: streaming uses guards inside create_streaming_response.
         let _prefill_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
@@ -659,7 +558,8 @@ impl PDRouter {
         );
         let prefill_url_for_log = prefill.url().to_string();
         let prefill_for_outcome = prefill.clone();
-        let prefill_request_id = request_id.to_string();
+        let correlation_for_log =
+            correlation_id.unwrap_or_else(|| "unknown".to_string());
         tokio::spawn(async move {
             match prefill_post.send().await {
                 Ok(res) => {
@@ -667,12 +567,12 @@ impl PDRouter {
                     if status.is_success() {
                         debug!(
                             "vLLM prefill {} request_id={} status={}",
-                            prefill_url_for_log, prefill_request_id, status
+                            prefill_url_for_log, correlation_for_log, status
                         );
                     } else {
                         warn!(
                             "vLLM prefill {} request_id={} returned non-success status={}",
-                            prefill_url_for_log, prefill_request_id, status
+                            prefill_url_for_log, correlation_for_log, status
                         );
                     }
                     // Drain body so the connection can be reused.
@@ -682,7 +582,7 @@ impl PDRouter {
                 Err(e) => {
                     error!(
                         "vLLM prefill {} request_id={} failed: {}",
-                        prefill_url_for_log, prefill_request_id, e
+                        prefill_url_for_log, correlation_for_log, e
                     );
                     prefill_for_outcome.record_outcome(false);
                 }
@@ -799,18 +699,9 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode) = match self
-                            .select_pd_pair(
-                                context.request_text.as_deref(),
-                                context.model_id,
-                                context.headers.as_ref(),
-                            )
-                            .await
-                        {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                return Self::handle_server_selection_error(e);
-                            }
+                        let (prefill, decode, ctx) = match self.plan_pd_pair(&context).await {
+                            Ok(t) => t,
+                            Err(resp) => return resp,
                         };
 
                         debug!(
@@ -825,14 +716,13 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
-                        json_request = match Self::inject_bootstrap_into_value(
-                            json_request,
-                            prefill.as_ref(),
-                            context.batch_size,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
+                        let inject_result = match context.batch_size {
+                            Some(n) => self.adapter.inject_batch_prefill_fields(&mut json_request, &ctx, n),
+                            None => self.adapter.inject_prefill_fields(&mut json_request, &ctx),
                         };
+                        if let Err(e) = inject_result {
+                            return Self::handle_serialization_error(e);
+                        }
 
                         let response = self
                             .execute_dual_dispatch_internal(
@@ -1188,112 +1078,6 @@ impl PDRouter {
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
-    async fn select_pd_pair(
-        &self,
-        request_text: Option<&str>,
-        model_id: Option<&str>,
-        headers: Option<&HeaderMap>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
-        debug!("Selecting PD pair: model_id={:?}", model_id);
-
-        let prefill_workers = self.worker_registry.get_prefill_workers();
-
-        let decode_workers = self.worker_registry.get_decode_workers();
-
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-
-        // Get cached hash ring for consistent hashing
-        let hash_ring = self.worker_registry.get_hash_ring(UNKNOWN_MODEL_ID);
-
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
-            request_text,
-            headers,
-            hash_ring.clone(),
-            "prefill",
-        )
-        .await?;
-
-        let decode = Self::pick_worker_by_policy_arc(
-            &decode_workers,
-            &*decode_policy,
-            request_text,
-            headers,
-            hash_ring,
-            "decode",
-        )
-        .await?;
-
-        // Record worker selection metrics (Layer 3)
-        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            prefill_policy.name(),
-        );
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_DECODE,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            decode_policy.name(),
-        );
-
-        Ok((prefill, decode))
-    }
-
-    async fn pick_worker_by_policy_arc(
-        workers: &[Arc<dyn Worker>],
-        policy: &dyn LoadBalancingPolicy,
-        request_text: Option<&str>,
-        headers: Option<&HeaderMap>,
-        hash_ring: Option<Arc<HashRing>>,
-        worker_type: &str,
-    ) -> Result<Arc<dyn Worker>, String> {
-        if workers.is_empty() {
-            return Err(format!(
-                "No {} workers available. Please check if {} servers are configured and healthy.",
-                worker_type, worker_type
-            ));
-        }
-
-        let available_workers: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if available_workers.is_empty() {
-            return Err(format!(
-                "No available {} workers (all circuits open or unhealthy)",
-                worker_type
-            ));
-        }
-
-        let selected_idx = policy
-            .select_worker(
-                &available_workers,
-                &SelectWorkerInfo {
-                    request_text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                    headers,
-                    hash_ring,
-                },
-            )
-            .await
-            .ok_or_else(|| {
-                format!(
-                    "Policy {} failed to select a {} worker",
-                    policy.name(),
-                    worker_type
-                )
-            })?;
-
-        Ok(available_workers[selected_idx].clone())
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn create_streaming_response(
         &self,
@@ -1609,15 +1393,19 @@ impl RouterTrait for PDRouter {
     async fn health_generate(&self, _req: Request<Body>) -> Response {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
-        // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                return error::service_unavailable(
-                    "no_healthy_worker_pair",
-                    format!("No healthy worker pair available: {}", e),
+        let descriptor = RequestDescriptor {
+            protocol: Some(Protocol::Http),
+            ..Default::default()
+        };
+        let (prefill, decode) = match self.planner.plan(&descriptor).await {
+            Ok(PlacementPlan::Pair { prefill, decode, .. }) => (prefill, decode),
+            Ok(PlacementPlan::Single { .. }) => {
+                return error::internal_error(
+                    "unexpected_single_plan",
+                    "Planner returned Single plan for PD router",
                 );
             }
+            Err(err) => return placement_err_to_response(err, None),
         };
 
         let prefill_url = format!("{}/health_generate", prefill.url());
@@ -1822,21 +1610,29 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::core::{
+        placement::backend::sglang::SglangAdapter, BasicWorkerBuilder, WorkerType,
+    };
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
+        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
+            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
+        ));
+        let adapter: Arc<dyn BackendAdapter> = Arc::new(SglangAdapter);
+
         PDRouter {
             worker_registry,
             policy_registry,
             client: Client::new(),
             retry_config: RetryConfig::default(),
-            api_key: Some("test_api_key".to_string()),
             backend: BackendType::Sglang,
-            vllm_prefill_info: None,
+            planner,
+            adapter,
         }
     }
 
@@ -1846,50 +1642,6 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
-    }
-
-    #[tokio::test]
-    async fn test_select_healthy_prefill_worker() {
-        let router = create_test_pd_router();
-
-        let healthy_worker = create_test_worker(
-            "http://healthy".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-        let unhealthy_worker = create_test_worker(
-            "http://unhealthy".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            false,
-        );
-        let decode_worker =
-            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
-
-        router.worker_registry.register(Arc::from(unhealthy_worker));
-        router.worker_registry.register(Arc::from(healthy_worker));
-        router.worker_registry.register(Arc::from(decode_worker));
-
-        let result = router.select_pd_pair(None, None, None).await;
-
-        assert!(result.is_ok());
-        let (prefill, _decode) = result.unwrap();
-
-        assert_eq!(prefill.url(), "http://healthy");
-        assert!(prefill.is_healthy());
-    }
-
-    #[tokio::test]
-    async fn test_empty_worker_lists() {
-        let router = create_test_pd_router();
-
-        let result = router.select_pd_pair(None, None, None).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No prefill workers available"));
     }
 
     #[test]
@@ -1985,70 +1737,6 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
-    }
-
-    // --- select_pd_pair tests ---
-
-    #[tokio::test]
-    async fn test_select_pd_pair_no_decode_workers() {
-        let router = create_test_pd_router();
-
-        let prefill = create_test_worker(
-            "http://prefill".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-        router.worker_registry.register(Arc::from(prefill));
-
-        let result = router.select_pd_pair(None, None, None).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("decode"));
-    }
-
-    #[tokio::test]
-    async fn test_select_pd_pair_all_unhealthy() {
-        let router = create_test_pd_router();
-
-        let prefill = create_test_worker(
-            "http://prefill".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            false,
-        );
-        let decode = create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
-        router.worker_registry.register(Arc::from(prefill));
-        router.worker_registry.register(Arc::from(decode));
-
-        let result = router.select_pd_pair(None, None, None).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_select_pd_pair_multiple_workers() {
-        let router = create_test_pd_router();
-
-        for i in 0..3 {
-            let prefill = create_test_worker(
-                format!("http://prefill-{}", i),
-                WorkerType::Prefill {
-                    bootstrap_port: None,
-                },
-                true,
-            );
-            let decode =
-                create_test_worker(format!("http://decode-{}", i), WorkerType::Decode, true);
-            router.worker_registry.register(Arc::from(prefill));
-            router.worker_registry.register(Arc::from(decode));
-        }
-
-        let result = router.select_pd_pair(None, None, None).await;
-        assert!(result.is_ok());
-        let (p, d) = result.unwrap();
-        assert!(p.url().starts_with("http://prefill-"));
-        assert!(d.url().starts_with("http://decode-"));
     }
 
     // --- get_chat_batch_size / get_generate_batch_size ---
@@ -2193,71 +1881,10 @@ mod tests {
         assert!(router.policies_need_request_text());
     }
 
-    // --- handle_server_selection_error ---
-
-    #[test]
-    fn test_handle_server_selection_error() {
-        let response = PDRouter::handle_server_selection_error("test error".to_string());
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
     #[test]
     fn test_handle_serialization_error() {
         let response = PDRouter::handle_serialization_error("bad json");
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // --- inject_bootstrap_into_value ---
-
-    #[test]
-    fn test_inject_bootstrap_no_batch() {
-        let worker = BasicWorkerBuilder::new("http://prefill:8000")
-            .worker_type(WorkerType::Prefill {
-                bootstrap_port: Some(9000),
-            })
-            .build();
-
-        let original = json!({"text": "hello"});
-        let result = PDRouter::inject_bootstrap_into_value(original, &worker, None);
-        assert!(result.is_ok());
-        let val = result.unwrap();
-        assert!(val.get("bootstrap_host").is_some());
-        assert!(val.get("bootstrap_port").is_some());
-        assert!(val.get("bootstrap_room").is_some());
-    }
-
-    #[test]
-    fn test_inject_bootstrap_with_batch() {
-        let worker = BasicWorkerBuilder::new("http://prefill:8000")
-            .worker_type(WorkerType::Prefill {
-                bootstrap_port: Some(9000),
-            })
-            .build();
-
-        let original = json!({"text": "hello"});
-        let result = PDRouter::inject_bootstrap_into_value(original, &worker, Some(3));
-        assert!(result.is_ok());
-        let val = result.unwrap();
-        // With batch, bootstrap fields should be arrays
-        let hosts = val["bootstrap_host"].as_array().unwrap();
-        assert_eq!(hosts.len(), 3);
-        let ports = val["bootstrap_port"].as_array().unwrap();
-        assert_eq!(ports.len(), 3);
-        let rooms = val["bootstrap_room"].as_array().unwrap();
-        assert_eq!(rooms.len(), 3);
-    }
-
-    #[test]
-    fn test_inject_bootstrap_non_object() {
-        let worker = BasicWorkerBuilder::new("http://prefill:8000")
-            .worker_type(WorkerType::Prefill {
-                bootstrap_port: None,
-            })
-            .build();
-
-        let original = json!("not an object");
-        let result = PDRouter::inject_bootstrap_into_value(original, &worker, None);
-        assert!(result.is_err());
     }
 
     // --- router_type ---
