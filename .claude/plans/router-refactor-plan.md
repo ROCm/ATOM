@@ -188,7 +188,7 @@ pub trait BackendAdapter: Send + Sync {
 | P0b | 完整 82-102 测试用例表（setup/input/expected）+ 转成 cargo test 全红骨架 | 1 天 | ✅ done（94 个 placeholder + 10 个 fixture smoke 全绿） | `cargo test` 全部 fail 且原因符合预期 |
 | P1 | 实现 placement core (candidate / policy_apply / planner / trace) | 2 天 | ✅ done | A/B/C/D/F/G 类测试全绿 |
 | P2 | 实现 BackendAdapter (SGLang + vLLM) | 1.5 天 (含 §11.13 +0.5) | ✅ done | E 类测试全绿 |
-| P3 | gRPC 切换 (WorkerSelectionStage 调 planner) | 1 天 | pending | gRPC 走新 planner，H 类 gRPC 集成测全绿 |
+| P3 | gRPC 切换 (WorkerSelectionStage 调 planner) | 1 天 | ✅ done | gRPC 走新 planner，H04/H05/H06 全绿 |
 | P4 | HTTP Regular 切换 | 1 天 | pending | http_router.rs 走 planner，`routers/http/router.rs` 现有 15 个测试全绿 |
 | P5 | HTTP PD 切换 (含 BackendAdapter wiring) | 2 天 | pending | http_pd_router.rs 走 planner + adapter，HTTP PD 25 测试全绿 |
 | P6 | 清理: 死代码删除 / 反向依赖修 / 文件扁平化 / clippy clean | 1 天 | pending | clippy 无 warning，cargo test 全绿 |
@@ -252,6 +252,35 @@ pub trait BackendAdapter: Send + Sync {
 - §11.6 PD path api_key 转发：本期决定 A 路线（删字段 + tracking issue），P5 wire 阶段不顺手补
 - `PlacementError::NoPrefill/NoDecodeWorkers` 仅 plan() 派遣层使用，post-health 一律返 NoAvailableWorkers（§11.7 + G07 spec），观察性可在 P2 引入区分
 - `PlacementTrace` 的 `candidate_count_before/after` 在 Pair 模式合并 P+D 总数；如观察性需要拆分需扩 schema
+
+### 5.4 P3 实际产出（已落地）
+
+实现：
+
+| 文件 | 改动 | 关键决策 |
+|------|------|---------|
+| `core/placement/registry_adapters.rs` | 新建 — `WorkerRegistryAdapter` + `PolicyRegistryAdapter` 包装生产 registry，impl `WorkerSource` / `PolicySource` | Prefill 分支走 `get_by_model(m)`（model_id 给定）或 `get_prefill_workers()`（None），再按 variant + connection_mode 过滤；non-Prefill 透传 `get_workers_filtered(..., healthy_only=false)` 让 planner 的 health filter 单点负责 |
+| `core/placement/mod.rs` | `pub mod registry_adapters;` | — |
+| `routers/grpc/common/stages/worker_selection.rs` | 269 → 124 LOC：删 `select_single_worker` / `select_pd_pair` / `WorkerSelectionMode`；新增 `plan_to_worker_selection` + `placement_err_to_response` pub(crate) helper；`execute()` 构造 `RequestDescriptor`（含 `stream: ctx.is_streaming()`）→ planner.plan() → 翻译 | mode 字段彻底删除：DefaultPlanner 自动按 worker pool 检测 Single/Pair |
+| `routers/grpc/common/stages/mod.rs` | 删 `WorkerSelectionMode` re-export | — |
+| `routers/grpc/pipeline.rs` | `new_regular` / `new_pd` 都先建 `Arc<dyn PdPlanner>`（DefaultPlanner over adapters）再传给 stage | 两条流水线 stage 构造完全相同；regular vs PD 区分由后续 `RequestBuildingStage(true/false)` + `ExecutionMode::Single/DualDispatch` 驱动 |
+| `tests_integration.rs` | H04/H05/H06 实现：直接调 `plan_to_worker_selection` / `placement_err_to_response` helper，不构造 RequestContext | H06 验证 `ModelNotFound` body 含 model 名（G06 spec），所有 503 响应含 model_id（G09 spec） |
+
+测试覆盖 (3 个新增):
+- H04 (gRPC stage Regular → Single)
+- H05 (gRPC stage PD → Dual)
+- H06 (gRPC stage planner Err → service_unavailable + model_id)
+
+**当下 baseline** (P4 启动前必须保持):
+- `cargo build --package atom-mesh` 干净
+- `cargo test --package atom-mesh --lib core::placement::` → 99 passed (10 fixture smoke + 72 P1 + 12+2 P2 + 3 H) / 7 failed (H01-H03 + H07-H10，P4-P5 scope)
+- `cargo clippy --package atom-mesh --lib --tests` → 3 pre-existing warning（不动），placement / grpc stage 0 新 warning
+
+**Subagent review 1 轮**（rust-reviewer 0 BLOCK / 1 HIGH / 1 MEDIUM / 0 LOW；HIGH `stream: false` 硬编码 → 改为 `ctx.is_streaming()`，MEDIUM 采纳 — Prefill 分支用 `get_by_model(m)` 走 model_index 而非全表扫）。
+
+**遗留进入 P4 跟踪**:
+- 同 P2 遗留三项
+- `RequestDescriptor.return_logprob` 在 grpc stage 仍硬编码 `false`：当前 placement core 无任何路径读它，且生产 chat/generate 的字段映射不一致（chat 用 `logprobs: bool`，generate 用 `return_logprob`），P4/P5 wire 阶段如需透传再统一加
 
 ### 5.1 P0b 实际产出（已落地，后续 phase 直接消费）
 

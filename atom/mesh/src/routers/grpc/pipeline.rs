@@ -15,7 +15,14 @@ use super::{
     utils::error_type_from_status,
 };
 use crate::{
-    core::{WorkerRegistry, UNKNOWN_MODEL_ID},
+    core::{
+        placement::{
+            planner::DefaultPlanner,
+            registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
+            traits::PdPlanner,
+        },
+        WorkerRegistry, UNKNOWN_MODEL_ID,
+    },
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
     protocols::{
@@ -63,13 +70,14 @@ impl RequestPipeline {
             metrics_labels::BACKEND_REGULAR,
         ));
 
+        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::new(worker_registry)),
+            Arc::new(PolicyRegistryAdapter::new(policy_registry)),
+        ));
+
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular,
-            )),
+            Box::new(WorkerSelectionStage::new(planner)),
             Box::new(ClientAcquisitionStage),
             Box::new(RequestBuildingStage::new(false)), // No PD metadata
             Box::new(DispatchMetadataStage),
@@ -107,13 +115,14 @@ impl RequestPipeline {
             metrics_labels::BACKEND_PD,
         ));
 
+        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::new(worker_registry)),
+            Arc::new(PolicyRegistryAdapter::new(policy_registry)),
+        ));
+
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::PrefillDecode,
-            )),
+            Box::new(WorkerSelectionStage::new(planner)),
             Box::new(ClientAcquisitionStage),
             Box::new(RequestBuildingStage::new(true)), // Inject PD metadata
             Box::new(DispatchMetadataStage),
