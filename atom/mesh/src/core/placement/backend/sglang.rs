@@ -12,19 +12,36 @@ pub struct SglangPairCtx {
     pub bootstrap_port: Option<u16>,
 }
 
+const KEY_BOOTSTRAP_HOST: &str = "bootstrap_host";
+const KEY_BOOTSTRAP_PORT: &str = "bootstrap_port";
+const KEY_BOOTSTRAP_ROOM: &str = "bootstrap_room";
+
 fn downcast(ctx: &PairCtx) -> Result<&SglangPairCtx, AdapterError> {
     ctx.downcast_ref::<SglangPairCtx>()
         .ok_or(AdapterError::CtxTypeMismatch)
+}
+
+fn generate_room_id() -> u64 {
+    rand::random::<u64>() & (i64::MAX as u64)
+}
+
+fn port_to_value(port: Option<u16>) -> Value {
+    match port {
+        Some(v) => Value::from(v),
+        None => Value::Null,
+    }
 }
 
 impl BackendAdapter for SglangAdapter {
     fn prepare_pair(
         &self,
         prefill: &dyn Worker,
-        decode: &dyn Worker,
+        _decode: &dyn Worker,
     ) -> Result<PairCtx, AdapterError> {
-        let _ = (prefill, decode);
-        todo!()
+        Ok(Box::new(SglangPairCtx {
+            bootstrap_host: prefill.bootstrap_host().to_string(),
+            bootstrap_port: prefill.bootstrap_port(),
+        }))
     }
 
     fn inject_prefill_fields(
@@ -33,18 +50,24 @@ impl BackendAdapter for SglangAdapter {
         ctx: &PairCtx,
     ) -> Result<(), AdapterError> {
         let ctx = downcast(ctx)?;
-        let _ = (body, ctx);
-        todo!()
+        let obj = body.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
+        obj.insert(
+            KEY_BOOTSTRAP_HOST.to_string(),
+            Value::from(ctx.bootstrap_host.as_str()),
+        );
+        obj.insert(KEY_BOOTSTRAP_PORT.to_string(), port_to_value(ctx.bootstrap_port));
+        obj.insert(KEY_BOOTSTRAP_ROOM.to_string(), Value::from(generate_room_id()));
+        Ok(())
     }
 
     /// No-op: SGLang dual-dispatch does not inject on the decode side.
     /// Still validates ctx type so a wrong-adapter call surfaces as CtxTypeMismatch.
     fn inject_decode_fields(
         &self,
-        body: &mut Value,
+        _body: &mut Value,
         ctx: &PairCtx,
     ) -> Result<(), AdapterError> {
-        let _ = (body, downcast(ctx)?);
+        downcast(ctx)?;
         Ok(())
     }
 
@@ -55,7 +78,17 @@ impl BackendAdapter for SglangAdapter {
         batch_size: usize,
     ) -> Result<(), AdapterError> {
         let ctx = downcast(ctx)?;
-        let _ = (body, ctx, batch_size);
-        todo!()
+        let obj = body.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
+        let host_val = Value::from(ctx.bootstrap_host.as_str());
+        let port_val = port_to_value(ctx.bootstrap_port);
+        let hosts: Vec<Value> = (0..batch_size).map(|_| host_val.clone()).collect();
+        let ports: Vec<Value> = (0..batch_size).map(|_| port_val.clone()).collect();
+        let rooms: Vec<Value> = (0..batch_size)
+            .map(|_| Value::from(generate_room_id()))
+            .collect();
+        obj.insert(KEY_BOOTSTRAP_HOST.to_string(), Value::Array(hosts));
+        obj.insert(KEY_BOOTSTRAP_PORT.to_string(), Value::Array(ports));
+        obj.insert(KEY_BOOTSTRAP_ROOM.to_string(), Value::Array(rooms));
+        Ok(())
     }
 }

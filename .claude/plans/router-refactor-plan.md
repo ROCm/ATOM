@@ -186,13 +186,72 @@ pub trait BackendAdapter: Send + Sync {
 |-------|------|------|------|---------|
 | P0a | spec 定稿: 决策 + type signatures + 12 个样本测试 + 测试分类总表 | 0.5-1 天 | ✅ done | 文档评审通过 |
 | P0b | 完整 82-102 测试用例表（setup/input/expected）+ 转成 cargo test 全红骨架 | 1 天 | ✅ done（94 个 placeholder + 10 个 fixture smoke 全绿） | `cargo test` 全部 fail 且原因符合预期 |
-| P1 | 实现 placement core (candidate / policy_apply / planner / trace) | 2 天 | pending | A/B/C/D/F/G 类测试全绿 |
-| P2 | 实现 BackendAdapter (SGLang + vLLM) | 1.5 天 (含 §11.13 +0.5) | pending | E 类测试全绿 |
+| P1 | 实现 placement core (candidate / policy_apply / planner / trace) | 2 天 | ✅ done | A/B/C/D/F/G 类测试全绿 |
+| P2 | 实现 BackendAdapter (SGLang + vLLM) | 1.5 天 (含 §11.13 +0.5) | ✅ done | E 类测试全绿 |
 | P3 | gRPC 切换 (WorkerSelectionStage 调 planner) | 1 天 | pending | gRPC 走新 planner，H 类 gRPC 集成测全绿 |
 | P4 | HTTP Regular 切换 | 1 天 | pending | http_router.rs 走 planner，`routers/http/router.rs` 现有 15 个测试全绿 |
 | P5 | HTTP PD 切换 (含 BackendAdapter wiring) | 2 天 | pending | http_pd_router.rs 走 planner + adapter，HTTP PD 25 测试全绿 |
 | P6 | 清理: 死代码删除 / 反向依赖修 / 文件扁平化 / clippy clean | 1 天 | pending | clippy 无 warning，cargo test 全绿 |
 | **合计** | | **10-10.5 天** | | |
+
+### 5.2 P1 实际产出（已落地）
+
+实现：
+
+| 文件 | 改动 | 关键决策 |
+|------|------|---------|
+| `candidate.rs` | `filter_candidates()` = `WorkerSource::workers_filtered` + `is_available()` 过滤 | trait 文档锁定 Prefill 按 variant 松匹配 |
+| `policy_apply.rs` | `apply_policy()` 返回 `Arc<dyn Worker>`；空候选返 `NoAvailableWorkers`，policy 返 None 返 `PolicyReturnedNone` | 调用方在 planner 已短路；这里是防御 |
+| `trace.rs` | `for_single` / `for_pair` 纯结构装配 | Pair 的 `candidate_count_before/after` 用 P+D 总和 |
+| `planner.rs` | `DefaultPlanner` 自动检测模式：regular_pool 非空 → Single；P+D 都非空 → Pair；其他 → 类型化 error | `plan_single`/`plan_pair` 复用 `plan()` 已 fetch 的 raw pool，不二次查 source |
+| `traits.rs` | `WorkerSource::workers_filtered` 加 doc：Prefill 松匹配；P3 wrapping `WorkerRegistry` 必须改用 `get_prefill_workers()` | — |
+| `test_support.rs` | `RecordingPolicy.calls.hash_ring` 改为 `Option<Arc<HashRing>>`（支持 ptr_eq）；新增 `make_prefill_grpc` / `make_decode_grpc` | — |
+
+测试覆盖 (72 个，全绿):
+- A01-A18 (candidate filter)
+- B01-B14 (policy apply)
+- C01-C11 (regular planning)
+- D01-D14 (PD planning)
+- F01-F06 (trace)
+- G01-G09 (error variants)
+
+**当下 baseline** (P2 启动前必须保持):
+- `cargo build --package atom-mesh` 干净
+- `cargo test --package atom-mesh --lib core::placement::` → 82 passed (10 fixture smoke + 72 P1) / 22 failed (E12 + H10，P2/P3-P5 scope)
+- `cargo clippy --package atom-mesh --lib --tests` → 3 pre-existing warning，placement 0 新 warning
+
+**Subagent review 累计 5 轮**（A / B / F+C / D / 整体），全部解决。
+
+**遗留进入 P2 跟踪**:
+- §11.6 PD path api_key 转发：本期决定 A 路线（删字段 + tracking issue），P5 wire 阶段不顺手补
+- `PlacementError::NoPrefill/NoDecodeWorkers` 仅 plan() 派遣层使用，post-health 一律返 NoAvailableWorkers（§11.7 + G07 spec），观察性可在 P2 引入区分
+- `PlacementTrace` 的 `candidate_count_before/after` 在 Pair 模式合并 P+D 总数；如观察性需要拆分需扩 schema
+
+### 5.3 P2 实际产出（已落地）
+
+实现：
+
+| 文件 | 改动 | 关键决策 |
+|------|------|---------|
+| `backend/sglang.rs` | `prepare_pair`(host+port) / `inject_prefill_fields` / `inject_decode_fields` (no-op + ctx type check) / `inject_batch_prefill_fields`；inline 1 行 `generate_room_id()`；3 个 `const KEY_*` 静态键避免 per-request 分配 | bootstrap_room 在 inject 调用时生成（不是 prepare_pair），与 reference pd_router.rs:402 一致 |
+| `backend/vllm.rs` | `prepare_pair` 查 `bootstrap_addr` / `engine_id[dp_rank]`，typed `BootstrapAddrMissing` / `EngineIdMissing`；`inject_prefill_fields` 写 `kv_transfer_params` + force_prefill body 形状（stream=false / max_tokens=1 / max_completion_tokens=1 仅 if exists / 删 stream_options）；`inject_decode_fields` 写 decode 侧 kv_transfer_params 共享 transfer_id；`inject_batch_prefill_fields` 委托单请求并 `debug_assert_eq!(batch_size, 1)`（vLLM Mooncake 不批） | transfer_id 在 prepare_pair 生成一次、prefill+decode 共享（§11.2） |
+| `tests_adapter.rs` | E01-E12 + 2 个 vLLM body-not-object 补测（review H2 反馈） | — |
+
+测试覆盖 (14 个新增 — E01-E12 全绿 + 2 vllm body-not-object 补测):
+- E01-E06 (SGLang)
+- E07-E12 (vLLM)
+
+**当下 baseline** (P3 启动前必须保持):
+- `cargo build --package atom-mesh` 干净
+- `cargo test --package atom-mesh --lib core::placement::` → 96 passed (10 fixture smoke + 72 P1 + 12 E + 2 补测) / 10 failed (H 类 P3-P5 scope)
+- `cargo clippy --package atom-mesh --lib --tests` → 3 pre-existing warning（不动），placement 0 新 warning
+
+**Subagent review 累计 1 轮**（rust-reviewer 0 BLOCK / 2 HIGH / 3 MEDIUM / 3 LOW；HIGH H2 已修，MEDIUM M1-M3 全采纳，LOW L1 折入 M3 修复，L2/L3 按 surgical-changes 原则不动）。
+
+**遗留进入 P3 跟踪**:
+- §11.6 PD path api_key 转发：本期决定 A 路线（删字段 + tracking issue），P5 wire 阶段不顺手补
+- `PlacementError::NoPrefill/NoDecodeWorkers` 仅 plan() 派遣层使用，post-health 一律返 NoAvailableWorkers（§11.7 + G07 spec），观察性可在 P2 引入区分
+- `PlacementTrace` 的 `candidate_count_before/after` 在 Pair 模式合并 P+D 总数；如观察性需要拆分需扩 schema
 
 ### 5.1 P0b 实际产出（已落地，后续 phase 直接消费）
 
