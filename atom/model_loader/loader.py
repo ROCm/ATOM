@@ -388,9 +388,9 @@ def load_model(
                 is_rocm_aiter_fusion_shared_expert_enabled()
                 and maybe_matching_name is not None
             ):
-                n_routed = getattr(
-                    hf_config, "n_routed_experts", None
-                ) or getattr(hf_config, "num_experts", None)
+                n_routed = getattr(hf_config, "n_routed_experts", None) or getattr(
+                    hf_config, "num_experts", None
+                )
                 name = name.replace(
                     maybe_matching_name,
                     f"mlp.experts.{n_routed}.",

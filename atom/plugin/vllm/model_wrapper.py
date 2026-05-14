@@ -125,6 +125,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         from atom.config import get_current_atom_config
+
         _set_framework_backbone("vllm")
 
         self.config = vllm_config.model_config.hf_config
