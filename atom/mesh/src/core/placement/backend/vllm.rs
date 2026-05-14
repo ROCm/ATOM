@@ -135,4 +135,8 @@ impl BackendAdapter for VllmAdapter {
         debug_assert_eq!(batch_size, 1, "vLLM Mooncake fires per-request");
         self.inject_prefill_fields(body, ctx)
     }
+
+    fn correlation_id(&self, ctx: &PairCtx) -> Option<String> {
+        downcast(ctx).ok().map(|c| c.transfer_id.clone())
+    }
 }
