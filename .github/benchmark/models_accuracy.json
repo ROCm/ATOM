@@ -266,28 +266,28 @@
     "_baseline_note": "CI baseline=0.8605 (FP8 tp=4, 3-shot completions API, thinking mode active). HF card reports 0.9538 but uses chat API with reasoning_parser"
   },
   {
-    "model_name": "MiniMax-M2.5",
-    "model_path": "MiniMaxAI/MiniMax-M2.5",
+    "model_name": "MiniMax-M2.7",
+    "model_path": "MiniMaxAI/MiniMax-M2.7",
     "extraArgs": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "nightly",
-    "accuracy_threshold": 0.92,
-    "accuracy_baseline": 0.9401,
-    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
-    "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows baseline=0.9401"
+    "accuracy_threshold": 0.8872,
+    "accuracy_baseline": 0.9022,
+    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.7",
+    "_baseline_note": "ATOM CI measured: 0.9022 (gsm8k 3-shot flexible-extract). Threshold = baseline - 0.015."
   },
   {
-    "model_name": "MiniMax-M2.5-MXFP4",
-    "model_path": "amd/MiniMax-M2.5-MXFP4",
+    "model_name": "MiniMax-M2.7-MXFP4",
+    "model_path": "amd/MiniMax-M2.7-MXFP4",
     "extraArgs": "--kv_cache_dtype fp8 --trust-remote-code",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "nightly",
-    "accuracy_threshold": 0.91,
-    "accuracy_baseline": 0.9401,
-    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
-    "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows MXFP4=0.9256, baseline=0.9401"
+    "accuracy_threshold": 0.8872,
+    "accuracy_baseline": 0.9022,
+    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.7",
+    "_baseline_note": "ATOM CI measured BF16=0.9022 (gsm8k 3-shot flexible-extract). HF amd/MiniMax-M2.7-MXFP4: MXFP4=91.89, baseline=91.81 (percentage)."
   },
   {
     "model_name": "MiMo-V2-Flash",

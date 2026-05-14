@@ -103,16 +103,16 @@
     "_baseline_note": "Reference value from recipes/atom_vllm/Kimi-K2.5.md"
   },
   {
-    "model_name": "MiniMax-M2.5 TP2",
-    "model_path": "MiniMaxAI/MiniMax-M2.5",
+    "model_name": "MiniMax-M2.7 TP2",
+    "model_path": "MiniMaxAI/MiniMax-M2.7",
     "extraArgs": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
     "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
-    "accuracy_threshold": 0.92,
-    "accuracy_baseline": 0.9401,
-    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
-    "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows baseline=0.9401"
+    "accuracy_threshold": 0.8872,
+    "accuracy_baseline": 0.9022,
+    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.7",
+    "_baseline_note": "ATOM CI measured: 0.9022 (gsm8k 3-shot flexible-extract). Threshold = baseline - 0.015."
   },
   {
     "model_name": "DeepSeek-R1-FP8 TP8",
