@@ -14,15 +14,13 @@ from torch import nn
 from typing import Optional
 
 
-def _is_gfx1201_act() -> bool:
-    if not hasattr(_is_gfx1201_act, "_cached"):
-        try:
-            _is_gfx1201_act._cached = (
-                torch.cuda.get_device_properties(0).gcnArchName or ""
-            ).startswith("gfx1201")
-        except Exception:
-            _is_gfx1201_act._cached = False
-    return _is_gfx1201_act._cached
+def _detect_gfx1201() -> bool:
+    try:
+        return (torch.cuda.get_device_properties(0).gcnArchName or "").startswith("gfx1201")
+    except Exception:
+        return False
+
+_IS_GFX1201: bool = _detect_gfx1201()
 
 
 def mxfp4_act_mul_quant_fuse_fake(
@@ -98,7 +96,7 @@ class SiluAndMul(nn.Module):
         # gfx1201 code object (CDNA-only v_pk_mul_f32). Use the portable
         # triton silu_and_mul added in aiter PR #3168 (which mirrors the
         # HIP signature out=fn(x)).
-        if _is_gfx1201_act():
+        if _IS_GFX1201:
             from aiter.ops.triton.activation import (
                 silu_and_mul as _aiter_silu_mul_triton,
             )

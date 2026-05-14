@@ -194,6 +194,7 @@ class PagedAttention(BaseAttention):
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError("Duplicate layer: {}".format(self.layer_name))
         compilation_config.static_forward_context[self.layer_name] = self
+        self._use_native_triton = (self.attn_backend.get_name() == "NATIVE_TRITON_ATTENTION")
 
     def forward(
         self,
@@ -220,7 +221,7 @@ class PagedAttention(BaseAttention):
 
         # Torch-native fallback: backends without aiter prebuilt HIP modules
         # (e.g. gfx1201) route through self.impl.forward instead of the aiter op.
-        if self.attn_backend.get_name() == "NATIVE_TRITON_ATTENTION":
+        if self._use_native_triton:
             return self.impl.forward(
                 query=query,
                 key=key,

@@ -43,16 +43,17 @@ logger = logging.getLogger("atom")
 # gfx1201 code objects in the rocm/atom-dev:latest image, causing SIGSEGV on
 # kernel load. We dequantize FP8 weights to BF16 and run F.linear instead.
 # Detection is cached after first call.
-def _is_gfx1201_linear() -> bool:
-    if not hasattr(_is_gfx1201_linear, "_cached"):
-        try:
-            import torch as _t
+def _detect_gfx1201() -> bool:
+    try:
+        return (torch.cuda.get_device_properties(0).gcnArchName or "").startswith("gfx1201")
+    except Exception:
+        return False
 
-            name = _t.cuda.get_device_properties(0).gcnArchName or ""
-            _is_gfx1201_linear._cached = name.startswith("gfx1201")
-        except Exception:
-            _is_gfx1201_linear._cached = False
-    return _is_gfx1201_linear._cached
+_IS_GFX1201: bool = _detect_gfx1201()
+
+
+def _is_gfx1201_linear() -> bool:
+    return _IS_GFX1201
 
 
 _TRITON_FP8_GEMM = None

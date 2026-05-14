@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import warnings
-from functools import lru_cache
 
 import torch
 from aiter import mixed_sample_outer_exponential
@@ -30,6 +29,18 @@ _NATIVE_SAMPLING_WARNING_ISSUED = False
 
 # Epsilon value for numerical stability and to prevent division by 0
 SAMPLER_EPS = 1e-10
+
+
+def _detect_gfx1201() -> bool:
+    try:
+        return (torch.cuda.get_device_properties(0).gcnArchName or "").startswith(
+            "gfx1201"
+        )
+    except Exception:
+        return False
+
+
+_IS_GFX1201: bool = _detect_gfx1201()
 
 
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
@@ -127,14 +138,7 @@ class Sampler(nn.Module):
             exponential = get_per_token_exponential(vocab_size, logits.device).expand(
                 num_tokens, vocab_size
             )
-        if not hasattr(self, "_is_gfx1201_cached"):
-            try:
-                self._is_gfx1201_cached = (
-                    torch.cuda.get_device_properties(0).gcnArchName or ""
-                ).startswith("gfx1201")
-            except Exception:
-                self._is_gfx1201_cached = False
-        if self._is_gfx1201_cached:
+        if _IS_GFX1201:
             # Torch fallback: Gumbel-max sampling. exponential is Exp(1) noise,
             # so log(exponential) is Gumbel-distributed (up to sign). Greedy
             # (T->0) collapses to argmax.
