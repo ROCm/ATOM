@@ -8,7 +8,6 @@ from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.models.utils import IntermediateTensors
-from atom.plugin import is_vllm
 from atom.utils.decorators import support_torch_compile
 from transformers import PretrainedConfig
 
@@ -70,13 +69,7 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        if is_vllm():
-            # masking inputs at position 0, as not needed by MTP
-            masked_inputs_embeds = torch.where(
-                positions.unsqueeze(-1) == 0, 0, inputs_embeds
-            )
-        else:
-            masked_inputs_embeds = inputs_embeds
+        masked_inputs_embeds = inputs_embeds
         inputs_embeds = self.enorm(masked_inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 

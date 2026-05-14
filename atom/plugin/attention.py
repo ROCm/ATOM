@@ -1,5 +1,4 @@
 from typing import Generic, Optional, TypeVar
-import inspect
 import logging
 
 from dataclasses import dataclass
@@ -1448,16 +1447,6 @@ class vllmAiterMLABackendMethods:
         # us from `get_kv_cache_shape` to the actual memory layout we want.
         # (num_blocks, num_layers, block_size, head_size)
         return (1, 0, 2, 3) if include_num_layers_dimension else (0, 1, 2)
-
-
-def _copy_public_attrs_without_binding(src_cls, dst_cls):
-    """Copy public attributes without descriptor rebinding."""
-    for name in dir(src_cls):
-        if name.startswith("_"):
-            continue
-        # Avoid getattr(), which binds classmethod to src_cls.
-        raw_attr = inspect.getattr_static(src_cls, name)
-        setattr(dst_cls, name, raw_attr)
 
 
 def AiterBackendDecoratorForPluginMode(cls):
