@@ -22,7 +22,8 @@ pub mod error;
 pub mod factory;
 pub mod grpc;
 pub mod header_utils;
-pub mod http;
+pub mod http_pd_router;
+pub mod http_router;
 pub mod parse;
 pub mod persistence_utils;
 pub mod router_manager;
@@ -30,8 +31,6 @@ pub mod shared;
 pub mod tokenize;
 
 pub use factory::RouterFactory;
-// Re-export HTTP routers for convenience
-pub use http::{pd_router, pd_types, router};
 
 /// Core trait for all router implementations
 ///
