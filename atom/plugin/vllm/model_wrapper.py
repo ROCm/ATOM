@@ -144,7 +144,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.ignore_unexpected_suffixes: list[str] = []
 
         self.vllm_config = vllm_config
-        self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
         self.is_mtp = False
         speculative_config = getattr(vllm_config, "speculative_config", None)
         if speculative_config is not None:

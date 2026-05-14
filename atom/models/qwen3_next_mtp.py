@@ -137,10 +137,6 @@ class Qwen3NextMTP(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         config = atom_config.hf_config
-        if not hasattr(config, "n_shared_experts"):
-            config.n_shared_experts = 1
-        if not hasattr(config, "n_routed_experts"):
-            config.n_routed_experts = config.num_experts
         if atom_config.enable_prefix_caching:
             raise ValueError("Qwen3NextMTP currently does not support prefix caching")
         self.config = config
