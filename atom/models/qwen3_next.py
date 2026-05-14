@@ -495,20 +495,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
-        self.speculative_config = speculative_config
-        # When running as a vLLM plugin, Qwen3NextDecoderLayer instantiates
-        # this module without forwarding speculative_config. That left
-        # self.num_spec=0 even with MTP enabled, so get_state_shape() (the
-        # instance method vLLM's MambaBase.get_kv_cache_spec uses to size each
-        # layer's KV cache) allocated conv_state with only `kernel_size-1`
-        # token rows. During spec decode, causal_conv1d_update writes
-        # `kernel_size-1 + num_spec` rows per slot and the extra row spilled
-        # into the page-adjacent ssm_state, corrupting layer 0's recurrent
-        # state. Pull the spec config from the vLLM config as a fallback.
-        if is_vllm() and self.speculative_config is None:
-            vllm_spec_config = get_current_vllm_config().speculative_config
-            if vllm_spec_config is not None:
-                self.speculative_config = vllm_spec_config
+        # Qwen3NextDecoderLayer instantiates this module without forwarding
+        # speculative_config, so fall back to atom_config.speculative_config
+        # (populated by both standalone ATOM and the vLLM plugin path's
+        # _generate_atom_config_from_vllm_config). Without a correct num_spec,
+        # get_state_shape() (used by vLLM's MambaBase.get_kv_cache_spec to
+        # size each layer's KV cache) sizes conv_state with only
+        # `kernel_size-1` token rows, but causal_conv1d_update writes
+        # `kernel_size-1 + num_spec` rows per slot during spec decode — the
+        # extra row spills into the page-adjacent ssm_state and corrupts
+        # layer 0's recurrent state.
+        self.speculative_config = speculative_config or atom_config.speculative_config
         self.num_spec = (
             self.speculative_config.num_speculative_tokens
             if self.speculative_config
