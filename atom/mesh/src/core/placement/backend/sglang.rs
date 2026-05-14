@@ -10,6 +10,7 @@ pub struct SglangAdapter;
 pub struct SglangPairCtx {
     pub bootstrap_host: String,
     pub bootstrap_port: Option<u16>,
+    pub bootstrap_room: u64,
 }
 
 const KEY_BOOTSTRAP_HOST: &str = "bootstrap_host";
@@ -41,6 +42,7 @@ impl BackendAdapter for SglangAdapter {
         Ok(Box::new(SglangPairCtx {
             bootstrap_host: prefill.bootstrap_host().to_string(),
             bootstrap_port: prefill.bootstrap_port(),
+            bootstrap_room: generate_room_id(),
         }))
     }
 
@@ -56,7 +58,7 @@ impl BackendAdapter for SglangAdapter {
             Value::from(ctx.bootstrap_host.as_str()),
         );
         obj.insert(KEY_BOOTSTRAP_PORT.to_string(), port_to_value(ctx.bootstrap_port));
-        obj.insert(KEY_BOOTSTRAP_ROOM.to_string(), Value::from(generate_room_id()));
+        obj.insert(KEY_BOOTSTRAP_ROOM.to_string(), Value::from(ctx.bootstrap_room));
         Ok(())
     }
 
@@ -90,5 +92,9 @@ impl BackendAdapter for SglangAdapter {
         obj.insert(KEY_BOOTSTRAP_PORT.to_string(), Value::Array(ports));
         obj.insert(KEY_BOOTSTRAP_ROOM.to_string(), Value::Array(rooms));
         Ok(())
+    }
+
+    fn correlation_id(&self, ctx: &PairCtx) -> Option<String> {
+        downcast(ctx).ok().map(|c| c.bootstrap_room.to_string())
     }
 }
