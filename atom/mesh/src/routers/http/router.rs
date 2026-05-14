@@ -15,14 +15,19 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        is_retryable_status,
+        placement::{
+            planner::DefaultPlanner,
+            registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
+            traits::PdPlanner,
+            types::{PlacementPlan, Protocol, RequestDescriptor},
+        },
+        AttachedBody, RetryExecutor, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         common::GenerationRequest,
@@ -33,14 +38,16 @@ use crate::{
     routers::{
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        header_utils,
+        shared::placement_response::placement_err_to_response,
+        RouterTrait,
     },
 };
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
-    policy_registry: Arc<PolicyRegistry>,
+    planner: Arc<dyn PdPlanner>,
     client: Client,
     dp_aware: bool,
     retry_config: RetryConfig,
@@ -50,7 +57,6 @@ impl std::fmt::Debug for Router {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
             .field("worker_registry", &self.worker_registry)
-            .field("policy_registry", &self.policy_registry)
             .field("client", &self.client)
             .field("dp_aware", &self.dp_aware)
             .field("retry_config", &self.retry_config)
@@ -61,9 +67,13 @@ impl std::fmt::Debug for Router {
 impl Router {
     /// Create a new router with injected policy and client
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
+        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::new(ctx.worker_registry.clone())),
+            Arc::new(PolicyRegistryAdapter::new(ctx.policy_registry.clone())),
+        ));
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
-            policy_registry: ctx.policy_registry.clone(),
+            planner,
             client: ctx.client.clone(),
             dp_aware: ctx.router_config.dp_aware,
             retry_config: ctx.router_config.effective_retry_config(),
@@ -119,63 +129,6 @@ impl Router {
             }
             Err(e) => error::service_unavailable("no_workers", e),
         }
-    }
-
-    /// Select worker for a specific model considering circuit breaker state
-    async fn select_worker_for_model(
-        &self,
-        model_id: Option<&str>,
-        text: Option<&str>,
-        headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
-        // Get workers for the specified model O(1), filtered by connection mode
-        let workers = self.worker_registry.get_workers_filtered(
-            None,
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,  // any runtime type
-            false, // get all workers, we'll filter by is_available() next
-        );
-
-        let available: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-        if available.is_empty() {
-            return None;
-        }
-
-        // Get the appropriate policy for this model
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self.worker_registry.get_hash_ring(UNKNOWN_MODEL_ID);
-
-        let idx = policy
-            .select_worker(
-                &available,
-                &SelectWorkerInfo {
-                    request_text: text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                    headers,
-                    hash_ring,
-                },
-            )
-            .await?;
-
-        // Record worker selection metric (Layer 3)
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model_id.unwrap_or(UNKNOWN_MODEL_ID),
-            policy.name(),
-        );
-
-        Some(available[idx].clone())
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -266,26 +219,46 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self
-            .select_worker_for_model(model_id, Some(text), headers)
-            .await
-        {
-            Some(w) => w,
-            None => {
-                return error::service_unavailable(
-                    "no_available_workers",
-                    "No available workers (all circuits open or unhealthy)",
+        let descriptor = RequestDescriptor {
+            model_id,
+            protocol: Some(Protocol::Http),
+            text: Some(text),
+            tokens: None,
+            headers,
+            stream: is_stream,
+            return_logprob: false,
+        };
+
+        let (worker, policy_name) = match self.planner.plan(&descriptor).await {
+            Ok(PlacementPlan::Single {
+                worker,
+                policy_name,
+                ..
+            }) => (worker, policy_name),
+            Ok(PlacementPlan::Pair { .. }) => {
+                error!(
+                    function = "Router::route_typed_request_once",
+                    "Planner returned Pair plan for regular HTTP router"
                 );
+                return error::internal_error(
+                    "unexpected_pair_plan",
+                    "Planner returned Pair plan for regular router",
+                );
+            }
+            Err(err) => {
+                return placement_err_to_response(err, model_id);
             }
         };
 
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model_id.unwrap_or(UNKNOWN_MODEL_ID),
+            policy_name,
+        );
 
         let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
+            .contains(&policy_name)
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
         // Note: Using borrowed reference avoids heap allocation
@@ -765,15 +738,16 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use crate::core::BasicWorkerBuilder;
+    use crate::policies::PolicyRegistry;
 
     fn create_test_regular_router() -> Router {
-        // Create registries
+        use crate::core::WorkerType;
+
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(
             crate::config::types::PolicyConfig::RoundRobin,
         ));
 
-        // Register test workers
         let worker1 = BasicWorkerBuilder::new("http://worker1:8080")
             .worker_type(WorkerType::Regular)
             .build();
@@ -783,9 +757,14 @@ mod tests {
         worker_registry.register(Arc::new(worker1));
         worker_registry.register(Arc::new(worker2));
 
+        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
+            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
+        ));
+
         Router {
             worker_registry,
-            policy_registry,
+            planner,
             dp_aware: false,
             client: Client::new(),
             retry_config: RetryConfig::default(),
@@ -851,9 +830,13 @@ mod tests {
         let policy_registry = Arc::new(PolicyRegistry::new(
             crate::config::types::PolicyConfig::RoundRobin,
         ));
+        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
+            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
+        ));
         let router = Router {
             worker_registry,
-            policy_registry,
+            planner,
             dp_aware: false,
             client: Client::new(),
             retry_config: RetryConfig::default(),
@@ -909,9 +892,13 @@ mod tests {
         let policy_registry = Arc::new(PolicyRegistry::new(
             crate::config::types::PolicyConfig::RoundRobin,
         ));
+        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
+            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
+        ));
         let router = Router {
             worker_registry,
-            policy_registry,
+            planner,
             dp_aware: true,
             client: Client::new(),
             retry_config: RetryConfig::default(),
@@ -927,23 +914,6 @@ mod tests {
     fn test_router_type() {
         let router = create_test_regular_router();
         assert_eq!(router.router_type(), "regular");
-    }
-
-    #[tokio::test]
-    async fn test_select_worker_for_model_round_robin() {
-        let router = create_test_regular_router();
-
-        let w1 = router
-            .select_worker_for_model(None, None, None)
-            .await
-            .unwrap();
-        let w2 = router
-            .select_worker_for_model(None, None, None)
-            .await
-            .unwrap();
-
-        // Round robin should alternate between workers
-        assert_ne!(w1.url(), w2.url());
     }
 
     #[test]
