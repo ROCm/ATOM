@@ -284,7 +284,7 @@
           "dashboard_model": "DeepSeek-V3.2-FP8-aw-tp4",
           "prefix": "deepseek-v3-2-fp8-aw-tp4",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --kv-cache-dtype auto --block-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --kv-cache-dtype auto --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         },
         {
@@ -293,7 +293,7 @@
           "dashboard_model": "DeepSeek-V3.2-FP8-aw-tp8",
           "prefix": "deepseek-v3-2-fp8-aw-tp8",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --block-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         }
       ]

@@ -139,7 +139,7 @@
   {
     "model_name": "DeepSeek-V3.2-FP8 TP8",
     "model_path": "deepseek-ai/DeepSeek-V3.2",
-    "extraArgs": "--tensor-parallel-size 8 --block-size 1",
+    "extraArgs": "--tensor-parallel-size 8",
     "env_vars": "",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
