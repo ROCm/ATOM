@@ -21,9 +21,6 @@ This pushed our c4 leaderboard from 742 → 757 (about +2% but enough to climb i
 
 - `TECHNICAL_APPROACH.md` — what we changed and why
 - `PERFORMANCE_METRICS.md` — throughput numbers + raw JSON
-- `PR_DESCRIPTION.md` — proposed pull request body
-- `EMAIL_DRAFT.md` — body for `ai_dev_contests@amd.com`
-- `HUMAN_ACTION_REQUIRED.md` — step-by-step submission checklist
 - `launchers/`
   - `launch_atom_c4_level3.sh` — conc=4 with standard model
   - `launch_atom_c4_level3_mtp_moefp4.sh` — **conc=4 with MoEFP4 model (BEST)**
