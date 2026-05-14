@@ -189,7 +189,7 @@ pub trait BackendAdapter: Send + Sync {
 | P1 | 实现 placement core (candidate / policy_apply / planner / trace) | 2 天 | ✅ done | A/B/C/D/F/G 类测试全绿 |
 | P2 | 实现 BackendAdapter (SGLang + vLLM) | 1.5 天 (含 §11.13 +0.5) | ✅ done | E 类测试全绿 |
 | P3 | gRPC 切换 (WorkerSelectionStage 调 planner) | 1 天 | ✅ done | gRPC 走新 planner，H04/H05/H06 全绿 |
-| P4 | HTTP Regular 切换 | 1 天 | pending | http_router.rs 走 planner，`routers/http/router.rs` 现有 15 个测试全绿 |
+| P4 | HTTP Regular 切换 | 1 天 | ✅ done | http_router.rs 走 planner，`routers/http/router.rs` 现有 15 个测试全绿 |
 | P5 | HTTP PD 切换 (含 BackendAdapter wiring) | 2 天 | pending | http_pd_router.rs 走 planner + adapter，HTTP PD 25 测试全绿 |
 | P6 | 清理: 死代码删除 / 反向依赖修 / 文件扁平化 / clippy clean | 1 天 | pending | clippy 无 warning，cargo test 全绿 |
 | **合计** | | **10-10.5 天** | | |
@@ -281,6 +281,43 @@ pub trait BackendAdapter: Send + Sync {
 **遗留进入 P4 跟踪**:
 - 同 P2 遗留三项
 - `RequestDescriptor.return_logprob` 在 grpc stage 仍硬编码 `false`：当前 placement core 无任何路径读它，且生产 chat/generate 的字段映射不一致（chat 用 `logprobs: bool`，generate 用 `return_logprob`），P4/P5 wire 阶段如需透传再统一加
+
+### 5.5 P4 实际产出（已落地）
+
+实现：
+
+| 文件 | 改动 | 关键决策 |
+|------|------|---------|
+| `routers/http/router.rs` | `Router` 加 `planner: Arc<dyn PdPlanner>` 字段；`Router::new` 内构造 `DefaultPlanner` over `WorkerRegistryAdapter` + `PolicyRegistryAdapter`；`route_typed_request_once` 改调 `self.planner.plan(&RequestDescriptor { protocol: Some(Http), text: Some(text), stream: is_stream, .. })`；`Single` 分支用返回的 `worker` + `policy_name`；`Pair` 分支返 500 `unexpected_pair_plan`（HTTP regular invariant 防御）；`Err` 分支调 `placement_err_to_response`；`Metrics::record_worker_selection` 移入 Single arm 用 `policy_name` 不再二次查 policy；`WorkerLoadGuard` gate 用 `policy_name` 字符串匹配；删 `select_worker_for_model`；删 `policy_registry: Arc<PolicyRegistry>` 字段（reviewer-flagged orphan，refactor 后唯一读路径只剩 Debug）；`PolicyRegistry` import 下沉到 `mod tests` | D2 bug 双层（candidate model_id 过滤 + hash_ring keyed by model）经 planner 自动修；HTTP regular Router 不再含 P/D 拆分，Pair 分支只能由"registry 同时含 Regular+Prefill+Decode 但 Regular 全 unhealthy"触发，5xx fail-fast 优于静默错路 |
+| `routers/shared/mod.rs` (新增) | `pub mod placement_response;` | — |
+| `routers/shared/placement_response.rs` (新增) | `placement_err_to_response(PlacementError, Option<&str>) -> Response`，verbatim 从 gRPC stage 上调 | core/placement 不能依赖 routers::error（layering），故 helper 落 routers/shared/，与 §6.3 P6 metrics_utils 同位 |
+| `routers/mod.rs` | `pub mod shared;` | — |
+| `routers/grpc/common/stages/worker_selection.rs` | 删 local `placement_err_to_response`，改 import `routers::shared::placement_response::placement_err_to_response`；删 `PlacementError` 直接 import | — |
+| `core/placement/tests_integration.rs` | H01-H03 实现：H01 `MockWorkerSource` 单 HTTP regular worker → `Plan::Single`；H02 空 source + `model_id=None` → `NoWorkers` → `placement_err_to_response(.., None)` 503 含 `"no_workers"`；H03 source 仅含 `"other"` model + 请求 `"requested_model"` → `ModelNotFound` → 503 body 含 `"requested_model"`；H06 import 路径同步迁到 shared | mirror H04-H06 风格，纯 helper-level 单测，不构造 RequestContext |
+| `routers/http/router.rs` (tests) | 三个 fixture 加 `planner` 字段构造；删 `test_select_worker_for_model_round_robin`（被 placement core B/C 系列等价覆盖，per §11.12 视为 migrated） | — |
+
+测试覆盖 (3 个新增):
+- H01 (HTTP regular planner Single → worker URL)
+- H02 (HTTP regular empty source → 503 "no_workers")
+- H03 (HTTP regular ModelNotFound → 503 含 model name)
+
+**当下 baseline** (P5 启动前必须保持):
+- `cargo build --package atom-mesh` 干净（无 warning）
+- `cargo test --package atom-mesh --lib core::placement::` → 102 passed (10 fixture smoke + 72 P1 + 12+2 P2 + 3 P3 H + 3 P4 H) / 4 failed (H07-H10，P5 scope)
+- `cargo test --package atom-mesh --lib routers::http::router::tests` → 14 passed / 0 failed
+- `cargo clippy --package atom-mesh --lib --tests` → 3 pre-existing warning（不动），placement / http_router / shared 0 新 warning
+
+**Subagent review 1 轮**（rust-reviewer 0 BLOCK / 2 HIGH / 2 MEDIUM / 2 LOW）：
+- HIGH 1 dead `policy_registry` field — 采纳，删字段 + 下沉 `PolicyRegistry` import 到 mod tests
+- HIGH 2 hash_ring=None when model_id=None — dismiss with rationale：plan §11.8 显式将旧 `get_hash_ring(UNKNOWN_MODEL_ID)` 标为 D2 bug；cache_aware 不消费 `info.hash_ring`（用 `self.trees.get(model_id)`）；UNKNOWN_MODEL_ID ring 在多 model registry 下事实上为空 ring
+- MEDIUM Pair defensive arm 缺 model_id log — note 入 P5/P6 跟踪
+- MEDIUM H02 assertion soundness — 已验证 `error::create_error` 通过 Json(ErrorResponse) 序列化 `code` 入 body，assertion 成立
+- LOW 红线 grep / shared 模块位置 — 无 finding
+
+**遗留进入 P5 跟踪**:
+- 同 P3 遗留（§11.6 api_key A 路线 / NoPrefill 区分 / Pair trace 拆分）
+- HTTP regular `Pair` 防御 arm 当前 500 with `model_id` 缺失，P5 wire HTTP PD 时若 invariant 重新分析可统一改 503 + model log
+- `WorkerRegistryAdapter` + `PolicyRegistryAdapter` 在 `Router::new` 与 P5 `PDRouter::new` 会重复构造，P6 cleanup 可抽 helper
 
 ### 5.1 P0b 实际产出（已落地，后续 phase 直接消费）
 
