@@ -9,6 +9,9 @@ pub fn filter_candidates(
     worker_type: Option<WorkerType>,
     connection_mode: Option<ConnectionMode>,
 ) -> Vec<Arc<dyn Worker>> {
-    let _ = (source, model_id, worker_type, connection_mode);
-    todo!()
+    source
+        .workers_filtered(model_id, worker_type, connection_mode)
+        .into_iter()
+        .filter(|w| w.is_available())
+        .collect()
 }

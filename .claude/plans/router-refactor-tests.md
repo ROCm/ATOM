@@ -36,24 +36,24 @@
 
 > 覆盖：`http/router.rs:131-147`、`grpc/.../worker_selection.rs:136-150 + 195-225`、`http/pd_router.rs:1199-1201, 1262-1266`
 
-- [ ] **A01** `model_id=Some("m1")` 仅返回 m1 的 worker（D2 bug fix 核心证据 —— 不再静默落到 None）
-- [ ] **A02** `model_id=None` 返回所有 worker（向后兼容兜底）
-- [ ] **A03** `model_id=Some("unknown")` 且 registry 内无该 model → 返回空集合（错误分类由 planner 决定，候选层只负责过滤）
-- [ ] **A04** 两个 model 都有 worker，请求 model A 不会污染到 model B 的 worker
-- [ ] **A05** `worker_type=Some(Regular)` 过滤掉 Prefill / Decode
-- [ ] **A06** `worker_type=Some(Prefill { .. })` 过滤掉 Regular / Decode
-- [ ] **A07** `worker_type=Some(Decode)` 过滤掉 Regular / Prefill
-- [ ] **A08** `connection_mode=Some(Http)` 过滤掉 gRPC worker
-- [ ] **A09** `connection_mode=Some(Grpc { port: None })` 过滤掉 HTTP worker
-- [ ] **A10** 全部 worker healthy → 全部进入候选
-- [ ] **A11** 全部 worker unhealthy → 候选为空（caller 决定 NoAvailableWorkers）
-- [ ] **A12** 健康/不健康混合 → 仅健康进入候选
-- [ ] **A13** Registry 为空 → 候选为空，不 panic
-- [ ] **A14** Prefill 带 `bootstrap_port=Some(8998)`（SGLang）与 `None`（vLLM）共存 → 都被 `WorkerType::Prefill { .. }` 匹配，不因 port 值丢候选
-- [ ] **A15** 组合：`model_id + worker_type + connection_mode + 健康` 全部生效
-- [ ] **A16** 组合：`model_id=Some + worker_type=None`（HTTP PD 旧调用形态）正确返回所有该 model 的 worker
-- [ ] **A17** DP-aware: 同 URL 不同 `dp_rank` 的两个 worker 都进入候选（不去重）
-- [ ] **A18** 大量 worker（≥256）下过滤性能不退化（断言 ≤ N×O(1)，仅 sanity）
+- [x] **A01** `model_id=Some("m1")` 仅返回 m1 的 worker（D2 bug fix 核心证据 —— 不再静默落到 None）
+- [x] **A02** `model_id=None` 返回所有 worker（向后兼容兜底）
+- [x] **A03** `model_id=Some("unknown")` 且 registry 内无该 model → 返回空集合（错误分类由 planner 决定，候选层只负责过滤）
+- [x] **A04** 两个 model 都有 worker，请求 model A 不会污染到 model B 的 worker
+- [x] **A05** `worker_type=Some(Regular)` 过滤掉 Prefill / Decode
+- [x] **A06** `worker_type=Some(Prefill { .. })` 过滤掉 Regular / Decode
+- [x] **A07** `worker_type=Some(Decode)` 过滤掉 Regular / Prefill
+- [x] **A08** `connection_mode=Some(Http)` 过滤掉 gRPC worker
+- [x] **A09** `connection_mode=Some(Grpc { port: None })` 过滤掉 HTTP worker
+- [x] **A10** 全部 worker healthy → 全部进入候选
+- [x] **A11** 全部 worker unhealthy → 候选为空（caller 决定 NoAvailableWorkers）
+- [x] **A12** 健康/不健康混合 → 仅健康进入候选
+- [x] **A13** Registry 为空 → 候选为空，不 panic
+- [x] **A14** Prefill 带 `bootstrap_port=Some(8998)`（SGLang）与 `None`（vLLM）共存 → 都被 `WorkerType::Prefill { .. }` 匹配，不因 port 值丢候选
+- [x] **A15** 组合：`model_id + worker_type + connection_mode + 健康` 全部生效
+- [x] **A16** 组合：`model_id=Some + worker_type=None`（HTTP PD 旧调用形态）正确返回所有该 model 的 worker
+- [x] **A17** DP-aware: 同 URL 不同 `dp_rank` 的两个 worker 都进入候选（不去重）
+- [x] **A18** 大量 worker（≥256）下过滤性能不退化（断言 ≤ N×O(1)，仅 sanity）
 
 ---
 
@@ -61,20 +61,20 @@
 
 > 覆盖：`http/router.rs:149-178`、`grpc/.../worker_selection.rs:152-186, 227-267`、`http/pd_router.rs:1247-1280`
 
-- [ ] **B01** `RoundRobin` policy 被调用一次，返回 idx 在 `0..candidates.len()` 内
-- [ ] **B02** `Random` policy 被调用一次，返回有效 idx
-- [ ] **B03** `PowerOfTwo` policy 被调用一次（由 `policies/power_of_two.rs` 决定 idx）
-- [ ] **B04** `CacheAware` policy 被调用，且 `SelectWorkerInfo.request_text` 必须是 `Some` 否则触发 `needs_request_text=true` 路径
-- [ ] **B05** `PrefixHash` policy 被调用，且 `SelectWorkerInfo.tokens` 必须为 `Some(non_empty)` 才进入哈希分支
-- [ ] **B06** **D2 修复证据**: 请求 model "m1" 时 `apply_policy` 收到的 `hash_ring` 是 `worker_source.hash_ring("m1")` 的结果，**不是** `hash_ring(UNKNOWN_MODEL_ID)`
-- [ ] **B07** `model_id` 在 registry 中无对应 hash_ring → 注入 `hash_ring=None`，policy 仍可工作（fallback 到非 ring 分支）
-- [ ] **B08** `request_text=Some("hello")` 透传至 policy 收到的 `SelectWorkerInfo.request_text`
-- [ ] **B09** `tokens=Some(&[1,2,3])` 透传至 policy 收到的 `SelectWorkerInfo.tokens`
-- [ ] **B10** `headers=Some(&hm)` 透传至 policy 收到的 `SelectWorkerInfo.headers`
-- [ ] **B11** Policy `select_worker` 返回 `None` → `apply_policy` 返回 `Err(PolicyReturnedNone)` 而不是 panic
-- [ ] **B12** `candidates.is_empty()` → 调用方在进入 `apply_policy` 前应已 short-circuit；本测试断言 `apply_policy` 在空 slice 上不调用 policy（防御）
-- [ ] **B13** `cache_aware` policy 的 `needs_request_text()=true` 在 `PolicySource::pd_needs_request_text()` 中被正确聚合（覆盖 §11.4）
-- [ ] **B14** `apply_policy` 返回的 idx 用于 `available[idx].clone()` 时不越界（使用上面 B01-B05 任一断言 idx < len）
+- [x] **B01** `RoundRobin` policy 被调用一次，返回 idx 在 `0..candidates.len()` 内
+- [x] **B02** `Random` policy 被调用一次，返回有效 idx
+- [x] **B03** `PowerOfTwo` policy 被调用一次（由 `policies/power_of_two.rs` 决定 idx）
+- [x] **B04** `CacheAware` policy 被调用，且 `SelectWorkerInfo.request_text` 必须是 `Some` 否则触发 `needs_request_text=true` 路径
+- [x] **B05** `PrefixHash` policy 被调用，且 `SelectWorkerInfo.tokens` 必须为 `Some(non_empty)` 才进入哈希分支
+- [x] **B06** **D2 修复证据**: 请求 model "m1" 时 `apply_policy` 收到的 `hash_ring` 是 `worker_source.hash_ring("m1")` 的结果，**不是** `hash_ring(UNKNOWN_MODEL_ID)`
+- [x] **B07** `model_id` 在 registry 中无对应 hash_ring → 注入 `hash_ring=None`，policy 仍可工作（fallback 到非 ring 分支）
+- [x] **B08** `request_text=Some("hello")` 透传至 policy 收到的 `SelectWorkerInfo.request_text`
+- [x] **B09** `tokens=Some(&[1,2,3])` 透传至 policy 收到的 `SelectWorkerInfo.tokens`
+- [x] **B10** `headers=Some(&hm)` 透传至 policy 收到的 `SelectWorkerInfo.headers`
+- [x] **B11** Policy `select_worker` 返回 `None` → `apply_policy` 返回 `Err(PolicyReturnedNone)` 而不是 panic
+- [x] **B12** `candidates.is_empty()` → 调用方在进入 `apply_policy` 前应已 short-circuit；本测试断言 `apply_policy` 在空 slice 上不调用 policy（防御）
+- [x] **B13** `cache_aware` policy 的 `needs_request_text()=true` 在 `PolicySource::pd_needs_request_text()` 中被正确聚合（覆盖 §11.4）
+- [x] **B14** `apply_policy` 返回的 idx 用于 `available[idx].clone()` 时不越界（使用上面 B01-B05 任一断言 idx < len）
 
 ---
 
@@ -82,17 +82,17 @@
 
 > 覆盖：HTTP `select_worker_for_model` 全函数、gRPC `select_single_worker` 全函数
 
-- [ ] **C01** `model_id=Some("m1")`，registry 内 m1 有 1 个健康 Regular HTTP worker → 返回 `PlacementPlan::Single { worker.url == m1_worker_url }`
-- [ ] **C02** `model_id=None`，registry 内有任意 model 的健康 worker → fallback 到 `get_default_policy`，返回任一 worker
-- [ ] **C03** `model_id=Some("m_unknown")`，registry 无该 model → 返回 `Err(PlacementError::ModelNotFound { model_id: "m_unknown" })`（§11.7）
-- [ ] **C04** **D2 跨 model 隔离证据**: registry 内 m1 / m2 各有 worker，`model_id=Some("m1")` 永远不返回 m2 的 worker（重复跑 100 次断言 URL 全部命中 m1）
-- [ ] **C05** **D2 hash_ring 证据**: 配置 `PrefixHash` policy + 多 model，断言 `WorkerSource::hash_ring` 的调用参数等于请求的 `model_id`（不是 `UNKNOWN_MODEL_ID`）
-- [ ] **C06** gRPC 单 worker：`connection_mode` 自动选 `Grpc { port: None }`，断言不会返回 HTTP worker
-- [ ] **C07** gRPC + `model_id=None` → fallback 到 default policy（与 HTTP 行为一致）
-- [ ] **C08** 全部 unhealthy → `Err(NoAvailableWorkers)`
-- [ ] **C09** Registry 空 + `model_id=None` → `Err(NoWorkers)`
-- [ ] **C10** Registry 非空但全部是 Prefill / Decode（无 Regular） + `model_id=None` → `Err(NoAvailableWorkers)`（候选过滤后为空）
-- [ ] **C11** Policy 强制返回 None → `Err(PolicyReturnedNone)` 透传到顶层
+- [x] **C01** `model_id=Some("m1")`，registry 内 m1 有 1 个健康 Regular HTTP worker → 返回 `PlacementPlan::Single { worker.url == m1_worker_url }`
+- [x] **C02** `model_id=None`，registry 内有任意 model 的健康 worker → fallback 到 `get_default_policy`，返回任一 worker
+- [x] **C03** `model_id=Some("m_unknown")`，registry 无该 model → 返回 `Err(PlacementError::ModelNotFound { model_id: "m_unknown" })`（§11.7）
+- [x] **C04** **D2 跨 model 隔离证据**: registry 内 m1 / m2 各有 worker，`model_id=Some("m1")` 永远不返回 m2 的 worker（重复跑 100 次断言 URL 全部命中 m1）
+- [x] **C05** **D2 hash_ring 证据**: 配置 `PrefixHash` policy + 多 model，断言 `WorkerSource::hash_ring` 的调用参数等于请求的 `model_id`（不是 `UNKNOWN_MODEL_ID`）
+- [x] **C06** gRPC 单 worker：`connection_mode` 自动选 `Grpc { port: None }`，断言不会返回 HTTP worker
+- [x] **C07** gRPC + `model_id=None` → fallback 到 default policy（与 HTTP 行为一致）
+- [x] **C08** 全部 unhealthy → `Err(NoAvailableWorkers)`
+- [x] **C09** Registry 空 + `model_id=None` → `Err(NoWorkers)`
+- [x] **C10** Registry 非空但全部是 Prefill / Decode（无 Regular） + `model_id=None` → `Err(NoAvailableWorkers)`（候选过滤后为空）
+- [x] **C11** Policy 强制返回 None → `Err(PolicyReturnedNone)` 透传到顶层
 
 ---
 
@@ -100,20 +100,20 @@
 
 > 覆盖：HTTP `select_pd_pair`（pd_router.rs:1191-1245）、gRPC `select_pd_pair`（worker_selection.rs:188-268）
 
-- [ ] **D01** 1P + 1D normal（HTTP）→ `PlacementPlan::Pair { prefill, decode, prefill_policy, decode_policy }`
-- [ ] **D02** 1P + 1D normal（gRPC）→ 同上
-- [ ] **D03** **D2 跨 model 隔离 PD 路径**: m1 与 m2 各有 P/D，请求 m1 永远不混入 m2 worker
-- [ ] **D04** **D2 hash_ring 在 PD 路径**: PrefixHash 配置下，`hash_ring` 调用使用真实 model_id 而非 UNKNOWN_MODEL_ID（覆盖 pd_router.rs:1207 与 worker_selection.rs:236 的 bug）
-- [ ] **D05** 0 prefill + n decode → `Err(NoPrefillWorkers)`
-- [ ] **D06** n prefill + 0 decode → `Err(NoDecodeWorkers)`
-- [ ] **D07** **D4 行为变更证据（gRPC PD）**: 注入不同的 `prefill_policy`（RoundRobin）和 `decode_policy`（Random），验证两次 `select_worker` 调用分别走两个 policy 实例 —— 不再像今天那样用同一个 per-model policy（§11.1）
-- [ ] **D08** **D4 行为对齐（HTTP PD）**: 同 D07，验证 HTTP PD 行为不退化（HTTP 今天已是分离）
-- [ ] **D09** Prefill policy 返回 None → `Err(PolicyReturnedNone)`，且 decode policy 不被调用（短路）
-- [ ] **D10** Decode policy 返回 None → `Err(PolicyReturnedNone)`，且 prefill 已选定的事实在 trace 中可见（防止悄无声息）
-- [ ] **D11** `tokens=Some(&[..])` 同时传到 prefill_policy 和 decode_policy 的 SelectWorkerInfo
-- [ ] **D12** `text=Some("...")` 同样传到两个 policy
-- [ ] **D13** `headers=Some(&hm)` 同样传到两个 policy
-- [ ] **D14** Prefill worker 携带 `bootstrap_port=Some(8998)` 时 `PlacementPlan::Pair.prefill` 的 worker 引用保留该字段（adapter 层依赖）
+- [x] **D01** 1P + 1D normal（HTTP）→ `PlacementPlan::Pair { prefill, decode, prefill_policy, decode_policy }`
+- [x] **D02** 1P + 1D normal（gRPC）→ 同上
+- [x] **D03** **D2 跨 model 隔离 PD 路径**: m1 与 m2 各有 P/D，请求 m1 永远不混入 m2 worker
+- [x] **D04** **D2 hash_ring 在 PD 路径**: PrefixHash 配置下，`hash_ring` 调用使用真实 model_id 而非 UNKNOWN_MODEL_ID（覆盖 pd_router.rs:1207 与 worker_selection.rs:236 的 bug）
+- [x] **D05** 0 prefill + n decode → `Err(NoPrefillWorkers)`
+- [x] **D06** n prefill + 0 decode → `Err(NoDecodeWorkers)`
+- [x] **D07** **D4 行为变更证据（gRPC PD）**: 注入不同的 `prefill_policy`（RoundRobin）和 `decode_policy`（Random），验证两次 `select_worker` 调用分别走两个 policy 实例 —— 不再像今天那样用同一个 per-model policy（§11.1）
+- [x] **D08** **D4 行为对齐（HTTP PD）**: 同 D07，验证 HTTP PD 行为不退化（HTTP 今天已是分离）
+- [x] **D09** Prefill policy 返回 None → `Err(PolicyReturnedNone)`，且 decode policy 不被调用（短路）
+- [x] **D10** Decode policy 返回 None → `Err(PolicyReturnedNone)`，且 prefill 已选定的事实在 trace 中可见（防止悄无声息）
+- [x] **D11** `tokens=Some(&[..])` 同时传到 prefill_policy 和 decode_policy 的 SelectWorkerInfo
+- [x] **D12** `text=Some("...")` 同样传到两个 policy
+- [x] **D13** `headers=Some(&hm)` 同样传到两个 policy
+- [x] **D14** Prefill worker 携带 `bootstrap_port=Some(8998)` 时 `PlacementPlan::Pair.prefill` 的 worker 引用保留该字段（adapter 层依赖）
 
 ---
 
@@ -143,12 +143,12 @@
 
 > 覆盖：`core/placement/trace.rs`
 
-- [ ] **F01** trace.model_id 等于请求的 `model_id`（`Some / None` 都覆盖）
-- [ ] **F02** trace.candidate_count_before / after 反映过滤前后数量（健康 + 过滤 unhealthy 后变化）
-- [ ] **F03** trace.selected_urls：Single 模式 1 个；Pair 模式 2 个（prefill / decode 顺序固定）
-- [ ] **F04** Single 模式 trace.policy_name 等于实际调用的 policy name（如 `"round_robin"`）
-- [ ] **F05** Pair 模式 trace 同时含 prefill_policy_name 与 decode_policy_name（验证 §11.1 不再共用同一名称）
-- [ ] **F06** trace.hash_ring_key：当 `model_id=Some("m1")` 时为 `Some("m1")`；当 `model_id=None` 时为 `None`（不写 UNKNOWN_MODEL_ID）
+- [x] **F01** trace.model_id 等于请求的 `model_id`（`Some / None` 都覆盖）
+- [x] **F02** trace.candidate_count_before / after 反映过滤前后数量（健康 + 过滤 unhealthy 后变化）
+- [x] **F03** trace.selected_urls：Single 模式 1 个；Pair 模式 2 个（prefill / decode 顺序固定）
+- [x] **F04** Single 模式 trace.policy_name 等于实际调用的 policy name（如 `"round_robin"`）
+- [x] **F05** Pair 模式 trace 同时含 prefill_policy_name 与 decode_policy_name（验证 §11.1 不再共用同一名称）
+- [x] **F06** trace.hash_ring_key：当 `model_id=Some("m1")` 时为 `Some("m1")`；当 `model_id=None` 时为 `None`（不写 UNKNOWN_MODEL_ID）
 
 ---
 
@@ -156,15 +156,15 @@
 
 > 覆盖：`core/placement/types.rs::PlacementError`
 
-- [ ] **G01** `NoWorkers` 触发：registry 完全为空 + `model_id=None`
-- [ ] **G02** `NoAvailableWorkers` 触发：registry 有 worker 但全部 unhealthy
-- [ ] **G03** `NoPrefillWorkers` 触发：PD 路径，0 prefill + n decode
-- [ ] **G04** `NoDecodeWorkers` 触发：PD 路径，n prefill + 0 decode
-- [ ] **G05** `PolicyReturnedNone` 触发：mock policy 强制返回 None
-- [ ] **G06** `ModelNotFound { model_id }` 触发：`model_id=Some("m_x")` + registry 内无 m_x（按 §11.7 规则）
-- [ ] **G07** `NoAvailableWorkers` 在 PD 路径：prefill / decode 都存在但全部 unhealthy（验证不会被错分类成 NoPrefillWorkers / NoDecodeWorkers）
-- [ ] **G08** `AdapterError` 各 variant（BodyNotObject / BootstrapAddrMissing / EngineIdMissing）能被 router 层捕获并转 5xx Response
-- [ ] **G09** Error Display / Debug 包含 model_id / dp_rank / prefill_url 等关键字段（grep-able 到日志）
+- [x] **G01** `NoWorkers` 触发：registry 完全为空 + `model_id=None`
+- [x] **G02** `NoAvailableWorkers` 触发：registry 有 worker 但全部 unhealthy
+- [x] **G03** `NoPrefillWorkers` 触发：PD 路径，0 prefill + n decode
+- [x] **G04** `NoDecodeWorkers` 触发：PD 路径，n prefill + 0 decode
+- [x] **G05** `PolicyReturnedNone` 触发：mock policy 强制返回 None
+- [x] **G06** `ModelNotFound { model_id }` 触发：`model_id=Some("m_x")` + registry 内无 m_x（按 §11.7 规则）
+- [x] **G07** `NoAvailableWorkers` 在 PD 路径：prefill / decode 都存在但全部 unhealthy（验证不会被错分类成 NoPrefillWorkers / NoDecodeWorkers）
+- [x] **G08** `AdapterError` 各 variant（BodyNotObject / BootstrapAddrMissing / EngineIdMissing）能被 router 层捕获并转 5xx Response
+- [x] **G09** Error Display / Debug 包含 model_id / dp_rank / prefill_url 等关键字段（grep-able 到日志）
 
 ---
 

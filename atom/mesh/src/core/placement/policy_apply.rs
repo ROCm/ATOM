@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::types::{PlacementError, RequestDescriptor};
 use crate::core::{HashRing, Worker};
-use crate::policies::LoadBalancingPolicy;
+use crate::policies::{LoadBalancingPolicy, SelectWorkerInfo};
 
 pub async fn apply_policy(
     candidates: &[Arc<dyn Worker>],
@@ -10,6 +10,18 @@ pub async fn apply_policy(
     descriptor: &RequestDescriptor<'_>,
     hash_ring: Option<Arc<HashRing>>,
 ) -> Result<Arc<dyn Worker>, PlacementError> {
-    let _ = (candidates, policy, descriptor, hash_ring);
-    todo!()
+    if candidates.is_empty() {
+        return Err(PlacementError::NoAvailableWorkers);
+    }
+    let info = SelectWorkerInfo {
+        request_text: descriptor.text,
+        tokens: descriptor.tokens,
+        headers: descriptor.headers,
+        hash_ring,
+    };
+    let idx = policy
+        .select_worker(candidates, &info)
+        .await
+        .ok_or(PlacementError::PolicyReturnedNone)?;
+    Ok(candidates[idx].clone())
 }
