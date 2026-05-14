@@ -17,6 +17,7 @@ The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 ```bash
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \
@@ -31,8 +32,25 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --no-enable-prefix-caching
 ```
 
-**Important**: `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1` is required for Qwen3-Next because it uses a hybrid architecture with both linear attention (GatedDeltaNet) and full attention layers. This env var ensures full attention layers use vLLM's default implementation.
+### Qwen3-Next-80B-A3B-Instruct-FP8 MTP (TP=1, MI355X)
+```bash
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export ATOM_USE_CUSTOM_ALL_GATHER=0
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
+vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
+    --host localhost \
+    --port 8000 \
+    --tensor-parallel-size 1 \
+    --kv-cache-dtype fp8 \
+    --gpu_memory_utilization 0.9 \
+    --async-scheduling \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --max-model-len 16384 \
+    --max-num-batched-tokens 32768 \
+    --speculative-config '{"num_speculative_tokens":1, "method": "mtp"}' \
+    --no-enable-prefix-caching
+```
 ## Step 3: Performance Benchmark
 
 Users can use the default vllm bench commands for performance benchmarking.
@@ -70,9 +88,6 @@ lm_eval --model local-completions \
         --num_fewshot 3
 ```
 
-## Key Environment Variables
-
-- `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`: **Required** - disables ATOM attention plugin to use vLLM's implementation for full attention layers
 
 ## Architecture Notes
 
