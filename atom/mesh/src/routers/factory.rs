@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use super::{
     grpc::{pd_router::GrpcPDRouter, router::GrpcRouter},
-    http::{pd_router::PDRouter, router::Router},
+    http_pd_router::PDRouter,
+    http_router::Router,
     RouterTrait,
 };
 use crate::{
