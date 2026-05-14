@@ -72,7 +72,6 @@ async fn d02_grpc_1p1d_pair() {
             tokens: None,
             headers: None,
             stream: false,
-            return_logprob: false,
         })
         .await
         .unwrap();
@@ -186,7 +185,6 @@ async fn d07_grpc_pd_uses_separated_policies() {
             tokens: None,
             headers: None,
             stream: false,
-            return_logprob: false,
         })
         .await
         .unwrap();

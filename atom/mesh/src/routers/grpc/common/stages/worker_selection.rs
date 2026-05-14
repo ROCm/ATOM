@@ -57,7 +57,6 @@ impl PipelineStage for WorkerSelectionStage {
             tokens,
             headers: ctx.input.headers.as_ref(),
             stream: ctx.is_streaming(),
-            return_logprob: false,
         };
 
         match self.planner.plan(&descriptor).await {
