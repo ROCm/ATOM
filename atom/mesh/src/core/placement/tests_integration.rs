@@ -181,20 +181,200 @@ async fn h06_grpc_stage_planner_err_returns_service_unavailable() {
 
 #[tokio::test]
 async fn h07_http_pd_sglang_dual_dispatch_to_prefill_and_decode() {
-    todo!()
+    use std::sync::Arc;
+    use serde_json::json;
+    use crate::core::placement::backend::sglang::SglangAdapter;
+    use crate::core::placement::backend::BackendAdapter;
+    use crate::core::placement::planner::DefaultPlanner;
+    use crate::core::placement::traits::PdPlanner;
+    use crate::core::placement::types::{PlacementPlan, Protocol, RequestDescriptor};
+
+    let prefill = make_prefill_http("http://prefill-1:8000", "m", Some(8998));
+    let decode = make_decode_http("http://decode-1:8000", "m");
+    let src = MockWorkerSource::new()
+        .add_worker(prefill.clone())
+        .add_worker(decode.clone());
+    let policies = MockPolicySource::new();
+    let planner = DefaultPlanner::new(Arc::new(src), Arc::new(policies));
+
+    let descriptor = RequestDescriptor {
+        model_id: Some("m"),
+        protocol: Some(Protocol::Http),
+        ..Default::default()
+    };
+    let plan = planner.plan(&descriptor).await.expect("plan");
+    let (p, d) = match plan {
+        PlacementPlan::Pair { prefill, decode, .. } => (prefill, decode),
+        _ => panic!("expected Pair"),
+    };
+    assert_eq!(p.url(), "http://prefill-1:8000");
+    assert_eq!(d.url(), "http://decode-1:8000");
+
+    let adapter = SglangAdapter;
+    let ctx = adapter.prepare_pair(p.as_ref(), d.as_ref()).expect("prepare");
+    let mut prefill_body = json!({"prompt": "hello"});
+    let mut decode_body = prefill_body.clone();
+    adapter
+        .inject_prefill_fields(&mut prefill_body, &ctx)
+        .unwrap();
+    adapter
+        .inject_decode_fields(&mut decode_body, &ctx)
+        .unwrap();
+    assert_eq!(prefill_body["bootstrap_host"], json!("prefill-1"));
+    assert_eq!(prefill_body["bootstrap_port"], json!(8998));
+    assert!(prefill_body["bootstrap_room"].is_u64());
+    assert_eq!(decode_body, json!({"prompt": "hello"}));
 }
 
 #[tokio::test]
 async fn h08_http_pd_vllm_pair_uses_shared_transfer_id() {
-    todo!()
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use serde_json::json;
+    use crate::core::placement::backend::vllm::{VllmAdapter, VllmPrefillInfo};
+    use crate::core::placement::backend::BackendAdapter;
+    use crate::core::placement::planner::DefaultPlanner;
+    use crate::core::placement::traits::PdPlanner;
+    use crate::core::placement::types::{PlacementPlan, Protocol, RequestDescriptor};
+
+    let prefill_url = "http://prefill-1:8000";
+    let prefill = make_prefill_http(prefill_url, "m", None);
+    let decode = make_decode_http("http://decode-1:8000", "m");
+    let src = MockWorkerSource::new()
+        .add_worker(prefill.clone())
+        .add_worker(decode.clone());
+    let policies = MockPolicySource::new();
+    let planner = DefaultPlanner::new(Arc::new(src), Arc::new(policies));
+
+    let descriptor = RequestDescriptor {
+        model_id: Some("m"),
+        protocol: Some(Protocol::Http),
+        ..Default::default()
+    };
+    let plan = planner.plan(&descriptor).await.expect("plan");
+    let (p, d) = match plan {
+        PlacementPlan::Pair { prefill, decode, .. } => (prefill, decode),
+        _ => panic!("expected Pair"),
+    };
+
+    let mut bootstrap_addrs = HashMap::new();
+    bootstrap_addrs.insert(prefill_url.to_string(), "http://10.0.0.1:9000".to_string());
+    let mut engine_ids = HashMap::new();
+    let mut per_rank = HashMap::new();
+    per_rank.insert(0usize, "engine-xyz".to_string());
+    engine_ids.insert(prefill_url.to_string(), per_rank);
+    let info = Arc::new(VllmPrefillInfo {
+        bootstrap_addrs,
+        engine_ids,
+    });
+    let adapter = VllmAdapter::new(info);
+    let ctx = adapter.prepare_pair(p.as_ref(), d.as_ref()).expect("prepare");
+
+    let mut prefill_body = json!({"prompt": "hi"});
+    let mut decode_body = prefill_body.clone();
+    adapter
+        .inject_prefill_fields(&mut prefill_body, &ctx)
+        .unwrap();
+    adapter
+        .inject_decode_fields(&mut decode_body, &ctx)
+        .unwrap();
+
+    let prefill_kv = &prefill_body["kv_transfer_params"];
+    let decode_kv = &decode_body["kv_transfer_params"];
+    assert_eq!(prefill_kv["do_remote_decode"], json!(true));
+    assert_eq!(prefill_kv["do_remote_prefill"], json!(false));
+    assert_eq!(decode_kv["do_remote_decode"], json!(false));
+    assert_eq!(decode_kv["do_remote_prefill"], json!(true));
+    assert_eq!(decode_kv["remote_engine_id"], json!("engine-xyz"));
+    let pid = prefill_kv["transfer_id"].as_str().unwrap();
+    let did = decode_kv["transfer_id"].as_str().unwrap();
+    assert_eq!(pid, did);
 }
 
 #[tokio::test]
 async fn h09_http_pd_sglang_batch_writes_length_n_arrays() {
-    todo!()
+    use std::sync::Arc;
+    use serde_json::json;
+    use crate::core::placement::backend::sglang::SglangAdapter;
+    use crate::core::placement::backend::BackendAdapter;
+    use crate::core::placement::planner::DefaultPlanner;
+    use crate::core::placement::traits::PdPlanner;
+    use crate::core::placement::types::{PlacementPlan, Protocol, RequestDescriptor};
+
+    let prefill = make_prefill_http("http://prefill-1:8000", "m", Some(8998));
+    let decode = make_decode_http("http://decode-1:8000", "m");
+    let src = MockWorkerSource::new()
+        .add_worker(prefill)
+        .add_worker(decode);
+    let policies = MockPolicySource::new();
+    let planner = DefaultPlanner::new(Arc::new(src), Arc::new(policies));
+
+    let descriptor = RequestDescriptor {
+        model_id: Some("m"),
+        protocol: Some(Protocol::Http),
+        ..Default::default()
+    };
+    let (p, d) = match planner.plan(&descriptor).await.expect("plan") {
+        PlacementPlan::Pair { prefill, decode, .. } => (prefill, decode),
+        _ => panic!("expected Pair"),
+    };
+
+    let adapter = SglangAdapter;
+    let ctx = adapter.prepare_pair(p.as_ref(), d.as_ref()).unwrap();
+    let mut body = json!({"prompt": ["a", "b", "c"]});
+    adapter
+        .inject_batch_prefill_fields(&mut body, &ctx, 3)
+        .unwrap();
+    assert_eq!(body["bootstrap_host"].as_array().unwrap().len(), 3);
+    assert_eq!(body["bootstrap_port"].as_array().unwrap().len(), 3);
+    assert_eq!(body["bootstrap_room"].as_array().unwrap().len(), 3);
 }
 
 #[tokio::test]
 async fn h10_http_pd_retry_preserves_text_headers_tokens() {
-    todo!()
+    use std::sync::Arc;
+    use http::HeaderMap;
+    use crate::core::placement::planner::DefaultPlanner;
+    use crate::core::placement::traits::PdPlanner;
+    use crate::core::placement::types::{PlacementPlan, Protocol, RequestDescriptor};
+
+    let prefill = make_prefill_http("http://prefill-1:8000", "m", Some(8998));
+    let decode = make_decode_http("http://decode-1:8000", "m");
+    let src = MockWorkerSource::new()
+        .add_worker(prefill)
+        .add_worker(decode);
+    let recording = Arc::new(RecordingPolicy::round_robin());
+    let policies = MockPolicySource::new()
+        .with_prefill(recording.clone())
+        .with_decode(recording.clone());
+    let planner = DefaultPlanner::new(Arc::new(src), Arc::new(policies));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-trace", "abc".parse().unwrap());
+    let tokens = vec![10u32, 20, 30];
+    let descriptor = RequestDescriptor {
+        model_id: Some("m"),
+        protocol: Some(Protocol::Http),
+        text: Some("hello"),
+        tokens: Some(&tokens),
+        headers: Some(&headers),
+        stream: false,
+        return_logprob: false,
+    };
+
+    for _ in 0..2 {
+        let plan = planner.plan(&descriptor).await.expect("plan");
+        assert!(matches!(plan, PlacementPlan::Pair { .. }));
+    }
+
+    let calls = recording.calls();
+    assert_eq!(calls.len(), 4);
+    for call in &calls {
+        assert_eq!(call.request_text.as_deref(), Some("hello"));
+        assert_eq!(call.tokens.as_deref(), Some(&[10u32, 20, 30][..]));
+        assert_eq!(
+            call.headers.as_ref().and_then(|h| h.get("x-trace")),
+            Some(&"abc".parse().unwrap())
+        );
+    }
 }

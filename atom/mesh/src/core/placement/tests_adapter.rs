@@ -241,6 +241,27 @@ fn vllm_inject_decode_on_non_object_returns_body_not_object() {
 }
 
 #[test]
+fn e13_vllm_correlation_id_matches_transfer_id() {
+    let (adapter, ctx) = vllm_pair_for("http://p:8000", 0);
+    let mut body = json!({});
+    adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
+    let body_xfer = body["kv_transfer_params"]["transfer_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(adapter.correlation_id(&ctx), Some(body_xfer));
+}
+
+#[test]
+fn e14_sglang_correlation_id_matches_bootstrap_room() {
+    let (adapter, ctx) = sglang_pair();
+    let mut body = json!({});
+    adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
+    let body_room = body["bootstrap_room"].as_u64().unwrap().to_string();
+    assert_eq!(adapter.correlation_id(&ctx), Some(body_room));
+}
+
+#[test]
 fn e12_vllm_prepare_pair_missing_engine_id() {
     let prefill = make_prefill_http("http://p:8000", "m", None);
     let decode = make_decode_http("http://decode:8000", "m");
