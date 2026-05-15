@@ -14,7 +14,7 @@ fn make_planner(src: MockWorkerSource, policies: MockPolicySource) -> DefaultPla
 }
 
 #[tokio::test]
-async fn g01_no_workers_triggered_by_empty_registry_and_no_model() {
+async fn test_no_workers_triggered_by_empty_registry_and_no_model() {
     let planner = make_planner(MockWorkerSource::new(), MockPolicySource::new());
     let err = planner
         .plan(&make_descriptor(None, None, None, None))
@@ -24,7 +24,7 @@ async fn g01_no_workers_triggered_by_empty_registry_and_no_model() {
 }
 
 #[tokio::test]
-async fn g02_no_available_workers_triggered_by_all_unhealthy() {
+async fn test_no_available_workers_triggered_by_all_unhealthy() {
     let w = make_regular_http("http://w:8000", "m");
     w.set_healthy(false);
     let planner = make_planner(
@@ -39,7 +39,7 @@ async fn g02_no_available_workers_triggered_by_all_unhealthy() {
 }
 
 #[tokio::test]
-async fn g03_no_prefill_workers_triggered_in_pd_path() {
+async fn test_no_prefill_workers_triggered_in_pd_path() {
     let src = MockWorkerSource::new().add_worker(make_decode_http("http://d:8000", "m"));
     let planner = make_planner(src, MockPolicySource::new());
     let err = planner
@@ -50,7 +50,7 @@ async fn g03_no_prefill_workers_triggered_in_pd_path() {
 }
 
 #[tokio::test]
-async fn g04_no_decode_workers_triggered_in_pd_path() {
+async fn test_no_decode_workers_triggered_in_pd_path() {
     let src =
         MockWorkerSource::new().add_worker(make_prefill_http("http://p:8000", "m", Some(8998)));
     let planner = make_planner(src, MockPolicySource::new());
@@ -62,7 +62,7 @@ async fn g04_no_decode_workers_triggered_in_pd_path() {
 }
 
 #[tokio::test]
-async fn g05_policy_returned_none_triggered_by_always_none_policy() {
+async fn test_policy_returned_none_triggered_by_always_none_policy() {
     let policies = MockPolicySource::new()
         .with_regular(Arc::new(AlwaysNonePolicy) as Arc<dyn LoadBalancingPolicy>);
     let planner = make_planner(
@@ -77,7 +77,7 @@ async fn g05_policy_returned_none_triggered_by_always_none_policy() {
 }
 
 #[tokio::test]
-async fn g06_model_not_found_triggered_when_model_id_unknown() {
+async fn test_model_not_found_triggered_when_model_id_unknown() {
     let src =
         MockWorkerSource::new().add_worker(make_regular_http("http://w:8000", "m_present"));
     let planner = make_planner(src, MockPolicySource::new());
@@ -94,7 +94,7 @@ async fn g06_model_not_found_triggered_when_model_id_unknown() {
 }
 
 #[tokio::test]
-async fn g07_no_available_workers_in_pd_path_when_all_unhealthy() {
+async fn test_no_available_workers_in_pd_path_when_all_unhealthy() {
     let p = make_prefill_http("http://p:8000", "m", Some(8998));
     let d = make_decode_http("http://d:8000", "m");
     p.set_healthy(false);
@@ -110,7 +110,7 @@ async fn g07_no_available_workers_in_pd_path_when_all_unhealthy() {
 }
 
 #[test]
-fn g08_adapter_errors_map_to_5xx_response() {
+fn test_adapter_errors_map_to_5xx_response() {
     let body_not_object = AdapterError::BodyNotObject;
     let bootstrap_missing = AdapterError::BootstrapAddrMissing {
         prefill_url: "http://p:8000".to_string(),
@@ -128,7 +128,7 @@ fn g08_adapter_errors_map_to_5xx_response() {
 }
 
 #[test]
-fn g09_error_display_includes_key_fields() {
+fn test_error_display_includes_key_fields() {
     let model_not_found = PlacementError::ModelNotFound {
         model_id: "m_xyz".to_string(),
     };

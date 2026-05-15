@@ -43,7 +43,7 @@ fn one_p_one_d_grpc(model: &str) -> MockWorkerSource {
 }
 
 #[tokio::test]
-async fn d01_http_1p1d_pair() {
+async fn test_http_1p1d_pair() {
     let planner = make_planner(one_p_one_d_http("m"), MockPolicySource::new());
     let plan = planner
         .plan(&make_descriptor(Some("m"), None, None, None))
@@ -62,7 +62,7 @@ async fn d01_http_1p1d_pair() {
 }
 
 #[tokio::test]
-async fn d02_grpc_1p1d_pair() {
+async fn test_grpc_1p1d_pair() {
     let planner = make_planner(one_p_one_d_grpc("m"), MockPolicySource::new());
     let plan = planner
         .plan(&RequestDescriptor {
@@ -88,7 +88,7 @@ async fn d02_grpc_1p1d_pair() {
 }
 
 #[tokio::test]
-async fn d03_pd_cross_model_isolation() {
+async fn test_pd_cross_model_isolation() {
     let src = MockWorkerSource::new()
         .add_worker(make_prefill_http("http://m1-p:8000", "m1", Some(8998)))
         .add_worker(make_decode_http("http://m1-d:8000", "m1"))
@@ -114,7 +114,7 @@ async fn d03_pd_cross_model_isolation() {
 }
 
 #[tokio::test]
-async fn d04_pd_hash_ring_keyed_by_real_model_id() {
+async fn test_pd_hash_ring_keyed_by_real_model_id() {
     let src = MockWorkerSource::new()
         .add_worker(make_prefill_http("http://m1-p:8000", "m1", Some(8998)))
         .add_worker(make_decode_http("http://m1-d:8000", "m1"));
@@ -140,7 +140,7 @@ async fn d04_pd_hash_ring_keyed_by_real_model_id() {
 }
 
 #[tokio::test]
-async fn d05_zero_prefill_returns_no_prefill_workers() {
+async fn test_zero_prefill_returns_no_prefill_workers() {
     let src = MockWorkerSource::new().add_worker(make_decode_http("http://d:8000", "m"));
     let planner = make_planner(src, MockPolicySource::new());
 
@@ -152,7 +152,7 @@ async fn d05_zero_prefill_returns_no_prefill_workers() {
 }
 
 #[tokio::test]
-async fn d06_zero_decode_returns_no_decode_workers() {
+async fn test_zero_decode_returns_no_decode_workers() {
     let src =
         MockWorkerSource::new().add_worker(make_prefill_http("http://p:8000", "m", Some(8998)));
     let planner = make_planner(src, MockPolicySource::new());
@@ -165,7 +165,7 @@ async fn d06_zero_decode_returns_no_decode_workers() {
 }
 
 #[tokio::test]
-async fn d07_grpc_pd_uses_separated_policies() {
+async fn test_grpc_pd_uses_separated_policies() {
     let prefill_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new())));
     let decode_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RandomPolicy::new())));
 
@@ -194,7 +194,7 @@ async fn d07_grpc_pd_uses_separated_policies() {
 }
 
 #[tokio::test]
-async fn d08_http_pd_uses_separated_policies() {
+async fn test_http_pd_uses_separated_policies() {
     let prefill_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new())));
     let decode_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RandomPolicy::new())));
 
@@ -216,7 +216,7 @@ async fn d08_http_pd_uses_separated_policies() {
 }
 
 #[tokio::test]
-async fn d09_prefill_none_short_circuits_decode() {
+async fn test_prefill_none_short_circuits_decode() {
     let decode_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new())));
     let decode_calls = decode_recorder.calls.clone();
 
@@ -239,7 +239,7 @@ async fn d09_prefill_none_short_circuits_decode() {
 }
 
 #[tokio::test]
-async fn d10_decode_none_returns_policy_returned_none_with_prefill_in_trace() {
+async fn test_decode_none_returns_policy_returned_none_with_prefill_in_trace() {
     let prefill_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new())));
     let prefill_calls = prefill_recorder.calls.clone();
 
@@ -262,7 +262,7 @@ async fn d10_decode_none_returns_policy_returned_none_with_prefill_in_trace() {
 }
 
 #[tokio::test]
-async fn d11_tokens_pass_to_both_pd_policies() {
+async fn test_tokens_pass_to_both_pd_policies() {
     let prefill_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new())));
     let decode_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new())));
     let prefill_calls = prefill_recorder.calls.clone();
@@ -290,7 +290,7 @@ async fn d11_tokens_pass_to_both_pd_policies() {
 }
 
 #[tokio::test]
-async fn d12_text_passes_to_both_pd_policies() {
+async fn test_text_passes_to_both_pd_policies() {
     let prefill_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new())));
     let decode_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new())));
     let prefill_calls = prefill_recorder.calls.clone();
@@ -317,7 +317,7 @@ async fn d12_text_passes_to_both_pd_policies() {
 }
 
 #[tokio::test]
-async fn d13_headers_pass_to_both_pd_policies() {
+async fn test_headers_pass_to_both_pd_policies() {
     let prefill_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new())));
     let decode_recorder = Arc::new(RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new())));
     let prefill_calls = prefill_recorder.calls.clone();
@@ -342,7 +342,7 @@ async fn d13_headers_pass_to_both_pd_policies() {
 }
 
 #[tokio::test]
-async fn d14_pair_preserves_prefill_bootstrap_port() {
+async fn test_pair_preserves_prefill_bootstrap_port() {
     let planner = make_planner(one_p_one_d_http("m"), MockPolicySource::new());
     let plan = planner
         .plan(&make_descriptor(Some("m"), None, None, None))

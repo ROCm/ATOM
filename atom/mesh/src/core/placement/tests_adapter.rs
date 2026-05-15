@@ -20,7 +20,7 @@ fn sglang_pair() -> (SglangAdapter, super::backend::PairCtx) {
 }
 
 #[test]
-fn e01_sglang_inject_prefill_writes_three_keys() {
+fn test_sglang_inject_prefill_writes_three_keys() {
     let (adapter, ctx) = sglang_pair();
     let mut body = json!({"prompt": "hi"});
     adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
@@ -32,7 +32,7 @@ fn e01_sglang_inject_prefill_writes_three_keys() {
 }
 
 #[test]
-fn e02_sglang_inject_prefill_port_none_writes_null() {
+fn test_sglang_inject_prefill_port_none_writes_null() {
     let prefill = make_prefill_http("http://prefill-2:8000", "m", None);
     let decode = make_decode_http("http://decode-2:8000", "m");
     let adapter = SglangAdapter;
@@ -46,7 +46,7 @@ fn e02_sglang_inject_prefill_port_none_writes_null() {
 }
 
 #[test]
-fn e03_sglang_inject_decode_is_noop() {
+fn test_sglang_inject_decode_is_noop() {
     let (adapter, ctx) = sglang_pair();
     let mut body = json!({"prompt": "hi"});
     let before = body.clone();
@@ -55,7 +55,7 @@ fn e03_sglang_inject_decode_is_noop() {
 }
 
 #[test]
-fn e04_sglang_inject_batch_writes_three_arrays_of_size_n() {
+fn test_sglang_inject_batch_writes_three_arrays_of_size_n() {
     let (adapter, ctx) = sglang_pair();
     let mut body = json!({});
     adapter
@@ -74,7 +74,7 @@ fn e04_sglang_inject_batch_writes_three_arrays_of_size_n() {
 }
 
 #[test]
-fn e05_sglang_inject_batch_room_ids_are_distinct() {
+fn test_sglang_inject_batch_room_ids_are_distinct() {
     let (adapter, ctx) = sglang_pair();
     let mut body = json!({});
     adapter
@@ -91,7 +91,7 @@ fn e05_sglang_inject_batch_room_ids_are_distinct() {
 }
 
 #[test]
-fn e06_sglang_inject_on_non_object_returns_body_not_object() {
+fn test_sglang_inject_on_non_object_returns_body_not_object() {
     let (adapter, ctx) = sglang_pair();
     let mut body = json!([1, 2, 3]);
     let before = body.clone();
@@ -133,7 +133,7 @@ fn vllm_pair_for(
 }
 
 #[test]
-fn e07_vllm_inject_prefill_kv_and_force_prefill_rewrites() {
+fn test_vllm_inject_prefill_kv_and_force_prefill_rewrites() {
     let (adapter, ctx) = vllm_pair_for("http://p:8000", 0);
     let mut body = json!({
         "prompt": "hi",
@@ -156,7 +156,7 @@ fn e07_vllm_inject_prefill_kv_and_force_prefill_rewrites() {
 }
 
 #[test]
-fn e08_vllm_inject_decode_lookups_and_shared_transfer_id() {
+fn test_vllm_inject_decode_lookups_and_shared_transfer_id() {
     let (adapter, ctx) = vllm_pair_for("http://p:8000", 0);
     let mut prefill_body = json!({});
     adapter
@@ -180,7 +180,7 @@ fn e08_vllm_inject_decode_lookups_and_shared_transfer_id() {
 }
 
 #[test]
-fn e09_vllm_force_prefill_max_completion_tokens_only_overwrites() {
+fn test_vllm_force_prefill_max_completion_tokens_only_overwrites() {
     let (adapter, ctx) = vllm_pair_for("http://p:8000", 0);
     let mut body = json!({"prompt": "hi"});
     adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
@@ -191,7 +191,7 @@ fn e09_vllm_force_prefill_max_completion_tokens_only_overwrites() {
 }
 
 #[test]
-fn e10_vllm_force_prefill_removes_stream_options() {
+fn test_vllm_force_prefill_removes_stream_options() {
     let (adapter, ctx) = vllm_pair_for("http://p:8000", 0);
     let mut body = json!({
         "prompt": "hi",
@@ -205,7 +205,7 @@ fn e10_vllm_force_prefill_removes_stream_options() {
 }
 
 #[test]
-fn e11_vllm_prepare_pair_missing_bootstrap_addr() {
+fn test_vllm_prepare_pair_missing_bootstrap_addr() {
     let prefill = make_prefill_http("http://unknown:8000", "m", None);
     let decode = make_decode_http("http://decode:8000", "m");
     let adapter = VllmAdapter::new(vllm_info_with("http://other:8000", 0));
@@ -241,7 +241,7 @@ fn vllm_inject_decode_on_non_object_returns_body_not_object() {
 }
 
 #[test]
-fn e13_vllm_correlation_id_matches_transfer_id() {
+fn test_vllm_correlation_id_matches_transfer_id() {
     let (adapter, ctx) = vllm_pair_for("http://p:8000", 0);
     let mut body = json!({});
     adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
@@ -253,7 +253,7 @@ fn e13_vllm_correlation_id_matches_transfer_id() {
 }
 
 #[test]
-fn e14_sglang_correlation_id_matches_bootstrap_room() {
+fn test_sglang_correlation_id_matches_bootstrap_room() {
     let (adapter, ctx) = sglang_pair();
     let mut body = json!({});
     adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
@@ -262,7 +262,7 @@ fn e14_sglang_correlation_id_matches_bootstrap_room() {
 }
 
 #[test]
-fn e12_vllm_prepare_pair_missing_engine_id() {
+fn test_vllm_prepare_pair_missing_engine_id() {
     let prefill = make_prefill_http("http://p:8000", "m", None);
     let decode = make_decode_http("http://decode:8000", "m");
     let adapter = VllmAdapter::new(vllm_info_with("http://p:8000", 7));
