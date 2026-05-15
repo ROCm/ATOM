@@ -56,6 +56,18 @@
     "_baseline_note": "Using Qwen3-235B baseline as proxy; needs CI measurement for Qwen3.5 specific baseline"
   },
   {
+    "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4",
+    "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+    "extraArgs": "--tensor-parallel-size 4 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+    "runner": "linux-atom-mi35x-4",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.80,
+    "accuracy_baseline": 0.81,
+    "accuracy_baseline_model": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+    "_baseline_note": "Qwen3-Next-80B-A3B-Instruct-FP8 baseline with TP4 (no MTP) as proxy; needs CI measurement for MTP-specific baseline"
+  },
+  {
     "model_name": "Llama-3.1-8B-Instruct TP1",
     "model_path": "meta-llama/Llama-3.1-8B-Instruct",
     "extraArgs": "--tensor-parallel-size 1",
