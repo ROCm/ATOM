@@ -892,7 +892,7 @@ jobs:
                       "gpt-oss-120b TP1",
                   },
               }
-              # Beijing weekdays: Mon-Thu -> P0; Fri -> P1+P2; Sat-Sun -> C-ALL.
+              # Beijing weekdays: Mon-Thu -> P0; Fri -> P1+P2; Sat-Sun -> ALL.
               if beijing_weekday <= 3:
                   selected_group = "P0"
                   targets = group_targets[selected_group]
@@ -900,7 +900,7 @@ jobs:
                   selected_group = "P1+P2"
                   targets = group_targets["P1"] | group_targets["P2"]
               else:
-                  selected_group = "C-ALL"
+                  selected_group = "ALL"
                   targets = None
 
               if targets is None:
