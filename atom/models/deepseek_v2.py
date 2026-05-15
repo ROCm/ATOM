@@ -135,6 +135,8 @@ def _can_fuse_indexer_wk_weights_proj(
     quant_config: Optional[QuantizationConfig],
     indexer_prefixes: list[str],
 ) -> bool:
+    if not ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION:
+        return False
     if not hasattr(config, "index_topk"):
         return False
     if quant_config is None:
@@ -1296,6 +1298,10 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
                 "Incomplete FP8 indexer.wk load: both weight and weight_scale "
                 "are required before building wk_weights_proj."
             )
+        if not self._wk_loaded:
+            raise RuntimeError(
+                "Missing indexer.wk load before building wk_weights_proj."
+            )
         super().process_weights_after_loading()
 
 
@@ -1412,8 +1418,6 @@ class Indexer(nn.Module):
                 k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
             q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
-            q[..., : self.rope_dim] = q_pe
-            k[..., : self.rope_dim] = k_pe
 
             q = q.view(-1, self.head_dim)
             q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
@@ -1422,14 +1426,15 @@ class Indexer(nn.Module):
             weights = (weights.unsqueeze(-1) * q_scale * self._weights_scale).squeeze(
                 -1
             )
+            q_input = q_fp8
         else:
-            q_fp8 = q
+            q_input = q
 
         return self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
-            q_fp8,
+            q_input,
             k,
             weights,
             self.quant_block_size,
