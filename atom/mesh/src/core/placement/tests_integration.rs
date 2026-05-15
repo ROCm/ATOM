@@ -3,7 +3,7 @@
 use super::test_support::*;
 
 #[tokio::test]
-async fn h01_http_regular_planner_single_dispatches_to_worker_url() {
+async fn test_http_regular_planner_single_dispatches_to_worker_url() {
     use std::sync::Arc;
     use crate::core::placement::planner::DefaultPlanner;
     use crate::core::placement::traits::PdPlanner;
@@ -29,7 +29,7 @@ async fn h01_http_regular_planner_single_dispatches_to_worker_url() {
 }
 
 #[tokio::test]
-async fn h02_http_regular_no_workers_returns_503() {
+async fn test_http_regular_no_workers_returns_503() {
     use std::sync::Arc;
     use axum::body::to_bytes;
     use axum::http::StatusCode;
@@ -63,7 +63,7 @@ async fn h02_http_regular_no_workers_returns_503() {
 }
 
 #[tokio::test]
-async fn h03_http_regular_model_not_found_returns_503_with_model_name() {
+async fn test_http_regular_model_not_found_returns_503_with_model_name() {
     use std::sync::Arc;
     use axum::body::to_bytes;
     use axum::http::StatusCode;
@@ -102,7 +102,7 @@ async fn h03_http_regular_model_not_found_returns_503_with_model_name() {
 }
 
 #[tokio::test]
-async fn h04_grpc_stage_regular_writes_single_worker_selection() {
+async fn test_grpc_stage_regular_writes_single_worker_selection() {
     use crate::core::placement::types::PlacementPlan;
     use crate::routers::grpc::context::WorkerSelection;
     use crate::routers::grpc::common::stages::worker_selection::plan_to_worker_selection;
@@ -123,7 +123,7 @@ async fn h04_grpc_stage_regular_writes_single_worker_selection() {
 }
 
 #[tokio::test]
-async fn h05_grpc_stage_pd_writes_dual_worker_selection() {
+async fn test_grpc_stage_pd_writes_dual_worker_selection() {
     use crate::core::placement::types::PlacementPlan;
     use crate::routers::grpc::context::WorkerSelection;
     use crate::routers::grpc::common::stages::worker_selection::plan_to_worker_selection;
@@ -148,7 +148,7 @@ async fn h05_grpc_stage_pd_writes_dual_worker_selection() {
 }
 
 #[tokio::test]
-async fn h06_grpc_stage_planner_err_returns_service_unavailable() {
+async fn test_grpc_stage_planner_err_returns_service_unavailable() {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use crate::core::placement::types::PlacementError;
@@ -169,7 +169,7 @@ async fn h06_grpc_stage_planner_err_returns_service_unavailable() {
 }
 
 #[tokio::test]
-async fn h07_http_pd_sglang_dual_dispatch_to_prefill_and_decode() {
+async fn test_http_pd_sglang_dual_dispatch_to_prefill_and_decode() {
     use std::sync::Arc;
     use serde_json::json;
     use crate::core::placement::backend::sglang::SglangAdapter;
@@ -216,7 +216,7 @@ async fn h07_http_pd_sglang_dual_dispatch_to_prefill_and_decode() {
 }
 
 #[tokio::test]
-async fn h08_http_pd_vllm_pair_uses_shared_transfer_id() {
+async fn test_http_pd_vllm_pair_uses_shared_transfer_id() {
     use std::collections::HashMap;
     use std::sync::Arc;
     use serde_json::json;
@@ -281,7 +281,7 @@ async fn h08_http_pd_vllm_pair_uses_shared_transfer_id() {
 }
 
 #[tokio::test]
-async fn h09_http_pd_sglang_batch_writes_length_n_arrays() {
+async fn test_http_pd_sglang_batch_writes_length_n_arrays() {
     use std::sync::Arc;
     use serde_json::json;
     use crate::core::placement::backend::sglang::SglangAdapter;
@@ -320,7 +320,7 @@ async fn h09_http_pd_sglang_batch_writes_length_n_arrays() {
 }
 
 #[tokio::test]
-async fn h10_http_pd_retry_preserves_text_headers_tokens() {
+async fn test_http_pd_retry_preserves_text_headers_tokens() {
     use std::sync::Arc;
     use http::HeaderMap;
     use crate::core::placement::planner::DefaultPlanner;
