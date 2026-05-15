@@ -451,10 +451,9 @@ COPY --from=build_mooncake /usr/local/lib/libre2* /usr/local/lib/
 COPY --from=build_mooncake /usr/local/bin/mooncake_master /usr/local/bin/
 COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake /opt/venv/lib/python3.12/site-packages/mooncake
 COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake-*.dist-info /opt/venv/lib/python3.12/site-packages/
-RUN apt-mark hold rccl && \
+RUN apt-mark hold rccl rccl-dev rocm-hip && \
     apt-get update && \
-    apt --fix-broken install -y && \
-    apt-get install -y --no-install-recommends librdmacm-dev libibverbs-dev rdma-core && \
+    apt-get install -y --no-install-recommends librdmacm-dev libibverbs-dev && \
     rm -rf /var/lib/apt/lists/* && \
     ldconfig && \
     python -c "from mooncake.engine import TransferEngine; print('Mooncake ROCm OK')"
