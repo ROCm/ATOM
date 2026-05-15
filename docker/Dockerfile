@@ -451,7 +451,9 @@ COPY --from=build_mooncake /usr/local/lib/libre2* /usr/local/lib/
 COPY --from=build_mooncake /usr/local/bin/mooncake_master /usr/local/bin/
 COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake /opt/venv/lib/python3.12/site-packages/mooncake
 COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake-*.dist-info /opt/venv/lib/python3.12/site-packages/
-RUN apt-get update && \
+RUN apt-mark hold rccl && \
+    apt-get update && \
+    apt --fix-broken install -y && \
     apt-get install -y --no-install-recommends librdmacm-dev libibverbs-dev rdma-core && \
     rm -rf /var/lib/apt/lists/* && \
     ldconfig && \
