@@ -135,8 +135,6 @@ def _can_fuse_indexer_wk_weights_proj(
     quant_config: Optional[QuantizationConfig],
     indexer_prefixes: list[str],
 ) -> bool:
-    if not ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION:
-        return False
     if not hasattr(config, "index_topk"):
         return False
     if quant_config is None:
