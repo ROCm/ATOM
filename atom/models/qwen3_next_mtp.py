@@ -38,10 +38,6 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             config.hidden_size,
         )
 
-        # Pass the layer's HF-style prefix so the quant_config exclude list
-        # (which contains "mtp.fc" in Qwen3-Next FP8 checkpoints) is honored;
-        # without it the lookup uses "" and falls back to the global FP8 spec,
-        # which makes fc FP8 even though the source weight is BF16.
         self.fc = ColumnParallelLinear(
             self.config.hidden_size * 2,
             self.config.hidden_size,
@@ -50,18 +46,15 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
 
-        # Use 0-indexed prefix (matches checkpoint's mtp.layers.0.* weight
-        # names and vLLM's reference impl), but keep layer_num as the
-        # absolute index so the attention layer gets a KV cache slot that
-        # doesn't collide with the target model's layers.
         self.layers = torch.nn.ModuleList(
             Qwen3NextDecoderLayer(
                 atom_config,
                 layer_type="full_attention",
                 prefix=f"{prefix}.layers.{idx}",
-                layer_num=self.mtp_start_layer_idx + idx,
+                layer_num=idx,
             )
-            for idx in range(self.num_mtp_layers)
+            for idx in range(
+                self.mtp_start_layer_idx, self.mtp_start_layer_idx + self.num_mtp_layers)
         )
 
         self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -279,7 +279,6 @@ class Qwen3NextAttention(nn.Module):
         atom_config,
         quant_config=None,
         prefix: str = "",
-        layer_num: int | None = None,
     ) -> None:
         super().__init__()
         if hasattr(atom_config.hf_config, "text_config"):
@@ -381,15 +380,6 @@ class Qwen3NextAttention(nn.Module):
                 k_norm=self.k_norm,
             )
 
-        # For MTP, the prefix is e.g. "mtp.layers.0.self_attn" so
-        # extract_layer_index(prefix) returns 0, which would collide with the
-        # target model's layer 0 KV cache slot. Allow callers (e.g.
-        # Qwen3NextDecoderLayer) to pass an explicit `layer_num` so MTP can
-        # use absolute indices (mtp_start_layer_idx + idx) and get its own
-        # KV cache slot.
-        attn_layer_num = (
-            layer_num if layer_num is not None else extract_layer_index(prefix)
-        )
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -398,7 +388,7 @@ class Qwen3NextAttention(nn.Module):
             kv_cache_dtype=atom_config.kv_cache_dtype,
             quant_config=quant_config,
             use_mla=False,
-            layer_num=attn_layer_num,
+            layer_num=extract_layer_index(prefix),
             config=atom_config,
             prefix=f"{prefix}",
             **fusion_kwargs,
@@ -495,16 +485,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
-        # Qwen3NextDecoderLayer instantiates this module without forwarding
-        # speculative_config, so fall back to atom_config.speculative_config
-        # (populated by both standalone ATOM and the vLLM plugin path's
-        # _generate_atom_config_from_vllm_config). Without a correct num_spec,
-        # get_state_shape() (used by vLLM's MambaBase.get_kv_cache_spec to
-        # size each layer's KV cache) sizes conv_state with only
-        # `kernel_size-1` token rows, but causal_conv1d_update writes
-        # `kernel_size-1 + num_spec` rows per slot during spec decode — the
-        # extra row spills into the page-adjacent ssm_state and corrupts
-        # layer 0's recurrent state.
+
         self.speculative_config = speculative_config or atom_config.speculative_config
         self.num_spec = (
             self.speculative_config.num_speculative_tokens
@@ -799,7 +780,6 @@ class Qwen3NextDecoderLayer(nn.Module):
                 atom_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
-                layer_num=layer_num,
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
