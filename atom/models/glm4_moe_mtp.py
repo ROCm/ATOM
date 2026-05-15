@@ -46,9 +46,7 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(
-            config.hidden_size * 2, config.hidden_size, bias=False
-        )
+        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=atom_config.quant_config
