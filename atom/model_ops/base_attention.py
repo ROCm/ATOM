@@ -48,7 +48,7 @@ def run_pa_fwd_asm(
     *,
     out: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
-    max_qlen: Optional[int] = None,
+    max_qlen: int = 1,
     high_precision: int = 0,
 ):
     """Run the AITER paged-attention ASM kernel with explicit metadata."""
