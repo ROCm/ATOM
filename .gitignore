@@ -52,4 +52,4 @@ __pycache__
 debug
 aiter_logs
 *.log
-.claude/plan/
+.claude/plans/
