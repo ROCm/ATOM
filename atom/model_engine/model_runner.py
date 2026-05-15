@@ -85,8 +85,8 @@ class tokenIDProcessor:
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         # Deferred output is disabled when running in P/D disaggregation mode
         # (kv_transfer_config is set), enabled otherwise.
-        # TODO: enable deferred output in P/D disaggregation mode
-        self.is_deferred_out = not bool(runner.config.kv_transfer_config)
+        # TODO: In P/D disaggregation mode, if have issue, we can disable it
+        self.is_deferred_out = True
 
         self.runner = runner
         device = runner.device
@@ -310,6 +310,15 @@ class tokenIDProcessor:
             if self.use_spec:
                 token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
 
+            self.input_ids.np[:total_tokens_decode] = token_ids
+            return self.input_ids.copy_to_gpu(total_tokens_decode)
+
+        # PD consumer first decode: no prior prefill step initialized
+        # prev_batch, so use scheduled_tokens directly for this step.
+        if self.prev_batch is None:
+            token_ids = scheduled_tokens[
+                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
+            ]
             self.input_ids.np[:total_tokens_decode] = token_ids
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
@@ -1879,6 +1888,7 @@ class ModelRunner:
         if connector is None:
             return KVConnectorOutput(finished_sending=[], finished_recving=[])
         done_sending, done_recving = connector.get_finished()
+
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
         )

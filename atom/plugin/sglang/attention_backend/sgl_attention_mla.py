@@ -601,6 +601,16 @@ def forward_sgl_plugin_mode_mla(
     **model_kwargs,
 ) -> torch.Tensor:
     prepared = forward_sgl_prepare(attn, positions, hidden_states, **model_kwargs)
+    from atom.utils.forward_context import get_forward_context
+
+    if get_forward_context().context.is_dummy_run:
+        base_hidden_states = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        )
+        dummy_output = base_hidden_states.new_empty(
+            (base_hidden_states.shape[0], base_hidden_states.shape[-1])
+        )
+        return dummy_output
     return forward_sgl_core(attn, prepared)
 
 
