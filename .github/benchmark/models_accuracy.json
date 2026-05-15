@@ -218,6 +218,18 @@
     "_baseline_note": "CI uses 3-shot, not comparable to HF 5-shot baseline"
   },
   {
+    "model_name": "Qwen3.5-397B-A17B",
+    "model_path": "Qwen/Qwen3.5-397B-A17B",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8",
+    "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.85,
+    "accuracy_baseline": 0.9538,
+    "accuracy_baseline_model": "Qwen3.5-397B-A17B-FP8",
+    "_baseline_note": "BF16 weight, TP8. Placeholder threshold/baseline copied from FP8 entry; refresh after first CI measurement."
+  },
+  {
     "model_name": "Qwen3.5-397B-A17B-FP8",
     "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
     "extraArgs": "--kv_cache_dtype fp8 -tp 4",

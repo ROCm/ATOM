@@ -485,7 +485,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
-        self.speculative_config = speculative_config
+
+        self.speculative_config = speculative_config or atom_config.speculative_config
         self.num_spec = (
             self.speculative_config.num_speculative_tokens
             if self.speculative_config
@@ -863,7 +864,6 @@ class Qwen3NextDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-
         if self.input_layernorm.use_fused_quant:
             if residual is None:
                 residual = hidden_states
@@ -1059,6 +1059,11 @@ class Qwen3NextForCausalLM(nn.Module):
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
+        # Expose embed_tokens at this level for vLLM MTP embedding sharing.
+        # vLLM's proposer accesses target_wrapper.model.embed_tokens, where
+        # target_wrapper.model = this class (Qwen3NextForCausalLM).
+        self.embed_tokens = self.model.embed_tokens
+
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -1132,6 +1137,7 @@ if is_vllm():
                 if vllm_config.speculative_config
                 else 0
             )
+
             return MambaStateShapeCalculator.gated_delta_net_state_shape(
                 tp_size,
                 hf_config.linear_num_key_heads,

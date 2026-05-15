@@ -283,6 +283,28 @@ def create_attn_metadata_builder_init_method(base_class):
         i64_kwargs = {"dtype": torch.int64, "device": device}
         self.positions = CpuGpuBuffer(max_num_batched_tokens, **i64_kwargs)
 
+        # Bump reorder_batch_threshold so multi-token spec-decode requests
+        # (MTP / EAGLE) are routed through the decode path. Mirrors vLLM's
+        # AttentionMetadataBuilder._init_reorder_batch_threshold(supports_spec_as_decode=True).
+        speculative_config = getattr(config, "speculative_config", None)
+        if (
+            getattr(self, "reorder_batch_threshold", None) is not None
+            and speculative_config is not None
+            and getattr(speculative_config, "num_speculative_tokens", None) is not None
+        ):
+            parallel_drafting = getattr(speculative_config, "parallel_drafting", False)
+            max_num_queries_for_spec = 1 + (2 if parallel_drafting else 1) * (
+                speculative_config.num_speculative_tokens
+            )
+            self.reorder_batch_threshold = max(
+                self.reorder_batch_threshold, max_num_queries_for_spec
+            )
+            logger.info(
+                "Spec decode: bumped reorder_batch_threshold to %d (num_spec_tokens=%d)",
+                self.reorder_batch_threshold,
+                speculative_config.num_speculative_tokens,
+            )
+
     return init_method_under_plugin_mode
 
 
@@ -300,7 +322,7 @@ def setup_attn_metadata_builder_base_class_and_attributes(class_dict: dict):
     needs_generic = True
 
     # align with vllm rocm aiter fa
-    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_BATCH
     class_dict["reorder_batch_threshold"] = 1
 
     return base_class, generic_base, needs_generic, class_dict
@@ -324,9 +346,12 @@ class vllmAttentionMetadataBuilderMethods:
 
         from vllm.v1.attention.backends.utils import split_decodes_prefills_and_extends
 
-        # here assume the decode num token is 1 per request
+        # decode_threshold tracks reorder_batch_threshold so MTP/EAGLE
+        # multi-token verification (query_len > 1) routes through decode.
+        decode_threshold = getattr(self, "reorder_batch_threshold", 1) or 1
         split_ret = split_decodes_prefills_and_extends(
-            common_attn_metadata=common_attn_metadata, decode_threshold=1
+            common_attn_metadata=common_attn_metadata,
+            decode_threshold=decode_threshold,
         )
 
         (
@@ -350,7 +375,15 @@ class vllmAttentionMetadataBuilderMethods:
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
+        # The spec-decode draft path invalidates it between proposal steps when
+        # num_speculative_tokens > 1.
+        # Fall back to seq_lens - query_lens computed on already-CPU tensors.
         num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
+        # In async spec-decode mode (auto-enabled for MTP/EAGLE), vLLM sets
+        # _num_computed_tokens_cpu to None because the GPU seq_lens is the
+        # authoritative source. Reconstruct from CPU tensors we already have.
+        if num_computed_tokens_cpu is None:
+            num_computed_tokens_cpu = seq_lens - query_lens_cpu
 
         prefill_max_query_len = decode_max_query_len = (
             common_attn_metadata.max_query_len
@@ -2447,7 +2480,14 @@ def unified_attention_with_output_base_for_plugin_mode(
         # ATOM needs to handle all of the buffer here
         # Positions for compiled unified_attention are provided via vLLM ForwardContext
         # (atom_positions) in ATOMModelBase.forward, not via this Python arg.
-        if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        #
+        # RoPE single-source-of-truth in plugin mode: when ATOM's
+        # PagedAttentionImpl is active, it applies RoPE inside
+        # rope_cache_plugin_mode. Applying RoPE here too would double apply
+        # it for any model hitting the "else" branch in rope_cache_plugin_mode when
+        # ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION is not set.
+        # if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        if current_atom_config.plugin_config.vllm_use_atom_attention:
             output = self.attn(q, k, v)
         else:
             # calculate the q and k with rotary embedding

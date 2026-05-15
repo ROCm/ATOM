@@ -67,6 +67,9 @@ on:
         description: "Release the OOT vLLM image (skips native image test/push). If both this and SGLang are checked, both will be released."
         type: boolean
         default: false
+      custom_tag:
+        description: "Custom tag for the native Docker image (e.g. 'my-feature'). Produces rocm/atom-dev:<custom_tag>. When set, branch-based tagging and 'latest' update are skipped."
+        default: ""
       only_release_sglang:
         description: "Release the SGLang+ATOM image (skips native image test/push). If both this and OOT are checked, both will be released."
         type: boolean
@@ -110,12 +113,14 @@ jobs:
       - name: Echo environment variables
         run: |
           echo "ATOM_REPO: ${{ inputs.atom_repo || env.ATOM_REPO }}"
+          echo "ATOM_BRANCH: ${{ github.ref_name }}"
           echo "ATOM_COMMIT: ${{ inputs.atom_commit || env.ATOM_COMMIT }}"
           echo "AITER_REPO: ${{ inputs.aiter_repo || env.AITER_REPO }}"
           echo "AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}"
           echo "RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}"
           echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
           echo "OOT_TAG_SUFFIX: ${{ inputs.oot_tag_suffix || '' }}"
+          echo "CUSTOM_TAG: ${{ inputs.custom_tag || '' }}"
           echo "SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}"
           echo "SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}"
           echo "SGLANG_VERSION: ${{ inputs.sglang_version || env.SGLANG_VERSION }}"
@@ -123,12 +128,19 @@ jobs:
       - name: Build Docker image
         timeout-minutes: 180
         run: |
+          ATOM_COMMIT="${{ inputs.atom_commit || env.ATOM_COMMIT }}"
+          if [ "${ATOM_COMMIT}" = "HEAD" ]; then
+            ATOM_CHECKOUT="${{ github.ref_name }}"
+          else
+            ATOM_CHECKOUT="${ATOM_COMMIT}"
+          fi
+          echo "ATOM checkout ref: ${ATOM_CHECKOUT} (branch: ${{ github.ref_name }})"
           DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
           --target atom_image \
           --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
           --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
-          --build-arg ATOM_COMMIT="${{ inputs.atom_commit || env.ATOM_COMMIT }}" \
+          --build-arg ATOM_COMMIT="${ATOM_CHECKOUT}" \
           --build-arg AITER_REPO="${{ inputs.aiter_repo || env.AITER_REPO }}" \
           --build-arg AITER_COMMIT="${{ inputs.aiter_commit || env.AITER_COMMIT }}" \
           --build-arg RCCL_REPO="${{ inputs.rccl_repo || env.RCCL_REPO }}" \
@@ -189,12 +201,32 @@ jobs:
       - name: Push Docker image
         if: ${{ success() && inputs.only_release_oot != true && inputs.only_release_sglang != true }}
         run: |
-          # Push both the versioned tag and update the 'latest' tag for the Docker image
-          TAG=nightly_$(date +%Y%m%d%H%M)
-          docker tag atom_release:ci rocm/atom-dev:latest
-          docker push rocm/atom-dev:latest
-          docker tag atom_release:ci rocm/atom-dev:${TAG}
-          docker push rocm/atom-dev:${TAG}
+          CUSTOM_TAG="${{ inputs.custom_tag || '' }}"
+          if [ -n "${CUSTOM_TAG}" ]; then
+            if [[ ! "${CUSTOM_TAG}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "Invalid custom_tag '${CUSTOM_TAG}'. Allowed characters: letters, numbers, '.', '_' and '-'."
+              exit 1
+            fi
+            docker tag atom_release:ci rocm/atom-dev:${CUSTOM_TAG}
+            docker push rocm/atom-dev:${CUSTOM_TAG}
+            echo "Custom tag: rocm/atom-dev:${CUSTOM_TAG}. Skipping latest update."
+          else
+            BRANCH="${{ github.ref_name }}"
+            DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+            TAG=nightly_$(date +%Y%m%d%H%M)
+            if [ "${BRANCH}" != "${DEFAULT_BRANCH}" ]; then
+              SAFE_BRANCH=$(echo "${BRANCH}" | sed 's/[^A-Za-z0-9._-]/-/g')
+              TAG="${TAG}-${SAFE_BRANCH}"
+              docker tag atom_release:ci rocm/atom-dev:${TAG}
+              docker push rocm/atom-dev:${TAG}
+              echo "Branch '${BRANCH}'; tag: rocm/atom-dev:${TAG}. Skipping latest update."
+            else
+              docker tag atom_release:ci rocm/atom-dev:latest
+              docker push rocm/atom-dev:latest
+              docker tag atom_release:ci rocm/atom-dev:${TAG}
+              docker push rocm/atom-dev:${TAG}
+            fi
+          fi
 
       - name: Build OOT Docker image
         if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
