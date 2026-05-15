@@ -7,10 +7,10 @@ concurrency:
 
 on:
   schedule:
-    # Daily 21:00 Beijing (13:00 UTC): Mon/Wed/Fri AWS P0; Tue/Thu/Sat AWS P1+META P0; Sun evening META P1 (see load-models weekday/hour logic).
-    - cron: '0 13 * * 0-6'
-    # Sun 10:00 Beijing (02:00 UTC): AWS P2 + OOB
-    - cron: '0 2 * * 0'
+    # Mon–Sat 21:00 Beijing (13:00 UTC): Mon/Wed/Fri AWS P0; Tue/Thu AWS P1+Meta P0; Sat AWS P2+OOB (see load-models).
+    - cron: '0 13 * * 1-6'
+    # Sat/Sun 10:00 Beijing (02:00 UTC): Sat AWS P1+Meta P0; Sun Meta P1
+    - cron: '0 2 * * 0,6'
   workflow_dispatch:
     inputs:
       benchmark_client:
@@ -914,22 +914,41 @@ jobs:
               beijing_weekday = beijing_dt.weekday()
               beijing_hour = beijing_dt.hour
 
-              # Beijing weekday: Mon=0 .. Sun=6.
-              # Mon/Wed/Fri 21:00: AWS P0. Tue/Thu/Sat 21:00: AWS P1 + META P0.
-              # Sun 10:00: AWS P2 + OOB. Sun 21:00: META P1.
-              if beijing_weekday == 6:
-                  if beijing_hour < 15:
+              # Beijing weekday: Mon=0 .. Sun=6. Hour buckets use 15:00 to split
+              # ~10:00 daytime vs ~21:00 evening scheduled runs.
+              # Mon/Wed/Fri evening: AWS P0. Tue/Thu evening: AWS P1 + Meta P0.
+              # Fri evening: AWS P0. Sat daytime (~10:00): AWS P1 + Meta P0.
+              # Sat evening (~21:00): AWS P2 + OOB. Sun daytime (~10:00): Meta P1.
+              is_daytime_slot = beijing_hour < 15
+
+              if beijing_weekday == 5:  # Saturday
+                  if is_daytime_slot:
+                      selected_group = "AWS-P1+META-P0"
+                      target_displays = AWS_P1 | META_P0
+                  else:
                       selected_group = "AWS-P2+OOB"
                       target_displays = AWS_P2 | OOB_DISPLAYS
-                  else:
+              elif beijing_weekday == 6:  # Sunday
+                  if is_daytime_slot:
                       selected_group = "META-P1"
                       target_displays = META_P1
-              elif beijing_weekday in (0, 2, 4):
-                  selected_group = "AWS-P0"
-                  target_displays = AWS_P0
-              elif beijing_weekday in (1, 3, 5):
-                  selected_group = "AWS-P1+META-P0"
-                  target_displays = AWS_P1 | META_P0
+                  else:
+                      selected_group = "SKIP"
+                      target_displays = set()
+              elif beijing_weekday in (0, 2, 4):  # Mon / Wed / Fri
+                  if is_daytime_slot:
+                      selected_group = "SKIP"
+                      target_displays = set()
+                  else:
+                      selected_group = "AWS-P0"
+                      target_displays = AWS_P0
+              elif beijing_weekday in (1, 3):  # Tue / Thu
+                  if is_daytime_slot:
+                      selected_group = "SKIP"
+                      target_displays = set()
+                  else:
+                      selected_group = "AWS-P1+META-P0"
+                      target_displays = AWS_P1 | META_P0
               else:
                   selected_group = "SKIP"
                   target_displays = set()
