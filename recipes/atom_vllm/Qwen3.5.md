@@ -72,9 +72,10 @@ vllm serve amd/Qwen3.5-397B-A17B-MXFP4 \
     --no-enable-prefix-caching
 ```
 
-**Important**: The following three environment variables are required for Qwen3.5:
+**Important**: The following environment variables are required for Qwen3.5:
 
 - `ATOM_USE_CUSTOM_ALL_GATHER=0`: Disables custom all-gather for compatibility with Qwen3.5 model architecture
+- `ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0`: Disables FP8 blockscale weight preshuffle
 - `AITER_QUICK_REDUCE_QUANTIZATION=INT4`: **Performance optimization** - enables INT4 quantization for quick reduce operations, which can significantly improve TTFT (Time To First Token) performance. **Note**: This optimization may introduce a risk of accuracy degradation. For accuracy-critical workloads, consider validating with your specific use case.
 
 ## Step 3: Performance Benchmark
@@ -136,6 +137,7 @@ Reference result (TP=4):
 ## Key Environment Variables
 
 - `ATOM_USE_CUSTOM_ALL_GATHER=0`: **Required** - disables custom all-gather for compatibility with Qwen3.5 model architecture
+- `ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0`: **Required** - disables FP8 blockscale weight preshuffle
 - `AITER_QUICK_REDUCE_QUANTIZATION=INT4`: **Performance optimization** - enables INT4 quantization for quick reduce operations
   - **Benefit**: Significantly improves TTFT (Time To First Token) performance by reducing communication overhead during tensor parallelism all-reduce operations
   - **Risk**: May cause slight accuracy degradation due to lower quantization precision
