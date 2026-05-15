@@ -868,6 +868,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         else:
             layer.register_parameter("w2_bias", None)
 
+        layer.w13_swizzle_layout = None
+        layer.w2_swizzle_layout = None
+
         if self.static_input_scales:
             w13_input_scale = atom_parameter(
                 torch.ones(num_experts, dtype=torch.float32)
@@ -907,7 +910,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             #from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             
-            w13_weight, w13_scale, w2_weight, w2_scale = _swizzle_mxfp4(
+            w13_weight, w13_scale, w13_swizzle_layout, w2_weight, w2_scale, w2_swizzle_layout = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
                 layer.w13_weight_scale,
                 layer.w2_weight.view(torch.uint8),
@@ -941,6 +944,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = w2_weight
             layer.w13_weight_scale = w13_scale
             layer.w2_weight_scale = w2_scale
+            layer.w13_swizzle_layout = w13_swizzle_layout
+            layer.w2_swizzle_layout = w2_swizzle_layout
             return
 
         # shuffle weight
@@ -1026,8 +1031,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 fused_routing_from_topk_triton,
             )
 
-            logger.warning("x")
-            logger.warning(x)
+            # logger.warning("x")
+            # logger.warning(x)
 
             # Check if the model needs custom routing that triton routing()
             # does not support (grouped topk, sigmoid scoring, bias correction).
@@ -1038,9 +1043,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or custom_routing_function is not None
             )
 
-            # logger.warning("layer weights in forward")
-            # logger.warning(layer.w13_weight)
-            # logger.warning(layer.w2_weight)
+            logger.warning("layer swizzle layouts")
+            logger.warning(layer.w13_swizzle_layout)
+            logger.warning(layer.w2_swizzle_layout)
 
             if needs_custom_routing:
                 # Use ATOM's full-featured select_experts for routing,
@@ -1090,6 +1095,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     activation=activation,
                     w13_scale=layer.w13_weight_scale,
                     w2_scale=layer.w2_weight_scale,
+                    w13_swizzle_layout=layer.w13_swizzle_layout,
+                    w2_swizzle_layout=layer.w2_swizzle_layout,
                     w1_bias=layer.w13_bias,
                     w2_bias=layer.w2_bias,
                     swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
@@ -1116,6 +1123,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 activation=activation,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                w13_swizzle_layout=layer.w13_swizzle_layout,
+                w2_swizzle_layout=layer.w2_swizzle_layout,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 w1_bias=layer.w13_bias,
@@ -2188,14 +2197,13 @@ class FusedMoE(torch.nn.Module):
 
         self.use_chunked = get_dp_group().world_size > 1
 
-        logger.warning("config in fusedmoe")
-        logger.warning(config)
+        # logger.warning("config in fusedmoe")
+        # logger.warning(config)
 
         # if config is not None
         #     and hasattr(config, "n_shared_experts")
         # TODO: implement more checks that this exists and won't error out for other models
         a_quant_dtype = config.quantization_config.get("global_quant_config", "").get("input_tensors", "").get("dtype", "")
-        
 
         moe = FusedMoEConfig(
             num_experts=self.global_num_experts,
@@ -3155,8 +3163,8 @@ class FusedMoE(torch.nn.Module):
             if _tbo:
                 tbo_switch_to_compute_sync()
 
-        logger.warning("completely fresh x")
-        logger.warning(hidden_states)
+        # logger.warning("completely fresh x")
+        # logger.warning(hidden_states)
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -3216,8 +3224,8 @@ class FusedMoE(torch.nn.Module):
             hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
             router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
 
-        logger.warning("completely fresh x")
-        logger.warning(hidden_states)
+        # logger.warning("completely fresh x")
+        # logger.warning(hidden_states)
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,

@@ -131,6 +131,8 @@ def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1
     # W2: (experts, N, K)
     # expected W1 for aiter triton matmul: (experts, N, K)
     # expected W2 for aiter triton matmul: (experts, K, N)
+    w1_triton_layout = w1.transpose(-2, -1)
+    w1_scale_triton_layout = w1_scale.transpose(-2, -1)
     w2_triton_layout = w2.transpose(-2, -1)
     w2_scale_triton_layout = w2_scale.transpose(-2, -1)
 
@@ -145,17 +147,27 @@ def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1
     # logger.warning(N_2)
     # logger.warning(K_2)
 
+    logger.warning(w1_scale_triton_layout)
+    logger.warning(w2_scale_triton_layout)
+
     # i think this is the problem area. quantizing is taking the atom padding into account
     # maybe????????????
     # i think the swizzle perhaps is messing things up
 
-    w1, w1_scale = quantize(w1, w_dtype)
-    w2_triton_layout, w2_scale_triton_layout = quantize(w2_triton_layout, w_dtype)
+    # w1, w1_scale = quantize(w1, w_dtype)
+    # w2_triton_layout, w2_scale_triton_layout = quantize(w2_triton_layout, w_dtype)
+
     # removed for now
-    w1_scale, _ = check_and_swizzle_scales(w1_scale, N_1, K_1 // TP)
-    w2_scale_triton_layout, _ = check_and_swizzle_scales(
-        w2_scale_triton_layout, K_2 // TP // 2, N_2
+    # double check the below inside the actual function to see whats up with the alignment of K and N
+    w1_scale_triton_layout, w1_swizzle_layout = check_and_swizzle_scales(w1_scale_triton_layout, N_1, K_1)
+    w2_scale_triton_layout, w2_swizzle_layout = check_and_swizzle_scales(
+        w2_scale_triton_layout, N_2, K_2
     )
+    logger.warning("scales after swizzle")
+    logger.warning(w1_scale_triton_layout)
+    logger.warning(w2_scale_triton_layout)
+    logger.warning(w1_scale_triton_layout.view(torch.uint8).flatten()[:64])
+    logger.warning(w2_scale_triton_layout.view(torch.uint8).flatten()[:64])
     # logger.warning("post quant shape")
     # logger.warning(w1.shape)
     # logger.warning(w1)
@@ -182,7 +194,107 @@ def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1
     #     wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
     # )
     # scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
-    return w1, w1_scale, w2_triton_layout, w2_scale_triton_layout# transferring triton layout for now
+    return w1_triton_layout, w1_scale_triton_layout, w1_swizzle_layout, w2_triton_layout, w2_scale_triton_layout, w2_swizzle_layout# transferring triton layout for now
+
+
+def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
+    """Build matmul_ogs routing data via the AITER fused-routing kernel.
+
+    Thin bridge over ``aiter.ops.triton.fused_routing_from_topk``: invokes
+    the single-CTA counting-sort kernel for small NK and packages the
+    resulting indices into the ``RoutingData`` / ``GatherIndx`` /
+    ``ScatterIndx`` structures consumed by
+    ``triton_kernels.matmul_ogs``. For ``NK = n_tokens * n_expts_act``
+    above the kernel's single-CTA budget (prefill-shaped inputs), falls
+    back to the multi-kernel ``routing_from_topk`` reference defined
+    below — that path does the per-row sort + global stable argsort in
+    plain torch and is correctness-stable at any NK.
+
+    Equivalence vs reference: the fused kernel skips the per-row sort,
+    so ``topk_indx`` / ``gate_indx`` differ at intra-expert ordering.
+    ``hist`` and the per-(token, expert, weight) bucket assignments
+    match exactly; ``matmul_ogs`` is commutative over per-expert slices
+    so the MoE output is unchanged (up to FP non-associativity).
+    """
+    if not has_triton_kernels():
+        return routing_from_topk(topk_weights, topk_ids, n_expts_tot)
+
+    n_tokens, n_expts_act = topk_weights.shape
+    n_gates_pad = n_tokens * n_expts_act
+
+    if n_gates_pad > 4096:
+        # Single-CTA design exceeded; fall back rather than degrading
+        # silently. Typically only hit during prefill.
+        return routing_from_topk(topk_weights, topk_ids, n_expts_tot)
+
+    hist, topk_indx, gate_indx, gate_scal = _aiter_fused_routing_from_topk(
+        topk_weights, topk_ids, n_expts_tot
+    )
+
+    # Package as the matmul_ogs routing data structures.
+    from triton_kernels.routing import (
+        RoutingData,
+        GatherIndx,
+        ScatterIndx,
+        compute_expt_data,
+    )
+
+    gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
+    scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
+    expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad)
+
+    routing_data = RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
+    return routing_data, gather_indx, scatter_indx
+
+
+def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
+    """Build matmul_ogs routing data via the AITER fused-routing kernel.
+
+    Thin bridge over ``aiter.ops.triton.fused_routing_from_topk``: invokes
+    the single-CTA counting-sort kernel for small NK and packages the
+    resulting indices into the ``RoutingData`` / ``GatherIndx`` /
+    ``ScatterIndx`` structures consumed by
+    ``triton_kernels.matmul_ogs``. For ``NK = n_tokens * n_expts_act``
+    above the kernel's single-CTA budget (prefill-shaped inputs), falls
+    back to the multi-kernel ``routing_from_topk`` reference defined
+    below — that path does the per-row sort + global stable argsort in
+    plain torch and is correctness-stable at any NK.
+
+    Equivalence vs reference: the fused kernel skips the per-row sort,
+    so ``topk_indx`` / ``gate_indx`` differ at intra-expert ordering.
+    ``hist`` and the per-(token, expert, weight) bucket assignments
+    match exactly; ``matmul_ogs`` is commutative over per-expert slices
+    so the MoE output is unchanged (up to FP non-associativity).
+    """
+    if not has_triton_kernels():
+        return routing_from_topk(topk_weights, topk_ids, n_expts_tot)
+
+    n_tokens, n_expts_act = topk_weights.shape
+    n_gates_pad = n_tokens * n_expts_act
+
+    if n_gates_pad > 4096:
+        # Single-CTA design exceeded; fall back rather than degrading
+        # silently. Typically only hit during prefill.
+        return routing_from_topk(topk_weights, topk_ids, n_expts_tot)
+
+    hist, topk_indx, gate_indx, gate_scal = _aiter_fused_routing_from_topk(
+        topk_weights, topk_ids, n_expts_tot
+    )
+
+    # Package as the matmul_ogs routing data structures.
+    from triton_kernels.routing import (
+        RoutingData,
+        GatherIndx,
+        ScatterIndx,
+        compute_expt_data,
+    )
+
+    gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
+    scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
+    expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad)
+
+    routing_data = RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
+    return routing_data, gather_indx, scatter_indx
 
 
 def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
@@ -313,6 +425,7 @@ def routing_from_topk(
     #     ScatterIndx,
     #     compute_expt_data,
     # )
+    logger.warning("routing from top_k")
     from aiter.ops.triton.moe.moe_routing.routing import (
         routing,
         RoutingData,
@@ -352,7 +465,8 @@ def routing_from_topk(
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
     expt_data = compute_expt_data_torch(hist, n_expts_tot, n_gates_pad, block_m)
 
-    routing_data = RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
+    # potential problem v
+    routing_data = RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
     return routing_data, topk_indx, gate_indx#gather_indx, scatter_indx
 
 
@@ -483,7 +597,7 @@ def triton_kernel_fused_experts(
     )
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
-    #gammas = routing_data.gate_scal if routing_data else None
+    gammas = routing_data.gate_scal if routing_data else None
 
     # On account of manual swiglu being required, HIP stream errors, and bench for triton having a 
     # static scale incorrect for given input states of about -3 - 3, we adjust static scale at 
@@ -509,19 +623,13 @@ def triton_kernel_fused_experts(
         if activation == ActivationType.Swiglu:
             # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
             x_q_dtype_base = x_q_dtype.split("_")[0]
-            logger.warning("split")
-            logger.warning(x_q_dtype_base)
             if (x_q_dtype_base == "fp8"):
                 from aiter.ops.triton.utils._triton.arch_info import get_arch
                 # If input type is fp8, input scales must be available
                 assert a13_scale is not None
                 assert a2_scale is not None
-                logger.warning(a13_scale)
-                logger.warning(a2_scale)
                 a13_scale = a13_scale.max().to(torch.float32)/448
                 a2_scale = a2_scale.max().to(torch.float32)/448
-                logger.warning(a13_scale)
-                logger.warning(a2_scale)
 
                 x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
 
@@ -531,20 +639,25 @@ def triton_kernel_fused_experts(
                 hidden_states = downcast_to_static_fp8(hidden_states, static_scale)
                 logger.warning("hidden states")
                 logger.warning(hidden_states)
-                raw_intermediate = moe_gemm_a8w4(
+                result = moe_gemm_a8w4(
                     hidden_states,
                     w1,
                     None,
                     w13_scale,
                     a13_scale,
-                    None,
+                    a2_scale,
                     w1_bias,
                     routing_data,
                     gather_indx=gather_indx,
-                    swizzle_mx_scale="CDNA4_SCALE", # TODO assuming it's not None for simplicity's sake for now but should be checked
-                    out_dtype=raw_intermediate.dtype,#x_dtype
-                    apply_swiglu=False,
+                    gammas=gammas if apply_router_weight_on_input else None,
+                    swizzle_mx_scale=w13_swizzle_layout,
+                    out_dtype=torch.float8_e4m3fn,
+                    apply_swiglu=True,
+                    alpha=1.702,          # gpt-oss
+                    limit=7.0,            # gpt-oss
+                    add_residual=True,    # gpt-oss `(up + 1)`
                 ) 
+                raw_intermediate = result
             else:
                 hidden_states, x_scale = mxfp4_quant(hidden_states)
                 raw_intermediate = moe_gemm_a4w4(
@@ -559,15 +672,26 @@ def triton_kernel_fused_experts(
                     gather_indx=gather_indx,
                     swizzle_mx_scale="CDNA4_SCALE", # ?
                     out_dtype=raw_intermediate.dtype,
-                    apply_swiglu=False,
+                    apply_swiglu=True,
                 )
 
             # Standard SiLU/SwiGLU activation: silu(gate) * up
             # needed for all quant versions
-            raw_2d = raw_intermediate.view(M * topk, N)
-            gate = raw_2d[:, :half_N]
-            up = raw_2d[:, half_N:]
-            intermediate_cache[0] = torch.nn.functional.silu(gate) * up
+            # raw_2d = raw_intermediate.view(M * topk, N)
+            # # logger.warning("raw 2d")
+            # # logger.warning(raw_2d) # no data loss
+            # # logger.warning(intermediate_cache.shape)
+            # gate = raw_2d[:, :half_N]
+            # up = raw_2d[:, half_N:]
+            # # logger.warning("issue with swiglu erasing intermediate cache")
+            # # logger.warning(gate) # no data loss
+            # # logger.warning(up) # no data loss
+            # # logger.warning(torch.nn.functional.silu(gate))
+            # intermediate_cache = torch.nn.functional.silu(gate) * up
+            # logger.warning(intermediate_cache) # no data loss but e+11 numbers
+
+            # apply gammas
+
 
             # matmul_ogs(
             #     intermediate_cache.view(M * topk, half_N),
@@ -581,55 +705,68 @@ def triton_kernel_fused_experts(
             # )
 
 
-    if (x_q_dtype_base == "fp8"):
-        # do not default to mxfp4
-        logger.warning("second stage")
-        from aiter.ops.triton.utils._triton.arch_info import get_arch
-        if (x_q_dtype_base == "fp8" or x_q_dtype_base == "mx8"):
-            # do not default to mxfp4
-            logger.warning("second stage")
-            from aiter.ops.triton.utils._triton.arch_info import get_arch
+            if (x_q_dtype_base == "fp8"):
+                # do not default to mxfp4
+                logger.warning("second stage")
+                from aiter.ops.triton.utils._triton.arch_info import get_arch
 
-            x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
+                    x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
 
-            if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
-                x_dtype = torch.float8_e4m3fnuz
+                    if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
+                        x_dtype = torch.float8_e4m3fnuz
 
-            interm_cache = downcast_to_static_fp8(intermediate_cache.view(M * topk, half_N), static_scale)
-            output_tensor = moe_gemm_a8w4(
-                interm_cache,
-                w2,
-                None,
-                w2_scale,
-                a2_scale,
-                None,
-                w2_bias,
-                routing_data,
-                scatter_indx=scatter_indx,
-                swizzle_mx_scale="CDNA4_SCALE", # simplicity
-            )
-        logger.warning("output")
-        logger.warning(output_tensor)
-    else:
-        interm_cache, x_scale = mxfp4_quant(intermediate_cache.view(M * topk, half_N))
-        output_tensor = moe_gemm_a4w4(
-            interm_cache, # intermediate_cache.view(M * topk, half_N)
-            w2, # w2
-            x_scale, # x scales
-            w2_scale, # w2 scale
-            None, # x static scale
-            None, # quant static scale
-            w2_bias, # bias
-            routing_data, # routing data
-            scatter_indx=scatter_indx,
-            swizzle_mx_scale="CDNA4_SCALE", # ?
-        )
+                # logger.warning("check intermediate cache is not all gone")
+                # logger.warning(intermediate_cache)
 
-            # logger.warning("output")
-            # logger.warning(output_tensor.shape)
-            # logger.warning(output_tensor.dtype)
-            # logger.warning(output_tensor)
-            # logger.warning(output_tensor.view(M, K))
+                # logger.warning("moving_scale")
+                # logger.warning(moving_scale)
+
+                # make an adjustment to moving scale to have it be useful for typical interm cache numbers
+                # moving_scale = moving_scale / moving_scale # reset to 1 -- new scalev for second pass
+                # #moving_scale = 
+
+                # logger.warning("moving_scale")
+                # logger.warning(moving_scale)
+
+                interm_cache = downcast_to_static_fp8(intermediate_cache.view(M * topk, half_N), a2_scale)
+                logger.warning("interm_cache")
+                logger.warning(interm_cache)
+                output_tensor = moe_gemm_a8w4(
+                    interm_cache,
+                    w2,
+                    None,
+                    w2_scale,
+                    a2_scale,
+                    None,
+                    w2_bias,
+                    routing_data,
+                    scatter_indx=scatter_indx,
+                    gammas=None if apply_router_weight_on_input else gammas,
+                    swizzle_mx_scale=w2_swizzle_layout, 
+                )
+                logger.warning("output")
+                logger.warning(output_tensor)
+                #logger.warning(output_tensor * static_scale)
+            else:
+                interm_cache, x_scale = mxfp4_quant(intermediate_cache.view(M * topk, half_N))
+                output_tensor = moe_gemm_a4w4(
+                    interm_cache, # intermediate_cache.view(M * topk, half_N)
+                    w2, # w2
+                    x_scale, # x scales
+                    w2_scale, # w2 scale
+                    None, # x static scale
+                    None, # quant static scale
+                    w2_bias, # bias
+                    routing_data, # routing data
+                    scatter_indx=scatter_indx,
+                    swizzle_mx_scale="CDNA4_SCALE", # ?
+                )
+
+                # logger.warning("output")
+                # logger.warning(output_tensor.shape)
+                # logger.warning(output_tensor.dtype)
+                # logger.warning(output_tensor)
+                # logger.warning(output_tensor.view(M, K))
 
         else:
             # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation
@@ -665,4 +802,6 @@ def triton_kernel_fused_experts(
             )
 
     output_tensor = output_tensor.view(M, K) 
+    logger.warning("final out")
+    logger.warning(output_tensor)
     return output_tensor
