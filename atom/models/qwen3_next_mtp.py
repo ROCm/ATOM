@@ -54,7 +54,8 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
                 layer_num=idx,
             )
             for idx in range(
-                self.mtp_start_layer_idx, self.mtp_start_layer_idx + self.num_mtp_layers)
+                self.mtp_start_layer_idx, self.mtp_start_layer_idx + self.num_mtp_layers
+            )
         )
 
         self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
