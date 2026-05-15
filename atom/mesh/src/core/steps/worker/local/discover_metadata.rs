@@ -12,6 +12,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::strip_protocol;
 use crate::{
+    config::BackendType,
     core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
     routers::grpc::client::GrpcClient,
 };
@@ -133,6 +134,47 @@ pub async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerI
     serde_json::from_value(json).map_err(|e| format!("Failed to parse server info: {}", e))
 }
 
+/// Get model id from OpenAI-compatible /v1/models endpoint.
+pub async fn get_openai_model_id(url: &str, api_key: Option<&str>) -> Result<String, String> {
+    let base_url = url.trim_end_matches('/');
+    let endpoint = format!("{}/v1/models", base_url);
+
+    let mut req = HTTP_CLIENT.get(&endpoint);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to {}: {}", endpoint, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Server returned status {} from {}",
+            response.status(),
+            endpoint
+        ));
+    }
+
+    let json: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response from {}: {}", endpoint, e))?;
+
+    json.get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|arr| {
+            arr.iter().find_map(|m| {
+                m.get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+        })
+        .ok_or_else(|| format!("No model id in /v1/models response from {}", endpoint))
+}
+
 /// Get model info from /model_info endpoint.
 pub async fn get_model_info(url: &str, api_key: Option<&str>) -> Result<ModelInfo, String> {
     let base_url = url.trim_end_matches('/');
@@ -214,6 +256,65 @@ async fn fetch_grpc_metadata(
     }
 }
 
+/// Discover HTTP metadata from an sglang backend via /server_info + /model_info.
+async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+
+    if let Ok(server_info) = get_server_info(url, api_key).await {
+        if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
+            labels.insert("model_path".to_string(), model_path);
+        }
+        if let Some(served_model_name) = server_info.served_model_name.filter(|s| !s.is_empty()) {
+            labels.insert("served_model_name".to_string(), served_model_name);
+        }
+        if let Some(tp_size) = server_info.tp_size {
+            labels.insert("tp_size".to_string(), tp_size.to_string());
+        }
+        if let Some(dp_size) = server_info.dp_size {
+            labels.insert("dp_size".to_string(), dp_size.to_string());
+        }
+        if let Some(load_balance_method) = server_info.load_balance_method {
+            labels.insert("load_balance_method".to_string(), load_balance_method);
+        }
+        if let Some(disaggregation_mode) = server_info.disaggregation_mode {
+            labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
+        }
+    }
+
+    if let Ok(model_info) = get_model_info(url, api_key).await {
+        if let Some(tokenizer_path) = model_info.tokenizer_path.filter(|s| !s.is_empty()) {
+            labels.insert("tokenizer_path".to_string(), tokenizer_path);
+        }
+        if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
+            labels.insert("model_type".to_string(), model_type);
+        }
+        if let Some(architectures) = model_info.architectures.filter(|a| !a.is_empty()) {
+            if let Ok(json_str) = serde_json::to_string(&architectures) {
+                labels.insert("architectures".to_string(), json_str);
+            }
+        }
+    }
+
+    labels
+}
+
+/// Discover HTTP metadata from an OpenAI-compatible backend (vLLM) via /v1/models.
+async fn discover_http_openai(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+
+    match get_openai_model_id(url, api_key).await {
+        Ok(id) if !id.is_empty() => {
+            labels.insert("model_path".to_string(), id);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("/v1/models failed for {}: {}", url, e);
+        }
+    }
+
+    labels
+}
+
 /// Step 2a: Discover metadata from worker.
 pub struct DiscoverMetadataStep;
 
@@ -236,52 +337,21 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
         let (discovered_labels, detected_runtime) = match connection_mode {
             ConnectionMode::Http => {
-                let mut labels = HashMap::new();
+                let backend = context
+                    .data
+                    .app_context
+                    .as_ref()
+                    .map(|ctx| ctx.router_config.backend)
+                    .unwrap_or_default();
 
-                // Fetch from /server_info for server-related metadata
-                if let Ok(server_info) =
-                    get_server_info(&config.url, config.api_key.as_deref()).await
-                {
-                    if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
-                        labels.insert("model_path".to_string(), model_path);
+                let labels = match backend {
+                    BackendType::Sglang => {
+                        discover_http_sglang(&config.url, config.api_key.as_deref()).await
                     }
-                    if let Some(served_model_name) =
-                        server_info.served_model_name.filter(|s| !s.is_empty())
-                    {
-                        labels.insert("served_model_name".to_string(), served_model_name);
+                    BackendType::Vllm => {
+                        discover_http_openai(&config.url, config.api_key.as_deref()).await
                     }
-                    if let Some(tp_size) = server_info.tp_size {
-                        labels.insert("tp_size".to_string(), tp_size.to_string());
-                    }
-                    if let Some(dp_size) = server_info.dp_size {
-                        labels.insert("dp_size".to_string(), dp_size.to_string());
-                    }
-                    if let Some(load_balance_method) = server_info.load_balance_method {
-                        labels.insert("load_balance_method".to_string(), load_balance_method);
-                    }
-                    if let Some(disaggregation_mode) = server_info.disaggregation_mode {
-                        labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
-                    }
-                }
-
-                // Fetch from /model_info for model-related metadata
-                if let Ok(model_info) = get_model_info(&config.url, config.api_key.as_deref()).await
-                {
-                    if let Some(tokenizer_path) =
-                        model_info.tokenizer_path.filter(|s| !s.is_empty())
-                    {
-                        labels.insert("tokenizer_path".to_string(), tokenizer_path);
-                    }
-                    if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
-                        labels.insert("model_type".to_string(), model_type);
-                    }
-                    if let Some(architectures) = model_info.architectures.filter(|a| !a.is_empty())
-                    {
-                        if let Ok(json_str) = serde_json::to_string(&architectures) {
-                            labels.insert("architectures".to_string(), json_str);
-                        }
-                    }
-                }
+                };
 
                 Ok((labels, None))
             }
