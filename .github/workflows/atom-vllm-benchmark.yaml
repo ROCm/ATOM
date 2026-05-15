@@ -892,20 +892,25 @@ jobs:
                       "gpt-oss-120b TP1",
                   },
               }
-              # Beijing weekdays: Mon-Fri -> P0 every night; Sat -> P1; Sun -> P2.
-              if beijing_weekday <= 4:
+              # Beijing weekdays: Mon-Thu -> P0; Fri -> P1+P2; Sat-Sun -> C-ALL.
+              if beijing_weekday <= 3:
                   selected_group = "P0"
-              elif beijing_weekday == 5:
-                  selected_group = "P1"
+                  targets = group_targets[selected_group]
+              elif beijing_weekday == 4:
+                  selected_group = "P1+P2"
+                  targets = group_targets["P1"] | group_targets["P2"]
               else:
-                  selected_group = "P2"
+                  selected_group = "C-ALL"
+                  targets = None
 
-              targets = group_targets[selected_group]
-              selected = [
-                  m
-                  for m in all_variants
-                  if normalize_display(m.get("display")) in targets
-              ]
+              if targets is None:
+                  selected = list(all_variants)
+              else:
+                  selected = [
+                      m
+                      for m in all_variants
+                      if normalize_display(m.get("display")) in targets
+                  ]
           else:
               variant_map = {}
               for family in families:
