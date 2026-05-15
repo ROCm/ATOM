@@ -2160,8 +2160,12 @@ class FusedMoE(torch.nn.Module):
 
         # if config is not None
         #     and hasattr(config, "n_shared_experts")
-        # TODO: implement more checks that this exists and won't error out for other models
-        a_quant_dtype = config.quantization_config.get("global_quant_config", "").get("input_tensors", "").get("dtype", "")
+        # try/except may be a bad idea but i think it should be alright
+        try:
+            a_quant_dtype = config.quantization_config.get("global_quant_config", "").get("input_tensors", "").get("dtype", "")
+        except:
+            # does not exist
+            a_quant_dtype = None
 
         moe = FusedMoEConfig(
             num_experts=self.global_num_experts,

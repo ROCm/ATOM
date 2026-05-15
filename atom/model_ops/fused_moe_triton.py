@@ -609,14 +609,14 @@ def triton_kernel_fused_experts(
     with _amd_smem_safe_tile():
         if activation == ActivationType.Swiglu:
             # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
-            x_q_dtype_base = x_q_dtype.split("_")[0]
+            x_q_dtype_base = x_q_dtype.split("_")[0] if x_q_dtype else None
             if (x_q_dtype_base == "fp8"):
                 from aiter.ops.triton.utils._triton.arch_info import get_arch
                 # If input type is fp8, input scales must be available
                 assert a13_scale is not None
                 assert a2_scale is not None
-                a13_scale = a13_scale.max().to(torch.float32)/448
-                a2_scale = a2_scale.max().to(torch.float32)/448
+                a13_scale = a13_scale.max().to(torch.float32)
+                a2_scale = a2_scale.max().to(torch.float32)
 
                 x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
 
@@ -657,9 +657,12 @@ def triton_kernel_fused_experts(
                     w1_bias,
                     routing_data,
                     gather_indx=gather_indx,
+                    gammas=gammas if apply_router_weight_on_input else None,
                     swizzle_mx_scale="CDNA4_SCALE", # ?
-                    out_dtype=raw_intermediate.dtype,
                     apply_swiglu=True,
+                    alpha=1.702,          # gpt-oss
+                    limit=7.0,            # gpt-oss
+                    add_residual=True,    # gpt-oss `(up + 1)`
                 )
 
             # Standard SiLU/SwiGLU activation: silu(gate) * up
@@ -705,49 +708,53 @@ def triton_kernel_fused_experts(
                 # logger.warning("check intermediate cache is not all gone")
                 # logger.warning(intermediate_cache)
 
-                # logger.warning("moving_scale")
-                # logger.warning(moving_scale)
+        # logger.warning("moving_scale")
+        # logger.warning(moving_scale)
 
-                # make an adjustment to moving scale to have it be useful for typical interm cache numbers
-                # moving_scale = moving_scale / moving_scale # reset to 1 -- new scalev for second pass
-                # #moving_scale = 
+        # make an adjustment to moving scale to have it be useful for typical interm cache numbers
+        # moving_scale = moving_scale / moving_scale # reset to 1 -- new scalev for second pass
+        # #moving_scale = 
 
-                # logger.warning("moving_scale")
-                # logger.warning(moving_scale)
+        # logger.warning("moving_scale")
+        # logger.warning(moving_scale)
 
-                interm_cache = downcast_to_static_fp8(intermediate_cache.view(M * topk, half_N), a2_scale)
-                logger.warning("interm_cache")
-                logger.warning(interm_cache)
-                output_tensor = moe_gemm_a8w4(
-                    interm_cache,
-                    w2,
-                    None,
-                    w2_scale,
-                    a2_scale,
-                    None,
-                    w2_bias,
-                    routing_data,
-                    scatter_indx=scatter_indx,
-                    gammas=None if apply_router_weight_on_input else gammas,
-                    swizzle_mx_scale=w2_swizzle_layout, 
-                )
-                logger.warning("output")
-                logger.warning(output_tensor)
-                #logger.warning(output_tensor * static_scale)
-            else:
-                interm_cache, x_scale = mxfp4_quant(intermediate_cache.view(M * topk, half_N))
-                output_tensor = moe_gemm_a4w4(
-                    interm_cache, # intermediate_cache.view(M * topk, half_N)
-                    w2, # w2
-                    x_scale, # x scales
-                    w2_scale, # w2 scale
-                    None, # x static scale
-                    None, # quant static scale
-                    w2_bias, # bias
-                    routing_data, # routing data
-                    scatter_indx=scatter_indx,
-                    swizzle_mx_scale="CDNA4_SCALE", # ?
-                )
+        # e+11 numbers from intermediate cache
+
+        interm_cache = raw_intermediate#downcast_to_static_fp8(intermediate_cache.view(M * topk, half_N), a2_scale)
+        # logger.warning("interm_cache")
+        # logger.warning(interm_cache) # data loss here (all +-448) -- this looks like as expected by benchmark though
+        output_tensor = moe_gemm_a8w4(
+            interm_cache,
+            w2,
+            None,
+            w2_scale,
+            a2_scale,
+            None,
+            w2_bias,
+            routing_data,
+            scatter_indx=scatter_indx,
+            gammas=None if apply_router_weight_on_input else gammas,
+            swizzle_mx_scale=w2_swizzle_layout, 
+        )
+        # logger.warning("output")
+        # logger.warning(output_tensor)
+        #logger.warning(output_tensor * static_scale)
+    else:
+        interm_cache = raw_intermediate
+        interm_cache, x_scale = mxfp4_quant(interm_cache)
+        output_tensor = moe_gemm_a4w4(
+            interm_cache, # intermediate_cache.view(M * topk, half_N)
+            w2, # w2
+            x_scale, # x scales
+            w2_scale, # w2 scale
+            None, # x static scale
+            None, # quant static scale
+            w2_bias, # bias
+            routing_data, # routing data
+            scatter_indx=scatter_indx,
+            gammas=None if apply_router_weight_on_input else gammas,
+            swizzle_mx_scale="CDNA4_SCALE", # ?
+        )
 
                 # logger.warning("output")
                 # logger.warning(output_tensor.shape)
