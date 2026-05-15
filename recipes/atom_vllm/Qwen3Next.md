@@ -18,6 +18,7 @@ The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \
@@ -37,6 +38,7 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \

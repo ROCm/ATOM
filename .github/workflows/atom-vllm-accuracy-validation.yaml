@@ -175,7 +175,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
                   "extra_args": "--tensor-parallel-size 8 --enable-expert-parallel",
                   "accuracy_test_threshold": 0.87,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "linux-atom-mi35x-8",
               },
               {
@@ -184,7 +184,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "linux-atom-mi35x-1",
               },
               {
@@ -193,7 +193,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "linux-atom-mi35x-4",
               },
               {
@@ -202,7 +202,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 4 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
                   "accuracy_test_threshold": 0.80,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "linux-atom-mi35x-4",
               },
               {
@@ -211,7 +211,7 @@ jobs:
                   "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "linux-atom-mi35x-8",
               },
               {
@@ -220,7 +220,7 @@ jobs:
                   "model_path": "Qwen/Qwen3.5-397B-A17B",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "linux-atom-mi35x-8",
               },
               {
@@ -229,7 +229,7 @@ jobs:
                   "model_path": "amd/Qwen3.5-397B-A17B-MXFP4",
                   "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "linux-atom-mi35x-4",
               },
               {
