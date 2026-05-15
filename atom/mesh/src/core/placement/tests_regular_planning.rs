@@ -14,7 +14,7 @@ fn make_planner(src: MockWorkerSource, policies: MockPolicySource) -> DefaultPla
 }
 
 #[tokio::test]
-async fn c01_single_worker_for_specified_model() {
+async fn test_single_worker_for_specified_model() {
     let src = MockWorkerSource::new().add_worker(make_regular_http("http://m1-w:8000", "m1"));
     let planner = make_planner(src, MockPolicySource::new());
 
@@ -32,7 +32,7 @@ async fn c01_single_worker_for_specified_model() {
 }
 
 #[tokio::test]
-async fn c02_model_id_none_falls_back_to_default_policy() {
+async fn test_model_id_none_falls_back_to_default_policy() {
     let src = MockWorkerSource::new().add_worker(make_regular_http("http://w:8000", "m"));
     let planner = make_planner(src, MockPolicySource::new());
 
@@ -48,7 +48,7 @@ async fn c02_model_id_none_falls_back_to_default_policy() {
 }
 
 #[tokio::test]
-async fn c03_model_not_found_returns_typed_error() {
+async fn test_model_not_found_returns_typed_error() {
     let src = MockWorkerSource::new().add_worker(make_regular_http("http://w:8000", "m_present"));
     let planner = make_planner(src, MockPolicySource::new());
 
@@ -66,7 +66,7 @@ async fn c03_model_not_found_returns_typed_error() {
 }
 
 #[tokio::test]
-async fn c04_cross_model_isolation_100_iterations() {
+async fn test_cross_model_isolation_100_iterations() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://m1-a:8000", "m1"))
         .add_worker(make_regular_http("http://m1-b:8000", "m1"))
@@ -89,7 +89,7 @@ async fn c04_cross_model_isolation_100_iterations() {
 }
 
 #[tokio::test]
-async fn c05_hash_ring_called_with_real_model_id() {
+async fn test_hash_ring_called_with_real_model_id() {
     let workers = vec![
         make_regular_http("http://w1:8000", "m1"),
         make_regular_http("http://w2:8000", "m1"),
@@ -131,7 +131,7 @@ async fn c05_hash_ring_called_with_real_model_id() {
 }
 
 #[tokio::test]
-async fn c06_grpc_single_worker_excludes_http() {
+async fn test_grpc_single_worker_excludes_http() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://h:8000", "m"))
         .add_worker(make_regular_grpc("http://g:8000", "m"));
@@ -156,7 +156,7 @@ async fn c06_grpc_single_worker_excludes_http() {
 }
 
 #[tokio::test]
-async fn c07_grpc_model_id_none_falls_back_to_default() {
+async fn test_grpc_model_id_none_falls_back_to_default() {
     let src = MockWorkerSource::new().add_worker(make_regular_grpc("http://g:8000", "m"));
     let planner = make_planner(src, MockPolicySource::new());
 
@@ -179,7 +179,7 @@ async fn c07_grpc_model_id_none_falls_back_to_default() {
 }
 
 #[tokio::test]
-async fn c08_all_unhealthy_returns_no_available_workers() {
+async fn test_all_unhealthy_returns_no_available_workers() {
     let w1 = make_regular_http("http://w1:8000", "m");
     let w2 = make_regular_http("http://w2:8000", "m");
     w1.set_healthy(false);
@@ -195,7 +195,7 @@ async fn c08_all_unhealthy_returns_no_available_workers() {
 }
 
 #[tokio::test]
-async fn c09_empty_registry_model_id_none_returns_no_workers() {
+async fn test_empty_registry_model_id_none_returns_no_workers() {
     let src = MockWorkerSource::new();
     let planner = make_planner(src, MockPolicySource::new());
 
@@ -207,7 +207,7 @@ async fn c09_empty_registry_model_id_none_returns_no_workers() {
 }
 
 #[tokio::test]
-async fn c10_pd_mode_all_unhealthy_returns_no_available_workers() {
+async fn test_pd_mode_all_unhealthy_returns_no_available_workers() {
     let p = make_prefill_http("http://p:8000", "m", Some(8998));
     let d = make_decode_http("http://d:8000", "m");
     p.set_healthy(false);
@@ -223,7 +223,7 @@ async fn c10_pd_mode_all_unhealthy_returns_no_available_workers() {
 }
 
 #[tokio::test]
-async fn c11_policy_returned_none_propagates() {
+async fn test_policy_returned_none_propagates() {
     let src = MockWorkerSource::new().add_worker(make_regular_http("http://w:8000", "m"));
     let policies = MockPolicySource::new()
         .with_regular(Arc::new(AlwaysNonePolicy) as Arc<dyn LoadBalancingPolicy>);

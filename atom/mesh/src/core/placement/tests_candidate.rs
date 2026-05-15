@@ -17,7 +17,7 @@ fn filter_candidates(
 }
 
 #[test]
-fn a01_filters_to_specified_model_only() {
+fn test_filters_to_specified_model_only() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://m1-w1:8000", "m1"))
         .add_worker(make_regular_http("http://m1-w2:8000", "m1"))
@@ -29,7 +29,7 @@ fn a01_filters_to_specified_model_only() {
 }
 
 #[test]
-fn a02_model_id_none_returns_all_workers() {
+fn test_model_id_none_returns_all_workers() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://w1:8000", "m1"))
         .add_worker(make_regular_http("http://w2:8000", "m2"));
@@ -39,7 +39,7 @@ fn a02_model_id_none_returns_all_workers() {
 }
 
 #[test]
-fn a03_unknown_model_returns_empty() {
+fn test_unknown_model_returns_empty() {
     let src = MockWorkerSource::new().add_worker(make_regular_http("http://w:8000", "m1"));
 
     let result = filter_candidates(&src, Some("m_missing"), None, None);
@@ -47,7 +47,7 @@ fn a03_unknown_model_returns_empty() {
 }
 
 #[test]
-fn a04_no_cross_model_contamination() {
+fn test_no_cross_model_contamination() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://m1-w:8000", "m1"))
         .add_worker(make_regular_http("http://m2-w:8000", "m2"));
@@ -59,7 +59,7 @@ fn a04_no_cross_model_contamination() {
 }
 
 #[test]
-fn a05_worker_type_regular_excludes_pd() {
+fn test_worker_type_regular_excludes_pd() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://r:8000", "m"))
         .add_worker(make_prefill_http("http://p:8000", "m", Some(8998)))
@@ -71,7 +71,7 @@ fn a05_worker_type_regular_excludes_pd() {
 }
 
 #[test]
-fn a06_worker_type_prefill_excludes_regular_and_decode() {
+fn test_worker_type_prefill_excludes_regular_and_decode() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://r:8000", "m"))
         .add_worker(make_prefill_http("http://p:8000", "m", Some(8998)))
@@ -90,7 +90,7 @@ fn a06_worker_type_prefill_excludes_regular_and_decode() {
 }
 
 #[test]
-fn a07_worker_type_decode_excludes_regular_and_prefill() {
+fn test_worker_type_decode_excludes_regular_and_prefill() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://r:8000", "m"))
         .add_worker(make_prefill_http("http://p:8000", "m", Some(8998)))
@@ -102,7 +102,7 @@ fn a07_worker_type_decode_excludes_regular_and_prefill() {
 }
 
 #[test]
-fn a08_connection_mode_http_excludes_grpc() {
+fn test_connection_mode_http_excludes_grpc() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://h:8000", "m"))
         .add_worker(make_regular_grpc("http://g:8000", "m"));
@@ -113,7 +113,7 @@ fn a08_connection_mode_http_excludes_grpc() {
 }
 
 #[test]
-fn a09_connection_mode_grpc_excludes_http() {
+fn test_connection_mode_grpc_excludes_http() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://h:8000", "m"))
         .add_worker(make_regular_grpc("http://g:8000", "m"));
@@ -124,7 +124,7 @@ fn a09_connection_mode_grpc_excludes_http() {
 }
 
 #[test]
-fn a10_all_healthy_all_pass() {
+fn test_all_healthy_all_pass() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://w1:8000", "m"))
         .add_worker(make_regular_http("http://w2:8000", "m"));
@@ -134,7 +134,7 @@ fn a10_all_healthy_all_pass() {
 }
 
 #[test]
-fn a11_all_unhealthy_empty_set() {
+fn test_all_unhealthy_empty_set() {
     let w1 = make_regular_http("http://w1:8000", "m");
     let w2 = make_regular_http("http://w2:8000", "m");
     w1.set_healthy(false);
@@ -146,7 +146,7 @@ fn a11_all_unhealthy_empty_set() {
 }
 
 #[test]
-fn a12_mixed_health_only_healthy_pass() {
+fn test_mixed_health_only_healthy_pass() {
     let healthy = make_regular_http("http://h:8000", "m");
     let unhealthy = make_regular_http("http://u:8000", "m");
     unhealthy.set_healthy(false);
@@ -160,7 +160,7 @@ fn a12_mixed_health_only_healthy_pass() {
 }
 
 #[test]
-fn a13_empty_registry_returns_empty_no_panic() {
+fn test_empty_registry_returns_empty_no_panic() {
     let src = MockWorkerSource::new();
     let result = filter_candidates(&src, Some("m"), None, None);
     assert!(result.is_empty());
@@ -169,7 +169,7 @@ fn a13_empty_registry_returns_empty_no_panic() {
 }
 
 #[test]
-fn a14_prefill_bootstrap_port_variants_both_match() {
+fn test_prefill_bootstrap_port_variants_both_match() {
     let src = MockWorkerSource::new()
         .add_worker(make_prefill_http("http://sg:8000", "m", Some(8998)))
         .add_worker(make_prefill_http("http://vl:8000", "m", None));
@@ -186,7 +186,7 @@ fn a14_prefill_bootstrap_port_variants_both_match() {
 }
 
 #[test]
-fn a15_combined_filters_all_apply() {
+fn test_combined_filters_all_apply() {
     let unhealthy = make_regular_http("http://m1-u:8000", "m1");
     unhealthy.set_healthy(false);
     let src = MockWorkerSource::new()
@@ -207,7 +207,7 @@ fn a15_combined_filters_all_apply() {
 }
 
 #[test]
-fn a16_model_id_some_worker_type_none_returns_all_for_model() {
+fn test_model_id_some_worker_type_none_returns_all_for_model() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://m1-r:8000", "m1"))
         .add_worker(make_prefill_http("http://m1-p:8000", "m1", Some(8998)))
@@ -220,7 +220,7 @@ fn a16_model_id_some_worker_type_none_returns_all_for_model() {
 }
 
 #[test]
-fn a17_dp_aware_same_url_different_dp_rank_both_pass() {
+fn test_dp_aware_same_url_different_dp_rank_both_pass() {
     let src = MockWorkerSource::new()
         .add_worker(make_regular_http("http://shared:8000", "m"))
         .add_worker(make_regular_http("http://shared:8000", "m"));
@@ -230,7 +230,7 @@ fn a17_dp_aware_same_url_different_dp_rank_both_pass() {
 }
 
 #[test]
-fn a18_filter_scales_linearly_with_worker_count() {
+fn test_filter_scales_linearly_with_worker_count() {
     let mut src = MockWorkerSource::new();
     for i in 0..256 {
         src = src.add_worker(make_regular_http(&format!("http://w{}:8000", i), "m"));
