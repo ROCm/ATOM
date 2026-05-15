@@ -440,14 +440,15 @@ COPY --from=build_aiter /app/aiter-test /app/aiter-test
 RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
     pip show amd-aiter
 
-# Mooncake: copy built libraries, etcd/gRPC runtime, and Python package
+# Mooncake: copy built libraries, gRPC runtime, and Python package
 COPY --from=build_mooncake /usr/local/lib/libmooncake* /usr/local/lib/
+COPY --from=build_mooncake /usr/local/lib/libetcd_wrapper.so /usr/local/lib/
 COPY --from=build_mooncake /usr/local/lib/libgrpc* /usr/local/lib/
 COPY --from=build_mooncake /usr/local/lib/libprotobuf* /usr/local/lib/
 COPY --from=build_mooncake /usr/local/lib/libabsl* /usr/local/lib/
 COPY --from=build_mooncake /usr/local/lib/libupb* /usr/local/lib/
 COPY --from=build_mooncake /usr/local/lib/libre2* /usr/local/lib/
-COPY --from=build_mooncake /usr/local/bin/etcd /usr/local/bin/etcdctl /usr/local/bin/
+COPY --from=build_mooncake /usr/local/bin/mooncake_master /usr/local/bin/
 COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake /opt/venv/lib/python3.12/site-packages/mooncake
 COPY --from=build_mooncake /opt/venv/lib/python3.12/site-packages/mooncake-*.dist-info /opt/venv/lib/python3.12/site-packages/
 RUN apt-get update && \
