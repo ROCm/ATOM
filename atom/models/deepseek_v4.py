@@ -50,6 +50,10 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import (
 from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
 )
+import triton
+
+from aiter.ops.triton.fusions.mhc import mhc_post_pre as _triton_mhc_post_pre
+from aiter.ops.triton.utils.mhc_config_utils import get_mhc_config
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
     Config,
@@ -124,7 +128,7 @@ _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
 _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
-_V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+_V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "1") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 
 
@@ -282,6 +286,184 @@ def _hc_head_reduce(
     pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
     y = torch.sum(pre.unsqueeze(-1) * x, dim=-2)
     return y.to(x.dtype)
+
+
+# Fused mHC sub-layer transition: close current sub-layer with hc_post and
+# open the next sub-layer with hc_pre, sharing the updated residual stream
+# between the two operations. Replaces the post→pre pair at the attn→ffn
+# boundary in Block.forward.
+#
+# Threshold mirrors `fused_qk_norm_rope_swa_write`: at small token counts the
+# Triton ``mhc_post_pre`` kernel beats the HIP chain (residual lives in
+# registers between post and pre's GEMM); at larger M the HIP pair pulls
+# ahead.
+_V4_FUSED_HC_POST_PRE_M_THRESHOLD = 64
+
+
+# Persistent buffers for the Triton `mhc_post_pre` path. We pre-allocate all
+# scratch + output tensors and pass them in on every call so their data_ptrs
+# stay fixed across CUDAGraph captures and replays. `torch.empty` inside the
+# kernel wrapper would otherwise allocate fresh memory on every call, and the
+# split-K `acc_partial` / `acc_sq_partial` partials in particular need stable
+# addresses — without this, captured graphs read stale data on replay (the
+# 0-accuracy regression at `--cudagraph-capture-sizes [1..64]`).
+#
+# Keyed by (M, dim, n, device). One entry per CUDAGraph capture size.
+_V4_FUSED_HC_POST_PRE_CACHE: dict = {}
+
+
+def _get_fused_hc_post_pre_buffers(
+    M: int,
+    dim: int,
+    n: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> dict:
+    """Return persistent buffers for one `(M, dim, n, device)` shape, allocating
+    on first miss. Pulls `BLOCK_K` from the same tuned config the Triton kernel
+    uses (`get_mhc_config("MHC_FUSED", M, dim, mode="sinkhorn")`), so the cached
+    `acc_partial` / `acc_sq_partial` shapes match the kernel's expectation.
+    """
+    key = (M, dim, n, device)
+    bufs = _V4_FUSED_HC_POST_PRE_CACHE.get(key)
+    if bufs is not None:
+        return bufs
+
+    N_total = 2 * n + n * n
+
+    cfg, _ = get_mhc_config("MHC_FUSED", M, dim, mode="sinkhorn")
+    BLOCK_K = cfg.get("BLOCK_K", min(512, triton.next_power_of_2(n * dim)))
+    BLOCK_K = min(BLOCK_K, triton.next_power_of_2(n * dim))
+    BLOCK_C_SPLIT = BLOCK_K // n
+    NUM_KSPLIT = triton.cdiv(dim, BLOCK_C_SPLIT)
+
+    bufs = {
+        "residual_out": torch.empty(M, n, dim, dtype=dtype, device=device),
+        "layer_input_out": torch.empty(M, dim, dtype=dtype, device=device),
+        "h_post": torch.empty(M, n, dtype=torch.float32, device=device),
+        "h_res": torch.empty(M, n, n, dtype=torch.float32, device=device),
+        "acc_partial": torch.empty(
+            NUM_KSPLIT, M, N_total, dtype=torch.float32, device=device
+        ),
+        "acc_sq_partial": torch.empty(
+            NUM_KSPLIT, M, dtype=torch.float32, device=device
+        ),
+    }
+    _V4_FUSED_HC_POST_PRE_CACHE[key] = bufs
+    return bufs
+
+
+def _fused_hc_post_pre_fake(
+    x: torch.Tensor,  # [num_tokens, dim]      attn/ffn output
+    residual: torch.Tensor,  # [num_tokens, hc, dim]  pre-post residual
+    post: torch.Tensor,  # [num_tokens, hc]       prev pre's post-gate
+    comb: torch.Tensor,  # [num_tokens, hc, hc]   prev pre's comb matrix
+    hc_fn_t: torch.Tensor,  # [hc*dim, mix_hc] fp32  Triton phi (= hc_fn.T view)
+    hc_fn: torch.Tensor,  # [mix_hc, hc*dim] fp32  HIP fn
+    hc_scale: torch.Tensor,  # [3] fp32 — both alphas (Triton) and HIP hc_scale
+    hc_base: torch.Tensor,  # [mix_hc] fp32
+    n: int,
+    norm_eps: float,
+    hc_eps: float,
+    hc_post_mult: float,
+    sinkhorn_iters: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, dim = x.shape
+    device = x.device
+    dtype = residual.dtype
+    return (
+        torch.empty(num_tokens, n, dim, dtype=dtype, device=device),
+        torch.empty(num_tokens, dim, dtype=dtype, device=device),
+        torch.empty(num_tokens, n, dtype=torch.float32, device=device),
+        torch.empty(num_tokens, n, n, dtype=torch.float32, device=device),
+    )
+
+
+@torch_compile_guard(gen_fake=_fused_hc_post_pre_fake, mutates_args=[])
+def fused_hc_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    hc_fn_t: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    n: int,
+    norm_eps: float,
+    hc_eps: float,
+    hc_post_mult: float,
+    sinkhorn_iters: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused mHC ``hc_post → hc_pre`` for a sub-layer transition.
+
+    At ``num_tokens <= 64`` runs the Triton ``mhc_post_pre`` kernel; otherwise
+    falls back to the HIP ``aiter.mhc_post → aiter.mhc_pre`` chain. Returns
+    ``(new_residual, layer_input_out, new_post, new_comb)``:
+
+    - ``new_residual`` ([num_tokens, hc, dim]): residual after the post mix,
+      consumed by the next ``hc_post`` of the same block.
+    - ``layer_input_out`` ([num_tokens, dim]): sub-layer input for the next
+      norm + op.
+    - ``new_post`` ([num_tokens, hc]) fp32: post-gate for the next ``hc_post``.
+    - ``new_comb`` ([num_tokens, hc, hc]) fp32: comb matrix for the next
+      ``hc_post``.
+
+    The HIP ``mhc_post`` kernel reinterprets ``post``/``comb`` as ``float*``
+    (mhc_kernels.cu:874), so the Triton branch pre-allocates fp32 buffers and
+    hands them to the kernel — no downstream cast, no bf16↔fp32 round-trip.
+    Likewise ``hc_scale`` (the (3,) fp32 parameter tensor) is passed straight
+    through: the Triton kernel ``tl.load``s alphas at offsets 0/1/2, so no
+    CPU sync from ``.tolist()`` or ``.item()``.
+    """
+    num_tokens = x.shape[0]
+    if num_tokens <= _V4_FUSED_HC_POST_PRE_M_THRESHOLD:
+        # Look up persistent scratch + output buffers for this M (allocated on
+        # first miss, reused thereafter). All buffers — including the split-K
+        # `acc_partial` / `acc_sq_partial` partials — have stable `.data_ptr()`,
+        # which is required for CUDAGraph replay to read the same memory each
+        # time. Without this, captured graphs see stale partials on replay.
+        bufs = _get_fused_hc_post_pre_buffers(
+            num_tokens, x.shape[1], n, residual.dtype, x.device
+        )
+        _, _, layer_input_out, new_residual = _triton_mhc_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn_t,
+            hc_scale,
+            hc_base,
+            n,
+            norm_eps,
+            hc_eps,
+            hc_post_mult,
+            sinkhorn_iters,
+            residual_out=bufs["residual_out"],
+            h_post=bufs["h_post"],
+            h_res=bufs["h_res"],
+            layer_input_out=bufs["layer_input_out"],
+            acc_partial=bufs["acc_partial"],
+            acc_sq_partial=bufs["acc_sq_partial"],
+        )
+        return new_residual, layer_input_out, bufs["h_post"], bufs["h_res"]
+
+    # HIP fallback: hc_post followed by hc_pre. `residual.dtype == x.dtype`
+    # (bf16 end-to-end in Block.forward), so `out` inherits the right dtype.
+    new_residual = torch.empty_like(residual)
+    aiter.mhc_post(new_residual, x, residual, post.unsqueeze(-1), comb)
+    new_post_3d, new_comb, layer_input_out = aiter.mhc_pre(
+        new_residual,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        norm_eps,
+        hc_eps,
+        hc_eps,
+        hc_post_mult,
+        sinkhorn_iters,
+    )
+    return new_residual, layer_input_out, new_post_3d.squeeze(-1), new_comb
 
 
 def _v4_attention_fake(
@@ -2402,11 +2584,23 @@ class Block(nn.Module):
         )
         x = self.attn_norm(x)  # [num_tokens, dim]
         x = self.attn(x, positions)  # [num_tokens, dim]
-        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-        # ----- FFN sub-layer with mHC mixing -----
-        residual = x  # [num_tokens, hc, dim]
-        x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        # ----- Fused attn→ffn transition: hc_post (close attn) + hc_pre (open ffn) -----
+        # `hc_ffn_fn.T` is a stride-swapped view (no copy); `hc_ffn_scale` is
+        # passed unchanged — the Triton kernel `tl.load`s the alphas itself.
+        residual, x, post, comb = fused_hc_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            self.hc_ffn_fn.T,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.hc_mult,
+            self.norm_eps,
+            self.hc_eps,
+            self.HC_POST_MULT,
+            self.hc_sinkhorn_iters,
         )
         x = self.ffn_norm(x)  # [num_tokens, dim]
         x = self.ffn(
@@ -2414,6 +2608,77 @@ class Block(nn.Module):
         )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)
         x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
         return x
+
+    def forward_carry(
+        self,
+        x: torch.Tensor,  # first layer: [num_tokens, hc, dim] residual; otherwise [num_tokens, dim] prev FFN output
+        residual_carry: Optional[
+            torch.Tensor
+        ],  # [num_tokens, hc, dim] or None on first layer
+        post_carry: Optional[torch.Tensor],  # [num_tokens, hc] or None
+        comb_carry: Optional[torch.Tensor],  # [num_tokens, hc, hc] or None
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cross-block-fused variant of forward. Returns
+        ``(x_ffn_out, residual, post, comb)``: the FFN output of this layer plus
+        the carries needed to close it via the *next* layer's attn-open
+        ``fused_hc_post_pre`` (or, after the last layer, via a standalone
+        ``hc_post`` in ``DeepseekV4Model.forward``).
+
+        First layer (``residual_carry is None``): opens with the standalone
+        ``hc_pre`` — nothing prior to close. Subsequent layers: open by fusing
+        the prev layer's FFN-close with this layer's attn-open in a single
+        ``fused_hc_post_pre`` call (saves one full residual HBM roundtrip per
+        layer boundary).
+
+        Legacy ``Block.forward`` is unchanged so MTPBlock keeps working.
+        """
+        if residual_carry is None:
+            # First-layer opening: no prior sub-layer to close.
+            residual = x
+            x, post, comb = self.hc_pre(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+        else:
+            # Cross-block fused open: close prev layer's FFN + open this attn.
+            residual, x, post, comb = fused_hc_post_pre(
+                x,
+                residual_carry,
+                post_carry,
+                comb_carry,
+                self.hc_attn_fn.T,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.hc_mult,
+                self.norm_eps,
+                self.hc_eps,
+                self.HC_POST_MULT,
+                self.hc_sinkhorn_iters,
+            )
+        x = self.attn_norm(x)
+        x = self.attn(x, positions)
+        # Within-block fused attn→ffn transition (same call as legacy forward).
+        residual, x, post, comb = fused_hc_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            self.hc_ffn_fn.T,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.hc_mult,
+            self.norm_eps,
+            self.hc_eps,
+            self.HC_POST_MULT,
+            self.hc_sinkhorn_iters,
+        )
+        x = self.ffn_norm(x)
+        x = self.ffn(x)
+        # No closing hc_post — defer to the next layer's forward_carry, or to
+        # DeepseekV4Model.forward after the last layer.
+        return x, residual, post, comb
 
 
 class ParallelHead(ParallelLMHead):
@@ -2649,8 +2914,22 @@ class DeepseekV4Model(nn.Module):
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
+        # Cross-block-fused loop: each block's closing hc_post fuses with the
+        # next block's opening hc_pre into a single `fused_hc_post_pre` call.
+        # First layer opens standalone (no prior FFN to close); after the loop
+        # we close the last layer's FFN with a standalone hc_post. See
+        # `Block.forward_carry`. Aliasing across layers is safe — the shared
+        # cached buffers from `_get_fused_hc_post_pre_buffers` are written
+        # in-place per CTA on disjoint `(m, *, c)` tiles.
+        residual_carry: Optional[torch.Tensor] = None
+        post_carry: Optional[torch.Tensor] = None
+        comb_carry: Optional[torch.Tensor] = None
         for layer in self.layers:
-            h = layer(h, positions)  # [num_tokens, hc, dim]
+            h, residual_carry, post_carry, comb_carry = layer.forward_carry(
+                h, residual_carry, post_carry, comb_carry, positions
+            )
+        # Close the final layer's FFN (no next layer to fuse with).
+        h = self.layers[-1].hc_post(h, residual_carry, post_carry, comb_carry)
 
         # Reduce the mHC residual stack (hc_head + final RMSNorm); leave the
         # vocab projection to compute_logits.
