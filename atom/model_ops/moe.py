@@ -896,8 +896,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if os.environ.get("ATOM_V4_TORCH_MOE"):
             return
 
-        if os.environ.get("ATOM_V4_TORCH_MOE"):
-            return
 
         if self.use_triton:
             import dataclasses
@@ -906,8 +904,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from atom.config import get_current_atom_config
 
             atom_config = get_current_atom_config()
-            #from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
-
             
             w13_weight, w13_scale, w13_swizzle_layout, w2_weight, w2_scale, w2_swizzle_layout = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
@@ -921,20 +917,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.intermediate_size,#K_2,   --  FC2
                 atom_config.tensor_parallel_size#TP
             )
-            # w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-            #     layer.w13_weight.view(torch.uint8),
-            #     layer.w13_weight_scale,
-            # )
-            # w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-            #     layer.w2_weight.view(torch.uint8),
-            #     layer.w2_weight_scale,
-            # )
-            # self.w13_precision_config = PrecisionConfig(
-            #     weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
-            # )
-            # self.w2_precision_config = PrecisionConfig(
-            #     weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
-            # )
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale
@@ -979,14 +961,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        # logger.warning("moe mxfp4 quant config")
-        # logger.warning(layer.config)
-        #TODO -- implement layer.config activations
-        # if layer.config or something has fp8 activations, return w4a8 version of below
+
+        # if activation scales are specified, check quant dtype
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
             
-        # TODO: make more flexible
+        # NOTE: implemented for visibility to fp8 moe
         if (self.moe.a_quant_dtype == "fp8_e4m3"):
             return mxfp4_w4a8_moe_quant_config(
                 a1_scale=a1_scale,
@@ -1029,9 +1009,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 triton_kernel_fused_experts,
                 fused_routing_from_topk_triton,
             )
-
-            # logger.warning("x")
-            # logger.warning(x)
 
             # Check if the model needs custom routing that triton routing()
             # does not support (grouped topk, sigmoid scoring, bias correction).
@@ -2059,8 +2036,7 @@ class FusedMoE(torch.nn.Module):
         )
         self.layer_quant_config = layer_quant_config
         self.has_bias = has_bias
-        # logger.warning("in triton fused moe, here's the config")
-        # logger.warning(config)
+
         # Note: here we guard against accessing the TP and DP groups when
         # uninitialized (this happens when testing)
         # self.tp_size = 1
@@ -2155,16 +2131,10 @@ class FusedMoE(torch.nn.Module):
 
         self.use_chunked = get_dp_group().world_size > 1
 
-        # logger.warning("config in fusedmoe")
-        # logger.warning(config)
-
-        # if config is not None
-        #     and hasattr(config, "n_shared_experts")
-        # try/except may be a bad idea but i think it should be alright
         try:
             a_quant_dtype = config.quantization_config.get("global_quant_config", "").get("input_tensors", "").get("dtype", "")
         except:
-            # does not exist
+            # global quant config does not exist, no activation loaded
             a_quant_dtype = None
 
         moe = FusedMoEConfig(
@@ -3087,9 +3057,6 @@ class FusedMoE(torch.nn.Module):
             if _tbo:
                 tbo_switch_to_compute_sync()
 
-        # logger.warning("completely fresh x")
-        # logger.warning(hidden_states)
-
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
@@ -3148,8 +3115,6 @@ class FusedMoE(torch.nn.Module):
             hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
             router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
 
-        # logger.warning("completely fresh x")
-        # logger.warning(hidden_states)
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
