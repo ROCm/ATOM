@@ -7,16 +7,10 @@ concurrency:
 
 on:
   schedule:
-    # Mon-Thu 21:00 Beijing (13:00 UTC): Mon/Wed AWS P0; Tue/Thu AWS P1 + META P0
-    - cron: '0 13 * * 1-4'
-    # Fri 21:00 Beijing (13:00 UTC): AWS P0
-    - cron: '0 13 * * 5'
-    # Sat 21:00 Beijing (13:00 UTC): AWS P1 + META P0
-    - cron: '0 13 * * 6'
-    # Sun 10:00 Beijing (02:00 UTC): AWS P2 + all OOB variants
+    # Daily 21:00 Beijing (13:00 UTC): Mon/Wed/Fri AWS P0; Tue/Thu/Sat AWS P1+META P0; Sun evening META P1 (see load-models weekday/hour logic).
+    - cron: '0 13 * * 0-6'
+    # Sun 10:00 Beijing (02:00 UTC): AWS P2 + OOB
     - cron: '0 2 * * 0'
-    # Sun 21:00 Beijing (13:00 UTC Sun): META P1
-    - cron: '0 13 * * 0'
   workflow_dispatch:
     inputs:
       benchmark_client:
