@@ -19,7 +19,7 @@ fn two_workers() -> Vec<Arc<dyn Worker>> {
 }
 
 #[tokio::test]
-async fn b01_round_robin_invoked_once_idx_in_range() {
+async fn test_round_robin_invoked_once_idx_in_range() {
     let candidates = two_workers();
     let recorder = RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new()));
     let descriptor = make_descriptor(Some("m"), None, None, None);
@@ -32,7 +32,7 @@ async fn b01_round_robin_invoked_once_idx_in_range() {
 }
 
 #[tokio::test]
-async fn b02_random_invoked_once_returns_valid_idx() {
+async fn test_random_invoked_once_returns_valid_idx() {
     let candidates = two_workers();
     let recorder = RecordingPolicy::wrap(Arc::new(RandomPolicy::new()));
     let descriptor = make_descriptor(Some("m"), None, None, None);
@@ -45,7 +45,7 @@ async fn b02_random_invoked_once_returns_valid_idx() {
 }
 
 #[tokio::test]
-async fn b03_power_of_two_invoked_once() {
+async fn test_power_of_two_invoked_once() {
     let candidates = two_workers();
     let recorder = RecordingPolicy::wrap(Arc::new(PowerOfTwoPolicy::new()));
     let descriptor = make_descriptor(Some("m"), None, None, None);
@@ -58,7 +58,7 @@ async fn b03_power_of_two_invoked_once() {
 }
 
 #[tokio::test]
-async fn b04_cache_aware_receives_request_text() {
+async fn test_cache_aware_receives_request_text() {
     let candidates = two_workers();
     let recorder = RecordingPolicy::wrap(Arc::new(CacheAwarePolicy::new()));
     let descriptor = make_descriptor(Some("m"), Some("hello world"), None, None);
@@ -71,7 +71,7 @@ async fn b04_cache_aware_receives_request_text() {
 }
 
 #[tokio::test]
-async fn b05_prefix_hash_receives_tokens() {
+async fn test_prefix_hash_receives_tokens() {
     let candidates = two_workers();
     let policy = PrefixHashPolicy::new(PrefixHashConfig::default());
     let recorder = RecordingPolicy::wrap(Arc::new(policy));
@@ -85,7 +85,7 @@ async fn b05_prefix_hash_receives_tokens() {
 }
 
 #[tokio::test]
-async fn b06_hash_ring_keyed_by_real_model_id() {
+async fn test_hash_ring_keyed_by_real_model_id() {
     let candidates = two_workers();
     let ring = Arc::new(HashRing::new(&candidates));
     let recorder = RecordingPolicy::round_robin();
@@ -101,7 +101,7 @@ async fn b06_hash_ring_keyed_by_real_model_id() {
 }
 
 #[tokio::test]
-async fn b07_no_hash_ring_for_model_falls_back_gracefully() {
+async fn test_no_hash_ring_for_model_falls_back_gracefully() {
     let candidates = two_workers();
     let recorder = RecordingPolicy::round_robin();
     let descriptor = make_descriptor(Some("m_no_ring"), None, None, None);
@@ -116,7 +116,7 @@ async fn b07_no_hash_ring_for_model_falls_back_gracefully() {
 }
 
 #[tokio::test]
-async fn b08_request_text_passes_through() {
+async fn test_request_text_passes_through() {
     let candidates = two_workers();
     let recorder = RecordingPolicy::round_robin();
     let descriptor = make_descriptor(Some("m"), Some("hello"), None, None);
@@ -127,7 +127,7 @@ async fn b08_request_text_passes_through() {
 }
 
 #[tokio::test]
-async fn b09_tokens_pass_through() {
+async fn test_tokens_pass_through() {
     let candidates = two_workers();
     let recorder = RecordingPolicy::round_robin();
     let tokens = [1u32, 2, 3];
@@ -139,7 +139,7 @@ async fn b09_tokens_pass_through() {
 }
 
 #[tokio::test]
-async fn b10_headers_pass_through() {
+async fn test_headers_pass_through() {
     let candidates = two_workers();
     let recorder = RecordingPolicy::round_robin();
     let mut hm = HeaderMap::new();
@@ -153,7 +153,7 @@ async fn b10_headers_pass_through() {
 }
 
 #[tokio::test]
-async fn b11_policy_returns_none_yields_typed_error() {
+async fn test_policy_returns_none_yields_typed_error() {
     let candidates = two_workers();
     let descriptor = make_descriptor(Some("m"), None, None, None);
 
@@ -164,7 +164,7 @@ async fn b11_policy_returns_none_yields_typed_error() {
 }
 
 #[tokio::test]
-async fn b12_empty_candidates_does_not_call_policy() {
+async fn test_empty_candidates_does_not_call_policy() {
     let candidates: Vec<Arc<dyn Worker>> = Vec::new();
     let recorder = RecordingPolicy::round_robin();
     let descriptor = make_descriptor(Some("m"), None, None, None);
@@ -177,7 +177,7 @@ async fn b12_empty_candidates_does_not_call_policy() {
 }
 
 #[test]
-fn b13_pd_needs_request_text_aggregated_from_policies() {
+fn test_pd_needs_request_text_aggregated_from_policies() {
     use super::traits::PolicySource;
 
     let yes: Arc<dyn LoadBalancingPolicy> = Arc::new(StaticNeedsTextPolicy::new("yes", true));
@@ -198,7 +198,7 @@ fn b13_pd_needs_request_text_aggregated_from_policies() {
 }
 
 #[tokio::test]
-async fn b14_returned_worker_belongs_to_candidate_set() {
+async fn test_returned_worker_belongs_to_candidate_set() {
     let candidates = two_workers();
     let candidate_urls: Vec<String> = candidates.iter().map(|w| w.url().to_string()).collect();
     let descriptor = make_descriptor(Some("m"), None, None, None);
