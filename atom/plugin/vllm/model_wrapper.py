@@ -37,6 +37,7 @@ logger = logging.getLogger("atom")
 
 _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
+    "Glm4MoeMTPModel",
 }
 _ATOM_MODEL_CLASSES: dict[str, str] = {
     "LlamaForCausalLM": "atom.models.llama:LlamaForCausalLM",
@@ -155,7 +156,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         model_arch = _select_model_arch(vllm_config)
         self.is_mtp_draft_model = self.is_mtp and model_arch != main_model_arch
         if self.is_mtp_draft_model:
-            self.atom_config = get_current_atom_config()
+            # Generate separate config for main model and draft model to make sure
+            # that draft model has its own compilation config rather than carried 
+            # over from main model. Also get the mutated hf_config from main model
+            main_atom_config = get_current_atom_config()
+            self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
+            self.atom_config.hf_config = main_atom_config.hf_config
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
         self.model_arch = model_arch
@@ -192,8 +198,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         if model_arch in _MTP_MASK_INPUT_ARCH:
             self._adapt_mtp_layers_for_vllm()
-            # Mirror nested attributes required by vLLM speculative decoding.
-            self._expose_spec_decode_attrs()
+        # Mirror nested attributes required by vLLM speculative decoding.
+        self._expose_spec_decode_attrs()
 
         # For sparse MLA, register the Indexer's DeepseekV32IndexerCache as
         # a virtual subclass of vLLM's AttentionLayerBase so vLLM can discover
