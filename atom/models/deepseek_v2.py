@@ -130,12 +130,23 @@ _FP8_DTYPES = tuple(
 )
 
 
+def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
+    if not hasattr(config, "index_topk"):
+        return False
+    if getattr(config, "model_type", None) == "glm_moe_dsa":
+        return False
+    return (
+        getattr(config, "index_head_dim", None) == 128
+        and getattr(config, "qk_rope_head_dim", None) == 64
+    )
+
+
 def _can_fuse_indexer_wk_weights_proj(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
     indexer_prefixes: list[str],
 ) -> bool:
-    if not hasattr(config, "index_topk"):
+    if not _supports_fused_indexer_kernel_config(config):
         return False
     if quant_config is None:
         return True
@@ -1365,6 +1376,7 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.use_qk_rope_cache_fusion = (
             ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
+            and _supports_fused_indexer_kernel_config(config)
             and self.head_dim == self.quant_block_size
             and self.rope_dim == self.head_dim // 2
         )
