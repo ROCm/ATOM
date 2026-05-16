@@ -57,6 +57,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `enable_dp_attention` | `bool` | `False` | Enable data-parallel attention |
 | `torch_dtype` | `torch.dtype` | *(computed)* | Inferred from `hf_config.torch_dtype`; falls back to `torch.bfloat16` |
 | `speculative_config` | `Optional[SpeculativeConfig]` | `None` | Speculative decoding configuration (see Section 5) |
+| `lora_modules` | `Optional[list[str]]` | `None` | Static LoRA adapters loaded at startup and applied to every request |
 | `bos_token_id` | `int` | `-1` | Beginning-of-sequence token ID (`-1` = use model default) |
 | `eos_token_id` | `int` | `-1` | End-of-sequence token ID (`-1` = use model default) |
 | `stop_token_ids` | `list[int]` | `[]` | Additional stop token IDs; populated from `GenerationConfig.eos_token_id` during init |
@@ -340,6 +341,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 -- 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |
+| `--lora-modules` | | `list[str]` | `None` | Static LoRA adapters loaded at startup; entries may be `name=path` or `path` and are applied to every request |
 
 **Example:**
 

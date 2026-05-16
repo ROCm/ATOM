@@ -15,6 +15,9 @@ from atom.utils.custom_register import direct_register_custom_op
 def is_rocm_aiter_fusion_shared_expert_enabled() -> bool:
     config = get_current_atom_config()
 
+    if getattr(config, "lora_modules", None):
+        return False
+
     quant_config = config.quant_config
 
     # Resolve actual dtypes for shared experts vs routed experts.

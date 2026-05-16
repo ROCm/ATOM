@@ -2714,6 +2714,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         "compressor.wgate": ("compressor.wkv_gate", 1),
         "shared_experts.w1": ("shared_experts.gate_up_proj", 0),
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
+        "shared_experts.down_proj": ("shared_experts.w2", None),
     }
 
     def __init__(self, config: Config, prefix: str = "") -> None:

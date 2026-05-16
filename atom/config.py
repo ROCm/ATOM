@@ -895,6 +895,7 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
+    lora_modules: Optional[list[str]] = None
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
@@ -1060,6 +1061,7 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(self.lora_modules)
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

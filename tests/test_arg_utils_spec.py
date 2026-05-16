@@ -64,3 +64,8 @@ class TestEngineArgsSpeculativeValidation:
             num_speculative_tokens=3,
         )
         assert kwargs["speculative_config"] is fake_spec_config
+
+    def test_lora_modules_pass_through_to_engine_kwargs(self):
+        args = EngineArgs(lora_modules=["adapter=/tmp/adapter"])
+        kwargs = args._get_engine_kwargs()
+        assert kwargs["lora_modules"] == ["adapter=/tmp/adapter"]

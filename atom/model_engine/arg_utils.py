@@ -53,6 +53,7 @@ class EngineArgs:
     kv_transfer_config: str = "{}"
     draft_model: Optional[str] = None
     mark_trace: bool = False
+    lora_modules: Optional[List[str]] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -218,6 +219,15 @@ class EngineArgs:
             "--mark-trace",
             action="store_true",
             help="Enable graph_marker nodes for tracing/profile instrumentation.",
+        )
+        parser.add_argument(
+            "--lora-modules",
+            nargs="*",
+            default=None,
+            help=(
+                "Static LoRA adapters to load at startup. Each entry may be "
+                "name=path or path. Loaded adapters are applied to every request."
+            ),
         )
 
         return parser
