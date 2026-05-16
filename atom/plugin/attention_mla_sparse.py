@@ -608,11 +608,12 @@ def sparse_attn_indexer_plugin_mode(
     has_decode = indexer_meta.num_decodes > 0
     has_prefill = indexer_meta.num_prefills > 0
     num_decode_tokens = indexer_meta.num_decode_tokens
+    num_actual_tokens = indexer_meta.num_actual_tokens
     kv_block_size = kv_cache.shape[1]
     preshuffle_cache = kv_block_size != 1
 
     if use_qk_rope_cache_fusion:
-        q_bf16 = q_input
+        q_bf16 = q_input[:num_actual_tokens]
         q_fp8 = torch.empty_like(q_bf16, dtype=dtypes.fp8)
         weights_out = torch.empty(
             weights.shape, device=weights.device, dtype=torch.float32
@@ -620,14 +621,14 @@ def sparse_attn_indexer_plugin_mode(
         indexer_qk_rope_quant_and_cache(
             q_bf16,
             q_fp8,
-            weights,
-            weights_out,
-            k,
+            weights[:num_actual_tokens],
+            weights_out[:num_actual_tokens],
+            k[:num_actual_tokens],
             kv_cache,
-            slot_mapping,
+            slot_mapping[:num_actual_tokens],
             k_norm_weight,
             k_norm_bias,
-            positions,
+            positions[:num_actual_tokens],
             cos_cache,
             sin_cache,
             k_norm_eps,
@@ -639,11 +640,11 @@ def sparse_attn_indexer_plugin_mode(
         )
         weights = weights_out
     else:
-        q_fp8 = q_input
+        q_fp8 = q_input[:num_actual_tokens]
         indexer_k_quant_and_cache(
-            k,
+            k[:num_actual_tokens],
             kv_cache,
-            slot_mapping,
+            slot_mapping[:num_actual_tokens],
             quant_block_size,
             scale_fmt,
             preshuffle=preshuffle_cache,
