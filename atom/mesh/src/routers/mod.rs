@@ -41,6 +41,9 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Get a reference to self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// Gracefully release router-owned resources during server shutdown.
+    async fn shutdown(&self) {}
+
     /// Route a health generate request
     async fn health_generate(&self, _req: Request<Body>) -> Response {
         (

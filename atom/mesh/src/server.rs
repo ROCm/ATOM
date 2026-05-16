@@ -44,7 +44,10 @@ use crate::{
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
-    routers::{conversations, parse, router_manager::RouterManager, tokenize, RouterTrait},
+    python::atom_standalone::AtomStandaloneRuntime,
+    routers::{
+        conversations, parse, router_manager::RouterManager, tokenize, RouterTrait,
+    },
     tokenizer::TokenizerRegistry,
 };
 #[derive(Clone)]
@@ -466,6 +469,7 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
+    pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
 }
 
 pub fn build_app(
@@ -607,7 +611,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
 
     let app_context = Arc::new(
-        AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
+        crate::app_context::AppContextBuilder::from_config(
+            config.router_config.clone(),
+            config.request_timeout_secs,
+        )
+        .await?
+        .atom_standalone_runtime(config.atom_standalone_runtime.clone())
+        .build()
+        .map_err(|e| e.to_string())?,
     );
 
     if config.prometheus_config.is_some() {
@@ -793,7 +804,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ]
     });
 
-    let app = build_app(app_state, config.max_payload_size, request_id_headers);
+    let app = build_app(app_state.clone(), config.max_payload_size, request_id_headers);
 
     // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
     let bind_addr = format!("{}:{}", config.host, config.port);
@@ -805,10 +816,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
+    let app_state_clone = app_state.clone();
     let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
     spawn(async move {
         shutdown_signal().await;
         handle_clone.graceful_shutdown(Some(grace_period));
+        app_state_clone.router.shutdown().await;
     });
 
     axum_server::bind(addr)
