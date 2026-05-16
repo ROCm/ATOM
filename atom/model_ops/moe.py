@@ -2477,6 +2477,17 @@ class FusedMoE(torch.nn.Module):
                 ),
                 dim=0,
             )
+        # In the DP-attn fallback path (dp>1, no MORI all2all), MoE runs
+        # after all_gather_with_padding, so the token dim can be dp_size times
+        # the per-rank max.
+        moe_max_num_tokens = atom_config.max_num_batched_tokens
+        if (
+            self.moe_parallel_config.dp_size > 1
+            and not self.moe_parallel_config.use_all2all_kernels
+            and atom_config.enable_dp_attention
+        ):
+            moe_max_num_tokens *= self.moe_parallel_config.dp_size
+
         if fuse_shared_experts and self.num_fused_shared_experts > 0:
             init_aiter_topK_meta_data(
                 n_routed_experts=self.global_num_experts,
@@ -2489,7 +2500,7 @@ class FusedMoE(torch.nn.Module):
                     if is_rocm_aiter_fuse_routed_scaling_factor()
                     else 1 / self.routed_scaling_factor
                 ),
-                max_num_tokens=atom_config.max_num_batched_tokens,
+                max_num_tokens=moe_max_num_tokens,
                 is_EP=self.use_ep,
             )
         if fuse_shared_experts:
@@ -2529,7 +2540,7 @@ class FusedMoE(torch.nn.Module):
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=atom_config.torch_dtype,
             a_quant_dtype=a_quant_dtype,
-            max_num_tokens=atom_config.max_num_batched_tokens,
+            max_num_tokens=moe_max_num_tokens,
             has_bias=self.has_bias,
             # is_act_and_mul=True,
             is_lora_enabled=False,
