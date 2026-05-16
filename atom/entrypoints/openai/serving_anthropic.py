@@ -67,8 +67,15 @@ def anthropic_to_openai_messages(
         if isinstance(system, str):
             result.append({"role": "system", "content": system})
         elif isinstance(system, list):
-            text_parts = [b["text"] for b in system if b.get("type") == "text"]
-            result.append({"role": "system", "content": "\n".join(text_parts)})
+            text_parts = []
+            for b in system:
+                if b.get("type") == "text":
+                    text = b["text"]
+                    if text.startswith("x-anthropic-billing-header"):
+                        continue
+                    text_parts.append(text)
+            if text_parts:
+                result.append({"role": "system", "content": "\n".join(text_parts)})
 
     for msg in messages:
         role = msg.role

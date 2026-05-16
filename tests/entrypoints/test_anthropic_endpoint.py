@@ -446,3 +446,23 @@ class TestAnthropicMessagesRequest:
         assert req.stream is True
         assert req.stop_sequences == ["STOP"]
         assert len(req.tools) == 1
+
+    def test_attribution_header_stripped(self):
+        system = [
+            {"type": "text", "text": "x-anthropic-billing-header: abc123"},
+            {"type": "text", "text": "You are helpful."},
+        ]
+        msgs = [AnthropicMessage(role="user", content="Hi")]
+        result = anthropic_to_openai_messages(msgs, system=system)
+        assert result[0]["role"] == "system"
+        assert "x-anthropic-billing-header" not in result[0]["content"]
+        assert "You are helpful." in result[0]["content"]
+
+    def test_attribution_header_only_system(self):
+        system = [
+            {"type": "text", "text": "x-anthropic-billing-header: xyz"},
+        ]
+        msgs = [AnthropicMessage(role="user", content="Hi")]
+        result = anthropic_to_openai_messages(msgs, system=system)
+        # No system message when all blocks are attribution headers
+        assert result[0]["role"] == "user"
