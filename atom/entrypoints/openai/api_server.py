@@ -47,6 +47,7 @@ from .serving_chat import (
 from .serving_anthropic import (
     AnthropicMessagesRequest,
     anthropic_to_openai_messages,
+    anthropic_to_openai_tools,
     build_anthropic_response,
     stream_content_block_delta,
     stream_content_block_start,
@@ -803,12 +804,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         messages = [ChatMessage(**m) for m in openai_messages]
 
+        openai_tools = anthropic_to_openai_tools(request.tools)
+
         merged_kwargs = dict(default_chat_template_kwargs)
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
             [msg.to_template_dict() for msg in messages],
-            tools=None,
+            tools=openai_tools,
             **merged_kwargs,
         )
 
