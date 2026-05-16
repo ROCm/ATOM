@@ -816,12 +816,29 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             temperature=request.temperature or 1.0,
             max_tokens=request.max_tokens,
             stop_strings=request.stop_sequences,
-            top_k=request.top_k,
-            top_p=request.top_p,
+            ignore_eos=False,
+            top_k=request.top_k if request.top_k is not None else -1,
+            top_p=request.top_p if request.top_p is not None else 1.0,
         )
 
         request_id = uuid.uuid4().hex[:24]
         input_tokens = len(tokenizer.encode(prompt))
+
+        max_ctx = getattr(engine, "max_model_len", None)
+        if max_ctx is None:
+            try:
+                max_ctx = engine.config.max_model_len
+            except AttributeError:
+                max_ctx = 16384
+        headroom = min(request.max_tokens, max_ctx // 2)
+        max_input = max_ctx - headroom
+        if input_tokens > max_input:
+            logger.warning(
+                f"Prompt too long ({input_tokens} > {max_input}), truncating"
+            )
+            token_ids = tokenizer.encode(prompt)[:max_input]
+            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
+            input_tokens = max_input
 
         if request.stream:
             # Streaming response
@@ -834,6 +851,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 from .tool_parser import ToolCallStreamParser
 
                 reasoning_filter = ReasoningFilter()
+                if prompt.rstrip().endswith("<think>"):
+                    reasoning_filter.state = 1
                 tool_parser = ToolCallStreamParser()
                 block_index = 0
                 started_text = False
@@ -871,78 +890,97 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                 )
                             else:
                                 # Phase 2: Tool call detection on content
-                                tool_parser.process(text)
-                                content_text = tool_parser.get_content()
-                                tool_calls = tool_parser.get_tool_calls()
-
-                                if content_text:
-                                    if started_thinking and not started_text:
+                                events = tool_parser.process(text)
+                                for etype, edata in events:
+                                    if etype == "content":
+                                        if started_thinking and not started_text:
+                                            yield stream_content_block_stop(
+                                                block_index
+                                            )
+                                            block_index += 1
+                                        if not started_text:
+                                            yield stream_content_block_start(
+                                                block_index, "text"
+                                            )
+                                            started_text = True
+                                        yield stream_content_block_delta(
+                                            block_index, edata, "text"
+                                        )
+                                    elif etype == "tool_call_start":
+                                        has_tool_calls = True
+                                        stop_reason = "tool_use"
+                                        if started_text:
+                                            yield stream_content_block_stop(
+                                                block_index
+                                            )
+                                            block_index += 1
+                                            started_text = False
+                                        elif started_thinking:
+                                            yield stream_content_block_stop(
+                                                block_index
+                                            )
+                                            block_index += 1
+                                            started_thinking = False
+                                        fn = edata.get("function", {})
+                                        yield stream_content_block_start(
+                                            block_index,
+                                            "tool_use",
+                                            tool_use_id=edata.get("id", ""),
+                                            tool_name=fn.get("name", ""),
+                                        )
+                                    elif etype == "tool_call_args":
+                                        fn = edata.get("function", {})
+                                        yield stream_content_block_delta(
+                                            block_index,
+                                            fn.get("arguments", ""),
+                                            "tool_use",
+                                        )
+                                    elif etype == "tool_call_end":
                                         yield stream_content_block_stop(block_index)
                                         block_index += 1
+
+                        if finished:
+                            # Flush remaining tool call events
+                            for etype, edata in tool_parser.flush():
+                                if etype == "content":
                                     if not started_text:
+                                        if started_thinking:
+                                            yield stream_content_block_stop(
+                                                block_index
+                                            )
+                                            block_index += 1
+                                            started_thinking = False
                                         yield stream_content_block_start(
                                             block_index, "text"
                                         )
                                         started_text = True
                                     yield stream_content_block_delta(
-                                        block_index, content_text, "text"
+                                        block_index, edata, "text"
                                     )
-
-                                if tool_calls:
+                                elif etype == "tool_call_start":
                                     has_tool_calls = True
                                     stop_reason = "tool_use"
-                                    # Close text block if open
                                     if started_text:
-                                        yield stream_content_block_stop(block_index)
+                                        yield stream_content_block_stop(
+                                            block_index
+                                        )
                                         block_index += 1
                                         started_text = False
-                                    elif started_thinking and not started_text:
-                                        yield stream_content_block_stop(block_index)
-                                        block_index += 1
-                                        started_thinking = False
-                                    for tc in tool_calls:
-                                        args = tc.function.get("arguments", "{}")
-                                        yield stream_content_block_start(
-                                            block_index,
-                                            "tool_use",
-                                            tool_use_id=tc.id,
-                                            tool_name=tc.function.get("name", ""),
-                                        )
-                                        yield stream_content_block_delta(
-                                            block_index,
-                                            json.dumps(args),
-                                            "tool_use",
-                                        )
-                                        yield stream_content_block_stop(block_index)
-                                        block_index += 1
-
-                        if finished:
-                            # Flush remaining tool calls
-                            remaining = tool_parser.flush()
-                            if remaining:
-                                has_tool_calls = True
-                                stop_reason = "tool_use"
-                                if started_text:
-                                    yield stream_content_block_stop(block_index)
-                                    block_index += 1
-                                    started_text = False
-                                for tc in remaining:
-                                    args = (
-                                        tc.function.get("arguments", "{}")
-                                        if False
-                                        else {}
-                                    )
+                                    fn = edata.get("function", {})
                                     yield stream_content_block_start(
                                         block_index,
                                         "tool_use",
-                                        tool_use_id=tc.id,
-                                        tool_name=tc.function.get("name", ""),
+                                        tool_use_id=edata.get("id", ""),
+                                        tool_name=fn.get("name", ""),
                                     )
+                                elif etype == "tool_call_args":
+                                    fn = edata.get("function", {})
                                     yield stream_content_block_delta(
                                         block_index,
-                                        json.dumps(args),
+                                        fn.get("arguments", ""),
                                         "tool_use",
                                     )
+                                elif etype == "tool_call_end":
                                     yield stream_content_block_stop(block_index)
                                     block_index += 1
 
@@ -958,7 +996,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             yield stream_message_stop()
                             break
                 finally:
-                    cleanup_streaming_request(seq_id)
+                    cleanup_streaming_request(request_id, seq_id)
 
             return StreamingResponse(
                 generate_anthropic_stream(),
