@@ -10,12 +10,14 @@ set -uo pipefail
 
 echo "=== Stopping ATOM server ==="
 
-# Patterns matching every process the server can spawn.
+# Patterns matching every process the server can spawn AND clients hammering
+# it (lm_eval) so the next launch starts from a fully clean state.
 PATTERNS=(
     'atom.entrypoints'
     'multiprocessing.spawn'
     'multiprocessing.resource_tracker'
     'atom.model_engine'
+    'lm_eval'
 )
 
 count_alive() {

@@ -48,7 +48,11 @@ from atom.model_ops.attentions.backends import (
     CommonAttentionBuilder,
 )
 from atom.utils import CpuGpuBuffer
-from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils.forward_context import (
+    AttentionMetaData,
+    Context,
+    get_forward_context,
+)
 
 # ---------------------------------------------------------------------------
 # Typed metadata surface for V4. The base AttentionMetaData class is shared
@@ -853,6 +857,101 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "cu_starts_gpu": seq_base_per_token_gpu,  # alias for fp8_mqa_logits
             "cu_ends_gpu": cu_ends_gpu,
         }
+
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor = None,
+    ):
+        """Per-draft-step V4 region metadata rebuild for 1-token-per-seq shape.
+
+        Called by EagleProposer.propose at mid-step iters (i < mtp_k - 1).
+        Eagle has already bumped attn_metadata.context_lens GPU by +1 and
+        max_seqlen_k by +1 before calling us. We mirror the +1 on CPU (zero
+        D2H: structural invariant of eagle's loop) and rebuild
+        v4_kv_indices_{swa,csa,hca}, batch_id_per_token, n_committed_csa_per_seq,
+        window_topk, indexer meta, and compress_plans.
+
+        ``only_update`` / ``num_reject_tokens`` are MLA-specific (no V4
+        analog — V4 has no incremental-update kernel and the ctx rollback
+        is already applied at the top of prepare_decode for the verify
+        shape). Ignored.
+        """
+        # `max_per_req_cache_slots` is set inside `model_runner.get_num_blocks`,
+        # which runs AFTER `warmup_model`. The full per-fwd meta rebuild below
+        # eventually reads it via `_attach_v4_paged_decode_meta`, so during
+        # warmup (attr unset) we no-op — warmup discards draft output anyway,
+        # and the verify-shape attn_metadata from the main forward stays valid
+        # for the rest of eagle.propose.
+        if not getattr(self.model_runner, "max_per_req_cache_slots", 0):
+            return {}
+
+        var = self.model_runner.forward_vars
+        attn_metadata = get_forward_context().attn_metadata
+
+        # 1. CPU mirror of eagle's GPU `context_lens[:bs] += 1` bump. Zero
+        #    D2H: we know the offset by construction (+1 per call).
+        var["context_lens"].np[:bs] += 1
+        context_lens_np = var["context_lens"].np[:bs]
+
+        # 2. 1-token-per-seq shape: positions = ctx-1, cu_seqlens_q = arange.
+        positions_np = (context_lens_np - 1).astype(np.int32)
+        cu_seqlens_q_np = np.arange(bs + 1, dtype=np.int32)
+        var["positions"].np[:bs] = positions_np
+        var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q_np
+
+        # 3. H2D-only staging on prep_stream (mirrors prepare_decode pattern).
+        prep_stream = self.prep_stream
+        current_stream = torch.cuda.current_stream()
+        prep_stream.wait_stream(current_stream)
+        with torch.cuda.stream(prep_stream):
+            positions_gpu = var["positions"].copy_to_gpu(bs)
+            var["cu_seqlens_q"].copy_to_gpu(bs + 1)
+            # context_lens already correct on GPU (eagle bumped it);
+            # CPU is now mirrored.
+        current_stream.wait_stream(prep_stream)
+
+        # 4. CPU numpy: extend_lens (=1 per seq) and start_pos.
+        start_pos_per_seq_cpu = positions_np.astype(np.int64)
+        extend_lens_np = np.ones(bs, dtype=np.int32)
+
+        # 5. Rebuild V4 region metadata via existing helpers (numpy + H2D,
+        #    no D2H — `_build_compress_plans` only triggers `.cpu()` when
+        #    given torch tensors; we pass numpy below).
+        self._attach_v4_per_fwd_meta(
+            attn_metadata,
+            positions_np,
+            cu_seqlens_q_np,
+            start_pos_per_seq_cpu,
+            state_slot_mapping_cpu=attn_metadata.state_slot_mapping_cpu,
+            scheduled_bs=bs,
+            total_tokens=bs,
+            padded_bs=bs,
+            max_q_len=1,
+        )
+        self._attach_v4_indexer_meta(
+            attn_metadata,
+            cu_seqlens_q_np,
+            start_pos_per_seq_cpu,
+            scheduled_bs=bs,
+            total_tokens=bs,
+            positions_gpu=positions_gpu,
+        )
+
+        # 6. Compress plans for state-ring write of each new draft token.
+        attn_metadata.compress_plans = self._build_compress_plans(
+            extend_lens_np,
+            context_lens_np,
+            torch.device(self.device),
+            for_decode_cg=True,
+        )
+
+        # All updates done in-place on attn_metadata; eagle's
+        # `for k, v in workinfos.items(): __dict__[k] = v` loop is a no-op.
+        return {}
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         """V4-style decode prep: populates positions, cu_seqlens_q,

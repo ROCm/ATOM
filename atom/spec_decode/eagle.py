@@ -364,6 +364,13 @@ class EagleProposer:
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
 
+        # Backends that expose flat per-seq kv_indices/kv_indptr (MLA, MHA)
+        # wire them through eagle's mid-step block; V4 has block_tables +
+        # context_lens instead (its v4_kv_indices_{swa,csa,hca} are per-token
+        # non-equivalent). Hoisted out of the loop so the value is bound for
+        # every iteration (used at i>=1 too, even though i==0 sets it).
+        has_flat_kv = "kv_indices" in var
+
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
                 model_output = self.model(
@@ -398,16 +405,17 @@ class EagleProposer:
                     if i == 0:
                         i0_max_seqlen_q = attn_metadata.max_seqlen_q
                         attn_metadata.max_seqlen_q = 1
-                        kv_indptr = var["kv_indptr"].gpu[: bs + 1]
-                        kv_indices = var["kv_indices"].gpu
                         slot_mapping = var["slot_mapping"].gpu[
                             : bs * attn_metadata.max_seqlen_q
                         ]
                         cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
-                        attn_metadata.kv_indptr = kv_indptr
-                        attn_metadata.kv_indices = kv_indices
                         attn_metadata.cu_seqlens_q = cu_seqlens_q
                         attn_metadata.slot_mapping = slot_mapping
+                        if has_flat_kv:
+                            kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+                            kv_indices = var["kv_indices"].gpu
+                            attn_metadata.kv_indptr = kv_indptr
+                            attn_metadata.kv_indices = kv_indices
                         if target_uses_mla:
                             kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
                             attn_metadata.kv_last_page_lens = kv_last_page_lens
@@ -420,7 +428,7 @@ class EagleProposer:
                                 "sparse_kv_indptr"
                             ].gpu[: bs + 1]
                         cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
-                        if target_uses_mla:
+                        if target_uses_mla and has_flat_kv:
                             # MLA: block_size=1, kv_indptr tracks tokens
                             kv_indptr[1 : bs + 1] -= torch.cumsum(
                                 num_reject_tokens, dim=0
@@ -446,7 +454,12 @@ class EagleProposer:
                     )
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
-                    slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
+                    if has_flat_kv:
+                        # MLA/MHA path: slot derived from flat kv_indices.
+                        # V4 doesn't expose flat kv_indices and its kernels
+                        # don't read attn_metadata.slot_mapping (state-ring +
+                        # swa_write_indices instead), so the update is skipped.
+                        slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
                     positions += 1

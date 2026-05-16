@@ -2,32 +2,29 @@
 # Run ATOM offline simple_inference for any registered model.
 # Usage: bash start_simple_inference.sh [MODEL_PATH] [TP_SIZE] [EXTRA_ARGS...]
 #
+# All engine flags (kv_cache_dtype, max_num_seqs, max_model_len, gpu mem util,
+# spec method, …) go in EXTRA_ARGS as native CLI args — no env-var translation.
+# Only LOG_FILE and true env vars (ATOM_*, AITER_*, HSA_*, HIP_*) remain
+# overridable via env.
+#
 # Examples:
 #   bash start_simple_inference.sh                                     # default DeepSeek-R1-0528 tp=8
-#   bash start_simple_inference.sh /data/Llama-3.1-8B-Instruct-FP8-KV 1
-#   bash start_simple_inference.sh /data/DeepSeek-V4-Pro 8 --enforce-eager
-#   bash start_simple_inference.sh /data/DeepSeek-V4-Pro 8 --enforce-eager --temperature 0.0
+#   bash start_simple_inference.sh /data/Llama-3.1-8B-Instruct-FP8-KV 1 --kv_cache_dtype fp8
+#   bash start_simple_inference.sh /data/DeepSeek-V4-Pro 8 --kv_cache_dtype fp8 --enforce-eager --level 0
+#   bash start_simple_inference.sh /data/DeepSeek-V4-Pro 8 \
+#       --kv_cache_dtype fp8 --enforce-eager --level 0 \
+#       --method mtp --num-speculative-tokens 3
+#   MAX_MODEL_LEN=1024 ...  # ← no longer supported; pass --max-model-len 1024 instead
 #
-# Override defaults via env vars (MAX_NUM_SEQS / MAX_MODEL_LEN /
-# MAX_BATCHED_TOKENS unset → use simple_inference's own native defaults):
-#   KV_CACHE_DTYPE=fp8 MAX_NUM_SEQS=4 MAX_MODEL_LEN=2048 bash start_simple_inference.sh ...
+# DeepSeek-V4 must also export ATOM_USE_TRITON_MOE=1 (real env var, not a CLI flag).
 
 set -euo pipefail
 
 MODEL_PATH="${1:-/data/DeepSeek-R1-0528}"
 TP_SIZE="${2:-8}"
 shift 2 2>/dev/null || true
-EXTRA_ARGS="$*"
+EXTRA_ARGS=("$@")
 
-KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
-# MAX_NUM_SEQS / MAX_MODEL_LEN / MAX_BATCHED_TOKENS default to model native
-# (unset → simple_inference's own defaults). Override via env vars when you
-# want a tighter shape — e.g. for fast smoke (`MAX_MODEL_LEN=1024`) or to
-# force OOM on a small fp16 model.
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
-MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 LOG_FILE="${LOG_FILE:-/app/logs_claude/simple_inference.log}"
 
 export AITER_LOG_LEVEL="${AITER_LOG_LEVEL:-INFO}"
@@ -99,35 +96,20 @@ echo " ATOM simple_inference Launcher"
 echo "========================================"
 echo " Model:           $MODEL_PATH"
 echo " TP Size:         $TP_SIZE"
-echo " KV Cache dtype:  $KV_CACHE_DTYPE"
-echo " Max num seqs:    ${MAX_NUM_SEQS:-default}"
-echo " Max model len:   ${MAX_MODEL_LEN:-default}"
-echo " Max batched tok: ${MAX_BATCHED_TOKENS:-default}"
-echo " GPU mem util:    $GPU_MEM_UTIL"
-echo " Extra args:      ${EXTRA_ARGS:-none}"
+echo " Extra args:      ${EXTRA_ARGS[*]:-none}"
 echo " Date:            $(date)"
 echo "----------------------------------------"
 echo " Inherited env vars (ATOM_*, V4_*, AITER_*, HSA_*, AMD_*, HIP_*):"
-env | grep -E '^(ATOM_|V4_|AITER_|HSA_|AMD_|HIP_|KV_CACHE|MAX_NUM_SEQS|MAX_MODEL_LEN|MAX_BATCHED_TOKENS|GPU_MEM_UTIL)' \
+env | grep -E '^(ATOM_|V4_|AITER_|HSA_|AMD_|HIP_)' \
   | sort | sed 's/^/   /' || echo "   (none set)"
 echo "========================================"
 } | tee "$LOG_FILE"
 
-# Build optional flags only when caller set the matching env var.
-# Empty values would otherwise become positional args and crash argparse.
-OPT_FLAGS=()
-[ -n "$MAX_NUM_SEQS" ]      && OPT_FLAGS+=(--max-num-seqs "$MAX_NUM_SEQS")
-[ -n "$MAX_BATCHED_TOKENS" ] && OPT_FLAGS+=(--max-num-batched-tokens "$MAX_BATCHED_TOKENS")
-[ -n "$MAX_MODEL_LEN" ]     && OPT_FLAGS+=(--max-model-len "$MAX_MODEL_LEN")
-
 set +e
 python -m atom.examples.simple_inference \
     --model "$MODEL_PATH" \
-    --kv_cache_dtype "$KV_CACHE_DTYPE" \
     -tp "$TP_SIZE" \
-    --gpu-memory-utilization "$GPU_MEM_UTIL" \
-    "${OPT_FLAGS[@]}" \
-    $EXTRA_ARGS \
+    "${EXTRA_ARGS[@]}" \
     >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 set -e
