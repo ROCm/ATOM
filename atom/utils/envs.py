@@ -62,6 +62,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
     ),
+    # gfx1201/RDNA4: quantize BF16 lm_head weights once and run the logits
+    # projection through Triton gemm_a8w8. Set to 0 to force the BF16 tgemm path.
+    "ATOM_GFX1201_LM_HEAD_FP8": lambda: (
+        os.getenv("ATOM_GFX1201_LM_HEAD_FP8", "1") == "1"
+    ),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",

@@ -17,6 +17,17 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+from aiter.ops.triton.normalization.rmsnorm import (
+    # rmsnorm_forward_inference: lean variant that skips the autograd Function
+    # wrapper used by rms_norm(). Saves ~125 us/call which is significant for
+    # Qwen3 q_norm/k_norm (dim=128) called per layer per token.
+    rmsnorm_forward_inference as _aiter_triton_rms_norm,
+    # _rmsnorm_forward_with_add is the lean variant matching
+    # rmsnorm2d_fwd_with_add but without the autograd Function wrapper.
+    # Underscore-prefixed but exposed at the module level alongside the public
+    # API; we use it for the same Python-overhead reason as above.
+    _rmsnorm_forward_with_add as _aiter_triton_rmsnorm_with_add,
+)
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
@@ -51,12 +62,26 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
     return torch._C._nn.silu(input)
 
 
+def _detect_gfx1201() -> bool:
+    try:
+        return (torch.cuda.get_device_properties(0).gcnArchName or "").startswith(
+            "gfx1201"
+        )
+    except Exception:
+        return False
+
+
+_IS_GFX1201: bool = _detect_gfx1201()
+
+
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
 ) -> torch.Tensor:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
+    if _IS_GFX1201:
+        return _aiter_triton_rms_norm(x, weight, eps).view(ori_shape)
     return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
 
 
@@ -66,6 +91,14 @@ def rmsnorm2d_fwd_with_add_(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
+    if _IS_GFX1201:
+        res_in = residual.reshape(-1, dim)
+        out = torch.empty_like(x)
+        res_out = torch.empty_like(res_in)
+        # rsigma is required by the kernel API but unused in inference
+        rsigma = torch.empty(x.shape[0], dtype=torch.float32, device=x.device)
+        _aiter_triton_rmsnorm_with_add(out, x, res_in, res_out, weight, rsigma, eps)
+        return out.view(ori_shape), res_out.view(ori_shape)
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
     rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
