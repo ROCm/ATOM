@@ -1053,7 +1053,6 @@ class MooncakeConnector(KVConnectorBase):
         # Phase 2b: compressor states via staging buffer (182 → 1)
         producer_pool_idx = -1
         consumer_staging_addr = request_data.get("consumer_staging_addr", 0)
-        consumer_staging_bytes = request_data.get("consumer_staging_bytes", 0)
         if self._gather_slot is not None and consumer_staging_addr:
             producer_pool_idx = self._acquire_staging_slot()
             self._gather_slot(src_slot, producer_pool_idx)
