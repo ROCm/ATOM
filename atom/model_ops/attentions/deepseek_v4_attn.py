@@ -35,6 +35,7 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
   Total                                      = ~26.5 MB / slot
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Type, cast
 
@@ -525,29 +526,54 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             )
 
+        # ---- Compressor state tensors (compute-contiguous) ------------------
+        csa_main_kv = self._zero_state(
+            (n_csa, num_slots, *self.csa_main_state_shape), device
+        )
+        csa_main_score = self._neg_inf_state(
+            (n_csa, num_slots, *self.csa_main_state_shape), device
+        )
+        csa_idx_kv = self._zero_state(
+            (n_csa, num_slots, *self.csa_idx_state_shape), device
+        )
+        csa_idx_score = self._neg_inf_state(
+            (n_csa, num_slots, *self.csa_idx_state_shape), device
+        )
+        hca_main_kv = self._zero_state(
+            (n_hca, num_slots, *self.hca_main_state_shape), device
+        )
+        hca_main_score = self._neg_inf_state(
+            (n_hca, num_slots, *self.hca_main_state_shape), device
+        )
+
+        # ---- RDMA staging pool, for RDMA performance ---------------------
+        state_tensors = [
+            csa_main_kv,
+            csa_main_score,
+            csa_idx_kv,
+            csa_idx_score,
+            hca_main_kv,
+            hca_main_score,
+        ]
+        state_slot_stride = sum(t[0, 0].numel() * t.shape[0] for t in state_tensors)
+        pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "8"))
+        state_pool = torch.zeros(
+            pool_size * state_slot_stride,
+            dtype=self._state_dtype,
+            device=device,
+        )
+
         return {
             "v4_unified_kv": unified_kv,
-            # CSA Main Compressor state.
-            "v4_csa_main_kv_state": self._zero_state(
-                (n_csa, num_slots, *self.csa_main_state_shape), device
-            ),
-            "v4_csa_main_score_state": self._neg_inf_state(
-                (n_csa, num_slots, *self.csa_main_state_shape), device
-            ),
-            # CSA Indexer's inner Compressor.
-            "v4_csa_idx_kv_state": self._zero_state(
-                (n_csa, num_slots, *self.csa_idx_state_shape), device
-            ),
-            "v4_csa_idx_score_state": self._neg_inf_state(
-                (n_csa, num_slots, *self.csa_idx_state_shape), device
-            ),
-            # HCA Main Compressor.
-            "v4_hca_main_kv_state": self._zero_state(
-                (n_hca, num_slots, *self.hca_main_state_shape), device
-            ),
-            "v4_hca_main_score_state": self._neg_inf_state(
-                (n_hca, num_slots, *self.hca_main_state_shape), device
-            ),
+            "v4_csa_main_kv_state": csa_main_kv,
+            "v4_csa_main_score_state": csa_main_score,
+            "v4_csa_idx_kv_state": csa_idx_kv,
+            "v4_csa_idx_score_state": csa_idx_score,
+            "v4_hca_main_kv_state": hca_main_kv,
+            "v4_hca_main_score_state": hca_main_score,
+            "v4_state_pool": state_pool,
+            "v4_state_pool_size": pool_size,
+            "v4_state_slot_stride": state_slot_stride,
         }
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -676,6 +702,98 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return None
 
         return super().build_kv_cache_tensor(layer_id, module)
+
+    def get_kv_transfer_tensors(self):
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferRegion,
+            KVTransferTensors,
+        )
+
+        runner = self.model_runner
+        if not hasattr(runner, "v4_unified_kv"):
+            return None
+
+        num_slots = runner.max_per_req_cache_slots
+        swa_pages = num_slots * self.window_size
+        elem_bf16 = 2
+        elem_fp32 = 4
+
+        block_regions: list[KVTransferRegion] = []
+        slot_regions: list[KVTransferRegion] = []
+
+        # Block regions: compress tail per layer
+        for layer_id in range(self.num_layers):
+            uv = runner.v4_unified_kv[layer_id]
+            compress_base = uv.data_ptr() + swa_pages * self.head_dim * elem_bf16
+            compress_total = (
+                uv.numel() * elem_bf16 - swa_pages * self.head_dim * elem_bf16
+            )
+            if compress_total <= 0:
+                continue
+            ratio = self.compress_ratios[layer_id]
+            if ratio == 4:
+                bpb = self.k1_csa * self.head_dim * elem_bf16
+            elif ratio == 128:
+                bpb = self.k2_hca * self.head_dim * elem_bf16
+            else:
+                continue
+            block_regions.append(KVTransferRegion(compress_base, compress_total, bpb))
+
+        # Block regions: CSA Indexer KV (FP8)
+        for pos in range(len(self.csa_layers)):
+            t = runner.v4_csa_idx_kv[pos]
+            bpb = self.k1_csa * self._aligned_index_dim
+            block_regions.append(
+                KVTransferRegion(t.data_ptr(), t.numel() * t.element_size(), bpb)
+            )
+
+        # Slot regions: SWA per layer
+        swa_slot_bytes = self.window_size * self.head_dim * elem_bf16
+        for layer_id in range(self.num_layers):
+            uv = runner.v4_unified_kv[layer_id]
+            slot_regions.append(
+                KVTransferRegion(
+                    uv.data_ptr(),
+                    swa_pages * self.head_dim * elem_bf16,
+                    swa_slot_bytes,
+                )
+            )
+
+        # Staging pool for compressor states (not in slot_regions — managed
+        # separately by the connector with pool acquire/release).
+        staging_region = None
+        gather_slot = None
+        scatter_slot = None
+        if hasattr(runner, "v4_state_pool"):
+            pool = runner.v4_state_pool
+            stride = runner.v4_state_slot_stride
+            pool_size = runner.v4_state_pool_size
+            staging_region = KVTransferRegion(
+                pool.data_ptr(),
+                pool.numel() * elem_fp32,
+                stride * elem_fp32,
+            )
+            state_tensors = [
+                runner.v4_csa_main_kv_state,
+                runner.v4_csa_main_score_state,
+                runner.v4_csa_idx_kv_state,
+                runner.v4_csa_idx_score_state,
+                runner.v4_hca_main_kv_state,
+                runner.v4_hca_main_score_state,
+            ]
+            gather_slot = self._make_gather_slot(pool, stride, state_tensors)
+            scatter_slot = self._make_scatter_slot(pool, stride, state_tensors)
+
+        return KVTransferTensors(
+            block_regions=block_regions,
+            slot_regions=slot_regions,
+            num_blocks=runner.num_physical_kvcache_blocks,
+            num_slots=num_slots,
+            staging_region=staging_region,
+            staging_pool_size=pool_size if staging_region else 0,
+            gather_slot=gather_slot,
+            scatter_slot=scatter_slot,
+        )
 
     # ------------------------------------------------------------------ #
     # CommonAttentionBuilder abstract methods (V4 forward consumes only  #
@@ -2251,6 +2369,66 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         for s in shape:
             n *= s
         return n
+
+    @staticmethod
+    def _contiguous_strides(shape: tuple) -> tuple:
+        strides = []
+        acc = 1
+        for s in reversed(shape):
+            strides.append(acc)
+            acc *= s
+        return tuple(reversed(strides))
+
+    @staticmethod
+    def _make_gather_slot(
+        buf: torch.Tensor,
+        stride: int,
+        state_tensors: list[torch.Tensor],
+    ):
+        """Return a callable that copies compute tensors → staging buffer for one slot."""
+        offsets_and_sizes = []
+        off = 0
+        for t in state_tensors:
+            n_layers = t.shape[0]
+            per_layer = t[0, 0].numel()
+            total = n_layers * per_layer
+            offsets_and_sizes.append((off, n_layers, per_layer))
+            off += total
+        assert off == stride
+
+        def gather_slot(compute_slot: int, pool_idx: int) -> None:
+            dst_start = pool_idx * stride
+            for t, (off, n_layers, per_layer) in zip(state_tensors, offsets_and_sizes):
+                buf[dst_start + off : dst_start + off + n_layers * per_layer] = t[
+                    :, compute_slot
+                ].reshape(-1)
+
+        return gather_slot
+
+    @staticmethod
+    def _make_scatter_slot(
+        buf: torch.Tensor,
+        stride: int,
+        state_tensors: list[torch.Tensor],
+    ):
+        """Return a callable that copies staging buffer → compute tensors for one slot."""
+        offsets_and_sizes = []
+        off = 0
+        for t in state_tensors:
+            n_layers = t.shape[0]
+            per_layer = t[0, 0].numel()
+            total = n_layers * per_layer
+            offsets_and_sizes.append((off, n_layers, per_layer))
+            off += total
+        assert off == stride
+
+        def scatter_slot(compute_slot: int, pool_idx: int) -> None:
+            src_start = pool_idx * stride
+            for t, (off, n_layers, per_layer) in zip(state_tensors, offsets_and_sizes):
+                chunk = buf[src_start + off : src_start + off + n_layers * per_layer]
+                t[:, compute_slot] = chunk.view(t[:, compute_slot].shape)
+
+        return scatter_slot
 
     def _zero_state(self, shape: tuple, device) -> torch.Tensor:
         return torch.zeros(shape, dtype=self._state_dtype, device=device)

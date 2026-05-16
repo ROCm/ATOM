@@ -498,7 +498,9 @@ def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> An
 
 
 def set_kv_cache_data(
-    kv_cache_data: dict[int, KVCacheTensor], config: Optional[Config] = None
+    kv_cache_data: dict[int, KVCacheTensor],
+    config: Optional[Config] = None,
+    transfer_tensors: Any = None,
 ) -> None:
     """Register KV cache data globally and with the KV connector if enabled."""
     global _forward_kv_cache_context
@@ -506,6 +508,6 @@ def set_kv_cache_data(
     if hasattr(config, "kv_transfer_config") and config.kv_transfer_config:
         connector = get_kvconnector(config=config)
         if connector is not None:
-            connector.register_kv_caches(kv_cache_data)
+            connector.register_kv_caches(kv_cache_data, transfer_tensors)
 
     _forward_kv_cache_context.kv_cache_data = kv_cache_data

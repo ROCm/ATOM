@@ -3,7 +3,10 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, Optional, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
+
+if TYPE_CHECKING:
+    from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
@@ -134,6 +137,19 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         `mamba_k_cache` / `mamba_v_cache`).
         """
         return {}
+
+    def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
+        """Return RDMA transfer regions for PD disaggregation.
+
+        Each attention backend overrides this to describe its block-indexed
+        and slot-indexed tensor regions.  The KV connector uses the result
+        to register RDMA memory and compute transfer offsets without knowing
+        the backend's internal layout.
+
+        Returns ``None`` when KV transfer is not configured or tensors have
+        not been allocated yet.
+        """
+        return None
 
     def compute_block_bytes(self) -> int:
         """Per-block bytes contributed by this attention type's primary KV

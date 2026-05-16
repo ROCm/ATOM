@@ -587,6 +587,47 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             v_scale=None,
         )
 
+    def get_kv_transfer_tensors(self):
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferRegion,
+            KVTransferTensors,
+        )
+
+        runner = self.model_runner
+        if not hasattr(runner, "kv_cache"):
+            return None
+
+        block_regions: list[KVTransferRegion] = []
+        num_layers = runner.kv_cache.shape[0]
+        for layer_id in range(num_layers):
+            t = runner.kv_cache[layer_id]
+            bpb = t.stride(0) * t.element_size()
+            block_regions.append(
+                KVTransferRegion(
+                    base_addr=t.data_ptr(),
+                    total_bytes=t.numel() * t.element_size(),
+                    unit_bytes=bpb,
+                )
+            )
+
+        if hasattr(runner, "index_cache"):
+            for layer_id in range(runner.index_cache.shape[0]):
+                t = runner.index_cache[layer_id]
+                bpb = t.stride(0) * t.element_size()
+                block_regions.append(
+                    KVTransferRegion(
+                        base_addr=t.data_ptr(),
+                        total_bytes=t.numel() * t.element_size(),
+                        unit_bytes=bpb,
+                    )
+                )
+
+        return KVTransferTensors(
+            block_regions=block_regions,
+            slot_regions=[],
+            num_blocks=runner.num_physical_kvcache_blocks,
+        )
+
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
         bs = batch.total_seqs_num_prefill
