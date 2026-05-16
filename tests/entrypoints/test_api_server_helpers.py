@@ -13,6 +13,7 @@ rather than block the rest of the suite.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from types import SimpleNamespace
@@ -195,6 +196,29 @@ class TestStreamDecodeDelta:
         assert 11 not in fake_engine.io_processor.requests
         assert 12 in fake_engine.io_processor.requests
 
+    def test_logged_stream_with_cleanup_cleans_when_closed(self, monkeypatch):
+        async def run_stream():
+            async def source():
+                yield 'data: {"ok": true}\n\n'
+                await asyncio.Event().wait()
+
+            stream = api_server._logged_stream_with_cleanup(source(), "req-a", [11])
+            assert await anext(stream) == 'data: {"ok": true}\n\n'
+            await stream.aclose()
+
+        fake_engine = SimpleNamespace(
+            io_processor=SimpleNamespace(requests={11: "seq-a"})
+        )
+        monkeypatch.setattr(api_server, "engine", fake_engine)
+        api_server._stream_decode_states["req-a"] = {0: {}}
+        api_server._stream_queues["req-a"] = asyncio.Queue()
+
+        asyncio.run(run_stream())
+
+        assert "req-a" not in api_server._stream_decode_states
+        assert "req-a" not in api_server._stream_queues
+        assert 11 not in fake_engine.io_processor.requests
+
 
 class TestBuildSamplingParams:
     """``_build_sampling_params`` threads ``n`` into SamplingParams."""
@@ -234,7 +258,10 @@ class TestResponsesRoute:
 
     def test_responses_route_exists(self):
         routes = {
-            (tuple(sorted(getattr(route, "methods", []) or [])), getattr(route, "path", ""))
+            (
+                tuple(sorted(getattr(route, "methods", []) or [])),
+                getattr(route, "path", ""),
+            )
             for route in api_server.app.routes
         }
         assert (("POST",), "/v1/responses") in routes

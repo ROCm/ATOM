@@ -53,7 +53,12 @@ def test_stream_responses_response_emits_text_events_and_done_marker():
         queue = asyncio.Queue()
         await queue.put({"text": "Hello", "token_ids": [1], "finished": False})
         await queue.put(
-            {"text": " world", "token_ids": [2], "finished": True, "finish_reason": "stop"}
+            {
+                "text": " world",
+                "token_ids": [2],
+                "finished": True,
+                "finish_reason": "stop",
+            }
         )
         cleaned = []
 
@@ -84,7 +89,11 @@ def test_stream_responses_response_emits_text_events_and_done_marker():
     assert event_types[-1] == "[DONE]"
     assert cleaned == [("resp-stream", 42)]
 
-    completed = next(event for event in events if event != "[DONE]" and event["type"] == "response.completed")
+    completed = next(
+        event
+        for event in events
+        if event != "[DONE]" and event["type"] == "response.completed"
+    )
     assert completed["response"]["output_text"] == "Hello world"
     assert completed["response"]["usage"] == {
         "input_tokens": 2,
@@ -97,7 +106,11 @@ def test_stream_responses_response_keeps_reasoning_and_text_indices_stable():
     async def collect_events():
         queue = asyncio.Queue()
         await queue.put(
-            {"text": "<think>reason</think>answer", "token_ids": [1, 2], "finished": True}
+            {
+                "text": "<think>reason</think>answer",
+                "token_ids": [1, 2],
+                "finished": True,
+            }
         )
         return [
             _decode_sse_event(chunk)
@@ -113,10 +126,18 @@ def test_stream_responses_response_keeps_reasoning_and_text_indices_stable():
         ]
 
     events = [event for event in asyncio.run(collect_events()) if event != "[DONE]"]
-    reasoning_delta = next(event for event in events if event["type"] == "response.reasoning_text.delta")
-    reasoning_done = next(event for event in events if event["type"] == "response.reasoning_text.done")
-    text_delta = next(event for event in events if event["type"] == "response.output_text.delta")
-    text_done = next(event for event in events if event["type"] == "response.output_text.done")
+    reasoning_delta = next(
+        event for event in events if event["type"] == "response.reasoning_text.delta"
+    )
+    reasoning_done = next(
+        event for event in events if event["type"] == "response.reasoning_text.done"
+    )
+    text_delta = next(
+        event for event in events if event["type"] == "response.output_text.delta"
+    )
+    text_done = next(
+        event for event in events if event["type"] == "response.output_text.done"
+    )
 
     assert reasoning_delta["output_index"] == reasoning_done["output_index"]
     assert text_delta["output_index"] == text_done["output_index"]

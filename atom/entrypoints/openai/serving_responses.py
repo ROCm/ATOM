@@ -26,7 +26,9 @@ def _sse(event: Dict[str, Any]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-def _response_base(request_id: str, model: str, status: str = "in_progress") -> Dict[str, Any]:
+def _response_base(
+    request_id: str, model: str, status: str = "in_progress"
+) -> Dict[str, Any]:
     return {
         "id": request_id,
         "object": "response",
@@ -38,7 +40,9 @@ def _response_base(request_id: str, model: str, status: str = "in_progress") -> 
     }
 
 
-def _event(event_type: str, request_id: str, model: str, **extra: Any) -> Dict[str, Any]:
+def _event(
+    event_type: str, request_id: str, model: str, **extra: Any
+) -> Dict[str, Any]:
     event = {
         "type": event_type,
         "sequence_number": -1,
@@ -62,7 +66,11 @@ def _completed_event(
     return {"type": "response.completed", "sequence_number": -1, "response": response}
 
 
-def _message_item(item_id: str, status: str, content: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def _message_item(
+    item_id: str,
+    status: str,
+    content: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     return {
         "id": item_id,
         "type": "message",
@@ -82,7 +90,9 @@ def _reasoning_item(item_id: str, status: str, text: str = "") -> Dict[str, Any]
     }
 
 
-def _function_call_item(call_id: str, name: str, arguments: str, status: str) -> Dict[str, Any]:
+def _function_call_item(
+    call_id: str, name: str, arguments: str, status: str
+) -> Dict[str, Any]:
     return {
         "id": call_id,
         "type": "function_call",
@@ -128,7 +138,12 @@ class _ResponsesStreamState:
                 "output_index": self.message_output_index,
                 "item_id": self.message_item_id,
                 "content_index": self.message_content_index,
-                "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []},
+                "part": {
+                    "type": "output_text",
+                    "text": "",
+                    "annotations": [],
+                    "logprobs": [],
+                },
             },
         ]
 
@@ -205,7 +220,9 @@ class _ResponsesStreamState:
                     "type": "response.output_item.added",
                     "sequence_number": -1,
                     "output_index": output_index,
-                    "item": _function_call_item(call["id"], call["name"], "", "in_progress"),
+                    "item": _function_call_item(
+                        call["id"], call["name"], "", "in_progress"
+                    ),
                 }
             ]
         if event_type == "tool_call_args":
@@ -252,7 +269,11 @@ class _ResponsesStreamState:
                     "type": "response.output_item.done",
                     "sequence_number": -1,
                     "output_index": self.reasoning_output_index,
-                    "item": _reasoning_item(self.reasoning_item_id, "completed", self.reasoning_text),
+                    "item": _reasoning_item(
+                        self.reasoning_item_id,
+                        "completed",
+                        self.reasoning_text,
+                    ),
                 }
             )
         if self.sent_message_item:
@@ -326,7 +347,12 @@ class _ResponsesStreamState:
                 )
             )
         if self.content_text:
-            part = {"type": "output_text", "text": self.content_text, "annotations": [], "logprobs": []}
+            part = {
+                "type": "output_text",
+                "text": self.content_text,
+                "annotations": [],
+                "logprobs": [],
+            }
             indexed_items.append(
                 (
                     self.message_output_index or 0,
@@ -341,7 +367,9 @@ class _ResponsesStreamState:
             indexed_items.append(
                 (
                     call["output_index"],
-                    _function_call_item(call["id"], call["name"], call["arguments"], "completed"),
+                    _function_call_item(
+                        call["id"], call["name"], call["arguments"], "completed"
+                    ),
                 )
             )
         return [item for _, item in sorted(indexed_items, key=lambda entry: entry[0])]
@@ -357,9 +385,16 @@ def build_responses_response(
     content, tool_calls = parse_tool_calls(content_with_tools)
     output: List[Dict[str, Any]] = []
     if reasoning_content:
-        output.append(_reasoning_item(f"rs_{uuid.uuid4().hex}", "completed", reasoning_content))
+        output.append(
+            _reasoning_item(f"rs_{uuid.uuid4().hex}", "completed", reasoning_content)
+        )
     if content:
-        part = {"type": "output_text", "text": content, "annotations": [], "logprobs": []}
+        part = {
+            "type": "output_text",
+            "text": content,
+            "annotations": [],
+            "logprobs": [],
+        }
         output.append(_message_item(f"msg_{uuid.uuid4().hex}", "completed", [part]))
     for tool_call in tool_calls:
         output.append(
@@ -380,7 +415,8 @@ def build_responses_response(
         usage={
             "input_tokens": final_output["num_tokens_input"],
             "output_tokens": final_output["num_tokens_output"],
-            "total_tokens": final_output["num_tokens_input"] + final_output["num_tokens_output"],
+            "total_tokens": final_output["num_tokens_input"]
+            + final_output["num_tokens_output"],
         },
     )
 
@@ -444,5 +480,13 @@ async def stream_responses_response(
         "output_tokens": num_tokens_output,
         "total_tokens": num_tokens_input + num_tokens_output,
     }
-    yield _sse(_completed_event(request_id, model, state.output_items(), state.content_text, usage))
+    yield _sse(
+        _completed_event(
+            request_id,
+            model,
+            state.output_items(),
+            state.content_text,
+            usage,
+        )
+    )
     yield STREAM_DONE_MESSAGE

@@ -920,7 +920,7 @@ async def responses(request: ResponsesRequest):
                 cleanup_streaming_request,
             )
             return StreamingResponse(
-                _logged_stream(gen, request_id),
+                _logged_stream_with_cleanup(gen, request_id, [seq_id]),
                 media_type="text/event-stream",
             )
 

@@ -245,15 +245,21 @@ class ResponsesRequest(BaseModel):
                     )
                     messages.append(ChatMessage.model_validate(msg))
                 elif item_type == "input_text":
-                    messages.append(ChatMessage(role="user", content=item.get("text", "")))
+                    messages.append(
+                        ChatMessage(role="user", content=item.get("text", ""))
+                    )
                 elif item_type == "output_text":
                     messages.append(
                         ChatMessage(role="assistant", content=item.get("text", ""))
                     )
                 elif "text" in item:
-                    messages.append(ChatMessage(role="user", content=item.get("text", "")))
+                    messages.append(
+                        ChatMessage(role="user", content=item.get("text", ""))
+                    )
         if not messages or all(m.role == "system" for m in messages):
-            raise ValueError("Responses input must contain at least one user or assistant message")
+            raise ValueError(
+                "Responses input must contain at least one user or assistant message"
+            )
         return messages
 
 
