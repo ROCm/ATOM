@@ -1171,92 +1171,102 @@ class MLAAttention(nn.Module):
                     prefill_q, k_nope, k_rope, kv_cache, attn_metadata
                 )
         else:
-            q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
+            use_shuffle_kv = (
+                envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV
+            )
+            needs_explicit_q_cache = (
+                attn_metadata.max_seqlen_q > 1 or self.use_seg_mla or use_shuffle_kv
+            )
+            if needs_explicit_q_cache:
+                q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
-            if self.use_seg_mla:
-                # Seg path: allocate q_out with a padded last dim so each head row
-                # has a 768-byte stride (required by the gfx1250 decode asm). The
-                # kernel only writes the first kv_lora_rank + qk_rope_head_dim
-                # columns; the padding tail is left untouched and never read.
-                q_out = torch.empty(
-                    (
-                        q_nope.shape[0],
-                        self.num_heads,
-                        _MLA_Q_OUT_PADDED_DIM,
-                    ),
-                    dtype=attn_metadata.dtype_q,
-                    device=q_nope.device,
-                )
-            else:
-                q_out = torch.empty(
-                    (
-                        q_nope.shape[0],
-                        self.num_heads,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=attn_metadata.dtype_q,
-                    device=q_nope.device,
-                )
-            if kv_cache.numel() > 0:
-                if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
-                    shuffled_cache = self._shuffled_kv_view(kv_cache)
-                    triton_fused_qk_rope_cat_and_cache_mla(
-                        q_nope,
-                        q_rope,
-                        k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
-                        k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
-                        shuffled_cache,
-                        attn_metadata.slot_mapping,
-                        positions,
-                        self.rotary_emb.cos_cache,
-                        self.rotary_emb.sin_cache,
-                        self._k_scale,
-                        self.rotary_emb.is_neox_style,
-                        num_decode_toks_for_zeros=0,
-                        apply_scale=True,
-                        q_out=q_out,
-                        shuffled_kv_cache=True,
-                    )
-                elif self.use_seg_mla:
-                    kv_cache_seg = self._seg_kv_cache_view(kv_cache)
-                    fused_qk_rope_concat_and_cache_mla_seg(
-                        q_nope,
-                        q_rope,
-                        k_nope,
-                        k_rope,
-                        # Flat seg layout: [num_blocks, page_size*(kv_lora + pe)].
-                        kv_cache_seg,
-                        q_out,
-                        attn_metadata.slot_mapping,
-                        self._k_scale,
-                        self._q_scale,
-                        positions,
-                        self.rotary_emb.cos_cache,
-                        self.rotary_emb.sin_cache,
-                        is_neox=self.rotary_emb.is_neox_style,
+                if self.use_seg_mla:
+                    # Seg path: allocate q_out with a padded last dim so each head row
+                    # has a 768-byte stride (required by the gfx1250 decode asm). The
+                    # kernel only writes the first kv_lora_rank + qk_rope_head_dim
+                    # columns; the padding tail is left untouched and never read.
+                    q_out = torch.empty(
+                        (
+                            q_nope.shape[0],
+                            self.num_heads,
+                            _MLA_Q_OUT_PADDED_DIM,
+                        ),
+                        dtype=attn_metadata.dtype_q,
+                        device=q_nope.device,
                     )
                 else:
-                    fused_qk_rope_concat_and_cache_mla(
-                        q_nope,
-                        q_rope,
-                        k_nope,
-                        k_rope,
-                        kv_cache.view(
-                            kv_cache.shape[0],
-                            -1,
+                    q_out = torch.empty(
+                        (
+                            q_nope.shape[0],
+                            self.num_heads,
                             self.kv_lora_rank + self.qk_rope_head_dim,
                         ),
-                        q_out,
-                        attn_metadata.slot_mapping,
-                        self._k_scale,
-                        self._q_scale,
-                        positions,
-                        self.rotary_emb.cos_cache,
-                        self.rotary_emb.sin_cache,
-                        is_neox=self.rotary_emb.is_neox_style,
-                        is_nope_first=True,
+                        dtype=attn_metadata.dtype_q,
+                        device=q_nope.device,
                     )
-                # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
+                if kv_cache.numel() > 0:
+                    if use_shuffle_kv:
+                        shuffled_cache = self._shuffled_kv_view(kv_cache)
+                        triton_fused_qk_rope_cat_and_cache_mla(
+                            q_nope,
+                            q_rope,
+                            k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
+                            k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
+                            shuffled_cache,
+                            attn_metadata.slot_mapping,
+                            positions,
+                            self.rotary_emb.cos_cache,
+                            self.rotary_emb.sin_cache,
+                            self._k_scale,
+                            self.rotary_emb.is_neox_style,
+                            num_decode_toks_for_zeros=0,
+                            apply_scale=True,
+                            q_out=q_out,
+                            shuffled_kv_cache=True,
+                        )
+                    elif self.use_seg_mla:
+                        kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+                        fused_qk_rope_concat_and_cache_mla_seg(
+                            q_nope,
+                            q_rope,
+                            k_nope,
+                            k_rope,
+                            # Flat seg layout: [num_blocks, page_size*(kv_lora + pe)].
+                            kv_cache_seg,
+                            q_out,
+                            attn_metadata.slot_mapping,
+                            self._k_scale,
+                            self._q_scale,
+                            positions,
+                            self.rotary_emb.cos_cache,
+                            self.rotary_emb.sin_cache,
+                            is_neox=self.rotary_emb.is_neox_style,
+                        )
+                    else:
+                        fused_qk_rope_concat_and_cache_mla(
+                            q_nope,
+                            q_rope,
+                            k_nope,
+                            k_rope,
+                            kv_cache.view(
+                                kv_cache.shape[0],
+                                -1,
+                                self.kv_lora_rank + self.qk_rope_head_dim,
+                            ),
+                            q_out,
+                            attn_metadata.slot_mapping,
+                            self._k_scale,
+                            self._q_scale,
+                            positions,
+                            self.rotary_emb.cos_cache,
+                            self.rotary_emb.sin_cache,
+                            is_neox=self.rotary_emb.is_neox_style,
+                            is_nope_first=True,
+                        )
+            elif kv_cache.numel() > 0:
+                q_out = self.fused_kv_bmm(
+                    q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata
+                )
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
