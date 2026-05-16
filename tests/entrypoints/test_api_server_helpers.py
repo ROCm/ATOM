@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 
@@ -132,6 +133,67 @@ class TestCoerceN:
 
     def test_n_one_with_greedy_stays_one(self):
         assert api_server._coerce_n(1, 0.0) == 1
+
+
+class TestStreamDecodeDelta:
+    def setup_method(self):
+        api_server._stream_decode_states.clear()
+
+    def teardown_method(self):
+        api_server._stream_decode_states.clear()
+
+    def test_common_prefix_len(self):
+        assert api_server._common_prefix_len("abcdef", "abcXYZ") == 3
+        assert api_server._common_prefix_len("abc", "abc") == 3
+        assert api_server._common_prefix_len("abc", "xyz") == 0
+
+    def test_withholds_replacement_char_until_sequence_resolves(self, monkeypatch):
+        class FakeTokenizer:
+            def decode(self, token_ids, skip_special_tokens=True):
+                assert skip_special_tokens is True
+                token_ids = tuple(token_ids)
+                if token_ids == (1,):
+                    return "A"
+                if token_ids == (1, 2):
+                    return "A\ufffd"
+                if token_ids == (1, 2, 3):
+                    return "A\u00e9"
+                return "".join(str(token_id) for token_id in token_ids)
+
+        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+
+        assert api_server._decode_stream_delta(("req", 0), [1], False) == "A"
+        assert api_server._decode_stream_delta(("req", 0), [2], False) == ""
+        assert api_server._decode_stream_delta(("req", 0), [3], True) == "\u00e9"
+
+    def test_keeps_decode_state_bucketed_by_request(self, monkeypatch):
+        class FakeTokenizer:
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "".join(chr(ord("a") + token_id) for token_id in token_ids)
+
+        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+
+        assert api_server._decode_stream_delta(("req-a", 0), [0], False) == "a"
+        assert api_server._decode_stream_delta(("req-a", 1), [1], False) == "b"
+        assert api_server._decode_stream_delta(("req-b", 0), [2], False) == "c"
+
+        assert set(api_server._stream_decode_states) == {"req-a", "req-b"}
+        assert set(api_server._stream_decode_states["req-a"]) == {0, 1}
+
+    def test_cleanup_removes_request_decode_bucket(self, monkeypatch):
+        api_server._stream_decode_states["req-a"] = {0: {}, 1: {}}
+        api_server._stream_decode_states["req-b"] = {0: {}}
+        fake_engine = SimpleNamespace(
+            io_processor=SimpleNamespace(requests={11: "seq-a", 12: "seq-b"})
+        )
+        monkeypatch.setattr(api_server, "engine", fake_engine)
+
+        api_server.cleanup_streaming_request("req-a", 11)
+
+        assert "req-a" not in api_server._stream_decode_states
+        assert "req-b" in api_server._stream_decode_states
+        assert 11 not in fake_engine.io_processor.requests
+        assert 12 in fake_engine.io_processor.requests
 
 
 class TestBuildSamplingParams:

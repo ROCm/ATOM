@@ -58,16 +58,37 @@ class ChatMessage(BaseModel):
         normalized = []
         for item in tool_calls:
             if not isinstance(item, dict):
-                raise TypeError(f"tool_calls entries must be dicts, got {type(item)!r}")
+                raise ValueError(
+                    f"tool_calls entries must be dicts, got {type(item)!r}"
+                )
 
             call = dict(item)
-            function = dict(call.get("function") or {})
+            function_value = call.get("function") or {}
+            if not isinstance(function_value, dict):
+                raise ValueError(
+                    f"tool_calls function must be a dict, got {type(function_value)!r}"
+                )
+
+            function = dict(function_value)
             arguments = function.get("arguments")
-            if arguments:
-                if not isinstance(arguments, (dict, list)):
-                    function["arguments"] = json.loads(arguments)
-            else:
+            if arguments is None or arguments == "":
                 function["arguments"] = {}
+            elif isinstance(arguments, str):
+                try:
+                    decoded_arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "tool_calls function.arguments must be a valid JSON object"
+                    ) from exc
+                if not isinstance(decoded_arguments, dict):
+                    raise ValueError(
+                        "tool_calls function.arguments must decode to a JSON object"
+                    )
+                function["arguments"] = decoded_arguments
+            elif not isinstance(arguments, dict):
+                raise ValueError(
+                    "tool_calls function.arguments must be a dict or JSON object string"
+                )
             call["function"] = function
             normalized.append(call)
         return normalized

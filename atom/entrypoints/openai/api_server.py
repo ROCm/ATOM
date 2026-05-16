@@ -72,8 +72,9 @@ _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
 _request_start_times: Dict[str, float] = {}
-_stream_decode_states: Dict[Tuple[str, int], Dict[str, Any]] = {}
+_stream_decode_states: Dict[str, Dict[int, Dict[str, Any]]] = {}
 _request_logger: Optional[logging.Logger] = None
+STREAM_DECODE_CONTEXT_TOKENS = 16
 
 
 # ============================================================================
@@ -106,6 +107,18 @@ async def _logged_stream(
             else:
                 _log_request_event("stream_done", request_id, None)
         yield chunk
+
+
+async def _logged_stream_with_cleanup(
+    gen: AsyncGenerator[str, None], request_id: str, seq_ids: List[int]
+) -> AsyncGenerator[str, None]:
+    """Log a stream and clean request state if the client disconnects."""
+    try:
+        async for chunk in _logged_stream(gen, request_id):
+            yield chunk
+    finally:
+        for seq_id in seq_ids:
+            cleanup_streaming_request(request_id, seq_id)
 
 
 # ============================================================================
@@ -178,31 +191,50 @@ def _decode_stream_delta(
 
     The scheduler sends only newly generated token ids. Decoding that slice
     directly can split byte-fallback or multi-token Unicode sequences and
-    emit U+FFFD. Keep cumulative token ids per stream and return only the
-    newly decoded suffix, similar to vLLM's incremental detokenizer.
+    emit U+FFFD. Keep per-stream token context and return only the newly
+    decoded suffix, similar to vLLM's incremental detokenizer.
     """
     global tokenizer
 
-    state = _stream_decode_states.setdefault(
-        state_key,
-        {"token_ids": [], "sent_text": ""},
+    request_id, sibling_index = state_key
+    states_for_request = _stream_decode_states.setdefault(request_id, {})
+    state = states_for_request.setdefault(
+        sibling_index,
+        {"token_ids": [], "sent_text": "", "context_start": 0, "context_text": ""},
     )
+    old_token_count = len(state["token_ids"])
     state["token_ids"].extend(new_token_ids)
 
-    decoded_text = tokenizer.decode(state["token_ids"], skip_special_tokens=True)
-    sent_text = state["sent_text"]
-    if decoded_text.startswith(sent_text):
-        delta = decoded_text[len(sent_text) :]
+    token_ids = state["token_ids"]
+    new_context_start = max(
+        0,
+        len(token_ids) - len(new_token_ids) - STREAM_DECODE_CONTEXT_TOKENS,
+    )
+    decoded_text = tokenizer.decode(
+        token_ids[new_context_start:], skip_special_tokens=True
+    )
+    if state["context_start"] == new_context_start:
+        sent_context_text = state["context_text"]
     else:
-        # Tokenizers may normalize whitespace around special tokens. Fall back
-        # to the changed suffix instead of replaying the entire decoded text.
-        prefix_len = _common_prefix_len(decoded_text, sent_text)
+        sent_context_text = tokenizer.decode(
+            token_ids[new_context_start:old_token_count],
+            skip_special_tokens=True,
+        )
+
+    if decoded_text.startswith(sent_context_text):
+        delta = decoded_text[len(sent_context_text) :]
+    else:
+        # Tokenizers may normalize text around the rolling context boundary.
+        # Fall back to the changed suffix instead of replaying the full text.
+        prefix_len = _common_prefix_len(decoded_text, sent_context_text)
         delta = decoded_text[prefix_len:]
 
     if delta.endswith("\ufffd") and not finished:
         return ""
 
-    state["sent_text"] = decoded_text
+    state["sent_text"] += delta
+    state["context_start"] = new_context_start
+    state["context_text"] = decoded_text
     return delta
 
 
@@ -520,8 +552,7 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
-    for key in [key for key in _stream_decode_states if key[0] == request_id]:
-        _stream_decode_states.pop(key, None)
+    _stream_decode_states.pop(request_id, None)
     engine.io_processor.requests.pop(seq_id, None)
 
 
@@ -687,6 +718,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
+                cleanup_seq_ids = seq_ids
             else:
                 seq_id, stream_queue = await setup_streaming_request(
                     prompt, sampling_params, request_id
@@ -700,8 +732,9 @@ async def chat_completions(request: ChatCompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
+                cleanup_seq_ids = [seq_id]
             return StreamingResponse(
-                _logged_stream(gen, request_id),
+                _logged_stream_with_cleanup(gen, request_id, cleanup_seq_ids),
                 media_type="text/event-stream",
             )
 
@@ -772,6 +805,7 @@ async def completions(request: CompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
+                cleanup_seq_ids = seq_ids
             else:
                 seq_id, stream_queue = await setup_streaming_request(
                     request.prompt,
@@ -788,8 +822,9 @@ async def completions(request: CompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
+                cleanup_seq_ids = [seq_id]
             return StreamingResponse(
-                _logged_stream(gen, request_id),
+                _logged_stream_with_cleanup(gen, request_id, cleanup_seq_ids),
                 media_type="text/event-stream",
             )
 
