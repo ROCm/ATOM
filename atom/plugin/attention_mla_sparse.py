@@ -650,6 +650,7 @@ def sparse_attn_indexer_plugin_mode(
         )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # topk_indices_buffer[: num_actual_tokens] = -1
     if has_prefill:
         prefill_metadata = indexer_meta.prefill
         for chunk in prefill_metadata.chunks:
