@@ -13,6 +13,7 @@ rather than block the rest of the suite.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from types import SimpleNamespace
@@ -180,6 +181,23 @@ class TestStreamDecodeDelta:
         assert set(api_server._stream_decode_states) == {"req-a", "req-b"}
         assert set(api_server._stream_decode_states["req-a"]) == {0, 1}
 
+    def test_prunes_decode_state_to_rolling_context(self, monkeypatch):
+        class FakeTokenizer:
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "".join(chr(ord("a") + token_id) for token_id in token_ids)
+
+        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+        monkeypatch.setattr(api_server, "STREAM_DECODE_CONTEXT_TOKENS", 2)
+
+        assert api_server._decode_stream_delta(("req", 0), [0, 1, 2], False) == "abc"
+        state = api_server._stream_decode_states["req"][0]
+        assert state["token_ids"] == [1, 2]
+        assert state["context_text"] == "bc"
+
+        assert api_server._decode_stream_delta(("req", 0), [3], False) == "d"
+        assert state["token_ids"] == [2, 3]
+        assert state["context_text"] == "cd"
+
     def test_cleanup_removes_request_decode_bucket(self, monkeypatch):
         api_server._stream_decode_states["req-a"] = {0: {}, 1: {}}
         api_server._stream_decode_states["req-b"] = {0: {}}
@@ -194,6 +212,36 @@ class TestStreamDecodeDelta:
         assert "req-b" in api_server._stream_decode_states
         assert 11 not in fake_engine.io_processor.requests
         assert 12 in fake_engine.io_processor.requests
+
+    def test_send_stream_chunk_direct_decodes_on_event_loop(self, monkeypatch):
+        class FakeTokenizer:
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "".join(chr(ord("a") + token_id) for token_id in token_ids)
+
+        async def run_stream_callback():
+            stream_queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            request_output = SimpleNamespace(
+                output_tokens=[0],
+                finished=False,
+                finish_reason=None,
+            )
+
+            api_server._send_stream_chunk_direct(
+                request_output,
+                "req",
+                stream_queue,
+                loop,
+            )
+            assert "req" not in api_server._stream_decode_states
+            return await asyncio.wait_for(stream_queue.get(), timeout=1.0)
+
+        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+
+        chunk = asyncio.run(run_stream_callback())
+
+        assert chunk["text"] == "a"
+        assert api_server._stream_decode_states["req"][0]["token_ids"] == [0]
 
 
 class TestBuildSamplingParams:

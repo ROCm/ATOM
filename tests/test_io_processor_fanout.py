@@ -155,3 +155,18 @@ class TestPreprocessFanout:
 
         with pytest.raises(ValueError, match="which exceeds max_model_len=8"):
             proc.preprocess_fanout("hello", SamplingParams(n=1, max_tokens=4))
+
+    def test_fanout_coerces_none_max_tokens_before_context_check(self):
+        proc = _make_processor()
+        proc.config.max_model_len = 5
+
+        seqs = proc.preprocess_fanout("hello", SamplingParams(n=1, max_tokens=None))
+
+        assert seqs[0].max_tokens == 0
+
+    def test_fanout_rejects_non_integer_max_tokens(self):
+        proc = _make_processor()
+        proc.config.max_model_len = 8
+
+        with pytest.raises(ValueError, match="max_tokens must be an integer"):
+            proc.preprocess_fanout("hello", SamplingParams(n=1, max_tokens="bad"))

@@ -200,26 +200,13 @@ def _decode_stream_delta(
     states_for_request = _stream_decode_states.setdefault(request_id, {})
     state = states_for_request.setdefault(
         sibling_index,
-        {"token_ids": [], "sent_text": "", "context_start": 0, "context_text": ""},
+        {"token_ids": [], "context_text": ""},
     )
-    old_token_count = len(state["token_ids"])
     state["token_ids"].extend(new_token_ids)
 
     token_ids = state["token_ids"]
-    new_context_start = max(
-        0,
-        len(token_ids) - len(new_token_ids) - STREAM_DECODE_CONTEXT_TOKENS,
-    )
-    decoded_text = tokenizer.decode(
-        token_ids[new_context_start:], skip_special_tokens=True
-    )
-    if state["context_start"] == new_context_start:
-        sent_context_text = state["context_text"]
-    else:
-        sent_context_text = tokenizer.decode(
-            token_ids[new_context_start:old_token_count],
-            skip_special_tokens=True,
-        )
+    decoded_text = tokenizer.decode(token_ids, skip_special_tokens=True)
+    sent_context_text = state["context_text"]
 
     if decoded_text.startswith(sent_context_text):
         delta = decoded_text[len(sent_context_text) :]
@@ -232,10 +219,35 @@ def _decode_stream_delta(
     if delta.endswith("\ufffd") and not finished:
         return ""
 
-    state["sent_text"] += delta
-    state["context_start"] = new_context_start
-    state["context_text"] = decoded_text
+    state["token_ids"] = token_ids[-STREAM_DECODE_CONTEXT_TOKENS:]
+    state["context_text"] = tokenizer.decode(
+        state["token_ids"], skip_special_tokens=True
+    )
     return delta
+
+
+def _enqueue_decoded_stream_chunk_direct(
+    request_id: str,
+    output_tokens: List[int],
+    finished: bool,
+    finish_reason: Optional[str],
+    kv_transfer_params_output: Optional[Dict[str, Any]],
+    stream_queue: asyncio.Queue,
+) -> None:
+    """Decode and enqueue one direct stream chunk on the event loop thread."""
+    new_text = _decode_stream_delta((request_id, 0), output_tokens, finished)
+    started_at = _request_start_times.get(request_id)
+    chunk_data = {
+        "text": new_text,
+        "token_ids": output_tokens,
+        "finished": finished,
+        "finish_reason": finish_reason,
+        "finished_at": time.time(),
+        "started_at": started_at,
+    }
+    if kv_transfer_params_output:
+        chunk_data["kv_transfer_params"] = kv_transfer_params_output
+    stream_queue.put_nowait(chunk_data)
 
 
 def _send_stream_chunk_direct(
@@ -245,23 +257,42 @@ def _send_stream_chunk_direct(
     loop: AbstractEventLoop,
 ) -> None:
     """Send a stream chunk decoded with cumulative token context."""
-    new_text = _decode_stream_delta(
-        (request_id, 0),
-        request_output.output_tokens,
+    output_tokens = list(request_output.output_tokens or [])
+    loop.call_soon_threadsafe(
+        _enqueue_decoded_stream_chunk_direct,
+        request_id,
+        output_tokens,
         request_output.finished,
+        request_output.finish_reason,
+        getattr(request_output, "kv_transfer_params_output", None),
+        stream_queue,
     )
-    started_at = _request_start_times.get(request_id)
+
+
+def _enqueue_decoded_stream_chunk_tagged(
+    request_id: str,
+    sibling_index: int,
+    output_tokens: List[int],
+    finished: bool,
+    finish_reason: Optional[str],
+    kv_transfer_params_output: Optional[Dict[str, Any]],
+    stream_queue: asyncio.Queue,
+) -> None:
+    """Decode and enqueue one fan-out stream chunk on the event loop thread."""
+    new_text = _decode_stream_delta(
+        (request_id, sibling_index),
+        output_tokens,
+        finished,
+    )
     chunk_data = {
         "text": new_text,
-        "token_ids": request_output.output_tokens,
-        "finished": request_output.finished,
-        "finish_reason": request_output.finish_reason,
-        "finished_at": time.time(),
-        "started_at": started_at,
+        "token_ids": output_tokens,
+        "finished": finished,
+        "finish_reason": finish_reason,
     }
-    if getattr(request_output, "kv_transfer_params_output", None):
-        chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-    loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
+    if kv_transfer_params_output:
+        chunk_data["kv_transfer_params"] = kv_transfer_params_output
+    stream_queue.put_nowait((sibling_index, chunk_data))
 
 
 def _send_stream_chunk_tagged(
@@ -277,20 +308,17 @@ def _send_stream_chunk_tagged(
     queue so the merge-stream consumer in :mod:`serving_chat` /
     :mod:`serving_completion` can demultiplex by index.
     """
-    new_text = _decode_stream_delta(
-        (request_id, sibling_index),
-        request_output.output_tokens,
+    output_tokens = list(request_output.output_tokens or [])
+    loop.call_soon_threadsafe(
+        _enqueue_decoded_stream_chunk_tagged,
+        request_id,
+        sibling_index,
+        output_tokens,
         request_output.finished,
+        request_output.finish_reason,
+        getattr(request_output, "kv_transfer_params_output", None),
+        stream_queue,
     )
-    chunk_data = {
-        "text": new_text,
-        "token_ids": request_output.output_tokens,
-        "finished": request_output.finished,
-        "finish_reason": request_output.finish_reason,
-    }
-    if getattr(request_output, "kv_transfer_params_output", None):
-        chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-    loop.call_soon_threadsafe(stream_queue.put_nowait, (sibling_index, chunk_data))
 
 
 async def generate_async(

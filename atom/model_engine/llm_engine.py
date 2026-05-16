@@ -266,7 +266,15 @@ class InputOutputProcessor:
                 f"max_model_len={max_model_len}. Shorten the prompt or "
                 "restart the server with a larger --max-model-len."
             )
-        max_tokens = max(0, int(getattr(sampling_params, "max_tokens", 0)))
+        raw_max_tokens = getattr(sampling_params, "max_tokens", 0)
+        if raw_max_tokens is None:
+            max_tokens = 0
+        else:
+            try:
+                max_tokens = max(0, int(raw_max_tokens))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("max_tokens must be an integer or None") from exc
+        sampling_params.max_tokens = max_tokens
         if (
             max_model_len is not None
             and prompt_len + max_tokens > max_model_len
