@@ -139,6 +139,54 @@ class TestChatMessage:
         d = msg.to_template_dict()
         assert d["tool_calls"][0]["function"]["arguments"] == {"cmd": "pwd"}
 
+    def test_to_template_dict_rejects_non_dict_tool_call_entry(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": ["not-a-dict"],
+            }
+        )
+
+        with pytest.raises(ValueError, match="tool_calls entries must be dicts"):
+            msg.to_template_dict()
+
+    def test_to_template_dict_rejects_non_object_tool_arguments(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "bad", "arguments": "[1, 2]"},
+                    }
+                ],
+            }
+        )
+
+        with pytest.raises(ValueError, match="must decode to a JSON object"):
+            msg.to_template_dict()
+
+    def test_to_template_dict_rejects_decoded_non_object_tool_arguments(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "bad", "arguments": ["x"]},
+                    }
+                ],
+            }
+        )
+
+        with pytest.raises(ValueError, match="must be a dict or JSON object string"):
+            msg.to_template_dict()
+
     def test_to_template_dict_tool_message(self):
         """Tool result message should preserve tool_call_id."""
         msg = ChatMessage.model_validate(
