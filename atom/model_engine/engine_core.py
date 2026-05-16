@@ -192,6 +192,15 @@ class EngineCore:
 
     def _process_engine_step(self):
         result = self.scheduler.schedule()
+
+        # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
+        # the scheduler) through the same finished-seq path as normal seqs.
+        # Without this, `llm.generate()` blocks forever waiting for an output
+        # the rejected seq will never produce.
+        rejected = self.scheduler.take_rejected()
+        if rejected:
+            self.output_queue.put_nowait(rejected)
+
         if result is None:
             return False
         scheduled_batch, seqs = result

@@ -735,12 +735,18 @@ class ModelRunner:
         return False
 
     def is_deepseek_v4(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        # `deepseek_v4_mtp` is the model_type the SpeculativeConfig stamps onto
-        # the draft hf_config when V4 is run with --method mtp. It must take the
-        # same V4-specific runner / builder paths as the target.
-        return self.hf_text_config.model_type in ("deepseek_v4", "deepseek_v4_mtp")
+        # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
+        # `_CONFIG_REGISTRY` maps deepseek_v4 → deepseek_v3 (V4 reuses V3 schema).
+        # Use `architectures` (preserved by get_hf_config:567) instead. Covers
+        # both target (DeepseekV4ForCausalLM[NextN]) and draft (whose model_type
+        # SpeculativeConfig stamps as deepseek_v4_mtp).
+        arches = getattr(self.hf_text_config, "architectures", None) or []
+        if any("DeepseekV4" in str(a) for a in arches):
+            return True
+        return getattr(self.hf_text_config, "model_type", None) in (
+            "deepseek_v4",
+            "deepseek_v4_mtp",
+        )
 
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):

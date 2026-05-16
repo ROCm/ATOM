@@ -343,13 +343,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # max-density ratio (1 indexer slot per 4 source tokens).
         self.max_model_len_idx = model_runner.config.max_model_len // 4
 
-        # Compressor state shape: [coff * ratio, coff * head_dim], fp32.
-        # CSA: ratio=4, overlap=True -> coff=2 -> [8, 2*head_dim]
-        # HCA: ratio=128, overlap=False -> coff=1 -> [128, head_dim]
-        self.csa_main_state_shape = (2 * 4, 2 * self.head_dim)
-        self.csa_idx_state_shape = (2 * 4, 2 * self.index_head_dim)
-        self.hca_main_state_shape = (128, self.head_dim)
-
         # Classical KV pool geometry. block_size=128 original tokens means
         # each V4 block holds k1=128/4=32 CSA entries and k2=128/128=1 HCA
         # entry per layer (paper §3.6.1).
@@ -372,6 +365,25 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.max_spec_steps = (
             int(model_runner.drafter.mtp_k) if hasattr(model_runner, "drafter") else 0
         )
+
+        # Compressor state shape: [ring_size, coff * head_dim], fp32.
+        # ring_size = K_pool + (max_spec_steps + 1), where K_pool = coff * ratio.
+        # The extra (max_spec_steps + 1) slots prevent reject K/V written to the
+        # ring in round R from being borrow-read by the round-R+1 re-commit of
+        # the same boundary (slot index = pos % ring_size). With ring_size =
+        # K_pool the slot of pos P+K_pool aliases the slot of pos P, so a
+        # rejected K_{P+K_pool} written in R overwrites the K_P that R+1's
+        # commit pool window [P..P+K_pool-1] still needs. Bumping by one
+        # verify window's worth of positions decouples the two.
+        # CSA: ratio=4, overlap=True  → K_pool=8;  spec ring_size=8 + (mtp_k+1)
+        # HCA: ratio=128, overlap=False → K_pool=128; spec ring_size=128+(mtp_k+1)
+        # Non-spec (max_spec_steps=0) → ring_size = K_pool + 1 (effectively
+        # equivalent to old K_pool layout for correctness; one extra slot is
+        # the algebraic minimum and trivial in memory).
+        ring_extra = self.max_spec_steps + 1
+        self.csa_main_state_shape = (2 * 4 + ring_extra, 2 * self.head_dim)
+        self.csa_idx_state_shape = (2 * 4 + ring_extra, 2 * self.index_head_dim)
+        self.hca_main_state_shape = (128 + ring_extra, self.head_dim)
         self.max_decode_tokens = self.max_bs * (1 + self.max_spec_steps)
         # SWA ring-buffer slots per req. Distinct from `window_size`:
         #   * `window_size`  = SWA attention window = topk count per token
@@ -2101,9 +2113,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # replay MUST use the same value (CG kernel call args are baked).
         self._decode_compress_cap: dict[int, int] = {}
         for ratio, is_overlap in self._unique_compress_ratios_overlap:
-            state_size = (2 if is_overlap else 1) * ratio
+            # NOTE: this is the pool-window size (algorithm constant), NOT the
+            # state ring buffer size. The ring buffer is now K_pool + max_spec_steps + 1
+            # to avoid R+1 re-commit borrow-reads (see csa_main_state_shape comment),
+            # but write_plan still emits ≤ K_pool rows per seq per fwd because
+            # `write_starts = max(0, seq_lens - K_pool)` in make_compress_plans.
+            K_pool = (2 if is_overlap else 1) * ratio
             max_compress = mnbt // ratio + bs
-            max_write = min(mnbt, bs * state_size)
+            max_write = min(mnbt, bs * K_pool)
             bufs[f"v4_compress_plan_{ratio}"] = CpuGpuBuffer(max_compress, 4, **i32)
             bufs[f"v4_write_plan_{ratio}"] = CpuGpuBuffer(max_write, 4, **i32)
             # Pre-fill with sentinel so capture-time buffer state is valid

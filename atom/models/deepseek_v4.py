@@ -805,8 +805,8 @@ class Compressor(nn.Module):
 
         # State cache (per paper §3.6.1 "uncompressed tail + B-side overlap
         # window" portion). Indexed as a single ring buffer of size
-        # `coff * compress_ratio` by `pos % STATE_SIZE` per token — no
-        # segment switching, no roll. The `forward` softmax-pool consumer
+        # `ring_size` (≥ coff * compress_ratio) by `pos % ring_size` per token
+        # — no segment switching, no roll. The `forward` softmax-pool consumer
         # resolves A-side (current block) vs B-side (previous block) by
         # block-id parity (`comp_id % 2`).
         #
@@ -814,9 +814,12 @@ class Compressor(nn.Module):
         # runs before allocate_kv_cache → build_kv_cache_tensor) sees a
         # valid tensor; afterwards `DeepseekV4AttentionMetadataBuilder.
         # build_kv_cache_tensor` setattr-replaces these attributes with
-        # views of the per-request cache pool (shape
-        # `[max_num_seqs, coff*ratio, coff*head_dim]`). The 1-slot init
-        # buffers (≈9 MB total across all layers) are GC'd once replaced.
+        # views of the per-request cache pool whose second dim is the real
+        # ring_size = coff*ratio + max_spec_steps + 1 (spec) or coff*ratio
+        # (non-spec). The 1-slot init buffers (≈9 MB total across all layers)
+        # are GC'd once replaced before any real kernel call, so the
+        # placeholder's smaller second dim never actually flows through the
+        # kernel's `state_size >= K_pool` assertion.
         self.register_buffer(
             "kv_state",
             torch.zeros(

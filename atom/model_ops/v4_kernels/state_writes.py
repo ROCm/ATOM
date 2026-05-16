@@ -158,6 +158,7 @@ def swa_write(
     # block per token covers it. Round up to the next power of two for tl.
     BLOCK_D = triton.next_power_of_2(head_dim)
     grid = (W,)
+
     _swa_write_kernel[grid](
         kv,
         write_indices,
@@ -329,10 +330,11 @@ def update_compressor_states(
     assert kv.dim() == 2 and score.dim() == 2
     assert kv.shape == score.shape, f"{kv.shape} vs {score.shape}"
     assert ape.dim() == 2 and ape.shape[0] == ratio
-    state_size = (2 if overlap else 1) * ratio
+    K_pool = (2 if overlap else 1) * ratio  # pool window (lower bound)
+    state_size = kv_state.shape[1]  # ring buffer modulo (≥ K_pool)
     assert (
-        kv_state.shape[1] == state_size
-    ), f"kv_state.shape[1]={kv_state.shape[1]}, expected {state_size}"
+        state_size >= K_pool
+    ), f"kv_state.shape[1]={state_size}, must be ≥ K_pool={K_pool}"
     dim = kv.shape[1]
     assert write_plan.dim() == 2 and write_plan.shape[1] == 4
     assert write_plan.dtype == torch.int32
@@ -389,7 +391,7 @@ def update_compressor_states_reference(
     `write_plan[i] = (ragged_id, batch_id, position, _)` — each row is one
     token to write.  No mask (host filtered).
     """
-    state_size = (2 if overlap else 1) * ratio
+    state_size = kv_state.shape[1]  # ring buffer modulo (≥ (1+overlap)*ratio)
     plan_cpu = write_plan.detach().cpu()
     slot_map_cpu = state_slot_mapping.detach().cpu()
     for i in range(plan_cpu.shape[0]):

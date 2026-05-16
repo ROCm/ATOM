@@ -104,16 +104,18 @@ class MTPBlock(Block):
         x: torch.Tensor,  # [num_tokens, hc, dim]  residual stream from main model
         positions: torch.Tensor,  # [num_tokens] int  absolute positions
         input_ids: torch.Tensor,  # [num_tokens] int
-    ) -> torch.Tensor:  # [num_tokens, dim]  hidden (post hc_head + RMSNorm)
-        """Run one MTP step. Returns the dim-shaped hidden after this MTP's own
-        hc_head reduction + final RMSNorm. The vocab projection is deferred to
-        the wrapper's `compute_logits` (using the shared `self.head.get_logits`)
-        so this matches ATOM's EagleProposer contract — `forward → hidden`,
-        `compute_logits → logits`.
+    ) -> torch.Tensor:  # [num_tokens, hc, dim]  pre-hc_head residual
+        """Run one MTP step. Returns the un-reduced mHC residual stack
+        `[num_tokens, hc, dim]` — same shape contract as
+        `DeepseekV4Model.forward`. The hc_head reduction + RMSNorm + LM head
+        are all deferred to `DeepseekV4MTP.compute_logits` so the wrapper's
+        forward output can be fed back in as `x` for the NEXT MTP draft
+        step (mtp_k > 1) without re-expanding from a `[N, dim]` post-reduction
+        state.
         """
         assert (
-            self.embed is not None and self.head is not None
-        ), "MTPBlock requires .embed and .head to be assigned by the wrapper"
+            self.embed is not None
+        ), "MTPBlock requires .embed to be assigned by the wrapper"
         e = self.enorm(self.embed(input_ids))  # [num_tokens, dim]
         x = self.hnorm(x)  # [num_tokens, hc, dim]
         # Mix token-embed + hidden into a fresh residual. h_proj is FP8
@@ -125,12 +127,7 @@ class MTPBlock(Block):
         n_tok, hc, d = x.shape
         h_proj_out = self.h_proj(x.reshape(n_tok * hc, d)).reshape(n_tok, hc, d)
         x = self.e_proj(e).unsqueeze(-2) + h_proj_out  # [num_tokens, hc, dim]
-        x = super().forward(x, positions)  # [num_tokens, hc, dim]
-        # Per-MTP hc_head reduction + RMSNorm; LM projection lives in compute_logits.
-        x = self.head.hc_head(
-            x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
-        )  # [num_tokens, dim]
-        return self.norm(x)  # [num_tokens, dim]
+        return super().forward(x, positions)  # [num_tokens, hc, dim]
 
 
 class DeepseekV4MTPModel(nn.Module):
@@ -160,17 +157,30 @@ class DeepseekV4MTPModel(nn.Module):
         positions: torch.Tensor,  # [num_tokens] int
         hidden_states: torch.Tensor,  # [num_tokens, hc, dim]  pre-hc_head from target
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:  # [num_tokens, dim]  post-hc_head + norm hidden
+    ) -> torch.Tensor:  # [num_tokens, hc, dim]  pre-hc_head residual
+        """Returns the un-reduced mHC residual `[N, hc, dim]` from the
+        selected MTP block — same shape contract as `DeepseekV4Model.forward`.
+        EagleProposer feeds this back in as `hidden_states` for the NEXT
+        draft step (mtp_k > 1)."""
         idx = spec_step_idx % len(self.mtp)
         return self.mtp[idx](hidden_states, positions, input_ids)
 
     def compute_logits(
         self,
-        hidden_states: torch.Tensor,  # [num_tokens, dim]
+        hidden_states: torch.Tensor,  # [num_tokens, hc, dim]  pre-hc_head residual
+        spec_step_idx: int = 0,
     ) -> torch.Tensor:  # [bs, vocab]
-        # All MTPBlocks share the same target-bound `head`; `mtp[0]` is always
-        # populated (n_mtp_layers >= 1 whenever this wrapper is constructed).
-        return self.mtp[0].head.get_logits(hidden_states)
+        """Mirror `DeepseekV4ForCausalLM.compute_logits`: hc_head + RMSNorm +
+        LM head all here so MTPBlock.forward can return the un-reduced
+        residual stack. Each MTP block has its own `hc_head_fn/base/scale`
+        and own `norm` (the LM head is target-shared via `share_with_target`)."""
+        idx = spec_step_idx % len(self.mtp)
+        blk = self.mtp[idx]
+        x = blk.head.hc_head(
+            hidden_states, blk.hc_head_fn, blk.hc_head_scale, blk.hc_head_base
+        )  # [num_tokens, dim]
+        x = blk.norm(x)
+        return blk.head.get_logits(x)
 
 
 class DeepseekV4MTP(nn.Module):
@@ -245,7 +255,7 @@ class DeepseekV4MTP(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> Optional[torch.Tensor]:
-        return self.model.compute_logits(hidden_states)
+        return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def share_with_target(self, target_base: nn.Module, loaded: set[str]) -> None:
         """Bind embed/head on each MTPBlock to the already-loaded target's
