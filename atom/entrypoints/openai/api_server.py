@@ -37,7 +37,9 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    ResponsesRequest,
 )
+from .serving_responses import build_responses_response, stream_responses_response
 from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
@@ -826,6 +828,83 @@ async def completions(request: CompletionRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in completions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/responses")
+async def responses(request: ResponsesRequest):
+    """Handle Responses API requests.
+
+    Implements a compatibility subset by mapping Responses input to ATOM's
+    existing chat-template generation path and wrapping streaming chunks in
+    Responses API SSE events.
+    """
+    global engine, tokenizer, model_name
+
+    validate_model(request.model)
+
+    try:
+        messages = request.to_chat_messages()
+
+        merged_kwargs = dict(default_chat_template_kwargs)
+        if request.chat_template_kwargs:
+            merged_kwargs.update(request.chat_template_kwargs)
+
+        prompt = apply_chat_template(
+            tokenizer,
+            custom_message_encoder,
+            [msg.to_template_dict() for msg in messages],
+            tools=request.tools,
+            **merged_kwargs,
+        )
+
+        sampling_params = _build_sampling_params(
+            temperature=request.temperature,
+            max_tokens=request.get_max_tokens(),
+            stop_strings=request.stop,
+            ignore_eos=request.ignore_eos,
+            top_k=request.top_k,
+            top_p=request.top_p,
+            n=1,
+        )
+
+        request_id = f"resp-{uuid.uuid4().hex}"
+        _log_request_event("request", request_id, request.model_dump())
+
+        if request.stream:
+            seq_id, stream_queue = await setup_streaming_request(
+                prompt, sampling_params, request_id
+            )
+            gen = stream_responses_response(
+                request_id,
+                model_name,
+                prompt,
+                stream_queue,
+                seq_id,
+                tokenizer,
+                cleanup_streaming_request,
+            )
+            return StreamingResponse(
+                _logged_stream(gen, request_id),
+                media_type="text/event-stream",
+            )
+
+        final_output = None
+        async for output in generate_async(prompt, sampling_params, request_id):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError("No output generated")
+        resp = build_responses_response(
+            request_id, model_name, final_output["text"], final_output
+        )
+        _log_request_event("response", request_id, resp.model_dump())
+        return resp
+
+    except ValueError as e:
+        logger.error(f"Validation error in responses: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in responses: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

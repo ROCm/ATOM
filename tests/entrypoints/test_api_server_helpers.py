@@ -165,3 +165,14 @@ class TestBuildSamplingParams:
                 ignore_eos=False,
                 n=0,
             )
+
+
+class TestResponsesRoute:
+    """The OpenAI Responses API route is registered."""
+
+    def test_responses_route_exists(self):
+        routes = {
+            (tuple(sorted(getattr(route, "methods", []) or [])), getattr(route, "path", ""))
+            for route in api_server.app.routes
+        }
+        assert (("POST",), "/v1/responses") in routes
