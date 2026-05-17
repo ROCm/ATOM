@@ -1721,7 +1721,7 @@ class DeepseekV4Attention(nn.Module):
                 rd,
                 self.kv_norm.weight,
                 self.eps,
-                win,
+                cache_size,
                 swa_write_indices=write_indices,
                 batch_id_per_token=batch_id,
                 state_slot_mapping=slot_map,

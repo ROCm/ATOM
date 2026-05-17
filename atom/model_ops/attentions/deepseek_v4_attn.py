@@ -909,12 +909,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # 3. H2D-only staging on prep_stream (mirrors prepare_decode pattern).
         # NB: this runs inside attn_metadata_builder.build(), BEFORE
         # set_forward_context() — can't read main_stream from the context yet.
-        prep_stream = self.prep_stream
+        # prep_stream = self.prep_stream
         # current_stream = torch.cuda.current_stream()
         # prep_stream.wait_stream(current_stream)
         # with torch.cuda.stream(prep_stream):
-        positions_gpu = var["positions"].copy_to_gpu(bs)
-        var["cu_seqlens_q"].copy_to_gpu(bs + 1)
+        if True:
+            positions_gpu = var["positions"].copy_to_gpu(bs)
+            var["cu_seqlens_q"].copy_to_gpu(bs + 1)
         # context_lens already correct on GPU (eagle bumped it);
         # CPU is now mirrored.
         # current_stream.wait_stream(prep_stream)
@@ -1018,10 +1019,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # NB: this runs inside attn_metadata_builder.build(), BEFORE
         # set_forward_context() — can't read main_stream from the context yet.
         prep_stream = self.prep_stream
-        # current_stream = torch.cuda.current_stream()
-        # prep_stream.wait_stream(current_stream)
-        # with torch.cuda.stream(prep_stream):
-        if True:
+        current_stream = torch.cuda.current_stream()
+        prep_stream.wait_stream(current_stream)
+        with torch.cuda.stream(prep_stream):
             positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
             cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(scheduled_bs + 1)
             context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
@@ -1039,7 +1039,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         # ---- sync, build attn_metadata, per-fwd meta ----
-        # current_stream.wait_stream(prep_stream)
+        current_stream.wait_stream(prep_stream)
 
         attn_metadata = AttentionMetaData_DSV4(
             cu_seqlens_q=cu_seqlens_q_gpu,
@@ -2038,7 +2038,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         sentinel-skips inactive rows internally for both BF16 Main and FP8
         Indexer paths.)
         """
-        device = self.model_runner.device
         var = self.model_runner.forward_vars
         # Honor MTP at capture time: V4-Pro `mtp_k=1` → 2 tokens/req. The
         # outer `model_runner.capture_cudagraph` populates cu_seqlens_q with
