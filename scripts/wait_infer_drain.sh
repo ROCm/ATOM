@@ -1,32 +1,37 @@
 #!/bin/bash
-# Watch an in-flight ATOM inference workload. Exit 0 when the engine drains
-# (no eval client running AND a single poll with no new output), exit 1 if
-# a hang is detected (no progress for STUCK_POLLS polls) while a client is
-# still hammering the server. STUCK_POLLS only gates HANG detection (need
-# many quiet polls to be sure the workload didn't just briefly idle); drain
-# detection is immediate once client is gone (no new requests can arrive).
+# Watch an in-flight ATOM inference workload (server OR offline simple_inference).
+# Exit 0 when the workload drains cleanly, exit 1 on hang, exit 2 on GPU fault.
 #
-# A "hang" is defined as STUCK_POLLS consecutive polls with:
-#   - zero new "Engine Core: output send" lines in $LOG_FILE
-#   - server process still alive (worker thread stuck on a kernel)
-#   - an eval client (lm_eval / curl loop / etc.) still running
+# Workload modes (auto-detected by process pattern):
+#   - Server mode  (atom.entrypoints): drains when eval client (lm_eval / curl
+#                  / benchmark) is gone and a single poll shows no new output.
+#                  Hang = STUCK_POLLS consecutive polls with no new "Engine
+#                  Core: output send" while a client is still hammering.
+#   - Offline mode (atom.examples.simple_inference / atom.examples.benchmark):
+#                  drains when the inference process exits naturally (no fault
+#                  in log). Hang detection is N/A (no client concept; no
+#                  Engine Core ZMQ progress).
 #
-# Liveness: pgrep `atom.entrypoints` (NOT curl /v1/models — under heavy load
+# Use this script for ANY blocking wait on an ATOM workload — don't fall back
+# to `sleep + tail`. Offline path is supported in-script so you can wrap
+# simple_inference the same way as server runs.
+#
+# Liveness: pgrep `$SERVER_PATTERN` (NOT curl /v1/models — under heavy load
 # the HTTP endpoint can fail to respond within reasonable timeout even when
 # the server is alive, producing false-positive "dead" reports).
 #
 # Usage: bash scripts/wait_infer_drain.sh [PORT] [MAX_MIN] [POLL_SEC] [LOG_FILE] [STUCK_POLLS]
-#   PORT         default 8000  (kept for API symmetry with wait_server_ready.sh)
+#   PORT         default 8000  (kept for API symmetry with wait_server_ready.sh; unused in offline mode)
 #   MAX_MIN      default 30    (full GSM8K 1319 typically 5-15 min on V4-Pro)
 #   POLL_SEC     default 10    (fast poll for quick hang detection)
 #   LOG_FILE     default /app/logs_claude/atom_server.log
 #   STUCK_POLLS  default 6     (6 × 10s = 1 min of no progress → declare hang)
 #
 # Exit codes:
-#   0 — engine drained cleanly (no client + no pending output)
-#   1 — hang detected (no progress while client running)
-#   2 — fault detected (MEMORY_VIOLATION / ASSERT_TRAP / proc died)
-#   3 — server process gone
+#   0 — workload drained cleanly (server: client gone + no pending output;
+#                                 offline: process exited without fault)
+#   1 — hang detected (server only: no progress while client running)
+#   2 — fault detected (MEMORY_VIOLATION / ASSERT_TRAP / Memory access fault / proc died)
 #   4 — max wait elapsed without resolution
 
 set -uo pipefail
@@ -41,7 +46,9 @@ ITERS=$(( MAX_MIN * 60 / POLL ))
 # Match anything that indicates the eval driver is still hammering the
 # server. Extend if you use a different client.
 CLIENT_PATTERN='lm_eval|curl.*v1/(completions|chat)|atom\.examples\.benchmark|atom\.benchmarks\.benchmark'
-SERVER_PATTERN='atom\.entrypoints'
+# Server- or offline-mode workload process. simple_inference and
+# atom.examples.benchmark also count — process-exit + no-fault = drain.
+SERVER_PATTERN='atom\.entrypoints|atom\.examples\.simple_inference'
 
 prev_outputs=0
 stuck=0
@@ -49,23 +56,26 @@ stuck=0
 for ((i=1; i<=ITERS; i++)); do
     sleep "$POLL"
 
-    # Server alive? Only by process presence — no curl (false-positives under
-    # heavy load).
-    if ! pgrep -f "$SERVER_PATTERN" >/dev/null 2>&1; then
-        echo "[t=$((i*POLL))s] server process GONE — exiting 3"
-        tail -20 "$LOG_FILE" 2>/dev/null
-        exit 3
-    fi
-
-    # GPU fault?
-    FAULT=$(grep -cE "stopped, reason|MEMORY_VIOLATION|ASSERT_TRAP|proc died unexpectedly" \
+    # GPU fault? Check BEFORE process-exit so that fault-then-exit is
+    # attributed to fault (exit 2), not normal drain.
+    FAULT=$(grep -cE "stopped, reason|MEMORY_VIOLATION|ASSERT_TRAP|proc died unexpectedly|Memory access fault by GPU" \
         "$LOG_FILE" 2>/dev/null | head -1)
     FAULT="${FAULT:-0}"
     if [ "$FAULT" -gt 0 ]; then
         echo "[t=$((i*POLL))s] GPU fault detected ($FAULT signals) — exiting 2"
-        grep -E "stopped, reason|MEMORY_VIOLATION|ASSERT_TRAP|proc died" \
+        grep -E "stopped, reason|MEMORY_VIOLATION|ASSERT_TRAP|proc died|Memory access fault by GPU" \
             "$LOG_FILE" 2>/dev/null | head -3
         exit 2
+    fi
+
+    # Workload process alive? Only by process presence — no curl (HTTP can
+    # false-negative under heavy load).
+    if ! pgrep -f "$SERVER_PATTERN" >/dev/null 2>&1; then
+        # No fault grep matched above + process gone = clean exit (drain).
+        # Covers both stop_atom_server (server mode) and simple_inference
+        # finishing its prompts (offline mode).
+        echo "[t=$((i*POLL))s] workload process exited cleanly — DRAINED"
+        exit 0
     fi
 
     # Engine progress?

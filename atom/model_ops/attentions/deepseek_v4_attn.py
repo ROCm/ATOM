@@ -115,9 +115,11 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kernels skip on `bid < 0`. All other per-token quantities resolved as
     `per_seq_data[batch_id_per_token[t]]` — no [T] aliases of seq data."""
     swa_write_indices: Optional[torch.Tensor] = None
-    """[padded_T] int64 GPU — src row id into per-fwd KV for swa_write.
-    `[0:num_write]` = real (last `win` tokens per seq);
-    `[num_write:padded_T]` = -1 sentinel. `None` for warmup / empty fwd."""
+    """[W] int64 GPU — src row id into per-fwd KV for swa_write.
+    `[0:num_write]` = real (last `win` tokens per seq); trailing entries
+    `[num_write:W]` = -1 sentinel (only present on decode/MTP CG paths
+    where `W = padded_bs * (1 + max_spec_steps)`; prefill is eager and
+    uses `W = num_write` exactly, no padding). `None` for warmup / empty fwd."""
     compress_plans: Optional[Dict[int, Any]] = None
     """dict[ratio:int -> CompressPlan] — packed plan tensors per
     compress_ratio (4=CSA, 128=HCA)."""
@@ -908,14 +910,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # NB: this runs inside attn_metadata_builder.build(), BEFORE
         # set_forward_context() — can't read main_stream from the context yet.
         prep_stream = self.prep_stream
-        current_stream = torch.cuda.current_stream()
-        prep_stream.wait_stream(current_stream)
-        with torch.cuda.stream(prep_stream):
-            positions_gpu = var["positions"].copy_to_gpu(bs)
-            var["cu_seqlens_q"].copy_to_gpu(bs + 1)
-            # context_lens already correct on GPU (eagle bumped it);
-            # CPU is now mirrored.
-        current_stream.wait_stream(prep_stream)
+        # current_stream = torch.cuda.current_stream()
+        # prep_stream.wait_stream(current_stream)
+        # with torch.cuda.stream(prep_stream):
+        positions_gpu = var["positions"].copy_to_gpu(bs)
+        var["cu_seqlens_q"].copy_to_gpu(bs + 1)
+        # context_lens already correct on GPU (eagle bumped it);
+        # CPU is now mirrored.
+        # current_stream.wait_stream(prep_stream)
 
         # 4. CPU numpy: extend_lens (=1 per seq) and start_pos.
         start_pos_per_seq_cpu = positions_np.astype(np.int64)
@@ -1016,9 +1018,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # NB: this runs inside attn_metadata_builder.build(), BEFORE
         # set_forward_context() — can't read main_stream from the context yet.
         prep_stream = self.prep_stream
-        current_stream = torch.cuda.current_stream()
-        prep_stream.wait_stream(current_stream)
-        with torch.cuda.stream(prep_stream):
+        # current_stream = torch.cuda.current_stream()
+        # prep_stream.wait_stream(current_stream)
+        # with torch.cuda.stream(prep_stream):
+        if True:
             positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
             cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(scheduled_bs + 1)
             context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
@@ -1036,7 +1039,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         # ---- sync, build attn_metadata, per-fwd meta ----
-        current_stream.wait_stream(prep_stream)
+        # current_stream.wait_stream(prep_stream)
 
         attn_metadata = AttentionMetaData_DSV4(
             cu_seqlens_q=cu_seqlens_q_gpu,
@@ -1050,6 +1053,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             num_cached_tokens=None,
             block_tables=block_tables_gpu,
             context_lens=context_lens_gpu,
+            is_pure_decode=True,
         )
         attn_metadata.state_slot_mapping = state_slot_gpu
         attn_metadata.state_slot_mapping_cpu = state_slot_np
@@ -1097,6 +1101,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # fields with defaults; the parent dataclass is non-slotted.
         base_md.__class__ = AttentionMetaData_DSV4
         attn_metadata = cast(AttentionMetaData_DSV4, base_md)
+        # Prefill is by definition not pure decode (fresh-prefill seqs have
+        # start_pos == 0). Class-promotion via __class__ doesn't run the
+        # dataclass __init__, so V4-specific defaults aren't applied — set
+        # explicitly.
+        attn_metadata.is_pure_decode = False
         scheduled_bs = batch.total_seqs_num_prefill
         if attn_metadata.block_tables is None:
             attn_metadata.block_tables = self._populate_block_tables(
@@ -1303,10 +1312,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         them once per fwd saves ~64 redundant constructions for V4-Pro.
 
         Sets:
-          - `attn_metadata.swa_write_indices`: [padded_T] int64 row ids
-            into per-token KV. Real entries are the last `win` tokens per seq;
-            tail (entries beyond the per-fwd `num_write`) is sentinel-filled
-            with -1 so a fixed grid `padded_T` is always safe (CUDAGraph).
+          - `attn_metadata.swa_write_indices`: [W] int64 row ids into
+            per-token KV. Real entries are the last `win` tokens per seq.
+            For decode/MTP (CG-captured): `W = padded_bs * (1 + max_spec_steps)`,
+            trailing entries `[num_write:W]` get -1 sentinel so the fixed
+            grid is CUDAGraph-safe. For prefill (eager, no CG):
+            `W = num_write` exactly — no padding, no wasted grid programs
+            (long-prefill chunks would otherwise launch up to ~64× more
+            programs that all bail on `src_id < 0`).
           - `attn_metadata.batch_id_per_token`: [padded_T] int32 batch id
             per token (single per-token mapping; consumed by `swa_write`,
             Phase B/C/E paged-decode kernels, and the indexer).
@@ -1331,14 +1344,29 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         start_pos_per_seq_np = np.asarray(
             start_pos_per_seq_cpu[:scheduled_bs], dtype=np.int64
         )
-        if padded_bs is None or max_q_len is None:
-            padded_total_tokens = total_tokens
-        else:
-            padded_total_tokens = max(int(padded_bs) * int(max_q_len), total_tokens)
+        # is_pure_decode is set by the caller at AttentionMetaData_DSV4
+        # construction time (single source of truth — prepare_decode /
+        # prepare_prefill / build_for_cudagraph_capture each know their
+        # own semantics). Consumed for: padded_total_tokens (CG bucket vs
+        # eager-tight), arange shortcut (write_indices), SWA grid bucketing,
+        # and by `_attach_v4_paged_decode_meta` for the index-buffer skip.
+        is_pure_decode = attn_metadata.is_pure_decode
 
-        is_decode_only = scheduled_bs == total_tokens and bool(
-            (token_num_per_seq == 1).all()
-        )
+        # padded_total_tokens: CG-captured decode/MTP pads to the fixed
+        # bucket `padded_bs * (1+max_spec_steps)` so per-token buffers
+        # (batch_id_per_token, swa_write_indices) have a stable shape across
+        # captures. Non-pure-decode (prefill / mixed / fresh-prefill) is
+        # eager and uses `total_tokens` exactly — no wasted padding (a long
+        # prefill chunk doesn't need to be padded up to a bucket that
+        # doesn't exist for it).
+        if is_pure_decode:
+            assert padded_bs is not None and max_q_len is not None, (
+                "is_pure_decode requires padded_bs + max_q_len from caller "
+                "(CG bucket size — fixed at capture)"
+            )
+            padded_total_tokens = int(padded_bs) * int(max_q_len)
+        else:
+            padded_total_tokens = total_tokens
 
         var = self.model_runner.forward_vars
 
@@ -1354,29 +1382,32 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         n_committed_csa_per_seq_np = (ctx_per_seq_np // 4).astype(np.int32)
 
-        write_starts = cu_seqlens_q_arr[:scheduled_bs] + np.maximum(
-            0, token_num_per_seq - win
-        )
-        write_ends = cu_seqlens_q_arr[1:]
-        if is_decode_only:
-            write_indices_np = np.arange(total_tokens, dtype=np.int64)
+        # Build write_indices for the SWA-write kernel.
+        # is_pure_decode ⇒ source is `self._swa_iota` (static GPU tensor) +
+        #   GPU fill_(-1) tail. No CPU numpy needed; `num_write = total_tokens`,
+        #   `swa_write_grid = padded_total_tokens` (CG bucket).
+        # else ⇒ per-seq concat tail (filter `last win tokens per seq`).
+        #   Built as a fresh local numpy (NOT into the shared pinned
+        #   `wi_buf.np`, which would race with the next fwd's rewrite during
+        #   in-flight DMA). `swa_write_grid = num_write` (tight, no padding —
+        #   prefill is eager).
+        if is_pure_decode:
+            write_indices_np = None
+            num_write = total_tokens
+            swa_write_grid = padded_total_tokens
         else:
+            write_starts = cu_seqlens_q_arr[:scheduled_bs] + np.maximum(
+                0, token_num_per_seq - win
+            )
+            write_ends = cu_seqlens_q_arr[1:]
             write_indices_np = np.concatenate(
                 [
                     np.arange(s, e, dtype=np.int64)
                     for s, e in zip(write_starts, write_ends)
                 ]
             )
-        num_write = int(write_indices_np.shape[0])
-        wi_buf = var["v4_meta_swa_write_indices"]
-        cap = wi_buf.np.shape[0]
-        assert (
-            padded_total_tokens <= cap
-        ), f"v4_meta_swa_write_indices too small: need {padded_total_tokens}, have {cap}"
-        if num_write > 0:
-            wi_buf.np[:num_write] = write_indices_np
-        if num_write < padded_total_tokens:
-            wi_buf.np[num_write:padded_total_tokens].fill(-1)
+            num_write = int(write_indices_np.shape[0])
+            swa_write_grid = num_write
 
         # ---- Build window_topk on CPU (avoids ~25 small GPU kernels) ----
         # Per-row formula needs only `positions` + `cache_size` after
@@ -1397,7 +1428,27 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.n_committed_csa_per_seq = self._stage(
             "v4_n_committed_csa_per_seq", n_committed_csa_per_seq_np
         )
-        attn_metadata.swa_write_indices = wi_buf.copy_to_gpu(padded_total_tokens)
+        # Race-free write into the shared `v4_meta_swa_write_indices` GPU
+        # buffer (stable pointer → CG-capture-safe). Bypasses `_stage`
+        # because `_stage`'s `buf.np[:n] = arr; copy_to_gpu(non_blocking=True)`
+        # pattern uses the shared pinned alias as the H2D source — the next
+        # fwd's CPU rewrite of `buf.np` can land mid-DMA and tear the GPU
+        # contents, producing torn `src_id` values that exceed `kv.shape[0]`
+        # and MEMORY_VIOLATION the `tl.load(kv_ptr + src_id * ...)` in
+        # `_swa_write_kernel`.
+        wi_gpu = var["v4_meta_swa_write_indices"].gpu
+        assert swa_write_grid <= wi_gpu.shape[0], (
+            f"v4_meta_swa_write_indices too small: need {swa_write_grid}, "
+            f"have {wi_gpu.shape[0]}"
+        )
+        if is_pure_decode:
+            if num_write > 0:
+                wi_gpu[:num_write].copy_(self._swa_iota[:num_write])
+            if num_write < swa_write_grid:
+                wi_gpu[num_write:swa_write_grid].fill_(-1)
+        elif num_write > 0:
+            wi_gpu[:num_write].copy_(torch.from_numpy(write_indices_np))
+        attn_metadata.swa_write_indices = wi_gpu[:swa_write_grid]
 
         self._attach_v4_paged_decode_meta(
             attn_metadata=attn_metadata,
@@ -1466,15 +1517,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._clear_v4_paged_decode_meta(attn_metadata)
             return
 
-        # is_pure_decode = uniform tokens-per-seq AND no fresh prefill
-        # (per doc §7.4). Catches both regular decode (1 tok/seq) and MTP-1
-        # (2 tok/seq); rejects mixed batches and fresh-prefill seqs.
-        tok_first = int(token_num_per_seq[0])
-        is_uniform_tok = bool((token_num_per_seq == tok_first).all())
-        no_fresh_prefill = bool((start_pos_per_seq_np > 0).all())
-        is_pure_decode = is_uniform_tok and no_fresh_prefill
-
-        if not is_pure_decode or len(state_slot_mapping_cpu) < scheduled_bs:
+        # is_pure_decode is set at AttentionMetaData_DSV4 construction time
+        # (single source of truth). Skip the paged-decode index buffer build
+        # for non-pure-decode batches (prefill / mixed / fresh-prefill) and
+        # for warmup / dummy_run batches where per_req_cache_groups is empty
+        # (the latter flips is_pure_decode to False via _clear).
+        if (
+            not attn_metadata.is_pure_decode
+            or len(state_slot_mapping_cpu) < scheduled_bs
+        ):
             self._clear_v4_paged_decode_meta(attn_metadata)
             return
 
@@ -1611,7 +1662,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # batch_id_per_token + n_committed_csa_per_seq already set in
         # `_attach_v4_per_fwd_meta` (single source of truth, also consumed by
         # swa_write / indexer outside the is_pure_decode branch).
-        attn_metadata.is_pure_decode = True
+        # is_pure_decode was set by the caller at AttentionMetaData_DSV4
+        # construction time; we only touch it via `_clear_v4_paged_decode_meta`
+        # when the warmup carve-out fires.
         attn_metadata.kv_indices_swa = swa_indices_gpu[: T * win]
         attn_metadata.kv_indices_csa = csa_indices_gpu[: int(csa_indptr_np[T])]
         attn_metadata.kv_indices_hca = hca_indices_gpu  # already exact len
@@ -2021,6 +2074,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         block_tables_gpu = var["block_tables"].copy_to_gpu(bs)
         state_slot_gpu = self._stage("v4_meta_state_slot_groups", state_slot_np)
 
+        # Synthetic decode batch: start_pos = win > 0 and uniform
+        # max_q_len tokens per seq, so is_pure_decode is True by
+        # construction (capture replays the decode codepath).
         attn_metadata = AttentionMetaData_DSV4(
             cu_seqlens_q=cu_seqlens_q_gpu,
             cu_seqlens_k=None,
@@ -2033,6 +2089,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             num_cached_tokens=None,
             block_tables=block_tables_gpu,
             context_lens=context_lens_gpu,
+            is_pure_decode=True,
         )
         attn_metadata.state_slot_mapping = state_slot_gpu
         attn_metadata.state_slot_mapping_cpu = state_slot_np
@@ -2118,7 +2175,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_meta_start_pos_per_seq"] = CpuGpuBuffer(bs, **i64)
         bufs["v4_meta_token_num_per_seq"] = CpuGpuBuffer(bs, **i64)
         bufs["v4_meta_state_slot_groups"] = CpuGpuBuffer(bs, **i32)
-        bufs["v4_meta_swa_write_indices"] = CpuGpuBuffer(mnbt, **i64)
+        # swa_write_indices: tight bound = `max_bs * window_size`. Universal
+        # worst-case across paths — prefill compact write is `sum(min(num_i,
+        # win)) ≤ bs * win`; decode/MTP CG is `bs * (1+max_spec_steps) ≤
+        # bs * win` (since `1+max_spec_steps ≪ win`). Legacy `mnbt` sizing
+        # was over-padded to the prefill total-token worst case.
+        bufs["v4_meta_swa_write_indices"] = CpuGpuBuffer(bs * win, **i64)
+        # Static GPU iota used by `_attach_v4_per_fwd_meta` for the
+        # is_pure_decode arange shortcut. Pre-allocated once so the per-fwd
+        # write into `v4_meta_swa_write_indices` is a pure GPU-to-GPU copy
+        # (no CPU intermediate → no pinned-buffer H2D race) and the source
+        # pointer stays stable for CUDAGraph capture.
+        self._swa_iota = torch.arange(bs * win, dtype=torch.int64, device=self.device)
         # Window-topk output buffer (per-token sliding-window ring indices).
         # Sized [mnbt, win] int32 — `_build_window_topk_np` fills the
         # [total_tokens, win] head; `_attach_v4_paged_decode_meta` derives
@@ -2231,8 +2299,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         buf = self.model_runner.forward_vars[name]
         n = arr.shape[0] if arr.ndim > 0 else 1
-        if n == 0:
-            return buf.gpu[:0]
+        assert (
+            n > 0
+        ), f"Cannot stage empty array for {name!r} — ensure the input array has at least one element."
         cap = buf.np.shape[0]
         assert n <= cap, (
             f"V4 buffer {name!r} too small: need {n}, have {cap}. "
