@@ -680,6 +680,48 @@ def _merge_vocab_parallel_lora_(
     )
 
 
+def _load_vocab_parallel_lora(
+    target_name: str,
+    module: nn.Module,
+    pair: LoRATensorPair,
+    adapter_name: str,
+) -> None:
+    add_lora_adapter = getattr(module, "add_lora_adapter", None)
+    if add_lora_adapter is None:
+        _merge_vocab_parallel_lora_(target_name, module, pair, adapter_name)
+        return
+
+    weight = module.weight
+    if weight.dim() != 2:
+        raise ValueError(
+            f"LoRA target {target_name} weight must be 2D, got {tuple(weight.shape)}"
+        )
+    if pair.lora_a.shape[1] != weight.shape[1]:
+        raise ValueError(
+            f"LoRA A input mismatch for {target_name}: "
+            f"expected {weight.shape[1]}, got {pair.lora_a.shape[1]}"
+        )
+    lora_b = _slice_vocab_parallel_lora_b(module, pair.lora_b)
+    if lora_b.shape[0] != weight.shape[0]:
+        raise ValueError(
+            f"LoRA B output mismatch for {target_name}: "
+            f"expected {weight.shape[0]}, got {lora_b.shape[0]}"
+        )
+
+    dtype = _lora_dtype_for_module(module)
+    add_lora_adapter(
+        pair.lora_a.to(device=weight.device, dtype=dtype),
+        lora_b.to(device=weight.device, dtype=dtype),
+        pair.scaling,
+        adapter_name=adapter_name,
+    )
+    logger.debug(
+        "Registered LoRA adapter %s for vocab-parallel target %s",
+        adapter_name,
+        target_name,
+    )
+
+
 def apply_lora_adapters(
     model: nn.Module,
     lora_modules: list[str] | None,
@@ -719,17 +761,18 @@ def apply_lora_adapters(
                 packed_modules_mapping,
             )
             target_module = model_modules[target_name]
+            if shard_id is None and _looks_like_vocab_parallel_head(target_module):
+                _load_vocab_parallel_lora(
+                    target_name,
+                    target_module,
+                    pair,
+                    spec.name,
+                )
+                loaded_count += 1
+                continue
+
             add_lora_adapter = getattr(target_module, "add_lora_adapter", None)
             if add_lora_adapter is None:
-                if shard_id is None and _looks_like_vocab_parallel_head(target_module):
-                    _merge_vocab_parallel_lora_(
-                        target_name,
-                        target_module,
-                        pair,
-                        spec.name,
-                    )
-                    loaded_count += 1
-                    continue
                 raise TypeError(
                     f"LoRA target {target_name} does not support static LoRA"
                 )

@@ -127,6 +127,10 @@ class FakeParallelLMHead(nn.Module):
             torch.zeros(self.num_embeddings_per_partition, 4, dtype=torch.bfloat16),
             requires_grad=False,
         )
+        self.loaded_loras = []
+
+    def add_lora_adapter(self, lora_a, lora_b, scaling, **kwargs):
+        self.loaded_loras.append((lora_a, lora_b, scaling, kwargs))
 
 
 def _write_adapter(path, tensors, r=2, alpha=4):
@@ -403,7 +407,7 @@ def test_apply_lora_adapters_merges_routed_expert_lora_into_fp8_block_moe(
     assert torch.allclose(dequant, torch.full((2, 4), 2.0), atol=0.25)
 
 
-def test_apply_lora_adapters_merges_vocab_parallel_lm_head(tmp_path):
+def test_apply_lora_adapters_registers_vocab_parallel_lm_head(tmp_path):
     adapter_path = tmp_path / "adapter"
     lora_a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     lora_b = torch.arange(12, dtype=torch.float32).reshape(6, 2)
@@ -419,8 +423,45 @@ def test_apply_lora_adapters_merges_vocab_parallel_lm_head(tmp_path):
 
     apply_lora_adapters(model, [f"test={adapter_path}"])
 
-    expected = (lora_b[3:6] @ lora_a * 2.0).to(torch.bfloat16)
-    assert torch.equal(model.lm_head.weight, expected)
+    assert torch.count_nonzero(model.lm_head.weight) == 0
+    loaded_a, loaded_b, scaling, kwargs = model.lm_head.loaded_loras[0]
+    assert torch.equal(loaded_a.cpu(), lora_a.to(torch.bfloat16))
+    assert torch.equal(loaded_b.cpu(), lora_b[3:6].to(torch.bfloat16))
+    assert scaling == 2.0
+    assert kwargs["adapter_name"] == "test"
+
+
+def test_parallel_lm_head_lora_applies_delta_before_gather(monkeypatch):
+    import importlib
+
+    pytest.importorskip("aiter")
+    try:
+        embed_head = importlib.import_module("atom.model_ops.embed_head")
+    except ImportError as exc:
+        pytest.skip(f"ParallelLMHead dependencies are not importable: {exc}")
+
+    class FakeTPGroup:
+        rank_in_group = 0
+        world_size = 1
+
+    monkeypatch.setattr(embed_head, "get_tp_group", lambda: FakeTPGroup())
+    lm_head = embed_head.ParallelLMHead(num_embeddings=3, embedding_dim=4)
+    lora_a = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+        dtype=torch.bfloat16,
+    )
+    lora_b = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        dtype=torch.bfloat16,
+    )
+    lm_head.add_lora_adapter(lora_a, lora_b, scaling=0.5, adapter_name="test")
+    x = torch.tensor([[2.0, 4.0, 8.0, 16.0]], dtype=torch.bfloat16)
+    logits = torch.zeros(1, 3, dtype=torch.bfloat16)
+
+    out = lm_head._apply_lora_adapters(x, logits)
+
+    expected = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.bfloat16)
+    assert torch.equal(out, expected)
 
 
 def test_resolve_lora_target_rejects_routed_fused_moe_experts():
