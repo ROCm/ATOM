@@ -47,6 +47,7 @@ from atom.model_ops.attentions.backends import (
     AttentionMetadataBuilder,
     CommonAttentionBuilder,
 )
+from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import (
     AttentionMetaData,
@@ -1572,51 +1573,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Stage to GPU (HCA compress tail; window prefix scattered below).
         hca_indices_gpu = self._stage("v4_kv_indices_hca", hca_indices_np)
 
-        # ----- SWA paged offsets (GPU-side from window_topk_gpu) -----
-        # `state_slot_per_token = state_slot_per_seq[batch_id_per_token]` —
-        # done as a transient GPU gather (no persistent per-token buffer).
-        # Reuse `attn_metadata.state_slot_mapping` (= forward_vars[
-        # "v4_meta_state_slot_groups"] gpu view, set by `_populate_state_slot_mapping`)
-        # — same data as the legacy `v4_meta_state_slot_i32` re-staging, no
-        # second H2D needed.
-        device = self.device
-        state_slot_per_seq_gpu = attn_metadata.state_slot_mapping
-        # Use only the real-data prefix of batch_id_per_token here — the
-        # padded tail carries -1 sentinels, and `swa_paged_2d` is computed
-        # against `window_topk_gpu` of shape [T, win] only.
-        state_slot_per_token_gpu = state_slot_per_seq_gpu[
-            batch_id_per_token_gpu[:T].long()
-        ]  # [T] int32 transient
-        # `window_topk_gpu` [T, win] int32 — passed in from caller
-        # (`_attach_v4_per_fwd_meta` builds it once per fwd). Builder-internal
-        # intermediate; not exposed on attn_metadata since no kernel reads it.
-        # Stride into unified_kv SWA region is `cs = win_with_spec`, NOT `win`.
-        # `window_topk_gpu` values are 0..cs-1 (case_c modulo cs); each slot
-        # holds `cs` ring entries.
-        swa_paged_2d = torch.where(
-            window_topk_gpu >= 0,
-            state_slot_per_token_gpu[:, None] * cs + window_topk_gpu,
-            torch.full_like(window_topk_gpu, -1),
-        )  # [T, win] int32
-        swa_paged_flat = swa_paged_2d.reshape(-1)  # [T*win] int32
-
-        # ----- Write SWA paged offsets to all 3 buffer heads (GPU) -----
-        # SWA buffer: uniform stride win → simple flat copy.
+        # ----- Write SWA / CSA / HCA window-prefix paged offsets (1 kernel) -----
+        # Replaces a chain of 6 transient tensors + 2 `index_copy_` calls.
+        # The transients raced under MTP-3 long-prefill (caching allocator
+        # handed in-flight `index_copy_` storage to next call's transient →
+        # ASSERT_TRAP in `index_copy_kernel_impl<OpaqueType<4>>`). Single
+        # Triton launch reads only persistent forward_vars buffers and writes
+        # all 3 destinations in-place. See skill `debug-agent-locate-kernel`.
         swa_indices_gpu = var["v4_kv_indices_swa"].gpu
-        swa_indices_gpu[: T * win].copy_(swa_paged_flat)
-
-        # CSA / HCA buffers: window prefix at packed positions
-        # [indptr[t], indptr[t]+win) — scatter via index_copy_.
-        win_arange = torch.arange(win, device=device, dtype=torch.int64)
-        csa_win_pos = (
-            csa_indptr_gpu[:T].to(torch.int64).unsqueeze(1) + win_arange.unsqueeze(0)
-        ).reshape(-1)
-        hca_win_pos = (
-            hca_indptr_gpu[:T].to(torch.int64).unsqueeze(1) + win_arange.unsqueeze(0)
-        ).reshape(-1)
         csa_indices_gpu = var["v4_kv_indices_csa"].gpu
-        csa_indices_gpu.index_copy_(0, csa_win_pos, swa_paged_flat)
-        hca_indices_gpu.index_copy_(0, hca_win_pos, swa_paged_flat)
+        write_v4_paged_decode_indices(
+            state_slot_per_seq=attn_metadata.state_slot_mapping,
+            batch_id_per_token=batch_id_per_token_gpu,
+            window_topk=window_topk_gpu,
+            csa_indptr=csa_indptr_gpu,
+            hca_indptr=hca_indptr_gpu,
+            swa_indices=swa_indices_gpu,
+            csa_indices=csa_indices_gpu,
+            hca_indices=hca_indices_gpu,
+            T=T,
+            win=win,
+            cs=cs,
+        )
 
         # ----- skip_prefix_len_csa: decode = full SWA window per token -----
         # csa_translate_pack consumes this to know where the CSA section
@@ -2251,8 +2229,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f"V4 buffer {name!r} too small: need {n}, have {cap}. "
             f"Increase the corresponding bound in _alloc_v4_metadata_buffers."
         )
-        if arr.dtype != buf.np.dtype:
-            arr = arr.astype(buf.np.dtype, copy=False)
+        assert arr.dtype == buf.np.dtype, (
+            f"V4 buffer {name!r} dtype mismatch: buffer is {buf.np.dtype}, "
+            f"but got arr with dtype {arr.dtype}. Cast arr to the correct "
+            f"dtype before calling _stage."
+        )
         buf.np[:n] = arr
         return buf.copy_to_gpu(n)
 
