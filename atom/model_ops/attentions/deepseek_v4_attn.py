@@ -905,6 +905,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q_np
 
         # 3. H2D-only staging on prep_stream (mirrors prepare_decode pattern).
+        # NB: this runs inside attn_metadata_builder.build(), BEFORE
+        # set_forward_context() — can't read main_stream from the context yet.
         prep_stream = self.prep_stream
         current_stream = torch.cuda.current_stream()
         prep_stream.wait_stream(current_stream)
@@ -1011,6 +1013,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ss_buf.np[:scheduled_bs] = state_slot_np
 
         # ---- fire H2D on prep_stream ----
+        # NB: this runs inside attn_metadata_builder.build(), BEFORE
+        # set_forward_context() — can't read main_stream from the context yet.
         prep_stream = self.prep_stream
         current_stream = torch.cuda.current_stream()
         prep_stream.wait_stream(current_stream)

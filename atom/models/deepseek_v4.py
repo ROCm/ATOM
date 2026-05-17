@@ -1564,17 +1564,21 @@ class DeepseekV4Attention(nn.Module):
         Main Compressor → alt_stream (CSA + HCA).
         Indexer Compressor → compress_stream (CSA only).
         Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us."""
-        current_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self.alt_stream):
-            self.compressor(
-                x,
-                plan=plan,
-                state_slot_mapping=state_slot_mapping,
-                block_tables=block_tables,
-            )
+        current_stream = get_forward_context().main_stream
+        if self.compressor is not None and self.alt_stream is not None:
+            self.alt_stream.wait_stream(current_stream)
         if self.indexer is not None and self.compress_stream is not None:
             self.compress_stream.wait_stream(current_stream)
+
+        if self.compressor is not None and self.alt_stream is not None:
+            with torch.cuda.stream(self.alt_stream):
+                self.compressor(
+                    x,
+                    plan=plan,
+                    state_slot_mapping=state_slot_mapping,
+                    block_tables=block_tables,
+                )
+        if self.indexer is not None and self.compress_stream is not None:
             with torch.cuda.stream(self.compress_stream):
                 self.indexer.compressor(
                     x,
@@ -1615,6 +1619,18 @@ class DeepseekV4Attention(nn.Module):
         if get_forward_context().context.is_dummy_run:
             return torch.zeros_like(x)
         num_tokens = x.size(0)
+        # Async-compress (alt_stream main Compressor + compress_stream
+        # indexer.compressor) is only safe inside CUDAGraph capture: graph
+        # records the fork-join edges and replay re-uses the same stream
+        # layout. In eager mode the side-stream launches accumulate across
+        # 60 layers and deadlock the hipStream queue when the first splitk
+        # GEMM kernel allocates its workspace — verified hang on both
+        # small (~800-token) and large (>2k-token) prefill batches in
+        # eager. Replay does not re-execute this Python code so the flag
+        # doesn't matter then.
+        use_async_compress = (
+            self._use_async_compress and get_forward_context().in_hipgraph
+        )
         # SWA ring-slot count per req (= window_size + max_spec_steps for
         # MTP-aware cache). Sourced from the bound cache to avoid threading
         # `max_spec_steps` through V4Args; for non-MTP this equals
@@ -1663,7 +1679,8 @@ class DeepseekV4Attention(nn.Module):
         plan_for_layer = compress_plans[ratio] if ratio else None
 
         # ===== Triple-stream: Q/KV path + both Compressors in parallel =====
-        if self._use_async_compress:
+        current_stream = get_forward_context().main_stream
+        if use_async_compress:
             self._launch_compressors_async(
                 x, plan_for_layer, state_slot_mapping, block_tables_gpu
             )
@@ -1724,7 +1741,7 @@ class DeepseekV4Attention(nn.Module):
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
         # ===== Compressor + Indexer =====
-        if not self._use_async_compress:
+        if not use_async_compress:
             if self.compressor is not None:
                 self.compressor(
                     x,
@@ -1740,9 +1757,9 @@ class DeepseekV4Attention(nn.Module):
                         block_tables=block_tables_gpu,
                     )
         if self.indexer is not None:
-            if self._use_async_compress:
-                torch.cuda.current_stream().wait_stream(self.alt_stream)
-                torch.cuda.current_stream().wait_stream(self.compress_stream)
+            if use_async_compress:
+                current_stream.wait_stream(self.compress_stream)
+                current_stream.wait_stream(self.alt_stream)
             indexer_topk_batched = self.indexer.forward_batched(
                 x_full=x,
                 qr_full=qr,
@@ -1755,8 +1772,8 @@ class DeepseekV4Attention(nn.Module):
             #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
             # `_fill_csa_paged_compress` dispatches internally on is_pure_decode.
             self._fill_csa_paged_compress(attn_md, indexer_topk_batched, num_tokens)
-        elif self._use_async_compress:
-            torch.cuda.current_stream().wait_stream(self.alt_stream)
+        elif use_async_compress:
+            current_stream.wait_stream(self.alt_stream)
 
         # ===== Sparse attention dispatch =====
         # Two paths over the unified KV pool. The order of `swa_write` vs
@@ -2219,11 +2236,11 @@ class MoE(nn.Module):
         independent; main stream waits on alt_stream's completion before
         combining.
         """
-        current_stream = torch.cuda.current_stream()
+        current_stream = get_forward_context().main_stream
         self.alt_stream.wait_stream(current_stream)
+        routed = self.routed_expert_forward(x)
         with torch.cuda.stream(self.alt_stream):
             shared = self.shared_experts(x)
-        routed = self.routed_expert_forward(x)
         current_stream.wait_stream(self.alt_stream)
         return self.combine_outputs(routed, shared)
 

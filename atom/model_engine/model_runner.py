@@ -2033,6 +2033,7 @@ class ModelRunner:
                     num_tokens=num_tokens,
                     num_tokens_across_dp=num_tokens_across_dp,
                     ubatch_slices=ubatch_slices,
+                    in_hipgraph=True,
                 )
 
                 # Warmup

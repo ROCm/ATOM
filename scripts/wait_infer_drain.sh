@@ -1,7 +1,10 @@
 #!/bin/bash
 # Watch an in-flight ATOM inference workload. Exit 0 when the engine drains
-# (no progress for STUCK_POLLS polls AND no eval client running), exit 1 if
-# a hang is detected while a client is still hammering the server.
+# (no eval client running AND a single poll with no new output), exit 1 if
+# a hang is detected (no progress for STUCK_POLLS polls) while a client is
+# still hammering the server. STUCK_POLLS only gates HANG detection (need
+# many quiet polls to be sure the workload didn't just briefly idle); drain
+# detection is immediate once client is gone (no new requests can arrive).
 #
 # A "hang" is defined as STUCK_POLLS consecutive polls with:
 #   - zero new "Engine Core: output send" lines in $LOG_FILE
@@ -82,9 +85,11 @@ for ((i=1; i<=ITERS; i++)); do
         prev_outputs=$cur_outputs
     fi
 
-    # Drained cleanly: no progress AND no clients → done
-    if [ "$stuck" -ge "$STUCK_POLLS" ] && [ "$client_alive" -eq 0 ]; then
-        echo "Engine DRAINED (no client + no pending output for ${stuck} polls)"
+    # Drained cleanly: client gone AND no new output this poll → done.
+    # No need to wait STUCK_POLLS — once the client is gone no new requests
+    # can arrive, so a single quiet poll is definitive.
+    if [ "$client_alive" -eq 0 ] && [ "$stuck" -ge 1 ]; then
+        echo "Engine DRAINED (client gone + no pending output)"
         exit 0
     fi
 
