@@ -49,7 +49,7 @@ class AiterChunkContextMetadata:
 
 
 @dataclass
-class AiterFlashAttentionChunkPrefillMetadata:
+class AiterChunkPrefillMetadata:
     max_query_len: int
     max_seq_len: int
     query_start_loc: torch.Tensor
@@ -86,7 +86,7 @@ class AiterMhaMetadataForVllm:
 
     decode_metadata: Optional[AiterMhaPhaseMetadata] = None
     prefill_metadata: Optional[AiterMhaPhaseMetadata] = None
-    extend_metadata: Optional[AiterFlashAttentionChunkPrefillMetadata] = None
+    extend_metadata: Optional[AiterChunkPrefillMetadata] = None
 
     use_cascade: bool = False
     common_prefix_len: int = 0

@@ -12,7 +12,7 @@ from atom.plugin.vllm.attention.metadata import (
     _CP_TOKENS_PER_ITER_ROCM,
     AiterChunkContextMetadata,
     AiterChunkSlidingWindowMetadata,
-    AiterFlashAttentionChunkPrefillMetadata,
+    AiterChunkPrefillMetadata,
     AiterMlaDecodeMetadataForVllm,
     AiterMlaMetadataForVllm,
     AiterMlaPersistentMetadataForVllm,
@@ -319,7 +319,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             torch.cumsum(
                 seq_lens_device, dim=0, dtype=cu_seq_lens.dtype, out=cu_seq_lens[1:]
             )
-            extend_metadata = AiterFlashAttentionChunkPrefillMetadata(
+            extend_metadata = AiterChunkPrefillMetadata(
                 max_query_len=query_lens_extend.max().item(),
                 max_seq_len=seq_lens[num_extends_slice].max().item(),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
