@@ -497,9 +497,17 @@ class LinearBase(nn.Module):
 
     @mark_trace
     def forward(
-        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
+        self,
+        x: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
+        otype=dtypes.bf16,
+        lora_x: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        lora_x = x if self._static_lora_adapters else None
+        lora_x = (
+            (x if lora_x is None else lora_x)
+            if self._static_lora_adapters
+            else None
+        )
         if self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(
                 x,

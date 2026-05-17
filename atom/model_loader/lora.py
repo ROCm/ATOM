@@ -201,6 +201,14 @@ def validate_lora_adapters_supported(lora_modules: list[str] | None) -> None:
         iter_lora_tensor_module_names(spec.path)
 
 
+def module_has_static_lora_adapters(module: nn.Module | None) -> bool:
+    return bool(getattr(module, "_static_lora_adapters", ()))
+
+
+def any_module_has_static_lora_adapters(*modules: nn.Module | None) -> bool:
+    return any(module_has_static_lora_adapters(module) for module in modules)
+
+
 def _endswith_module_name(module_name: str, suffix: str) -> bool:
     return module_name == suffix or module_name.endswith(f".{suffix}")
 

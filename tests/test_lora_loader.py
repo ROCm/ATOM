@@ -9,8 +9,10 @@ from torch import nn
 
 from atom.model_loader.lora import (
     _dequantize_fp8_blocks,
+    any_module_has_static_lora_adapters,
     apply_lora_adapters,
     load_lora_tensors,
+    module_has_static_lora_adapters,
     parse_lora_module_entry,
     parse_lora_tensor_name,
     resolve_lora_target,
@@ -145,6 +147,17 @@ def _write_adapter(path, tensors, r=2, alpha=4):
 def test_parse_lora_module_entry_supports_name_equals_path():
     assert parse_lora_module_entry("adapter=/tmp/lora").name == "adapter"
     assert parse_lora_module_entry("/tmp/my-lora").name == "my-lora"
+
+
+def test_static_lora_helper_detects_registered_adapters():
+    without_lora = nn.Module()
+    with_lora = nn.Module()
+    with_lora._static_lora_adapters = [("a", "b", 1.0, None)]
+
+    assert not module_has_static_lora_adapters(None)
+    assert not module_has_static_lora_adapters(without_lora)
+    assert module_has_static_lora_adapters(with_lora)
+    assert any_module_has_static_lora_adapters(without_lora, with_lora)
 
 
 def test_parse_lora_tensor_name_strips_peft_prefix_and_default_slot():
