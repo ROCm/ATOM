@@ -496,10 +496,8 @@ jobs:
           IFS=',' read -ra HOSTS <<< "$DECODE_HOSTS"
           for i in "${!HOSTS[@]}"; do
             echo "Cleaning decode node: ${HOSTS[$i]}"
-            ssh -o StrictHostKeyChecking=no "${HOSTS[$i]}" bash -l <<EOF || true
-            docker stop atom-pd-consumer-${i} 2>/dev/null || true
-            docker rm atom-pd-consumer-${i} 2>/dev/null || true
-          EOF
+            ssh -o StrictHostKeyChecking=no "${HOSTS[$i]}" \
+              "docker stop atom-pd-consumer-${i} 2>/dev/null; docker rm atom-pd-consumer-${i} 2>/dev/null" || true
           done
 
       - name: Start local CI container (proxy + producer)
@@ -680,10 +678,8 @@ jobs:
           if [ -n "$DECODE_HOSTS" ]; then
             IFS=',' read -ra HOSTS <<< "$DECODE_HOSTS"
             for i in "${!HOSTS[@]}"; do
-              ssh -o StrictHostKeyChecking=no "${HOSTS[$i]}" bash -l <<EOF || true
-              docker stop atom-pd-consumer-${i} 2>/dev/null || true
-              docker rm atom-pd-consumer-${i} 2>/dev/null || true
-            EOF
+              ssh -o StrictHostKeyChecking=no "${HOSTS[$i]}" \
+                "docker stop atom-pd-consumer-${i} 2>/dev/null; docker rm atom-pd-consumer-${i} 2>/dev/null" || true
             done
           fi
 
