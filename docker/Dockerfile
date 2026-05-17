@@ -417,13 +417,12 @@ COPY --from=build_mori /opt/venv /opt/venv
 COPY --from=build_mori /app/mori /app/mori
 RUN pip show mori || true
 
-# RDMA + Mooncake runtime libraries — must be installed BEFORE the custom
-# RCCL .deb, which breaks the dpkg dependency state for rocm-hip.
-# Mooncake links gflags, glog, jsoncpp, yaml-cpp, numa, curl, unwind, c-ares
-# at runtime; install them via apt so transitive deps are handled correctly.
+# Mooncake runtime deps.  Do NOT add libibverbs-dev / librdmacm-dev here —
+# they pull in a system rdma-core that overwrites the ROCm base-image version
+# and breaks RCCL (ncclSystemError at barrier).  The base image already
+# provides libibverbs + librdmacm runtime libs via ibverbs-utils.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        librdmacm-dev libibverbs-dev \
         libgflags-dev libgoogle-glog-dev \
         libjsoncpp-dev libyaml-cpp-dev \
         libnuma-dev libcurl4-openssl-dev \
