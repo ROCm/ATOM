@@ -946,7 +946,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.compress_plans = self._build_compress_plans(
             extend_lens_np,
             context_lens_np,
-            torch.device(self.device),
             for_decode_cg=True,
         )
 
@@ -1029,7 +1028,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         compress_plans = self._build_compress_plans(
             extend_lens_np,
             context_lens_np,
-            torch.device(self.device),
             for_decode_cg=True,
         )
 
@@ -1127,7 +1125,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             np.int32
         )
         attn_metadata.compress_plans = self._build_compress_plans(
-            extend_lens_np, context_lens_np, positions.device, for_decode_cg=False
+            extend_lens_np, context_lens_np, for_decode_cg=False
         )
         # Prefill goes through eager (no CG): defaults make padded_total_tokens
         # collapse to total_tokens — no padding logic kicks in. Must still run
@@ -1858,12 +1856,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.swa_pages = swa_pages
 
     def _build_compress_plans(
-        self, extend_lens_np, seq_lens_np, device, *, for_decode_cg: bool
+        self, extend_lens_np, context_lens_np, *, for_decode_cg: bool
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
 
         Reuse this from prepare_decode / prepare_prefill / prepare_capture —
-        caller supplies extend_lens / seq_lens (np int32) and target device.
+        caller supplies extend_lens / context_lens (np int32). context_lens
+        is the absolute per-seq length AFTER the new extend tokens (i.e.
+        prefix + extend); `make_compress_plans` reads it as `context_lens_cpu`
+        and reconstructs prefix internally.
         Plan tensors are written into the pre-allocated
         `v4_compress_plan_{ratio}` / `v4_write_plan_{ratio}` CpuGpuBuffers
         (fixed pointers for CUDAGraph capture); the kernels skip
@@ -1878,11 +1879,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         if not self._unique_compress_ratios_overlap:
             return {}
-        # Ensure inputs are np int32 (callers may pass torch tensors / lists).
-        if isinstance(extend_lens_np, torch.Tensor):
-            extend_lens_np = extend_lens_np.cpu().numpy().astype(np.int32)
-        if isinstance(seq_lens_np, torch.Tensor):
-            seq_lens_np = seq_lens_np.cpu().numpy().astype(np.int32)
+        # Inputs MUST be numpy int32 — torch tensors would force a D2H sync.
+        # Callers are responsible for staging from forward_vars np mirrors.
+        assert isinstance(extend_lens_np, np.ndarray), (
+            f"extend_lens_np must be np.ndarray, got {type(extend_lens_np).__name__} "
+            "— passing torch.Tensor here would trigger a hidden D2H sync"
+        )
+        assert isinstance(context_lens_np, np.ndarray), (
+            f"context_lens_np must be np.ndarray, got {type(context_lens_np).__name__} "
+            "— passing torch.Tensor here would trigger a hidden D2H sync"
+        )
         var = self.model_runner.forward_vars
         plan_buffers = {
             ratio: {
@@ -1893,9 +1899,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         }
         return make_compress_plans(
             np.ascontiguousarray(extend_lens_np, dtype=np.int32),
-            np.ascontiguousarray(seq_lens_np, dtype=np.int32),
+            np.ascontiguousarray(context_lens_np, dtype=np.int32),
             self._unique_compress_ratios_overlap,
-            device,
             plan_buffers=plan_buffers,
             decode_capacity_per_ratio=(
                 self._decode_compress_cap if for_decode_cg else None
@@ -2033,7 +2038,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # helpers used at runtime — guarantees addresses match.
         extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
         attn_metadata.compress_plans = self._build_compress_plans(
-            extend_lens_np, context_lens_np, device, for_decode_cg=True
+            extend_lens_np, context_lens_np, for_decode_cg=True
         )
         # Capture: padded_bs == scheduled_bs == bs (synthetic batch is full).
         # Must run BEFORE `_attach_v4_indexer_meta` so the indexer-side meta
@@ -2194,7 +2199,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # state ring buffer size. The ring buffer is now K_pool + max_spec_steps + 1
             # to avoid R+1 re-commit borrow-reads (see csa_main_state_shape comment),
             # but write_plan still emits ≤ K_pool rows per seq per fwd because
-            # `write_starts = max(0, seq_lens - K_pool)` in make_compress_plans.
+            # `write_starts = max(0, context_lens - K_pool)` in make_compress_plans.
             K_pool = (2 if is_overlap else 1) * ratio
             max_compress = mnbt // ratio + bs
             max_write = min(mnbt, bs * K_pool)
