@@ -222,7 +222,7 @@ class EngineArgs:
         )
         parser.add_argument(
             "--lora-modules",
-            nargs="*",
+            nargs="+",
             default=None,
             help=(
                 "Static LoRA adapters to load at startup. Each entry may be "

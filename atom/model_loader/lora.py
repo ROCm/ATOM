@@ -138,6 +138,11 @@ def load_lora_tensors(adapter_path: str) -> list[LoRATensorPair]:
             continue
         lora_a = sides["A"]
         lora_b = sides["B"]
+        if lora_a.dim() != 2 or lora_b.dim() != 2:
+            raise ValueError(
+                f"LoRA tensors for {module_name} must be 2D, got "
+                f"A={tuple(lora_a.shape)} B={tuple(lora_b.shape)}"
+            )
         rank = int(lora_a.shape[0])
         if lora_b.shape[1] != rank:
             raise ValueError(
@@ -192,6 +197,7 @@ def validate_lora_adapters_supported(lora_modules: list[str] | None) -> None:
 
     for entry in lora_modules:
         spec = parse_lora_module_entry(entry)
+        _load_adapter_config(spec.path)
         iter_lora_tensor_module_names(spec.path)
 
 
@@ -290,6 +296,27 @@ def _slice_qkvg_q_lora_b(module: nn.Module, lora_b: torch.Tensor) -> torch.Tenso
     return torch.cat([gate_part, q_part], dim=0)
 
 
+def _validate_lora_output_shape(
+    module: nn.Module,
+    lora_b: torch.Tensor,
+    output_offset: int | None,
+) -> None:
+    if output_offset is None:
+        if lora_b.shape[0] != module.output_size:
+            raise ValueError(
+                f"LoRA B output mismatch for {module.__class__.__name__}: "
+                f"expected {module.output_size}, got {lora_b.shape[0]}"
+            )
+        return
+
+    if output_offset < 0 or output_offset + lora_b.shape[0] > module.output_size:
+        raise ValueError(
+            f"LoRA B output slice for {module.__class__.__name__} exceeds the "
+            f"module output size: offset={output_offset}, B={tuple(lora_b.shape)}, "
+            f"output_size={module.output_size}"
+        )
+
+
 def slice_lora_tensors_for_module(
     module: nn.Module,
     lora_a: torch.Tensor,
@@ -352,6 +379,7 @@ def slice_lora_tensors_for_module(
             )
         output_offset = sum(module.output_sizes[:shard_id])
 
+    _validate_lora_output_shape(module, lora_b, output_offset)
     return lora_a, lora_b, output_offset
 
 
@@ -509,10 +537,11 @@ def _merge_routed_expert_lora(
     model_modules: dict[str, nn.Module],
     pair: LoRATensorPair,
     adapter_name: str,
-) -> bool:
+) -> tuple[bool, bool]:
+    """Return (handled, merged) for routed expert LoRA modules."""
     match = _match_routed_expert(module_name)
     if match is None:
-        return False
+        return False, False
 
     experts_name = f"{match.group('prefix')}.experts"
     if experts_name not in model_modules:
@@ -520,7 +549,7 @@ def _merge_routed_expert_lora(
     experts = model_modules[experts_name]
     local_expert_id = _map_routed_expert_id(experts, int(match.group("expert_id")))
     if local_expert_id is None:
-        return True
+        return True, False
 
     proj = match.group("proj")
     delta = _slice_routed_lora_delta(experts, pair, proj)
@@ -565,12 +594,90 @@ def _merge_routed_expert_lora(
             block_k,
         )
 
-    logger.info(
+    logger.debug(
         "Merged static LoRA adapter %s into routed expert %s",
         adapter_name,
         module_name,
     )
-    return True
+    return True, True
+
+
+def _looks_like_vocab_parallel_head(module: nn.Module) -> bool:
+    return (
+        hasattr(module, "weight")
+        and hasattr(module, "num_embeddings_per_partition")
+        and hasattr(module, "vocab_start_idx")
+        and hasattr(module, "vocab_end_idx")
+    )
+
+
+def _slice_vocab_parallel_lora_b(
+    module: nn.Module,
+    lora_b: torch.Tensor,
+) -> torch.Tensor:
+    local_vocab = int(module.num_embeddings_per_partition)
+    if lora_b.shape[0] == local_vocab:
+        return lora_b
+    start = int(module.vocab_start_idx)
+    return _slice_or_validate(
+        lora_b,
+        dim=0,
+        start=start,
+        size=local_vocab,
+        what="vocab-parallel lm_head output",
+    )
+
+
+def _merge_vocab_parallel_lora_(
+    target_name: str,
+    module: nn.Module,
+    pair: LoRATensorPair,
+    adapter_name: str,
+) -> None:
+    weight = module.weight.data
+    if weight.dim() != 2:
+        raise ValueError(
+            f"LoRA target {target_name} weight must be 2D, got {tuple(weight.shape)}"
+        )
+    if pair.lora_a.dim() != 2 or pair.lora_b.dim() != 2:
+        raise ValueError(
+            f"LoRA tensors for {target_name} must be 2D, got "
+            f"A={tuple(pair.lora_a.shape)} B={tuple(pair.lora_b.shape)}"
+        )
+    if pair.lora_a.shape[0] != pair.lora_b.shape[1]:
+        raise ValueError(
+            f"LoRA rank mismatch for {target_name}: "
+            f"A={tuple(pair.lora_a.shape)} B={tuple(pair.lora_b.shape)}"
+        )
+    if pair.lora_a.shape[1] != weight.shape[1]:
+        raise ValueError(
+            f"LoRA A input mismatch for {target_name}: "
+            f"expected {weight.shape[1]}, got {pair.lora_a.shape[1]}"
+        )
+
+    lora_b = _slice_vocab_parallel_lora_b(module, pair.lora_b)
+    if lora_b.shape[0] != weight.shape[0]:
+        raise ValueError(
+            f"LoRA B output mismatch for {target_name}: "
+            f"expected {weight.shape[0]}, got {lora_b.shape[0]}"
+        )
+    if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError(
+            "Static vocab-parallel LoRA supports floating-point lm_head "
+            f"weights only, got {weight.dtype}"
+        )
+
+    compute_dtype = _lora_dtype_for_module(module)
+    delta = (
+        lora_b.to(device=weight.device, dtype=compute_dtype)
+        @ pair.lora_a.to(device=weight.device, dtype=compute_dtype)
+    ) * pair.scaling
+    weight.add_(delta.to(dtype=weight.dtype))
+    logger.debug(
+        "Merged static LoRA adapter %s into vocab-parallel target %s",
+        adapter_name,
+        target_name,
+    )
 
 
 def apply_lora_adapters(
@@ -595,13 +702,15 @@ def apply_lora_adapters(
             len(adapter_pairs),
         )
         for pair in adapter_pairs:
-            if _merge_routed_expert_lora(
+            routed_handled, routed_merged = _merge_routed_expert_lora(
                 pair.module_name,
                 model_modules,
                 pair,
                 spec.name,
-            ):
-                loaded_count += 1
+            )
+            if routed_handled:
+                if routed_merged:
+                    loaded_count += 1
                 continue
 
             target_name, shard_id = resolve_lora_target(
@@ -612,6 +721,15 @@ def apply_lora_adapters(
             target_module = model_modules[target_name]
             add_lora_adapter = getattr(target_module, "add_lora_adapter", None)
             if add_lora_adapter is None:
+                if shard_id is None and _looks_like_vocab_parallel_head(target_module):
+                    _merge_vocab_parallel_lora_(
+                        target_name,
+                        target_module,
+                        pair,
+                        spec.name,
+                    )
+                    loaded_count += 1
+                    continue
                 raise TypeError(
                     f"LoRA target {target_name} does not support static LoRA"
                 )

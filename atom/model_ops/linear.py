@@ -312,6 +312,7 @@ class LinearBase(nn.Module):
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
         self._static_lora_adapters: list[tuple[str, str, float, int | None]] = []
+        self._static_lora_dtype: torch.dtype | None = None
 
     @staticmethod
     def weight_loader_process(
@@ -427,6 +428,30 @@ class LinearBase(nn.Module):
                 f"LoRA A input mismatch for {self.prefix}: "
                 f"expected {self.input_size}, got {lora_a.shape[1]}"
             )
+        if output_offset is None:
+            if lora_b.shape[0] != self.output_size:
+                raise ValueError(
+                    f"LoRA B output mismatch for {self.prefix}: "
+                    f"expected {self.output_size}, got {lora_b.shape[0]}"
+                )
+        elif output_offset < 0 or output_offset + lora_b.shape[0] > self.output_size:
+            raise ValueError(
+                f"LoRA B output slice for {self.prefix} exceeds output size: "
+                f"offset={output_offset}, B={tuple(lora_b.shape)}, "
+                f"output_size={self.output_size}"
+            )
+        if lora_a.dtype != lora_b.dtype:
+            raise ValueError(
+                f"Static LoRA tensors for {self.prefix} must share one dtype; "
+                f"got A={lora_a.dtype}, B={lora_b.dtype}"
+            )
+        if self._static_lora_dtype is None:
+            self._static_lora_dtype = lora_a.dtype
+        elif self._static_lora_dtype != lora_a.dtype:
+            raise ValueError(
+                f"Static LoRA adapters for {self.prefix} must share one dtype; "
+                f"got existing={self._static_lora_dtype}, new={lora_a.dtype}"
+            )
 
         idx = len(self._static_lora_adapters)
         a_name = f"_static_lora_A_{idx}"
@@ -436,7 +461,7 @@ class LinearBase(nn.Module):
         self._static_lora_adapters.append(
             (a_name, b_name, float(scaling), output_offset)
         )
-        logger.info(
+        logger.debug(
             "Loaded LoRA adapter %s for %s: A=%s B=%s scaling=%s output_offset=%s",
             adapter_name or idx,
             self.prefix,
@@ -447,10 +472,15 @@ class LinearBase(nn.Module):
         )
 
     def _apply_static_lora(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if not self._static_lora_adapters:
+            return y
+
+        if self._static_lora_dtype is None:
+            raise ValueError(f"Static LoRA dtype missing for {self.prefix}")
+        x_lora = x.to(dtype=self._static_lora_dtype)
         for a_name, b_name, scaling, output_offset in self._static_lora_adapters:
             lora_a = getattr(self, a_name)
             lora_b = getattr(self, b_name)
-            x_lora = x.to(dtype=lora_a.dtype)
             delta = torch.matmul(torch.matmul(x_lora, lora_a.t()), lora_b.t())
             delta = (delta * scaling).to(dtype=y.dtype)
             if output_offset is None:
