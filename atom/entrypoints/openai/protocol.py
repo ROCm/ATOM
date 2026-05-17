@@ -63,8 +63,10 @@ class ChatMessage(BaseModel):
                 )
 
             call = dict(item)
-            function_value = call.get("function") or {}
-            if not isinstance(function_value, dict):
+            function_value = call.get("function")
+            if function_value is None:
+                function_value = {}
+            elif not isinstance(function_value, dict):
                 raise ValueError(
                     f"tool_calls function must be a dict, got {type(function_value)!r}"
                 )

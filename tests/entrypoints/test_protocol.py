@@ -149,6 +149,24 @@ class TestChatMessage:
         with pytest.raises(ValueError, match="tool_calls entries must be dicts"):
             msg.to_template_dict()
 
+    def test_to_template_dict_rejects_falsy_non_dict_function_value(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": "",
+                    }
+                ],
+            }
+        )
+
+        with pytest.raises(ValueError, match="tool_calls function must be a dict"):
+            msg.to_template_dict()
+
     def test_to_template_dict_rejects_non_object_tool_arguments(self):
         msg = ChatMessage.model_validate(
             {
