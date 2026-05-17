@@ -31,7 +31,10 @@ If any missing: install `rocm-debug-agent`, `llvm`, `pip install py-spy`. Stop h
 ## Critical pre-flight
 
 1. **`ulimit -c 0`** — disables gpucore dumps. ROCm fault dumps gpucore files of 30-50 GB each per rank; on 8-GPU TP this fills disk in seconds. The launcher script sets this for you.
-2. **`--enforce-eager --level 0`** — graph mode is incompatible with the agent's no-caching-allocator. The two flags are NOT redundant: `--enforce-eager` disables CUDAGraph capture; `--level 0` disables Inductor (avoids the AMD `cluster_dims` autotune bug). **Always pass both** via `EXTRA_ARGS`. The launcher script does NOT inject them — that's intentional, you control the launch.
+2. **`--enforce-eager` / `--level 0` — optional fallbacks, not required.** Try the default launch first; the debug agent runs fine under hipgraph in most cases. Only reach for these flags when symptoms point at graph mode:
+   - **`--enforce-eager`** disables CUDAGraph capture. Try this when the agent reports faults that don't reproduce in eager mode, or when capture/replay itself crashes under the agent's no-caching-allocator behavior.
+   - **`--level 0`** disables Inductor. Try this on AMD when you hit the `cluster_dims` autotune bug or other Inductor-side crashes during warmup.
+   - They are independent — apply only the one(s) the symptom points at. The launcher script does NOT inject either; pass via `EXTRA_ARGS` when you want them.
 3. **Clean GPU state** — kill any prior `spawn_main`/`openai_server` processes. Stale `KFD process` entries (`rocm-smi --showpids` showing UNKNOWN PIDs holding VRAM) cause the next launch to OOM at NCCL barrier. `scripts/start_atom_server.sh` does the standard cleanup.
 4. **Model-specific env** — pass on the command line or export before calling. Examples:
    - V4-Pro requires `ATOM_USE_TRITON_MOE=1`
@@ -56,7 +59,10 @@ bash scripts/stop_atom_server.sh                         # ensure clean
 ATOM_USE_TRITON_MOE=1 \
   bash scripts/run_debug_agent.sh \
   /data/DeepSeek-V4-Pro 8 8000 \
-  --method mtp --num-speculative-tokens 3 --enforce-eager --level 0 &
+  --method mtp --num-speculative-tokens 3 &
+# If launch fails / faults look graph-mode-specific, retry with
+# `--enforce-eager` (and `--level 0` on AMD for the Inductor cluster_dims bug)
+# appended to EXTRA_ARGS.
 
 bash scripts/wait_server_ready.sh 8000 5 30              # 2-4 min under agent
 cd /app/logs_claude && python <repro_script>.py          # smallest hang trigger
@@ -158,7 +164,7 @@ Per [[atom-patterns]] / DeepSeek V4 guidance, do not ship `cuda.synchronize()` w
 
 ## Anti-patterns
 
-- **Don't run debug agent under `--level 3` (default CUDAGraph)** — graph mode incompatible, server crashes at warmup with cryptic errors. Always `--enforce-eager --level 0`.
+- **Don't assume `--enforce-eager --level 0` is mandatory.** Default launch is fine for most agent runs; reach for these flags only when symptoms point at hipgraph or Inductor (see pre-flight item 2). Adding them blindly hides graph-mode-only bugs.
 - **Don't grep `atom_server.log` for "error" or "Traceback"** — agent's wave dump has neither; grep `"stopped, reason"` instead.
 - **Don't trust PC literally** — see Step 5. Especially Triton kernels are notorious for cross-wave PC misattribution. Bisect-confirm.
 - **Don't leave `--save-code-objects` on for routine runs** — each run dumps ~500 MB. Only enable for the bisect run.
