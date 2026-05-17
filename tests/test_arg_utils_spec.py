@@ -73,6 +73,12 @@ class TestEngineArgsSpeculativeValidation:
         kwargs = args._get_engine_kwargs()
         assert kwargs["lora_modules"] == ["adapter=/tmp/adapter"]
 
+    def test_empty_lora_modules_list_is_rejected(self):
+        args = EngineArgs(lora_modules=[])
+
+        with pytest.raises(ValueError, match="requires at least one adapter path"):
+            args._get_engine_kwargs()
+
     def test_lora_modules_cli_requires_at_least_one_adapter(self):
         parser = argparse.ArgumentParser()
         EngineArgs.add_cli_args(parser)

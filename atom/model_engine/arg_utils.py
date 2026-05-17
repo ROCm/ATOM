@@ -283,6 +283,12 @@ class EngineArgs:
             kwargs.pop("draft_model")
             kwargs["speculative_config"] = None
 
+        lora_modules = kwargs.get("lora_modules")
+        if lora_modules is not None and len(lora_modules) == 0:
+            raise ValueError(
+                "--lora-modules requires at least one adapter path when provided"
+            )
+
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
         tbo_mode = kwargs.pop("enable_tbo", None)
         kwargs["enable_tbo"] = tbo_mode is not None
