@@ -2588,21 +2588,30 @@ class Block(nn.Module):
         # ----- Fused attn→ffn transition: hc_post (close attn) + hc_pre (open ffn) -----
         # `hc_ffn_fn.T` is a stride-swapped view (no copy); `hc_ffn_scale` is
         # passed unchanged — the Triton kernel `tl.load`s the alphas itself.
-        residual, x, post, comb = fused_hc_post_pre(
-            x,
-            residual,
-            post,
-            comb,
-            self.hc_ffn_fn.T,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.hc_mult,
-            self.norm_eps,
-            self.hc_eps,
-            self.HC_POST_MULT,
-            self.hc_sinkhorn_iters,
-        )
+        if _V4_USE_TRITON_FUSED_MHC:
+            residual, x, post, comb = fused_hc_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                self.hc_ffn_fn.T,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.hc_mult,
+                self.norm_eps,
+                self.hc_eps,
+                self.HC_POST_MULT,
+                self.hc_sinkhorn_iters,
+            )
+        else:
+            x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
+            # ----- FFN sub-layer with mHC mixing -----
+            residual = x  # [num_tokens, hc, dim]
+            x, post, comb = self.hc_pre(
+                x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            )
+
         x = self.ffn_norm(x)  # [num_tokens, dim]
         x = self.ffn(
             x
