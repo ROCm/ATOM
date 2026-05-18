@@ -224,9 +224,13 @@ class ScheduledBatch:
         is_dummy_run: bool = False,
         num_spec_step: int = 0,
         scheduled_spec_decode_tokens: dict[int, np.ndarray] | None = None,
+        remote_kv_block_ids: list[int] | None = None,
+        remote_kv_seq_blocks: dict[int, list[int]] | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
+        self.remote_kv_block_ids = remote_kv_block_ids or []
+        self.remote_kv_seq_blocks = remote_kv_seq_blocks or {}
 
         self.req_ids = list(seqs.keys())
         # self.scheduled_tokens = [
@@ -512,6 +516,27 @@ class Scheduler:
                     self.kv_connector.get_num_new_matched_tokens(seq)
                 )
 
+            if waiting_remote_to_waiting_ready:
+                seq.status = SequenceStatus.RUNNING
+                seq.is_first_decode = True
+                first_token_id = (seq.kv_transfer_params or {}).get("first_token_id")
+                if first_token_id is not None:
+                    seq.append_token(first_token_id)
+                    seq._injected_t0 = first_token_id
+                logger.info(
+                    "[PD-TRANSITION] seq %s: num_tokens=%d, "
+                    "num_prompt=%d, blocks=%d, first_token=%s, "
+                    "last_5_tids=%s",
+                    seq.id,
+                    seq.num_tokens,
+                    seq.num_prompt_tokens,
+                    len(seq.block_table),
+                    first_token_id,
+                    seq.token_ids[-5:],
+                )
+                self.running.append(seq)
+                continue
+
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
                 num_batched_tokens + num_new_tokens > self.max_num_batched_tokens
@@ -520,8 +545,7 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
 
-            if not waiting_remote_to_waiting_ready:
-                self.block_manager.allocate(seq)
+            self.block_manager.allocate(seq)
 
             if self.kv_connector is not None:
                 self.kv_connector.update_state_after_alloc(seq)
@@ -529,12 +553,6 @@ class Scheduler:
             if need_to_remove_to_load_kv_async_queue:
                 skipped_waiting_requests.append(seq)
                 seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-                continue
-
-            if waiting_remote_to_waiting_ready:
-                seq.status = SequenceStatus.RUNNING
-                seq.is_first_decode = True
-                self.running.append(seq)
                 continue
 
             num_seqs_prefill += 1
@@ -587,6 +605,8 @@ class Scheduler:
         # --- Decode scheduling ---
         num_seqs_decode = 0
         num_new_tokens = self.mtp_k + 1
+        remote_kv_blocks: set[int] = set()
+        remote_kv_seq_blocks: dict[int, list[int]] = {}
         while self.running and num_seqs_decode < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq, num_new_tokens):
@@ -599,10 +619,31 @@ class Scheduler:
                 if seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
-                # Skip block append for the first decode step after remote
-                # prefill — blocks were already allocated during prefill.
-                if not getattr(seq, "is_first_decode", False):
+                # For PD first-decode: if T0 was injected, may_append is
+                # needed for the new position N. Without T0 injection,
+                # blocks were already allocated during prefill.
+                is_first = getattr(seq, "is_first_decode", False)
+                if is_first and seq.block_table:
+                    remote_kv_blocks.update(seq.block_table)
+                    remote_kv_seq_blocks[seq.id] = list(seq.block_table)
+                has_injected_t0 = (
+                    is_first
+                    and (seq.kv_transfer_params or {}).get("first_token_id") is not None
+                )
+                if not is_first or has_injected_t0:
                     self.block_manager.may_append(seq, num_new_tokens)
+                if is_first:
+                    logger.info(
+                        "[PD-FIRST-DECODE] seq %s: num_tokens=%d, "
+                        "blocks=%d, injected_t0=%s, "
+                        "last_block_num=%d, context_will_be=%d",
+                        seq.id,
+                        seq.num_tokens,
+                        len(seq.block_table),
+                        has_injected_t0,
+                        seq.last_block_num_tokens,
+                        seq.num_tokens,
+                    )
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
                 num_scheduled_tokens.append(num_new_tokens)
@@ -628,6 +669,8 @@ class Scheduler:
             connector_meta_output=connector_meta_output,
             num_spec_step=self.mtp_k,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
+            remote_kv_seq_blocks=remote_kv_seq_blocks,
         )
         return (decode_batch, scheduled_seqs)
 
@@ -645,6 +688,7 @@ class Scheduler:
         seq.num_rejected = 0
         seq.num_bonus_tokens = 0
         seq.spec_token_ids = np.array([], dtype=np.int32)
+        seq.is_first_decode = False
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
@@ -708,11 +752,26 @@ class Scheduler:
                     seq.append_token(token_id)
             new_tokens = token_ids
 
+            injected_t0 = getattr(seq, "_injected_t0", None)
+            if injected_t0 is not None:
+                new_tokens = [injected_t0] + list(new_tokens)
+                seq._injected_t0 = None
+
             if self.mtp_k > 0:
                 # idx already resolved above via get_idx
                 seq.spec_token_ids = draft_token_ids[idx]
 
-            if seq.num_completion_tokens == 1 and seq.first_token_time == 0.0:
+            if seq.num_completion_tokens <= 3 and seq.kv_transfer_params:
+                logger.info(
+                    "[PD-DECODE] seq %s: comp_tokens=%d, "
+                    "new_token=%s, num_tokens=%d, blocks=%d",
+                    seq.id,
+                    seq.num_completion_tokens,
+                    token_ids,
+                    seq.num_tokens,
+                    len(seq.block_table),
+                )
+            if seq.num_completion_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
 
             num_tokens = seq.num_tokens - self.mtp_k - num_rejected

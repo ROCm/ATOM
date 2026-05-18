@@ -14,6 +14,7 @@
 ## 📢 News
 
 - **[2026/05]** [Dissecting DeepSeek V4 Compressor](https://rocm.github.io/ATOM/dissecting_dsv4_compressor) — interactive animation visualizing how the CSA/HCA compressor state cache works (overlap mechanism, prefill vs decode, bulk compression vs sequential accumulation).
+- **[2026/05]** ATOM now supports **Prefill/Decode (P/D) disaggregation** with [Mooncake](https://github.com/kvcache-ai/Mooncake) RDMA push-mode KV cache transfer. See [PD disaggregation guide](docs/pd_disaggregation_guide.md).
 - **[2026/03]** ATOM now supports **Prefill/Decode (P/D) disaggregation** — run prefill and decode on separate GPU nodes with RDMA-based KV cache transfer via [MORI-IO](https://github.com/ROCm/mori). See [disaggregation docs](atom/kv_transfer/disaggregation/README.md).
 
 ## 🚀 Features

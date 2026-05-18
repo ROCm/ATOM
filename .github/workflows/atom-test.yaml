@@ -199,7 +199,7 @@ jobs:
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
-          retention-days: 1
+          retention-days: 7
 
   load-test-models:
     name: Load test model configs
