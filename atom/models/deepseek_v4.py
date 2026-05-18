@@ -129,6 +129,7 @@ _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "1") == "1"
+_V4_USE_TRITON_FUSED_MHC = os.environ.get("ATOM_V4_USE_TRITON_FUSED_MHC", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 
 
@@ -2914,22 +2915,26 @@ class DeepseekV4Model(nn.Module):
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
-        # Cross-block-fused loop: each block's closing hc_post fuses with the
-        # next block's opening hc_pre into a single `fused_hc_post_pre` call.
-        # First layer opens standalone (no prior FFN to close); after the loop
-        # we close the last layer's FFN with a standalone hc_post. See
-        # `Block.forward_carry`. Aliasing across layers is safe — the shared
-        # cached buffers from `_get_fused_hc_post_pre_buffers` are written
-        # in-place per CTA on disjoint `(m, *, c)` tiles.
-        residual_carry: Optional[torch.Tensor] = None
-        post_carry: Optional[torch.Tensor] = None
-        comb_carry: Optional[torch.Tensor] = None
-        for layer in self.layers:
-            h, residual_carry, post_carry, comb_carry = layer.forward_carry(
-                h, residual_carry, post_carry, comb_carry, positions
-            )
-        # Close the final layer's FFN (no next layer to fuse with).
-        h = self.layers[-1].hc_post(h, residual_carry, post_carry, comb_carry)
+        if _V4_USE_TRITON_FUSED_MHC:
+            # Cross-block-fused loop: each block's closing hc_post fuses with the
+            # next block's opening hc_pre into a single `fused_hc_post_pre` call.
+            # First layer opens standalone (no prior FFN to close); after the loop
+            # we close the last layer's FFN with a standalone hc_post. See
+            # `Block.forward_carry`. Aliasing across layers is safe — the shared
+            # cached buffers from `_get_fused_hc_post_pre_buffers` are written
+            # in-place per CTA on disjoint `(m, *, c)` tiles.
+            residual_carry: Optional[torch.Tensor] = None
+            post_carry: Optional[torch.Tensor] = None
+            comb_carry: Optional[torch.Tensor] = None
+            for layer in self.layers:
+                h, residual_carry, post_carry, comb_carry = layer.forward_carry(
+                    h, residual_carry, post_carry, comb_carry, positions
+                )
+            # Close the final layer's FFN (no next layer to fuse with).
+            h = self.layers[-1].hc_post(h, residual_carry, post_carry, comb_carry)
+        else:
+            for layer in self.layers:
+                h = layer(h, positions)  # [num_tokens, hc, dim]
 
         # Reduce the mHC residual stack (hc_head + final RMSNorm); leave the
         # vocab projection to compute_logits.
