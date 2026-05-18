@@ -311,6 +311,8 @@ class LinearBase(nn.Module):
             self.weight_scale.weight_loader = self.weight_loader
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
+        self._static_lora_adapters: list[tuple[str, str, float, int | None]] = []
+        self._static_lora_dtype: torch.dtype | None = None
 
     @staticmethod
     def weight_loader_process(
@@ -403,10 +405,109 @@ class LinearBase(nn.Module):
         if self.quant_type == QuantType.per_1x32:
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
+    def add_lora_adapter(
+        self,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        scaling: float,
+        output_offset: int | None = None,
+        adapter_name: str = "",
+    ):
+        if lora_a.dim() != 2 or lora_b.dim() != 2:
+            raise ValueError(
+                f"LoRA tensors for {self.prefix} must be 2D, got "
+                f"A={tuple(lora_a.shape)} B={tuple(lora_b.shape)}"
+            )
+        if lora_a.shape[0] != lora_b.shape[1]:
+            raise ValueError(
+                f"LoRA rank mismatch for {self.prefix}: "
+                f"A={tuple(lora_a.shape)} B={tuple(lora_b.shape)}"
+            )
+        if lora_a.shape[1] != self.input_size:
+            raise ValueError(
+                f"LoRA A input mismatch for {self.prefix}: "
+                f"expected {self.input_size}, got {lora_a.shape[1]}"
+            )
+        if output_offset is None:
+            if lora_b.shape[0] != self.output_size:
+                raise ValueError(
+                    f"LoRA B output mismatch for {self.prefix}: "
+                    f"expected {self.output_size}, got {lora_b.shape[0]}"
+                )
+        elif output_offset < 0 or output_offset + lora_b.shape[0] > self.output_size:
+            raise ValueError(
+                f"LoRA B output slice for {self.prefix} exceeds output size: "
+                f"offset={output_offset}, B={tuple(lora_b.shape)}, "
+                f"output_size={self.output_size}"
+            )
+        if lora_a.dtype != lora_b.dtype:
+            raise ValueError(
+                f"Static LoRA tensors for {self.prefix} must share one dtype; "
+                f"got A={lora_a.dtype}, B={lora_b.dtype}"
+            )
+        if self._static_lora_dtype is None:
+            self._static_lora_dtype = lora_a.dtype
+        elif self._static_lora_dtype != lora_a.dtype:
+            raise ValueError(
+                f"Static LoRA adapters for {self.prefix} must share one dtype; "
+                f"got existing={self._static_lora_dtype}, new={lora_a.dtype}"
+            )
+
+        idx = len(self._static_lora_adapters)
+        a_name = f"_static_lora_A_{idx}"
+        b_name = f"_static_lora_B_{idx}"
+        self.register_buffer(a_name, lora_a.contiguous(), persistent=False)
+        self.register_buffer(b_name, lora_b.contiguous(), persistent=False)
+        self._static_lora_adapters.append(
+            (a_name, b_name, float(scaling), output_offset)
+        )
+        logger.debug(
+            "Loaded LoRA adapter %s for %s: A=%s B=%s scaling=%s output_offset=%s",
+            adapter_name or idx,
+            self.prefix,
+            tuple(lora_a.shape),
+            tuple(lora_b.shape),
+            scaling,
+            output_offset,
+        )
+
+    def _apply_static_lora(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if not self._static_lora_adapters:
+            return y
+
+        if self._static_lora_dtype is None:
+            raise ValueError(f"Static LoRA dtype missing for {self.prefix}")
+        x_lora = x.to(dtype=self._static_lora_dtype)
+        for a_name, b_name, scaling, output_offset in self._static_lora_adapters:
+            lora_a = getattr(self, a_name)
+            lora_b = getattr(self, b_name)
+            delta = torch.matmul(torch.matmul(x_lora, lora_a.t()), lora_b.t())
+            delta = (delta * scaling).to(dtype=y.dtype)
+            if output_offset is None:
+                y.add_(delta)
+            else:
+                if delta.shape[-1] + output_offset > y.shape[-1]:
+                    raise ValueError(
+                        f"LoRA output slice for {self.prefix} exceeds output shape: "
+                        f"offset={output_offset}, delta={tuple(delta.shape)}, "
+                        f"output={tuple(y.shape)}"
+                    )
+                y.narrow(-1, output_offset, delta.shape[-1]).add_(delta)
+        return y
+
     @mark_trace
     def forward(
-        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
+        self,
+        x: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
+        otype=dtypes.bf16,
+        lora_x: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        lora_x = (
+            (x if lora_x is None else lora_x)
+            if self._static_lora_adapters
+            else None
+        )
         if self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(
                 x,
@@ -492,6 +593,8 @@ class LinearBase(nn.Module):
                 )
                 if self.bias is not None:
                     y += self.bias
+        if lora_x is not None:
+            y = self._apply_static_lora(lora_x, y)
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         return y

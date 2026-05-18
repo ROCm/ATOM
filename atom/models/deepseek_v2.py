@@ -51,6 +51,10 @@ from aiter.ops.triton.fused_mxfp4_quant import (
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.model_loader.lora import (
+    any_module_has_static_lora_adapters,
+    module_has_static_lora_adapters,
+)
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules, is_rocm_aiter_fp4bmm_enabled
 from atom.model_ops.base_attention import Attention
@@ -1723,6 +1727,16 @@ class DeepseekV2MLAAttention(nn.Module):
             ):
                 self.fuse_qknorm_quant = True
 
+    def has_static_lora_adapters(self) -> bool:
+        return any_module_has_static_lora_adapters(
+            getattr(self, "fused_qkv_a_proj", None),
+            getattr(self, "q_proj", None),
+            getattr(self, "kv_a_proj_with_mqa", None),
+            getattr(self, "q_b_proj", None),
+            getattr(self, "kv_b_proj", None),
+            getattr(self, "o_proj", None),
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1733,7 +1747,19 @@ class DeepseekV2MLAAttention(nn.Module):
             hidden_states, hidden_states_scale = hidden_states
 
         if self.q_lora_rank is not None:
-            if self.fuse_qknorm_quant and use_triton_gemm():
+            qkv_a_has_lora = module_has_static_lora_adapters(
+                getattr(self, "fused_qkv_a_proj", None)
+            )
+            q_b_has_lora = module_has_static_lora_adapters(
+                getattr(self, "q_b_proj", None)
+            )
+            use_fused_qkv_a = (
+                self.fuse_qknorm_quant
+                and use_triton_gemm()
+                and not qkv_a_has_lora
+                and not q_b_has_lora
+            )
+            if use_fused_qkv_a:
                 q_c, q_c_scale, kv_c_normed, k_pe = (
                     _fuse_qkv_a_proj_reduce_rmsnorm_quant(
                         hidden_states,
@@ -1769,7 +1795,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 if self.fuse_qknorm_quant or self.fuse_qknorm:
                     (
                         (hidden_states_or_q_c, hidden_states_or_q_c_scale),
-                        _,
+                        hidden_states_or_q_c_unquantized,
                         kv_c_normed,
                         _,
                     ) = _fuse_rmsnorm_quant(
@@ -1785,9 +1811,15 @@ class DeepseekV2MLAAttention(nn.Module):
                         scale_shuffle_padding=False,
                         group_size=128,
                         quant_type=self.qknorm_quant_type,
-                        output_unquantized_inp1=False,
+                        output_unquantized_inp1=q_b_has_lora,
                         transpose_scale=True,
                     )
+                    if q_b_has_lora:
+                        if hidden_states_or_q_c_unquantized is None:
+                            hidden_states_or_q_c = self.q_a_layernorm(q_c)
+                        else:
+                            hidden_states_or_q_c = hidden_states_or_q_c_unquantized
+                        hidden_states_or_q_c_scale = None
                 else:
                     hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
@@ -1936,7 +1968,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if self.fuse_input_norm_quant:
+        if self.fuse_input_norm_quant and not self.self_attn.has_static_lora_adapters():
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps

@@ -235,6 +235,36 @@ class TestPrefixCaching:
         assert batch2.total_tokens_num_prefill == 10
         assert seq2.num_cached_tokens == 0
 
+    def test_prefix_cache_full_prompt_hit_keeps_tail_block_uncached(
+        self, seq_factory
+    ):
+        """A full prompt cache hit still needs nonzero prefill work for logits."""
+        sched = self._make_prefix_scheduler()
+
+        seq1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        sched.add(seq1)
+        sched.schedule()
+
+        seq1.append_token(2)  # EOS
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq1.id],
+                token_ids=[(2,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+        )
+
+        seq2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        sched.add(seq2)
+        batch2, _ = sched.schedule()
+
+        assert batch2.total_tokens_num_prefill == 4
+        assert batch2.num_scheduled_tokens == [4]
+        assert seq2.num_cached_tokens == 4
+
 
 # ── preempt ────────────────────────────────────────────────────────────────
 

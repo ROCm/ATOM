@@ -161,6 +161,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         **kwargs,
     ):
         super().__init__(num_embeddings, embedding_dim)
+        self._lora_adapters: list[tuple[str, str, float, str | None]] = []
+        self._lora_dtype: torch.dtype | None = None
         if bias:
             self.bias = atom_parameter(
                 torch.empty(self.num_embeddings_per_partition),
@@ -168,6 +170,75 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+
+    def add_lora_adapter(
+        self,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        scaling: float,
+        output_offset: int | None = None,
+        adapter_name: str | None = None,
+    ) -> None:
+        if output_offset is not None:
+            raise ValueError("ParallelLMHead LoRA does not support output_offset")
+        if lora_a.dim() != 2 or lora_b.dim() != 2:
+            raise ValueError(
+                "ParallelLMHead LoRA tensors must be 2D, got "
+                f"A={tuple(lora_a.shape)} B={tuple(lora_b.shape)}"
+            )
+        if lora_a.shape[0] != lora_b.shape[1]:
+            raise ValueError(
+                "ParallelLMHead LoRA rank mismatch: "
+                f"A={tuple(lora_a.shape)} B={tuple(lora_b.shape)}"
+            )
+        if lora_a.shape[1] != self.weight.shape[1]:
+            raise ValueError(
+                "ParallelLMHead LoRA A input mismatch: "
+                f"expected {self.weight.shape[1]}, got {lora_a.shape[1]}"
+            )
+        if lora_b.shape[0] != self.weight.shape[0]:
+            raise ValueError(
+                "ParallelLMHead LoRA B output mismatch: "
+                f"expected {self.weight.shape[0]}, got {lora_b.shape[0]}"
+            )
+        if lora_a.dtype != lora_b.dtype:
+            raise ValueError(
+                "ParallelLMHead LoRA tensors must share one dtype; "
+                f"got A={lora_a.dtype}, B={lora_b.dtype}"
+            )
+        if self._lora_dtype is None:
+            self._lora_dtype = lora_a.dtype
+        elif self._lora_dtype != lora_a.dtype:
+            raise ValueError(
+                "ParallelLMHead LoRA adapters must share one dtype; "
+                f"got existing={self._lora_dtype}, new={lora_a.dtype}"
+            )
+
+        idx = len(self._lora_adapters)
+        a_name = f"_lora_A_{idx}"
+        b_name = f"_lora_B_{idx}"
+        self.register_buffer(a_name, lora_a.detach().contiguous(), persistent=False)
+        self.register_buffer(b_name, lora_b.detach().contiguous(), persistent=False)
+        self._lora_adapters.append((a_name, b_name, float(scaling), adapter_name))
+
+    def _apply_lora_adapters(
+        self,
+        x: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self._lora_adapters:
+            return logits
+        if self._lora_dtype is None:
+            raise ValueError("ParallelLMHead LoRA dtype missing")
+        y = logits
+        x_lora = x.to(self._lora_dtype)
+        for a_name, b_name, scaling, _ in self._lora_adapters:
+            lora_a = getattr(self, a_name)
+            lora_b = getattr(self, b_name)
+            delta = (x_lora @ lora_a.t()) @ lora_b.t()
+            delta = delta * scaling
+            y = y + delta.to(dtype=y.dtype)
+        return y
 
     def forward(self, x: torch.Tensor):
         if not is_plugin_mode():
@@ -179,6 +250,7 @@ class ParallelLMHead(VocabParallelEmbedding):
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
         logits = tgemm.mm(x, self.weight, self.bias)
+        logits = self._apply_lora_adapters(x, logits)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
             logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)

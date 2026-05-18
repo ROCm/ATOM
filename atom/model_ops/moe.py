@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 import os
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -56,6 +57,383 @@ from atom.utils.decorators import mark_trace
 from torch import nn
 from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
+
+
+logger = logging.getLogger("atom")
+_StaticRoutedLoRAStore = dict[int, dict[str, list[tuple[str, str, float]]]]
+_STATIC_ROUTED_LORA_PROJ_TO_STACK = {
+    "gate_proj": ("w13", 0),
+    "up_proj": ("w13", 1),
+    "down_proj": ("w2", 0),
+}
+
+
+def _should_preserve_unshuffled_weights(layer: torch.nn.Module) -> bool:
+    return bool(getattr(layer, "_static_routed_lora_requires_unshuffled", False))
+
+
+def _static_routed_lora_fused_context(
+    layer: torch.nn.Module,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> dict[str, torch.Tensor] | None:
+    if not _module_has_static_routed_lora(layer):
+        return None
+    required = (
+        "_static_routed_lora_w13_a_stacked",
+        "_static_routed_lora_w13_b_stacked",
+        "_static_routed_lora_w2_a_stacked",
+        "_static_routed_lora_w2_b_stacked",
+    )
+    if not all(hasattr(layer, name) for name in required):
+        return None
+    return {
+        "w13_a": layer._static_routed_lora_w13_a_stacked,
+        "w13_b": layer._static_routed_lora_w13_b_stacked,
+        "w2_a": layer._static_routed_lora_w2_a_stacked,
+        "w2_b": layer._static_routed_lora_w2_b_stacked,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+    }
+
+
+def _apply_static_routed_lora_vllm_triton_fp8(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    activation: ActivationType,
+    *,
+    block_shape: list[int] | None,
+    per_channel_quant: bool,
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe import fused_moe as vllm_fused_moe
+    from vllm.triton_utils import tl
+
+    from atom.model_ops.fused_moe_triton import (
+        _build_static_lora_routing,
+        _call_vllm_fused_moe_lora,
+        _fused_moe_lora_config,
+    )
+
+    if activation == ActivationType.Silu:
+        activation_enum = vllm_fused_moe.MoEActivation.SILU
+    else:
+        raise NotImplementedError(
+            f"Static routed LoRA FP8 Triton path does not support {activation}."
+        )
+
+    M, K = x.shape
+    E, N, _ = layer.w13_weight.shape
+    topk = topk_ids.shape[1]
+    if expert_map is None:
+        global_num_experts = E
+    else:
+        global_num_experts = int(expert_map.numel())
+
+    config_dtype = vllm_fused_moe._get_config_dtype_str(
+        dtype=x.dtype,
+        use_fp8_w8a8=True,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+    )
+    config = vllm_fused_moe.try_get_optimal_moe_config(
+        layer.w13_weight.size(),
+        layer.w2_weight.size(),
+        topk,
+        config_dtype,
+        M,
+        block_shape=block_shape,
+    )
+    quant_dtype = vllm_fused_moe._get_config_quant_dtype(
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        ocp_mx_scheme=None,
+    )
+    if x.dtype == torch.bfloat16:
+        compute_type = tl.bfloat16
+    elif x.dtype == torch.float16:
+        compute_type = tl.float16
+    elif x.dtype == torch.float32:
+        compute_type = tl.float32
+    else:
+        raise ValueError(f"Unsupported FP8 MoE activation dtype: {x.dtype}")
+
+    qx, a1q_scale = vllm_fused_moe.moe_kernel_quantize_input(
+        x,
+        layer.w13_input_scale,
+        quant_dtype,
+        per_channel_quant,
+        block_shape,
+    )
+
+    sparsity_factor = 4
+    use_naive_assignment = (
+        expert_map is None and M * topk * sparsity_factor <= global_num_experts
+    )
+    if use_naive_assignment:
+        max_num_tokens_padded = topk_ids.numel() * config["BLOCK_SIZE_M"]
+        sorted_token_ids = None
+        expert_ids = topk_ids.view(-1)
+        num_tokens_post_padded = torch.empty(
+            (1,), dtype=torch.int32, device=topk_ids.device
+        )
+        num_tokens_post_padded.fill_(max_num_tokens_padded)
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            vllm_fused_moe.moe_align_block_size(
+                topk_ids,
+                config["BLOCK_SIZE_M"],
+                global_num_experts,
+                expert_map,
+                ignore_invalid_experts=True,
+            )
+        )
+
+    intermediate_cache1 = torch.empty(
+        (M, topk, N), dtype=x.dtype, device=x.device
+    )
+    activation_out_dim = N // 2
+    intermediate_cache2 = torch.empty(
+        (M * topk, activation_out_dim), dtype=x.dtype, device=x.device
+    )
+    intermediate_cache3 = torch.empty(
+        (M, topk, K), dtype=x.dtype, device=x.device
+    )
+
+    vllm_fused_moe.dispatch_fused_moe_kernel(
+        qx,
+        layer.w13_weight,
+        intermediate_cache1,
+        a1q_scale,
+        layer.w13_weight_scale,
+        None,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        apply_router_weight_on_input,
+        topk,
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        per_channel_quant=per_channel_quant,
+        block_shape=block_shape,
+        B_bias=None,
+    )
+
+    static_lora = _static_routed_lora_fused_context(layer, topk_weights, topk_ids)
+    assert static_lora is not None
+    w13_lora_a = static_lora["w13_a"]
+    w13_lora_b = static_lora["w13_b"]
+    w2_lora_a = static_lora["w2_a"]
+    w2_lora_b = static_lora["w2_b"]
+    w13_shrink_config = _fused_moe_lora_config("W13_SHRINK")
+    w13_expand_config = _fused_moe_lora_config("W13_EXPAND")
+    w2_shrink_config = _fused_moe_lora_config("W2_SHRINK")
+    w2_expand_config = _fused_moe_lora_config("W2_EXPAND")
+    (
+        sorted_token_ids_lora,
+        expert_ids_lora,
+        num_tokens_post_padded_lora,
+        lora_ids,
+        token_lora_mapping,
+        _,
+    ) = _build_static_lora_routing(
+        topk_ids.to(torch.int32),
+        num_experts=global_num_experts,
+        block_size=w13_shrink_config["BLOCK_SIZE_M"],
+        expert_map=expert_map,
+    )
+    adapter_enabled = torch.ones((2,), dtype=torch.int32, device=x.device)
+    _call_vllm_fused_moe_lora(
+        intermediate_cache1,
+        x,
+        (w13_lora_a[0].unsqueeze(0), w13_lora_a[1].unsqueeze(0)),
+        (w13_lora_b[0].unsqueeze(0), w13_lora_b[1].unsqueeze(0)),
+        topk_weights,
+        sorted_token_ids_lora,
+        expert_ids_lora,
+        num_tokens_post_padded_lora,
+        int(w13_lora_a.shape[-2]),
+        topk,
+        lora_ids,
+        token_lora_mapping,
+        adapter_enabled,
+        w13_shrink_config,
+        w13_expand_config,
+        mul_routed_weight=False,
+    )
+
+    vllm_fused_moe.apply_moe_activation(
+        activation_enum,
+        intermediate_cache2,
+        intermediate_cache1.view(-1, N),
+    )
+    qintermediate_cache2, a2q_scale = vllm_fused_moe.moe_kernel_quantize_input(
+        intermediate_cache2,
+        layer.w2_input_scale,
+        quant_dtype,
+        per_channel_quant,
+        block_shape,
+    )
+    if expert_map is not None:
+        intermediate_cache3.zero_()
+    vllm_fused_moe.dispatch_fused_moe_kernel(
+        qintermediate_cache2,
+        layer.w2_weight,
+        intermediate_cache3,
+        a2q_scale,
+        layer.w2_weight_scale,
+        None,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        not apply_router_weight_on_input,
+        1,
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        per_channel_quant=per_channel_quant,
+        block_shape=block_shape,
+        B_bias=None,
+    )
+    _call_vllm_fused_moe_lora(
+        intermediate_cache3,
+        intermediate_cache2,
+        (w2_lora_a[0].unsqueeze(0),),
+        (w2_lora_b[0].unsqueeze(0),),
+        topk_weights,
+        sorted_token_ids_lora,
+        expert_ids_lora,
+        num_tokens_post_padded_lora,
+        int(w2_lora_a.shape[-2]),
+        topk,
+        lora_ids,
+        token_lora_mapping,
+        adapter_enabled,
+        w2_shrink_config,
+        w2_expand_config,
+        mul_routed_weight=True,
+    )
+    output = torch.empty_like(x)
+    ops.moe_sum(intermediate_cache3, output)
+    return output
+
+
+def _ensure_static_routed_lora_stacks(
+    layer: torch.nn.Module,
+    lora_rank: int,
+    dtype: torch.dtype,
+) -> None:
+    device = layer.w13_weight.device
+    num_experts = layer.local_num_experts
+    hidden_size = layer.hidden_size
+    intermediate_size = layer.intermediate_size_per_partition
+
+    stack_rank = getattr(layer, "_static_routed_lora_rank", None)
+    if stack_rank is not None:
+        if stack_rank != lora_rank:
+            raise ValueError(
+                "Static routed expert LoRA adapters must share one rank for "
+                f"the fused MoE LoRA path; got existing={stack_rank}, "
+                f"new={lora_rank}"
+            )
+        return
+
+    layer._static_routed_lora_rank = lora_rank
+    layer.register_buffer(
+        "_static_routed_lora_w13_a_stacked",
+        torch.zeros(
+            2,
+            num_experts,
+            lora_rank,
+            hidden_size,
+            device=device,
+            dtype=dtype,
+        ),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_static_routed_lora_w13_b_stacked",
+        torch.zeros(
+            2,
+            num_experts,
+            intermediate_size,
+            lora_rank,
+            device=device,
+            dtype=dtype,
+        ),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_static_routed_lora_w2_a_stacked",
+        torch.zeros(
+            1,
+            num_experts,
+            lora_rank,
+            intermediate_size,
+            device=device,
+            dtype=dtype,
+        ),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_static_routed_lora_w2_b_stacked",
+        torch.zeros(
+            1,
+            num_experts,
+            hidden_size,
+            lora_rank,
+            device=device,
+            dtype=dtype,
+        ),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_static_routed_lora_expert_enabled",
+        torch.zeros(num_experts, device=device, dtype=torch.int32),
+        persistent=False,
+    )
+
+
+def _store_static_routed_lora_stack(
+    layer: torch.nn.Module,
+    local_expert_id: int,
+    proj: str,
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    scaling: float,
+) -> None:
+    stack_name, stack_idx = _STATIC_ROUTED_LORA_PROJ_TO_STACK[proj]
+    if scaling != 1.0:
+        lora_b = lora_b * scaling
+
+    if stack_name == "w13":
+        layer._static_routed_lora_w13_a_stacked[stack_idx, local_expert_id].copy_(
+            lora_a
+        )
+        layer._static_routed_lora_w13_b_stacked[stack_idx, local_expert_id].copy_(
+            lora_b
+        )
+    else:
+        layer._static_routed_lora_w2_a_stacked[stack_idx, local_expert_id].copy_(
+            lora_a
+        )
+        layer._static_routed_lora_w2_b_stacked[stack_idx, local_expert_id].copy_(
+            lora_b
+        )
+    layer._static_routed_lora_expert_enabled[local_expert_id] = 1
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -222,6 +600,186 @@ def reduce_scatter_with_unpadding(
         scattered_output = scattered_output[slices]
 
     return scattered_output
+
+
+def _module_has_static_routed_lora(layer: torch.nn.Module) -> bool:
+    return bool(getattr(layer, "_static_routed_lora", None))
+
+
+def _dequantize_static_lora_weight(
+    weight: torch.Tensor,
+    scale: Optional[torch.Tensor],
+    block_n: int,
+    block_k: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return weight.to(dtype=dtype)
+
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if weight.dtype not in fp8_dtypes or scale is None:
+        raise TypeError(
+            "Static routed expert LoRA runtime fallback supports "
+            "floating-point and FP8 block-quantized MoE weights only."
+        )
+    out_dim, in_dim = weight.shape
+    if out_dim % block_n or in_dim % block_k:
+        raise ValueError(
+            f"FP8 MoE weight shape {tuple(weight.shape)} is not aligned to "
+            f"block shape ({block_n}, {block_k})"
+        )
+    expected_scale = (out_dim // block_n, in_dim // block_k)
+    if tuple(scale.shape) != expected_scale:
+        if weight.shape[0] % scale.shape[0] or weight.shape[1] % scale.shape[1]:
+            raise ValueError(
+                f"FP8 MoE scale shape {tuple(scale.shape)} does not match "
+                f"{expected_scale} for weight {tuple(weight.shape)}"
+            )
+        block_n = weight.shape[0] // scale.shape[0]
+        block_k = weight.shape[1] // scale.shape[1]
+
+    blocks = weight.float().reshape(
+        out_dim // block_n,
+        block_n,
+        in_dim // block_k,
+        block_k,
+    )
+    scale_blocks = scale.float().reshape(
+        out_dim // block_n,
+        1,
+        in_dim // block_k,
+        1,
+    )
+    return (blocks * scale_blocks).reshape(out_dim, in_dim).to(dtype=dtype)
+
+
+def _apply_static_routed_lora_reference(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: Optional[torch.Tensor],
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    lora_store: _StaticRoutedLoRAStore | None = getattr(
+        layer, "_static_routed_lora", None
+    )
+    if not lora_store:
+        return torch.zeros_like(x)
+
+    if apply_router_weight_on_input:
+        raise NotImplementedError(
+            "Static routed expert LoRA does not support "
+            "apply_router_weight_on_input yet."
+        )
+
+    output = torch.zeros_like(x)
+    lora_dtype = getattr(layer, "_static_routed_lora_dtype", torch.bfloat16)
+    x_lora = x.to(dtype=lora_dtype)
+    topk_ids_cpu = topk_ids.detach().cpu()
+    quant_method = getattr(layer, "quant_method", None)
+    block_n = getattr(quant_method, "block_n", 1)
+    block_k = getattr(quant_method, "block_k", 1)
+    shard_size = layer.intermediate_size_per_partition
+
+    selected_expert_ids = torch.unique(topk_ids_cpu).tolist()
+    for global_expert_id in selected_expert_ids:
+        if global_expert_id < 0:
+            continue
+        projections = lora_store.get(int(global_expert_id), {})
+        local_expert_id = global_expert_id
+        if expert_map is not None:
+            if global_expert_id >= int(expert_map.numel()):
+                continue
+            mapped = int(expert_map[global_expert_id].item())
+            if mapped == -1:
+                continue
+            local_expert_id = mapped
+        if local_expert_id >= int(getattr(layer, "local_num_experts", 0)):
+            continue
+
+        mask = topk_ids_cpu == global_expert_id
+        if not bool(mask.any()):
+            continue
+
+        token_ids_cpu, route_ids_cpu = mask.nonzero(as_tuple=True)
+        token_ids = token_ids_cpu.to(device=x.device, dtype=torch.long)
+        route_ids = route_ids_cpu.to(device=x.device, dtype=torch.long)
+        selected_x = x_lora.index_select(0, token_ids)
+
+        w13 = layer.w13_weight[local_expert_id]
+        w13_scale = getattr(layer, "w13_weight_scale", None)
+        gate_scale = None
+        up_scale = None
+        if w13_scale is not None:
+            w13_scale = w13_scale[local_expert_id]
+            if w13_scale.dim() == 2 and w13_scale.shape[0] % 2 == 0:
+                rows = w13_scale.shape[0] // 2
+                gate_scale = w13_scale[:rows]
+                up_scale = w13_scale[rows : rows * 2]
+            else:
+                gate_scale = w13_scale
+                up_scale = w13_scale
+
+        gate_weight = _dequantize_static_lora_weight(
+            w13[:shard_size],
+            gate_scale,
+            block_n,
+            block_k,
+            lora_dtype,
+        )
+        up_weight = _dequantize_static_lora_weight(
+            w13[shard_size : shard_size * 2],
+            up_scale,
+            block_n,
+            block_k,
+            lora_dtype,
+        )
+
+        gate = torch.matmul(selected_x, gate_weight.t())
+        up = torch.matmul(selected_x, up_weight.t())
+        for proj in ("gate_proj", "up_proj"):
+            adapter_entries = projections.get(proj, ())
+            proj_delta = None
+            for a_name, b_name, scaling in adapter_entries:
+                lora_a = getattr(layer, a_name)
+                lora_b = getattr(layer, b_name)
+                delta = (
+                    torch.matmul(torch.matmul(selected_x, lora_a.t()), lora_b.t())
+                    * scaling
+                )
+                proj_delta = delta if proj_delta is None else proj_delta + delta
+            if proj_delta is None:
+                continue
+            if proj == "gate_proj":
+                gate = gate + proj_delta
+            elif proj == "up_proj":
+                up = up + proj_delta
+
+        hidden = torch.nn.functional.silu(gate) * up
+        w2_scale = getattr(layer, "w2_weight_scale", None)
+        if w2_scale is not None:
+            w2_scale = w2_scale[local_expert_id]
+        w2_weight = _dequantize_static_lora_weight(
+            layer.w2_weight[local_expert_id],
+            w2_scale,
+            block_n,
+            block_k,
+            lora_dtype,
+        )
+        down_out = torch.matmul(hidden, w2_weight.t())
+        for a_name, b_name, scaling in projections.get("down_proj", ()):
+            lora_a = getattr(layer, a_name)
+            lora_b = getattr(layer, b_name)
+            down_out = down_out + (
+                torch.matmul(torch.matmul(hidden, lora_a.t()), lora_b.t()) * scaling
+            )
+
+        route_weight = topk_weights[token_ids, route_ids].to(down_out.dtype)
+        down_out = down_out * route_weight.unsqueeze(-1)
+        output.index_add_(0, token_ids, down_out.to(dtype=output.dtype))
+
+    return output
 
 
 @torch_compile_guard()
@@ -486,8 +1044,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight = atom_parameter(self._maybe_pad_weight(layer.w13_weight.data))
         layer.w2_weight = atom_parameter(self._maybe_pad_weight(layer.w2_weight.data))
-        # reshaping weights is required for aiter moe kernel.
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        if not _should_preserve_unshuffled_weights(layer):
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -530,6 +1088,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        if _module_has_static_routed_lora(layer):
+            return _apply_static_routed_lora_reference(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                apply_router_weight_on_input,
+            )
         if self.fused_experts:
             return self.fused_experts(
                 hidden_states=x,
@@ -931,6 +1498,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or scoring_func != "softmax"
                 or e_score_correction_bias is not None
                 or custom_routing_function is not None
+                or _module_has_static_routed_lora(layer)
             )
 
             if needs_custom_routing:
@@ -981,6 +1549,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
                     expert_map=expert_map,
+                    static_lora=_static_routed_lora_fused_context(
+                        layer, topk_weights, topk_ids
+                    ),
                 )
                 return _moe_result
 
@@ -1021,6 +1592,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        if _module_has_static_routed_lora(layer):
+            return _apply_static_routed_lora_reference(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                apply_router_weight_on_input,
+            )
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         if self.fused_experts is None:
@@ -1422,6 +2002,19 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        if _module_has_static_routed_lora(layer):
+            block_shape = [self.block_n, self.block_k] if self.block_quant else None
+            return _apply_static_routed_lora_vllm_triton_fp8(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                activation,
+                block_shape=block_shape,
+                per_channel_quant=self.per_channel,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
 
         # Get activation scales (may be None for dynamic quantization)
         a1_scale = getattr(layer, "w13_input_scale", None)
@@ -1663,7 +2256,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # per_1x128 blockscale MoE only needs weight bpreshuffle when the
         # preshuffle GEMM path is enabled. Skip it to match the non-preshuffle
         # kernel's expected weight layout.
-        if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+        if (
+            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+            and not _should_preserve_unshuffled_weights(layer)
+        ):
             shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_channel_quant(self, layer: nn.Module) -> None:
@@ -1685,7 +2281,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data[expert_id] = w2_q
                 layer.w2_weight_scale.data[expert_id] = w2_s.squeeze(-1)
 
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        if not _should_preserve_unshuffled_weights(layer):
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_tensor_quant(self, layer: nn.Module) -> None:
         if not self.quant_config.is_dynamic:
@@ -1716,7 +2313,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ) = quant_func(dq_weight, max_w13_scales[expert_id])
                 start += shard_size
 
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        if not _should_preserve_unshuffled_weights(layer):
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
         layer.w13_weight_scale = atom_parameter(max_w13_scales)
 
@@ -1776,6 +2374,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_fused_shared_experts=layer.num_fused_shared_experts,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        if _module_has_static_routed_lora(layer):
+            if self.block_quant and self.quant_type == QuantType.per_1x128:
+                block_shape = [128, 128]
+            elif self.block_quant and self.quant_type == QuantType.per_1x32:
+                block_shape = [1, 32]
+            else:
+                block_shape = None
+            return _apply_static_routed_lora_vllm_triton_fp8(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                activation,
+                block_shape=block_shape,
+                per_channel_quant=self.channel_quant,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
         # per_Tensor doesn't support num_local_tokens, so fallback to
         # rocm_aiter_fused_moe when using per-tensor or no modular kernel.
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
@@ -1971,6 +2587,8 @@ class FusedMoE(torch.nn.Module):
         self.top_k = top_k
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
+        self._static_routed_lora: _StaticRoutedLoRAStore = {}
+        self._static_routed_lora_dtype: torch.dtype | None = None
 
         fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
         self.num_fused_shared_experts = (
@@ -2096,6 +2714,109 @@ class FusedMoE(torch.nn.Module):
             raise ValueError("Duplicate layer name: {}".format(prefix))
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+
+    def add_static_routed_lora(
+        self,
+        expert_id: int,
+        proj: str,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        scaling: float,
+        adapter_name: str,
+    ) -> None:
+        if proj not in {"gate_proj", "up_proj", "down_proj"}:
+            raise ValueError(f"Unsupported routed expert LoRA projection: {proj}")
+        if lora_a.dim() != 2 or lora_b.dim() != 2:
+            raise ValueError(
+                f"Routed expert LoRA tensors must be 2D, got "
+                f"A={tuple(lora_a.shape)} B={tuple(lora_b.shape)}"
+            )
+        if lora_a.shape[0] != lora_b.shape[1]:
+            raise ValueError(
+                f"Routed expert LoRA rank mismatch: "
+                f"A={tuple(lora_a.shape)} B={tuple(lora_b.shape)}"
+            )
+
+        if proj in {"gate_proj", "up_proj"}:
+            if lora_a.shape[1] != self.hidden_size:
+                raise ValueError(
+                    f"Routed expert LoRA A input mismatch for {proj}: "
+                    f"expected {self.hidden_size}, got {lora_a.shape[1]}"
+                )
+            if lora_b.shape[0] != self.intermediate_size_per_partition:
+                tp_rank = getattr(self, "tp_rank", 0)
+                lora_b = lora_b.narrow(
+                    0,
+                    tp_rank * self.intermediate_size_per_partition,
+                    self.intermediate_size_per_partition,
+                )
+        else:
+            if lora_a.shape[1] != self.intermediate_size_per_partition:
+                tp_rank = getattr(self, "tp_rank", 0)
+                lora_a = lora_a.narrow(
+                    1,
+                    tp_rank * self.intermediate_size_per_partition,
+                    self.intermediate_size_per_partition,
+                )
+            if lora_b.shape[0] != self.hidden_size:
+                raise ValueError(
+                    f"Routed expert LoRA B output mismatch for {proj}: "
+                    f"expected {self.hidden_size}, got {lora_b.shape[0]}"
+                )
+
+        dtype = torch.bfloat16
+        if self._static_routed_lora_dtype is None:
+            self._static_routed_lora_dtype = dtype
+        elif self._static_routed_lora_dtype != dtype:
+            raise ValueError(
+                "Static routed expert LoRA adapters must share one dtype; "
+                f"got existing={self._static_routed_lora_dtype}, new={dtype}"
+            )
+
+        local_expert_id = (
+            expert_id
+            if self.expert_map is None
+            else int(self.expert_map[expert_id].item())
+        )
+        if local_expert_id == -1:
+            return
+
+        idx = sum(
+            len(entries)
+            for expert_entries in self._static_routed_lora.values()
+            for entries in expert_entries.values()
+        )
+        a_name = f"_static_routed_lora_A_{idx}"
+        b_name = f"_static_routed_lora_B_{idx}"
+        device = self.w13_weight.device
+        self.register_buffer(
+            a_name, lora_a.to(device=device, dtype=dtype).contiguous(), persistent=False
+        )
+        self.register_buffer(
+            b_name, lora_b.to(device=device, dtype=dtype).contiguous(), persistent=False
+        )
+        _ensure_static_routed_lora_stacks(self, lora_a.shape[0], dtype)
+        _store_static_routed_lora_stack(
+            self,
+            local_expert_id,
+            proj,
+            getattr(self, a_name),
+            getattr(self, b_name),
+            scaling,
+        )
+        self._static_routed_lora.setdefault(expert_id, {}).setdefault(proj, []).append(
+            (a_name, b_name, float(scaling))
+        )
+        logger.debug(
+            "Registered static routed LoRA adapter %s for expert %s %s: "
+            "A=%s B=%s scaling=%s",
+            adapter_name,
+            expert_id,
+            proj,
+            tuple(lora_a.shape),
+            tuple(lora_b.shape),
+            scaling,
+        )
 
     @property
     def tp_size(self):

@@ -48,6 +48,8 @@ def _reset_sequence_counter():
 def _make_processor() -> InputOutputProcessor:
     proc = InputOutputProcessor.__new__(InputOutputProcessor)
     proc.config = MagicMock()
+    proc.config.max_model_len = 128
+    proc.config.max_num_batched_tokens = 64
     tokenizer = MagicMock()
     tokenizer.encode = MagicMock(side_effect=lambda s, **_: list(range(len(s))))
     proc.tokenizer = tokenizer
@@ -140,3 +142,21 @@ class TestPreprocessFanout:
             stream_callback=cb,
         )
         assert all(s.stream_callback is cb for s in seqs)
+
+    def test_rejects_prompt_longer_than_batched_token_budget(self):
+        proc = _make_processor()
+        proc.config.max_num_batched_tokens = 4
+
+        with pytest.raises(ValueError, match="max_num_batched_tokens=4"):
+            proc.preprocess_fanout("hello", SamplingParams(max_tokens=1))
+
+        assert proc.requests == {}
+
+    def test_rejects_prompt_and_output_longer_than_model_len(self):
+        proc = _make_processor()
+        proc.config.max_model_len = 8
+
+        with pytest.raises(ValueError, match="max_model_len=8"):
+            proc.preprocess_fanout("hello", SamplingParams(max_tokens=4))
+
+        assert proc.requests == {}

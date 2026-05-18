@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Regression tests for speculative-config validation in EngineArgs._get_engine_kwargs.
 
+import argparse
 import sys
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # conftest.py stubs atom.* and zmq before any atom imports are attempted,
 # but arg_utils.py imports LLMEngine from atom and CompilationConfig /
@@ -64,3 +67,24 @@ class TestEngineArgsSpeculativeValidation:
             num_speculative_tokens=3,
         )
         assert kwargs["speculative_config"] is fake_spec_config
+
+    def test_lora_modules_pass_through_to_engine_kwargs(self):
+        args = EngineArgs(lora_modules=["adapter=/tmp/adapter"])
+        kwargs = args._get_engine_kwargs()
+        assert kwargs["lora_modules"] == ["adapter=/tmp/adapter"]
+
+    def test_empty_lora_modules_list_is_rejected(self):
+        args = EngineArgs(lora_modules=[])
+
+        with pytest.raises(ValueError, match="requires at least one adapter path"):
+            args._get_engine_kwargs()
+
+    def test_lora_modules_cli_requires_at_least_one_adapter(self):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+
+        args = parser.parse_args(["--lora-modules", "adapter=/tmp/adapter"])
+        assert args.lora_modules == ["adapter=/tmp/adapter"]
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--lora-modules"])

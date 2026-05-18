@@ -23,7 +23,7 @@ import torch
 from contextlib import contextmanager
 from typing import Any
 import logging
-from math import prod
+from math import ceil, prod
 from aiter import ActivationType
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.fusions.fused_routing_from_topk import (
@@ -229,6 +229,159 @@ def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
     return x.flatten()[: prod(v)].view(*v)
 
 
+def _round_up(x: int, base: int) -> int:
+    return ((x + base - 1) // base) * base
+
+
+def _fused_moe_lora_config(prefix: str) -> dict[str, int]:
+    block_m = int(os.getenv(f"ATOM_FUSED_MOE_LORA_{prefix}_BLOCK_M", "64"))
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": int(os.getenv(f"ATOM_FUSED_MOE_LORA_{prefix}_BLOCK_N", "64")),
+        "BLOCK_SIZE_K": int(os.getenv(f"ATOM_FUSED_MOE_LORA_{prefix}_BLOCK_K", "32")),
+        "GROUP_SIZE_M": int(os.getenv(f"ATOM_FUSED_MOE_LORA_{prefix}_GROUP_M", "8")),
+        "NUM_WARPS": int(os.getenv(f"ATOM_FUSED_MOE_LORA_{prefix}_WARPS", "4")),
+        "NUM_STAGES": int(os.getenv(f"ATOM_FUSED_MOE_LORA_{prefix}_STAGES", "3")),
+        "SPLIT_K": int(os.getenv(f"ATOM_FUSED_MOE_LORA_{prefix}_SPLIT_K", "1")),
+    }
+
+
+def _call_vllm_fused_moe_lora(
+    output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    lora_a_stacked: tuple[torch.Tensor, ...],
+    lora_b_stacked: tuple[torch.Tensor, ...],
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    max_lora_rank: int,
+    topk: int,
+    lora_ids: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
+    adapter_enabled: torch.Tensor,
+    shrink_config: dict[str, int],
+    expand_config: dict[str, int],
+    mul_routed_weight: bool = False,
+):
+    from vllm.lora.ops.triton_ops import fused_moe_lora
+
+    common_args = (
+        output,
+        hidden_states,
+        lora_a_stacked,
+        lora_b_stacked,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    )
+    kernel_configs = (
+        adapter_enabled,
+        shrink_config["BLOCK_SIZE_M"],
+        shrink_config["BLOCK_SIZE_N"],
+        shrink_config["BLOCK_SIZE_K"],
+        shrink_config["GROUP_SIZE_M"],
+        shrink_config["NUM_WARPS"],
+        shrink_config["NUM_STAGES"],
+        shrink_config["SPLIT_K"],
+        expand_config["BLOCK_SIZE_M"],
+        expand_config["BLOCK_SIZE_N"],
+        expand_config["BLOCK_SIZE_K"],
+        expand_config["GROUP_SIZE_M"],
+        expand_config["NUM_WARPS"],
+        expand_config["NUM_STAGES"],
+        expand_config["SPLIT_K"],
+        mul_routed_weight,
+        False,
+        0,
+    )
+    num_active_loras = torch.tensor([lora_ids.numel()], dtype=torch.int32, device="cpu")
+    try:
+        fused_moe_lora(
+            *common_args,
+            token_lora_mapping,
+            max_lora_rank,
+            topk,
+            lora_ids,
+            num_active_loras,
+            *kernel_configs,
+        )
+    except TypeError as new_api_error:
+        try:
+            fused_moe_lora(
+                *common_args,
+                max_lora_rank,
+                topk,
+                lora_ids,
+                *kernel_configs,
+            )
+        except TypeError:
+            raise new_api_error
+
+
+def _build_static_lora_routing(
+    topk_ids: torch.Tensor,
+    *,
+    num_experts: int,
+    block_size: int,
+    expert_map: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    from vllm import _custom_ops as ops
+
+    max_loras = 1
+    max_num_tokens_padded = _round_up(
+        topk_ids.numel() + num_experts * (block_size - 1), block_size
+    )
+    max_num_m_blocks = ceil(max_num_tokens_padded / block_size)
+    sorted_token_ids = torch.empty(
+        (max_loras * max_num_tokens_padded,),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    expert_ids = torch.empty(
+        (max_loras * max_num_m_blocks,),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    num_tokens_post_padded = torch.empty(
+        (max_loras,), dtype=torch.int32, device=topk_ids.device
+    )
+    token_lora_mapping = torch.zeros(
+        topk_ids.shape[0], dtype=torch.int32, device=topk_ids.device
+    )
+    lora_ids = torch.zeros((max_loras,), dtype=torch.int32, device=topk_ids.device)
+    adapter_enabled = torch.ones(
+        (max_loras + 1,), dtype=torch.int32, device=topk_ids.device
+    )
+
+    ops.moe_lora_align_block_size(
+        topk_ids,
+        token_lora_mapping,
+        num_experts,
+        block_size,
+        max_loras,
+        max_num_tokens_padded,
+        max_num_m_blocks,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        adapter_enabled,
+        lora_ids,
+    )
+    if expert_map is not None:
+        expert_ids = expert_map[expert_ids]
+
+    return (
+        sorted_token_ids.view(max_loras, -1),
+        expert_ids.view(max_loras, -1),
+        num_tokens_post_padded,
+        lora_ids,
+        token_lora_mapping,
+        max_loras,
+    )
+
+
 def triton_kernel_moe_forward(
     hidden_states: torch.Tensor,
     w1,  # Tensor or triton_kernels.Tensor
@@ -293,6 +446,7 @@ def triton_kernel_fused_experts(
     expert_map: torch.Tensor | None = None,
     intermediate_cache: torch.Tensor | None = None,
     a1q_scale: torch.Tensor | None = None,
+    static_lora: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
@@ -327,6 +481,39 @@ def triton_kernel_fused_experts(
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
     gammas = routing_data.gate_scal if routing_data else None
+    lora_routing = None
+    if static_lora is not None:
+        w13_lora_a = static_lora["w13_a"]
+        w13_lora_b = static_lora["w13_b"]
+        w2_lora_a = static_lora["w2_a"]
+        w2_lora_b = static_lora["w2_b"]
+        lora_topk_ids = static_lora["topk_ids"].to(torch.int32)
+        lora_topk_weights = static_lora["topk_weights"]
+        w13_lora_a_tuple = (w13_lora_a[0].unsqueeze(0), w13_lora_a[1].unsqueeze(0))
+        w13_lora_b_tuple = (w13_lora_b[0].unsqueeze(0), w13_lora_b[1].unsqueeze(0))
+        w2_lora_a_tuple = (w2_lora_a[0].unsqueeze(0),)
+        w2_lora_b_tuple = (w2_lora_b[0].unsqueeze(0),)
+        w13_shrink_config = _fused_moe_lora_config("W13_SHRINK")
+        w13_expand_config = _fused_moe_lora_config("W13_EXPAND")
+        w2_shrink_config = _fused_moe_lora_config("W2_SHRINK")
+        w2_expand_config = _fused_moe_lora_config("W2_EXPAND")
+        lora_routing = _build_static_lora_routing(
+            lora_topk_ids,
+            num_experts=global_num_experts,
+            block_size=w13_shrink_config["BLOCK_SIZE_M"],
+            expert_map=expert_map,
+        )
+        (
+            sorted_token_ids_lora,
+            expert_ids_lora,
+            num_tokens_post_padded_lora,
+            lora_ids,
+            token_lora_mapping,
+            _,
+        ) = lora_routing
+        adapter_enabled = torch.ones(
+            (2,), dtype=torch.int32, device=lora_topk_ids.device
+        )
 
     # NOTE: We intentionally do NOT use the triton fused SwiGLU activation
     # because it expects interleaved [gate0, up0, gate1, up1, ...] layout
@@ -344,6 +531,10 @@ def triton_kernel_fused_experts(
 
     with _amd_smem_safe_tile():
         if activation == ActivationType.Swiglu:
+            if static_lora is not None:
+                raise NotImplementedError(
+                    "Static routed LoRA is wired for the SiLU MoE path only."
+                )
             # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
             act = FusedActivation(
                 FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
@@ -372,7 +563,28 @@ def triton_kernel_fused_experts(
                 precision_config=w13_precision_config,
                 gammas=gammas if apply_router_weight_on_input else None,
             )
-            raw_2d = raw_intermediate.view(M * topk, N)
+            if static_lora is None:
+                raw_2d = raw_intermediate.view(M * topk, N)
+            else:
+                raw_2d = raw_intermediate.view(-1, N)[gather_indx.dst_indx]
+                _call_vllm_fused_moe_lora(
+                    raw_2d.view(M, topk, N),
+                    hidden_states,
+                    w13_lora_a_tuple,
+                    w13_lora_b_tuple,
+                    lora_topk_weights,
+                    sorted_token_ids_lora,
+                    expert_ids_lora,
+                    num_tokens_post_padded_lora,
+                    int(w13_lora_a.shape[-2]),
+                    topk,
+                    lora_ids,
+                    token_lora_mapping,
+                    adapter_enabled,
+                    w13_shrink_config,
+                    w13_expand_config,
+                    mul_routed_weight=False,
+                )
             intermediate_cache = intermediate_cache.view(M * topk, half_N)
             fused_clamp_act_mul(
                 raw_2d,
@@ -383,16 +595,53 @@ def triton_kernel_fused_experts(
             )
             intermediate_cache = intermediate_cache.view(batch_dim, M * topk, half_N)
 
-        matmul_ogs(
-            intermediate_cache.view(M * topk, half_N),
-            w2,
-            w2_bias,
-            routing_data,
-            scatter_indx=scatter_indx,
-            precision_config=w2_precision_config,
-            gammas=None if apply_router_weight_on_input else gammas,
-            y=output_tensor,
-        )
+        if static_lora is None:
+            matmul_ogs(
+                intermediate_cache.view(M * topk, half_N),
+                w2,
+                w2_bias,
+                routing_data,
+                scatter_indx=scatter_indx,
+                precision_config=w2_precision_config,
+                gammas=None if apply_router_weight_on_input else gammas,
+                y=output_tensor,
+            )
+        else:
+            w2_output = torch.empty(
+                (batch_dim, M * topk, K),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            routing_data.n_expts_act = 1
+            matmul_ogs(
+                intermediate_cache.view(M * topk, half_N)[gather_indx.src_indx],
+                w2,
+                w2_bias,
+                routing_data,
+                scatter_indx=scatter_indx,
+                precision_config=w2_precision_config,
+                gammas=None if apply_router_weight_on_input else gammas,
+                y=w2_output,
+            )
+            _call_vllm_fused_moe_lora(
+                w2_output.view(M, topk, K),
+                intermediate_cache.view(M * topk, half_N),
+                w2_lora_a_tuple,
+                w2_lora_b_tuple,
+                lora_topk_weights,
+                sorted_token_ids_lora,
+                expert_ids_lora,
+                num_tokens_post_padded_lora,
+                int(w2_lora_a.shape[-2]),
+                topk,
+                lora_ids,
+                token_lora_mapping,
+                adapter_enabled,
+                w2_shrink_config,
+                w2_expand_config,
+                mul_routed_weight=True,
+            )
+            output_tensor.view(M, K).copy_(w2_output.view(M, topk, K).sum(dim=1))
 
     output_tensor = output_tensor.view(M, K)
     return output_tensor

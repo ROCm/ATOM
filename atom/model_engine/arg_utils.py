@@ -53,6 +53,7 @@ class EngineArgs:
     kv_transfer_config: str = "{}"
     draft_model: Optional[str] = None
     mark_trace: bool = False
+    lora_modules: Optional[List[str]] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -219,6 +220,15 @@ class EngineArgs:
             action="store_true",
             help="Enable graph_marker nodes for tracing/profile instrumentation.",
         )
+        parser.add_argument(
+            "--lora-modules",
+            nargs="+",
+            default=None,
+            help=(
+                "Static LoRA adapters to load at startup. Each entry may be "
+                "name=path or path. Loaded adapters are applied to every request."
+            ),
+        )
 
         return parser
 
@@ -272,6 +282,12 @@ class EngineArgs:
             kwargs.pop("num_speculative_tokens")
             kwargs.pop("draft_model")
             kwargs["speculative_config"] = None
+
+        lora_modules = kwargs.get("lora_modules")
+        if lora_modules is not None and len(lora_modules) == 0:
+            raise ValueError(
+                "--lora-modules requires at least one adapter path when provided"
+            )
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
         tbo_mode = kwargs.pop("enable_tbo", None)
