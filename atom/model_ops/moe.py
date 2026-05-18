@@ -97,6 +97,240 @@ def _static_routed_lora_fused_context(
     }
 
 
+def _apply_static_routed_lora_vllm_triton_fp8(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    activation: ActivationType,
+    *,
+    block_shape: list[int] | None,
+    per_channel_quant: bool,
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe import fused_moe as vllm_fused_moe
+    from vllm.triton_utils import tl
+
+    from atom.model_ops.fused_moe_triton import (
+        _build_static_lora_routing,
+        _call_vllm_fused_moe_lora,
+        _fused_moe_lora_config,
+    )
+
+    if activation == ActivationType.Silu:
+        activation_enum = vllm_fused_moe.MoEActivation.SILU
+    else:
+        raise NotImplementedError(
+            f"Static routed LoRA FP8 Triton path does not support {activation}."
+        )
+
+    M, K = x.shape
+    E, N, _ = layer.w13_weight.shape
+    topk = topk_ids.shape[1]
+    if expert_map is None:
+        global_num_experts = E
+    else:
+        global_num_experts = int(expert_map.numel())
+
+    config_dtype = vllm_fused_moe._get_config_dtype_str(
+        dtype=x.dtype,
+        use_fp8_w8a8=True,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+    )
+    config = vllm_fused_moe.try_get_optimal_moe_config(
+        layer.w13_weight.size(),
+        layer.w2_weight.size(),
+        topk,
+        config_dtype,
+        M,
+        block_shape=block_shape,
+    )
+    quant_dtype = vllm_fused_moe._get_config_quant_dtype(
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        ocp_mx_scheme=None,
+    )
+    if x.dtype == torch.bfloat16:
+        compute_type = tl.bfloat16
+    elif x.dtype == torch.float16:
+        compute_type = tl.float16
+    elif x.dtype == torch.float32:
+        compute_type = tl.float32
+    else:
+        raise ValueError(f"Unsupported FP8 MoE activation dtype: {x.dtype}")
+
+    qx, a1q_scale = vllm_fused_moe.moe_kernel_quantize_input(
+        x,
+        layer.w13_input_scale,
+        quant_dtype,
+        per_channel_quant,
+        block_shape,
+    )
+
+    sparsity_factor = 4
+    use_naive_assignment = (
+        expert_map is None and M * topk * sparsity_factor <= global_num_experts
+    )
+    if use_naive_assignment:
+        max_num_tokens_padded = topk_ids.numel() * config["BLOCK_SIZE_M"]
+        sorted_token_ids = None
+        expert_ids = topk_ids.view(-1)
+        num_tokens_post_padded = torch.empty(
+            (1,), dtype=torch.int32, device=topk_ids.device
+        )
+        num_tokens_post_padded.fill_(max_num_tokens_padded)
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            vllm_fused_moe.moe_align_block_size(
+                topk_ids,
+                config["BLOCK_SIZE_M"],
+                global_num_experts,
+                expert_map,
+                ignore_invalid_experts=True,
+            )
+        )
+
+    intermediate_cache1 = torch.empty(
+        (M, topk, N), dtype=x.dtype, device=x.device
+    )
+    activation_out_dim = N // 2
+    intermediate_cache2 = torch.empty(
+        (M * topk, activation_out_dim), dtype=x.dtype, device=x.device
+    )
+    intermediate_cache3 = torch.empty(
+        (M, topk, K), dtype=x.dtype, device=x.device
+    )
+
+    vllm_fused_moe.dispatch_fused_moe_kernel(
+        qx,
+        layer.w13_weight,
+        intermediate_cache1,
+        a1q_scale,
+        layer.w13_weight_scale,
+        None,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        apply_router_weight_on_input,
+        topk,
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        per_channel_quant=per_channel_quant,
+        block_shape=block_shape,
+        B_bias=None,
+    )
+
+    static_lora = _static_routed_lora_fused_context(layer, topk_weights, topk_ids)
+    assert static_lora is not None
+    w13_lora_a = static_lora["w13_a"]
+    w13_lora_b = static_lora["w13_b"]
+    w2_lora_a = static_lora["w2_a"]
+    w2_lora_b = static_lora["w2_b"]
+    w13_shrink_config = _fused_moe_lora_config("W13_SHRINK")
+    w13_expand_config = _fused_moe_lora_config("W13_EXPAND")
+    w2_shrink_config = _fused_moe_lora_config("W2_SHRINK")
+    w2_expand_config = _fused_moe_lora_config("W2_EXPAND")
+    (
+        sorted_token_ids_lora,
+        expert_ids_lora,
+        num_tokens_post_padded_lora,
+        lora_ids,
+        token_lora_mapping,
+        _,
+    ) = _build_static_lora_routing(
+        topk_ids.to(torch.int32),
+        num_experts=global_num_experts,
+        block_size=w13_shrink_config["BLOCK_SIZE_M"],
+        expert_map=expert_map,
+    )
+    adapter_enabled = torch.ones((2,), dtype=torch.int32, device=x.device)
+    _call_vllm_fused_moe_lora(
+        intermediate_cache1,
+        x,
+        (w13_lora_a[0].unsqueeze(0), w13_lora_a[1].unsqueeze(0)),
+        (w13_lora_b[0].unsqueeze(0), w13_lora_b[1].unsqueeze(0)),
+        topk_weights,
+        sorted_token_ids_lora,
+        expert_ids_lora,
+        num_tokens_post_padded_lora,
+        int(w13_lora_a.shape[-2]),
+        topk,
+        lora_ids,
+        token_lora_mapping,
+        adapter_enabled,
+        w13_shrink_config,
+        w13_expand_config,
+        mul_routed_weight=False,
+    )
+
+    vllm_fused_moe.apply_moe_activation(
+        activation_enum,
+        intermediate_cache2,
+        intermediate_cache1.view(-1, N),
+    )
+    qintermediate_cache2, a2q_scale = vllm_fused_moe.moe_kernel_quantize_input(
+        intermediate_cache2,
+        layer.w2_input_scale,
+        quant_dtype,
+        per_channel_quant,
+        block_shape,
+    )
+    if expert_map is not None:
+        intermediate_cache3.zero_()
+    vllm_fused_moe.dispatch_fused_moe_kernel(
+        qintermediate_cache2,
+        layer.w2_weight,
+        intermediate_cache3,
+        a2q_scale,
+        layer.w2_weight_scale,
+        None,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        not apply_router_weight_on_input,
+        1,
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        per_channel_quant=per_channel_quant,
+        block_shape=block_shape,
+        B_bias=None,
+    )
+    _call_vllm_fused_moe_lora(
+        intermediate_cache3,
+        intermediate_cache2,
+        (w2_lora_a[0].unsqueeze(0),),
+        (w2_lora_b[0].unsqueeze(0),),
+        topk_weights,
+        sorted_token_ids_lora,
+        expert_ids_lora,
+        num_tokens_post_padded_lora,
+        int(w2_lora_a.shape[-2]),
+        topk,
+        lora_ids,
+        token_lora_mapping,
+        adapter_enabled,
+        w2_shrink_config,
+        w2_expand_config,
+        mul_routed_weight=True,
+    )
+    output = torch.empty_like(x)
+    ops.moe_sum(intermediate_cache3, output)
+    return output
+
+
 def _ensure_static_routed_lora_stacks(
     layer: torch.nn.Module,
     lora_rank: int,
@@ -1769,13 +2003,17 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             routed_scaling_factor=layer.routed_scaling_factor,
         )
         if _module_has_static_routed_lora(layer):
-            return _apply_static_routed_lora_reference(
+            block_shape = [self.block_n, self.block_k] if self.block_quant else None
+            return _apply_static_routed_lora_vllm_triton_fp8(
                 layer,
                 x,
                 topk_weights,
                 topk_ids,
                 expert_map,
-                apply_router_weight_on_input,
+                activation,
+                block_shape=block_shape,
+                per_channel_quant=self.per_channel,
+                apply_router_weight_on_input=apply_router_weight_on_input,
             )
 
         # Get activation scales (may be None for dynamic quantization)
@@ -2137,13 +2375,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             routed_scaling_factor=layer.routed_scaling_factor,
         )
         if _module_has_static_routed_lora(layer):
-            return _apply_static_routed_lora_reference(
+            if self.block_quant and self.quant_type == QuantType.per_1x128:
+                block_shape = [128, 128]
+            elif self.block_quant and self.quant_type == QuantType.per_1x32:
+                block_shape = [1, 32]
+            else:
+                block_shape = None
+            return _apply_static_routed_lora_vllm_triton_fp8(
                 layer,
                 x,
                 topk_weights,
                 topk_ids,
                 expert_map,
-                apply_router_weight_on_input,
+                activation,
+                block_shape=block_shape,
+                per_channel_quant=self.channel_quant,
+                apply_router_weight_on_input=apply_router_weight_on_input,
             )
         # per_Tensor doesn't support num_local_tokens, so fallback to
         # rocm_aiter_fused_moe when using per-tensor or no modular kernel.

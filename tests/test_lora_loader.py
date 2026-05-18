@@ -695,6 +695,67 @@ def test_fused_moe_static_routed_lora_keeps_vllm_stacked_layout(monkeypatch):
     assert layer._static_routed_lora_expert_enabled.cpu().tolist() == [0, 1]
 
 
+def test_fp8_moe_static_routed_lora_uses_vllm_triton_path(monkeypatch):
+    pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
+    import atom.model_ops.moe as moe_mod
+    from aiter import ActivationType, QuantType
+
+    sentinel = torch.full((2, 3), 7.0)
+    captured = {}
+
+    monkeypatch.setattr(
+        moe_mod.FusedMoE,
+        "select_experts",
+        staticmethod(
+            lambda **_kwargs: (
+                torch.ones(2, 1, dtype=torch.float32),
+                torch.zeros(2, 1, dtype=torch.int64),
+            )
+        ),
+    )
+
+    def fake_vllm_triton_path(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(
+        moe_mod,
+        "_apply_static_routed_lora_vllm_triton_fp8",
+        fake_vllm_triton_path,
+    )
+    monkeypatch.setattr(
+        moe_mod,
+        "_apply_static_routed_lora_reference",
+        lambda *_args, **_kwargs: pytest.fail("reference fallback was used"),
+    )
+
+    quant_config = types.SimpleNamespace(
+        quant_type=QuantType.per_1x128,
+        quant_dtype=torch.float8_e4m3fn,
+    )
+    method = moe_mod.Fp8MoEMethod(quant_config, moe=types.SimpleNamespace())
+    layer = nn.Module()
+    layer._static_routed_lora = {0: {"gate_proj": []}}
+    layer.num_fused_shared_experts = 0
+    layer.routed_scaling_factor = 1.0
+
+    result = method.apply(
+        layer,
+        torch.zeros(2, 3, dtype=torch.bfloat16),
+        torch.zeros(2, 4, dtype=torch.float32),
+        top_k=1,
+        renormalize=True,
+        activation=ActivationType.Silu,
+    )
+
+    assert result is sentinel
+    assert captured["args"][0] is layer
+    assert captured["kwargs"]["block_shape"] == [128, 128]
+    assert captured["kwargs"]["per_channel_quant"] is False
+
+
 def test_apply_lora_adapters_registers_vocab_parallel_lm_head(tmp_path):
     adapter_path = tmp_path / "adapter"
     lora_a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
