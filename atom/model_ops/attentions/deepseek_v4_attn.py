@@ -243,50 +243,6 @@ def _segment_indices(
     return token_seq_ids, local_pos
 
 
-def _build_window_topk_np(
-    positions: np.ndarray,  # [total_tokens] int (abs token positions)
-    window_size: int,
-    cache_size: int,  # = window_size + max_spec_steps; SWA ring slot count
-) -> np.ndarray:  # [total_tokens, window_size] int32
-    """Per-token sliding-window topk indices for the whole batch.
-
-    Single unified formula (was three branches pre-MTP-fix; case_a/b/c all
-    collapse to the same per-row ring expression — see plan
-    v4-swa-mtp-fix.md §5.2):
-
-        idx[t, w] = (positions[t] - W + 1 + w) % cache_size  for w in [0, W)
-        mask -1 if absolute position is < 0 or > positions[t]
-
-    Why this works for all three legacy cases:
-      - sp == 0 (fresh prefill): abs ∈ [pos-W+1, pos]; w with abs<0 masked
-        (= old case_a's clamp+future-mask). Mod cache_size is a no-op here
-        because pos < cache_size. Bytewise equivalent to old case_a (modulo
-        the ordering of -1 entries vs valid entries — the consumer kernel
-        is set-based, position-mask-free, so order doesn't matter).
-      - 0 < sp < W-1 (prefix): per-row formula correctly bounds reads to
-        positions actually written by prior fwds (old case_b's shared-per-
-        seq form leaked future KV under MTP — root bug from plan §3).
-      - sp >= W-1 (cyclic): same per-row formula, modulo cache_size puts
-        each token in its own ring window. cs > W guarantees no in-window
-        self-collision; MTP draft slots don't alias verified slots.
-
-    `cache_size` (= win_with_spec) MUST match the SWA ring dim
-    (`swa_kv.shape[1]`). Using `window_size` here corrupts MTP cache reads.
-
-    For decode batches the ~25 GPU kernel launches in the GPU equivalent
-    dominate; this numpy version runs in microseconds on CPU and feeds a
-    single H2D copy via the CG-stable `v4_meta_window_topk` buffer.
-    """
-    total = positions.shape[0]
-    arange_w = np.arange(window_size, dtype=np.int64).reshape(1, window_size)
-    pos_col = positions.reshape(total, 1)
-
-    abs_pos = pos_col - window_size + 1 + arange_w  # [total, W] absolute positions
-    ring_idx = abs_pos % cache_size
-    ring_idx = np.where((abs_pos < 0) | (abs_pos > pos_col), -1, ring_idx)
-    return ring_idx.astype(np.int32)
-
-
 class DeepseekV4Backend(AttentionBackend):
     """Backend selector entry for V4 hybrid attention.
 
@@ -403,7 +359,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         #     future tokens (silent correctness bug). MTP off → max_spec_steps
         #     == 0 → win_with_spec == window_size, identical bytes layout.
         # Used as: SWA `unified_kv` per-slot stride, `swa_kv` ring-buffer dim,
-        # `swa_write` modulo, and the per-row case_c modulo in window_topk.
+        # `swa_write` modulo, and the ring-index modulo `cs` in the V4
+        # paged-decode index-write kernel.
         self.win_with_spec = self.window_size + self.max_spec_steps
         # Worst-case HCA per-token committed compress count
         # (= max_model_len // 128 for V4-Pro = 8192 at 1M context).
@@ -876,7 +833,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         max_seqlen_k by +1 before calling us. We mirror the +1 on CPU (zero
         D2H: structural invariant of eagle's loop) and rebuild
         v4_kv_indices_{swa,csa,hca}, batch_id_per_token, n_committed_csa_per_seq,
-        window_topk, indexer meta, and compress_plans.
+        indexer meta, and compress_plans.
 
         ``only_update`` / ``num_reject_tokens`` are MLA-specific (no V4
         analog — V4 has no incremental-update kernel and the ctx rollback
@@ -1341,9 +1298,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_q_np[: scheduled_bs + 1], dtype=np.int64
         )
         token_num_per_seq = cu_seqlens_q_arr[1:] - cu_seqlens_q_arr[:scheduled_bs]
-        start_pos_per_seq_np = np.asarray(
-            start_pos_per_seq_cpu[:scheduled_bs], dtype=np.int64
-        )
         # is_pure_decode is set by the caller at AttentionMetaData_DSV4
         # construction time (single source of truth — prepare_decode /
         # prepare_prefill / build_for_cudagraph_capture each know their
@@ -1409,19 +1363,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             num_write = int(write_indices_np.shape[0])
             swa_write_grid = num_write
 
-        # ---- Build window_topk on CPU (avoids ~25 small GPU kernels) ----
-        # Per-row formula needs only `positions` + `cache_size` after
-        # case_a/b/c unification (plan v4-swa-mtp-fix.md §5.2): each row's
-        # window is fully determined by its own position. No `start_pos`
-        # broadcast needed.
-        positions_long = positions_np[:total_tokens].astype(np.int64)
-        window_topk_np = _build_window_topk_np(positions_long, win, self.win_with_spec)
-        wt_buf = var["v4_meta_window_topk"]
-        wt_buf.np[:total_tokens, :win] = window_topk_np
-
         # ---- Stage all buffers to GPU ----
-        window_topk_gpu = wt_buf.copy_to_gpu(total_tokens)
-
+        # window_topk used to be CPU-built here ([T, win] of ring indices with
+        # -1 sentinels) and staged via v4_meta_window_topk. Now the ring index
+        # is computed inline inside `write_v4_paged_decode_indices` kernel
+        # from `var["positions"].gpu` — saves O(T·win) numpy work + 4 MB
+        # staging buffer. The `positions` H2D is already done by the caller.
         attn_metadata.batch_id_per_token = self._stage(
             "v4_batch_id_per_token", batch_id_per_token_np
         )
@@ -1453,9 +1400,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._attach_v4_paged_decode_meta(
             attn_metadata=attn_metadata,
             token_num_per_seq=token_num_per_seq,
-            start_pos_per_seq_np=start_pos_per_seq_np,
             state_slot_mapping_cpu=state_slot_mapping_cpu,
-            window_topk_gpu=window_topk_gpu,
             scheduled_bs=scheduled_bs,
             total_tokens=total_tokens,
             padded_total_tokens=padded_total_tokens,
@@ -1485,30 +1430,40 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self,
         attn_metadata,
         token_num_per_seq,
-        start_pos_per_seq_np,
         state_slot_mapping_cpu,
-        window_topk_gpu,
         scheduled_bs: int,
         total_tokens: int,
         padded_total_tokens: Optional[int] = None,
     ) -> None:
         """Phase B: build per-fwd paged-decode index buffers (layer-invariant).
 
+        All three per-token regions are RAGGED-PACKED — same layout family as
+        the prefill path (`_build_paged_prefill_meta`). Per-token slot count:
+          SWA: actual_swa_count = min(positions[t]+1, win)
+          CSA: actual_swa_count + min(n_committed_csa, index_topk)
+          HCA: actual_swa_count + n_committed_hca
+
         Writes into stable forward_vars buffers (attn_metadata fields are
         the V4-namespaced counterparts on `AttentionMetaData_DSV4`):
-          - kv_indices_swa : SWA paged offsets, uniform stride win
+          - kv_indices_swa : per-token SWA paged offsets, ragged-packed
           - kv_indices_csa : SWA prefix written here; CSA compress section
                              left UNINITIALIZED — V4Attention.forward fills
                              it per-layer via csa_translate_pack (Phase C)
           - kv_indices_hca : SWA prefix + HCA compress section, both fully
                              written (HCA is layer-invariant)
-          - kv_indptr_{swa,csa,hca} : 3 indptr cumsums (SWA uniform, CSA /
-                             HCA packed; per doc §6.3). Padded tail repeats
+          - kv_indptr_{swa,csa,hca} : 3 ragged cumsums. Padded tail repeats
                              last value → kv_len=0 sentinel for CG-padded slots.
+          - skip_prefix_len_csa : per-token actual_swa_count (offset where
+                             csa_translate_pack starts writing CSA topk
+                             within each token's region). Matches prefill
+                             semantics (where it equals prefix_swa_count[t]).
 
         Reuses (built earlier in `_attach_v4_per_fwd_meta`):
           - batch_id_per_token : single per-token mapping (with -1 sentinel)
           - n_committed_csa_per_seq : per-seq `ctx_len // 4`
+          - var["positions"] : global token positions (already H2D-copied by
+                               the caller; consumed by the index-write kernel
+                               + CPU-side actual_swa_count cumsum here)
 
         Skipped (defaults via `_clear_v4_paged_decode_meta`) when not
         is_pure_decode (prefill, mixed, fresh-prefill).
@@ -1530,7 +1485,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return
 
         var = self.model_runner.forward_vars
-        win = self.window_size  # per-token topk count (W indices per token)
+        win = self.window_size  # per-token max SWA prefix slots
         cs = self.win_with_spec  # SWA region per-slot stride (W + mtp_k)
         # swa_pages = num_slots * cs, layer-invariant; matches the boundary
         # between SWA and compress regions in unified_kv (Phase A).
@@ -1553,17 +1508,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         n_committed_csa_per_seq = ctx_per_seq // 4  # host copy for cumsum below
         n_committed_hca_per_seq = (ctx_per_seq // 128).astype(np.int64)
 
-        # ----- 3 indptr cumsums (CPU numpy, per doc §6.3) -----
-        # Per-token kv_len = f(per-seq quantity)[batch_id_per_token]. CSA
-        # length is clamped to index_topk because csa_translate_pack only
-        # writes that many rows per seq (kernel mask `(k < n_committed) &
-        # (k < index_topk)`); the host-side clamp here just keeps the indices
-        # buffer correctly sized — the staged GPU n_committed_csa stays raw.
+        # ----- 3 indptr cumsums (CPU numpy, ragged) -----
+        # Per-token kv_len = actual_swa_count + n_compress. CSA length is
+        # clamped to index_topk because csa_translate_pack only writes that
+        # many rows per seq (kernel mask `(k < n_committed) & (k < index_topk)`);
+        # the host-side clamp here just keeps the indices buffer correctly
+        # sized — the staged GPU n_committed_csa stays raw.
         index_topk = self.index_topk
         n_committed_csa_clamped_per_token = np.minimum(
             n_committed_csa_per_seq[batch_id_per_token_np], index_topk
         )
         n_committed_hca_per_token = n_committed_hca_per_seq[batch_id_per_token_np]
+
+        # actual_swa_count[t] = min(positions[t]+1, win). Matches the kernel's
+        # inline `n = tl.minimum(pos+1, win)` so SWA-prefix segment sizes line
+        # up perfectly. `var["positions"].np` was populated + H2D-copied by
+        # the caller (prepare_decode/build_for_cudagraph_capture).
+        positions_np = np.asarray(var["positions"].np[:T], dtype=np.int64)
+        actual_swa_count_np = np.minimum(positions_np + 1, win).astype(np.int32)
 
         # CG-padding-aware T_for_indptr: indptr buffer must size to the
         # captured kernel grid (= padded_total_tokens) so padded slots see
@@ -1574,21 +1536,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if T_pad < T:
             T_pad = T
 
-        # SWA: uniform stride for real [0:T+1]. Padded entries [T+1:T_pad+1]
-        # repeat the last value (T*win) → kv_len = 0 for padded tokens, kernel
-        # bails out of the inner loop without reading kv_indices.
-        swa_indptr_np = np.empty(T_pad + 1, dtype=np.int32)
-        swa_indptr_np[: T + 1] = np.arange(T + 1, dtype=np.int64) * win
+        actual_swa_count_i64 = actual_swa_count_np.astype(np.int64)
+        # SWA: ragged, per-token len = actual_swa_count[t].
+        swa_indptr_np = np.zeros(T_pad + 1, dtype=np.int32)
+        swa_indptr_np[1 : T + 1] = np.cumsum(actual_swa_count_i64).astype(np.int32)
         if T_pad > T:
-            swa_indptr_np[T + 1 :].fill(int(T * win))
-        # CSA: packed, per-token len = win + min(n_committed_csa, index_topk)
-        csa_per_tok = win + n_committed_csa_clamped_per_token.astype(np.int64)
+            swa_indptr_np[T + 1 :].fill(int(swa_indptr_np[T]))
+        # CSA: ragged, per-token len = actual_swa_count + min(n_csa, index_topk)
+        csa_per_tok = actual_swa_count_i64 + n_committed_csa_clamped_per_token.astype(
+            np.int64
+        )
         csa_indptr_np = np.zeros(T_pad + 1, dtype=np.int32)
         csa_indptr_np[1 : T + 1] = np.cumsum(csa_per_tok).astype(np.int32)
         if T_pad > T:
             csa_indptr_np[T + 1 :].fill(int(csa_indptr_np[T]))
-        # HCA: packed, per-token len = win + n_committed_hca
-        hca_per_tok = win + n_committed_hca_per_token
+        # HCA: ragged, per-token len = actual_swa_count + n_committed_hca
+        hca_per_tok = actual_swa_count_i64 + n_committed_hca_per_token
         hca_indptr_np = np.zeros(T_pad + 1, dtype=np.int32)
         hca_indptr_np[1 : T + 1] = np.cumsum(hca_per_tok).astype(np.int32)
         if T_pad > T:
@@ -1615,8 +1578,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             entry_offsets = np.arange(total_hca_entries, dtype=np.int64) - np.repeat(
                 cu_n_h[:T], n_h_per_token
             )
+            # HCA compress section starts at `actual_swa_count[t]` (was `win`
+            # under the old uniform layout) — ragged-packed offset matches
+            # what the kernel writes for the SWA prefix segment.
             write_pos = (
-                hca_indptr_np[token_indices].astype(np.int64) + win + entry_offsets
+                hca_indptr_np[token_indices].astype(np.int64)
+                + actual_swa_count_i64[token_indices]
+                + entry_offsets
             )
             bid_expanded = batch_id_per_token_np[token_indices]
             hca_indices_np[write_pos] = (
@@ -1627,18 +1595,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         hca_indices_gpu = self._stage("v4_kv_indices_hca", hca_indices_np)
 
         # ----- Write SWA / CSA / HCA window-prefix paged offsets (1 kernel) -----
-        # Replaces a chain of 6 transient tensors + 2 `index_copy_` calls.
-        # The transients raced under MTP-3 long-prefill (caching allocator
-        # handed in-flight `index_copy_` storage to next call's transient →
-        # ASSERT_TRAP in `index_copy_kernel_impl<OpaqueType<4>>`). Single
-        # Triton launch reads only persistent forward_vars buffers and writes
-        # all 3 destinations in-place. See skill `debug-agent-locate-kernel`.
+        # Kernel computes `n = min(positions[t]+1, win)` and ring-index
+        # `(positions[t] - n + 1 + i) % cs` inline — no window_topk staging.
+        # See `write_v4_paged_decode_indices` docstring and plan
+        # `sequential-noodling-turing.md` for the motivation. Reads only
+        # persistent forward_vars buffers — no allocator churn (the prior
+        # `index_copy_` chain raced under MTP-3 long-prefill; this kernel
+        # also fixes that, see skill `debug-agent-locate-kernel`).
         swa_indices_gpu = var["v4_kv_indices_swa"].gpu
         csa_indices_gpu = var["v4_kv_indices_csa"].gpu
         write_v4_paged_decode_indices(
             state_slot_per_seq=attn_metadata.state_slot_mapping,
             batch_id_per_token=batch_id_per_token_gpu,
-            window_topk=window_topk_gpu,
+            positions=var["positions"].gpu,
+            swa_indptr=swa_indptr_gpu,
             csa_indptr=csa_indptr_gpu,
             hca_indptr=hca_indptr_gpu,
             swa_indices=swa_indices_gpu,
@@ -1649,14 +1619,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cs=cs,
         )
 
-        # ----- skip_prefix_len_csa: decode = full SWA window per token -----
-        # csa_translate_pack consumes this to know where the CSA section
-        # starts within each per-token region. Decode path fills [0:T] with
-        # `win`; padded tail [T:padded_T] = 0 (kernel bails on bid<0).
-        # Pre-allocated buffer gives a stable address for CG capture.
-        skip_csa_gpu = var["v4_skip_prefix_len_csa"].gpu
-        skip_csa_gpu[:T].fill_(win)
-        skip_csa_gpu[T:].zero_()
+        # ----- skip_prefix_len_csa: per-token actual SWA-prefix length -----
+        # csa_translate_pack consumes this as the offset within each token's
+        # `kv_indices_csa` region where the CSA topk section starts (after
+        # the SWA prefix segment). Decode + prefill now share this semantics
+        # (was `win` in decode, `prefix_swa_count[t]` in prefill).
+        skip_csa_buf = var["v4_skip_prefix_len_csa"]
+        skip_csa_buf.np[:T] = actual_swa_count_np
+        skip_csa_buf.np[T:T_pad].fill(0)
+        skip_csa_gpu = skip_csa_buf.copy_to_gpu(T_pad)
 
         # ----- Stash on attn_metadata for V4Attention.forward consumption -----
         # batch_id_per_token + n_committed_csa_per_seq already set in
@@ -1665,7 +1636,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # is_pure_decode was set by the caller at AttentionMetaData_DSV4
         # construction time; we only touch it via `_clear_v4_paged_decode_meta`
         # when the warmup carve-out fires.
-        attn_metadata.kv_indices_swa = swa_indices_gpu[: T * win]
+        attn_metadata.kv_indices_swa = swa_indices_gpu[: int(swa_indptr_np[T])]
         attn_metadata.kv_indices_csa = csa_indices_gpu[: int(csa_indptr_np[T])]
         attn_metadata.kv_indices_hca = hca_indices_gpu  # already exact len
         attn_metadata.kv_indptr_swa = swa_indptr_gpu
@@ -2141,7 +2112,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         Bounds:
           - per-seq:        max_bs
           - per-token:      max_num_batched_tokens
-          - window_topk:    max_num_batched_tokens * window_size
           - csa compress:   max_num_batched_tokens * index_topk
           - hca compress:   max_num_batched_tokens * max_num_blocks_per_seq
           - csa gather:     max_bs * max_num_blocks_per_seq * (block_size // 4)
@@ -2186,14 +2156,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (no CPU intermediate → no pinned-buffer H2D race) and the source
         # pointer stays stable for CUDAGraph capture.
         self._swa_iota = torch.arange(bs * win, dtype=torch.int64, device=self.device)
-        # Window-topk output buffer (per-token sliding-window ring indices).
-        # Sized [mnbt, win] int32 — `_build_window_topk_np` fills the
-        # [total_tokens, win] head; `_attach_v4_paged_decode_meta` derives
-        # SWA paged offsets from it. Builder-internal intermediate, but the
-        # buffer must be CG-capture-stable since it backs a tensor read by
-        # the captured graph (the SWA paged offsets derived from it land in
-        # `kv_indices_swa/csa/hca` which the captured kernels do read).
-        bufs["v4_meta_window_topk"] = CpuGpuBuffer(mnbt, win, **i32)
 
         # Phase B: paged-decode index buffers (consumed by Phase C/E).
         # Sized to worst-case decode shape `T = max_bs * (1 + max_spec_steps)`

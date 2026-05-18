@@ -1,44 +1,49 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""V4 paged-decode index scatter — single Triton kernel writes all 3
-destinations (SWA / CSA / HCA window prefix) from persistent forward_vars
-buffers. Replaces the prior chain in `_attach_v4_paged_decode_meta`:
+"""V4 paged-decode index scatter — single Triton kernel writes SWA window-
+prefix paged offsets into the three ragged-packed destination buffers
+(`kv_indices_swa` / `kv_indices_csa` / `kv_indices_hca`).
 
-    state_slot_per_token = state_slot_per_seq[batch_id_per_token[:T].long()]
+Replaces the prior chain (numpy `_build_window_topk_np` + `index_copy_`):
+
+    window_topk_np = _build_window_topk_np(positions, win, cs)  # [T, win]
     swa_paged_2d = torch.where(window_topk >= 0, slot * cs + topk, -1)
     swa_paged_flat = swa_paged_2d.reshape(-1)
     swa_indices_gpu[:T*win].copy_(swa_paged_flat)
-    win_arange = torch.arange(win, ...)
-    csa_win_pos = (csa_indptr[:T].to(int64).unsqueeze(1) + win_arange).reshape(-1)
-    hca_win_pos = (hca_indptr[:T].to(int64).unsqueeze(1) + win_arange).reshape(-1)
     csa_indices_gpu.index_copy_(0, csa_win_pos, swa_paged_flat)
     hca_indices_gpu.index_copy_(0, hca_win_pos, swa_paged_flat)
 
-That chain creates ~5 transient tensors via `torch.where / arange / .reshape /
-.to(int64)`. Under MTP-3 long-prefill, the caching allocator races on these
-across stream boundaries: a still-in-flight `index_copy_` reads storage that
-the allocator has just handed to the next call's transient. Manifests as
-`ASSERT_TRAP` in `at::native::index_copy_kernel_impl<OpaqueType<4>>` (PyTorch
-device-side bound check) when the racing tensor's contents look like an
-out-of-bounds index. See skill `debug-agent-locate-kernel` for the full
-investigation (May 14 2026).
+Two simplifications vs the prior implementation (see plan
+`sequential-noodling-turing.md` for details):
 
-This kernel takes ONLY persistent forward_vars buffers as input — no
-allocator churn — and writes all 3 destinations in-place in a single launch.
-Bytewise-equivalent to the previous chain: each token's win-prefix entries
-hold `slot * cs + window_topk[t,w]` (or -1 sentinel where window_topk[t,w]<0).
+1. The ring-index formula `ring = (pos - win + 1 + w) % cs` is computed
+   inline inside the kernel from `positions[t]`. The `[T, win]`
+   `window_topk` intermediate buffer (mnbt·win·4 = 4 MB at typical config)
+   is gone; no separate CPU build + H2D copy.
+2. The destination layout is now ragged-packed (same as prefill): each
+   token's SWA prefix segment has length `n = min(positions[t]+1, win)`
+   (NOT a fixed `win` padded with `-1` sentinels). The caller's
+   `swa_indptr` / `csa_indptr` / `hca_indptr` reflect this ragged sizing.
+
+Bytewise correctness: for tokens with `position >= win-1` (all `n == win`),
+the output is identical to the prior implementation. For shorter
+positions, the prior layout wrote `(win - n)` leading `-1` entries that
+the sparse-attention kernel masked out; the new layout omits those slots
+entirely, saving sparse-attn loop iterations.
 
 Caller contract:
 - Grid = T (one program per token).
 - `batch_id_per_token[:T]` may carry `-1` sentinels in the CG-padded tail —
   kernel checks and bails (matches `_attach_v4_per_fwd_meta` convention).
-- `csa_indices` / `hca_indices` capacity must be >= csa_indptr[T] /
-  hca_indptr[T] (the full packed buffer); we only write the window-prefix
-  segment `[csa_indptr[t], csa_indptr[t]+win)` per token, the compress-tail
-  is filled elsewhere (HCA: numpy fill in caller, CSA: csa_translate_pack
-  per-layer).
-- `swa_indices` capacity must be >= T*win.
+- `swa_indptr` / `csa_indptr` / `hca_indptr` must reflect the ragged-packed
+  sizing: per-token slot count = `min(positions[t]+1, win) + n_compress[t]`
+  where `n_compress[t]` is 0 for SWA, `min(n_committed_csa, index_topk)`
+  for CSA, `n_committed_hca` for HCA.
+- `swa_indices` / `csa_indices` / `hca_indices` capacity ≥ corresponding
+  indptr[T]; this kernel only writes the SWA-prefix segment
+  `[indptr[t], indptr[t] + n)` per token. The compress-tail is filled
+  elsewhere (HCA: numpy fill in caller, CSA: `csa_translate_pack` per layer).
 """
 
 import torch
@@ -50,53 +55,66 @@ import triton.language as tl
 def _v4_paged_decode_indices_kernel(
     state_slot_per_seq_ptr,  # [bs] int32
     batch_id_per_token_ptr,  # [T+pad] int — sentinel -1 in pad tail
-    window_topk_ptr,  # [T, win] int32 (-1 sentinel for invalid)
-    csa_indptr_ptr,  # [T+1] int32
-    hca_indptr_ptr,  # [T+1] int32
-    swa_indices_ptr,  # [T*win] int32, output
-    csa_indices_ptr,  # [csa_total] int32, output (in-place at csa_indptr[t]+w)
-    hca_indices_ptr,  # [hca_total] int32, output (in-place at hca_indptr[t]+w)
+    positions_ptr,  # [T+pad] int — global token position
+    swa_indptr_ptr,  # [T+1] int32 — ragged SWA-prefix cumsum
+    csa_indptr_ptr,  # [T+1] int32 — ragged (SWA + CSA topk)
+    hca_indptr_ptr,  # [T+1] int32 — ragged (SWA + HCA committed)
+    swa_indices_ptr,  # [swa_total] int32, output
+    csa_indices_ptr,  # [csa_total] int32, output (writes SWA-prefix segment only)
+    hca_indices_ptr,  # [hca_total] int32, output (writes SWA-prefix segment only)
     cs,  # win_with_spec — stride into unified_kv SWA region (paper §3.6.1)
-    win,  # window_size — number of SWA prefix slots written per token
-    BLOCK_W: tl.constexpr,  # next_pow2(win)
+    win: tl.constexpr,  # window_size — max SWA prefix slots
+    BLOCK_N: tl.constexpr,  # next_pow2(win)
 ):
-    """One program per token. Writes `win` paged offsets to SWA, CSA, HCA.
+    """One program per token. Writes `n = min(positions[t]+1, win)` paged
+    offsets to the SWA prefix segment of each of SWA/CSA/HCA index buffers.
 
     For token `t`:
         bid = batch_id_per_token[t]                  # bail if -1 (CG pad)
         slot = state_slot_per_seq[bid]
-        for w in range(win):
-            topk = window_topk[t, w]
-            paged = slot * cs + topk if topk >= 0 else -1
-            swa_indices[t * win + w]              = paged
-            csa_indices[csa_indptr[t] + w]        = paged
-            hca_indices[hca_indptr[t] + w]        = paged
+        pos = positions[t]
+        n = min(pos + 1, win)
+        # Old -1 sentinels were at the leading `win - n` cols; reparameterize
+        # to skip them: i in [0, n) → abs_pos = pos - n + 1 + i ∈ [0, pos].
+        for i in range(n):
+            abs_pos = pos - n + 1 + i
+            ring = abs_pos % cs
+            paged = slot * cs + ring
+            swa_indices[swa_indptr[t] + i] = paged
+            csa_indices[csa_indptr[t] + i] = paged
+            hca_indices[hca_indptr[t] + i] = paged
     """
     t = tl.program_id(0)
     bid = tl.load(batch_id_per_token_ptr + t)
     if bid < 0:
-        return  # CG-padded sentinel — leave outputs untouched (sentinel -1 in caller)
+        return  # CG-padded sentinel — leave outputs untouched
 
     slot = tl.load(state_slot_per_seq_ptr + bid)
+    pos = tl.load(positions_ptr + t)
+    # `n` = actual valid SWA prefix count. Cast to match `win` (compile-time
+    # int) — pos is i32/i64 from positions buffer.
+    n = tl.minimum(pos + 1, win)
+    swa_base = tl.load(swa_indptr_ptr + t)
     csa_base = tl.load(csa_indptr_ptr + t)
     hca_base = tl.load(hca_indptr_ptr + t)
 
-    w = tl.arange(0, BLOCK_W)
-    mask = w < win
+    i = tl.arange(0, BLOCK_N)
+    mask = i < n
+    abs_pos = pos - n + 1 + i  # ∈ [0, pos] for valid i
+    ring_idx = abs_pos % cs
+    paged = slot * cs + ring_idx
 
-    topk = tl.load(window_topk_ptr + t * win + w, mask=mask, other=-1)
-    paged = tl.where(topk >= 0, slot * cs + topk, -1)
-
-    tl.store(swa_indices_ptr + t * win + w, paged, mask=mask)
-    tl.store(csa_indices_ptr + csa_base + w, paged, mask=mask)
-    tl.store(hca_indices_ptr + hca_base + w, paged, mask=mask)
+    tl.store(swa_indices_ptr + swa_base + i, paged, mask=mask)
+    tl.store(csa_indices_ptr + csa_base + i, paged, mask=mask)
+    tl.store(hca_indices_ptr + hca_base + i, paged, mask=mask)
 
 
 def write_v4_paged_decode_indices(
     *,
     state_slot_per_seq: torch.Tensor,
     batch_id_per_token: torch.Tensor,
-    window_topk: torch.Tensor,
+    positions: torch.Tensor,
+    swa_indptr: torch.Tensor,
     csa_indptr: torch.Tensor,
     hca_indptr: torch.Tensor,
     swa_indices: torch.Tensor,
@@ -106,62 +124,66 @@ def write_v4_paged_decode_indices(
     win: int,
     cs: int,
 ) -> None:
-    """In-place fill SWA / CSA / HCA window-prefix offsets via a single Triton
-    kernel. Replaces the prior `state_slot gather + torch.where + arange +
-    2× index_copy_` chain in `_attach_v4_paged_decode_meta`. All inputs are
-    persistent forward_vars buffers — no allocator churn.
+    """In-place fill SWA / CSA / HCA window-prefix offsets via a single
+    Triton kernel. Replaces the prior `_build_window_topk_np` (CPU O(T·win))
+    + `index_copy_` chain. All inputs are persistent forward_vars buffers —
+    no allocator churn.
 
     Args (all GPU tensors except T/win/cs):
       state_slot_per_seq:  [bs]   int32 — per-seq state cache slot.
       batch_id_per_token:  [>=T]  int   — token→seq map; -1 sentinel skipped.
-      window_topk:         [T, win] int32 — per-token SWA ring indices
-                                   (0..cs-1) or -1 for invalid slots.
-      csa_indptr:          [>=T+1] int32 — packed CSA buffer indptr.
-      hca_indptr:          [>=T+1] int32 — packed HCA buffer indptr.
-      swa_indices:         [>=T*win] int32 OUT — uniform-stride SWA offsets.
-      csa_indices:         [>=csa_indptr[T]] int32 OUT — packed; only
-                                   window-prefix `[csa_indptr[t], +win)` written.
-      hca_indices:         [>=hca_indptr[T]] int32 OUT — same shape semantics.
+      positions:           [>=T]  int   — global token position
+                                   (forward_vars["positions"]); used to derive
+                                   `n = min(pos+1, win)` per token + the ring
+                                   index `(pos - n + 1 + i) % cs`.
+      swa_indptr:          [>=T+1] int32 — ragged SWA-prefix cumsum, where
+                                   `swa_indptr[t+1] - swa_indptr[t] =
+                                    min(positions[t]+1, win)`.
+      csa_indptr:          [>=T+1] int32 — ragged CSA buffer indptr (SWA
+                                   prefix + CSA topk per token).
+      hca_indptr:          [>=T+1] int32 — ragged HCA buffer indptr (SWA
+                                   prefix + HCA committed per token).
+      swa_indices:         [>=swa_indptr[T]] int32 OUT — fully written by
+                                   this kernel (no other source).
+      csa_indices:         [>=csa_indptr[T]] int32 OUT — window-prefix
+                                   `[csa_indptr[t], +n)` written here; CSA
+                                   topk tail filled per-layer by
+                                   `csa_translate_pack`.
+      hca_indices:         [>=hca_indptr[T]] int32 OUT — same semantics; HCA
+                                   compress tail filled in the caller via
+                                   numpy fill.
       T:                   int — number of real tokens (grid size).
       win:                 int — SWA window size (typically 128 for V4-Pro).
       cs:                  int — `win_with_spec = window_size + max_spec_steps`,
-                                 stride into unified_kv SWA region per slot.
-
-    Output values per token `t` and slot `w in [0, win)`:
-        paged = state_slot_per_seq[batch_id_per_token[t]] * cs + window_topk[t,w]
-                if window_topk[t,w] >= 0 else -1
-        swa_indices[t*win + w]         = paged
-        csa_indices[csa_indptr[t] + w] = paged
-        hca_indices[hca_indptr[t] + w] = paged
+                                 stride into unified_kv SWA region per slot
+                                 AND modulo for ring-index wrap.
     """
     if T == 0:
         return
     assert state_slot_per_seq.dim() == 1
     assert batch_id_per_token.dim() == 1 and batch_id_per_token.shape[0] >= T
-    assert window_topk.dim() == 2 and window_topk.shape[0] >= T
-    assert (
-        window_topk.shape[1] == win
-    ), f"window_topk.shape[1] {window_topk.shape[1]} != win {win}"
+    assert positions.dim() == 1 and positions.shape[0] >= T
+    assert swa_indptr.dim() == 1 and swa_indptr.shape[0] >= T + 1
     assert csa_indptr.dim() == 1 and csa_indptr.shape[0] >= T + 1
     assert hca_indptr.dim() == 1 and hca_indptr.shape[0] >= T + 1
-    assert swa_indices.dim() == 1 and swa_indices.shape[0] >= T * win
+    assert swa_indices.dim() == 1
     assert csa_indices.dim() == 1
     assert hca_indices.dim() == 1
-    assert window_topk.is_contiguous(), "window_topk must be contiguous (row-major)"
 
-    BLOCK_W = triton.next_power_of_2(win)
+    BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_decode_indices_kernel[(T,)](
         state_slot_per_seq,
         batch_id_per_token,
-        window_topk,
+        positions,
+        swa_indptr,
         csa_indptr,
         hca_indptr,
         swa_indices,
         csa_indices,
         hca_indices,
         cs,
-        win,
-        BLOCK_W=BLOCK_W,
+        win=win,
+        BLOCK_N=BLOCK_N,
     )
 
 
@@ -169,7 +191,8 @@ def write_v4_paged_decode_indices_reference(
     *,
     state_slot_per_seq: torch.Tensor,
     batch_id_per_token: torch.Tensor,
-    window_topk: torch.Tensor,
+    positions: torch.Tensor,
+    swa_indptr: torch.Tensor,
     csa_indptr: torch.Tensor,
     hca_indptr: torch.Tensor,
     swa_indices: torch.Tensor,
@@ -181,40 +204,32 @@ def write_v4_paged_decode_indices_reference(
 ) -> None:
     """Pure-PyTorch reference equivalent of `write_v4_paged_decode_indices`.
     For unit tests and bisect verification. Mirrors the kernel exactly:
-    skip rows where bid<0, otherwise compute `slot*cs + topk` with -1 sentinel
-    propagation, write to all three destinations.
+    per-token ragged-packed write, no -1 sentinels in output.
     """
     if T == 0:
         return
     bid = batch_id_per_token[:T].long()
+    pos_t = positions[:T].long()
     valid = bid >= 0
+    # n = min(pos+1, win) per token; clamp invalid rows to 0 to skip writes.
+    n_per_tok = torch.minimum(pos_t + 1, torch.full_like(pos_t, win))
+    n_per_tok = torch.where(valid, n_per_tok, torch.zeros_like(n_per_tok))
     slot = torch.where(
-        valid, state_slot_per_seq[bid.clamp(min=0)], torch.zeros_like(bid)
+        valid, state_slot_per_seq[bid.clamp(min=0)].long(), torch.zeros_like(bid)
     )
-    topk = window_topk[:T]  # [T, win]
-    paged = torch.where(
-        topk >= 0,
-        slot[:, None] * cs + topk,
-        torch.full_like(topk, -1),
-    )  # [T, win] int32
-    # For invalid rows (bid<0), DON'T write — kernel bails. Mask them out:
-    valid_mask = valid[:, None].expand_as(paged)
-    # SWA: uniform stride → straight copy, but only valid rows
-    flat = paged.reshape(-1)
-    swa_indices[: T * win].copy_(flat)
-    if (~valid).any():
-        # restore sentinel for invalid rows in SWA (kernel doesn't write them,
-        # so callers may have pre-filled -1 — match by leaving them be).
-        # Reference writes regardless; for tests on non-CG inputs this is moot
-        # since callers don't pass -1 bids.
-        pass
-    # CSA / HCA: packed at indptr[t]+w
     for t in range(T):
-        if not bool(valid[t]):
+        n = int(n_per_tok[t].item())
+        if n == 0:
             continue
+        p = int(pos_t[t].item())
+        s = int(slot[t].item())
+        i_arr = torch.arange(n, device=positions.device, dtype=torch.long)
+        abs_pos = p - n + 1 + i_arr  # [n]
+        ring = abs_pos % cs
+        paged = (s * cs + ring).to(torch.int32)
+        swa_base = int(swa_indptr[t].item())
         csa_base = int(csa_indptr[t].item())
         hca_base = int(hca_indptr[t].item())
-        csa_indices[csa_base : csa_base + win] = paged[t]
-        hca_indices[hca_base : hca_base + win] = paged[t]
-    # silence lint
-    del valid_mask
+        swa_indices[swa_base : swa_base + n] = paged
+        csa_indices[csa_base : csa_base + n] = paged
+        hca_indices[hca_base : hca_base + n] = paged
