@@ -579,7 +579,8 @@ jobs:
       - name: Install PD dependencies (prefill node)
         run: |
           docker exec atom-pd-prefill bash -lc \
-            "pip install msgpack msgspec quart mooncake-transfer-engine"
+            "apt-get update -qq && apt-get install -y -qq openssh-client > /dev/null && \
+             pip install msgpack msgspec quart mooncake-transfer-engine"
 
       - name: Launch all PD components
         timeout-minutes: 60

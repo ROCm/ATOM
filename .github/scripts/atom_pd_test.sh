@@ -115,7 +115,7 @@ get_local_hostname() {
 }
 
 get_local_ip() {
-    ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -1
+    hostname -I | awk '{print $1}'
 }
 
 check_node_free() {
@@ -195,7 +195,7 @@ get_decode_hosts_csv() {
 get_remote_ip() {
     local node=$1
     # shellcheck disable=SC2086
-    ssh $SSH_OPTS "$node" "ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if (\$i==\"src\") print \$(i+1)}' | head -1" 2>/dev/null
+    ssh $SSH_OPTS "$node" "hostname -I | awk '{print \$1}'" 2>/dev/null
 }
 
 # ── Launch functions ────────────────────────────────────────────────
