@@ -23,8 +23,7 @@ vllm serve zai-org/GLM-5-FP8 \
     --gpu_memory_utilization 0.9 \
     --async-scheduling \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
-    --no-enable-prefix-caching \
-    --block-size 1
+    --no-enable-prefix-caching
 ```
 
 ## Step 3: Performance Benchmark

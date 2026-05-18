@@ -213,13 +213,42 @@ async def stream_decode_response(
     request_id: str,
 ):
     """Yield response chunks from a decode instance, then close the session."""
+    chunk_count = 0
     try:
         if response.status != 200:
             raise RuntimeError(
                 f"Decode request {request_id} failed with status {response.status}"
             )
-        async for chunk_bytes in response.content.iter_chunked(1024):
+        while True:
+            try:
+                chunk_bytes = await asyncio.wait_for(
+                    response.content.readany(), timeout=120.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[PROXY] stream_decode TIMEOUT for %s after %d chunks "
+                    "(120s no data), closing",
+                    request_id,
+                    chunk_count,
+                )
+                break
+            if not chunk_bytes:
+                break
+            chunk_count += 1
             yield chunk_bytes
+        logger.info(
+            "[PROXY] stream_decode finished for %s, %d chunks forwarded",
+            request_id,
+            chunk_count,
+        )
+    except Exception as e:
+        logger.exception(
+            "[PROXY] stream_decode ERROR for %s after %d chunks: %s",
+            request_id,
+            chunk_count,
+            e,
+        )
+        raise
     finally:
         await session.close()
 
@@ -254,6 +283,7 @@ async def handle_request():
 
         req_data = await request.get_json()
         request_id = str(uuid.uuid4())
+        logger.info("[PROXY] handle_request #%d, id=%s", request_nums, request_id)
 
         if not prefill_instances or not decode_instances:
             return await make_response(
@@ -300,7 +330,10 @@ async def handle_request():
         )
 
         # --- Decode request ---
-        req_data["max_tokens"] -= 1
+        # NOTE: Do NOT decrement max_tokens. The decode engine's first token
+        # (T0 re-prediction) is overridden with prefill's T0 via first_token_id,
+        # but that decode step still counts toward max_tokens. Keeping the
+        # original max_tokens ensures the total output length matches non-PD.
         req_data["kv_transfer_params"] = {
             "do_remote_decode": False,
             "do_remote_prefill": True,
@@ -313,26 +346,30 @@ async def handle_request():
 
         logger.info("Transfer type: %s", TRANSFER_TYPE)
 
+        prefill_response = await send_prefill_task
+        logger.info("Prefill response received for request %s", request_id)
+        prefill_kv = prefill_response["kv_transfer_params"]
+        req_data["kv_transfer_params"]["transfer_id"] = prefill_kv["transfer_id"]
+        if "first_token_id" in prefill_kv:
+            req_data["kv_transfer_params"]["first_token_id"] = prefill_kv[
+                "first_token_id"
+            ]
+
+        actual_dp_rank = prefill_kv.get("dp_rank", selected_prefill_dp_rank)
+        if actual_dp_rank is not None:
+            selected_prefill_dp_rank = actual_dp_rank
+
         if TRANSFER_TYPE == "read":
-            prefill_response = await send_prefill_task
-            logger.info("Prefill response received for request %s", request_id)
-            prefill_kv = prefill_response["kv_transfer_params"]
             req_data["kv_transfer_params"]["remote_engine_id"] = prefill_kv[
                 "remote_engine_id"
             ]
             req_data["kv_transfer_params"]["remote_block_ids"] = prefill_kv[
                 "remote_block_ids"
             ]
-            req_data["kv_transfer_params"]["transfer_id"] = prefill_kv["transfer_id"]
-
-            # Use the actual dp_rank from the prefill response (authoritative),
-            # falling back to the proxy's round-robin selection.
-            actual_dp_rank = prefill_kv.get("dp_rank", selected_prefill_dp_rank)
-            if actual_dp_rank is not None:
-                selected_prefill_dp_rank = actual_dp_rank
 
         req_data["kv_transfer_params"]["remote_dp_size"] = prefill_ep["dp_size"]
         req_data["kv_transfer_params"]["remote_tp_size"] = prefill_ep["tp_size"]
+        req_data["kv_transfer_params"]["tp_size"] = prefill_ep["tp_size"]
 
         if selected_prefill_dp_rank is not None:
             req_data["kv_transfer_params"]["remote_dp_rank"] = selected_prefill_dp_rank
@@ -341,12 +378,19 @@ async def handle_request():
             decode_ep["request_address"], req_data, request_id
         )
         stream_gen = stream_decode_response(session, decode_response, request_id)
+        logger.info(
+            "[PROXY] decode response status=%d for %s",
+            decode_response.status,
+            request_id,
+        )
         response = await make_response(stream_gen)
         response.headers["Content-Type"] = "application/json; charset=utf-8"
         return response
 
     except Exception as e:
-        logger.exception("Error handling request: %s", e)
+        logger.exception(
+            "[PROXY] Error handling request #%d id=%s: %s", request_nums, request_id, e
+        )
         resp = await make_response((f"Internal Server Error: {e!s}", 500))
         resp.headers["Content-Type"] = "application/json; charset=utf-8"
         return resp
@@ -355,11 +399,38 @@ async def handle_request():
 _DEFAULT_DISCOVERY_PORT = 36367
 
 
+@app.route("/start_profile", methods=["POST"])
+@app.route("/stop_profile", methods=["POST"])
+async def proxy_profile():
+    """Forward profiler start/stop to all registered prefill and decode instances."""
+    path = request.path  # "/start_profile" or "/stop_profile"
+    results = {}
+    async with aiohttp.ClientSession() as session:
+        for tag, instances in [
+            ("prefill", prefill_instances),
+            ("decode", decode_instances),
+        ]:
+            for i, ep in enumerate(instances):
+                ip, port = _extract_ip_port(ep["request_address"])
+                url = f"http://{ip}:{port}{path}"
+                try:
+                    async with session.post(
+                        url, timeout=aiohttp.ClientTimeout(total=600)
+                    ) as resp:
+                        results[f"{tag}_{i}"] = {
+                            "status": resp.status,
+                            "body": await resp.json(),
+                        }
+                except Exception as e:
+                    results[f"{tag}_{i}"] = {"status": "error", "detail": str(e)}
+    return results
+
+
 def main(port: int = 10001):
     """Launch the P/D proxy service."""
     discovery_thread = start_service_discovery("0.0.0.0", _DEFAULT_DISCOVERY_PORT)
 
-    app.debug = True
+    app.debug = False
     app.config["BODY_TIMEOUT"] = 360000
     app.config["RESPONSE_TIMEOUT"] = 360000
 

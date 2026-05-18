@@ -698,10 +698,6 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
-            use_prefix_cache = (
-                attn_metadata.has_cached and self.kv_b_proj.weight.dtype != dtypes.fp4x2
-            )
-
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )
@@ -718,7 +714,7 @@ class MLAAttention(nn.Module):
                     scale=self._k_scale,
                 )
 
-            if use_prefix_cache:
+            if attn_metadata.has_cached:
                 # k_full/v_full are used for attention compute; gather_kv_b_proj reads
                 # fp8 from cache and dequantizes internally, so output must be model dtype
                 k_full = torch.empty(

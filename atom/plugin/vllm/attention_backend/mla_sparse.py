@@ -23,7 +23,7 @@ class AiterMLASparseBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "ROCM_AITER_MLA_SPARSE" if not is_plugin_mode() else "CUSTOM"
+        return "ROCM_AITER_MLA_SPARSE" if not is_plugin_mode() else "CUSTOM_MLA_SPARSE"
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLASparseMetadataBuilder"]:
@@ -59,7 +59,11 @@ class AiterMLASparseIndexerBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "ROCM_AITER_MLA_SPARSE_INDEXER" if not is_plugin_mode() else "CUSTOM"
+        return (
+            "ROCM_AITER_MLA_SPARSE_INDEXER"
+            if not is_plugin_mode()
+            else "CUSTOM_MLA_SPARSE_INDEXER"
+        )
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLASparseIndexerMetadataBuilder"]:
