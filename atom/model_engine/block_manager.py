@@ -34,6 +34,11 @@ class BlockManager:
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
         self.block_size = block_size
+        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
+        # dcp_rank is always 0 here: BlockManager runs only on the scheduler
+        # (rank 0). DCP rank is used only to compute local token counts for
+        # memory reservation; the actual per-rank routing is done in the workers.
+        self.dcp_rank = 0
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -92,6 +97,19 @@ class BlockManager:
         self.free_block_ids.append(block_id)
         self.free_block_ids_set.add(block_id)
 
+    def _dcp_num_blocks(self, seq_len: int) -> int:
+        if self.dcp_world_size <= 1:
+            return (seq_len + self.block_size - 1) // self.block_size
+        from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+
+        local_len = get_dcp_local_seq_lens(
+            np.array([seq_len]), self.dcp_world_size, self.dcp_rank
+        )[0]
+        return int((local_len + self.block_size - 1) // self.block_size)
+
+    def _effective_block_size(self):
+        return self.block_size * self.dcp_world_size
+
     def can_allocate(self, seq: Sequence) -> bool:
         per_req_cache_cost = (
             self.per_req_cache_equiv_blocks if seq.has_per_req_cache else 0
@@ -99,16 +117,17 @@ class BlockManager:
         per_req_cache_slot_ok = (not seq.has_per_req_cache) or len(
             self.free_per_req_cache_groups
         ) > 0
+        num_blocks = self._dcp_num_blocks(len(seq))
         if not self.enable_prefix_caching:
             return (
-                len(self.free_block_ids_set) >= seq.num_blocks + per_req_cache_cost
+                len(self.free_block_ids_set) >= num_blocks + per_req_cache_cost
                 and per_req_cache_slot_ok
             )
         # Dry-run: count how many blocks would be cache hits
         h = -1
         cache_miss = False
         needed_free = 0
-        for i in range(seq.num_blocks):
+        for i in range(num_blocks):
             token_ids = seq.block(i)
             h = (
                 self.compute_hash(token_ids, h)
@@ -129,8 +148,9 @@ class BlockManager:
         assert not seq.block_table
         h = -1
         cache_miss = False
+        num_blocks = self._dcp_num_blocks(len(seq))
 
-        for i in range(seq.num_blocks):
+        for i in range(num_blocks):
             token_ids = seq.block(i)
             h = (
                 self.compute_hash(token_ids, h)
@@ -188,9 +208,8 @@ class BlockManager:
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
-        needed_blocks = (
-            seq_len + num_new_tokens + self.block_size - 1
-        ) // self.block_size
+        ebs = self._effective_block_size()
+        needed_blocks = (seq_len + num_new_tokens + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
         return len(self.free_block_ids_set) >= new_blocks_needed
 
@@ -203,8 +222,9 @@ class BlockManager:
         # Check if we need to allocate a new block
         # When len(seq) % block_size == 1, we need a new block for the next token
         # When block_size == 1, every token needs a new block
-        if 0 < seq_len % self.block_size <= num_new_tokens or self.block_size == 1:
-            needed_blocks = (seq_len + self.block_size - 1) // self.block_size
+        ebs = self._effective_block_size()
+        if 0 < seq_len % ebs <= num_new_tokens or ebs == 1:
+            needed_blocks = (seq_len + ebs - 1) // ebs
             while len(block_table) < needed_blocks:
                 # Decode-generated blocks: token not finalized yet (depends on
                 # sampling / speculative verification), so we cannot compute a

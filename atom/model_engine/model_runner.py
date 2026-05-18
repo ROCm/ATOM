@@ -544,6 +544,9 @@ class ModelRunner:
             distributed_init_method=distributed_init_method,
             data_parallel_size=config.parallel_config.data_parallel_size,
             data_parallel_rank=config.parallel_config.data_parallel_rank,
+            decode_context_parallel_size=getattr(
+                config, "decode_context_parallel_size", 1
+            ),
         )
         init_exit_handler(self)
         default_dtype = self.config.torch_dtype

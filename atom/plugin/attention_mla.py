@@ -300,6 +300,7 @@ class MLAAttentionImplPluginModeMethods:
                 toks=toks,
             )
 
+            kv_c_normed = kv_c_normed.squeeze(1)
             kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
@@ -413,7 +414,6 @@ class MLAAttentionImplPluginModeMethods:
     ):
         # TODO (zyongye): Prefill function hereplugin_metadata
         assert attn_metadata.plugin_metadata.prefill is not None
-        assert self.dcp_world_size != -1
 
         has_context = attn_metadata.plugin_metadata.prefill.chunked_context is not None
 
@@ -514,14 +514,15 @@ class MLAAttentionImplPluginModeMethods:
         if has_context:
             suffix_output, suffix_lse = output_prefill
             if self.dcp_world_size > 1:
-                context_output, context_lse = (
-                    self._context_parallel_compute_prefill_context_plugin_mode(
-                        q,
-                        kv_c_and_k_pe_cache,
-                        attn_metadata,
-                        k_scale=None,
-                        dcp_world_size=self.dcp_world_size,
-                    )
+                (
+                    context_output,
+                    context_lse,
+                ) = self._context_parallel_compute_prefill_context_plugin_mode(
+                    q,
+                    kv_c_and_k_pe_cache,
+                    attn_metadata,
+                    k_scale=None,
+                    dcp_world_size=self.dcp_world_size,
                 )
             else:
                 context_output, context_lse = self._compute_prefill_context_plugin_mode(
@@ -556,9 +557,10 @@ class MLAAttentionImplPluginModeMethods:
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
         B = q.shape[0]
+        num_heads_q = q.shape[1]
         o = torch.empty(
             B,
-            self.padded_num_heads,
+            num_heads_q,
             self.kv_lora_rank,
             dtype=attn_metadata.plugin_metadata.decode.attn_out_dtype,
             device=q.device,
@@ -566,9 +568,7 @@ class MLAAttentionImplPluginModeMethods:
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        use_persistent_mode = not (
-            self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
-        )
+        use_persistent_mode = not (self.dcp_world_size > 1)
         if not use_persistent_mode:
             work_meta_data = None
             work_indptr = None
@@ -587,7 +587,9 @@ class MLAAttentionImplPluginModeMethods:
         paged_kv_indptr = attn_metadata.plugin_metadata.decode.paged_kv_indptr
         paged_kv_indices = attn_metadata.plugin_metadata.decode.paged_kv_indices
 
-        mla_decode_fwd(
+        return_lse = self.need_to_return_lse_for_decode
+
+        _, lse = mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
@@ -605,10 +607,13 @@ class MLAAttentionImplPluginModeMethods:
             reduce_partial_map=reduce_partial_map,
             q_scale=layer._q_scale,
             kv_scale=layer._k_scale,
+            return_lse=return_lse,
         )
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :]
-        return o, None
+            if lse is not None:
+                lse = lse[:, :: self.head_repeat_factor]
+        return o, lse
 
     def forward_impl_plugin_mode(
         self,
@@ -669,9 +674,6 @@ class MLAAttentionImplPluginModeMethods:
             # same expert outputs.
             return output.fill_(0)
 
-        if self.dcp_world_size == -1:
-            self.dcp_world_size = get_dcp_group().world_size
-
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
         num_actual_toks = attn_metadata.plugin_metadata.num_actual_tokens
@@ -719,7 +721,13 @@ class MLAAttentionImplPluginModeMethods:
                 self._has_fused_rope_cache = hasattr(
                     ops, "concat_and_cache_mla_rope_fused"
                 )
-            if kv_cache.numel() > 0 and self._has_fused_rope_cache:
+            if (
+                kv_cache.numel() > 0
+                and self._has_fused_rope_cache
+                and self.dcp_world_size <= 1
+            ):
+                # Need to adjust the fused kernel for DCP. As for now, we
+                # just skip concat_and_cache_mla_rope_fused when enable DCP.
                 ops.concat_and_cache_mla_rope_fused(
                     positions,
                     q[..., self.qk_nope_head_dim :],
@@ -910,7 +918,26 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
         )
 
         self.supports_quant_query_input = False
-        self.dcp_world_size: int = -1
+
+        from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
+
+        try:
+            self.dcp_world_size = get_dcp_group().world_size
+            self.dcp_rank = get_dcp_group().rank_in_group
+        except AssertionError:
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+        try:
+            self.pcp_world_size = get_pcp_group().world_size
+            self.pcp_rank = get_pcp_group().rank_in_group
+        except AssertionError:
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
+        self.total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        self.need_to_return_lse_for_decode = self.dcp_world_size > 1
+        self.supports_pcp = False
+        self.supports_mtp_with_cp_non_trivial_interleave_size = False
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
                 get_current_vllm_config()

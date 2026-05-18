@@ -203,6 +203,13 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.device = model_runner.device
         config = model_runner.config
         hf_config = config.hf_config
+        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
+        if self.dcp_world_size > 1:
+            from aiter.dist.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
+        else:
+            self.dcp_rank = 0
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
         self.max_num_blocks_per_seq = (
@@ -275,21 +282,31 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not batch.block_tables:
                 continue
-            num_blocks = (
-                seqlen + self.model_runner.block_size - 1
-            ) // self.model_runner.block_size
-            num_cached_blocks = (
-                cached_seqlen + self.model_runner.block_size - 1
-            ) // self.model_runner.block_size
-            last_block_tokens = batch.last_block_num_tokens[i]
+            block_size = self.model_runner.block_size
             block_table = batch.block_tables[i]
-            for blk_idx in range(num_cached_blocks, num_blocks):
-                start = block_table[blk_idx] * self.model_runner.block_size
-                if blk_idx != num_blocks - 1:
-                    end = start + self.model_runner.block_size
-                else:
-                    end = start + last_block_tokens
-                slot_mapping.extend(list(range(start, end)))
+            if self.dcp_world_size > 1:
+                virtual_block_size = block_size * self.dcp_world_size
+                for pos in range(cached_seqlen, seqlen):
+                    vb_offset = pos % virtual_block_size
+                    if vb_offset % self.dcp_world_size == self.dcp_rank:
+                        blk_idx = pos // virtual_block_size
+                        local_offset = vb_offset // self.dcp_world_size
+                        slot_mapping.append(
+                            block_table[blk_idx] * block_size + local_offset
+                        )
+                    else:
+                        slot_mapping.append(-1)
+            else:
+                num_blocks = (seqlen + block_size - 1) // block_size
+                num_cached_blocks = (cached_seqlen + block_size - 1) // block_size
+                last_block_tokens = batch.last_block_num_tokens[i]
+                for blk_idx in range(num_cached_blocks, num_blocks):
+                    start = block_table[blk_idx] * block_size
+                    if blk_idx != num_blocks - 1:
+                        end = start + block_size
+                    else:
+                        end = start + last_block_tokens
+                    slot_mapping.extend(list(range(start, end)))
         if has_cached:
             self.prepare_block_tables(batch)
         # Validate metadata consistency
