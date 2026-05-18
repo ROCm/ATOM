@@ -50,6 +50,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_QKNORM_FUSION", "1") == "1"
     ),
+    "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
+        os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
@@ -73,8 +76,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use a thread pool for weight loading instead of main-process sequential I/O.
     # Set to 0 to disable if the thread pool causes hangs (e.g. on gfx1250).
-    "ATOM_LOADER_USE_THREADPOOL": lambda: os.getenv("ATOM_LOADER_USE_THREADPOOL", "1")
-    == "1",
+    "ATOM_LOADER_USE_THREADPOOL": lambda: (
+        os.getenv("ATOM_LOADER_USE_THREADPOOL", "1") == "1"
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
@@ -108,10 +112,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_REQUIRES_GRAD": lambda: os.getenv("ATOM_REQUIRES_GRAD", "0") == "1",
     # --- Bpreshuffle for weight ---
     # Preshuffle weight.  Default "1" (enabled)
-    "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE": lambda: os.getenv(
-        "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1"
-    )
-    == "1",
+    "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE": lambda: (
+        os.getenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1") == "1"
+    ),
     # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
     # `legacy` (default) keeps the per-seq Python dispatch loop with .item()
     # syncs in deepseek_v4.py. `new` routes through V4AttentionBackend with

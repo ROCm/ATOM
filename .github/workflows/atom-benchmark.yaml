@@ -82,6 +82,10 @@ on:
           Example (multiple sets): 1024,1024,128,0.8;2048,1024,256,0.7"
         type: string
         default: "1024,1024,128,0.8"
+      atom_commit:
+        description: "ATOM commit SHA to checkout; leave empty to use the workflow ref"
+        type: string
+        default: ""
 
 jobs:
   parse-param-lists:
@@ -91,6 +95,8 @@ jobs:
       matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Parse parameter lists
         id: parse-param-lists
@@ -122,6 +128,8 @@ jobs:
       models_json: ${{ steps.load.outputs.models_json }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
       - id: load
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -186,6 +194,8 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Start CI container
         run: |
@@ -349,6 +359,8 @@ jobs:
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Download all benchmark results
         uses: actions/download-artifact@v8
@@ -497,6 +509,8 @@ jobs:
       has_matrix: ${{ steps.gen.outputs.has_matrix }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - uses: actions/download-artifact@v8
         with:
@@ -552,6 +566,8 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Docker Login
         run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
@@ -744,6 +760,8 @@ jobs:
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Download regression traces
         if: needs.collect-regression-traces.result == 'success'
