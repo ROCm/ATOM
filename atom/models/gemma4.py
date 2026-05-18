@@ -382,7 +382,7 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         **model_kwargs: dict[str, Any] | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if residual is not None:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
@@ -403,6 +403,13 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = hidden_states * self.layer_scalar
 
+        # layer_scalar is folded into the full layer output, which is
+        # incompatible with the cross-layer residual carry chain: the next
+        # layer would need to recover (delta, residual) from the scaled
+        # output to fuse input_layernorm with our residual, but that split
+        # cannot be reconstructed once the scalar is applied. Return None
+        # to deliberately break the carry chain and force the next layer's
+        # input_layernorm to start a fresh residual from hidden_states.
         return hidden_states, None
 
 
