@@ -201,6 +201,18 @@ def validate_lora_adapters_supported(lora_modules: list[str] | None) -> None:
         iter_lora_tensor_module_names(spec.path)
 
 
+def lora_modules_have_routed_experts(lora_modules: list[str] | None) -> bool:
+    if not lora_modules:
+        return False
+
+    for entry in lora_modules:
+        spec = parse_lora_module_entry(entry)
+        for module_name in iter_lora_tensor_module_names(spec.path):
+            if _match_routed_expert(module_name) is not None:
+                return True
+    return False
+
+
 def mark_static_routed_lora_targets(
     model: nn.Module,
     lora_modules: list[str] | None,

@@ -8,6 +8,7 @@ from typing import List, Optional
 
 from atom import LLMEngine
 from atom.config import CompilationConfig, SpeculativeConfig
+from atom.model_loader.lora import lora_modules_have_routed_experts
 
 logger = logging.getLogger("atom")
 
@@ -287,6 +288,18 @@ class EngineArgs:
         if lora_modules is not None and len(lora_modules) == 0:
             raise ValueError(
                 "--lora-modules requires at least one adapter path when provided"
+            )
+        try:
+            has_routed_lora = lora_modules_have_routed_experts(lora_modules)
+        except FileNotFoundError:
+            has_routed_lora = False
+        if has_routed_lora and not kwargs.get("enforce_eager"):
+            kwargs["enforce_eager"] = True
+            logger.warning(
+                "Static routed expert LoRA currently uses a correctness-first "
+                "reference MoE path and is not CUDA-graph safe; forcing "
+                "enforce_eager=True. Use --enforce-eager explicitly to silence "
+                "this automatic compatibility adjustment."
             )
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode

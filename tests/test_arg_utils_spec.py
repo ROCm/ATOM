@@ -2,10 +2,13 @@
 # Regression tests for speculative-config validation in EngineArgs._get_engine_kwargs.
 
 import argparse
+import json
 import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 # conftest.py stubs atom.* and zmq before any atom imports are attempted,
 # but arg_utils.py imports LLMEngine from atom and CompilationConfig /
@@ -26,6 +29,15 @@ if _atom_config_stub is not None:
         )
 
 from atom.model_engine.arg_utils import EngineArgs  # noqa: E402
+
+
+def _write_adapter(path, tensors):
+    path.mkdir()
+    (path / "adapter_config.json").write_text(
+        json.dumps({"r": 1, "lora_alpha": 1}),
+        encoding="utf-8",
+    )
+    save_file(tensors, path / "adapter_model.safetensors")
 
 
 class TestEngineArgsSpeculativeValidation:
@@ -72,6 +84,46 @@ class TestEngineArgsSpeculativeValidation:
         args = EngineArgs(lora_modules=["adapter=/tmp/adapter"])
         kwargs = args._get_engine_kwargs()
         assert kwargs["lora_modules"] == ["adapter=/tmp/adapter"]
+
+    def test_routed_lora_modules_force_enforce_eager(self, tmp_path):
+        adapter_path = tmp_path / "adapter"
+        _write_adapter(
+            adapter_path,
+            {
+                "base_model.model.model.layers.10.mlp.experts.0.down_proj."
+                "lora_A.weight": torch.ones(1, 3),
+                "base_model.model.model.layers.10.mlp.experts.0.down_proj."
+                "lora_B.weight": torch.ones(4, 1),
+            },
+        )
+        args = EngineArgs(
+            enforce_eager=False,
+            lora_modules=[f"adapter={adapter_path}"],
+        )
+
+        kwargs = args._get_engine_kwargs()
+
+        assert kwargs["enforce_eager"] is True
+
+    def test_regular_lora_modules_do_not_force_enforce_eager(self, tmp_path):
+        adapter_path = tmp_path / "adapter"
+        _write_adapter(
+            adapter_path,
+            {
+                "base_model.model.model.layers.10.self_attn.q_a_proj."
+                "lora_A.weight": torch.ones(1, 3),
+                "base_model.model.model.layers.10.self_attn.q_a_proj."
+                "lora_B.weight": torch.ones(4, 1),
+            },
+        )
+        args = EngineArgs(
+            enforce_eager=False,
+            lora_modules=[f"adapter={adapter_path}"],
+        )
+
+        kwargs = args._get_engine_kwargs()
+
+        assert kwargs["enforce_eager"] is False
 
     def test_empty_lora_modules_list_is_rejected(self):
         args = EngineArgs(lora_modules=[])
