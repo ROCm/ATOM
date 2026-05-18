@@ -206,7 +206,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
         self.max_num_blocks_per_seq = (
-            config.max_model_len + self.block_size - 1
+            max(config.max_model_len, model_runner.max_num_batched_tokens) + self.block_size - 1
         ) // self.block_size
 
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
