@@ -382,10 +382,8 @@ jobs:
   parse-pd-params:
     name: Parse PD parameter lists
     if: >-
-      !cancelled()
-      && (github.event_name == 'schedule'
-          || inputs.pd-benchmark != false)
-    needs: [benchmark]
+      github.event_name == 'schedule'
+      || inputs.pd-benchmark != false
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.parse.outputs.matrix_json }}
@@ -418,10 +416,8 @@ jobs:
   load-pd-models:
     name: Load PD model configs
     if: >-
-      !cancelled()
-      && (github.event_name == 'schedule'
-          || inputs.pd-benchmark != false)
-    needs: [benchmark]
+      github.event_name == 'schedule'
+      || inputs.pd-benchmark != false
     runs-on: ubuntu-latest
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
@@ -464,10 +460,8 @@ jobs:
   pd-ip-upload:
     name: PD IP upload test
     if: >-
-      !cancelled()
-      && (github.event_name == 'schedule'
-          || inputs.pd-benchmark != false)
-    needs: [benchmark]
+      github.event_name == 'schedule'
+      || inputs.pd-benchmark != false
     runs-on: atom-mi355-8gpu.predownload
     timeout-minutes: 5
     outputs:
@@ -530,11 +524,6 @@ jobs:
   pd-prefill:
     name: PD-Prefill ${{ matrix.model.display }}
     needs: [parse-pd-params, load-pd-models, pd-ip-verify]
-    if: >-
-      !cancelled()
-      && needs.parse-pd-params.result == 'success'
-      && needs.load-pd-models.result == 'success'
-      && needs.pd-ip-verify.result == 'success'
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -823,10 +812,6 @@ jobs:
   pd-decode:
     name: PD-Decode ${{ matrix.entry.display }} #${{ matrix.entry.decode_index }}
     needs: [load-pd-models, pd-ip-verify]
-    if: >-
-      !cancelled()
-      && needs.load-pd-models.result == 'success'
-      && needs.pd-ip-verify.result == 'success'
     strategy:
       fail-fast: false
       matrix:
