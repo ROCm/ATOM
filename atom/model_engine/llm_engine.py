@@ -258,6 +258,28 @@ class InputOutputProcessor:
             if isinstance(prompt_or_tokens, str)
             else prompt_or_tokens
         )
+        num_prompt_tokens = len(tokens)
+        max_num_batched_tokens = getattr(self.config, "max_num_batched_tokens", None)
+        if (
+            max_num_batched_tokens is not None
+            and num_prompt_tokens > max_num_batched_tokens
+        ):
+            raise ValueError(
+                "Prompt is too long to schedule: "
+                f"input tokens={num_prompt_tokens} > "
+                f"max_num_batched_tokens={max_num_batched_tokens}. "
+                "Increase --max-num-batched-tokens or shorten the prompt."
+            )
+        max_model_len = getattr(self.config, "max_model_len", None)
+        if max_model_len is not None:
+            max_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
+            if num_prompt_tokens + max_tokens > max_model_len:
+                raise ValueError(
+                    "Prompt plus requested output is too long: "
+                    f"input tokens={num_prompt_tokens} + "
+                    f"max_tokens={max_tokens} > max_model_len={max_model_len}. "
+                    "Reduce prompt length or max_tokens."
+                )
 
         stop_token_sequences = []
         if sampling_params.stop_strings:
