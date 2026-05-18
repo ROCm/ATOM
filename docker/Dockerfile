@@ -217,6 +217,10 @@ RUN echo "========== [SGLANG-ATOM 5/6] Install validated Triton ==========" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir "triton==${SGLANG_TRITON_VERSION}" && \
     "${VENV_PYTHON}" -m pip show triton
 
+RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir "smg-grpc-servicer==0.5.2" && \
+    "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer
+
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom mori amd-aiter flydsl || true
 
