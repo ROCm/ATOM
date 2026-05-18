@@ -301,10 +301,11 @@ class TestPrefixCachingPreemption:
         assert s1.num_cached_tokens == 0
         assert s1.block_table == []
 
-        # Re-allocate — should get cache hits on both blocks
+        # Re-allocate — first block is a cache hit; the last full block is
+        # force-recomputed so prefill has at least one token to forward.
         s1_retry = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1_retry)
-        assert s1_retry.num_cached_tokens == 8  # both blocks cached
+        assert s1_retry.num_cached_tokens == 4
 
 
 # ── Edge cases ───────────────────────────────────────────────────────────
@@ -325,8 +326,9 @@ class TestPrefixCachingEdgeCases:
         # Partial block → hash is -1 → no caching
         assert s2.num_cached_tokens == 0
 
-    def test_exact_block_size_fully_cached(self, seq_factory):
-        """Sequence with exactly block_size tokens — fully cached on reuse."""
+    def test_exact_block_size_last_block_recomputed(self, seq_factory):
+        """Single-block prompt: last full block is force-recomputed on reuse so
+        prefill has at least one token to forward and produce logits."""
         cfg = MockConfig(
             num_kvcache_blocks=4, kv_cache_block_size=4, enable_prefix_caching=True
         )
@@ -336,7 +338,7 @@ class TestPrefixCachingEdgeCases:
         bm.deallocate(s1)
         s2 = seq_factory([1, 2, 3, 4])
         bm.allocate(s2)
-        assert s2.num_cached_tokens == 4
+        assert s2.num_cached_tokens == 0
 
     def test_free_block_ids_set_consistent(self, block_manager, seq_factory):
         """free_block_ids_set stays consistent through allocate/deallocate."""

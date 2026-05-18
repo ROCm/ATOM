@@ -35,7 +35,9 @@ import logging
 
 logger = logging.getLogger("atom")
 
-
+_MTP_MASK_INPUT_ARCH: set[str] = {
+    "DeepSeekMTPModel",
+}
 _ATOM_MODEL_CLASSES: dict[str, str] = {
     "LlamaForCausalLM": "atom.models.llama:LlamaForCausalLM",
     "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
@@ -46,7 +48,9 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
+    "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next:Qwen3NextForCausalLM",
+    "Qwen3NextMTP": "atom.models.qwen3_next_mtp:Qwen3NextMTP",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
@@ -121,6 +125,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        from atom.config import get_current_atom_config
 
         _set_framework_backbone("vllm")
 
@@ -140,19 +145,21 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.ignore_unexpected_suffixes: list[str] = []
 
         self.vllm_config = vllm_config
-        self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
         self.is_mtp = False
         speculative_config = getattr(vllm_config, "speculative_config", None)
         if speculative_config is not None:
             spec_method = speculative_config.method
             self.is_mtp = spec_method == "mtp"
 
-        _prepare_env(atom_config=self.atom_config)
-
         main_model_arch = vllm_config.model_config.architectures[0]
         model_arch = _select_model_arch(vllm_config)
         self.is_mtp_draft_model = self.is_mtp and model_arch != main_model_arch
+        if self.is_mtp_draft_model:
+            self.atom_config = get_current_atom_config()
+        else:
+            self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
         self.model_arch = model_arch
+        _prepare_env(atom_config=self.atom_config)
         model_cls = _get_atom_model_cls(model_arch)
         module_remapping = getattr(model_cls, "packed_modules_mapping", {})
         weights_mapper = getattr(model_cls, "hf_to_atom_mapper", {})
@@ -182,9 +189,11 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
         self.model = model_cls(self.atom_config)
-        self._adapt_mtp_layers_for_vllm()
-        # Mirror nested attributes required by vLLM speculative decoding.
-        self._expose_spec_decode_attrs()
+
+        if model_arch in _MTP_MASK_INPUT_ARCH:
+            self._adapt_mtp_layers_for_vllm()
+            # Mirror nested attributes required by vLLM speculative decoding.
+            self._expose_spec_decode_attrs()
 
         # For sparse MLA, register the Indexer's DeepseekV32IndexerCache as
         # a virtual subclass of vLLM's AttentionLayerBase so vLLM can discover
@@ -192,7 +201,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self._register_indexer_caches_with_vllm()
 
         if self.model is None:
-            model_arch = vllm_config.model_config.architectures[0]
             raise ValueError(
                 f"The model {model_arch} is not supported by model impl backend atom"
             )
@@ -309,8 +317,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             if prefix not in vllm_sfc:
                 vllm_sfc[prefix] = module
                 logger.info(
-                    f"Registered indexer cache in vLLM static_forward_context: "
-                    f"{prefix}"
+                    f"Registered indexer cache in vLLM static_forward_context: {prefix}"
                 )
             else:
                 logger.warning(
@@ -397,7 +404,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
-
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
@@ -412,12 +418,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         is_mtp_draft_model = self.model_arch in {
             "DeepSeekMTPModel",
-            "Qwen3NextMTPModel",
+            "Qwen3NextMTP",
+            "Glm4MoeMTPModel",
         }
         draft_hf_config = None
         if is_mtp_draft_model:
             draft_model_config = getattr(
-                getattr(self.vllm_config, "speculative_config", None),
+                getattr(self.atom_config, "speculative_config", None),
                 "draft_model_config",
                 None,
             )
@@ -452,7 +459,6 @@ class ATOMMoEForCausalLM(ATOMModelBase, VllmModelForTextGeneration): ...
 class ATOMForConditionalGeneration(
     ATOMModelBase, VllmModelForTextGeneration, SupportsMultiModal, SupportsMRoPE
 ):
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         """

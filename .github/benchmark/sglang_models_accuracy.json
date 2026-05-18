@@ -12,6 +12,54 @@
     "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
   },
   {
+    "model_name": "Qwen3.5-35B-A3B-FP8 TP2",
+    "model_path": "Qwen/Qwen3.5-35B-A3B-FP8",
+    "extraArgs": "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+    "runner": "linux-atom-mi35x-4",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.76,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "Qwen/Qwen3.5-35B-A3B-FP8",
+    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+  },
+  {
+    "model_name": "Qwen3.5-35B-A3B TP2",
+    "model_path": "Qwen/Qwen3.5-35B-A3B",
+    "extraArgs": "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+    "runner": "linux-atom-mi35x-4",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.83,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "Qwen/Qwen3.5-35B-A3B",
+    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+  },
+  {
+    "model_name": "Qwen3.5-397B-A17B-FP8 TP4",
+    "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "extraArgs": "--tensor-parallel-size 4 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+    "runner": "linux-atom-mi35x-4",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.83,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+  },
+  {
+    "model_name": "Qwen3.5-397B-A17B-FP8 TP8",
+    "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "extraArgs": "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+    "runner": "linux-atom-mi35x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.83,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+  },
+  {
     "model_name": "DeepSeek-R1-FP8 TP8",
     "model_path": "deepseek-ai/DeepSeek-R1-0528",
     "extraArgs": "--tensor-parallel-size 8",

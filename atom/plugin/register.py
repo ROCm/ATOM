@@ -94,6 +94,8 @@ def init_aiter_dist(config: Config) -> None:
     )
 
     rank = config.plugin_config.rank
+    if getattr(config.plugin_config, "is_sglang", False):
+        rank = getattr(config.plugin_config, "sglang_aiter_rank_id", rank)
     tensor_parallel_size = config.tensor_parallel_size
 
     assert (

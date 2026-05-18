@@ -220,6 +220,15 @@ jobs:
               ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
             accuracy_test_threshold: 0.91
             runner: linux-atom-mi35x-4
+          - model_name: "Qwen3.5-35B-A3B-FP8 TP2"
+            model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
+            extra_args: "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
+            env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
+            accuracy_test_threshold: 0.76
+            runner: linux-atom-mi35x-4
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:

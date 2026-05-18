@@ -6,8 +6,8 @@ concurrency:
 
 on:
   schedule:
-    # Nightly at 01:00 Beijing time (17:00 UTC on the previous day)
-    - cron: '0 17 * * *'
+    # Weekday nightly at 23:00 Beijing time (15:00 UTC)
+    - cron: '0 15 * * 1-5'
   workflow_dispatch:
     inputs:
       deepseek-r1-fp8-tp8:
@@ -28,6 +28,14 @@ on:
         default: false
       deepseek-r1-fp4-tp8-ep8:
         description: "DeepSeek-R1-0528-MXFP4 FP4 TP8 EP8"
+        type: boolean
+        default: false
+      qwen3-5-397b-a17b-fp8-tp4:
+        description: "Qwen3.5-397B-A17B-FP8 TP4"
+        type: boolean
+        default: false
+      qwen3-5-397b-a17b-fp8-tp8:
+        description: "Qwen3.5-397B-A17B-FP8 TP8"
         type: boolean
         default: false
       sglang_image:
@@ -274,6 +282,7 @@ jobs:
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
       has_enabled_models: ${{ steps.load.outputs.has_enabled_models }}
+      selected_group: ${{ steps.load.outputs.selected_group }}
     steps:
       - uses: actions/checkout@v6
       - id: load
@@ -283,25 +292,80 @@ jobs:
           ENABLE_DEEPSEEK_R1_FP4_TP8: ${{ inputs.deepseek-r1-fp4-tp8 }}
           ENABLE_DEEPSEEK_R1_FP4_TP4: ${{ inputs.deepseek-r1-fp4-tp4 }}
           ENABLE_DEEPSEEK_R1_FP4_TP8_EP8: ${{ inputs.deepseek-r1-fp4-tp8-ep8 }}
+          ENABLE_QWEN3_5_397B_A17B_FP8_TP4: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}
+          ENABLE_QWEN3_5_397B_A17B_FP8_TP8: ${{ inputs.qwen3-5-397b-a17b-fp8-tp8 }}
         run: |
-          MODELS_JSON="$(jq -c '
-            map(select(
-              env.GITHUB_EVENT_NAME == "schedule"
-              or (.prefix == "deepseek-r1-fp8-tp8" and env.ENABLE_DEEPSEEK_R1_FP8_TP8 == "true")
-              or (.prefix == "deepseek-r1-fp8-tp4" and env.ENABLE_DEEPSEEK_R1_FP8_TP4 == "true")
-              or (.prefix == "deepseek-r1-fp4-tp8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8 == "true")
-              or (.prefix == "deepseek-r1-fp4-tp4" and env.ENABLE_DEEPSEEK_R1_FP4_TP4 == "true")
-              or (.prefix == "deepseek-r1-fp4-tp8-ep8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8_EP8 == "true")
-            ))
-          ' .github/benchmark/sglang_benchmark_models.json)"
-          echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
-          if [ "${MODELS_JSON}" = "[]" ]; then
-            echo "has_enabled_models=false" >> "$GITHUB_OUTPUT"
-            echo "No models selected for SGLang benchmark."
-          else
-            echo "has_enabled_models=true" >> "$GITHUB_OUTPUT"
-            echo "Selected models: ${MODELS_JSON}"
+          set -euo pipefail
+
+          export BEIJING_WEEKDAY="$(TZ=Asia/Shanghai date +%u)"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          models = json.loads(
+              Path(".github/benchmark/sglang_benchmark_models.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          event = os.environ["GITHUB_EVENT_NAME"]
+          selected_group = ""
+
+          if event == "schedule":
+              weekday = int(os.environ["BEIJING_WEEKDAY"])
+              if weekday in (1, 3):
+                  selected_group = "A-DEEPSEEK"
+                  selected = [m for m in models if m.get("nightly_group", "A") == "A"]
+              elif weekday in (2, 4):
+                  selected_group = "B-QWEN35"
+                  selected = [m for m in models if m.get("nightly_group") == "B"]
+              elif weekday == 5:
+                  selected_group = "C-ALL"
+                  selected = list(models)
+              else:
+                  selected_group = "SKIP-WEEKEND"
+                  selected = []
+          else:
+              enabled_by_prefix = {
+                  "deepseek-r1-fp8-tp8": os.environ.get("ENABLE_DEEPSEEK_R1_FP8_TP8", ""),
+                  "deepseek-r1-fp8-tp4": os.environ.get("ENABLE_DEEPSEEK_R1_FP8_TP4", ""),
+                  "deepseek-r1-fp4-tp8": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8", ""),
+                  "deepseek-r1-fp4-tp4": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP4", ""),
+                  "deepseek-r1-fp4-tp8-ep8": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_EP8", ""),
+                  "qwen3-5-397b-a17b-fp8-tp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP4", ""),
+                  "qwen3-5-397b-a17b-fp8-tp8": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP8", ""),
+              }
+              selected = [
+                  model
+                  for model in models
+                  if enabled_by_prefix.get(str(model.get("prefix")), "").lower() == "true"
+              ]
+
+          if selected_group:
+              print(f"Scheduled SGLang benchmark group: {selected_group}", file=sys.stderr)
+          if not selected:
+              print("No models selected for SGLang benchmark.", file=sys.stderr)
+          else:
+              print("Selected SGLang benchmark models:", file=sys.stderr)
+              for model in selected:
+                  print(f" - {model['display']} ({model['prefix']})", file=sys.stderr)
+
+          print(f"models_json={json.dumps(selected, separators=(',', ':'))}")
+          print(f"selected_group={selected_group}")
+          print(f"has_enabled_models={'true' if selected else 'false'}")
+          PY
+
+      - name: Print selected models
+        env:
+          SELECTED_GROUP: ${{ steps.load.outputs.selected_group }}
+          MODELS_JSON: ${{ steps.load.outputs.models_json }}
+        run: |
+          if [[ -n "${SELECTED_GROUP}" ]]; then
+            echo "Scheduled SGLang benchmark group: ${SELECTED_GROUP}"
           fi
+          printf 'Selected models: %s\n' "${MODELS_JSON}"
 
   build-benchmark-matrix:
     name: Build SGLang benchmark matrix
@@ -547,6 +611,8 @@ jobs:
             deepseek-r1-fp4-tp8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp4-tp4) echo "enabled=${{ inputs.deepseek-r1-fp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp4-tp8-ep8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-ep8 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-5-397b-a17b-fp8-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-5-397b-a17b-fp8-tp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
           esac
 
