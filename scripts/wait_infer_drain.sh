@@ -25,6 +25,9 @@
 #   MAX_MIN      default 30    (full GSM8K 1319 typically 5-15 min on V4-Pro)
 #   POLL_SEC     default 10    (fast poll for quick hang detection)
 #   LOG_FILE     default /app/logs_claude/atom_server.log
+#                Can also be a CLIENT log (e.g. /app/logs_claude/benchmark.log)
+#                with tqdm/progress output — file-mtime growth is treated as
+#                progress when the engine "output send" marker is absent.
 #   STUCK_POLLS  default 6     (6 × 10s = 1 min of no progress → declare hang)
 #
 # Exit codes:
@@ -51,6 +54,7 @@ CLIENT_PATTERN='lm_eval|curl.*v1/(completions|chat)|atom\.examples\.benchmark|at
 SERVER_PATTERN='atom\.entrypoints|atom\.examples\.simple_inference'
 
 prev_outputs=0
+prev_mtime=0
 stuck=0
 
 for ((i=1; i<=ITERS; i++)); do
@@ -78,21 +82,27 @@ for ((i=1; i<=ITERS; i++)); do
         exit 0
     fi
 
-    # Engine progress?
+    # Engine progress? Two signals — either resets the stuck counter:
+    #   1. "Engine Core: output send" count rising (server log primary signal).
+    #   2. LOG_FILE mtime advancing (works for client logs without engine
+    #      markers, e.g. benchmark tqdm output, simple_inference stdout).
     cur_outputs=$(grep -c "Engine Core: output send" "$LOG_FILE" 2>/dev/null | head -1)
     cur_outputs="${cur_outputs:-0}"
-    delta=$(( cur_outputs - prev_outputs ))
+    delta_out=$(( cur_outputs - prev_outputs ))
+    cur_mtime=$(stat -c %Y "$LOG_FILE" 2>/dev/null || echo 0)
+    delta_mtime=$(( cur_mtime - prev_mtime ))
 
     # Client still running?
     client_alive=$(pgrep -af "$CLIENT_PATTERN" 2>/dev/null | grep -v grep | wc -l)
 
-    echo "[t=$((i*POLL))s] outputs=${cur_outputs} (+${delta}) clients=${client_alive} stuck=${stuck}/${STUCK_POLLS}"
+    echo "[t=$((i*POLL))s] outputs=${cur_outputs} (+${delta_out}) mtime+${delta_mtime}s clients=${client_alive} stuck=${stuck}/${STUCK_POLLS}"
 
-    if [ "$delta" -eq 0 ]; then
+    if [ "$delta_out" -eq 0 ] && [ "$delta_mtime" -eq 0 ]; then
         stuck=$(( stuck + 1 ))
     else
         stuck=0
         prev_outputs=$cur_outputs
+        prev_mtime=$cur_mtime
     fi
 
     # Drained cleanly: client gone AND no new output this poll → done.
