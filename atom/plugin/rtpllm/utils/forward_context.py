@@ -67,7 +67,13 @@ class RTPForwardContext:
         if cu_seqlens is not None and cu_seqlens.numel() > 1:
             # Decode steps may carry placeholder [0, 0] cu_seqlens from upper layers.
             # Only trust cu_seqlens when it represents non-empty query tokens.
-            if bool((cu_seqlens[-1] > 0).item()):
+            # In cuda-graph capture the .item() host-sync would abort capture
+            # (see rtp+atom_graph.md §2.4); under capture we always fall through
+            # to the input_lengths-based path below.
+            if (
+                not torch.cuda.is_current_stream_capturing()
+                and bool((cu_seqlens[-1] > 0).item())
+            ):
                 if input_lengths is not None and cu_seqlens.numel() >= input_lengths.numel() + 1:
                     return cu_seqlens[: input_lengths.numel() + 1]
                 return cu_seqlens
@@ -211,7 +217,15 @@ class RTPForwardContext:
                 # Legacy fallback when sequence_lengths_plus_1_d is unavailable.
                 last_token_idx = sequence_lengths + input_lengths - 1
 
-        if torch.any(last_token_idx < 0):
+        # Keep eager semantics strict (fail fast on malformed metadata).
+        # CUDA-graph warmup/replay may temporarily feed placeholder
+        # sequence_lengths_plus_1_d=0, so only graph-mode relaxes by clamping.
+        in_capture = torch.cuda.is_current_stream_capturing()
+        graph_mode = bool(getattr(attn_inputs, "is_cuda_graph", False))
+        relaxed_validation = in_capture or graph_mode
+        if relaxed_validation:
+            last_token_idx = torch.clamp(last_token_idx, min=0)
+        if not relaxed_validation and torch.any(last_token_idx < 0):
             raise ValueError(
                 "RTP plugin produced negative token index for GDN state mapping."
             )
@@ -220,14 +234,19 @@ class RTPForwardContext:
             int(seq_size_per_block),
             rounding_mode="floor",
         )
-        if torch.any(block_col < 0) or torch.any(block_col >= base.shape[1]):
+        # Only graph mode clamps out-of-range columns for warmup/replay safety.
+        if relaxed_validation:
+            block_col = torch.clamp(block_col, max=max(int(base.shape[1]) - 1, 0))
+        if not relaxed_validation and (
+            torch.any(block_col < 0) or torch.any(block_col >= base.shape[1])
+        ):
             raise ValueError(
                 "RTP plugin block-table index out of range for GDN state mapping "
                 f"(max_col={int(base.shape[1]) - 1})."
             )
         row_idx = torch.arange(base.shape[0], device=device, dtype=torch.int64)
         slot_ids = base[row_idx, block_col.to(dtype=torch.int64)]
-        if torch.any(slot_ids < 0):
+        if not relaxed_validation and torch.any(slot_ids < 0):
             raise ValueError(
                 "RTP plugin resolved padded/invalid (-1) block slot for GDN state mapping."
             )
@@ -448,6 +467,21 @@ class RTPForwardContext:
                 )
             return (prefix_lengths + input_lengths).contiguous()
 
+        sequence_lengths = RTPForwardContext._non_empty_int32(
+            getattr(attn_inputs, "sequence_lengths", None),
+            device=device,
+        )
+        if sequence_lengths is not None:
+            if int(sequence_lengths.numel()) != int(input_lengths.numel()):
+                raise ValueError(
+                    "RTP plugin sequence_lengths/input_lengths batch mismatch "
+                    f"(sequence_lengths={int(sequence_lengths.numel())}, "
+                    f"input_lengths={int(input_lengths.numel())})."
+                )
+            # Keep decode seq_lens semantics aligned with pure RTP/aiter path:
+            # real context length is sequence_lengths + input_lengths.
+            return (sequence_lengths + input_lengths).contiguous()
+
         sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
             getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
             device=device,
@@ -461,21 +495,10 @@ class RTPForwardContext:
                 )
             return sequence_lengths_plus_1.contiguous()
 
-        sequence_lengths = RTPForwardContext._non_empty_int32(
-            getattr(attn_inputs, "sequence_lengths", None),
-            device=device,
+        raise ValueError(
+            "RTP decode requires attention_inputs.sequence_lengths or "
+            "sequence_lengths_plus_1_d for seq_lens."
         )
-        if sequence_lengths is None:
-            raise ValueError(
-                "RTP decode requires attention_inputs.sequence_lengths for seq_lens."
-            )
-        if int(sequence_lengths.numel()) != int(input_lengths.numel()):
-            raise ValueError(
-                "RTP plugin sequence_lengths/input_lengths batch mismatch "
-                f"(sequence_lengths={int(sequence_lengths.numel())}, "
-                f"input_lengths={int(input_lengths.numel())})."
-            )
-        return (sequence_lengths + input_lengths).contiguous()
 
     @staticmethod
     def _build_slot_mapping(
@@ -484,6 +507,7 @@ class RTPForwardContext:
         query_start_loc: torch.Tensor,
         block_table: torch.Tensor,
         seq_size_per_block: int,
+        cg_bufs: dict | None = None,
     ) -> torch.Tensor:
         if positions is None or positions.numel() == 0:
             raise ValueError("RTP plugin requires non-empty positions for slot_mapping.")
@@ -506,9 +530,41 @@ class RTPForwardContext:
 
         device = positions.device
         dtype = torch.int32
-        pos_i32 = positions.to(device=device, dtype=dtype, non_blocking=True).contiguous()
-        qsl = query_start_loc.to(device=device, dtype=dtype, non_blocking=True).contiguous()
-        bt = block_table.to(device=device, dtype=dtype, non_blocking=True).contiguous()
+        in_capture = torch.cuda.is_current_stream_capturing()
+
+        # Capture path must not silently allocate via .to(...)/.contiguous().
+        if in_capture and cg_bufs is not None:
+            if positions.device != device or positions.dtype != dtype:
+                raise RuntimeError(
+                    "RTP plugin capture requires positions to already be int32 on model device."
+                )
+            if not positions.is_contiguous():
+                raise RuntimeError(
+                    "RTP plugin capture requires positions to be contiguous to avoid allocation."
+                )
+            if query_start_loc.device != device or query_start_loc.dtype != dtype:
+                raise RuntimeError(
+                    "RTP plugin capture requires query_start_loc to already be int32 on model device."
+                )
+            if not query_start_loc.is_contiguous():
+                raise RuntimeError(
+                    "RTP plugin capture requires query_start_loc to be contiguous to avoid allocation."
+                )
+            if block_table.device != device or block_table.dtype != dtype:
+                raise RuntimeError(
+                    "RTP plugin capture requires block_table to already be int32 on model device."
+                )
+            if not block_table.is_contiguous():
+                raise RuntimeError(
+                    "RTP plugin capture requires block_table to be contiguous to avoid allocation."
+                )
+            pos_i32 = positions
+            qsl = query_start_loc
+            bt = block_table
+        else:
+            pos_i32 = positions.to(device=device, dtype=dtype, non_blocking=True).contiguous()
+            qsl = query_start_loc.to(device=device, dtype=dtype, non_blocking=True).contiguous()
+            bt = block_table.to(device=device, dtype=dtype, non_blocking=True).contiguous()
 
         batch_size = int(qsl.numel()) - 1
         num_tokens = int(pos_i32.numel())
@@ -531,10 +587,37 @@ class RTPForwardContext:
             raise ValueError(
                 "RTP plugin query_start_loc contains non-positive sequence length."
             )
-        seq_id = torch.repeat_interleave(
-            torch.arange(batch_size, device=device, dtype=torch.int64),
-            lengths.to(dtype=torch.int64),
-        )
+        if in_capture and cg_bufs is not None:
+            # Zero-alloc path: use pre-allocated buffers so captured GPU ops
+            # reference stable addresses that stay alive through replay.
+            # For decode (1 token/seq): seq_id[i] == i, pre-computed as arange.
+            seq_id = cg_bufs["seq_id"][:num_tokens]
+            block_col_buf = cg_bufs["block_col"][:num_tokens]
+            torch.div(pos_i32, int(seq_size_per_block), rounding_mode="floor", out=block_col_buf)
+            block_col_i64_buf = cg_bufs["block_col_i64"][:num_tokens]
+            block_col_i64_buf.copy_(block_col_buf)
+            slot_base_buf = cg_bufs["slot_base"][:num_tokens]
+            slot_base_buf.copy_(bt[seq_id, block_col_i64_buf])
+            token_offset_buf = cg_bufs["token_offset"][:num_tokens]
+            torch.remainder(pos_i32, int(seq_size_per_block), out=token_offset_buf)
+            slot_mapping_buf = cg_bufs["slot_mapping"][:num_tokens]
+            torch.add(
+                slot_base_buf * int(seq_size_per_block),
+                token_offset_buf,
+                out=slot_mapping_buf,
+            )
+            return slot_mapping_buf
+        elif in_capture:
+            # cg_bufs not provided: fall back to searchsorted (capture-safe but
+            # allocates transient tensors — may cause replay fault if GC'd).
+            raise RuntimeError(
+                "RTP plugin capture requires prewarmed cg_bufs; fallback allocation path is disabled."
+            )
+        else:
+            seq_id = torch.repeat_interleave(
+                torch.arange(batch_size, device=device, dtype=torch.int64),
+                lengths.to(dtype=torch.int64),
+            )
         if validate_slot_mapping and int(seq_id.numel()) != num_tokens:
             raise ValueError(
                 "RTP plugin internal seq_id construction mismatch for slot_mapping."
@@ -569,12 +652,29 @@ class RTPForwardContext:
         seq_lens: torch.Tensor,
         num_tokens: int,
         device: torch.device,
+        cg_bufs: dict | None = None,
     ) -> torch.Tensor:
         batch_size = int(seq_lens.numel())
         if batch_size <= 0:
             raise ValueError("RTP plugin cannot build query_start_loc with empty seq_lens.")
 
-        # First try RTP's native path.
+        in_capture = torch.cuda.is_current_stream_capturing()
+
+        # In cuda-graph capture mode, every .tolist()/.item() blocks capture.
+        # Decode-only capture path (Qwen3.5-MoE) always has num_tokens==batch_size
+        # (1 token/seq), so query_start_loc == arange(0, bs+1).
+        if in_capture and cg_bufs is not None:
+            # Zero-alloc path: return a pre-allocated slice (stable address).
+            return cg_bufs["query_start_loc"][: batch_size + 1]
+
+        if in_capture:
+            raise ValueError(
+                "RTP plugin capture requires prewarmed cg_bufs for query_start_loc "
+                f"(batch={batch_size}, num_tokens={int(num_tokens)})."
+            )
+
+        # Eager-mode validations (host sync allowed): keep prior semantics for
+        # safety so the eager path catches malformed metadata early.
         qsl = RTPForwardContext._query_start_loc(attn_inputs, device=device)
         if qsl is not None and qsl.numel() == batch_size + 1:
             lengths = qsl[1:] - qsl[:-1]
@@ -583,7 +683,6 @@ class RTPForwardContext:
             if qsl_total_tokens == int(num_tokens) and qsl_min_len > 0:
                 return qsl.contiguous()
 
-        # Fallback: derive from input_lengths when it is valid for this step.
         input_lengths = RTPForwardContext._non_empty_int32(
             getattr(attn_inputs, "input_lengths", None),
             device=device,
@@ -598,7 +697,6 @@ class RTPForwardContext:
                 prefix = torch.zeros((1,), dtype=torch.int32, device=device)
                 return torch.cat([prefix, input_lengths.cumsum(dim=0)], dim=0).contiguous()
 
-        # Final fallback for decode-style step where each sequence contributes 1 token.
         if int(num_tokens) == batch_size:
             prefix = torch.arange(
                 0, batch_size + 1, dtype=torch.int32, device=device
@@ -618,6 +716,8 @@ class RTPForwardContext:
         attn_inputs: Any,
         positions: torch.Tensor,
         seq_size_per_block: int,
+        cg_max_seq_len: int = 0,
+        cg_bufs: dict | None = None,
     ) -> AttentionMetaData:
         block_table = RTPForwardContext._select_block_table_for_layer(
             attn_inputs=attn_inputs,
@@ -628,36 +728,96 @@ class RTPForwardContext:
                 "RTP plugin requires kv_cache_kernel_block_id_device for plugin attention metadata."
             )
         device = positions.device
+        is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if in_capture and cg_bufs is None:
+            raise RuntimeError(
+                "RTP plugin capture requires prewarmed cg_bufs; metadata fallback path is disabled."
+            )
         seq_lens = RTPForwardContext._build_seq_lens(attn_inputs, device=device)
-        seq_lens = seq_lens.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
+        if in_capture and cg_bufs is not None:
+            bs_now = int(seq_lens.shape[0])
+            seq_lens_buf = cg_bufs["seq_lens_i32"]
+            if int(seq_lens_buf.shape[0]) < bs_now:
+                raise RuntimeError(
+                    "RTP plugin prewarmed seq_lens_i32 buffer is too small "
+                    f"(buffer={int(seq_lens_buf.shape[0])}, required={bs_now})."
+                )
+            seq_lens_view = seq_lens_buf[:bs_now]
+            seq_lens_view.copy_(seq_lens, non_blocking=True)
+            seq_lens = seq_lens_view
+        else:
+            seq_lens = seq_lens.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
+        batch_size = int(seq_lens.numel())
+
+        # During RTP CUDA graph capture, positions is the full preallocated
+        # buffer (CONCURRENCY_LIMIT * MAX_SEQ_LEN elements). For decode (1
+        # token per seq) only the first batch_size positions are active —
+        # slice here so slot_mapping and num_actual_tokens are correctly sized.
+        if in_capture and not is_prefill:
+            positions = positions[:batch_size]
+        num_actual_tokens = int(positions.numel())
+
         query_start_loc = RTPForwardContext._build_query_start_loc_for_plugin(
             attn_inputs=attn_inputs,
             seq_lens=seq_lens,
-            num_tokens=int(positions.numel()),
+            num_tokens=num_actual_tokens,
             device=device,
+            cg_bufs=cg_bufs,
         )
         slot_mapping = RTPForwardContext._build_slot_mapping(
             positions=positions,
             query_start_loc=query_start_loc,
             block_table=block_table,
             seq_size_per_block=seq_size_per_block,
+            cg_bufs=cg_bufs,
         )
 
-        is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
-        batch_size = int(seq_lens.numel())
-        num_actual_tokens = int(positions.numel())
-        query_lens = query_start_loc[1:] - query_start_loc[:-1]
-        stats = torch.stack(
-            [
-                torch.max(query_lens),
-                torch.max(seq_lens),
-                torch.sum(seq_lens),
-            ],
-            dim=0,
-        ).to(device="cpu")
-        max_query_len, max_seq_len, num_actual_kv_tokens = [
-            int(v) for v in stats.tolist()
-        ]
+        is_dummy_warmup = False
+        if in_capture:
+            # Cuda-graph capture path: cannot host-sync. Decode capture (Qwen3.5-MoE
+            # decode-only graph, num_tokens_per_bs=1) has fixed per-step query
+            # length = 1. max_seq_len comes from the runtime prewarm budget so
+            # the kernel-side max_num_partitions = (max_seq_len + 255) // 256
+            # matches what RTPFullAttention.prewarm_for_cuda_graph allocated.
+            # num_actual_kv_tokens is informational; an upper bound is fine.
+            max_query_len = 1
+            if cg_max_seq_len <= 0:
+                raise RuntimeError(
+                    "RTP plugin cuda-graph capture requires cg_max_seq_len; "
+                    "did you forget to thread it through RTPForwardContext.bind?"
+                )
+            max_seq_len = int(cg_max_seq_len)
+            num_actual_kv_tokens = max_seq_len * batch_size
+        else:
+            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            stats = torch.stack(
+                [
+                    torch.max(query_lens),
+                    torch.max(seq_lens),
+                    torch.sum(seq_lens),
+                ],
+                dim=0,
+            ).to(device="cpu")
+            max_query_len, max_seq_len, num_actual_kv_tokens = [
+                int(v) for v in stats.tolist()
+            ]
+            # RTP's `initCapture forward for output datatype` probe feeds dummy
+            # seq_lens=[0,...] / block_tables=[0,...]. The probe's only purpose
+            # is to discover the output dtype — it never reads valid KV history,
+            # so running a real attention kernel on those zeros is meaningless
+            # and unsafe (aiter.paged_attention_rocm pre-fetches block_tables /
+            # KV slots before bounds-checking context_len, → page fault). Mark
+            # the metadata so RTPFullAttention can short-circuit to zeros.
+            if max_seq_len <= 0:
+                is_dummy_warmup = True
+            if max_seq_len <= 0:
+                if cg_max_seq_len > 0:
+                    max_seq_len = int(cg_max_seq_len)
+                else:
+                    max_seq_len = 1
+            if max_query_len <= 0:
+                max_query_len = 1
 
         decode_md = None
         prefill_md = None
@@ -674,9 +834,24 @@ class RTPForwardContext:
                 query_start_loc=query_start_loc,
             )
 
-        block_table_i32 = block_table.to(
-            device=device, dtype=torch.int32, non_blocking=True
-        ).contiguous()
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if in_capture and cg_bufs is not None:
+            # Zero-alloc capture path: always route through prewarmed block_table_i32.
+            bt_buf = cg_bufs["block_table_i32"]
+            bs_now = int(block_table.shape[0])
+            cols_now = int(block_table.shape[1])
+            if int(bt_buf.shape[0]) < bs_now or int(bt_buf.shape[1]) < cols_now:
+                raise RuntimeError(
+                    "RTP plugin prewarmed block_table_i32 buffer is too small "
+                    f"(buffer={tuple(bt_buf.shape)}, required=({bs_now}, {cols_now}))."
+                )
+            bt_view = bt_buf[:bs_now, :cols_now]
+            bt_view.copy_(block_table, non_blocking=True)
+            block_table_i32 = bt_view
+        else:
+            block_table_i32 = block_table.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
         plugin_md = AiterFlashAttentionMetadataForPluginMode(
             num_actual_tokens=num_actual_tokens,
             num_actual_kv_tokens=num_actual_kv_tokens,
@@ -702,8 +877,18 @@ class RTPForwardContext:
         )
         # Prefill-only fields shared across all full-attn layers in the step.
         plugin_md.rtp_cu_seqlens_q = query_start_loc
+        # Mark dummy probe (RTP initCapture's "forward for output datatype" feeds
+        # all-zero seq_lens/block_tables); RTPFullAttention short-circuits to zeros.
+        plugin_md.is_dummy_warmup = bool(is_dummy_warmup)
         prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
-        if prefix_lengths is not None and int(prefix_lengths.numel()) > 0:
+        if (
+            prefix_lengths is not None
+            and int(prefix_lengths.numel()) > 0
+            and not in_capture
+        ):
+            # .item() is host-sync; skip during capture. rtp_has_prefix is only
+            # consulted on the prefill branch and Qwen3.5-MoE decode-graph capture
+            # never hits has_prefix=True (decode never has fresh prefix tokens).
             plugin_md.rtp_has_prefix = bool((prefix_lengths > 0).any().item())
         else:
             plugin_md.rtp_has_prefix = False
@@ -876,6 +1061,8 @@ class RTPForwardContext:
         inputs: Any,
         positions: torch.Tensor,
         layer_maps: LayerMaps | None = None,
+        cg_max_seq_len: int = 0,
+        cg_bufs: dict | None = None,
     ) -> "RTPForwardContext":
         attn_inputs = getattr(inputs, "attention_inputs", None)
         if attn_inputs is None:
@@ -919,6 +1106,8 @@ class RTPForwardContext:
             attn_inputs=attn_inputs,
             positions=positions,
             seq_size_per_block=kernel_seq_size_per_block,
+            cg_max_seq_len=int(cg_max_seq_len),
+            cg_bufs=cg_bufs,
         )
         resolved_layer_maps = layer_maps or cls.collect_layer_maps(model)
         kv_cache_signature = cls._kv_cache_signature(
@@ -968,6 +1157,8 @@ class RTPForwardContext:
         inputs: Any,
         positions: torch.Tensor,
         layer_maps: LayerMaps | None = None,
+        cg_max_seq_len: int = 0,
+        cg_bufs: dict | None = None,
     ) -> Iterator[None]:
         forward_context = cls.build(
             model=model,
@@ -975,6 +1166,8 @@ class RTPForwardContext:
             inputs=inputs,
             positions=positions,
             layer_maps=layer_maps,
+            cg_max_seq_len=cg_max_seq_len,
+            cg_bufs=cg_bufs,
         )
         prev_kv = _forward_kv_cache_context.kv_cache_data
         attn_md = forward_context.attn_metadata

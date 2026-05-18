@@ -103,8 +103,20 @@ def apply_qwen3_next_rtpllm_patch() -> None:
                 x_scale=x_scale,
             )
         elif self.layer_type == "full_attention":
-            # RTP+ATOM mode always uses RTP fused KV write path.
-            attn_positions = torch.zeros_like(positions)
+            # RTP+ATOM mode always uses RTP fused KV write path; RoPE happens
+            # inside RTP's fused kernel, so positions is unused by ATOM's
+            # plugin attention path (RTPFullAttention._forward_impl_plugin_mode
+            # immediately `del positions`).
+            #
+            # Round 24 / Step 1: positions arrives as RTP's stable buffer
+            # (Round 23 confirmed positions.shape == real token count, NOT a
+            # max-capacity buffer as Round 20 wrongly assumed). Slice it as a
+            # view (zero-alloc, capture-safe) instead of allocating a fresh
+            # zero tensor — the latter triggers a captured cudaMalloc + memset
+            # at addresses that PyTorch caching allocator may reuse after
+            # capture ends, causing replay GPU page faults.
+            real_num_tokens = int(hidden_states.shape[0])
+            attn_positions = positions[:real_num_tokens]
             hidden_states = self.self_attn(
                 hidden_states=hidden_states,
                 positions=attn_positions,

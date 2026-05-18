@@ -47,6 +47,46 @@ class _NoopModelWeightsLoader:
         return None
 
 
+class _ATOMAttnPyObj:
+    """Container returned by _ATOMQwen35MoeRuntime.prepare_fmha_impl.
+
+    RTP CudaGraphRunner caches this object once at initCapture
+    (CudaGraphRunner.cc:480) and calls .prepare_cuda_graph(attn_inputs) on it
+    before each replay (CudaGraphRunner.cc:122). We delegate to every ATOM
+    RTPFullAttention layer so each layer can refresh its capture-time state.
+
+    Also exposes a .fmha_params attribute because RTP qwen3_next reference path
+    constructs PyModelOutputs(hidden_states, fmha_impl.fmha_params); ATOM's own
+    forward returns PyModelOutputs(hidden_states) so this is just a stub for
+    type-compat with downstream code that may peek at the attribute.
+    """
+
+    def __init__(self, runtime: "_ATOMQwen35MoeRuntime") -> None:
+        self._runtime = runtime
+        self.is_cuda_graph = False
+        self._rtp_full_attn_layers: list = []
+        try:
+            from atom.plugin.rtpllm.attention_backend import RTPAttention as _RTPAttn
+            self._rtp_attention_cls = _RTPAttn
+        except (ImportError, ModuleNotFoundError):
+            self._rtp_attention_cls = None
+        if self._rtp_attention_cls is not None:
+            for module in runtime.model.modules():
+                if isinstance(module, self._rtp_attention_cls):
+                    self._rtp_full_attn_layers.append(module)
+
+    @property
+    def fmha_params(self):
+        return None
+
+    def prepare_cuda_graph(self, attn_inputs) -> None:
+        # Forward to each layer. Layer-side prepare_cuda_graph is a no-op today
+        # (rtp+atom_graph.md §4.1); kept here so future per-layer state refresh
+        # has a wire-up point.
+        for layer in self._rtp_full_attn_layers:
+            layer.prepare_cuda_graph(attn_inputs)
+
+
 class _ATOMQwen35MoeRuntime(GptModelBase):
     """rtp-llm runtime adapter backed by ATOM model."""
 
@@ -83,6 +123,31 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         self._rtp_kv_cache_signature: tuple | None = None
         self._rtp_layer_group_map: dict[int, int] | None = None
         self._rtp_layer_group_map_signature: tuple | None = None
+        # cuda-graph attn_pyobj cache (see _ATOMAttnPyObj).
+        self._atom_attn_pyobj: _ATOMAttnPyObj | None = None
+        self._cg_layers_prewarmed: bool = False
+        # Capture budget; prewarm uses these. We want max_num_tokens to be the
+        # largest batch size that will actually be captured, NOT the runtime
+        # concurrency limit. RTP only captures graphs for batch sizes listed in
+        # decode_capture_batch_sizes (env DECODE_CAPTURE_CONFIG). Sizing prewarm
+        # for max_generate_batch_size when that's much larger (e.g. 128 vs 8)
+        # over-allocates tmp_output ≈ [N, num_heads, max_partitions, head_dim]
+        # by 16× — enough on TP=4 fp8 to push PyTorch caching allocator past
+        # the point where it can extend a 256 MiB segment during capture.
+        decode_caps = getattr(py_hw_kernel_config, "decode_capture_batch_sizes", None)
+        if decode_caps:
+            self._cg_max_num_tokens: int = min(
+                int(max(decode_caps)), int(max_generate_batch_size)
+            )
+        else:
+            self._cg_max_num_tokens: int = int(max_generate_batch_size)
+        # max_seq_len comes from model_config; for Qwen3.5-MoE it is the model
+        # context length.
+        self._cg_max_seq_len: int = int(
+            getattr(model_config, "max_seq_len", 0)
+            or getattr(model_config, "max_position_embeddings", 0)
+            or 32768
+        )
 
     def load_weights(self):
         # ATOM weights should be loaded exactly once from ATOMQwen35Moe._create_python_model.
@@ -211,32 +276,155 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         positions = positions.to(
             device=model_device, dtype=torch.int32, non_blocking=True
         ).contiguous()
-        pos_tokens = int(positions.shape[-1]) if positions.dim() > 0 else int(positions.numel())
-        if token_num > 0 and pos_tokens != token_num:
-            rebuilt_positions = self._build_positions_from_attention_inputs(
-                attn_inputs=attn_inputs,
-                model_device=model_device,
+        # Eager-only: shape-based fallback rebuild. In cuda-graph capture mode
+        # this Python-level branch on tensor shape is unsafe (and unnecessary
+        # because RTP guarantees position_ids has the same length as the
+        # capture-time max_num_token). See rtp+atom_graph.md §4.3.
+        if not torch.cuda.is_current_stream_capturing():
+            pos_tokens = (
+                int(positions.shape[-1]) if positions.dim() > 0 else int(positions.numel())
             )
-            rebuilt_tokens = (
-                int(rebuilt_positions.shape[-1])
-                if rebuilt_positions is not None and rebuilt_positions.dim() > 0
-                else (int(rebuilt_positions.numel()) if rebuilt_positions is not None else -1)
-            )
-            if rebuilt_positions is not None and rebuilt_tokens == token_num:
-                positions = rebuilt_positions.to(
-                    device=model_device, dtype=torch.int32, non_blocking=True
-                ).contiguous()
-            elif pos_tokens > token_num:
-                # Keep using RTP-provided real positions, but align to current token window.
-                positions = positions[..., -token_num:].contiguous()
-            else:
-                raise ValueError(
-                    "RTP plugin position_ids/token_num mismatch "
-                    f"(position_ids_tokens={pos_tokens}, token_num={token_num})."
+            if token_num > 0 and pos_tokens != token_num:
+                rebuilt_positions = self._build_positions_from_attention_inputs(
+                    attn_inputs=attn_inputs,
+                    model_device=model_device,
                 )
+                rebuilt_tokens = (
+                    int(rebuilt_positions.shape[-1])
+                    if rebuilt_positions is not None and rebuilt_positions.dim() > 0
+                    else (int(rebuilt_positions.numel()) if rebuilt_positions is not None else -1)
+                )
+                if rebuilt_positions is not None and rebuilt_tokens == token_num:
+                    positions = rebuilt_positions.to(
+                        device=model_device, dtype=torch.int32, non_blocking=True
+                    ).contiguous()
+                elif pos_tokens > token_num:
+                    positions = positions[..., -token_num:].contiguous()
+                else:
+                    raise ValueError(
+                        "RTP plugin position_ids/token_num mismatch "
+                        f"(position_ids_tokens={pos_tokens}, token_num={token_num})."
+                    )
         return positions
 
+    def prepare_fmha_impl(
+        self, inputs: PyModelInputs, is_cuda_graph: bool = False
+    ) -> Any:
+        """Override base class to return ATOM-aware container.
+
+        RTP CudaGraphRunner.cc:480 calls this once during initCapture and stores
+        the returned object as ``attn_pyobj``; CudaGraphRunner.cc:122 then calls
+        ``attn_pyobj.prepare_cuda_graph(attn_inputs)`` before each replay.
+
+        Returning the base RTP fmha_impl (which has its own prepare_cuda_graph)
+        is wrong here because ATOM's RTPFullAttention reads from forward_context
+        independently and never consults the RTP fmha_impl object — see
+        rtp+atom_graph.md §4.1 (首要根因).
+        """
+        if self._atom_attn_pyobj is None:
+            self._atom_attn_pyobj = _ATOMAttnPyObj(self)
+        self._atom_attn_pyobj.is_cuda_graph = bool(is_cuda_graph)
+        # Keep eager/non-graph path untouched: only prewarm when graph path
+        # explicitly asks for fmha_impl in cuda-graph mode.
+        if bool(is_cuda_graph):
+            inputs.attention_inputs.is_cuda_graph = True
+            self._ensure_cuda_graph_prewarmed()
+        return self._atom_attn_pyobj
+
+    def _ensure_cuda_graph_prewarmed(self) -> None:
+        if self._cg_layers_prewarmed:
+            return
+        if self._atom_attn_pyobj is None:
+            return
+        max_num_tokens = int(self._cg_max_num_tokens)
+        max_seq_len = int(self._cg_max_seq_len)
+        if max_num_tokens <= 0 or max_seq_len <= 0:
+            logger.warning(
+                "ATOM cuda-graph prewarm skipped: invalid budget "
+                "(max_num_tokens=%d, max_seq_len=%d)",
+                max_num_tokens,
+                max_seq_len,
+            )
+            return
+        device = self._get_model_device()
+        dtype = self._get_model_dtype()
+
+        # RTP C++ KVCache.num_kv_heads is the POST-TP-copy value — it stays at
+        # the global total when kv_head_num < tp_size (no division is done).
+        # e.g. Qwen3.5-MoE: global=2, tp=4 → KVCache.num_kv_heads=2, but
+        # ATOM layer's self.num_kv_heads=max(1, 2//4)=1.
+        # _align_kv_heads_for_cache() will repeat k/v from 1→2 heads before
+        # writing to the kv cache, so the fused-QKV buffer must be sized for
+        # the larger (post-alignment) count.
+        kv_cache = getattr(self, "kv_cache", None)
+        rtp_kv_heads: int | None = (
+            int(kv_cache.num_kv_heads)
+            if kv_cache is not None and int(kv_cache.num_kv_heads) > 0
+            else None
+        )
+
+        for layer in self._atom_attn_pyobj._rtp_full_attn_layers:
+            layer.prewarm_for_cuda_graph(
+                max_num_tokens=max_num_tokens,
+                max_seq_len=max_seq_len,
+                query_dtype=dtype,
+                device=device,
+                effective_num_kv_heads=rtp_kv_heads,
+            )
+
+        # Pre-allocate metadata tensors consumed by _build_plugin_attention_metadata
+        # during decode capture.  RTP captures via cudaStreamBeginCapture (not
+        # torch.cuda.graph()), so PyTorch's caching allocator never switches to
+        # graph-pool mode — any tensor allocated during capture is in the regular
+        # pool and may be freed + reused after capture ends, causing replay faults.
+        # By pre-allocating here (before capture) and holding a model-level
+        # reference, the GPU addresses stay valid for the entire capture/replay
+        # lifetime.  decode path: 1 token per seq, so max_num_tokens == max_bs.
+        max_bs = max_num_tokens
+        # block_table columns are indexed in kernel block granularity
+        # (rtp_kernel_seq_size_per_block), not seq_size_per_block.
+        # Qwen3.5 config example: max_seq_len=262144, kernel_block=16 -> 16384 columns.
+        kernel_seq_size_per_block = (
+            int(getattr(kv_cache, "kernel_seq_size_per_block", 0))
+            or int(getattr(kv_cache, "seq_size_per_block", 0))
+            or 1
+        )
+        max_blocks = (int(max_seq_len) + kernel_seq_size_per_block - 1) // kernel_seq_size_per_block + 1
+        # query_start_loc for decode: always [0, 1, 2, ..., bs], i.e. arange(bs+1).
+        # seq_id for decode slot_mapping: seq_id[i] == i, i.e. arange(bs).
+        self._cg_meta_bufs: dict = {
+            "query_start_loc": torch.arange(
+                0, max_bs + 1, device=device, dtype=torch.int32
+            ),
+            "seq_id": torch.arange(0, max_bs, device=device, dtype=torch.int64),
+            "block_col": torch.empty(max_bs, device=device, dtype=torch.int32),
+            "block_col_i64": torch.empty(max_bs, device=device, dtype=torch.int64),
+            "slot_base": torch.empty(max_bs, device=device, dtype=torch.int32),
+            "token_offset": torch.empty(max_bs, device=device, dtype=torch.int32),
+            "slot_mapping": torch.empty(max_bs, device=device, dtype=torch.int64),
+            "seq_lens_i32": torch.empty(max_bs, device=device, dtype=torch.int32),
+            "block_table_i32": torch.empty(
+                max_bs, max_blocks, device=device, dtype=torch.int32
+            ),
+        }
+        self._cg_layers_prewarmed = True
+        logger.info(
+            "ATOM RTPFullAttention cuda-graph prewarmed for %d layers "
+            "(max_num_tokens=%d, max_seq_len=%d, rtp_kv_heads=%s, "
+            "meta_bufs: query_start_loc[%d], slot_mapping[%d], block_table_i32[%dx%d])",
+            len(self._atom_attn_pyobj._rtp_full_attn_layers),
+            max_num_tokens,
+            max_seq_len,
+            rtp_kv_heads,
+            max_bs + 1,
+            max_bs,
+            max_bs,
+            max_blocks,
+        )
+
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
+        if bool(getattr(fmha_impl, "is_cuda_graph", False)):
+            inputs.attention_inputs.is_cuda_graph = True
         model_device = self._get_model_device()
         model_dtype = self._get_model_dtype()
         input_ids = inputs.input_ids
@@ -269,6 +457,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             inputs=inputs,
             positions=positions,
             layer_maps=self._rtp_layer_maps,
+            cg_max_seq_len=int(self._cg_max_seq_len),
+            cg_bufs=getattr(self, "_cg_meta_bufs", None),
         ):
             hidden_states = self.model(
                 input_ids=input_ids,
@@ -286,6 +476,19 @@ class ATOMQwen35Moe(Qwen35Moe):
     def _is_external_plugin_mode() -> bool:
         modules = os.getenv("RTP_LLM_EXTERNAL_MODEL_PACKAGES", "")
         return "atom.plugin.rtpllm.models" in modules
+
+    def support_cuda_graph(self) -> bool:
+        """Tell RTP PyWrappedModel.h:160 whether to construct CudaGraphRunner.
+
+        Keep ATOM and RTP on the same switch: ENABLE_CUDA_GRAPH.
+        Default: enabled (missing/other values behave as enabled).
+        """
+        if os.getenv("ENABLE_CUDA_GRAPH", "1") == "0":
+            logger.info(
+                "ENABLE_CUDA_GRAPH=0 — ATOMQwen35Moe forces eager forward."
+            )
+            return False
+        return True
 
     @staticmethod
     def _make_qwen35_hf_mapper() -> WeightsMapper:
