@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 
 import json
+import os
+import sys
+import types
 
 import pytest
 import torch
@@ -115,6 +118,15 @@ class FakeFp8BlockFusedMoE(nn.Module):
             requires_grad=False,
         )
 
+    def add_static_routed_lora(
+        self, expert_id, proj, lora_a, lora_b, scaling, adapter_name
+    ):
+        if not hasattr(self, "runtime_loras"):
+            self.runtime_loras = []
+        self.runtime_loras.append(
+            (expert_id, proj, lora_a.clone(), lora_b.clone(), scaling, adapter_name)
+        )
+
 
 class FakeParallelLMHead(nn.Module):
     def __init__(self, tp_rank=1, tp_size=2):
@@ -142,6 +154,53 @@ def _write_adapter(path, tensors, r=2, alpha=4):
         encoding="utf-8",
     )
     save_file(tensors, path / "adapter_model.safetensors")
+
+
+def _prepare_real_model_ops_import():
+    atom_pkg = sys.modules.get("atom")
+    if atom_pkg is not None:
+        atom_root = atom_pkg.__path__[0]
+    else:
+        atom_root = os.path.join(os.path.dirname(os.path.dirname(__file__)), "atom")
+
+    for mod_name in list(sys.modules):
+        if mod_name == "atom.model_ops" or mod_name.startswith("atom.model_ops."):
+            del sys.modules[mod_name]
+
+    model_ops_pkg = types.ModuleType("atom.model_ops")
+    model_ops_pkg.__path__ = [os.path.join(atom_root, "model_ops")]
+    model_ops_pkg.__package__ = "atom.model_ops"
+    sys.modules["atom.model_ops"] = model_ops_pkg
+
+    atom_config = sys.modules.get("atom.config")
+    if atom_config is not None:
+        atom_config.QuantizationConfig = getattr(
+            atom_config, "QuantizationConfig", type("QuantizationConfig", (), {})
+        )
+        atom_config.CompilationConfig = getattr(
+            atom_config, "CompilationConfig", type("CompilationConfig", (), {})
+        )
+        atom_config.CompilationLevel = getattr(
+            atom_config,
+            "CompilationLevel",
+            types.SimpleNamespace(
+                NO_COMPILATION=0,
+                DYNAMO_AS_IS=1,
+                DYNAMO_ONCE=2,
+                PIECEWISE=3,
+            ),
+        )
+        atom_config.LayerQuantConfig = getattr(
+            atom_config, "LayerQuantConfig", type("LayerQuantConfig", (), {})
+        )
+        if not hasattr(atom_config, "get_current_atom_config"):
+            atom_config.get_current_atom_config = lambda: types.SimpleNamespace(
+                enable_dp_attention=False,
+                enable_expert_parallel=False,
+                max_num_batched_tokens=64,
+                torch_dtype=torch.bfloat16,
+                compilation_config=types.SimpleNamespace(static_forward_context={}),
+            )
 
 
 def test_parse_lora_module_entry_supports_name_equals_path():
@@ -374,7 +433,7 @@ def test_apply_lora_adapters_merges_routed_expert_lora_into_bf16_moe(tmp_path):
     )
 
 
-def test_apply_lora_adapters_merges_routed_expert_lora_into_fp8_block_moe(
+def test_apply_lora_adapters_registers_routed_expert_lora_for_fp8_block_moe(
     tmp_path,
 ):
     adapter_path = tmp_path / "adapter"
@@ -404,20 +463,129 @@ def test_apply_lora_adapters_merges_routed_expert_lora_into_fp8_block_moe(
     apply_lora_adapters(model, [f"test={adapter_path}"])
 
     experts = model.model.layers[0].mlp.experts
-    dequant = _dequantize_fp8_blocks(
-        experts.w13_weight[0, :2],
-        experts.w13_weight_scale[0, :1],
-        block_n=2,
-        block_k=2,
+    assert [(e, p, s, name) for e, p, _, _, s, name in experts.runtime_loras] == [
+        (0, "gate_proj", 1.0, "test"),
+        (0, "up_proj", 1.0, "test"),
+    ]
+    assert torch.equal(
+        experts.w13_weight[0, :2], torch.zeros_like(experts.w13_weight[0, :2])
     )
-    assert torch.allclose(dequant, torch.ones(2, 4), atol=0.125)
-    dequant = _dequantize_fp8_blocks(
-        experts.w13_weight[0, 2:],
-        experts.w13_weight_scale[0, 1:],
-        block_n=2,
-        block_k=2,
+
+
+def test_apply_lora_adapters_registers_routed_expert_lora_when_supported(tmp_path):
+    adapter_path = tmp_path / "adapter"
+    lora_a = torch.ones(1, 4)
+    lora_b = torch.ones(2, 1)
+    _write_adapter(
+        adapter_path,
+        {
+            "base_model.model.model.layers.0.mlp.experts.0.gate_proj."
+            "lora_A.weight": lora_a,
+            "base_model.model.model.layers.0.mlp.experts.0.gate_proj."
+            "lora_B.weight": lora_b,
+        },
+        r=1,
+        alpha=1,
     )
-    assert torch.allclose(dequant, torch.full((2, 4), 2.0), atol=0.25)
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([nn.Module()])
+    model.model.layers[0].mlp = nn.Module()
+    model.model.layers[0].mlp.experts = FakeFp8BlockFusedMoE()
+
+    apply_lora_adapters(model, [f"test={adapter_path}"])
+
+    experts = model.model.layers[0].mlp.experts
+    assert len(experts.runtime_loras) == 1
+    expert_id, proj, loaded_a, loaded_b, scaling, adapter_name = experts.runtime_loras[
+        0
+    ]
+    assert expert_id == 0
+    assert proj == "gate_proj"
+    assert adapter_name == "test"
+    assert scaling == 1.0
+    assert torch.equal(loaded_a, lora_a)
+    assert torch.equal(loaded_b, lora_b)
+    assert torch.equal(
+        experts.w13_weight[0, :2], torch.zeros_like(experts.w13_weight[0, :2])
+    )
+
+
+def test_static_routed_lora_reference_matches_manual_moe():
+    pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
+    from atom.model_ops.moe import _apply_static_routed_lora_reference
+
+    layer = nn.Module()
+    layer.intermediate_size_per_partition = 2
+    layer.local_num_experts = 2
+    layer.quant_method = None
+    layer._static_routed_lora_dtype = torch.float32
+    layer.w13_weight = nn.Parameter(
+        torch.tensor(
+            [
+                [[0.2, -0.1, 0.3], [0.4, 0.0, -0.2], [0.1, 0.5, 0.2], [-0.3, 0.2, 0.4]],
+                [[-0.2, 0.3, 0.1], [0.5, -0.4, 0.2], [0.3, 0.1, -0.5], [0.2, 0.4, 0.1]],
+            ],
+            dtype=torch.float32,
+        ),
+        requires_grad=False,
+    )
+    layer.w2_weight = nn.Parameter(
+        torch.tensor(
+            [
+                [[0.2, 0.3], [-0.1, 0.4], [0.5, -0.2]],
+                [[0.1, -0.3], [0.2, 0.2], [-0.4, 0.6]],
+            ],
+            dtype=torch.float32,
+        ),
+        requires_grad=False,
+    )
+    layer.register_buffer("gate_a", torch.tensor([[0.5, -0.2, 0.1]]))
+    layer.register_buffer("gate_b", torch.tensor([[0.3], [-0.4]]))
+    layer.register_buffer("up_a", torch.tensor([[-0.1, 0.4, 0.2]]))
+    layer.register_buffer("up_b", torch.tensor([[0.6], [0.2]]))
+    layer.register_buffer("down_a", torch.tensor([[0.7, -0.3]]))
+    layer.register_buffer("down_b", torch.tensor([[0.2], [-0.5], [0.1]]))
+    layer._static_routed_lora = {
+        1: {
+            "gate_proj": [("gate_a", "gate_b", 0.5)],
+            "up_proj": [("up_a", "up_b", 0.25)],
+            "down_proj": [("down_a", "down_b", 0.75)],
+        }
+    }
+
+    x = torch.tensor([[1.0, -0.5, 0.25], [0.3, 0.2, -0.7]], dtype=torch.float32)
+    topk_ids = torch.tensor([[1, 0], [1, 1]], dtype=torch.int64)
+    topk_weights = torch.tensor([[0.75, 0.25], [0.6, 0.4]], dtype=torch.float32)
+
+    actual = _apply_static_routed_lora_reference(
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+
+    expected = torch.zeros_like(x)
+    for token_idx in range(x.shape[0]):
+        for route_idx in range(topk_ids.shape[1]):
+            expert_id = int(topk_ids[token_idx, route_idx].item())
+            token_x = x[token_idx : token_idx + 1]
+            w13 = layer.w13_weight[expert_id]
+            gate = token_x @ w13[:2].t()
+            up = token_x @ w13[2:].t()
+            if expert_id == 1:
+                gate = gate + (token_x @ layer.gate_a.t() @ layer.gate_b.t()) * 0.5
+                up = up + (token_x @ layer.up_a.t() @ layer.up_b.t()) * 0.25
+            hidden = torch.nn.functional.silu(gate) * up
+            down = hidden @ layer.w2_weight[expert_id].t()
+            if expert_id == 1:
+                down = down + (hidden @ layer.down_a.t() @ layer.down_b.t()) * 0.75
+            expected[token_idx] += down.squeeze(0) * topk_weights[token_idx, route_idx]
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_apply_lora_adapters_registers_vocab_parallel_lm_head(tmp_path):
@@ -448,6 +616,7 @@ def test_parallel_lm_head_lora_applies_delta_before_gather(monkeypatch):
     import importlib
 
     pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
     try:
         embed_head = importlib.import_module("atom.model_ops.embed_head")
     except ImportError as exc:

@@ -560,6 +560,23 @@ def _merge_routed_expert_lora(
         return True, False
 
     proj = match.group("proj")
+    add_static_routed_lora = getattr(experts, "add_static_routed_lora", None)
+    if add_static_routed_lora is not None:
+        add_static_routed_lora(
+            int(match.group("expert_id")),
+            proj,
+            pair.lora_a,
+            pair.lora_b,
+            pair.scaling,
+            adapter_name=adapter_name,
+        )
+        logger.debug(
+            "Registered static LoRA adapter %s for routed expert %s",
+            adapter_name,
+            module_name,
+        )
+        return True, True
+
     delta = _slice_routed_lora_delta(experts, pair, proj)
     quant_method = getattr(experts, "quant_method", None)
     block_n = getattr(quant_method, "block_n", 1)
