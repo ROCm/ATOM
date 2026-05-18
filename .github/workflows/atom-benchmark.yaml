@@ -457,11 +457,12 @@ jobs:
           print(f"Loaded {len(models)} PD model(s), {len(decode_entries)} decode entries (sequential scheduling)")
           PY
 
-  # ── IP round-trip validation (1 runner, no GPU) ───────────────────
-  # Smoke test: a single runner reports its IP via artifact, then
-  # downloads the same artifact back and verifies the value.
-  pd-ip-test:
-    name: PD IP round-trip test
+  # ── IP round-trip validation (2 runners, no GPU) ─────────────────
+  # Smoke test: runner A uploads its IP as artifact, runner B downloads
+  # and prints it. Validates the cross-job artifact exchange that PD
+  # prefill/decode rely on.
+  pd-ip-upload:
+    name: PD IP upload test
     if: >-
       !cancelled()
       && (github.event_name == 'schedule'
@@ -469,6 +470,8 @@ jobs:
     needs: [benchmark]
     runs-on: atom-mi355-8gpu.predownload
     timeout-minutes: 5
+    outputs:
+      ip: ${{ steps.report.outputs.ip }}
     steps:
       - name: Report IP
         id: report
@@ -487,29 +490,37 @@ jobs:
           path: /tmp/ip-test/ip.txt
           overwrite: true
 
+  pd-ip-verify:
+    name: PD IP download test
+    needs: [pd-ip-upload]
+    runs-on: atom-mi355-8gpu.predownload
+    timeout-minutes: 5
+    steps:
       - name: Download IP artifact
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for i in $(seq 1 10); do
+          echo "Polling for artifact pd-ip-test..."
+          for i in $(seq 1 30); do
             if gh run download ${{ github.run_id }} \
                 -n "pd-ip-test" \
                 -D /tmp/ip-download 2>/dev/null; then
               echo "Artifact downloaded on attempt $i"
               break
             fi
-            echo "  Retry ($i/10)..."
+            [ "$i" -eq 30 ] && echo "ERROR: Timed out" && exit 1
+            echo "  Retry ($i/30)..."
             sleep 5
           done
 
       - name: Verify round-trip
         run: |
-          ORIGINAL="${{ steps.report.outputs.ip }}"
+          EXPECTED="${{ needs.pd-ip-upload.outputs.ip }}"
           DOWNLOADED=$(cat /tmp/ip-download/ip.txt)
-          echo "Original IP:   ${ORIGINAL}"
-          echo "Downloaded IP: ${DOWNLOADED}"
-          if [ "$ORIGINAL" = "$DOWNLOADED" ]; then
-            echo "IP round-trip OK"
+          echo "Upload runner IP: ${EXPECTED}"
+          echo "Downloaded IP:    ${DOWNLOADED}"
+          if [ "$EXPECTED" = "$DOWNLOADED" ]; then
+            echo "IP round-trip OK — cross-job artifact exchange works"
           else
             echo "ERROR: IP mismatch!"
             exit 1
@@ -518,12 +529,12 @@ jobs:
   # ── Prefill node: proxy + producer + benchmark runner ──────────────
   pd-prefill:
     name: PD-Prefill ${{ matrix.model.display }}
-    needs: [parse-pd-params, load-pd-models, pd-ip-test]
+    needs: [parse-pd-params, load-pd-models, pd-ip-verify]
     if: >-
       !cancelled()
       && needs.parse-pd-params.result == 'success'
       && needs.load-pd-models.result == 'success'
-      && needs.pd-ip-test.result == 'success'
+      && needs.pd-ip-verify.result == 'success'
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -811,11 +822,11 @@ jobs:
   # done signal before starting, so models run one at a time.
   pd-decode:
     name: PD-Decode ${{ matrix.entry.display }} #${{ matrix.entry.decode_index }}
-    needs: [load-pd-models, pd-ip-test]
+    needs: [load-pd-models, pd-ip-verify]
     if: >-
       !cancelled()
       && needs.load-pd-models.result == 'success'
-      && needs.pd-ip-test.result == 'success'
+      && needs.pd-ip-verify.result == 'success'
     strategy:
       fail-fast: false
       matrix:
