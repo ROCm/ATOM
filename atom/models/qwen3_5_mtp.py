@@ -136,8 +136,6 @@ class Qwen3_5MTP(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         config = get_qwen3_5_text_config(atom_config)
-        if atom_config.enable_prefix_caching:
-            raise ValueError("Qwen3_5MTP currently does not support prefix caching")
         self.config = config
 
         # Reindex MTP exclude entries on a copy: checkpoint uses 0-based
