@@ -72,6 +72,31 @@ def _should_preserve_unshuffled_weights(layer: torch.nn.Module) -> bool:
     return bool(getattr(layer, "_static_routed_lora_requires_unshuffled", False))
 
 
+def _static_routed_lora_fused_context(
+    layer: torch.nn.Module,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> dict[str, torch.Tensor] | None:
+    if not _module_has_static_routed_lora(layer):
+        return None
+    required = (
+        "_static_routed_lora_w13_a_stacked",
+        "_static_routed_lora_w13_b_stacked",
+        "_static_routed_lora_w2_a_stacked",
+        "_static_routed_lora_w2_b_stacked",
+    )
+    if not all(hasattr(layer, name) for name in required):
+        return None
+    return {
+        "w13_a": layer._static_routed_lora_w13_a_stacked,
+        "w13_b": layer._static_routed_lora_w13_b_stacked,
+        "w2_a": layer._static_routed_lora_w2_a_stacked,
+        "w2_b": layer._static_routed_lora_w2_b_stacked,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+    }
+
+
 def _ensure_static_routed_lora_stacks(
     layer: torch.nn.Module,
     lora_rank: int,
@@ -1239,6 +1264,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or scoring_func != "softmax"
                 or e_score_correction_bias is not None
                 or custom_routing_function is not None
+                or _module_has_static_routed_lora(layer)
             )
 
             if needs_custom_routing:
@@ -1289,6 +1315,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
                     expert_map=expert_map,
+                    static_lora=_static_routed_lora_fused_context(
+                        layer, topk_weights, topk_ids
+                    ),
                 )
                 return _moe_result
 

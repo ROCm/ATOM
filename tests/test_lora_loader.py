@@ -194,14 +194,23 @@ def _prepare_real_model_ops_import():
         atom_config.LayerQuantConfig = getattr(
             atom_config, "LayerQuantConfig", type("LayerQuantConfig", (), {})
         )
-        if not hasattr(atom_config, "get_current_atom_config"):
-            atom_config.get_current_atom_config = lambda: types.SimpleNamespace(
-                enable_dp_attention=False,
-                enable_expert_parallel=False,
-                max_num_batched_tokens=64,
-                torch_dtype=torch.bfloat16,
-                compilation_config=types.SimpleNamespace(static_forward_context={}),
-            )
+        fake_quant_config = types.SimpleNamespace(
+            exclude_layers=[],
+            quant_dtype="bf16",
+            get_layer_quant_config=lambda _name: types.SimpleNamespace(
+                quant_dtype="bf16"
+            ),
+        )
+        atom_config.get_current_atom_config = lambda: types.SimpleNamespace(
+            enable_dp_attention=False,
+            enable_expert_parallel=False,
+            max_num_batched_tokens=64,
+            torch_dtype=torch.bfloat16,
+            compilation_config=types.SimpleNamespace(static_forward_context={}),
+            quant_config=fake_quant_config,
+            parallel_config=types.SimpleNamespace(data_parallel_size=1),
+            lora_modules=None,
+        )
 
 
 def test_parse_lora_module_entry_supports_name_equals_path():
@@ -623,16 +632,23 @@ def test_static_routed_lora_reference_matches_manual_moe():
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_fused_moe_static_routed_lora_keeps_vllm_stacked_layout():
+def test_fused_moe_static_routed_lora_keeps_vllm_stacked_layout(monkeypatch):
     pytest.importorskip("aiter")
     _prepare_real_model_ops_import()
+    import atom.model_ops.moe as moe_mod
     from atom.model_ops.moe import FusedMoE
+
+    class FakeDPGroup:
+        world_size = 1
+        rank_in_group = 0
+
+    monkeypatch.setattr(moe_mod, "get_dp_group", lambda: FakeDPGroup())
 
     layer = FusedMoE(
         num_experts=2,
         top_k=2,
         hidden_size=3,
-        intermediate_size=4,
+        intermediate_size=2,
         params_dtype=torch.bfloat16,
         tp_size=1,
         dp_size=1,
