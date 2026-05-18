@@ -116,7 +116,18 @@ class BlockManager:
                 else -1
             )
             block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            would_cache_full_prompt = (
+                block_id != -1
+                and not cache_miss
+                and i == seq.num_blocks - 1
+                and len(token_ids) == self.block_size
+                and seq.num_tokens == (i + 1) * self.block_size
+            )
+            if (
+                block_id == -1
+                or self.blocks[block_id].token_ids != token_ids
+                or would_cache_full_prompt
+            ):
                 cache_miss = True
             if cache_miss:
                 needed_free += 1
@@ -140,7 +151,18 @@ class BlockManager:
             block_id = (
                 self.hash_to_block_id.get(h, -1) if self.enable_prefix_caching else -1
             )
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            would_cache_full_prompt = (
+                block_id != -1
+                and not cache_miss
+                and i == seq.num_blocks - 1
+                and len(token_ids) == self.block_size
+                and seq.num_tokens == (i + 1) * self.block_size
+            )
+            if (
+                block_id == -1
+                or self.blocks[block_id].token_ids != token_ids
+                or would_cache_full_prompt
+            ):
                 cache_miss = True
             if cache_miss:
                 block_id = self._pop_free_block()
