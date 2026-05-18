@@ -24,7 +24,7 @@
 set -euo pipefail
 
 # ======================== configuration ========================
-MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4}"
+MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-R1-0528-MXFP4-V2}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
 CONTAINER="${CONTAINER:-atom_sglang_standalone_dp8ep8_${SLURM_JOB_ID}}"
 
