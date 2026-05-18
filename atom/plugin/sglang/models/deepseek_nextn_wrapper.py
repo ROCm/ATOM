@@ -153,7 +153,6 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
         input_embeds: torch.Tensor = None,
         **kwargs,
     ):
-        del kwargs
         if forward_batch.spec_info is None:
             raise ValueError("DeepSeek MTP draft forward requires speculative info")
 
