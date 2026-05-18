@@ -1004,9 +1004,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 k_cache.view(
                     -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
                 ),
-                v_cache.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                ),
+                v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
                 cache_loc,
                 k_scale=k_descale,
                 v_scale=v_descale,
@@ -1662,4 +1660,3 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             getattr(_sglang_aiter, "_AITER_PARTITION_SIZE_ROCM", 256),
         )
         return o
-
