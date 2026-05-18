@@ -418,7 +418,7 @@ class LinearBase(nn.Module):
                         k_pad = (k_packed + _ASM_K_ALIGN - 1) // _ASM_K_ALIGN * _ASM_K_ALIGN
                         w_new = torch.zeros(w_u8.shape[0], k_pad, dtype=torch.uint8, device=w_u8.device)
                         w_new[:, :k_packed] = w_u8
-                        self.weight = nn.Parameter(w_new.view(self.weight.data.dtype), requires_grad=False)
+                        self.weight = atom_parameter(w_new.view(self.weight.data.dtype))
                         if self.weight_scale is not None:
                             ws_u8 = self.weight_scale.data.view(torch.uint8)
                             ws_k = ws_u8.shape[-1]
@@ -426,7 +426,7 @@ class LinearBase(nn.Module):
                             if ws_k < ws_k_pad:
                                 ws_new = torch.zeros(ws_u8.shape[0], ws_k_pad, dtype=torch.uint8, device=ws_u8.device)
                                 ws_new[:, :ws_k] = ws_u8
-                                self.weight_scale = nn.Parameter(ws_new.view(self.weight_scale.data.dtype), requires_grad=False)
+                                self.weight_scale = atom_parameter(ws_new.view(self.weight_scale.data.dtype))
                         self._fp4_k_orig = k_packed
                         self._fp4_k_padded = k_pad
                         logger.info(f"[MXFP4] Padded weight K {k_packed} -> {k_pad} for {self.prefix}")
