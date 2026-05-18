@@ -61,10 +61,120 @@ from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 
 logger = logging.getLogger("atom")
 _StaticRoutedLoRAStore = dict[int, dict[str, list[tuple[str, str, float]]]]
+_STATIC_ROUTED_LORA_PROJ_TO_STACK = {
+    "gate_proj": ("w13", 0),
+    "up_proj": ("w13", 1),
+    "down_proj": ("w2", 0),
+}
 
 
 def _should_preserve_unshuffled_weights(layer: torch.nn.Module) -> bool:
     return bool(getattr(layer, "_static_routed_lora_requires_unshuffled", False))
+
+
+def _ensure_static_routed_lora_stacks(
+    layer: torch.nn.Module,
+    lora_rank: int,
+    dtype: torch.dtype,
+) -> None:
+    device = layer.w13_weight.device
+    num_experts = layer.local_num_experts
+    hidden_size = layer.hidden_size
+    intermediate_size = layer.intermediate_size_per_partition
+
+    stack_rank = getattr(layer, "_static_routed_lora_rank", None)
+    if stack_rank is not None:
+        if stack_rank != lora_rank:
+            raise ValueError(
+                "Static routed expert LoRA adapters must share one rank for "
+                f"the fused MoE LoRA path; got existing={stack_rank}, "
+                f"new={lora_rank}"
+            )
+        return
+
+    layer._static_routed_lora_rank = lora_rank
+    layer.register_buffer(
+        "_static_routed_lora_w13_a_stacked",
+        torch.zeros(
+            2,
+            num_experts,
+            lora_rank,
+            hidden_size,
+            device=device,
+            dtype=dtype,
+        ),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_static_routed_lora_w13_b_stacked",
+        torch.zeros(
+            2,
+            num_experts,
+            intermediate_size,
+            lora_rank,
+            device=device,
+            dtype=dtype,
+        ),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_static_routed_lora_w2_a_stacked",
+        torch.zeros(
+            1,
+            num_experts,
+            lora_rank,
+            intermediate_size,
+            device=device,
+            dtype=dtype,
+        ),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_static_routed_lora_w2_b_stacked",
+        torch.zeros(
+            1,
+            num_experts,
+            hidden_size,
+            lora_rank,
+            device=device,
+            dtype=dtype,
+        ),
+        persistent=False,
+    )
+    layer.register_buffer(
+        "_static_routed_lora_expert_enabled",
+        torch.zeros(num_experts, device=device, dtype=torch.int32),
+        persistent=False,
+    )
+
+
+def _store_static_routed_lora_stack(
+    layer: torch.nn.Module,
+    local_expert_id: int,
+    proj: str,
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    scaling: float,
+) -> None:
+    stack_name, stack_idx = _STATIC_ROUTED_LORA_PROJ_TO_STACK[proj]
+    if scaling != 1.0:
+        lora_b = lora_b * scaling
+
+    if stack_name == "w13":
+        layer._static_routed_lora_w13_a_stacked[stack_idx, local_expert_id].copy_(
+            lora_a
+        )
+        layer._static_routed_lora_w13_b_stacked[stack_idx, local_expert_id].copy_(
+            lora_b
+        )
+    else:
+        layer._static_routed_lora_w2_a_stacked[stack_idx, local_expert_id].copy_(
+            lora_a
+        )
+        layer._static_routed_lora_w2_b_stacked[stack_idx, local_expert_id].copy_(
+            lora_b
+        )
+    layer._static_routed_lora_expert_enabled[local_expert_id] = 1
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -2387,6 +2497,14 @@ class FusedMoE(torch.nn.Module):
                 f"got existing={self._static_routed_lora_dtype}, new={dtype}"
             )
 
+        local_expert_id = (
+            expert_id
+            if self.expert_map is None
+            else int(self.expert_map[expert_id].item())
+        )
+        if local_expert_id == -1:
+            return
+
         idx = sum(
             len(entries)
             for expert_entries in self._static_routed_lora.values()
@@ -2400,6 +2518,15 @@ class FusedMoE(torch.nn.Module):
         )
         self.register_buffer(
             b_name, lora_b.to(device=device, dtype=dtype).contiguous(), persistent=False
+        )
+        _ensure_static_routed_lora_stacks(self, lora_a.shape[0], dtype)
+        _store_static_routed_lora_stack(
+            self,
+            local_expert_id,
+            proj,
+            getattr(self, a_name),
+            getattr(self, b_name),
+            scaling,
         )
         self._static_routed_lora.setdefault(expert_id, {}).setdefault(proj, []).append(
             (a_name, b_name, float(scaling))

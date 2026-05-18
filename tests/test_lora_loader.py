@@ -623,6 +623,62 @@ def test_static_routed_lora_reference_matches_manual_moe():
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_fused_moe_static_routed_lora_keeps_vllm_stacked_layout():
+    pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
+    from atom.model_ops.moe import FusedMoE
+
+    layer = FusedMoE(
+        num_experts=2,
+        top_k=2,
+        hidden_size=3,
+        intermediate_size=4,
+        params_dtype=torch.bfloat16,
+        tp_size=1,
+        dp_size=1,
+    )
+    gate_a = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+    gate_b = torch.tensor([[4.0], [5.0]], dtype=torch.float32)
+    up_a = torch.tensor([[6.0, 7.0, 8.0]], dtype=torch.float32)
+    up_b = torch.tensor([[9.0], [10.0]], dtype=torch.float32)
+    down_a = torch.tensor([[11.0, 12.0]], dtype=torch.float32)
+    down_b = torch.tensor([[13.0], [14.0], [15.0]], dtype=torch.float32)
+
+    layer.add_static_routed_lora(1, "gate_proj", gate_a, gate_b, 0.5, "test")
+    layer.add_static_routed_lora(1, "up_proj", up_a, up_b, 1.0, "test")
+    layer.add_static_routed_lora(1, "down_proj", down_a, down_b, 0.25, "test")
+
+    assert layer._static_routed_lora_w13_a_stacked.shape == (2, 2, 1, 3)
+    assert layer._static_routed_lora_w13_b_stacked.shape == (2, 2, 2, 1)
+    assert layer._static_routed_lora_w2_a_stacked.shape == (1, 2, 1, 2)
+    assert layer._static_routed_lora_w2_b_stacked.shape == (1, 2, 3, 1)
+    assert torch.equal(
+        layer._static_routed_lora_w13_a_stacked[0, 1].cpu().float(),
+        gate_a,
+    )
+    assert torch.equal(
+        layer._static_routed_lora_w13_b_stacked[0, 1].cpu().float(),
+        gate_b * 0.5,
+    )
+    assert torch.equal(
+        layer._static_routed_lora_w13_a_stacked[1, 1].cpu().float(),
+        up_a,
+    )
+    assert torch.equal(
+        layer._static_routed_lora_w13_b_stacked[1, 1].cpu().float(),
+        up_b,
+    )
+    assert torch.equal(
+        layer._static_routed_lora_w2_a_stacked[0, 1].cpu().float(),
+        down_a,
+    )
+    assert torch.equal(
+        layer._static_routed_lora_w2_b_stacked[0, 1].cpu().float(),
+        down_b * 0.25,
+    )
+    assert layer._static_routed_lora_expert_enabled.cpu().tolist() == [0, 1]
+
+
 def test_apply_lora_adapters_registers_vocab_parallel_lm_head(tmp_path):
     adapter_path = tmp_path / "adapter"
     lora_a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
