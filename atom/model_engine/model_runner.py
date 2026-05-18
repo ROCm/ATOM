@@ -24,7 +24,11 @@ from atom.config import Config, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
-from atom.model_loader.lora import apply_lora_adapters, validate_lora_adapters_supported
+from atom.model_loader.lora import (
+    apply_lora_adapters,
+    mark_static_routed_lora_targets,
+    validate_lora_adapters_supported,
+)
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.eagle import EagleProposer
@@ -608,6 +612,7 @@ class ModelRunner:
             fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
         validate_lora_adapters_supported(config.lora_modules)
+        mark_static_routed_lora_targets(self.model, config.lora_modules)
         load_model(
             self.model,
             config.model,

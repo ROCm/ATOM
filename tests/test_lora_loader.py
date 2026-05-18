@@ -15,6 +15,7 @@ from atom.model_loader.lora import (
     any_module_has_static_lora_adapters,
     apply_lora_adapters,
     load_lora_tensors,
+    mark_static_routed_lora_targets,
     module_has_static_lora_adapters,
     parse_lora_module_entry,
     parse_lora_tensor_name,
@@ -469,6 +470,40 @@ def test_apply_lora_adapters_registers_routed_expert_lora_for_fp8_block_moe(
     ]
     assert torch.equal(
         experts.w13_weight[0, :2], torch.zeros_like(experts.w13_weight[0, :2])
+    )
+
+
+def test_mark_static_routed_lora_targets_preserves_unshuffled_moe_weights(tmp_path):
+    adapter_path = tmp_path / "adapter"
+    _write_adapter(
+        adapter_path,
+        {
+            "base_model.model.model.layers.0.mlp.experts.0.gate_proj."
+            "lora_A.weight": torch.ones(1, 4),
+            "base_model.model.model.layers.0.mlp.experts.0.gate_proj."
+            "lora_B.weight": torch.ones(2, 1),
+            "base_model.model.model.layers.0.self_attn.q_a_proj."
+            "lora_A.weight": torch.ones(1, 4),
+            "base_model.model.model.layers.0.self_attn.q_a_proj."
+            "lora_B.weight": torch.ones(2, 1),
+        },
+        r=1,
+        alpha=1,
+    )
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+    model.model.layers[0].mlp = nn.Module()
+    model.model.layers[0].mlp.experts = FakeFp8BlockFusedMoE()
+    model.model.layers[1].mlp = nn.Module()
+    model.model.layers[1].mlp.experts = FakeFp8BlockFusedMoE()
+
+    mark_static_routed_lora_targets(model, [f"test={adapter_path}"])
+
+    assert model.model.layers[0].mlp.experts._static_routed_lora_requires_unshuffled
+    assert not hasattr(
+        model.model.layers[1].mlp.experts,
+        "_static_routed_lora_requires_unshuffled",
     )
 
 

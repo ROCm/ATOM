@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 import os
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -58,7 +59,12 @@ from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 
 
+logger = logging.getLogger("atom")
 _StaticRoutedLoRAStore = dict[int, dict[str, list[tuple[str, str, float]]]]
+
+
+def _should_preserve_unshuffled_weights(layer: torch.nn.Module) -> bool:
+    return bool(getattr(layer, "_static_routed_lora_requires_unshuffled", False))
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -669,8 +675,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight = atom_parameter(self._maybe_pad_weight(layer.w13_weight.data))
         layer.w2_weight = atom_parameter(self._maybe_pad_weight(layer.w2_weight.data))
-        # reshaping weights is required for aiter moe kernel.
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        if not _should_preserve_unshuffled_weights(layer):
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1873,7 +1879,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # per_1x128 blockscale MoE only needs weight bpreshuffle when the
         # preshuffle GEMM path is enabled. Skip it to match the non-preshuffle
         # kernel's expected weight layout.
-        if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+        if (
+            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+            and not _should_preserve_unshuffled_weights(layer)
+        ):
             shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_channel_quant(self, layer: nn.Module) -> None:
@@ -1895,7 +1904,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data[expert_id] = w2_q
                 layer.w2_weight_scale.data[expert_id] = w2_s.squeeze(-1)
 
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        if not _should_preserve_unshuffled_weights(layer):
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_tensor_quant(self, layer: nn.Module) -> None:
         if not self.quant_config.is_dynamic:
@@ -1926,7 +1936,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ) = quant_func(dq_weight, max_w13_scales[expert_id])
                 start += shard_size
 
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        if not _should_preserve_unshuffled_weights(layer):
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
         layer.w13_weight_scale = atom_parameter(max_w13_scales)
 

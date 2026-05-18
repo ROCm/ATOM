@@ -201,6 +201,37 @@ def validate_lora_adapters_supported(lora_modules: list[str] | None) -> None:
         iter_lora_tensor_module_names(spec.path)
 
 
+def mark_static_routed_lora_targets(
+    model: nn.Module,
+    lora_modules: list[str] | None,
+) -> None:
+    """Mark MoE layers that need unshuffled weights for routed LoRA runtime."""
+    if not lora_modules:
+        return
+
+    model_modules = dict(model.named_modules())
+    marked = 0
+    for entry in lora_modules:
+        spec = parse_lora_module_entry(entry)
+        for module_name in iter_lora_tensor_module_names(spec.path):
+            match = _match_routed_expert(module_name)
+            if match is None:
+                continue
+            experts_name = f"{match.group('prefix')}.experts"
+            experts = model_modules.get(experts_name)
+            if experts is None:
+                continue
+            if not getattr(experts, "_static_routed_lora_requires_unshuffled", False):
+                marked += 1
+            experts._static_routed_lora_requires_unshuffled = True
+
+    if marked:
+        logger.info(
+            "Marked %d MoE layers to preserve unshuffled weights for static routed LoRA",
+            marked,
+        )
+
+
 def module_has_static_lora_adapters(module: nn.Module | None) -> bool:
     return bool(getattr(module, "_static_lora_adapters", ()))
 
