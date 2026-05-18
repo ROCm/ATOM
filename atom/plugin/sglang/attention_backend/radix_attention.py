@@ -90,8 +90,7 @@ class RadixAttention(BaseAttention):
                 )
             elif not self.attn.k_scale.is_cuda:
                 self.attn.k_scale = atom_parameter(
-                    self.attn.k_scale.detach().to(device="cuda"),
-                    requires_grad=False,
+                    self.attn.k_scale.detach().to(device="cuda")
                 )
             if self.attn.v_scale is None:
                 self.attn.v_scale = atom_parameter(
@@ -99,9 +98,15 @@ class RadixAttention(BaseAttention):
                 )
             elif not self.attn.v_scale.is_cuda:
                 self.attn.v_scale = atom_parameter(
-                    self.attn.v_scale.detach().to(device="cuda"),
-                    requires_grad=False,
+                    self.attn.v_scale.detach().to(device="cuda")
                 )
+            # Some SGLang attention backends consume the host-side float scales
+            # directly. Keep them in sync with the device-side defaults so the
+            # plugin path works even when checkpoint loading never populates them.
+            if self.attn.k_scale_float is None:
+                self.attn.k_scale_float = 1.0
+            if self.attn.v_scale_float is None:
+                self.attn.v_scale_float = 1.0
         else:
             raise NotImplementedError(
                 "RadixAttention is only supported for plugin mode for sglang for now"
