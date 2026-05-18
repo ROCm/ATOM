@@ -622,6 +622,102 @@ def test_static_routed_lora_reference_matches_manual_moe():
             expected[token_idx] += down.squeeze(0) * topk_weights[token_idx, route_idx]
 
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    assert sorted(layer._static_routed_lora_base_weight_cache) == [
+        (0, "down_proj", torch.float32),
+        (0, "gate_proj", torch.float32),
+        (0, "up_proj", torch.float32),
+        (1, "down_proj", torch.float32),
+        (1, "gate_proj", torch.float32),
+        (1, "up_proj", torch.float32),
+    ]
+
+    cached = dict(layer._static_routed_lora_base_weight_cache)
+    again = _apply_static_routed_lora_reference(
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert torch.allclose(again, expected, atol=1e-6, rtol=1e-6)
+    assert layer._static_routed_lora_base_weight_cache == cached
+
+
+def test_static_routed_lora_base_weight_cache_is_bounded(monkeypatch):
+    pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
+    from atom.model_ops import moe
+
+    layer = nn.Module()
+    layer.intermediate_size_per_partition = 1
+    layer.w13_weight = nn.Parameter(
+        torch.arange(12, dtype=torch.float32).reshape(2, 2, 3),
+        requires_grad=False,
+    )
+    layer.w2_weight = nn.Parameter(
+        torch.arange(6, dtype=torch.float32).reshape(2, 3, 1),
+        requires_grad=False,
+    )
+    monkeypatch.setattr(
+        moe.envs,
+        "ATOM_STATIC_ROUTED_LORA_WEIGHT_CACHE_SIZE",
+        2,
+        raising=False,
+    )
+
+    first = moe._get_static_lora_base_weight(
+        layer, 0, "gate_proj", torch.float32, 1, 1
+    )
+    second = moe._get_static_lora_base_weight(
+        layer, 0, "up_proj", torch.float32, 1, 1
+    )
+    third = moe._get_static_lora_base_weight(
+        layer, 0, "down_proj", torch.float32, 1, 1
+    )
+
+    cache = layer._static_routed_lora_base_weight_cache
+    assert list(cache) == [
+        (0, "up_proj", torch.float32),
+        (0, "down_proj", torch.float32),
+    ]
+    assert first is not second
+    assert third is cache[(0, "down_proj", torch.float32)]
+
+
+def test_static_routed_lora_base_weight_cache_can_be_disabled(monkeypatch):
+    pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
+    from atom.model_ops import moe
+
+    layer = nn.Module()
+    layer.intermediate_size_per_partition = 1
+    layer.w13_weight = nn.Parameter(
+        torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),
+        requires_grad=False,
+    )
+    layer.w2_weight = nn.Parameter(
+        torch.arange(3, dtype=torch.float32).reshape(1, 3, 1),
+        requires_grad=False,
+    )
+    monkeypatch.setattr(
+        moe.envs,
+        "ATOM_STATIC_ROUTED_LORA_WEIGHT_CACHE_SIZE",
+        0,
+        raising=False,
+    )
+
+    first = moe._get_static_lora_base_weight(
+        layer, 0, "gate_proj", torch.float32, 1, 1
+    )
+    second = moe._get_static_lora_base_weight(
+        layer, 0, "gate_proj", torch.float32, 1, 1
+    )
+
+    assert not hasattr(layer, "_static_routed_lora_base_weight_cache")
+    assert torch.equal(first, second)
+    assert first is not second
 
 
 def test_apply_lora_adapters_registers_vocab_parallel_lm_head(tmp_path):

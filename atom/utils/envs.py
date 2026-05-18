@@ -112,6 +112,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1"
     )
     == "1",
+    # Maximum number of dequantized base expert-projection weights cached per
+    # MoE layer for static routed LoRA reference fallback. 0 disables caching.
+    "ATOM_STATIC_ROUTED_LORA_WEIGHT_CACHE_SIZE": lambda: int(
+        os.getenv("ATOM_STATIC_ROUTED_LORA_WEIGHT_CACHE_SIZE", "24")
+    ),
     # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
     # `legacy` (default) keeps the per-seq Python dispatch loop with .item()
     # syncs in deepseek_v4.py. `new` routes through V4AttentionBackend with
