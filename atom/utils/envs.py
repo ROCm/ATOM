@@ -75,6 +75,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to 0 to disable if the thread pool causes hangs (e.g. on gfx1250).
     "ATOM_LOADER_USE_THREADPOOL": lambda: os.getenv("ATOM_LOADER_USE_THREADPOOL", "1")
     == "1",
+    # Static LoRA adapters to apply in vLLM plugin mode after base weights load.
+    # Format matches ATOM's standalone --lora-modules entries:
+    #   name=/path/to/adapter[,name2=/path/to/adapter2]
+    "ATOM_STATIC_LORA_MODULES": lambda: os.getenv("ATOM_STATIC_LORA_MODULES", ""),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

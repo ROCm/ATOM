@@ -5,6 +5,7 @@ import importlib
 import types
 import torch
 import torch.nn as nn
+from atom.utils import envs
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tp_group,
@@ -113,6 +114,13 @@ def _select_model_arch(vllm_config: VllmConfig) -> str:
     return model_arch
 
 
+def _static_lora_modules_from_env() -> list[str]:
+    raw = envs.ATOM_STATIC_LORA_MODULES
+    if not raw:
+        return []
+    return [entry.strip() for entry in raw.split(",") if entry.strip()]
+
+
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # forced_model_arch: str | None = None
 
@@ -141,6 +149,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         self.vllm_config = vllm_config
         self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
+        self.atom_config.lora_modules = _static_lora_modules_from_env()
         self.is_mtp = False
         speculative_config = getattr(vllm_config, "speculative_config", None)
         if speculative_config is not None:
@@ -182,6 +191,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
         self.model = model_cls(self.atom_config)
+        if self.atom_config.lora_modules:
+            from atom.model_loader.lora import mark_static_routed_lora_targets
+
+            mark_static_routed_lora_targets(self.model, self.atom_config.lora_modules)
         self._adapt_mtp_layers_for_vllm()
         # Mirror nested attributes required by vLLM speculative decoding.
         self._expose_spec_decode_attrs()
@@ -433,6 +446,18 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             spec_decode=is_mtp_draft_model,
             hf_config_override=draft_hf_config,
         )
+        if self.atom_config.lora_modules:
+            from atom.model_loader.lora import (
+                apply_lora_adapters,
+                validate_lora_adapters_supported,
+            )
+
+            validate_lora_adapters_supported(self.atom_config.lora_modules)
+            apply_lora_adapters(
+                self.model,
+                self.atom_config.lora_modules,
+                packed_modules_mapping=getattr(self.model, "packed_modules_mapping", {}),
+            )
         return loaded_weights_record
 
     def compute_logits(
