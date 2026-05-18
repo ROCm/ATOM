@@ -4,7 +4,6 @@
 import logging
 import os
 from abc import abstractmethod
-from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -285,64 +284,6 @@ def _dequantize_static_lora_weight(
     return (blocks * scale_blocks).reshape(out_dim, in_dim).to(dtype=dtype)
 
 
-def _get_static_lora_base_weight(
-    layer: torch.nn.Module,
-    local_expert_id: int,
-    proj: str,
-    dtype: torch.dtype,
-    block_n: int,
-    block_k: int,
-) -> torch.Tensor:
-    cache_name = "_static_routed_lora_base_weight_cache"
-    cache_size = envs.ATOM_STATIC_ROUTED_LORA_WEIGHT_CACHE_SIZE
-    if cache_size <= 0:
-        cache = None
-    else:
-        cache = getattr(layer, cache_name, None)
-        if cache is None:
-            cache = OrderedDict()
-            setattr(layer, cache_name, cache)
-
-    key = (int(local_expert_id), proj, dtype)
-    if cache is not None and key in cache:
-        cache.move_to_end(key)
-        return cache[key]
-
-    shard_size = layer.intermediate_size_per_partition
-    if proj in {"gate_proj", "up_proj"}:
-        w13 = layer.w13_weight[local_expert_id]
-        w13_scale = getattr(layer, "w13_weight_scale", None)
-        scale = None
-        if w13_scale is not None:
-            scale = w13_scale[local_expert_id]
-            if scale.dim() == 2 and scale.shape[0] % 2 == 0:
-                rows = scale.shape[0] // 2
-                scale = scale[:rows] if proj == "gate_proj" else scale[rows:]
-        weight = w13[:shard_size] if proj == "gate_proj" else w13[shard_size:]
-    elif proj == "down_proj":
-        weight = layer.w2_weight[local_expert_id]
-        scale = getattr(layer, "w2_weight_scale", None)
-        if scale is not None:
-            scale = scale[local_expert_id]
-    else:
-        raise ValueError(f"Unsupported routed expert LoRA projection: {proj}")
-
-    dequantized = _dequantize_static_lora_weight(
-        weight,
-        scale,
-        block_n,
-        block_k,
-        dtype,
-    ).contiguous()
-    if cache is None:
-        return dequantized
-
-    cache[key] = dequantized
-    while len(cache) > cache_size:
-        cache.popitem(last=False)
-    return dequantized
-
-
 def _apply_static_routed_lora_reference(
     layer: torch.nn.Module,
     x: torch.Tensor,
@@ -370,6 +311,7 @@ def _apply_static_routed_lora_reference(
     quant_method = getattr(layer, "quant_method", None)
     block_n = getattr(quant_method, "block_n", 1)
     block_k = getattr(quant_method, "block_k", 1)
+    shard_size = layer.intermediate_size_per_partition
 
     selected_expert_ids = torch.unique(topk_ids_cpu).tolist()
     for global_expert_id in selected_expert_ids:
@@ -396,11 +338,33 @@ def _apply_static_routed_lora_reference(
         route_ids = route_ids_cpu.to(device=x.device, dtype=torch.long)
         selected_x = x_lora.index_select(0, token_ids)
 
-        gate_weight = _get_static_lora_base_weight(
-            layer, local_expert_id, "gate_proj", lora_dtype, block_n, block_k
+        w13 = layer.w13_weight[local_expert_id]
+        w13_scale = getattr(layer, "w13_weight_scale", None)
+        gate_scale = None
+        up_scale = None
+        if w13_scale is not None:
+            w13_scale = w13_scale[local_expert_id]
+            if w13_scale.dim() == 2 and w13_scale.shape[0] % 2 == 0:
+                rows = w13_scale.shape[0] // 2
+                gate_scale = w13_scale[:rows]
+                up_scale = w13_scale[rows : rows * 2]
+            else:
+                gate_scale = w13_scale
+                up_scale = w13_scale
+
+        gate_weight = _dequantize_static_lora_weight(
+            w13[:shard_size],
+            gate_scale,
+            block_n,
+            block_k,
+            lora_dtype,
         )
-        up_weight = _get_static_lora_base_weight(
-            layer, local_expert_id, "up_proj", lora_dtype, block_n, block_k
+        up_weight = _dequantize_static_lora_weight(
+            w13[shard_size : shard_size * 2],
+            up_scale,
+            block_n,
+            block_k,
+            lora_dtype,
         )
 
         gate = torch.matmul(selected_x, gate_weight.t())
@@ -424,8 +388,15 @@ def _apply_static_routed_lora_reference(
                 up = up + proj_delta
 
         hidden = torch.nn.functional.silu(gate) * up
-        w2_weight = _get_static_lora_base_weight(
-            layer, local_expert_id, "down_proj", lora_dtype, block_n, block_k
+        w2_scale = getattr(layer, "w2_weight_scale", None)
+        if w2_scale is not None:
+            w2_scale = w2_scale[local_expert_id]
+        w2_weight = _dequantize_static_lora_weight(
+            layer.w2_weight[local_expert_id],
+            w2_scale,
+            block_n,
+            block_k,
+            lora_dtype,
         )
         down_out = torch.matmul(hidden, w2_weight.t())
         for a_name, b_name, scaling in projections.get("down_proj", ()):
