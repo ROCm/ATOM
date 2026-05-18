@@ -15,7 +15,6 @@ from atom.model_loader.lora import (
     any_module_has_static_lora_adapters,
     apply_lora_adapters,
     load_lora_tensors,
-    lora_modules_have_routed_experts,
     mark_static_routed_lora_targets,
     module_has_static_lora_adapters,
     parse_lora_module_entry,
@@ -704,36 +703,6 @@ def test_validate_lora_adapters_accepts_routed_fused_moe_experts(tmp_path):
     )
 
     validate_lora_adapters_supported([f"user={adapter_path}"])
-
-
-def test_lora_modules_have_routed_experts_detects_expert_adapters(tmp_path):
-    adapter_path = tmp_path / "adapter"
-    _write_adapter(
-        adapter_path,
-        {
-            "base_model.model.model.layers.10.mlp.experts.0.down_proj."
-            "lora_A.weight": torch.ones(2, 3),
-            "base_model.model.model.layers.10.mlp.experts.0.down_proj."
-            "lora_B.weight": torch.ones(4, 2),
-        },
-    )
-
-    assert lora_modules_have_routed_experts([f"user={adapter_path}"])
-
-
-def test_lora_modules_have_routed_experts_ignores_regular_adapters(tmp_path):
-    adapter_path = tmp_path / "adapter"
-    _write_adapter(
-        adapter_path,
-        {
-            "base_model.model.model.layers.10.self_attn.q_a_proj."
-            "lora_A.weight": torch.ones(2, 3),
-            "base_model.model.model.layers.10.self_attn.q_a_proj."
-            "lora_B.weight": torch.ones(4, 2),
-        },
-    )
-
-    assert not lora_modules_have_routed_experts([f"user={adapter_path}"])
 
 
 def test_validate_lora_adapters_requires_config(tmp_path):
