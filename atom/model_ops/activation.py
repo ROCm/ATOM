@@ -5,25 +5,12 @@ import torch
 import torch.nn.functional as F
 from aiter import (
     QuantType,
-    silu_and_mul,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.config import QuantizationConfig
 from atom.quant_spec import LayerQuantConfig
 from torch import nn
 from typing import Optional
-
-
-def _detect_gfx1201() -> bool:
-    try:
-        return (torch.cuda.get_device_properties(0).gcnArchName or "").startswith(
-            "gfx1201"
-        )
-    except Exception:
-        return False
-
-
-_IS_GFX1201: bool = _detect_gfx1201()
 
 
 def mxfp4_act_mul_quant_fuse_fake(
@@ -95,14 +82,6 @@ class SiluAndMul(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # gfx1201 (RDNA4): aiter's prebuilt HIP silu_and_mul has no gfx1201
-        # code object (its inner kernel uses v_pk_mul_f32, a CDNA-only
-        # instruction). Route through aiter's portable triton
-        # fused_silu_mul (PR #2578).
-        if _IS_GFX1201:
-            from aiter.ops.triton.activation import fused_silu_mul
-
-            return fused_silu_mul(x)
         # fp8 quantization
         if x_scale is not None and self.fused_quant:
             from aiter.ops.triton.fused_fp8_quant import (
@@ -123,9 +102,11 @@ class SiluAndMul(nn.Module):
             and self.quant_type.value == QuantType.per_1x32.value
         ):
             return mxfp4_act_mul_quant_fuse(x, shuffle=True)
+        # aiter triton fused_silu_mul (portable, works on all archs)
+        elif x.is_contiguous() and x.size(-1) % 2 == 0:
+            from aiter.ops.triton.activation import fused_silu_mul
+
+            return fused_silu_mul(x)
+        # torch fallback
         else:
-            out = torch.empty(
-                [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
-            )
-            silu_and_mul(out, x)
-            return out
+            return self.forward_native(x)
