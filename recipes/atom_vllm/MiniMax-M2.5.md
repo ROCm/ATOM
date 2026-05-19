@@ -1,84 +1,88 @@
-# MiniMax-M2.5 with vLLM-ATOM Plugin Backend
+# MiniMax-M2.5 with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `MiniMaxAI/MiniMax-M2.5` with the vLLM-ATOM plugin backend. For background on the plugin backend, see [vLLM plugin backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `MiniMaxAI/MiniMax-M2.5` (HF `architectures[0]`: `MiniMaxM2ForCausalLM`, MoE + FP8 weights) with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
 The checkpoint uses custom modeling code; keep `--trust-remote-code` on the server command line.
 
 ## Step 1: Pull the OOT Docker
 
 ```bash
-docker pull rocm/atom-dev:vllm-v0.19.0-nightly_20260517
+docker pull rocm/atom-dev:vllm-latest
 ```
 
 ## Step 2: Launch vLLM Server
 
-The vLLM-ATOM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
+The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
+
+The following matches the internal benchmark entry (`--kv_cache_dtype fp8 -tp 2 --trust-remote-code` in `.github/benchmark/models.json`). On multi-GPU hosts, use tensor parallel size 2 or adjust to your topology.
 
 ```bash
-TP=2
-MODEL="MiniMaxAI/MiniMax-M2.5"
-
-export SAFETENSORS_FAST_GPU=1
-export VLLM_RPC_TIMEOUT=1800000
-export VLLM_CACHE_ROOT=/root/.cache/vllm
-export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 
-rm -rf /root/.cache
-vllm serve "${MODEL}" \
+vllm serve MiniMaxAI/MiniMax-M2.5 \
     --host 0.0.0.0 \
     --port 8000 \
     --async-scheduling \
     --load-format fastsafetensors \
-    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --tensor-parallel-size 2 \
     --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --kv-cache-dtype fp8 \
-    --tensor-parallel-size "${TP}" \
     --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
     --no-enable-prefix-caching
 ```
 
+Caveat: the upstream `config.json` may advertise MTP-related fields; the current ATOM `MiniMaxM2ForCausalLM` path targets the main transformer. If you hit load or shape errors around MTP modules, compare with native ATOM server behavior and upstream vLLM release notes.
+
 ## Step 3: Performance Benchmark
 
 ```bash
-TP=2
-ISL=1000
-OSL=100
-CONC=4
-RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-RESULTS_DIR="${RESULTS_DIR:-$PWD/results_minimax}/${RUN_ID}"
-NAME="${RUN_ID}-minimax-m2-5-aw-tp${TP}-${ISL}-${OSL}-${CONC}"
-
-mkdir -p "${RESULTS_DIR}"
-
 vllm bench serve \
     --backend vllm \
     --base-url http://127.0.0.1:8000 \
     --endpoint /v1/completions \
     --model MiniMaxAI/MiniMax-M2.5 \
     --dataset-name random \
-    --random-input-len "${ISL}" \
-    --random-output-len "${OSL}" \
+    --random-input-len 1000 \
+    --random-output-len 100 \
     --temperature 0.0 \
-    --num-prompts "$(( CONC * 10 ))" \
-    --max-concurrency "${CONC}" \
+    --max-concurrency 4 \
+    --num-prompts 40 \
     --trust_remote_code \
-    --num-warmups "$(( 2 * CONC ))" \
+    --num-warmups 8 \
     --request-rate inf \
     --ignore-eos \
     --disable-tqdm \
     --save-result \
-    --percentile-metrics ttft,tpot,itl,e2el \
-    --result-dir "${RESULTS_DIR}" \
-    --result-filename "${NAME}.json"
+    --percentile-metrics ttft,tpot,itl,e2el
 ```
+
 ## Step 4: Accuracy Validation
+
+Nightly OOT accuracy uses `gsm8k` with **3-shot** in `.github/scripts/atom_oot_test.sh` (same as other full-validation models). For a local check:
 
 ```bash
 lm_eval --model local-completions \
         --model_args model=MiniMaxAI/MiniMax-M2.5,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True \
         --tasks gsm8k \
-        --num_fewshot 3
+        --num_fewshot 3 \
+        --output_path ./lm_eval_minimax_m25_gsm8k
 ```
+
+Reference metric (tracking baseline for this model family; replace with your run output and keep the raw JSON path next to the table):
+
+- Internal tracking: `accuracy_baseline` **0.9401** for `MiniMaxAI/MiniMax-M2.5` in `.github/benchmark/models_accuracy.json` (see `_baseline_note` there for HF card context).
+- OOT gate: `accuracy_test_threshold` **0.92** on `exact_match,flexible-extract` (see `atom-vllm-oot-test.yaml` nightly matrix).
+
+Example table shape after `lm_eval` (fill `Value` / `Stderr` from your console or `${output_path}` JSON):
+
+```text
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     3|exact_match|↑  |0.9287|±  |0.0071|
+|     |       |strict-match    |     3|exact_match|↑  |0.9272|±  |0.0072|
+```
+
+Raw results JSON: `<path-to-lm_eval-output-*.json>` (from `--output_path` above).
