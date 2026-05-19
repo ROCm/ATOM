@@ -16,7 +16,7 @@ from atom.models.utils import IntermediateTensors
 from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
-from .deepseek_v2 import DeepseekV2DecoderLayer
+from .deepseek_v2 import DeepseekV2DecoderLayer, _can_fuse_indexer_wk_weights_proj
 from .utils import ckpt_has_tensor_suffix, maybe_prefix
 
 
@@ -215,19 +215,38 @@ class DeepSeekMTP(nn.Module):
                 "up_proj": ("gate_up_proj", 1),
             }
 
+        topk_indices_buffer = None
+        model_prefix = maybe_prefix(prefix, "model")
         if hasattr(self.config, "index_topk"):
+            indexer_prefixes = [
+                f"{model_prefix}.layers.{idx}.self_attn.indexer"
+                for idx in range(
+                    self.config.num_hidden_layers,
+                    self.config.num_hidden_layers
+                    + self.config.num_nextn_predict_layers,
+                )
+            ]
+            if _can_fuse_indexer_wk_weights_proj(
+                self.config,
+                atom_config.quant_config,
+                indexer_prefixes,
+            ):
+                self.packed_modules_mapping.update(
+                    {
+                        "indexer.wk": ("indexer.wk_weights_proj", 0),
+                        "indexer.weights_proj": ("indexer.wk_weights_proj", 1),
+                    }
+                )
             topk_indices_buffer = torch.empty(
                 atom_config.max_num_batched_tokens,
                 self.config.index_topk,
                 dtype=torch.int32,
                 device="cuda",
             )
-        else:
-            topk_indices_buffer = None
 
         self.model = DeepSeekMultiTokenPredictor(
             atom_config=atom_config,
-            prefix=maybe_prefix(prefix, "model"),
+            prefix=model_prefix,
             topk_indices_buffer=topk_indices_buffer,
         )
 
