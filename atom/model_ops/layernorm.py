@@ -678,42 +678,31 @@ class GemmaRMSNorm(nn.Module):
         """PyTorch-native implementation equivalent to forward()."""
         return self.forward_static(self.weight.data, self.variance_epsilon, x, residual)
 
+    def _get_aiter_weight(self) -> torch.Tensor:
+        """Cache weight + 1.0 for aiter rmsnorm (which uses x*w, not x*(1+w))."""
+        if not hasattr(self, "_aiter_weight_cache") or self._aiter_weight_cache is None:
+            self._aiter_weight_cache = self.weight.data + 1.0
+        return self._aiter_weight_cache
+
     def forward_cuda(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # Use the aiter HIP fused_qk_rmsnorm_group_quant kernel in no-quant mode
-        # (q_out_scale=None) to perform Gemma RMSNorm + optional residual add.
-        # Same math as the Triton kernel: out = rmsnorm(x [+ residual]) * (1 + w),
-        # but executed by the aiter kernel for higher achieved bandwidth.
-        from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+        from aiter import rmsnorm2d_fwd, rmsnorm2d_fwd_with_add
 
+        weight = self._get_aiter_weight()
         ori_shape = x.shape
-        x_2d = x.view(-1, ori_shape[-1])
+        x = x.view(-1, ori_shape[-1])
 
-        out = torch.empty_like(x_2d)
         if residual is not None:
-            residual_2d = residual.view(-1, ori_shape[-1])
-            res_out = torch.empty_like(x_2d)
-        else:
-            residual_2d = None
-            res_out = None
+            residual = residual.view(-1, ori_shape[-1])
+            out = torch.empty_like(x)
+            residual_out = torch.empty_like(residual)
+            rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, self.variance_epsilon)
+            return out.view(ori_shape), residual_out.view(ori_shape)
 
-        fused_qk_rmsnorm_group_quant(
-            q=x_2d,
-            q_weight=self.weight.data,
-            q_epsilon=self.variance_epsilon,
-            q_out_unquantized=out,
-            q_res_out=res_out,
-            q_residual=residual_2d,
-            gemma_norm=True,
-        )
-
-        out = out.view(ori_shape)
-        if residual is not None:
-            return out, res_out.view(ori_shape)
-        return out
+        return rmsnorm2d_fwd(x, weight, self.variance_epsilon).view(ori_shape)
 
     def _forward_fused_fp8(self, x, residual=None):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
