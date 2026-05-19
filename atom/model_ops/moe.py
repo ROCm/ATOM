@@ -1019,10 +1019,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or custom_routing_function is not None
             )
 
-            logger.warning("layer swizzle layouts")
-            logger.warning(layer.w13_swizzle_layout)
-            logger.warning(layer.w2_swizzle_layout)
-
             if needs_custom_routing:
                 # Use ATOM's full-featured select_experts for routing,
                 # then triton matmul_ogs for the actual MoE computation.
