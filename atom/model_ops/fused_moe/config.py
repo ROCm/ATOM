@@ -265,7 +265,7 @@ def fp8_w8a8_moe_quant_config(
         block_shape=block_shape,
     )
 
-# TODO new moe quant config for a8w4,
+
 def mxfp4_w4a8_moe_quant_config(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,

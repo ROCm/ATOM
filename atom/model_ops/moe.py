@@ -911,11 +911,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.view(torch.uint8),
                 layer.w2_weight_scale,
                 "mx4",
-                self.intermediate_size * 2,#N_1, --  FC1
-                self.hidden_size,#K_1,   --  FC1
-                self.hidden_size,#N_2,   --  FC2
-                self.intermediate_size,#K_2,   --  FC2
-                atom_config.tensor_parallel_size#TP
+                self.intermediate_size * 2,#N_1,
+                self.hidden_size,#K_1,
+                self.hidden_size,#N_2,
+                self.intermediate_size,#K_2,
+                atom_config.tensor_parallel_size
             )
             del layer.w13_weight
             del layer.w2_weight
@@ -2145,7 +2145,6 @@ class FusedMoE(torch.nn.Module):
             has_bias=self.has_bias,
             # is_act_and_mul=True,
             is_lora_enabled=False,
-            static_scale=torch.tensor(6.7e-3, device="cuda:0") # TODO adjust
         )
         self.moe_config = moe
         self.quant_config = quant_config
