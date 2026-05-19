@@ -583,7 +583,7 @@ jobs:
             }'
 
             rm -rf ~/.cache/atom/*
-            ATOM_HOST_IP=${PROXY_IP} ATOM_DISABLE_MMAP=true AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+            ATOM_DISABLE_MMAP=true AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
               python -m atom.entrypoints.openai_server \
                 --model $model_path \
                 --server-port 8003 \
@@ -756,7 +756,7 @@ jobs:
           echo "Connecting to proxy at ${PROXY_IP}, local IP: ${LOCAL_IP}"
           docker exec atom-smoke-decode bash -lc "
             rm -rf ~/.cache/atom/*
-            ATOM_HOST_IP=${LOCAL_IP} ATOM_DISABLE_MMAP=true AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+            ATOM_DISABLE_MMAP=true AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
               python -m atom.entrypoints.openai_server \
                 --model $model_path \
                 --server-port 8004 \
@@ -932,6 +932,27 @@ jobs:
           fi
           echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
 
+      - name: Check RDMA and network (prefill)
+        run: |
+          echo "=== Host RDMA ==="
+          ls -la /dev/infiniband/ 2>/dev/null || echo "No /dev/infiniband on host"
+          ls /sys/class/infiniband/ 2>/dev/null || echo "No /sys/class/infiniband on host"
+          echo "=== Container RDMA ==="
+          docker exec atom-pd-prefill bash -c '
+            ls -la /dev/infiniband/ 2>/dev/null || echo "No /dev/infiniband"
+            ls /sys/class/infiniband/ 2>/dev/null || echo "No /sys/class/infiniband"
+            ibv_devices 2>/dev/null || echo "ibv_devices not available"
+          '
+          echo "=== Auto-detected IP (get_ip) ==="
+          docker exec atom-pd-prefill python3 -c "
+          import socket
+          with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+              s.connect(('8.8.8.8', 80))
+              print(f'get_ip would return: {s.getsockname()[0]}')
+          "
+          echo "=== hostname -I ==="
+          docker exec atom-pd-prefill bash -c "hostname -I"
+
       - name: Download model
         run: |
           if [ -d "/models" ]; then
@@ -943,6 +964,8 @@ jobs:
         run: |
           docker exec atom-pd-prefill bash -lc \
             "pip install msgpack msgspec quart mooncake-transfer-engine"
+          docker exec atom-pd-prefill bash -c \
+            "sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null || true"
 
       - name: Start proxy and producer
         run: |
@@ -975,7 +998,7 @@ jobs:
 
             echo '========== Starting Producer on port 8003 =========='
             rm -rf ~/.cache/atom/*
-            ATOM_HOST_IP=${PROXY_IP} ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+            ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
               python -m atom.entrypoints.openai_server \
                 --model $model_path \
                 --server-port 8003 \
@@ -1034,10 +1057,28 @@ jobs:
               print('{input_length}|{output_length}|{concurrency}|{random_range_ratio}'.format(**c))
           " > /tmp/pd_configs.txt
 
+          RUN_IDX=0
           while IFS='|' read -r ISL OSL CONC RRR; do
             RESULT_FILENAME="${{ matrix.model.prefix }}-${ISL}-${OSL}-${CONC}-${RRR}"
             echo ""
             echo "========== Benchmark: ISL=${ISL} OSL=${OSL} CONC=${CONC} =========="
+
+            if [ "$RUN_IDX" -gt 0 ]; then
+              echo "Waiting for TIME_WAIT sockets to clear before next run..."
+              docker exec atom-pd-prefill bash -c '
+                for i in $(seq 1 30); do
+                  tw=$(ss -s 2>/dev/null | grep -oP "timewait \K[0-9]+" || echo 0)
+                  if [ "$tw" -lt 100 ]; then
+                    echo "TIME_WAIT sockets: $tw — OK"
+                    break
+                  fi
+                  echo "  TIME_WAIT sockets: $tw, waiting... ($i/30)"
+                  sleep 2
+                done
+              '
+            fi
+            RUN_IDX=$((RUN_IDX + 1))
+
             docker exec atom-pd-prefill bash -lc "set -euo pipefail
               ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RRR} \
               RESULT_FILENAME=${RESULT_FILENAME} \
@@ -1248,6 +1289,27 @@ jobs:
             --name atom-pd-consumer-${{ env.DECODE_INDEX }} \
             ${{ env.ATOM_DOCKER_IMAGE }}
 
+      - name: Check RDMA and network (decode)
+        run: |
+          echo "=== Host RDMA ==="
+          ls -la /dev/infiniband/ 2>/dev/null || echo "No /dev/infiniband on host"
+          ls /sys/class/infiniband/ 2>/dev/null || echo "No /sys/class/infiniband on host"
+          echo "=== Container RDMA ==="
+          docker exec atom-pd-consumer-${{ env.DECODE_INDEX }} bash -c '
+            ls -la /dev/infiniband/ 2>/dev/null || echo "No /dev/infiniband"
+            ls /sys/class/infiniband/ 2>/dev/null || echo "No /sys/class/infiniband"
+            ibv_devices 2>/dev/null || echo "ibv_devices not available"
+          '
+          echo "=== Auto-detected IP (get_ip) ==="
+          docker exec atom-pd-consumer-${{ env.DECODE_INDEX }} python3 -c "
+          import socket
+          with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+              s.connect(('8.8.8.8', 80))
+              print(f'get_ip would return: {s.getsockname()[0]}')
+          "
+          echo "=== hostname -I ==="
+          docker exec atom-pd-consumer-${{ env.DECODE_INDEX }} bash -c "hostname -I"
+
       - name: Download model
         run: |
           if [ -d "/models" ]; then
@@ -1293,7 +1355,7 @@ jobs:
 
           docker exec atom-pd-consumer-${{ env.DECODE_INDEX }} bash -lc "
             rm -rf ~/.cache/atom/*
-            ATOM_HOST_IP=${CONSUMER_IP} ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+            ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
               python -m atom.entrypoints.openai_server \
                 --model $model_path \
                 --server-port ${{ env.CONSUMER_PORT }} \
