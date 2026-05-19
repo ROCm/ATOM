@@ -7,13 +7,8 @@ This module provides additional methods for MLAAttention when running in plugin 
 """
 
 import torch
-from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
-from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
-    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
-)
 
-from functools import partial as functools_partial
 from atom.model_ops.linear import use_triton_gemm
 
 
@@ -27,11 +22,16 @@ fused_gemm_afp4wfp4_preshuffle_split_cat = None
 
 if use_triton_gemm():
     try:
-        from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
-            fused_gemm_a8w8_blockscale_preshuffle_split_cat,
+        from aiter.ops.triton import (
+            fused_gemm_a8w8_blockscale_split_cat as _fp8_split_cat,
         )
-        from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import (
-            fused_gemm_afp4wfp4_preshuffle_split_cat,
+        from aiter.ops.triton import fused_gemm_afp4wfp4_split_cat as _fp4_split_cat
+
+        fused_gemm_a8w8_blockscale_preshuffle_split_cat = (
+            _fp8_split_cat.fused_gemm_a8w8_blockscale_preshuffle_split_cat
+        )
+        fused_gemm_afp4wfp4_preshuffle_split_cat = (
+            _fp4_split_cat.fused_gemm_afp4wfp4_preshuffle_split_cat
         )
     except ImportError as e:
         logger.warning(f"Triton fused GEMM split_cat not available: {e}")

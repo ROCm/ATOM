@@ -5,8 +5,6 @@ from dataclasses import dataclass
 import torch
 import logging
 
-from atom.utils import envs
-
 logger = logging.getLogger("atom")
 
 

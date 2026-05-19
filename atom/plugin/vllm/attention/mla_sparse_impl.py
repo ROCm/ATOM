@@ -13,14 +13,8 @@ write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
 import torch
-from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
-from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
-    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
-)
-from aiter.mla import mla_decode_fwd
 from aiter import (
-    fused_qk_rope_concat_and_cache_mla,
     cp_gather_indexer_k_quant_cache,
     dtypes,
     indexer_k_quant_and_cache,
@@ -77,7 +71,9 @@ def _convert_req_index_to_global_index_kernel(
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
     base = tl.load(bt_ptr, mask=valid_block, other=0)
 
-    out_val = tl.where(is_invalid_tok | (~valid_block), 0, base * BLOCK_SIZE + inblock_off)
+    out_val = tl.where(
+        is_invalid_tok | (~valid_block), 0, base * BLOCK_SIZE + inblock_off
+    )
     out_ptr_ij = out_ptr + seq_start + indice_id
     out_ptr_ij_mask = (seq_start + indice_id) < seq_end
     tl.store(out_ptr_ij, out_val, mask=out_ptr_ij_mask)

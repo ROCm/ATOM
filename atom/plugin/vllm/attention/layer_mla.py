@@ -60,7 +60,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         model_layer_name = prefix if prefix is not None else f"MLA_{layer_num}"
         layer_name = f"{model_layer_name}.attn"
-        cache_dtype = cache_config.cache_dtype if cache_config is not None else kv_cache_dtype
+        cache_dtype = (
+            cache_config.cache_dtype if cache_config is not None else kv_cache_dtype
+        )
         calculate_kv_scales = (
             cache_config.calculate_kv_scales if cache_config is not None else False
         )
