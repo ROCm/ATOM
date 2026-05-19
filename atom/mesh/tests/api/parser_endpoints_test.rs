@@ -59,10 +59,6 @@ impl ParserTestContext {
             workers.push(worker);
         }
 
-        if !workers.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        }
-
         // Update config with worker URLs if not already set
         if let RoutingMode::Regular {
             worker_urls: ref mut urls,
