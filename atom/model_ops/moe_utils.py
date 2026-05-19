@@ -1,7 +1,8 @@
 # # edit as required but these are all the triton_kernels components used 
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.moe.moe_op_gemm_a4w4 import swizzle_scales
+from aiter.ops.triton.moe.moe_op_gemm_a4w4 import swizzle_scales # same for a4 and a16
+from aiter.ops.triton.moe.moe_routing.routing import ExptData
 import torch
 
 import logging
@@ -36,3 +37,29 @@ def quantize(x, dtype):
         assert dtype == "mx4", f"{dtype=}"
         x, scale = downcast_to_mxfp(x.to(torch.bfloat16), torch.uint8, axis=1)
         return x, scale
+
+def compute_expt_data(hist, n_expts_tot, n_gates, block_m):
+    # Similar in form to aiter compute_expt_data_torch, but isolated for ATOM
+    # offset for each experts
+    device = hist.device
+    token_offs_raw = torch.cumsum(hist, dim=0)
+    token_offs_raw = torch.cat((torch.zeros(1, device=device), token_offs_raw))
+    token_offs_raw = token_offs_raw.int()
+    # maximum number of tiles for all values of `block_m` considered
+    if n_gates <= n_expts_tot:
+        max_n_tiles = n_gates
+    else:
+        max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // block_m)
+    # fill up tile offset/infos for each block
+    n_tiles = (hist + block_m - 1) // block_m  # matmul blocks needed
+    token_offs_pad = torch.cumsum(n_tiles, dim=0)
+    token_offs_pad = torch.cat((torch.zeros(1, device=device), token_offs_pad))
+    token_offs_pad = token_offs_pad.int()
+    # compute data required to drive ragged batch matmul
+    block_pid_map = -torch.ones(max_n_tiles, device=device)
+    for e in range(n_expts_tot):
+        offset = token_offs_pad[e]
+        for b in range(n_tiles[e]):
+            block_pid_map[offset + b] = (b << 16) + e
+    block_pid_map = block_pid_map.int()
+    return ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
