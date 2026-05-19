@@ -14,6 +14,8 @@ tests/
 ├── security/                   # Authentication and access control tests
 ├── spec/                       # Protocol contract/spec tests
 ├── common/                     # Shared test utilities (not tests themselves)
+├── test_atomesh/               # Fixture-driven Atomesh test harness
+├── fixtures/mock_tests/        # Prompt/request and expected-response samples
 ├── inflight_tracker_test.rs    # Standalone: inflight request tracking
 ├── load_guard_raii_test.rs     # Standalone: RAII load guard lifecycle
 └── metrics_aggregator_test.rs  # Standalone: Prometheus metrics aggregation
@@ -30,6 +32,17 @@ The `common/` directory provides shared test utilities used across all test modu
 | `test_app.rs` | `AppTestContext` — builds a full router app stack for integration testing |
 | `test_config.rs` | `TestRouterConfig` / `TestWorkerConfig` — helpers for constructing test configurations |
 | `streaming_helpers.rs` | Utilities for testing SSE (Server-Sent Events) streaming responses |
+
+The `test_atomesh/` directory provides a reusable fixture-driven harness:
+
+| File | Purpose |
+|------|---------|
+| `mock_test_case.rs` | Loads prompt/request, route mode, and expected-response fixtures |
+| `virtual_request.rs` | Builds real Atomesh HTTP requests from fixtures |
+| `virtual_worker.rs` | Axum virtual worker that replays matched fixture responses |
+| `test_harness.rs` | Starts virtual workers, builds Atomesh app context, sends requests, and asserts results |
+| `golden_assert.rs` | Shared subset assertions for dynamic response bodies |
+| `mock_grpc_worker.rs` | Reserved boundary for future tonic-backed worker smoke tests |
 
 ---
 
@@ -95,18 +108,18 @@ Contract tests that verify serialization/deserialization behavior of protocol ty
 
 ```bash
 # Run all mesh tests
-cargo test -p mesh
+cargo test -p atom-mesh
 
 # Run a specific test module
-cargo test -p mesh --test api_tests
-cargo test -p mesh --test routing_tests
-cargo test -p mesh --test reliability_tests
-cargo test -p mesh --test security_tests
-cargo test -p mesh --test spec_test
+cargo test -p atom-mesh --test api_tests
+cargo test -p atom-mesh --test routing_tests
+cargo test -p atom-mesh --test reliability_tests
+cargo test -p atom-mesh --test security_tests
+cargo test -p atom-mesh --test spec_test
 
 # Run a specific test by name
-cargo test -p mesh test_list_workers
+cargo test -p atom-mesh test_list_workers
 
 # Run with output
-cargo test -p mesh -- --nocapture
+cargo test -p atom-mesh -- --nocapture
 ```

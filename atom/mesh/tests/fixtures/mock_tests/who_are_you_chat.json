@@ -1,0 +1,41 @@
+{
+  "name": "who_are_you_chat",
+  "model": "test-model",
+  "endpoint": "/v1/chat/completions",
+  "route": {
+    "worker_kind": "regular",
+    "connection_mode": "http"
+  },
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "who are you?"
+      }
+    ],
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "body": {
+      "id": "chatcmpl-test",
+      "object": "chat.completion",
+      "model": "test-model",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "I am your father"
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    }
+  },
+  "simulation": {
+    "ttft_ms": 30,
+    "chunk_interval_ms": 5,
+    "fail_after_chunks": null
+  }
+}

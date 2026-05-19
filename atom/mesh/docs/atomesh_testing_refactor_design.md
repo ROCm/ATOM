@@ -133,7 +133,7 @@ tests/
 │   ├── test_harness.rs             # 新增：统一启动 app、注册 worker、发送请求、断言
 │   ├── golden_assert.rs            # 新增：统一 response / SSE / worker path 断言
 │   ├── virtual_worker.rs           # 新增：virtual regular/PD worker
-│   ├── replay_store.rs             # 新增：加载和匹配 mock test cases
+│   ├── replay_case_store.rs        # 新增：保存和匹配可回放 mock test cases
 │   └── mock_grpc_worker.rs         # 新增：最小 tonic mock backend
 ├── fixtures/                        # 新增：测试数据层
 │   ├── mock_tests/                  # prompt/request + expected response 样本
@@ -164,6 +164,7 @@ tests/
 - `tests/test_atomesh/virtual_request.rs` 对应 `VirtualRequest`，把测试样本转成真实 Atomesh API 请求；HTTP/gRPC 的差异发生在 Atomesh 到 worker 的后端连接。
 - `tests/test_atomesh/test_harness.rs` 对应 `TestHarness`，统一完成 app 启动、worker 注册、请求发送和结果断言。
 - `tests/test_atomesh/virtual_worker.rs` 与 `tests/test_atomesh/mock_grpc_worker.rs` 对应 `VirtualWorker`，分别覆盖 HTTP virtual worker 和最小 gRPC backend。
+- `tests/test_atomesh/replay_case_store.rs` 对应 `ReplayCaseStore`，保存一组可回放 `MockTestCase`，并按 endpoint 与请求内容匹配 virtual worker 应返回的样本。
 - `tests/fixtures/mock_tests/` 是新增测试样本层，不是新增测试入口；它让现有 case 可以复用同一批 prompt/request 与 expected response。
 
 ## 4. Virtual Worker 设计
