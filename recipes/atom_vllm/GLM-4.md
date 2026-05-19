@@ -1,56 +1,76 @@
-# GLM-4-MoE with ATOM vLLM Plugin Backend
+# GLM-4-MoE with vLLM-ATOM Plugin Backend
 
-This recipe shows how to run a `GLM-4-MoE` model with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
-
-The checkpoint used here should expose the `Glm4MoeForCausalLM` architecture so it can be picked up by the ATOM OOT model override.
+This recipe shows how to run `zai-org/GLM-4.7-FP8` with the vLLM-ATOM plugin backend. For background on the plugin backend, see [vLLM plugin backend](../../docs/vllm_plugin_backend_guide.md).
 
 ## Step 1: Pull the OOT Docker
 
 ```bash
-docker pull rocm/atom-dev:vllm-latest
+docker pull rocm/atom-dev:vllm-v0.19.0-nightly_20260517
 ```
 
 ## Step 2: Launch vLLM Server
 
-The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
+The vLLM-ATOM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
 ```bash
-vllm serve zai-org/GLM-4.7-FP8 \
-    --host localhost \
+TP=4
+MODEL="zai-org/GLM-4.7-FP8"
+
+export SAFETENSORS_FAST_GPU=1
+export VLLM_RPC_TIMEOUT=1800000
+export VLLM_CACHE_ROOT=/root/.cache/vllm
+export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+
+rm -rf /root/.cache
+vllm serve "${MODEL}" \
+    --host 0.0.0.0 \
     --port 8000 \
-    --tensor-parallel-size 8 \
-    --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format fastsafetensors \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size "${TP}" \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
     --no-enable-prefix-caching
 ```
 
 ## Step 3: Performance Benchmark
-Users can use the default vllm bench commands for performance benchmarking.
+
 ```bash
+TP=4
+ISL=1000
+OSL=100
+CONC=4
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+RESULTS_DIR="${RESULTS_DIR:-$PWD/results_glm47}/${RUN_ID}"
+NAME="${RUN_ID}-glm-4-7-fp8-aw-tp${TP}-${ISL}-${OSL}-${CONC}"
+
+mkdir -p "${RESULTS_DIR}"
+
 vllm bench serve \
-    --host localhost \
-    --port 8000 \
+    --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --endpoint /v1/completions \
     --model zai-org/GLM-4.7-FP8 \
     --dataset-name random \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.8 \
-    --max-concurrency 64 \
-    --num-prompts 640 \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --temperature 0.0 \
+    --num-prompts "$(( CONC * 10 ))" \
+    --max-concurrency "${CONC}" \
     --trust_remote_code \
-    --percentile-metrics ttft,tpot,itl,e2el
+    --num-warmups "$(( 2 * CONC ))" \
+    --request-rate inf \
+    --ignore-eos \
+    --disable-tqdm \
+    --save-result \
+    --percentile-metrics ttft,tpot,itl,e2el \
+    --result-dir "${RESULTS_DIR}" \
+    --result-filename "${NAME}.json"
 ```
-
-### Optional: Enable Profiling
-If you want to collect profiling trace, you can use the same API as default vLLM to add `--profiler-config "$profiler_config"` to the `vllm serve` command above.
-
-```bash
-profiler_config=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_profiler_with_stack":true,"torch_profiler_record_shapes":true}' \
-    "${your-profiler-dir}")
-```
-
 ## Step 4: Accuracy Validation
 
 ```bash

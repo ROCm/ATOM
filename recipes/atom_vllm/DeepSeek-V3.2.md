@@ -1,8 +1,6 @@
-# Kimi-K2.5 with vLLM-ATOM Plugin Backend
+# DeepSeek-V3.2 with vLLM-ATOM Plugin Backend
 
-This recipe shows how to run `amd/Kimi-K2.5-MXFP4-AttnFP8` with the vLLM-ATOM plugin backend. For background on the plugin backend, see [vLLM plugin backend](../../docs/vllm_plugin_backend_guide.md).
-
-This model uses remote code, so the launch command keeps `--trust-remote-code`.
+This recipe shows how to run `deepseek-ai/DeepSeek-V3.2` with the vLLM-ATOM plugin backend. For background on the plugin backend, see [vLLM plugin backend](../../docs/vllm_plugin_backend_guide.md).
 
 ## Step 1: Pull the OOT Docker
 
@@ -16,7 +14,12 @@ The vLLM-ATOM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 
 ```bash
 TP=4
-MODEL="amd/Kimi-K2.5-MXFP4-AttnFP8"
+MODEL="deepseek-ai/DeepSeek-V3.2"
+if [ "${TP}" = "4" ]; then
+    KV_CACHE_DTYPE=auto
+else
+    KV_CACHE_DTYPE=fp8
+fi
 
 export SAFETENSORS_FAST_GPU=1
 export VLLM_RPC_TIMEOUT=1800000
@@ -32,7 +35,7 @@ vllm serve "${MODEL}" \
     --load-format fastsafetensors \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --trust-remote-code \
-    --kv-cache-dtype fp8 \
+    --kv-cache-dtype "${KV_CACHE_DTYPE}" \
     --tensor-parallel-size "${TP}" \
     --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
@@ -47,8 +50,8 @@ ISL=1000
 OSL=100
 CONC=4
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-RESULTS_DIR="${RESULTS_DIR:-$PWD/results_kimi_k25}/${RUN_ID}"
-NAME="${RUN_ID}-kimi-k2-5-mxfp4-aw-tp${TP}-${ISL}-${OSL}-${CONC}"
+RESULTS_DIR="${RESULTS_DIR:-$PWD/results_deepseek_v32}/${RUN_ID}"
+NAME="${RUN_ID}-deepseek-v3-2-fp8-aw-tp${TP}-${ISL}-${OSL}-${CONC}"
 
 mkdir -p "${RESULTS_DIR}"
 
@@ -56,7 +59,7 @@ vllm bench serve \
     --backend vllm \
     --base-url http://127.0.0.1:8000 \
     --endpoint /v1/completions \
-    --model amd/Kimi-K2.5-MXFP4-AttnFP8 \
+    --model deepseek-ai/DeepSeek-V3.2 \
     --dataset-name random \
     --random-input-len "${ISL}" \
     --random-output-len "${OSL}" \
@@ -72,12 +75,4 @@ vllm bench serve \
     --percentile-metrics ttft,tpot,itl,e2el \
     --result-dir "${RESULTS_DIR}" \
     --result-filename "${NAME}.json"
-```
-## Step 4: Accuracy Validation
-
-```bash
-lm_eval --model local-completions \
-        --model_args model=amd/Kimi-K2.5-MXFP4-AttnFP8,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
-        --tasks gsm8k \
-        --num_fewshot 3
 ```
