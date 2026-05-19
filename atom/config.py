@@ -731,6 +731,7 @@ class SpeculativeConfig:
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
         "deepseek_v3": "deepseek_mtp",
         "deepseek_v32": "deepseek_mtp",
+        "deepseek_v4": "deepseek_v4_mtp",
         "glm_moe_dsa": "deepseek_mtp",
         "qwen3_next": "qwen3_next_mtp",
         "qwen3_5": "qwen3_5_mtp",
@@ -743,6 +744,7 @@ class SpeculativeConfig:
     # mtp_model_type → (n_predict_attr, architecture)
     _MTP_CONFIG: ClassVar[dict[str, tuple[str, str]]] = {
         "deepseek_mtp": ("num_nextn_predict_layers", "DeepSeekMTPModel"),
+        "deepseek_v4_mtp": ("num_nextn_predict_layers", "DeepseekV4MTPModel"),
         "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
         "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
     }
@@ -1018,7 +1020,13 @@ class Config:
         # tokens. ATOM's BlockManager + slot_mapping math assume one global
         # block_size, so we override `kv_cache_block_size` here when V4 is
         # detected; the V4 attention builder enforces the same value.
-        if getattr(self.hf_config, "model_type", None) == "deepseek_v4":
+        #
+        # NOTE: cannot use `hf_config.model_type` for detection — `_CONFIG_REGISTRY`
+        # maps "deepseek_v4" → "deepseek_v3" so model_type reads as "deepseek_v3".
+        # Use the preserved `architectures` field (re-injected by get_hf_config,
+        # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
+        arches = getattr(self.hf_config, "architectures", None) or []
+        if any("DeepseekV4" in str(a) for a in arches):
             v4_block_size = 128
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
