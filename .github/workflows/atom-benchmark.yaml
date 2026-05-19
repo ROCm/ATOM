@@ -583,7 +583,7 @@ jobs:
             }'
 
             rm -rf ~/.cache/atom/*
-            ATOM_DISABLE_MMAP=true AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+            ATOM_HOST_IP=${PROXY_IP} ATOM_DISABLE_MMAP=true AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
               python -m atom.entrypoints.openai_server \
                 --model $model_path \
                 --server-port 8003 \
@@ -727,15 +727,32 @@ jobs:
           docker exec atom-smoke-decode bash -lc \
             "pip install msgpack msgspec quart mooncake-transfer-engine"
 
+      - name: Check connectivity to proxy
+        run: |
+          LOCAL_IP=$(hostname -I | awk '{print $1}')
+          echo "Decode runner: $(hostname), IP: ${LOCAL_IP}"
+          echo "Proxy IP: ${PROXY_IP}"
+          echo "--- Testing TCP connectivity to proxy ports ---"
+          for port in 10001 36367; do
+            if timeout 5 bash -c "echo >/dev/tcp/${PROXY_IP}/${port}" 2>/dev/null; then
+              echo "  Port ${port}: REACHABLE"
+            else
+              echo "  Port ${port}: UNREACHABLE (firewall or proxy not yet started)"
+            fi
+          done
+          echo "--- Ping test ---"
+          ping -c 2 -W 2 ${PROXY_IP} || echo "Ping failed (ICMP may be blocked)"
+
       - name: Start consumer
         run: |
+          LOCAL_IP=$(hostname -I | awk '{print $1}')
           if [ -d "/models" ]; then model_path="/models/openai/gpt-oss-120b"
           else model_path="openai/gpt-oss-120b"; fi
 
-          echo "Connecting to proxy at ${PROXY_IP}"
+          echo "Connecting to proxy at ${PROXY_IP}, local IP: ${LOCAL_IP}"
           docker exec atom-smoke-decode bash -lc "
             rm -rf ~/.cache/atom/*
-            ATOM_DISABLE_MMAP=true AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+            ATOM_HOST_IP=${LOCAL_IP} ATOM_DISABLE_MMAP=true AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
               python -m atom.entrypoints.openai_server \
                 --model $model_path \
                 --server-port 8004 \
@@ -953,7 +970,7 @@ jobs:
 
             echo '========== Starting Producer on port 8003 =========='
             rm -rf ~/.cache/atom/*
-            ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+            ATOM_HOST_IP=${PROXY_IP} ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
               python -m atom.entrypoints.openai_server \
                 --model $model_path \
                 --server-port 8003 \
@@ -1235,6 +1252,20 @@ jobs:
           docker exec atom-pd-consumer-${{ env.DECODE_INDEX }} bash -lc \
             "pip install msgpack msgspec quart mooncake-transfer-engine"
 
+      - name: Check connectivity to proxy
+        run: |
+          CONSUMER_IP=$(hostname -I | awk '{print $1}')
+          echo "Consumer runner: $(hostname), IP: ${CONSUMER_IP}"
+          echo "Proxy IP: ${PROXY_IP}"
+          echo "--- Testing TCP connectivity to proxy ports ---"
+          for port in 10001 36367; do
+            if timeout 5 bash -c "echo >/dev/tcp/${PROXY_IP}/${port}" 2>/dev/null; then
+              echo "  Port ${port}: REACHABLE"
+            else
+              echo "  Port ${port}: UNREACHABLE (firewall or proxy not yet started)"
+            fi
+          done
+
       - name: Start consumer
         run: |
           if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
@@ -1248,12 +1279,13 @@ jobs:
             \"http_port\": ${{ env.CONSUMER_PORT }}
           }"
 
+          CONSUMER_IP=$(hostname -I | awk '{print $1}')
           echo "========== Starting Consumer #${{ env.DECODE_INDEX }} on port ${{ env.CONSUMER_PORT }} =========="
-          echo "Proxy IP: ${PROXY_IP}"
+          echo "Proxy IP: ${PROXY_IP}, Consumer IP: ${CONSUMER_IP}"
 
           docker exec atom-pd-consumer-${{ env.DECODE_INDEX }} bash -lc "
             rm -rf ~/.cache/atom/*
-            ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+            ATOM_HOST_IP=${CONSUMER_IP} ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
               python -m atom.entrypoints.openai_server \
                 --model $model_path \
                 --server-port ${{ env.CONSUMER_PORT }} \
