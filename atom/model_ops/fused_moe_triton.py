@@ -48,6 +48,9 @@ if envs.ATOM_USE_TRITON_GEMM:
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
     )
+    from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
+        moe_gemm_a16w4,
+    )
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 if has_triton_kernels():
     try:
@@ -353,8 +356,9 @@ def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
     from aiter.ops.triton.moe.moe_routing.routing import (
         routing,
         RoutingData,
-        compute_expt_data_torch,
     )
+
+    from moe_utils import compute_expt_data
 
     n_tokens, n_expts_act = topk_weights.shape
     n_gates_pad = n_tokens * n_expts_act
@@ -379,7 +383,7 @@ def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
     m = n_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
-    expt_data = compute_expt_data_torch(hist, n_expts_tot, n_gates_pad, block_m)
+    expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad, block_m)
 
     routing_data = RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
     return routing_data, topk_indx, gate_indx #topk_indx = gather_indx, gate_indx = scatter_indx
@@ -541,127 +545,152 @@ def triton_kernel_fused_experts(
                 if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
                     x_dtype = torch.float8_e4m3fnuz
 
-        hidden_states = downcast_to_static_fp8(hidden_states, a13_scale)
-        quick_test = hidden_states.to(torch.bfloat16) * a13_scale
-        # logger.warning("hidden states")
-        # logger.warning(hidden_states)
-        # logger.warning(quick_test)
-        logger.warning(w13_swizzle_layout)
-        logger.warning(w2_swizzle_layout)
-        interm_cache = moe_gemm_a8w4(
-            hidden_states,
-            w1,
-            None,
-            w13_scale,
-            a13_scale,
-            a2_scale,
-            w1_bias,
-            routing_data,
-            gather_indx=gather_indx,
-            gammas=gammas if apply_router_weight_on_input else None,
-            swizzle_mx_scale=w13_swizzle_layout,
-            out_dtype=torch.float8_e4m3fn,
-            apply_swiglu=True,
-            alpha=1.702,          # gpt-oss
-            limit=7.0,            # gpt-oss
-            add_residual=True,    # gpt-oss `(up + 1)`
+                hidden_states = downcast_to_static_fp8(hidden_states, a13_scale)
+                quick_test = hidden_states.to(torch.bfloat16) * a13_scale
+                # logger.warning("hidden states")
+                # logger.warning(hidden_states)
+                # logger.warning(quick_test)
+                logger.warning(w13_swizzle_layout)
+                logger.warning(w2_swizzle_layout)
+                interm_cache = moe_gemm_a8w4(
+                    hidden_states,
+                    w1,
+                    None,
+                    w13_scale,
+                    a13_scale,
+                    a2_scale,
+                    w1_bias,
+                    routing_data,
+                    gather_indx=gather_indx,
+                    gammas=gammas if apply_router_weight_on_input else None,
+                    swizzle_mx_scale=w13_swizzle_layout,
+                    out_dtype=torch.float8_e4m3fn,
+                    apply_swiglu=True,
+                    alpha=1.702,          # gpt-oss
+                    limit=7.0,            # gpt-oss
+                    add_residual=True,    # gpt-oss `(up + 1)`
 
-        ) 
-        raw_intermediate = result
-        # manual application of swiglu and quant in order of how they are done in the kernel
-        #quick_test = downcast_to_static_fp8(raw_intermediate, static_scale)
-        # logger.warning("quick test")
-        # logger.warning(raw_intermediate) # no data loss
-        #raw_intermediate = raw_intermediate * moving_scale * moving_scale
-        # logger.warning("raw intermed")
-    else:
-        hidden_states, x_scale = mxfp4_quant(hidden_states)
-        raw_intermediate = moe_gemm_a4w4(
-            hidden_states,
-            w1, # w1
-            x_scale, # x scale
-            w13_scale, # w1 scale
-            None, # x static scale
-            None, # quant static scale
-            w1_bias,
-            routing_data,
-            gather_indx=gather_indx,
-            gammas=gammas if apply_router_weight_on_input else None,
-            swizzle_mx_scale="CDNA4_SCALE", # ?
-            apply_swiglu=True,
-            alpha=1.702,          # gpt-oss
-            limit=7.0,            # gpt-oss
-            add_residual=True,    # gpt-oss `(up + 1)`
-        )
-    # else:
-        # a16w4?
+                ) 
+            elif (x_q_dtype_base == "fp4"):
+                hidden_states, x_scale = mxfp4_quant(hidden_states)
+                raw_intermediate = moe_gemm_a4w4(
+                    hidden_states,
+                    w1, # w1
+                    x_scale, # x scale
+                    w13_scale, # w1 scale
+                    None, # x static scale
+                    None, # quant static scale
+                    w1_bias,
+                    routing_data,
+                    gather_indx=gather_indx,
+                    gammas=gammas if apply_router_weight_on_input else None,
+                    swizzle_mx_scale="CDNA4_SCALE", # ?
+                    apply_swiglu=True,
+                    alpha=1.702,          # gpt-oss
+                    limit=7.0,            # gpt-oss
+                    add_residual=True,    # gpt-oss `(up + 1)`
+                )
+            else:
+                interm_cache = moe_gemm_a16w4(
+                    hidden_states,
+                    w1,
+                    None,
+                    w13_scale,
+                    None,
+                    None,
+                    w1_bias,
+                    routing_data,
+                    gather_indx=gather_indx,
+                    gammas=gammas if apply_router_weight_on_input else None,
+                    swizzle_mx_scale=w13_swizzle_layout,
+                    apply_swiglu=True,
+                    alpha=1.702,          # gpt-oss
+                    limit=7.0,            # gpt-oss
+                    add_residual=True,    # gpt-oss `(up + 1)`
+                )
 
-    # Standard SiLU/SwiGLU activation: silu(gate) * up
-    # needed for all quant versions
-    # raw_2d = raw_intermediate.view(M * topk, N)
-    # # logger.warning("raw 2d")
-    # # logger.warning(raw_2d) # no data loss
-    # # logger.warning(intermediate_cache.shape)
-    # gate = raw_2d[:, :half_N]
-    # up = raw_2d[:, half_N:]
-    # # logger.warning("issue with swiglu erasing intermediate cache")
-    # # logger.warning(gate) # no data loss
-    # # logger.warning(up) # no data loss
-    # # logger.warning(torch.nn.functional.silu(gate))
-    # intermediate_cache = torch.nn.functional.silu(gate) * up
-    # logger.warning(intermediate_cache) # no data loss but e+11 numbers
+            if (x_q_dtype_base == "fp8"):
+                from aiter.ops.triton.utils._triton.arch_info import get_arch
 
-    # apply gammas
+                x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
 
+                if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
+                    x_dtype = torch.float8_e4m3fnuz
 
-    # matmul_ogs(
-    #     intermediate_cache.view(M * topk, half_N),
-    #     w2,
-    #     w2_bias,
-    #     routing_data,
-    #     scatter_indx=scatter_indx,
-    #     precision_config=w2_precision_config,
-    #     gammas=None if apply_router_weight_on_input else gammas,
-    #     y=output_tensor,
-    # )
+                output_tensor = moe_gemm_a8w4(
+                    interm_cache,
+                    w2,
+                    None,
+                    w2_scale,
+                    a2_scale,
+                    None,
+                    w2_bias,
+                    routing_data,
+                    scatter_indx=scatter_indx,
+                    gammas=None if apply_router_weight_on_input else gammas,
+                    swizzle_mx_scale=w2_swizzle_layout, 
+                )
+            elif (x_q_dtype_base == "fp4"):
+                interm_cache, x_scale = mxfp4_quant(interm_cache)
+                output_tensor = moe_gemm_a4w4(
+                    interm_cache, 
+                    w2,
+                    x_scale, 
+                    w2_scale, 
+                    None, # x static scale
+                    None, # quant static scale
+                    w2_bias, 
+                    routing_data, 
+                    scatter_indx=scatter_indx,
+                    gammas=None if apply_router_weight_on_input else gammas,
+                    swizzle_mx_scale="CDNA4_SCALE",
+                )
+            else:
+                output_tensor = moe_gemm_a16w4(
+                    interm_cache,
+                    w2,
+                    None,
+                    w2_scale,
+                    None,
+                    None,
+                    w2_bias,
+                    routing_data,
+                    scatter_indx=scatter_indx,
+                    gammas=None if apply_router_weight_on_input else gammas,
+                    swizzle_mx_scale=w2_swizzle_layout,
+                )
+        else:
+            # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation
+            raw_intermediate = matmul_ogs(
+                hidden_states,
+                w1,
+                w1_bias,
+                routing_data,
+                gather_indx=gather_indx,
+                precision_config=w13_precision_config,
+                gammas=gammas if apply_router_weight_on_input else None,
+            )
+            raw_2d = raw_intermediate.view(M * topk, N)
+            intermediate_cache = intermediate_cache.view(M * topk, half_N)
+            fused_clamp_act_mul(
+                raw_2d,
+                out=intermediate_cache,
+                swiglu_limit=swiglu_limit,
+                activation="silu",
+                dtype_quant=None,
+            )
+            intermediate_cache = intermediate_cache.view(batch_dim, M * topk, half_N)
 
-
-    if (x_q_dtype_base == "fp8"):
-        from aiter.ops.triton.utils._triton.arch_info import get_arch
-
-                    x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
-
-                    if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
-                        x_dtype = torch.float8_e4m3fnuz
-
-        output_tensor = moe_gemm_a8w4(
-            interm_cache,
-            w2,
-            None,
-            w2_scale,
-            a2_scale,
-            None,
-            w2_bias,
-            routing_data,
-            scatter_indx=scatter_indx,
-            gammas=None if apply_router_weight_on_input else gammas,
-            swizzle_mx_scale=w2_swizzle_layout, 
-        )
-    else:
-        interm_cache, x_scale = mxfp4_quant(interm_cache)
-        output_tensor = moe_gemm_a4w4(
-            interm_cache, 
-            w2,
-            x_scale, 
-            w2_scale, 
-            None, # x static scale
-            None, # quant static scale
-            w2_bias, 
-            routing_data, 
-            scatter_indx=scatter_indx,
-            gammas=None if apply_router_weight_on_input else gammas,
-            swizzle_mx_scale="CDNA4_SCALE",
-        )
+            matmul_ogs(
+                intermediate_cache.view(M * topk, half_N),
+                w2,
+                w2_bias,
+                routing_data,
+                scatter_indx=scatter_indx,
+                precision_config=w2_precision_config,
+                gammas=None if apply_router_weight_on_input else gammas,
+                y=output_tensor,
+            )
 
                 # logger.warning("output")
                 # logger.warning(output_tensor.shape)
