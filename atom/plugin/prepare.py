@@ -84,13 +84,7 @@ def prepare_model(config: Any, engine: str):
 
         apply_prepare_model_adaptations(atom_config, model_arch)
 
-    # Qwen3-Next and Qwen3.5 series models keep the upstream attention backend path.
-    if model_arch not in {
-        "Qwen3NextForCausalLM",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
-    }:
-        register_ops_to_sglang(atom_config=atom_config)
+    register_ops_to_sglang(atom_config=atom_config)
     set_attn_cls()
 
     # init aiter dist for using aiter custom collective ops

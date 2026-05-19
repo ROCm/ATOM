@@ -2394,7 +2394,7 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
             1,
             self.padded_num_heads,
             torch.bfloat16,
-            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            _get_aiter_kv_cache_dtype(config),
             is_sparse=True,
             fast_mode=True,
         )

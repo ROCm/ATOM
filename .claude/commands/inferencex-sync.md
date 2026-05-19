@@ -15,6 +15,7 @@ Use this skill to compare the througput of ATOM upstream benchamrk and Inference
 - [ ] 1) Create a throughput table from InferenceX benchmark
 - [ ] 2) Create a throughput table from ATOM upstream benchmark
 - [ ] 3) Chek performance regression of ATOM upstream benchmark from InferenceX benchmark
+- [ ] 4) Ask users what model needs a new PR
 ```
 
 ## 1) Create a throughput table from InferenceX benchmark
@@ -36,7 +37,7 @@ Rules:
 
 ## 2) Create a throughput table from ATOM upstream benchmark
 
-Check the ATOM upstream benchmark that is from the latest successful gh action runs at https://github.com/ROCm/ATOM/actions/workflows/atom-benchmark.yaml and append the throughput to the InferenceX performance table in Step 1) 
+Check the ATOM upstream benchmark that is from the latest successful gh action runs at https://github.com/ROCm/ATOM/actions/workflows/atom-benchmark.yaml, which as all jobs passed. Append the throughput to the InferenceX performance table in Step 1) 
 
 Rules:
 - 1. Use main branch. Find the latest job of https://github.com/ROCm/ATOM/actions/workflows/atom-benchmark.yaml where all jobs passed    
@@ -66,3 +67,18 @@ If the data is not available, stop and ask for any workaround
 ## 3) Chek performance regression of ATOM upstream benchmark from InferenceX benchmark
 
 Update the performance table to show regression in % of ATOM upstream benchmark from InferenceX benchmark
+
+## 4) Chek performance regression of ATOM upstream benchmark from InferenceX benchmark
+
+Based on Step 3) results, ask user what models need a PR to https://github.com/SemiAnalysisAI/InferenceX/pulls and create a PR to each model.
+
+Rules:
+- 1. Find the docker image from the step 2) ATOM upstream benchmark gh action runs. for eample, "Docker:
+  rocm/atom-dev:nightly_202605141645" from https://github.com/ROCm/ATOM/actions/runs/25875375446/job/76041129934#step:6:26 
+- 2. Create a PR and check https://github.com/ROCm/ATOM/blob/main/.github/benchmark/models.json options
+
+PR example: 
+- 1. https://github.com/SemiAnalysisAI/InferenceX/pull/1311/changes
+- 2. https://github.com/SemiAnalysisAI/InferenceX/blob/main/benchmarks/single_node/dsv4_fp4_mi355x_atom.sh
+- 3. https://github.com/SemiAnalysisAI/InferenceX/blob/main/.github/configs/amd-master.yaml#L1646
+- 4. https://github.com/SemiAnalysisAI/InferenceX/blob/main/perf-changelog.yaml#L1824-L1833

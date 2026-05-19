@@ -20,7 +20,10 @@ import triton.language as tl
 
 import sglang.srt.layers.attention.aiter_backend as _sglang_aiter
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    launch_reshape_and_cache_flash,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_bool_env_var
 
@@ -35,8 +38,10 @@ try:
         dtypes,
         get_pa_metadata_info_v1,
         get_pa_metadata_v1,
+        mha_batch_prefill_func,
         pa_fwd_asm,
         pa_persistent_fwd,
+        paged_attention_ragged,
     )
 except ImportError as e:
     raise ImportError(
@@ -380,20 +385,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             if seq_lens_cpu is None:
                 seq_lens_cpu = forward_batch.seq_lens.cpu()
 
-            page_table_persistent = self.page_table
-            seq_lens_persistent = self.seq_lens
-            seq_lens_persistent.fill_(0)
-            page_table_persistent.fill_(0)
-            seq_lens_persistent[:bs].copy_(forward_batch.seq_lens, non_blocking=True)
-            max_seq_pages = (
-                seq_lens_cpu.max().item() + self.page_size - 1
-            ) // self.page_size + 1
-            page_table = self.req_to_token[
-                forward_batch.req_pool_indices[:, None],
-                self.strided_indices[:max_seq_pages][None, :],
-            ]
-            page_table_persistent[:bs, :max_seq_pages].copy_(
-                page_table // self.page_size, non_blocking=True
+            page_table, seq_lens = self._update_decode_page_table(
+                bs,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
             )
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
@@ -402,8 +398,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 None,
                 1,
                 None,
-                page_table_persistent[:bs, :max_seq_pages],
-                seq_lens_persistent[:bs],
+                page_table,
+                seq_lens,
             )
             self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
         else:
@@ -519,8 +515,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             self.indices_updater_prefill.kv_indices,
             self.qo_indptr[: bs + 1],
             None,
-            self.indices_updater_prefill.max_q_len,
-            self.indices_updater_prefill.max_kv_len,
+            self._max_len(
+                forward_batch.extend_seq_lens_cpu,
+                forward_batch.extend_seq_lens,
+            ),
+            self._max_len(forward_batch.seq_lens_cpu, forward_batch.seq_lens),
             None,
             forward_batch.seq_lens,
         )
@@ -844,12 +843,28 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         if self.use_mla:
             self._init_mla_cuda_graph_metadata(bs, req_pool_indices, seq_lens)
         else:
-            page_table = self.page_table[:bs, :]
-            self.seq_lens[:bs].copy_(seq_lens, non_blocking=True)
-            seq_lens_persistent = self.seq_lens[:bs]
+            kv_indptr = self.kv_indptr
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            page_table, seq_lens_persistent = self._update_decode_page_table(
+                bs,
+                req_pool_indices,
+                seq_lens,
+                static_columns=True,
+            )
             self.forward_metadata = ForwardMetadata(
-                None,
-                None,
+                kv_indptr,
+                kv_indices,
                 None,
                 None,
                 1,
@@ -878,34 +893,127 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         if self.use_mla:
             self._init_mla_cuda_graph_metadata(bs, req_pool_indices, seq_lens)
         else:
-            page_table_persistent = self.page_table
-            seq_lens_persistent = self.seq_lens
-            seq_lens_persistent.fill_(0)
-            page_table_persistent.fill_(0)
-            seq_lens_persistent[:bs].copy_(seq_lens, non_blocking=True)
-            max_seq_pages = (
-                seq_lens_cpu.max().item() + self.page_size - 1
-            ) // self.page_size + 1
-            page_table = self.req_to_token[
-                req_pool_indices[:, None],
-                self.strided_indices[:max_seq_pages][None, :],
-            ]
-            page_table_persistent[:bs, :max_seq_pages].copy_(
-                page_table // self.page_size, non_blocking=True
+            kv_indptr = self.kv_indptr
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            page_table, seq_lens_persistent = self._update_decode_page_table(
+                bs,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                static_columns=True,
             )
 
             self.forward_metadata = ForwardMetadata(
-                None,
-                None,
+                kv_indptr,
+                kv_indices,
                 None,
                 None,
                 1,
                 None,
-                page_table_persistent[:bs, :max_seq_pages],
+                page_table,
                 seq_lens_persistent[:bs],
             )
             if self.decode_using_pa_ps:
                 self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
+
+    @staticmethod
+    def _max_len(cpu_values, device_values) -> int:
+        values = cpu_values if cpu_values is not None else device_values
+        if isinstance(values, torch.Tensor):
+            return int(values.max().item())
+        return int(max(values))
+
+    def _update_decode_page_table(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
+        static_columns: bool = False,
+    ):
+        page_table_persistent = self.page_table
+        seq_lens_persistent = self.seq_lens
+        seq_lens_persistent.fill_(0)
+        page_table_persistent.fill_(0)
+        seq_lens_persistent[:bs].copy_(seq_lens, non_blocking=True)
+
+        if seq_lens_cpu is None:
+            max_seq_len = int(seq_lens.max().item())
+        elif isinstance(seq_lens_cpu, torch.Tensor):
+            max_seq_len = int(seq_lens_cpu.max().item())
+        else:
+            max_seq_len = int(max(seq_lens_cpu))
+
+        max_seq_pages = (max_seq_len + self.page_size - 1) // self.page_size + 1
+        max_seq_pages = min(max_seq_pages, page_table_persistent.shape[1])
+        page_table = self.req_to_token[
+            req_pool_indices[:, None],
+            self.strided_indices[:max_seq_pages][None, :],
+        ]
+        page_table_persistent[:bs, :max_seq_pages].copy_(
+            page_table // self.page_size, non_blocking=True
+        )
+
+        if static_columns:
+            return page_table_persistent[:bs, :], seq_lens_persistent[:bs]
+        return page_table_persistent[:bs, :max_seq_pages], seq_lens_persistent[:bs]
+
+    def _should_use_native_dense_mha(self, layer) -> bool:
+        sliding_window_size = getattr(layer, "sliding_window_size", None)
+        return (
+            not self.use_mla
+            and not layer.is_cross_attention
+            and layer.head_dim == 256
+            and layer.qk_head_dim == 256
+            and layer.v_head_dim == 256
+            and (sliding_window_size is None or sliding_window_size <= -1)
+        )
+
+    def _kv_descales(self, layer):
+        if self.kv_cache_dtype != dtypes.fp8:
+            return None, None
+        k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+        v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
+        return k_descale, v_descale
+
+    def _get_aiter_paged_ragged_kv_cache_dtype(self) -> str:
+        if self.kv_cache_dtype != dtypes.fp8:
+            return "auto"
+        return "fp8_e4m3"
+
+    def _set_kv_buffer_native_dense(self, layer, cache_loc, k, v, forward_batch):
+        k_descale, v_descale = self._kv_descales(layer)
+        if self.kv_cache_dtype == dtypes.fp8:
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            launch_reshape_and_cache_flash(
+                k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                ),
+                v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+                cache_loc,
+                k_scale=k_descale,
+                v_scale=v_descale,
+            )
+            return
+
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            layer, cache_loc, k, v, k_descale, v_descale
+        )
 
     def set_kv_buffer_with_layout_shuffle(
         self,
@@ -947,11 +1055,16 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        use_native_dense_mha = self._should_use_native_dense_mha(layer)
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if self.use_mla:
+                if use_native_dense_mha:
+                    self._set_kv_buffer_native_dense(
+                        layer, cache_loc, k, v, forward_batch
+                    )
+                elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
                     k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
@@ -970,8 +1083,43 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         if self.use_mla:
             return self._forward_extend_mla(q, k, v, layer, forward_batch)
+        if use_native_dense_mha:
+            return self._forward_extend_native_dense_mha(q, layer, forward_batch)
         else:
             return self._forward_extend_mha(q, k, v, layer, forward_batch)
+
+    def _forward_extend_native_dense_mha(self, q, layer, forward_batch):
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        q_descale, k_descale, v_descale = None, None, None
+
+        if self.kv_cache_dtype == dtypes.fp8:
+            q = q.to(dtypes.fp8)
+            q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+            k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+            v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
+
+        bs0 = forward_batch.batch_size + 1
+        o = mha_batch_prefill_func(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            k_cache,
+            v_cache,
+            self.forward_metadata.qo_indptr[:bs0],
+            self.forward_metadata.kv_indptr[:bs0],
+            self.forward_metadata.kv_indices,
+            self.forward_metadata.max_q_len,
+            self.forward_metadata.max_kv_len,
+            causal=True,
+            logits_soft_cap=layer.logit_cap,
+            alibi_slopes=None,
+            return_lse=False,
+            return_attn_probs=False,
+            window_size=(-1, -1),
+            sink_ptr=None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _forward_extend_mha(self, q, k, v, layer, forward_batch):
         """Non-MLA extend path: standard MHA with flash_attn_varlen_func."""
@@ -1401,6 +1549,14 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             return o
 
         # Non-MLA decode paths
+        use_native_dense_mha = self._should_use_native_dense_mha(layer)
+        if use_native_dense_mha:
+            if save_kv_cache:
+                self._set_kv_buffer_native_dense(
+                    layer, forward_batch.out_cache_loc, k, v, forward_batch
+                )
+            return self._forward_decode_native_dense_mha(q, layer, forward_batch)
+
         o = q.new_empty((batch_size, layer.tp_q_head_num, head_dim_out))
 
         if save_kv_cache:
@@ -1476,3 +1632,31 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
 
         return o.view(-1, layer.tp_q_head_num * head_dim_out)
+
+    def _forward_decode_native_dense_mha(self, q, layer, forward_batch):
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        aiter_kv_str = self._get_aiter_paged_ragged_kv_cache_dtype()
+
+        o = torch.empty_like(q, dtype=self.input_dtype)
+        paged_attention_ragged(
+            o.view(-1, layer.tp_q_head_num, layer.head_dim),
+            self.workspace_buffer,
+            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            k_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
+            v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+            layer.scaling,
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.kv_indices,
+            self.kv_last_page_len,
+            1,
+            self.max_num_partitions,
+            None,
+            aiter_kv_str,
+            "NHD",
+            layer.logit_cap,
+            self.k_scale,
+            self.v_scale,
+            None,
+            getattr(_sglang_aiter, "_AITER_PARTITION_SIZE_ROCM", 256),
+        )
+        return o

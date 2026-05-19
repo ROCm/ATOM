@@ -192,7 +192,7 @@ jobs:
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
-          retention-days: 1
+          retention-days: 7
 
   atom-sglang-accuracy:
     needs: [check-signal, download_aiter_wheel]
