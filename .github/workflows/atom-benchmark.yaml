@@ -589,6 +589,7 @@ jobs:
                 --server-port 8003 \
                 --kv-transfer-config \"\$KV_CONFIG\" \
                 --kv_cache_dtype fp8 -tp 1 \
+                --gpu-memory-utilization 0.85 \
                 > /tmp/atom_producer.log 2>&1 &
           "
 
@@ -613,11 +614,14 @@ jobs:
       - name: Wait for consumer to connect
         timeout-minutes: 30
         run: |
+          if [ -d "/models" ]; then model_name="/models/openai/gpt-oss-120b"
+          else model_name="openai/gpt-oss-120b"; fi
+
           echo "Waiting for smoke consumer to connect via proxy..."
           for i in $(seq 1 60); do
             if curl -sf http://localhost:10001/v1/completions \
                 -H "Content-Type: application/json" \
-                -d '{"model":"openai/gpt-oss-120b","prompt":"hi","max_tokens":1}' \
+                -d "{\"model\":\"${model_name}\",\"prompt\":\"hi\",\"max_tokens\":1}" \
                 -o /dev/null --max-time 120 2>/dev/null; then
               echo "Proxy warmup succeeded — consumer connected (after $((i * 30))s)"
               echo "PD smoke test PASSED!"
@@ -764,6 +768,7 @@ jobs:
                   \"http_port\": 8004
                 }' \
                 --kv_cache_dtype fp8 -tp 1 \
+                --gpu-memory-utilization 0.85 \
                 > /tmp/atom_consumer.log 2>&1 &
           "
 
@@ -997,11 +1002,14 @@ jobs:
       - name: Wait for consumer to connect and warmup
         timeout-minutes: 30
         run: |
+          if [ -d "/models" ]; then model_name="/models/${{ env.MODEL_PATH }}"
+          else model_name="${{ env.MODEL_PATH }}"; fi
+
           echo "Waiting for consumer to register via proxy warmup..."
           for i in $(seq 1 60); do
             if curl -sf http://localhost:10001/v1/completions \
                 -H "Content-Type: application/json" \
-                -d '{"model":"${{ env.MODEL_PATH }}","prompt":"hi","max_tokens":1}' \
+                -d "{\"model\":\"${model_name}\",\"prompt\":\"hi\",\"max_tokens\":1}" \
                 -o /dev/null --max-time 120 2>/dev/null; then
               echo "Proxy warmup succeeded — consumer is connected (after $((i * 30))s)"
               break
