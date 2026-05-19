@@ -31,6 +31,10 @@ from atom.model_ops.v4_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill_reference,
 )
 from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
+from atom.model_ops.v4_kernels.paged_decode_indices import (
+    write_v4_paged_decode_indices,
+    write_v4_paged_decode_indices_reference,
+)
 from atom.model_ops.v4_kernels.state_writes import update_compressor_states, swa_write
 
 __all__ = [
@@ -48,4 +52,6 @@ __all__ = [
     "make_compress_plans",
     "inverse_rope_inplace",
     "scale_indexer_weights",
+    "write_v4_paged_decode_indices",
+    "write_v4_paged_decode_indices_reference",
 ]
