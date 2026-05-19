@@ -6,6 +6,7 @@ from atom.plugin.prepare import _set_framework_backbone
 from atom.utils import envs
 from atom.plugin.vllm.mla_patch import patch_vllm_mla_attention
 from atom.plugin.vllm.spec_decode_patch import apply_vllm_spec_decode_patch
+from atom.plugin.vllm.lora_bridge import apply_vllm_lora_bridge
 
 logger = logging.getLogger("atom")
 
@@ -119,6 +120,7 @@ def register_model() -> None:
         vllm_model_registry._try_inspect_model_cls.cache_clear()
 
     patch_vllm_mla_attention()
+    apply_vllm_lora_bridge()
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader
     try:

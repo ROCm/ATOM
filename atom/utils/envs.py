@@ -73,8 +73,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use a thread pool for weight loading instead of main-process sequential I/O.
     # Set to 0 to disable if the thread pool causes hangs (e.g. on gfx1250).
-    "ATOM_LOADER_USE_THREADPOOL": lambda: os.getenv("ATOM_LOADER_USE_THREADPOOL", "1")
-    == "1",
+    "ATOM_LOADER_USE_THREADPOOL": lambda: os.getenv(
+        "ATOM_LOADER_USE_THREADPOOL", "1"
+    ).lower()
+    not in ("0", "false", "no", "off"),
     # Static LoRA adapters to apply in vLLM plugin mode after base weights load.
     # Format matches ATOM's standalone --lora-modules entries:
     #   name=/path/to/adapter[,name2=/path/to/adapter2]

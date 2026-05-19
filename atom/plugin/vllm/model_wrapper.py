@@ -16,6 +16,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsQuant,
     SupportsMultiModal,
     SupportsMRoPE,
+    SupportsLoRA,
     MultiModalEmbeddings,
 )
 from vllm.model_executor.models.interfaces_base import (
@@ -121,8 +122,14 @@ def _static_lora_modules_from_env() -> list[str]:
     return [entry.strip() for entry in raw.split(",") if entry.strip()]
 
 
-class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
+class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP, SupportsLoRA):
     # forced_model_arch: str | None = None
+    supports_lora = True
+    is_3d_moe_weight = False
+    is_non_gated_moe = False
+    embedding_modules: dict[str, str] = {}
+    packed_modules_mapping: dict[str, list[str]] = {}
+    lora_skip_prefixes: list[str] = []
 
     def __init_subclass__(cls, *args, **kwargs):
         super().__init_subclass__(*args, **kwargs)
@@ -191,6 +198,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
         self.model = model_cls(self.atom_config)
+        self.packed_modules_mapping = getattr(self.model, "packed_modules_mapping", {})
         if self.atom_config.lora_modules:
             from atom.model_loader.lora import mark_static_routed_lora_targets
 
@@ -265,6 +273,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             (model.__class__,),
             {"__setattr__": _syncing_setattr},
         )
+
+    def get_expert_mapping(self):
+        return self.model.get_expert_mapping()
 
     def _register_indexer_caches_with_vllm(self):
         """Register DeepseekV32IndexerCache instances with vLLM so that:
