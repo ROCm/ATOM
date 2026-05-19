@@ -537,10 +537,11 @@ jobs:
           echo "${PROXY_IP}" > /tmp/smoke-ip/proxy_ip.txt
 
       - name: Upload proxy IP
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: pd-smoke-proxy-ip
           path: /tmp/smoke-ip/proxy_ip.txt
+          overwrite: true
 
       - name: Start prefill container
         run: |
@@ -633,10 +634,11 @@ jobs:
 
       - name: Upload smoke done signal
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: pd-smoke-done
           path: /tmp/smoke-ip/proxy_ip.txt
+          overwrite: true
 
       - name: Dump logs
         if: always()
@@ -664,24 +666,47 @@ jobs:
           ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Wait for proxy IP artifact
-        timeout-minutes: 10
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "Polling for smoke proxy IP artifact..."
-          for i in $(seq 1 60); do
-            if gh run download ${{ github.run_id }} \
-                -n "pd-smoke-proxy-ip" \
-                -D /tmp/smoke-ip 2>/dev/null; then
-              PROXY_IP=$(cat /tmp/smoke-ip/proxy_ip.txt)
-              echo "Got proxy IP: ${PROXY_IP}"
-              echo "PROXY_IP=${PROXY_IP}" >> $GITHUB_ENV
-              break
-            fi
-            [ "$i" -eq 60 ] && echo "ERROR: Timed out waiting for proxy IP" && exit 1
-            echo "  Artifact not ready ($i/60), retrying in 10s..."
-            sleep 10
-          done
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execSync } = require('child_process');
+            const artifactName = 'pd-smoke-proxy-ip';
+            const maxRetries = 60;
+            for (let i = 0; i < maxRetries; i++) {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: context.runId,
+                });
+                const artifact = data.artifacts.find(a => a.name === artifactName);
+                if (artifact) {
+                  const download = await github.rest.actions.downloadArtifact({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    artifact_id: artifact.id,
+                    archive_format: 'zip',
+                  });
+                  fs.mkdirSync('/tmp/smoke-ip', { recursive: true });
+                  fs.writeFileSync('/tmp/_proxy.zip', Buffer.from(download.data));
+                  execSync('unzip -qo /tmp/_proxy.zip -d /tmp/smoke-ip && rm -f /tmp/_proxy.zip');
+                  const ip = fs.readFileSync('/tmp/smoke-ip/proxy_ip.txt', 'utf8').trim();
+                  core.info(`Got proxy IP: ${ip}`);
+                  const envFile = process.env.GITHUB_ENV;
+                  fs.appendFileSync(envFile, `PROXY_IP=${ip}\n`);
+                  return;
+                }
+              } catch (e) {
+                core.debug(`Attempt ${i+1} error: ${e.message}`);
+              }
+              if (i === maxRetries - 1) {
+                core.setFailed('Timed out waiting for proxy IP artifact');
+                return;
+              }
+              core.info(`  Artifact not ready (${i+1}/${maxRetries}), retrying in 10s...`);
+              await new Promise(r => setTimeout(r, 10000));
+            }
 
       - name: Start decode container
         run: |
@@ -744,21 +769,29 @@ jobs:
           done
 
       - name: Wait for prefill to finish
-        timeout-minutes: 30
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "Consumer healthy. Waiting for smoke prefill job to complete..."
-          for i in $(seq 1 60); do
-            if gh run download ${{ github.run_id }} \
-                -n "pd-smoke-done" \
-                -D /tmp/smoke-done 2>/dev/null; then
-              echo "Smoke prefill job done (after $((i * 30))s)"
-              break
-            fi
-            [ "$i" -eq 60 ] && echo "Timed out waiting for prefill, exiting"
-            sleep 30
-          done
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifactName = 'pd-smoke-done';
+            const maxRetries = 60;
+            for (let i = 0; i < maxRetries; i++) {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: context.runId,
+                });
+                if (data.artifacts.find(a => a.name === artifactName)) {
+                  core.info(`Smoke prefill job done (after ${(i+1)*30}s)`);
+                  return;
+                }
+              } catch (e) {}
+              if (i === maxRetries - 1) {
+                core.info('Timed out waiting for prefill, exiting');
+                return;
+              }
+              await new Promise(r => setTimeout(r, 30000));
+            }
 
       - name: Dump logs
         if: always()
@@ -812,10 +845,11 @@ jobs:
           echo "${{ matrix.model.prefix }}" >> /tmp/pd-ip/pd_proxy_ip.txt
 
       - name: Upload proxy IP
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: pd-proxy-ip-${{ matrix.model.prefix }}
           path: /tmp/pd-ip/pd_proxy_ip.txt
+          overwrite: true
 
       - name: Start prefill container
         run: |
@@ -1022,10 +1056,11 @@ jobs:
 
       - name: Upload benchmark done signal
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: pd-done-${{ matrix.model.prefix }}
           path: /tmp/pd-ip/pd_proxy_ip.txt
+          overwrite: true
 
       - name: Dump proxy log
         if: always()
@@ -1090,42 +1125,59 @@ jobs:
       - name: Wait for previous model to complete
         if: matrix.entry.prev_model_prefix != ''
         timeout-minutes: 120
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          PREV_PREFIX="${{ matrix.entry.prev_model_prefix }}"
-          echo "Sequential scheduling: waiting for model '${PREV_PREFIX}' to finish..."
-          for i in $(seq 1 240); do
-            if gh run download ${{ github.run_id }} \
-                -n "pd-done-${PREV_PREFIX}" \
-                -D /tmp/prev-done 2>/dev/null; then
-              echo "Previous model '${PREV_PREFIX}' completed (after $((i * 30))s)"
-              break
-            fi
-            [ "$i" -eq 240 ] && echo "ERROR: Timed out waiting for previous model" && exit 1
-            echo "  Not done ($i/240), retrying in 30s..."
-            sleep 30
-          done
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifactName = 'pd-done-${{ matrix.entry.prev_model_prefix }}';
+            core.info(`Sequential scheduling: waiting for model '${{ matrix.entry.prev_model_prefix }}' to finish...`);
+            for (let i = 0; i < 240; i++) {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
+                });
+                if (data.artifacts.find(a => a.name === artifactName)) {
+                  core.info(`Previous model completed (after ${(i+1)*30}s)`);
+                  return;
+                }
+              } catch (e) {}
+              if (i === 239) { core.setFailed('Timed out waiting for previous model'); return; }
+              core.info(`  Not done (${i+1}/240), retrying in 30s...`);
+              await new Promise(r => setTimeout(r, 30000));
+            }
 
       - name: Wait for proxy IP artifact
         timeout-minutes: 10
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "Polling for proxy IP artifact (pd-proxy-ip-${{ matrix.entry.prefix }})..."
-          for i in $(seq 1 60); do
-            if gh run download ${{ github.run_id }} \
-                -n "pd-proxy-ip-${{ matrix.entry.prefix }}" \
-                -D /tmp/proxy-ip 2>/dev/null; then
-              PROXY_IP=$(head -1 /tmp/proxy-ip/pd_proxy_ip.txt)
-              echo "Got proxy IP: ${PROXY_IP}"
-              echo "PROXY_IP=${PROXY_IP}" >> $GITHUB_ENV
-              break
-            fi
-            [ "$i" -eq 60 ] && echo "ERROR: Timed out waiting for proxy IP" && exit 1
-            echo "  Artifact not ready ($i/60), retrying in 10s..."
-            sleep 10
-          done
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execSync } = require('child_process');
+            const artifactName = 'pd-proxy-ip-${{ matrix.entry.prefix }}';
+            core.info(`Polling for proxy IP artifact (${artifactName})...`);
+            for (let i = 0; i < 60; i++) {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
+                });
+                const artifact = data.artifacts.find(a => a.name === artifactName);
+                if (artifact) {
+                  const download = await github.rest.actions.downloadArtifact({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    artifact_id: artifact.id, archive_format: 'zip',
+                  });
+                  fs.mkdirSync('/tmp/proxy-ip', { recursive: true });
+                  fs.writeFileSync('/tmp/_proxy.zip', Buffer.from(download.data));
+                  execSync('unzip -qo /tmp/_proxy.zip -d /tmp/proxy-ip && rm -f /tmp/_proxy.zip');
+                  const ip = fs.readFileSync('/tmp/proxy-ip/pd_proxy_ip.txt', 'utf8').trim().split('\n')[0];
+                  core.info(`Got proxy IP: ${ip}`);
+                  fs.appendFileSync(process.env.GITHUB_ENV, `PROXY_IP=${ip}\n`);
+                  return;
+                }
+              } catch (e) { core.debug(`Attempt ${i+1} error: ${e.message}`); }
+              if (i === 59) { core.setFailed('Timed out waiting for proxy IP'); return; }
+              core.info(`  Artifact not ready (${i+1}/60), retrying in 10s...`);
+              await new Promise(r => setTimeout(r, 10000));
+            }
 
       - name: Start decode container
         run: |
@@ -1227,20 +1279,24 @@ jobs:
 
       - name: Wait for prefill to finish benchmarks
         timeout-minutes: 90
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "Consumer is running. Waiting for prefill job to complete..."
-          for i in $(seq 1 180); do
-            if gh run download ${{ github.run_id }} \
-                -n "pd-done-${{ matrix.entry.prefix }}" \
-                -D /tmp/pd-done 2>/dev/null; then
-              echo "Prefill job signaled done after $((i * 30))s"
-              break
-            fi
-            [ "$i" -eq 180 ] && echo "Timed out waiting for prefill, exiting"
-            sleep 30
-          done
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifactName = 'pd-done-${{ matrix.entry.prefix }}';
+            core.info('Consumer is running. Waiting for prefill job to complete...');
+            for (let i = 0; i < 180; i++) {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
+                });
+                if (data.artifacts.find(a => a.name === artifactName)) {
+                  core.info(`Prefill job signaled done after ${(i+1)*30}s`);
+                  return;
+                }
+              } catch (e) {}
+              if (i === 179) { core.info('Timed out waiting for prefill, exiting'); return; }
+              await new Promise(r => setTimeout(r, 30000));
+            }
 
       - name: Dump consumer log
         if: always()
