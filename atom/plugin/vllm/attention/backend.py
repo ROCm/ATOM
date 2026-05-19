@@ -2,7 +2,7 @@ from typing import Type
 
 import logging
 import torch
-from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
+from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
 from atom.utils import CpuGpuBuffer
@@ -19,6 +19,7 @@ from atom.plugin.vllm.attention.metadata import (
     AiterMlaPrefillMetadataForVllm,
     AiterMhaMetadataForVllm,
     AiterMhaPhaseMetadata,
+    get_aiter_kv_cache_dtype,
 )
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
@@ -159,6 +160,8 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
         num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
+        if num_computed_tokens_cpu is None:
+            num_computed_tokens_cpu = seq_lens - query_lens_cpu
 
         prefill_max_query_len = decode_max_query_len = (
             common_attn_metadata.max_query_len
@@ -518,7 +521,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             1,
             self.padded_num_attention_heads,
             torch.bfloat16,
-            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            get_aiter_kv_cache_dtype(config),
             is_sparse=False,
             fast_mode=True,
         )
@@ -1119,7 +1122,16 @@ class AiterSparseMlaBackendForVllm(AiterMlaBackendForVllm):
     """vLLM-facing sparse MLA backend surface for ATOM attention layers."""
 
     @staticmethod
-    def get_builder_cls() -> Type["AiterMLASparseMetadataBuilder"]:
+    def get_supported_kernel_block_sizes():
+        return [1, 64]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # Prefer block_size == 64 so the indexer's preshuffled path is taken.
+        return 64
+
+    @staticmethod
+    def get_builder_cls() -> Type:
         from atom.plugin.vllm.attention_backend.mla_sparse import (
             AiterMLASparseMetadataBuilder,
         )
@@ -1145,7 +1157,16 @@ class AiterSparseMlaIndexerBackendForVllm(AiterMlaBackendForVllm):
     """vLLM-facing sparse MLA indexer backend surface."""
 
     @staticmethod
-    def get_builder_cls() -> Type["AiterMLASparseIndexerMetadataBuilder"]:
+    def get_supported_kernel_block_sizes():
+        return [1, 64]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # Prefer block_size == 64 so the indexer's preshuffled path is taken.
+        return 64
+
+    @staticmethod
+    def get_builder_cls() -> Type:
         from atom.plugin.vllm.attention_backend.mla_sparse import (
             AiterMLASparseIndexerMetadataBuilder,
         )

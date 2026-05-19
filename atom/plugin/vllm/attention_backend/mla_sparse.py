@@ -4,10 +4,12 @@
 from typing import Type
 
 import torch
+from aiter import get_mla_metadata_info_v1
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
 from atom.plugin.vllm.attention.metadata import (
     AiterMlaSparseIndexerMetadataBuilderMethodsForVllm,
     AiterMlaSparseMetadataBuilderMethodsForVllm,
+    get_aiter_kv_cache_dtype,
     get_max_prefill_buffer_size,
 )
 from atom.plugin.vllm.attention.backend import AiterMlaBackendForVllm
@@ -26,6 +28,15 @@ class AiterMLASparseBackend(AiterMlaBackendForVllm):
     @staticmethod
     def get_name() -> str:
         return "CUSTOM"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [1, 64]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # Prefer block_size == 64 so the indexer's preshuffled path is taken.
+        return 64
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLASparseMetadataBuilder"]:
@@ -70,6 +81,7 @@ class AiterMLASparseMetadataBuilder(
 
         self.vllm_config = config
         self.model_config = config.model_config
+        self.model_dtype = self.model_config.dtype
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
@@ -79,9 +91,6 @@ class AiterMLASparseMetadataBuilder(
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = config.model_config.hf_config.index_topk
-        self.topk_tokens_tensor = torch.tensor(
-            [self.topk_tokens], device=device, dtype=torch.int32
-        )
         self.max_model_len_tensor = torch.tensor(
             [self.model_config.max_model_len], device=device, dtype=torch.int32
         )
@@ -109,12 +118,58 @@ class AiterMLASparseMetadataBuilder(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
 
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = get_mla_metadata_info_v1(
+            max_num_batched_tokens,
+            1,
+            self.padded_num_heads,
+            torch.bfloat16,
+            get_aiter_kv_cache_dtype(config),
+            is_sparse=True,
+            fast_mode=True,
+        )
+        self._mla_work_meta_data = torch.empty(
+            work_meta_data_size, dtype=work_meta_data_type, device=device
+        )
+        self._mla_work_indptr = torch.empty(
+            work_indptr_size, dtype=work_indptr_type, device=device
+        )
+        self._mla_work_info_set = torch.empty(
+            work_info_set_size, dtype=work_info_set_type, device=device
+        )
+        self._mla_reduce_indptr = torch.empty(
+            reduce_indptr_size, dtype=reduce_indptr_type, device=device
+        )
+        self._mla_reduce_final_map = torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type, device=device
+        )
+        self._mla_reduce_partial_map = torch.empty(
+            reduce_partial_map_size,
+            dtype=reduce_partial_map_type,
+            device=device,
+        )
+
 
 class AiterMLASparseIndexerBackend(AiterMlaBackendForVllm):
 
     @staticmethod
     def get_name() -> str:
         return "CUSTOM"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [1, 64]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # Prefer block_size == 64 so the indexer's preshuffled path is taken.
+        return 64
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLASparseIndexerMetadataBuilder"]:

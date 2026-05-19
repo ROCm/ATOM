@@ -5,15 +5,24 @@ from dataclasses import dataclass
 
 import torch
 
-from aiter import get_mla_metadata_v1
-from atom.utils.block_convert import kv_indices_generate_triton
+from aiter import dtypes, get_mla_metadata_v1
 from atom.utils.forward_context import Context
-from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
 
 logger = logging.getLogger("atom")
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+
+
+def get_aiter_kv_cache_dtype(config) -> torch.dtype:
+    kv_cache_dtype = config.cache_config.cache_dtype
+    if kv_cache_dtype == "auto":
+        kv_cache_dtype = "bf16"
+    elif kv_cache_dtype == "bfloat16":
+        kv_cache_dtype = "bf16"
+    elif kv_cache_dtype == "float16":
+        kv_cache_dtype = "fp16"
+    return dtypes.d_dtypes[kv_cache_dtype]
 
 
 @dataclass
@@ -349,10 +358,17 @@ class AiterMlaSparseMetadataForVllm:
     paged_kv_last_page_len: torch.Tensor
     paged_kv_indices: torch.Tensor
     paged_kv_indptr: torch.Tensor
-    paged_kv_indptr_rest: torch.Tensor
+    attn_out_dtype: torch.dtype
 
     block_size: int = 1
     topk_tokens: int = 2048
+
+    work_meta_data: torch.Tensor | None = None
+    work_indptr: torch.Tensor | None = None
+    work_info_set: torch.Tensor | None = None
+    reduce_indptr: torch.Tensor | None = None
+    reduce_final_map: torch.Tensor | None = None
+    reduce_partial_map: torch.Tensor | None = None
 
 
 class AiterMlaSparseMetadataBuilderMethodsForVllm:
@@ -371,18 +387,62 @@ class AiterMlaSparseMetadataBuilderMethodsForVllm:
         )
         # Zero-fill for cudagraphs
         self.req_id_per_token_buffer.fill_(0)
+        self.paged_kv_indices.fill_(0)
+        self.paged_kv_indptr.fill_(0)
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
             req_id_per_token, non_blocking=True
         )
-        self.paged_kv_indices.fill_(0)
-        self.paged_kv_indptr.fill_(0)
+
+        query_lens = (
+            common_attn_metadata.query_start_loc[1:]
+            - common_attn_metadata.query_start_loc[:-1]
+        )
+        seq_lens = common_attn_metadata.seq_lens
+
+        from atom.plugin.vllm.attention.mla_sparse_impl import (
+            generate_sparse_seqlen_triton,
+        )
+
+        sparse_seqlen = generate_sparse_seqlen_triton(
+            query_lens,
+            seq_lens,
+            common_attn_metadata.query_start_loc,
+            self.topk_tokens,
+            num_tokens,
+            common_attn_metadata.max_query_len,
+        )
+        torch.cumsum(
+            sparse_seqlen,
+            dim=0,
+            out=self.paged_kv_indptr[1 : num_tokens + 1],
+        )
+        self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
         qo_indptr = self.qo_indptr[: num_tokens + 1]
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
         paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
-        paged_kv_indptr_rest = self.paged_kv_indptr[num_tokens + 1 :]
+
+        get_mla_metadata_v1(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_last_page_len,
+            self.padded_num_heads,
+            1,
+            True,
+            self._mla_work_meta_data,
+            self._mla_work_info_set,
+            self._mla_work_indptr,
+            self._mla_reduce_indptr,
+            self._mla_reduce_final_map,
+            self._mla_reduce_partial_map,
+            page_size=1,
+            kv_granularity=16,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+        )
 
         attn_metadata = AiterMlaSparseMetadataForVllm(
             num_reqs=common_attn_metadata.num_reqs,
@@ -395,12 +455,18 @@ class AiterMlaSparseMetadataBuilderMethodsForVllm:
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
+            attn_out_dtype=self.model_dtype,
             topk_tokens=self.topk_tokens,
             qo_indptr=qo_indptr,
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indptr_rest=paged_kv_indptr_rest,
+            work_meta_data=self._mla_work_meta_data,
+            work_indptr=self._mla_work_indptr,
+            work_info_set=self._mla_work_info_set,
+            reduce_indptr=self._mla_reduce_indptr,
+            reduce_final_map=self._mla_reduce_final_map,
+            reduce_partial_map=self._mla_reduce_partial_map,
         )
 
         return attn_metadata

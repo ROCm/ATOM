@@ -22,7 +22,9 @@ from atom.plugin.vllm.attention.mla_impl import (
     reorg_kvcache,
     use_triton_gemm,
 )
-from atom.plugin.vllm.attention.mla_sparse_impl import fetch_id_to_ragged_triton
+from atom.plugin.vllm.attention.mla_sparse_impl import (
+    triton_convert_req_index_to_global_index,
+)
 from atom.utils import envs
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -957,7 +959,6 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self,
         q: torch.Tensor,  # [sq, heads, d_qk]
         kv_cache: torch.Tensor,  # [blocks, heads, d_qk]
-        topk_indices_global: torch.Tensor,  # [sq, topk]
         attn_metadata,
     ) -> torch.Tensor:
         sparse_meta = attn_metadata
@@ -965,26 +966,12 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         num_tokens = q.shape[0]
         output = torch.empty(
             [num_tokens, self.padded_num_heads, self.kv_lora_rank],
-            # dtype=q.dtype,
-            dtype=torch.bfloat16,
+            dtype=sparse_meta.attn_out_dtype,
             device=q.device,
-        )
-
-        seq_len = (topk_indices_global != -1).sum(dim=-1)
-        torch.cumsum(seq_len, dim=0, out=sparse_meta.paged_kv_indptr[1:])
-        sparse_meta.paged_kv_indptr_rest.fill_(sparse_meta.paged_kv_indptr[-1])
-        fetch_id_to_ragged_triton(
-            topk_indices_global,
-            sparse_meta.paged_kv_indptr,
-            sparse_meta.paged_kv_indices,
-            sparse_meta.topk_tokens,
         )
 
         kv_buffer = kv_cache.unsqueeze(2)
 
-        # TODO: Currently, persistent mode has memory access issues when input context is long
-        # in fp8 kv cache settings, so it is not used for now.
-        # Re-enable persistent mode when the issue is fixed.
         mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
@@ -998,6 +985,12 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
             page_size=1,
+            work_meta_data=sparse_meta.work_meta_data,
+            work_indptr=sparse_meta.work_indptr,
+            work_info_set=sparse_meta.work_info_set,
+            reduce_indptr=sparse_meta.reduce_indptr,
+            reduce_final_map=sparse_meta.reduce_final_map,
+            reduce_partial_map=sparse_meta.reduce_partial_map,
         )
 
         if self.head_repeat_factor > 1:
@@ -1138,22 +1131,15 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        try:
-            from vllm.v1.attention.backends.mla.sparse_utils import (
-                triton_convert_req_index_to_global_index,
-            )
-        except ImportError:
-            from vllm.v1.attention.backends.mla.flashmla_sparse import (
-                triton_convert_req_index_to_global_index,
-            )
-
         req_id_i32 = sparse_meta.req_id_per_token.to(dtype=torch.int32)
         block_table_i32 = sparse_meta.block_table.to(dtype=torch.int32)
         topk_indices_i32 = topk_indices.to(dtype=torch.int32)
-        topk_indices_global = triton_convert_req_index_to_global_index(
-            req_id_i32,  # sparse_meta.req_id_per_token,
-            block_table_i32,  # sparse_meta.block_table,
-            topk_indices_i32,  # topk_indices,
+        triton_convert_req_index_to_global_index(
+            req_id_i32,
+            block_table_i32,
+            topk_indices_i32,
+            sparse_meta.paged_kv_indptr,
+            sparse_meta.paged_kv_indices,
             BLOCK_SIZE=sparse_meta.block_size,
             NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
         )
@@ -1166,9 +1152,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 self._q_scale,
             )
             q_out = q_flat.reshape(q_out.shape)
-        attn_out = self._forward_sparse_bf16_kv(
-            q_out, kv_cache, topk_indices_global, attn_metadata
-        )
+        attn_out = self._forward_sparse_bf16_kv(q_out, kv_cache, attn_metadata)
 
         # V up-projection
         self._v_up_proj(attn_out, out=output[:num_actual_toks])
