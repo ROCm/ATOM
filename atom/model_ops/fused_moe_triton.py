@@ -132,7 +132,7 @@ def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1
         w2_scale_triton_layout, N_2, K_2
     )
     
-    return w1_triton_layout, w1_scale_triton_layout, w1_swizzle_layout, w2_triton_layout, w2_scale_triton_layout, w2_swizzle_layout# transferring triton layout for now
+    return w1_triton_layout, w1_scale_triton_layout, w1_swizzle_layout, w2_triton_layout, w2_scale_triton_layout, w2_swizzle_layout
 
 
 def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
@@ -357,7 +357,6 @@ def routing_from_topk(
     Returns:
         (RoutingData, GatherIndx, ScatterIndx) compatible with triton_kernel_fused_experts
     """
-    logger.warning("routing from top_k")
     from aiter.ops.triton.moe.moe_routing.routing import (
         routing,
         RoutingData,
