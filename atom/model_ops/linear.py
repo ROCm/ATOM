@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from functools import partial as functools_partial
 from typing import Callable, Optional
 
@@ -286,11 +287,16 @@ class LinearBase(nn.Module):
                     torch.empty(self.output_size, 1, dtype=dtypes.fp32)
                 )
             elif quant_type == QuantType.per_1x128:
+                # When MXFP8 a8w8 is active, allocate weight_scale directly as
+                # float8_e8m0fnu (1 byte) to match the on-disk dtype - avoids
+                # the lossy fp32 upcast/round-trip at load.
+                _mxfp8_env = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
+                _scale_dtype = torch.float8_e8m0fnu if _mxfp8_env else dtypes.fp32
                 self.weight_scale = atom_parameter(
                     torch.empty(
                         (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
-                        dtype=dtypes.fp32,
+                        dtype=_scale_dtype,
                     )
                 )
             elif quant_type == QuantType.per_1x32:
@@ -510,9 +516,22 @@ class LinearBase(nn.Module):
                 self.quant_type == QuantType.per_Token
                 and self.params_dtype == dtypes.fp8
             ) or self.quant_type == QuantType.per_1x32
-            # per_1x128 only needs shuffle when using the preshuffle GEMM path
+            # per_1x128 only needs shuffle when using a preshuffle GEMM path.
+            # MXFP8 path: only shuffle if gemm_mxfp8_preshuffle will consume the
+            # shuffled weight (gated by ATOM_MXFP8_USE_PRESHUFFLE, default on).
+            # The non-preshuffle gemm_mxfp8 reads scrambled rows otherwise.
+            _mxfp8_active = (
+                self.quant_type == QuantType.per_1x128
+                and os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
+            )
+            _mxfp8_preshuffle = _mxfp8_active and (
+                os.environ.get("ATOM_MXFP8_USE_PRESHUFFLE", "1") == "1"
+            )
             if not need_shuffle and self.quant_type == QuantType.per_1x128:
-                need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+                if _mxfp8_active:
+                    need_shuffle = _mxfp8_preshuffle
+                else:
+                    need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
             if need_shuffle:
                 if self.weight.dim() == 2:
                     shuffle_weights(self.weight)
@@ -520,6 +539,30 @@ class LinearBase(nn.Module):
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32:
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+
+        # ---- Optional: MXFP8 a8w8 path (dormant, only active when env set) ----
+        # On disk V4-Flash stores per_1x128 weight scales as float8_e8m0fnu
+        # (uint8 powers-of-2) and weights as float8_e4m3fn. With MXFP8 active,
+        # __init__ allocated weight_scale as float8_e8m0fnu so the loader copied
+        # bits without any upcast/round-trip. Just expose as uint8 view here
+        # (gemm_mxfp8 expects uint8) and convert fp8 weight to fn-bits if the
+        # loader landed it as fnuz.
+        self._mxfp8_active = (
+            self.quant_type == QuantType.per_1x128
+            and os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
+        )
+        if self._mxfp8_active:
+            if self.weight_scale.data.dtype != torch.uint8:
+                self.weight_scale = atom_parameter(
+                    self.weight_scale.data.view(torch.uint8).contiguous()
+                )
+            if self.weight.data.dtype == torch.float8_e4m3fnuz:
+                # On-disk format is float8_e4m3fn but the param was allocated
+                # as fnuz (AMD default). The bit patterns differ - convert via
+                # value to preserve semantics.
+                w_val = self.weight.data.float()
+                w_fn = w_val.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                self.weight = atom_parameter(w_fn)
 
     @mark_trace
     def forward(
@@ -533,7 +576,31 @@ class LinearBase(nn.Module):
                 otype=otype,
             )
         else:
-            if x_scale is None:
+            # MXFP8 path: route per_1x128 weights through MXFP8 GEMM.
+            _use_mxfp8 = self.quant_type.value == QuantType.per_1x128.value and getattr(
+                self, "_mxfp8_active", False
+            )
+            if _use_mxfp8:
+                from aiter.ops.triton.quant.quant_mxfp8 import (
+                    per_1x32_mxfp8_quant_triton,
+                )
+
+                if x_scale is None:
+                    x, x_scale = per_1x32_mxfp8_quant_triton(x)
+                elif x_scale.dtype == torch.uint8:
+                    pass  # caller already emitted MXFP8 1x32
+                else:
+                    # legacy caller emitted FP8 + fp32 1x128 scale. Dequant to
+                    # bf16, then re-quantize to MXFP8 1x32.
+                    Mx, Kx = x.shape
+                    sM, sCols = x_scale.shape
+                    group = Kx // sCols
+                    x_dq = x.to(torch.float32).view(Mx, sCols, group) * x_scale.to(
+                        torch.float32
+                    ).view(sM, sCols, 1)
+                    x_bf16 = x_dq.view(Mx, Kx).to(torch.bfloat16)
+                    x, x_scale = per_1x32_mxfp8_quant_triton(x_bf16)
+            elif x_scale is None:
                 quant_func = self.quant_func
                 if self.quant_type.value == QuantType.per_1x128.value:
                     # preshuffle GEMM expects column-major x_scale;
@@ -578,7 +645,101 @@ class LinearBase(nn.Module):
                     if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
-                if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+                if _use_mxfp8:
+                    # One-shot dump: overwrite each call so the final saved file
+                    # is the most recent call (curl-driven, post-warmup).
+                    # _dump_env = os.environ.get("ATOM_MXFP8_DUMP", "")
+                    # if _dump_env:
+                    #     if _dump_env in getattr(self, "prefix", ""):
+                    #         try:
+                    #             import torch as _t
+                    #             _t.save(
+                    #                 {
+                    #                     "prefix": self.prefix,
+                    #                     "x": x.detach().cpu(),
+                    #                     "weight": self.weight.data.detach().cpu(),
+                    #                     "x_scale": x_scale.detach().cpu()
+                    #                     if x_scale is not None
+                    #                     else None,
+                    #                     "weight_scale": self.weight_scale.data.detach().cpu(),
+                    #                     "otype": str(otype),
+                    #                 },
+                    #                 f"/tmp/mxfp8_dump_{self.prefix.replace('.', '_')}.pt",
+                    #             )
+                    #             print(
+                    #                 f"[MXFP8_DUMP] saved /tmp/mxfp8_dump_{self.prefix.replace('.', '_')}.pt "
+                    #                 f"x={tuple(x.shape)}/{x.dtype} "
+                    #                 f"w={tuple(self.weight.shape)}/{self.weight.dtype} "
+                    #                 f"xs={tuple(x_scale.shape) if x_scale is not None else None}/{x_scale.dtype if x_scale is not None else None} "
+                    #                 f"ws={tuple(self.weight_scale.shape)}/{self.weight_scale.dtype}",
+                    #                 flush=True,
+                    #             )
+                    #             self._mxfp8_dumped = True
+                    #         except Exception as e:
+                    #             print(f"[MXFP8_DUMP_FAIL] {e}", flush=True)
+                    # try:
+                    if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+                        from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
+                            gemm_afp8wfp8_preshuffle,
+                        )
+
+                        y = gemm_afp8wfp8_preshuffle(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            dtype=otype,
+                        )
+                    else:
+                        from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
+                            gemm_afp8wfp8,
+                        )
+
+                        y = gemm_afp8wfp8(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            dtype=otype,
+                        )
+                    # except Exception as e:
+                    #     print(
+                    #         f"[MXFP8_FAIL] x={tuple(x.shape)}/{x.dtype} "
+                    #         f"w={tuple(self.weight.shape)}/{self.weight.dtype} "
+                    #         f"xs={tuple(x_scale.shape)}/{x_scale.dtype} "
+                    #         f"ws={tuple(self.weight_scale.shape)}/{self.weight_scale.dtype} "
+                    #         f"err={type(e).__name__}: {str(e)[:200]}",
+                    #         flush=True,
+                    #     )
+                    #     raise
+                elif envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+                    # If MXFP8 loader was active but kernel was skipped, the
+                    # weight_scale is uint8 (e8m0). Legacy preshuffle GEMM wants
+                    # fp32 - decode on the fly.
+                    # _ws = self.weight_scale
+                    # if _ws.dtype == torch.uint8:
+                    #     _ws = fp4_utils.e8m0_to_f32(_ws.view(torch.float8_e8m0fnu))
+                    # Legacy dump hook for A/B comparison vs MXFP8 path.
+                    # _dump_env = os.environ.get("ATOM_MXFP8_DUMP", "")
+                    # if _dump_env and _dump_env in getattr(self, "prefix", ""):
+                    #     try:
+                    #         import torch as _t
+                    #         _t.save(
+                    #             {
+                    #                 "prefix": self.prefix,
+                    #                 "x": x.detach().cpu(),
+                    #                 "weight": self.weight.data.detach().cpu(),
+                    #                 "x_scale": x_scale.detach().cpu()
+                    #                 if x_scale is not None
+                    #                 else None,
+                    #                 "weight_scale": self.weight_scale.data.detach().cpu(),
+                    #                 "otype": str(otype),
+                    #                 "path": "legacy",
+                    #             },
+                    #             f"/tmp/legacy_dump_{self.prefix.replace('.', '_')}.pt",
+                    #         )
+                    #     except Exception as e:
+                    #         print(f"[LEGACY_DUMP_FAIL] {e}", flush=True)
                     y = gemm_a8w8_blockscale_preshuffle_impl(
                         x,
                         self.weight,

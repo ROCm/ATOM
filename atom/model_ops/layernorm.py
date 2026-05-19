@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from typing import Optional, Tuple
 
 import aiter
@@ -318,6 +319,28 @@ class RMSNorm(nn.Module):
                 and x_scale is None
                 and self.quant_type.value in _AITER_RMS_QUANT_TYPE_VALUES
             ):
+                # MXFP8 path: when downstream Linear consumes MXFP8 1x32 e8m0
+                # scales (ATOM_FP8_BLOCKSCALE_USE_MXFP8=1), emit those directly
+                # to skip the dequant+requant cascade. Limited to per_1x128 and
+                # the no-residual case (most q_norm callers).
+                if (
+                    self.quant_type.value == _QV_PER_1X128
+                    and residual is None
+                    and os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
+                ):
+                    from aiter.ops.triton.quant.quant_mxfp8 import (
+                        rmsnorm_mxfp8_quant,
+                    )
+
+                    if x.dim() != 2:
+                        x2 = x.reshape(-1, x.shape[-1])
+                    else:
+                        x2 = x
+                    y, s = rmsnorm_mxfp8_quant(x2, self.weight, self.eps)
+                    if x.dim() != 2:
+                        y = y.view(*x.shape[:-1], x.shape[-1])
+                        s = s.view(*x.shape[:-1], s.shape[-1])
+                    return y, s
                 # Dynamic-scale fused RMSNorm + quant via aiter HIP kernels.
                 # Static FP8 (x_scale provided) stays on the branch above.
                 x, x_scale, residual_out = _aiter_rms_quant(

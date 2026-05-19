@@ -126,6 +126,46 @@ _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
+# MXFP8 a8w8 GEMM path (Task #77). When on, q_norm RMSNorm emits FP8 e4m3fn +
+# uint8 e8m0 1x32 scales directly (via the Triton rmsnorm_mxfp8_quant path in
+# atom/model_ops/layernorm.py) so wq_b's MXFP8 GEMM consumes them with no
+# transcode. The helper below is reserved for call sites that need to fuse
+# the Q-side MXFP8 quant with the K-side bf16 RMSNorm in a single launch.
+_V4_USE_MXFP8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
+
+
+def _fuse_rmsnorm_mxfp8_quant(
+    q_lora: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_norm_eps: float,
+    kv_pre: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+    kv_norm_eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dual RMSNorm with MXFP8 emit on Q side, bf16 on K side, single launch.
+
+    Q: RMSNorm + per-1x32 MXFP8 quant -- emits FP8 e4m3fn + uint8 e8m0 scale
+       directly so the downstream wq_b MXFP8 GEMM consumes them with no
+       dequant+requant cascade.
+    K: RMSNorm only, bf16 output, consumed by the downstream RoPE / SWA-write
+       fused kernel which expects bf16 K.
+
+    Both halves run in a single Triton launch (dual_rmsnorm_mxfp8_quant) to
+    avoid the +6us/layer per-launch overhead of two separate kernels.
+
+    Returns (qr_fp8, qr_scale_e8m0, kv_bf16).
+    """
+    from aiter.ops.triton.quant.quant_mxfp8 import dual_rmsnorm_mxfp8_quant
+
+    qr, qr_scale, kv = dual_rmsnorm_mxfp8_quant(
+        q_lora,
+        kv_pre,
+        q_norm_weight,
+        kv_norm_weight,
+        q_norm_eps,
+        kv_norm_eps,
+    )
+    return qr, qr_scale, kv
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -1972,7 +2012,11 @@ class Expert(nn.Module):
         # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
         # quant through a single aiter triton kernel. The fused kernel emits
         # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
-        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
+        # ATOM_V4_DISABLE_FCAM=1 forces the unfused eager path for A/B vs the
+        # Triton fused-clamp-act-mul kernel.
+        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION and (
+            os.environ.get("ATOM_V4_DISABLE_FCAM", "0") != "1"
+        )
 
     def forward(
         self,
@@ -1987,14 +2031,31 @@ class Expert(nn.Module):
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         if self.use_fused_clamp_act_mul:
-            x_fp8, x_scale = fused_clamp_act_mul(
-                combined,
-                swiglu_limit=self.swiglu_limit,
-                activation="silu",
-                weights=weights,
-                dtype_quant=dtypes.fp8,
-                transpose_scale=True,
-            )
+            # When MXFP8 is enabled, ATOM_MXFP8_BYPASS_FCAM=1 forces the
+            # legacy fp32 1x128 emit + linear.py's dequant+requant fallback,
+            # isolating whether fused_clamp_act_mul's MXFP8 emit has a bug.
+            _mxfp8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
+            _bypass_fcam = os.environ.get("ATOM_MXFP8_BYPASS_FCAM", "0") == "1"
+            if _mxfp8 and not _bypass_fcam:
+                x_fp8, x_scale = fused_clamp_act_mul(
+                    combined,
+                    swiglu_limit=self.swiglu_limit,
+                    activation="silu",
+                    weights=weights,
+                    dtype_quant=torch.float8_e4m3fn,
+                    quant_block_size=32,
+                    scale_dtype_fmt="ue8m0",
+                    transpose_scale=False,
+                )
+            else:
+                x_fp8, x_scale = fused_clamp_act_mul(
+                    combined,
+                    swiglu_limit=self.swiglu_limit,
+                    activation="silu",
+                    weights=weights,
+                    dtype_quant=dtypes.fp8,
+                    transpose_scale=True,
+                )
             return self.w2(x_fp8, x_scale=x_scale)
         out = torch.empty(
             (combined.shape[0], combined.shape[-1] // 2),
