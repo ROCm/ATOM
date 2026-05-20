@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Tuple
 
 import torch
+from aiter import dtypes
 
 from atom.config import KVCacheTensor, get_current_atom_config
 from atom.model_ops.attention_gdn import GatedDeltaNet
@@ -73,7 +75,9 @@ class RTPForwardContext:
     layer_group_map: Dict[int, int]
     context: Context
     num_tokens: int
-    LayerMaps = tuple[Dict[int, GatedDeltaNet], Dict[int, Any]]
+    mla_layer_map: Dict[int, Any]
+    use_rtp_indexer_cache: bool = False
+    LayerMaps = tuple[Dict[int, GatedDeltaNet], Dict[int, Any], Dict[int, Any]]
 
     @staticmethod
     def _non_empty_int32(
@@ -304,6 +308,22 @@ class RTPForwardContext:
                 )
             return by_group[gid]
         return getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
+
+    @staticmethod
+    def _select_physical_block_table_for_layer(
+        attn_inputs: Any,
+        group_id: int | None = None,
+    ) -> torch.Tensor | None:
+        # MLA cache writes use concat_and_cache_mla(slot_mapping), whose slot is
+        # indexed in the physical KV cache layout, not the smaller kernel block
+        # granularity used by some RTP attention kernels.
+        block_table = getattr(attn_inputs, "kv_cache_block_id_device", None)
+        if block_table is not None:
+            return block_table
+        return RTPForwardContext._select_block_table_for_layer(
+            attn_inputs=attn_inputs,
+            group_id=group_id,
+        )
 
     @staticmethod
     def _build_layer_group_map(attn_inputs: Any) -> Dict[int, int]:
@@ -646,18 +666,7 @@ class RTPForwardContext:
                 "RTP plugin block_table/query_start_loc batch mismatch "
                 f"(block_table={int(bt.shape[0])}, batch={batch_size})."
             )
-        validate_slot_mapping = os.getenv("ATOM_VALIDATE_SLOT_MAPPING", "0") == "1"
-        if validate_slot_mapping and int(qsl[-1].item()) != num_tokens:
-            raise ValueError(
-                "RTP plugin query_start_loc/positions token mismatch "
-                f"(query_start_loc[-1]={int(qsl[-1].item())}, positions={num_tokens})."
-            )
-
         lengths = qsl[1:] - qsl[:-1]
-        if validate_slot_mapping and torch.any(lengths <= 0):
-            raise ValueError(
-                "RTP plugin query_start_loc contains non-positive sequence length."
-            )
         if in_capture and cg_bufs is not None:
             # Zero-alloc path: use pre-allocated buffers so captured GPU ops
             # reference stable addresses that stay alive through replay.
@@ -694,29 +703,14 @@ class RTPForwardContext:
                 torch.arange(batch_size, device=device, dtype=torch.int64),
                 lengths.to(dtype=torch.int64),
             )
-        if validate_slot_mapping and int(seq_id.numel()) != num_tokens:
-            raise ValueError(
-                "RTP plugin internal seq_id construction mismatch for slot_mapping."
-            )
 
         block_col = torch.div(
             pos_i32,
             int(seq_size_per_block),
             rounding_mode="floor",
         )
-        if validate_slot_mapping and (
-            torch.any(block_col < 0) or torch.any(block_col >= bt.shape[1])
-        ):
-            raise ValueError(
-                "RTP plugin block-table index out of range for full-attn slot_mapping "
-                f"(max_col={int(bt.shape[1]) - 1})."
-            )
 
         slot_base = bt[seq_id, block_col.to(dtype=torch.int64)]
-        if validate_slot_mapping and torch.any(slot_base < 0):
-            raise ValueError(
-                "RTP plugin resolved padded/invalid (-1) block slot for full-attn slot_mapping."
-            )
         token_offset = torch.remainder(pos_i32, int(seq_size_per_block))
         slot_mapping = slot_base * int(seq_size_per_block) + token_offset
         return slot_mapping.to(dtype=torch.int64).contiguous()
@@ -791,20 +785,83 @@ class RTPForwardContext:
         )
 
     @staticmethod
+    def _build_req_id_per_token(
+        *,
+        query_start_loc: torch.Tensor,
+        num_tokens: int,
+        device: torch.device,
+        cg_bufs: dict | None = None,
+    ) -> torch.Tensor:
+        batch_size = int(query_start_loc.numel()) - 1
+        if batch_size <= 0:
+            raise ValueError(
+                "RTP plugin cannot build req_id_per_token for empty batch."
+            )
+        if int(num_tokens) == 0:
+            return torch.empty((0,), dtype=torch.int32, device=device)
+        if cg_bufs is not None and "seq_id" in cg_bufs:
+            seq_id = cg_bufs["seq_id"][:num_tokens]
+            return seq_id.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
+        lengths = (query_start_loc[1:] - query_start_loc[:-1]).to(dtype=torch.int64)
+        if not torch.cuda.is_current_stream_capturing() and int(
+            lengths.sum().item()
+        ) != int(num_tokens):
+            raise ValueError(
+                "RTP plugin query_start_loc/num_tokens mismatch for req_id_per_token "
+                f"(query_start_loc[-1]={int(query_start_loc[-1].item())}, "
+                f"num_tokens={int(num_tokens)})."
+            )
+        return torch.repeat_interleave(
+            torch.arange(batch_size, device=device, dtype=torch.int32),
+            lengths,
+        ).contiguous()
+
+    @staticmethod
+    def _expand_block_table_for_atom_indexer(
+        block_table: torch.Tensor,
+        *,
+        seq_size_per_block: int,
+        kernel_seq_size_per_block: int,
+    ) -> torch.Tensor:
+        if (
+            kernel_seq_size_per_block <= 0
+            or seq_size_per_block <= 0
+            or seq_size_per_block == kernel_seq_size_per_block
+        ):
+            return block_table
+        if seq_size_per_block % kernel_seq_size_per_block != 0:
+            raise ValueError(
+                "RTP plugin cannot expand block_table for ATOM indexer: "
+                f"seq_size_per_block={seq_size_per_block}, "
+                f"kernel_seq_size_per_block={kernel_seq_size_per_block}."
+            )
+        block_ratio = int(seq_size_per_block // kernel_seq_size_per_block)
+        offsets = torch.arange(
+            block_ratio, device=block_table.device, dtype=torch.int32
+        )
+        base = block_table.to(dtype=torch.int32)
+        expanded = base.unsqueeze(-1) * block_ratio + offsets
+        expanded = torch.where(base.unsqueeze(-1) >= 0, expanded, -1)
+        return expanded.reshape(base.shape[0], base.shape[1] * block_ratio).contiguous()
+
+    @staticmethod
     def _build_plugin_attention_metadata(
         *,
         attn_inputs: Any,
         positions: torch.Tensor,
         seq_size_per_block: int,
+        kernel_seq_size_per_block: int = 0,
         cg_max_seq_len: int = 0,
         cg_bufs: dict | None = None,
     ) -> AttentionMetaData:
-        block_table = RTPForwardContext._select_block_table_for_layer(
+        block_table = RTPForwardContext._select_physical_block_table_for_layer(
             attn_inputs=attn_inputs,
         )
         if block_table is None or block_table.numel() == 0:
             raise ValueError(
-                "RTP plugin requires kv_cache_kernel_block_id_device for plugin attention metadata."
+                "RTP plugin requires kv_cache_block_id_device for plugin attention metadata."
             )
         device = positions.device
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
@@ -852,6 +909,12 @@ class RTPForwardContext:
             block_table=block_table,
             seq_size_per_block=seq_size_per_block,
             cg_bufs=cg_bufs,
+        )
+        req_id_per_token = RTPForwardContext._build_req_id_per_token(
+            query_start_loc=query_start_loc,
+            num_tokens=num_actual_tokens,
+            device=device,
+            cg_bufs=cg_bufs if in_capture else None,
         )
 
         is_dummy_warmup = False
@@ -932,6 +995,16 @@ class RTPForwardContext:
             block_table_i32 = block_table.to(
                 device=device, dtype=torch.int32, non_blocking=True
             ).contiguous()
+        if in_capture:
+            indexer_block_table_i32 = block_table_i32
+        else:
+            indexer_block_table_i32 = (
+                RTPForwardContext._expand_block_table_for_atom_indexer(
+                    block_table_i32,
+                    seq_size_per_block=int(seq_size_per_block),
+                    kernel_seq_size_per_block=int(kernel_seq_size_per_block),
+                )
+            )
         plugin_md = AiterFlashAttentionMetadataForPluginMode(
             num_actual_tokens=num_actual_tokens,
             num_actual_kv_tokens=num_actual_kv_tokens,
@@ -957,6 +1030,28 @@ class RTPForwardContext:
         )
         # Prefill-only fields shared across all full-attn layers in the step.
         plugin_md.rtp_cu_seqlens_q = query_start_loc
+        plugin_md.req_id_per_token = req_id_per_token
+        plugin_md.topk_tokens = 0
+        plugin_md.sparse_block_size = int(seq_size_per_block)
+        cu_seqlen_ks = None
+        cu_seqlen_ke = None
+        if is_prefill:
+            prefill_lengths = (query_start_loc[1:] - query_start_loc[:-1]).to(
+                dtype=torch.int64
+            )
+            if in_capture and cg_bufs is not None and "seq_id" in cg_bufs:
+                seq_id_for_span = cg_bufs["seq_id"][:num_actual_tokens]
+            else:
+                seq_id_for_span = torch.repeat_interleave(
+                    torch.arange(batch_size, device=device, dtype=torch.int64),
+                    prefill_lengths,
+                )
+            cu_seqlen_ks = (
+                query_start_loc[:-1][seq_id_for_span].to(dtype=torch.int32).contiguous()
+            )
+            cu_seqlen_ke = (
+                torch.arange(num_actual_tokens, device=device, dtype=torch.int32) + 1
+            ).contiguous()
         # Mark dummy probe (RTP initCapture's "forward for output datatype" feeds
         # all-zero seq_lens/block_tables); RTPFullAttention short-circuits to zeros.
         plugin_md.is_dummy_warmup = bool(is_dummy_warmup)
@@ -973,11 +1068,17 @@ class RTPForwardContext:
         else:
             plugin_md.rtp_has_prefix = False
         attn_metadata = AttentionMetaData(
+            cu_seqlens_q=query_start_loc,
+            cu_seqlens_k=query_start_loc,
             max_seqlen_q=max_query_len,
             max_seqlen_k=max_seq_len,
-            block_tables=plugin_md.block_table,
+            block_tables=indexer_block_table_i32,
             slot_mapping=slot_mapping,
             context_lens=seq_lens,
+            cu_seqlen_ks=cu_seqlen_ks,
+            cu_seqlen_ke=cu_seqlen_ke,
+            has_cached=False,
+            total_kv=int(num_actual_kv_tokens),
         )
         attn_metadata.plugin_metadata = plugin_md
         return attn_metadata
@@ -986,7 +1087,17 @@ class RTPForwardContext:
     def collect_layer_maps(model: Any) -> LayerMaps:
         gdn_layer_map: Dict[int, GatedDeltaNet] = {}
         full_attn_layer_map: Dict[int, Any] = {}
+        mla_layer_map: Dict[int, Any] = {}
         rtp_attention_cls: type[Any] | None = None
+        rtp_mla_attention_cls: type[Any] | None = None
+        try:
+            from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import (
+                RTPMLAAttention,
+            )
+
+            rtp_mla_attention_cls = RTPMLAAttention
+        except (ImportError, ModuleNotFoundError):
+            rtp_mla_attention_cls = None
         try:
             from atom.plugin.rtpllm.attention_backend import AttentionForRTPLLM
 
@@ -997,6 +1108,20 @@ class RTPForwardContext:
         for module in model.modules():
             if isinstance(module, GatedDeltaNet):
                 gdn_layer_map[int(module.layer_num)] = module
+            elif (
+                getattr(module, "indexer", None) is not None
+                and getattr(module, "mla_attn", None) is not None
+                and getattr(module, "layer_num", None) is not None
+            ):
+                mla_layer_map[int(module.layer_num)] = module
+            elif rtp_mla_attention_cls is not None and isinstance(
+                module, rtp_mla_attention_cls
+            ):
+                layer_num = getattr(module, "layer_id", None)
+                if layer_num is None:
+                    layer_num = getattr(module, "layer_num", None)
+                if layer_num is not None and int(layer_num) not in mla_layer_map:
+                    mla_layer_map[int(layer_num)] = module
             elif isinstance(module, (PagedAttention, PagedAttentionImpl)) or (
                 rtp_attention_cls is not None and isinstance(module, rtp_attention_cls)
             ):
@@ -1006,7 +1131,7 @@ class RTPForwardContext:
                     layer_num = getattr(module, "layer_num", None)
                 if layer_num is not None:
                     full_attn_layer_map[int(layer_num)] = module
-        return gdn_layer_map, full_attn_layer_map
+        return gdn_layer_map, full_attn_layer_map, mla_layer_map
 
     @staticmethod
     def _build_kv_cache_tensors(
@@ -1016,9 +1141,9 @@ class RTPForwardContext:
         if runtime.kv_cache is None:
             raise ValueError("RTP plugin requires initialized kv_cache for ATOM model.")
 
-        gdn_layer_map, full_attn_layer_map = layer_maps
+        gdn_layer_map, full_attn_layer_map, mla_layer_map = layer_maps
 
-        if not gdn_layer_map and not full_attn_layer_map:
+        if not gdn_layer_map and not full_attn_layer_map and not mla_layer_map:
             return {}
 
         cache_tensors: Dict[str, KVCacheTensor] = {}
@@ -1109,6 +1234,31 @@ class RTPForwardContext:
                 k_scale=None,
                 v_scale=None,
             )
+        # Build MLA cache references separately from full attention. MLA adapters
+        # own their kv_cache pointer and refresh it in bind() for every forward.
+        for layer_num in mla_layer_map.keys():
+            layer_key = f"layer_{layer_num}"
+            if layer_key in cache_tensors:
+                continue
+
+            layer_cache = runtime.kv_cache.get_layer_cache(layer_num)
+            kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
+            if kv_cache_base is None:
+                raise ValueError(
+                    f"Layer {layer_num} kv_cache_base is missing for MLA cache."
+                )
+            if kv_cache_base.dim() < 1:
+                raise ValueError(
+                    f"Layer {layer_num} MLA kv_cache_base has invalid shape "
+                    f"{tuple(kv_cache_base.shape)}."
+                )
+            cache_tensors[layer_key] = KVCacheTensor(
+                layer_num=layer_num,
+                k_cache=layer_cache,
+                v_cache=None,
+                k_scale=None,
+                v_scale=None,
+            )
         return cache_tensors
 
     @staticmethod
@@ -1118,10 +1268,12 @@ class RTPForwardContext:
     ) -> Tuple[Any, ...]:
         if runtime.kv_cache is None:
             return ("no_kv_cache",)
-        gdn_layer_map, full_attn_layer_map = layer_maps
+        gdn_layer_map, full_attn_layer_map, mla_layer_map = layer_maps
         signature: list[Any] = [id(runtime.kv_cache)]
         all_layer_nums = sorted(
-            set(gdn_layer_map.keys()) | set(full_attn_layer_map.keys())
+            set(gdn_layer_map.keys())
+            | set(full_attn_layer_map.keys())
+            | set(mla_layer_map.keys())
         )
         for layer_num in all_layer_nums:
             layer_cache = runtime.kv_cache.get_layer_cache(layer_num)
@@ -1136,6 +1288,16 @@ class RTPForwardContext:
                     int(kv_cache_base.numel()),
                 )
             )
+            kv_scale_base = getattr(layer_cache, "kv_scale_base", None)
+            if kv_scale_base is not None and kv_scale_base.numel() > 0:
+                signature.append(
+                    (
+                        int(layer_num),
+                        "scale",
+                        int(kv_scale_base.data_ptr()),
+                        int(kv_scale_base.numel()),
+                    )
+                )
         return tuple(signature)
 
     @classmethod
@@ -1194,7 +1356,8 @@ class RTPForwardContext:
         attn_metadata = cls._build_plugin_attention_metadata(
             attn_inputs=attn_inputs,
             positions=positions,
-            seq_size_per_block=kernel_seq_size_per_block,
+            seq_size_per_block=seq_size_per_block,
+            kernel_seq_size_per_block=kernel_seq_size_per_block,
             cg_max_seq_len=int(cg_max_seq_len),
             cg_bufs=cg_bufs,
         )
@@ -1234,7 +1397,157 @@ class RTPForwardContext:
             layer_group_map=layer_group_map,
             context=context,
             num_tokens=int(positions.numel()),
+            mla_layer_map=resolved_layer_maps[2],
+            use_rtp_indexer_cache=cls._use_rtp_indexer_cache(),
         )
+
+    @staticmethod
+    def _use_rtp_indexer_cache() -> bool:
+        return os.getenv("ATOM_RTP_USE_RTP_INDEXER_CACHE", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _resolve_rtp_indexer_cache(
+        *,
+        layer_num: int,
+        layer_cache: Any,
+        indexer: Any,
+        block_size: int,
+    ) -> torch.Tensor:
+        kv_scale_base = getattr(layer_cache, "kv_scale_base", None)
+        if kv_scale_base is None or kv_scale_base.numel() == 0:
+            raise ValueError(
+                f"Layer {layer_num} RTP indexer cache requires non-empty kv_scale_base."
+            )
+        if kv_scale_base.dtype == torch.uint8:
+            kv_scale_base = kv_scale_base.view(dtypes.fp8)
+        if kv_scale_base.dtype != dtypes.fp8:
+            raise ValueError(
+                f"Layer {layer_num} RTP indexer cache dtype mismatch "
+                f"(got={kv_scale_base.dtype}, expected={dtypes.fp8} or torch.uint8)."
+            )
+        if block_size <= 0:
+            raise ValueError(
+                f"Layer {layer_num} RTP indexer cache got invalid block_size={block_size}."
+            )
+        head_dim = int(getattr(indexer, "head_dim", 0) or 0)
+        if head_dim <= 0:
+            raise ValueError(
+                f"Layer {layer_num} RTP indexer cache requires positive indexer.head_dim."
+            )
+        if head_dim != 128:
+            warnings.warn(
+                "RTP indexer cache binding has only been layout-checked for "
+                "GLM5 head_dim=128; cross-kernel byte semantics are not verified "
+                f"for head_dim={head_dim}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        expected_raw_dim = head_dim + (head_dim // 128) * 4
+        expected_aligned_dim = ((expected_raw_dim + 15) // 16) * 16
+        allowed_dims = {expected_raw_dim, expected_aligned_dim}
+
+        if kv_scale_base.dim() == 3 and int(kv_scale_base.shape[-1]) in allowed_dims:
+            return kv_scale_base
+        if kv_scale_base.dim() == 2 and int(kv_scale_base.shape[1]) % block_size == 0:
+            per_token_dim = int(kv_scale_base.shape[1]) // block_size
+            if per_token_dim in allowed_dims:
+                return kv_scale_base.view(
+                    kv_scale_base.shape[0], block_size, per_token_dim
+                )
+        raise ValueError(
+            f"Layer {layer_num} RTP indexer cache layout mismatch "
+            f"(shape={tuple(kv_scale_base.shape)}, block_size={block_size}, "
+            f"allowed_last_dims={sorted(allowed_dims)})."
+        )
+
+    @staticmethod
+    def _build_fallback_indexer_cache(
+        *,
+        cache_owner: Any,
+        layer_cache: Any,
+        indexer: Any,
+        block_size: int,
+    ) -> torch.Tensor | None:
+        kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
+        if kv_cache_base is None or kv_cache_base.dim() == 0:
+            return None
+        index_dim = int(getattr(indexer, "head_dim", 0) or 0) + 4
+        if index_dim <= 4:
+            return None
+        aligned_dim = ((index_dim + 15) // 16) * 16
+        num_tokens = int(kv_cache_base.shape[0]) * block_size
+        cached = getattr(cache_owner, "_rtp_indexer_kv_cache", None)
+        expected_shape = (num_tokens, 1, aligned_dim)
+        if (
+            cached is None
+            or tuple(cached.shape) != expected_shape
+            or cached.device != kv_cache_base.device
+            or cached.dtype != dtypes.fp8
+        ):
+            cached = torch.empty(
+                expected_shape,
+                device=kv_cache_base.device,
+                dtype=dtypes.fp8,
+            )
+            setattr(cache_owner, "_rtp_indexer_kv_cache", cached)
+        return cached
+
+    @staticmethod
+    def _attach_mla_layer_caches(
+        forward_context: "RTPForwardContext",
+    ) -> tuple[list[tuple[Any, str, Any]], list[tuple[list[Any], int, Any]]]:
+        restore_attrs: list[tuple[Any, str, Any]] = []
+        restore_indices: list[tuple[list[Any], int, Any]] = []
+        for layer_num, layer in forward_context.mla_layer_map.items():
+            cache_tensor = forward_context.kv_cache_data.get(f"layer_{layer_num}")
+            if cache_tensor is None:
+                continue
+            cache_owner = getattr(layer, "mla_attn", layer)
+            restore_attrs.append(
+                (cache_owner, "kv_cache", getattr(cache_owner, "kv_cache", None))
+            )
+            cache_owner.kv_cache = cache_tensor.k_cache
+            indexer = getattr(layer, "indexer", None)
+            if indexer is None:
+                indexer = getattr(cache_owner, "indexer", None)
+            indexer_cache = getattr(indexer, "k_cache", None)
+            indexer_kv_cache = getattr(indexer_cache, "kv_cache", None)
+            if not isinstance(indexer_kv_cache, list) or not indexer_kv_cache:
+                continue
+            layer_cache = cache_tensor.k_cache
+            kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
+            if kv_cache_base is None or kv_cache_base.dim() == 0:
+                continue
+            block_size = int(
+                getattr(forward_context, "rtp_seq_size_per_block", 0)
+                or getattr(forward_context, "rtp_kernel_seq_size_per_block", 0)
+                or getattr(get_current_atom_config(), "kv_cache_block_size", 0)
+                or 1
+            )
+            if bool(getattr(forward_context, "use_rtp_indexer_cache", False)):
+                indexer_cache_tensor = RTPForwardContext._resolve_rtp_indexer_cache(
+                    layer_num=layer_num,
+                    layer_cache=layer_cache,
+                    indexer=indexer,
+                    block_size=block_size,
+                )
+            else:
+                indexer_cache_tensor = RTPForwardContext._build_fallback_indexer_cache(
+                    cache_owner=cache_owner,
+                    layer_cache=layer_cache,
+                    indexer=indexer,
+                    block_size=block_size,
+                )
+            if indexer_cache_tensor is None:
+                continue
+            restore_indices.append((indexer_kv_cache, 0, indexer_kv_cache[0]))
+            indexer_kv_cache[0] = indexer_cache_tensor
+        return restore_attrs, restore_indices
 
     @classmethod
     @contextmanager
@@ -1265,8 +1578,16 @@ class RTPForwardContext:
         attn_md.rtp_kernel_seq_size_per_block = (
             forward_context.rtp_kernel_seq_size_per_block
         )
+        attn_md.rtp_seq_size_per_block = getattr(
+            forward_context, "rtp_seq_size_per_block", 0
+        )
         attn_md.rtp_layer_group_map = forward_context.layer_group_map
+        restore_mla_attrs: list[tuple[Any, str, Any]] = []
+        restore_mla_indices: list[tuple[list[Any], int, Any]] = []
         try:
+            restore_mla_attrs, restore_mla_indices = cls._attach_mla_layer_caches(
+                forward_context
+            )
             set_kv_cache_data(forward_context.kv_cache_data)
             set_forward_context(
                 attn_metadata=attn_md,
@@ -1276,5 +1597,9 @@ class RTPForwardContext:
             )
             yield
         finally:
+            for target, index, old_cache in reversed(restore_mla_indices):
+                target[index] = old_cache
+            for target, attr, old_cache in reversed(restore_mla_attrs):
+                setattr(target, attr, old_cache)
             reset_forward_context()
             set_kv_cache_data(prev_kv if prev_kv is not None else {})
