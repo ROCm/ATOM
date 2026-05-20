@@ -8,11 +8,12 @@ use axum::response::Response;
 use data_connector::{self, ConversationId, ResponseId};
 use tracing::{debug, warn};
 
+use super::context::ResponsesContext;
 use crate::{
     protocols::responses::{
         self, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest,
     },
-    routers::{error, grpc::common::responses::ResponsesContext},
+    routers::error,
 };
 
 /// Load conversation history and response chains, returning modified request

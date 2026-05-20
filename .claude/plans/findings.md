@@ -452,3 +452,85 @@ orphaned — ~60 dead-code warnings on the build. Plan §I.1 sweeps these.
 **Human gates**:
 - G10 `/mesh-e2e-test` PD matrix: PENDING — user must run on GPU host.
 - G11 `/v1/responses` streaming + non-streaming smoke: PENDING — same.
+
+## Part H — 2026-05-20 — pass_count 866 (= Part G, no regression)
+
+**Scope**: Relocate /v1/responses subtree from `grpc/{common,regular}/responses/`
+into a new `routers/openai/responses/` namespace. Pure file moves + 1 merger +
+4 renames + import path updates. Zero business-logic edits.
+
+**H.1 — Moves** (all via `git mv` to preserve history):
+- `grpc/common/responses/context.rs`      → `openai/responses/context.rs` (verbatim)
+- `grpc/common/responses/handlers.rs`     → `openai/responses/retrieve.rs` (rename per design)
+- `grpc/common/responses/utils.rs`        → `openai/responses/persistence.rs` (verbatim)
+- `grpc/regular/responses/handlers.rs`    → `openai/responses/handlers.rs`
+- `grpc/regular/responses/non_streaming.rs` → `openai/responses/non_streaming.rs`
+- `grpc/regular/responses/common.rs`      → `openai/responses/conversation.rs` (rename per design)
+- `grpc/regular/responses/conversions.rs` → `openai/responses/conversions.rs`
+
+**H.2 — Streaming merger**:
+- `git mv grpc/common/responses/streaming.rs openai/responses/streaming.rs`
+  (this preserves history for the larger 638-ln file).
+- Appended `tail -n +33 grpc/regular/responses/streaming.rs` (skips the second
+  file's `use` block; body starts at "// =====  Streaming Path =====").
+- Consolidated `use` block at the top of the merged file: superset of both
+  originals, minus `routers::grpc::common::responses::{...}` which is replaced
+  by `super::{context::ResponsesContext, persistence::persist_response_if_needed}`
+  (the other two re-exported symbols, `ResponseStreamEventEmitter` and
+  `build_sse_response`, are now local to the same file).
+- `git rm` source file. **No name collisions**: common's streaming defined
+  `OutputItemType/ResponseStreamEventEmitter/build_sse_response`; regular's
+  defined `convert_chat_stream_to_responses_stream/process_and_transform_sse_stream/StreamingResponseAccumulator`.
+  All disjoint.
+
+**H.3 — V-1 honored**: `grpc/router.rs` and `grpc/pd_router.rs` NOT renamed.
+Top-level `routers/http_router.rs` (32 KB) and `routers/http_pd_router.rs` (67 KB)
+untouched. No file-name collision introduced.
+
+**H.4 — Import updates** (10 lines across 6 files):
+- `grpc/router.rs:7-17,190`: dropped `super::common::responses::{...}` and
+  `super::regular::responses`; added `routers::openai::responses::{context::ResponsesContext, handlers as responses_handlers, retrieve::{cancel_response_impl, get_response_impl}}`.
+  Renamed call site `responses::route_responses(...)` → `responses_handlers::route_responses(...)`.
+- `grpc/common/mod.rs`: removed `pub(crate) mod responses;`.
+- `grpc/regular/mod.rs`: removed `pub(crate) mod responses;`.
+- `openai/responses/mod.rs`: added `pub(crate) mod {context, conversation, conversions, handlers, non_streaming, persistence, retrieve, streaming};` (kept cfg(any())-gated `tests` submodule).
+- 5 moved files: rewrote 1–2 `use` lines each to use `super::*` instead of
+  `routers::grpc::common::responses::*`.
+
+**Test gates** (plan §Test Part H):
+- H1 build clean: PASS (cargo build --release exits 0, 64 pre-existing warnings, no new).
+- H2 no test regression: PASS (866 passed / 15 failed = identical to Part G).
+- H3 new paths exist: PASS.
+- H4 old dirs gone: PASS (`grpc/common/responses/` and `grpc/regular/responses/` both removed by `git rm`).
+- H5 `openai/responses/` only refs `grpc::pipeline::Pipeline`: PASS for actual `use` statements.
+  The plan's plain grep matches one doc-comment in `tests.rs` (`// A use crate::routers::grpc::engine::worker_client_cache::* in this file would compile,`)
+  — a comment, not an import; `tests.rs` is `#[cfg(any())]`-gated so it never compiles.
+  Stricter grep restricted to `^[[:space:]]*use ` lines is empty.
+- H6 `grpc/` does not ref `openai/`: PASS (empty).
+- H7 no `mesh_grpc::*` in `openai/responses/`: PASS for actual `use` statements. Same
+  doc-comment false-positive pattern in `tests.rs` (a comment quoting the rule).
+- H8 exactly 1 streaming file: PASS (`find ... 'streaming*.rs' | wc -l` = 1).
+- H9 prepare/render/worker_stream still grpc-free: PASS.
+- H10 top-level `http_router.rs` / `http_pd_router.rs` untouched in Part H: PASS.
+  Note: `git diff main --name-only` lists these as differing because they were
+  added on the branch in an earlier part (they don't exist on main at all).
+  `git diff HEAD --` shows zero edits in Part H — V-1 honored.
+- H11 `/v1/responses` smoke: PENDING — human gate.
+- H12 rust-reviewer: PASS (APPROVE, one LOW cosmetic — missing blank line at
+  the merge boundary `streaming.rs:655` — fixed before this commit).
+
+**Test counts**: 866 passed / 15 failed (identical to Part G — no regression).
+The 15 failures are pre-existing api_tests/routing_tests requiring external workers.
+
+**Line-count delta** (production source under `src/routers/`):
+- Old `grpc/common/responses/` 5 files (831 ln) → DELETED.
+- Old `grpc/regular/responses/` 6 files (1228 ln) → DELETED.
+- New `openai/responses/` 9 files (~2059 ln from moves + 9 ln mod.rs adds + 18 ln
+  consolidated imports - 32 ln dropped from regular's old import block).
+- `grpc/router.rs`: -17 / +17 (net 0; import path renames + 1 call-site path).
+- `grpc/common/mod.rs`, `grpc/regular/mod.rs`: -1 ln each.
+
+**Human gates**:
+- H11 `/v1/responses` streaming + non-streaming smoke: PENDING — user must run
+  on GPU host via `/mesh-e2e-test`. Refactor functionality unchanged; the path
+  through `pipeline.execute_chat_for_responses` was already validated by F9/G10.

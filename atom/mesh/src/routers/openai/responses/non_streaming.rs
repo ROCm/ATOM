@@ -8,13 +8,13 @@ use std::sync::Arc;
 use axum::response::Response;
 use tracing::error;
 
-use super::{common::load_conversation_history, conversions};
+use super::{
+    context::ResponsesContext, conversation::load_conversation_history, conversions,
+    persistence::persist_response_if_needed,
+};
 use crate::{
     protocols::responses::{ResponsesRequest, ResponsesResponse},
-    routers::{
-        error,
-        grpc::common::responses::{persist_response_if_needed, ResponsesContext},
-    },
+    routers::error,
 };
 
 /// Internal implementation for non-streaming responses

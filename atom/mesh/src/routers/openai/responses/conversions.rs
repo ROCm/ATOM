@@ -21,7 +21,7 @@ use crate::{
         },
         UNKNOWN_MODEL_ID,
     },
-    routers::grpc::common::responses::utils::extract_tools_from_response_tools,
+    routers::openai::responses::persistence::extract_tools_from_response_tools,
 };
 
 /// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline

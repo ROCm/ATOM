@@ -23,11 +23,11 @@ use axum::{
 };
 use uuid::Uuid;
 
-use super::{common::load_conversation_history, conversions, non_streaming, streaming};
-use crate::{
-    protocols::responses::ResponsesRequest,
-    routers::{error, grpc::common::responses::ResponsesContext},
+use super::{
+    context::ResponsesContext, conversation::load_conversation_history, conversions, non_streaming,
+    streaming,
 };
+use crate::{protocols::responses::ResponsesRequest, routers::error};
 
 /// Main handler for POST /v1/responses
 ///

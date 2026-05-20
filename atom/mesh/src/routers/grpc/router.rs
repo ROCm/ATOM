@@ -5,16 +5,11 @@ use axum::{http::HeaderMap, response::Response};
 use tracing::debug;
 
 use super::{
-    common::responses::{
-        handlers::{cancel_response_impl, get_response_impl},
-        ResponsesContext,
-    },
     completion_adapter::{
         completion_to_generate, wrap_generate_response_as_completion,
         wrap_streaming_generate_as_completion,
     },
     pipeline::Pipeline,
-    regular::responses,
 };
 use crate::{
     app_context::AppContext,
@@ -27,7 +22,15 @@ use crate::{
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{error, RouterTrait},
+    routers::{
+        error,
+        openai::responses::{
+            context::ResponsesContext,
+            handlers as responses_handlers,
+            retrieve::{cancel_response_impl, get_response_impl},
+        },
+        RouterTrait,
+    },
 };
 
 /// gRPC router implementation for SGLang
@@ -187,7 +190,7 @@ impl GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        responses::route_responses(
+        responses_handlers::route_responses(
             &self.responses_context,
             Arc::new(body.clone()),
             headers.cloned(),

@@ -3,7 +3,7 @@
 use axum::response::{IntoResponse, Response};
 use data_connector::ResponseId;
 
-use super::ResponsesContext;
+use super::context::ResponsesContext;
 use crate::routers::error;
 
 /// Implementation for GET /v1/responses/{response_id}
