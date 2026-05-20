@@ -830,6 +830,80 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if os.environ.get("ATOM_V4_TORCH_MOE"):
             return
 
+        # Step 1: a8w4 MoE backend weight-layout branch. Reorders W13/W2 into
+        # the layout moe_gemm_a8w4 expects and swizzles scales.
+        _use_a8w4_moe = os.environ.get("ATOM_MOE_BACKEND", "matmul_ogs") == "a8w4"
+        if _use_a8w4_moe and self.use_triton:
+            from aiter.ops.triton.moe.moe_op_gemm_a8w4 import swizzle_scales
+
+            # Step 3: gate/up interleave for apply_swiglu fold. Off by default.
+            _interleave_w13 = os.environ.get("ATOM_A8W4_SWIGLU_FOLD", "0") == "1"
+
+            def _interleave_gateup(t):
+                """t: [E, 2N, *] → reorder dim=1 from [g..u..] to [g,u,g,u,...]"""
+                E, two_N = t.shape[0], t.shape[1]
+                N = two_N // 2
+                tail = t.shape[2:]
+                return (
+                    t.view(E, 2, N, *tail)
+                    .permute(0, 2, 1, *range(3, 3 + len(tail)))
+                    .contiguous()
+                    .view(E, two_N, *tail)
+                )
+
+            # W1 weight: view-transpose to [E, K/2, 2N] (no .contiguous())
+            w1_w = layer.w13_weight.data.view(torch.uint8)  # [E, 2N, K/2]
+            if _interleave_w13:
+                w1_w = _interleave_gateup(w1_w)
+            w1_w_kernel = w1_w.transpose(-1, -2)  # [E, K/2, 2N], view
+            assert (
+                w1_w_kernel.stride(-2) == 1
+            ), "W1: K must be contiguous (do NOT call .contiguous())"
+
+            # W1 scale: transpose + contiguous + swizzle
+            w1_s = layer.w13_weight_scale.data  # [E, 2N, K/32]
+            if _interleave_w13:
+                w1_s = _interleave_gateup(w1_s)
+            w1_s_swz_in = w1_s.transpose(-1, -2).contiguous()  # [E, K/32, 2N]
+            w1_s_E, w1_s_SCALE_K, w1_s_N = w1_s_swz_in.shape
+            w1_s_K = w1_s_SCALE_K * 32
+            if w1_s_N % 32 == 0 and w1_s_K % 256 == 0:
+                w1_s_kernel = swizzle_scales(w1_s_swz_in)
+            else:
+                w1_s_kernel = w1_s_swz_in
+
+            # W2 weight: view-transpose to [E, N_per/2, hidden]
+            w2_w = layer.w2_weight.data.view(torch.uint8)
+            w2_w_kernel = w2_w.transpose(-1, -2)
+            assert (
+                w2_w_kernel.stride(-2) == 1
+            ), "W2: K (=N_per/2 packed) must be contiguous"
+
+            # W2 scale: transpose + contiguous + swizzle
+            w2_s = layer.w2_weight_scale.data
+            w2_s_swz_in = w2_s.transpose(-1, -2).contiguous()
+            w2_s_E, w2_s_SCALE_K, w2_s_N = w2_s_swz_in.shape
+            w2_s_K = w2_s_SCALE_K * 32
+            if w2_s_N % 32 == 0 and w2_s_K % 256 == 0:
+                w2_s_kernel = swizzle_scales(w2_s_swz_in)
+            else:
+                w2_s_kernel = w2_s_swz_in
+
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            layer.w13_weight = w1_w_kernel
+            layer.w2_weight = w2_w_kernel
+            layer.w13_weight_scale = w1_s_kernel
+            layer.w2_weight_scale = w2_s_kernel
+
+            self.w13_precision_config = None
+            self.w2_precision_config = None
+            self.moe_backend = "a8w4"
+            self.a8w4_swiglu_fold = _interleave_w13
+            return
+
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig

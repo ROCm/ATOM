@@ -2282,9 +2282,31 @@ class MoE(nn.Module):
     def single_stream_moe_forward(
         self, x: torch.Tensor  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
-        """Sequential: shared_experts → routed_experts → combine."""
+        """Sequential: shared_experts → routed_experts → combine.
+
+        Step 9: when the MoE method supports it (a8w4 triton-routing path),
+        the `routed + shared` add is folded into reduce_grouped's writeback by
+        stashing `shared` on `self.experts` before `routed_expert_forward`.
+        Saves the standalone elementwise add kernel. Gated by
+        ATOM_A8W4_FUSE_RESIDUAL (default 1) for easy A/B.
+        """
         shared = self.shared_experts(x) if self.shared_experts is not None else None
-        routed = self.routed_expert_forward(x)
+        fuse_residual = (
+            shared is not None and os.environ.get("ATOM_A8W4_FUSE_RESIDUAL", "1") == "1"
+        )
+        if fuse_residual:
+            self.experts._moe_residual_to_fold = shared
+        try:
+            routed = self.routed_expert_forward(x)
+        finally:
+            if fuse_residual:
+                self.experts._moe_residual_to_fold = None
+        folded = getattr(self.experts, "_moe_residual_was_folded", False)
+        self.experts._moe_residual_was_folded = False  # one-shot
+        if folded:
+            if self.tp_size > 1:
+                routed = tensor_model_parallel_all_reduce(routed)
+            return routed
         return self.combine_outputs(routed, shared)
 
     def dual_stream_moe_forward(
