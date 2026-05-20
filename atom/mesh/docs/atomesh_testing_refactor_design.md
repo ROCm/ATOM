@@ -141,7 +141,7 @@ tests/
 │   │   ├── generate_basic.json
 │   │   ├── pd_prefill_decode.json
 │   │   ├── chat_basic.json
-│   │   ├── chat_streaming_tool_call.json
+│   │   ├── chat_streaming_text.json
 │   │   └── responses_basic.json
 ├── api/                            # 现有：继续保留
 ├── routing/                        # 现有：继续保留
@@ -308,24 +308,25 @@ nightly（可选长期任务）:
 
 ## 6. 实施计划
 
-建议按 5 个工作日排布。当前已完成 Day 1 与 Day 2 的核心交付：测试命令/README 已修正，旧 `MockWorker` 与新增 harness 都已使用随机端口和 readiness polling，regular HTTP fixture-driven harness 已打通。Day 3 及之后的 streaming、PD、gRPC 和测试矩阵整理仍是后续工作。
+建议按 5 个工作日排布。当前已完成 Day 1 与 Day 2 的核心交付，并完成 Day 3 的基础 streaming/HTTP PD smoke：测试命令/README 已修正，旧 `MockWorker` 与新增 harness 都已使用随机端口和 readiness polling，regular HTTP fixture-driven harness 已打通，普通文本 SSE fixture 和 HTTP PD chat prefill/decode replay 已有基础断言。每个 harness case 会输出真实运行时 router config、worker URLs、注册 worker 数和健康 worker 数，便于确认运行状态。Day 3 中 reasoning fixture、复杂 streaming failure 和后续 gRPC/测试矩阵整理仍是后续工作。
 
 
 | 阶段    | 时间  | 主要工作                                                                                  | 交付物                                                    | 当前状态 |
 | ----- | --- | ------------------------------------------------------------------------------------- | ------------------------------------------------------ | ---- |
 | Day 1 | 1 天 | 修正测试命令；改造 `MockWorker::start/shutdown`；端口和 readiness polling 收敛。 | README 命令正确；`MockWorker` 与新增 `TestHarness` 启停和 readiness 基础稳定。 | 已完成 |
 | Day 2 | 1 天 | 新增 `MockTestCase`、`VirtualRequest`、`ReplayCaseStore`、golden assert；打通 regular HTTP virtual worker。 | fixture 可生成真实 Atomesh 请求，经 regular HTTP 路由到 virtual worker，并完成 response / worker path 校验。 | 已完成 |
-| Day 3 | 1 天 | 增加 `VirtualWorker` streaming fixture、PD prefill/decode replay。                                | SSE、tool call、reasoning、PD fixture 可断言。                    | 未开始 |
+| Day 3 | 1 天 | 增加 `VirtualWorker` streaming fixture、PD prefill/decode replay，并输出运行时 router/worker 状态。                                | 普通文本 SSE fixture、HTTP PD chat prefill/decode fixture 可断言；每个 case 可打印 router mode、connection mode、policy、worker URLs、注册 worker 数和健康 worker 数；reasoning 和复杂 streaming failure fixture 后续补齐。                    | 部分完成 |
 | Day 4 | 1 天 | 完善 `MockGrpcWorker` 接口；将更多现有 case 接入 `TestHarness`；整理运行模式矩阵。                         | 现有测试可复用测试系统；gRPC smoke 有后续扩展入口。                        | 部分预留 |
 | Day 5 | 1 天 | 建立重构 P0 清单；补 metrics/router/worker pool/entry routes 关键测试；整理 CI 分层。                   | 每个重构点有 P0 测试入口；CI quick/full 边界明确。                     | 未开始 |
 
 当前实现清单：
 
 - 已新增 `tests/test_atomesh/` 测试框架模块：`MockTestCase`、`VirtualRequest`、`ReplayCaseStore`、`VirtualWorker`、`TestHarness`、`GoldenAssert` 和 `MockGrpcWorker` 占位。
-- 已新增 `tests/fixtures/mock_tests/` regular HTTP 样本：`who_are_you_chat.json`、`generate_basic.json`。
-- 已在 `tests/api/atomesh_harness_test.rs` 接入 fixture-driven regular HTTP smoke 测试，并通过 `cargo test -p atom-mesh --test api_tests test_fixture_driven -- --nocapture`。
+- 已新增 `tests/fixtures/mock_tests/` 样本：`who_are_you_chat.json`、`generate_basic.json`、`chat_streaming_text.json`、`pd_prefill_decode.json`。
+- 已在 `tests/api/atomesh_harness_test.rs` 接入 fixture-driven regular HTTP、streaming 和 HTTP PD chat smoke 测试，并通过 `cargo test -p atom-mesh --test api_tests test_fixture_driven -- --nocapture`。
+- 已在 `TestHarnessResult` 中返回真实运行时 router/worker 状态：router mode、connection mode、policy、worker URLs、registered workers、healthy workers，并在 case 日志中输出。
 - 已修正 `tests/README.md` 中 package 名称和新增测试结构说明。
-- 尚未完成 streaming fixture 断言、HTTP PD replay、gRPC smoke、现有大批 case 迁移和 P0 测试矩阵整理。
+- 尚未完成 reasoning fixture、复杂 streaming failure、gRPC smoke、现有大批 case 迁移和 P0 测试矩阵整理。
 
 
 如果工期紧张，优先级为：
@@ -338,18 +339,20 @@ P2: gRPC PD smoke + sandbox binary startup + nightly backend compatibility
 
 ## 7. 测试与验收
 
-当前 P0 regular HTTP harness 验收：
+当前 P0/P1 HTTP harness 验收：
 
 - 默认 fixture-driven regular HTTP smoke 不依赖 GPU、真实 engine 或外部网络。
 - 旧 `MockWorker` 与新增 `VirtualWorker` 使用随机端口和 readiness polling，不依赖固定 sleep。
 - `MockTestCase` 能生成 `VirtualRequest`，通过 Atomesh 真实入口完成请求。
-- `VirtualWorker` 能根据 mock test fixture 匹配请求并返回 golden response。
+- `VirtualWorker` 能根据 mock test fixture 匹配请求并返回 golden response，支持非流式 JSON 和基础 SSE 回放。
+- HTTP PD chat 通过 fixture-driven `TestHarness` 接入，并可断言 prefill/decode worker path。
+- case 日志能打印真实 router config 和 worker registry 摘要，而不是直接复述 fixture 声明。
 - `tests/README.md` 与实际 package name、CI quick/full/nightly 命令一致。
 - `cargo test -p atom-mesh --test api_tests test_fixture_driven -- --nocapture` 通过。
 
 后续验收：
 
-- HTTP PD 通过 fixture-driven `TestHarness` 接入并覆盖 prefill/decode replay。
+- Reasoning fixture、复杂 streaming failure 和更完整的 tool-call 流式断言待后续专门补齐。
 - gRPC regular、gRPC PD 作为后续 smoke 扩展项。
 - 重构 metrics、router、worker pool、entry routes 前，有对应 P0 测试清单。
 

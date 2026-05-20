@@ -17,7 +17,7 @@ use tower::ServiceExt;
 use crate::common::{create_test_context, test_app};
 
 use super::{
-    golden_assert::GoldenAssert,
+    golden_assert::{assert_any_json_contains, GoldenAssert},
     mock_test_case::{MockTestCase, WorkerKindFixture},
     VirtualRequest, VirtualWorker,
 };
@@ -27,12 +27,25 @@ use super::{
 pub struct TestHarnessResult {
     pub status: u16,
     pub body: Value,
+    pub stream_events: Vec<Value>,
     pub worker_path: Vec<String>,
+    pub router_mode: String,
+    pub connection_mode: String,
+    pub policy: String,
+    pub worker_urls: Vec<String>,
+    pub registered_workers: usize,
+    pub healthy_workers: usize,
 }
 
 impl TestHarnessResult {
     /// Assert HTTP status and stable response fields against the fixture.
     pub fn assert_response(&self, case: &MockTestCase) {
+        if case.is_streaming() {
+            assert_eq!(self.status, case.expected_response.status);
+            assert_any_json_contains(&self.stream_events, &case.expected_response.body);
+            return;
+        }
+
         GoldenAssert {
             expected_status: case.expected_response.status,
             expected_body: case.expected_response.body.clone(),
@@ -47,6 +60,23 @@ impl TestHarnessResult {
             "worker path {:?} did not contain {}",
             self.worker_path,
             endpoint
+        );
+    }
+
+    /// Assert Atomesh routed to the same virtual worker endpoint multiple times.
+    pub fn assert_worker_path_count_at_least(&self, endpoint: &str, expected_count: usize) {
+        let actual_count = self
+            .worker_path
+            .iter()
+            .filter(|path| path.as_str() == endpoint)
+            .count();
+        assert!(
+            actual_count >= expected_count,
+            "worker path {:?} contained {} only {} times, expected at least {}",
+            self.worker_path,
+            endpoint,
+            actual_count,
+            expected_count
         );
     }
 }
@@ -67,6 +97,9 @@ impl TestHarness {
 
     /// Execute the full fixture flow through Atomesh and virtual workers.
     pub async fn run(&self) -> Result<TestHarnessResult, Box<dyn std::error::Error>> {
+        // Stage 0: this harness currently drives Atomesh's HTTP front door.
+        // gRPC fixtures can reuse the same high-level shape later, but need a
+        // different virtual backend transport.
         if !matches!(
             self.case.route.connection_mode,
             super::mock_test_case::ConnectionModeFixture::Http
@@ -74,30 +107,67 @@ impl TestHarness {
             return Err("TestHarness currently supports HTTP fixtures only".into());
         }
 
+        // Stage 1: start virtual backend workers from fixture route metadata.
+        // Regular mode starts one worker; PD mode starts a prefill/decode pair.
         let mut workers = self.start_virtual_workers().await?;
         let worker_urls = workers
             .iter()
             .map(|worker| worker.url.clone().unwrap())
             .collect::<Vec<_>>();
+
+        // Stage 2: build the same app context pieces Atomesh uses at runtime,
+        // then submit the production worker-initialization job. This is what
+        // triggers Atomesh's own worker health/model-info probes and registry
+        // insertion instead of manually registering fake workers.
         let config = self.router_config(&worker_urls);
         let app_context = create_test_context(config.clone()).await;
         initialize_workers(&app_context, &config, worker_urls.len()).await?;
+
+        // Capture runtime router state from the actual config/context used by
+        // RouterFactory, not from the fixture declaration.
+        let router_mode = format!("{:?}", config.mode);
+        let connection_mode = format!("{:?}", config.connection_mode);
+        let policy = format!("{:?}", config.policy);
+        let registered_workers = app_context.worker_registry.len();
+        let healthy_workers = app_context
+            .worker_registry
+            .get_all()
+            .iter()
+            .filter(|worker| worker.is_healthy())
+            .count();
+
+        // Stage 3: create the real router and Axum app from the initialized
+        // context. Requests below enter through `server::build_app`, not by
+        // directly calling router internals.
         let router = RouterFactory::create_router(&app_context).await?;
         let router: std::sync::Arc<dyn RouterTrait> = std::sync::Arc::from(router);
         let app = test_app::create_test_app_with_context(router, app_context);
 
+        // Stage 4: convert the fixture into a real Atomesh API request and send
+        // it through the app. Atomesh will select workers and forward the
+        // request to the virtual backend over HTTP.
         let request = VirtualRequest::from_case(&self.case).into_axum_request();
         let response = app.oneshot(request).await?;
+
+        // Stage 5: collect the response into assertion-friendly forms. For
+        // streaming responses we keep parsed SSE JSON events in addition to the
+        // raw response body fallback.
         let status = response.status().as_u16();
         let bytes = response.into_body().collect().await?.to_bytes();
-        let body = serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).to_string()));
+        let response_text = String::from_utf8_lossy(&bytes).to_string();
+        let stream_events = parse_sse_events(&response_text);
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(response_text));
 
+        // Stage 6: collect the worker-side request log. This includes startup
+        // and registration probes (`/health`, `/get_model_info`) plus the
+        // business endpoint, so tests can assert routing shape when needed.
         let worker_path = workers
             .iter()
             .flat_map(VirtualWorker::request_log)
             .collect::<Vec<_>>();
 
+        // Stage 7: stop virtual workers before returning the result. Keeping
+        // teardown inside the harness keeps individual fixture tests small.
         for worker in &mut workers {
             worker.stop().await;
         }
@@ -105,13 +175,21 @@ impl TestHarness {
         Ok(TestHarnessResult {
             status,
             body,
+            stream_events,
             worker_path,
+            router_mode,
+            connection_mode,
+            policy,
+            worker_urls,
+            registered_workers,
+            healthy_workers,
         })
     }
 
     async fn start_virtual_workers(
         &self,
     ) -> Result<Vec<VirtualWorker>, Box<dyn std::error::Error>> {
+        // The fixture's worker kind decides the topology under test.
         let worker_count = match self.case.route.worker_kind {
             WorkerKindFixture::Regular => 1,
             WorkerKindFixture::PrefillDecode => 2,
@@ -128,6 +206,8 @@ impl TestHarness {
     }
 
     fn router_config(&self, worker_urls: &[String]) -> RouterConfig {
+        // Keep the harness config minimal and deterministic: HTTP transport,
+        // round-robin policy, no retries, and random local router port.
         let mut builder = RouterConfig::builder()
             .host("127.0.0.1")
             .port(portpicker::pick_unused_port().expect("no free port for test router"))
@@ -153,6 +233,17 @@ impl TestHarness {
     }
 }
 
+fn parse_sse_events(response_text: &str) -> Vec<Value> {
+    // Axum's collected SSE body is line-oriented (`data: ...`). Ignore
+    // terminal `[DONE]` markers and keep only JSON payloads for golden asserts.
+    response_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .collect()
+}
+
 async fn initialize_workers(
     app_context: &std::sync::Arc<mesh::app_context::AppContext>,
     config: &RouterConfig,
@@ -162,6 +253,8 @@ async fn initialize_workers(
         return Ok(());
     }
 
+    // Worker initialization is intentionally performed through the job queue so
+    // tests exercise the same registration workflow as server startup.
     let job_queue = app_context
         .worker_job_queue
         .get()

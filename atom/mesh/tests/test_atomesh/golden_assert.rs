@@ -45,3 +45,18 @@ impl GoldenAssert {
         assert_json_contains(actual_body, &self.expected_body);
     }
 }
+
+/// Assert that at least one collected SSE event contains the expected fields.
+pub fn assert_any_json_contains(actual_events: &[Value], expected: &Value) {
+    assert!(
+        actual_events
+            .iter()
+            .any(
+                |actual| std::panic::catch_unwind(|| assert_json_contains(actual, expected))
+                    .is_ok()
+            ),
+        "no SSE event matched expected subset: expected={}, actual_events={:?}",
+        expected,
+        actual_events
+    );
+}

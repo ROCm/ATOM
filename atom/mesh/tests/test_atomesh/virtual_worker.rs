@@ -256,9 +256,16 @@ async fn replay(endpoint: &str, state: VirtualWorkerState, body: Value) -> Respo
 
 fn streaming_response(case: &MockTestCase) -> Response {
     let body = case.expected_response.body.clone();
-    let event = Ok::<_, Infallible>(Event::default().data(body.to_string()));
-    let done = Ok(Event::default().data("[DONE]"));
-    Sse::new(stream::iter([event, done]))
+    let mut events = match body {
+        Value::Array(items) => items
+            .into_iter()
+            .map(|item| Ok::<_, Infallible>(Event::default().data(item.to_string())))
+            .collect::<Vec<_>>(),
+        body => vec![Ok(Event::default().data(body.to_string()))],
+    };
+    events.push(Ok(Event::default().data("[DONE]")));
+
+    Sse::new(stream::iter(events))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
