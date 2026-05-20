@@ -18,6 +18,7 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+from aiter.ops.triton.quant.quant_mxfp8 import rmsnorm_mxfp8_quant
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
@@ -25,6 +26,8 @@ from atom.utils.decorators import mark_trace
 from atom.utils import envs
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
+
+_V4_USE_MXFP8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -326,12 +329,8 @@ class RMSNorm(nn.Module):
                 if (
                     self.quant_type.value == _QV_PER_1X128
                     and residual is None
-                    and os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
+                    and _V4_USE_MXFP8
                 ):
-                    from aiter.ops.triton.quant.quant_mxfp8 import (
-                        rmsnorm_mxfp8_quant,
-                    )
-
                     if x.dim() != 2:
                         x2 = x.reshape(-1, x.shape[-1])
                     else:

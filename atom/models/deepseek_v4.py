@@ -132,6 +132,8 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 # transcode. The helper below is reserved for call sites that need to fuse
 # the Q-side MXFP8 quant with the K-side bf16 RMSNorm in a single launch.
 _V4_USE_MXFP8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
+_V4_DISABLE_FCAM = os.environ.get("ATOM_V4_DISABLE_FCAM", "0") == "1"
+_MXFP8_BYPASS_FCAM = os.environ.get("ATOM_MXFP8_BYPASS_FCAM", "0") == "1"
 
 
 def _fuse_rmsnorm_mxfp8_quant(
@@ -2014,9 +2016,7 @@ class Expert(nn.Module):
         # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
         # ATOM_V4_DISABLE_FCAM=1 forces the unfused eager path for A/B vs the
         # Triton fused-clamp-act-mul kernel.
-        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION and (
-            os.environ.get("ATOM_V4_DISABLE_FCAM", "0") != "1"
-        )
+        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION and not _V4_DISABLE_FCAM
 
     def forward(
         self,
@@ -2034,9 +2034,7 @@ class Expert(nn.Module):
             # When MXFP8 is enabled, ATOM_MXFP8_BYPASS_FCAM=1 forces the
             # legacy fp32 1x128 emit + linear.py's dequant+requant fallback,
             # isolating whether fused_clamp_act_mul's MXFP8 emit has a bug.
-            _mxfp8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
-            _bypass_fcam = os.environ.get("ATOM_MXFP8_BYPASS_FCAM", "0") == "1"
-            if _mxfp8 and not _bypass_fcam:
+            if _V4_USE_MXFP8 and not _MXFP8_BYPASS_FCAM:
                 x_fp8, x_scale = fused_clamp_act_mul(
                     combined,
                     swiglu_limit=self.swiglu_limit,

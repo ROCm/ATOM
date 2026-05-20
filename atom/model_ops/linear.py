@@ -23,6 +23,10 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
+from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
+    gemm_afp8wfp8,
+    gemm_afp8wfp8_preshuffle,
+)
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.quant_spec import LayerQuantConfig
 from atom.model_ops.utils import (
@@ -646,43 +650,7 @@ class LinearBase(nn.Module):
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
                 if _use_mxfp8:
-                    # One-shot dump: overwrite each call so the final saved file
-                    # is the most recent call (curl-driven, post-warmup).
-                    # _dump_env = os.environ.get("ATOM_MXFP8_DUMP", "")
-                    # if _dump_env:
-                    #     if _dump_env in getattr(self, "prefix", ""):
-                    #         try:
-                    #             import torch as _t
-                    #             _t.save(
-                    #                 {
-                    #                     "prefix": self.prefix,
-                    #                     "x": x.detach().cpu(),
-                    #                     "weight": self.weight.data.detach().cpu(),
-                    #                     "x_scale": x_scale.detach().cpu()
-                    #                     if x_scale is not None
-                    #                     else None,
-                    #                     "weight_scale": self.weight_scale.data.detach().cpu(),
-                    #                     "otype": str(otype),
-                    #                 },
-                    #                 f"/tmp/mxfp8_dump_{self.prefix.replace('.', '_')}.pt",
-                    #             )
-                    #             print(
-                    #                 f"[MXFP8_DUMP] saved /tmp/mxfp8_dump_{self.prefix.replace('.', '_')}.pt "
-                    #                 f"x={tuple(x.shape)}/{x.dtype} "
-                    #                 f"w={tuple(self.weight.shape)}/{self.weight.dtype} "
-                    #                 f"xs={tuple(x_scale.shape) if x_scale is not None else None}/{x_scale.dtype if x_scale is not None else None} "
-                    #                 f"ws={tuple(self.weight_scale.shape)}/{self.weight_scale.dtype}",
-                    #                 flush=True,
-                    #             )
-                    #             self._mxfp8_dumped = True
-                    #         except Exception as e:
-                    #             print(f"[MXFP8_DUMP_FAIL] {e}", flush=True)
-                    # try:
                     if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
-                        from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
-                            gemm_afp8wfp8_preshuffle,
-                        )
-
                         y = gemm_afp8wfp8_preshuffle(
                             x,
                             self.weight,
@@ -691,10 +659,6 @@ class LinearBase(nn.Module):
                             dtype=otype,
                         )
                     else:
-                        from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
-                            gemm_afp8wfp8,
-                        )
-
                         y = gemm_afp8wfp8(
                             x,
                             self.weight,
@@ -702,44 +666,7 @@ class LinearBase(nn.Module):
                             self.weight_scale,
                             dtype=otype,
                         )
-                    # except Exception as e:
-                    #     print(
-                    #         f"[MXFP8_FAIL] x={tuple(x.shape)}/{x.dtype} "
-                    #         f"w={tuple(self.weight.shape)}/{self.weight.dtype} "
-                    #         f"xs={tuple(x_scale.shape)}/{x_scale.dtype} "
-                    #         f"ws={tuple(self.weight_scale.shape)}/{self.weight_scale.dtype} "
-                    #         f"err={type(e).__name__}: {str(e)[:200]}",
-                    #         flush=True,
-                    #     )
-                    #     raise
                 elif envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
-                    # If MXFP8 loader was active but kernel was skipped, the
-                    # weight_scale is uint8 (e8m0). Legacy preshuffle GEMM wants
-                    # fp32 - decode on the fly.
-                    # _ws = self.weight_scale
-                    # if _ws.dtype == torch.uint8:
-                    #     _ws = fp4_utils.e8m0_to_f32(_ws.view(torch.float8_e8m0fnu))
-                    # Legacy dump hook for A/B comparison vs MXFP8 path.
-                    # _dump_env = os.environ.get("ATOM_MXFP8_DUMP", "")
-                    # if _dump_env and _dump_env in getattr(self, "prefix", ""):
-                    #     try:
-                    #         import torch as _t
-                    #         _t.save(
-                    #             {
-                    #                 "prefix": self.prefix,
-                    #                 "x": x.detach().cpu(),
-                    #                 "weight": self.weight.data.detach().cpu(),
-                    #                 "x_scale": x_scale.detach().cpu()
-                    #                 if x_scale is not None
-                    #                 else None,
-                    #                 "weight_scale": self.weight_scale.data.detach().cpu(),
-                    #                 "otype": str(otype),
-                    #                 "path": "legacy",
-                    #             },
-                    #             f"/tmp/legacy_dump_{self.prefix.replace('.', '_')}.pt",
-                    #         )
-                    #     except Exception as e:
-                    #         print(f"[LEGACY_DUMP_FAIL] {e}", flush=True)
                     y = gemm_a8w8_blockscale_preshuffle_impl(
                         x,
                         self.weight,
