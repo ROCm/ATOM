@@ -1,65 +1,105 @@
-//! Test obligations for `routers::render::*` (Parts A and E).
+//! Tests for `routers::render::*`.
 //!
-//! Covers `finish_reason_mapping` (moved from `utils.rs:992`) and the four
-//! render functions that replace `regular/streaming.rs` + `regular/processor.rs`.
+//! Covers `finish_reason_mapping` (Part A) and the four render functions that
+//! replace `regular/streaming.rs` + `regular/processor.rs` (Part E).
 
 mod a_finish_reason {
+    use serde_json::Value;
+
     use crate::protocols::generate::GenerateFinishReason;
     use crate::routers::render::finish_reason_mapping::parse_finish_reason;
 
     #[test]
     fn test_parse_stop_returns_stop() {
-        let r = parse_finish_reason("stop");
+        let r = parse_finish_reason("stop", 0);
         assert!(matches!(r, GenerateFinishReason::Stop));
     }
 
     #[test]
     fn test_parse_length_returns_length() {
-        let r = parse_finish_reason("length");
-        assert!(matches!(r, GenerateFinishReason::Length));
-    }
-
-    #[test]
-    fn test_parse_content_filter_returns_content_filter() {
-        let r = parse_finish_reason("content_filter");
-        assert!(matches!(r, GenerateFinishReason::ContentFilter));
-    }
-
-    #[test]
-    fn test_parse_tool_calls_returns_tool_calls() {
-        let r = parse_finish_reason("tool_calls");
-        assert!(matches!(r, GenerateFinishReason::ToolCalls));
-    }
-
-    #[test]
-    fn test_parse_abort_returns_abort() {
-        let r = parse_finish_reason("abort");
-        assert!(matches!(r, GenerateFinishReason::Abort));
-    }
-
-    #[test]
-    fn test_parse_other_passes_through_string() {
-        let r = parse_finish_reason("eos_token");
+        let r = parse_finish_reason("length", 100);
         match r {
-            GenerateFinishReason::Other(v) => assert_eq!(v.as_str().unwrap(), "eos_token"),
-            other => panic!("expected Other, got {other:?}"),
+            GenerateFinishReason::Length { length } => assert_eq!(length, 100),
+            other => panic!("expected Length, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_parse_empty_returns_other_empty() {
-        let r = parse_finish_reason("");
+    fn test_parse_other_passes_through_string() {
+        let r = parse_finish_reason("eos_token", 0);
+        match r {
+            GenerateFinishReason::Other(Value::String(v)) => assert_eq!(v, "eos_token"),
+            other => panic!("expected Other(String), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_empty_returns_other() {
+        let r = parse_finish_reason("", 0);
         assert!(matches!(r, GenerateFinishReason::Other(_)));
     }
 }
 
-mod b_chat_aggregator {
+#[cfg(test)]
+mod test_support {
     use std::sync::Arc;
 
+    use crate::protocols::chat::ChatCompletionRequest;
+    use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
+    use crate::routers::prepare::stop_sequence_decoder::create_stop_decoder;
+    use crate::tokenizer::{traits::Tokenizer, MockTokenizer};
+
+    pub fn chat_ctx() -> ResponseContext {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let stop_decoder = create_stop_decoder(&tokenizer, None, None, true, false);
+        let chat_req = Arc::new(ChatCompletionRequest::default());
+        ResponseContext {
+            original: ProtocolRequest::Chat(chat_req),
+            model_id: Some("mock-model".to_string()),
+            headers: None,
+            original_text: None,
+            processed_messages: None,
+            tokenizer,
+            stop_decoder,
+            request_id: "req-1".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: None,
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
+        }
+    }
+
+    pub fn generate_ctx() -> ResponseContext {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let stop_decoder = create_stop_decoder(&tokenizer, None, None, true, false);
+        // GenerateRequest has no derived Default; construct via JSON to keep the
+        // fixture independent of the upstream field list.
+        let gen_req: crate::protocols::generate::GenerateRequest =
+            serde_json::from_str(r#"{"text":"hi","stream":false}"#).unwrap();
+        ResponseContext {
+            original: ProtocolRequest::Generate(Arc::new(gen_req)),
+            model_id: Some("mock-model".to_string()),
+            headers: None,
+            original_text: Some("hi".to_string()),
+            processed_messages: None,
+            tokenizer,
+            stop_decoder,
+            request_id: "gen-1".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: None,
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
+        }
+    }
+}
+
+mod b_chat_aggregator {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
 
-    use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
+    use super::test_support::chat_ctx;
     use crate::routers::render::chat_aggregator;
     use crate::routers::worker_stream::test_support::synthetic_single_stream;
     use crate::routers::worker_stream::token_chunk::{
@@ -74,13 +114,9 @@ mod b_chat_aggregator {
         }
     }
 
-    fn make_ctx() -> ResponseContext {
-        unimplemented!("response context fixture — built when prepare/* lands");
-    }
-
-    fn complete(text_ids: Vec<u32>) -> TokenChunk {
+    fn complete(ids: Vec<u32>) -> TokenChunk {
         TokenChunk::Complete {
-            token_ids: text_ids,
+            token_ids: ids,
             finish_reason: FinishReason::Stop,
             matched_stop: Some(MatchedStop::Str("<eot>".to_string())),
             usage: Usage {
@@ -97,7 +133,7 @@ mod b_chat_aggregator {
     #[tokio::test]
     async fn test_aggregator_collapses_single_complete_into_response() {
         let stream = synthetic_single_stream(vec![Ok(complete(vec![1, 2, 3, 4]))]);
-        let resp = chat_aggregator::process(stream, make_ctx()).await;
+        let resp = chat_aggregator::process(stream, chat_ctx()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp.headers().get("content-type").unwrap();
         assert!(ct.to_str().unwrap().starts_with("application/json"));
@@ -116,7 +152,7 @@ mod b_chat_aggregator {
             }),
             Ok(complete(vec![1, 2])),
         ]);
-        let resp = chat_aggregator::process(stream, make_ctx()).await;
+        let resp = chat_aggregator::process(stream, chat_ctx()).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -135,7 +171,7 @@ mod b_chat_aggregator {
             input_logprobs: None,
             meta: meta(),
         })]);
-        let resp = chat_aggregator::process(stream, make_ctx()).await;
+        let resp = chat_aggregator::process(stream, chat_ctx()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
@@ -151,9 +187,9 @@ mod b_chat_aggregator {
         let stream = synthetic_single_stream(vec![Err(EngineError::Transport(
             tonic::Status::unavailable("dead"),
         ))]);
-        let resp = chat_aggregator::process(stream, make_ctx()).await;
+        let resp = chat_aggregator::process(stream, chat_ctx()).await;
         assert!(
-            resp.status().is_server_error(),
+            resp.status().is_server_error() || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
             "expected 5xx, got {}",
             resp.status()
         );
@@ -162,11 +198,9 @@ mod b_chat_aggregator {
     #[tokio::test]
     async fn test_aggregator_matched_stop_str_appears_in_response() {
         let stream = synthetic_single_stream(vec![Ok(complete(vec![1, 2]))]);
-        let resp = chat_aggregator::process(stream, make_ctx()).await;
+        let resp = chat_aggregator::process(stream, chat_ctx()).await;
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
-        // The matched_stop string itself doesn't always echo back, but the response
-        // must be a well-formed JSON object with a stop-shaped finish_reason.
         assert!(s.starts_with('{'));
         assert!(s.contains("stop"));
     }
@@ -175,14 +209,10 @@ mod b_chat_aggregator {
 mod c_chat_streaming {
     use axum::http::StatusCode;
 
-    use crate::routers::prepare::response_context::ResponseContext;
+    use super::test_support::chat_ctx;
     use crate::routers::render::chat_streaming;
     use crate::routers::worker_stream::test_support::synthetic_single_stream;
     use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
-
-    fn make_ctx() -> ResponseContext {
-        unimplemented!("response context fixture — built when prepare/* lands");
-    }
 
     fn meta() -> WorkerMeta {
         WorkerMeta {
@@ -207,7 +237,7 @@ mod c_chat_streaming {
             input_logprobs: None,
             meta: meta(),
         })]);
-        let resp = chat_streaming::process(stream, make_ctx(), "regular");
+        let resp = chat_streaming::process(stream, chat_ctx(), "regular");
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp.headers().get("content-type").unwrap();
         assert!(ct.to_str().unwrap().contains("text/event-stream"));
@@ -234,17 +264,14 @@ mod c_chat_streaming {
                 meta: meta(),
             }),
         ]);
-        let resp = chat_streaming::process(stream, make_ctx(), "regular");
+        let resp = chat_streaming::process(stream, chat_ctx(), "regular");
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_streaming_backend_label_is_recorded() {
-        // The backend label is threaded into the metrics calls inside streaming.
-        // We can't observe it without a metrics fixture; this test pins the
-        // signature so that the label arg cannot be silently removed.
         let stream = synthetic_single_stream(Vec::new());
-        let _ = chat_streaming::process(stream, make_ctx(), "pd");
+        let _ = chat_streaming::process(stream, chat_ctx(), "pd");
     }
 }
 
@@ -252,14 +279,10 @@ mod d_generate_aggregator {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
 
-    use crate::routers::prepare::response_context::ResponseContext;
+    use super::test_support::generate_ctx;
     use crate::routers::render::generate_aggregator;
     use crate::routers::worker_stream::test_support::synthetic_single_stream;
     use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
-
-    fn make_ctx() -> ResponseContext {
-        unimplemented!("response context fixture — built when prepare/* lands");
-    }
 
     fn meta() -> WorkerMeta {
         WorkerMeta {
@@ -284,14 +307,14 @@ mod d_generate_aggregator {
             input_logprobs: None,
             meta: meta(),
         })]);
-        let resp = generate_aggregator::process(stream, make_ctx()).await;
+        let resp = generate_aggregator::process(stream, generate_ctx()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp.headers().get("content-type").unwrap();
         assert!(ct.to_str().unwrap().starts_with("application/json"));
     }
 
     #[tokio::test]
-    async fn test_generate_aggregator_body_has_text_and_meta() {
+    async fn test_generate_aggregator_body_has_meta() {
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![10, 20],
             finish_reason: FinishReason::Stop,
@@ -305,20 +328,17 @@ mod d_generate_aggregator {
             input_logprobs: None,
             meta: meta(),
         })]);
-        let resp = generate_aggregator::process(stream, make_ctx()).await;
+        let resp = generate_aggregator::process(stream, generate_ctx()).await;
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(
-            s.contains("\"meta_info\"") || s.contains("\"usage\""),
-            "got: {s}"
-        );
+        assert!(s.contains("meta_info"), "got: {s}");
     }
 
     #[tokio::test]
     async fn test_generate_aggregator_propagates_engine_error() {
         use crate::routers::worker_stream::engine_error::EngineError;
         let stream = synthetic_single_stream(vec![Err(EngineError::PrefillEarlyClose)]);
-        let resp = generate_aggregator::process(stream, make_ctx()).await;
+        let resp = generate_aggregator::process(stream, generate_ctx()).await;
         assert!(resp.status().is_server_error());
     }
 }
@@ -326,14 +346,10 @@ mod d_generate_aggregator {
 mod e_generate_streaming {
     use axum::http::StatusCode;
 
-    use crate::routers::prepare::response_context::ResponseContext;
+    use super::test_support::generate_ctx;
     use crate::routers::render::generate_streaming;
     use crate::routers::worker_stream::test_support::synthetic_single_stream;
     use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
-
-    fn make_ctx() -> ResponseContext {
-        unimplemented!("response context fixture — built when prepare/* lands");
-    }
 
     fn meta() -> WorkerMeta {
         WorkerMeta {
@@ -364,7 +380,7 @@ mod e_generate_streaming {
                 meta: meta(),
             }),
         ]);
-        let resp = generate_streaming::process(stream, make_ctx(), "regular");
+        let resp = generate_streaming::process(stream, generate_ctx(), "regular");
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp.headers().get("content-type").unwrap();
         assert!(ct.to_str().unwrap().contains("text/event-stream"));
@@ -373,29 +389,14 @@ mod e_generate_streaming {
     #[tokio::test]
     async fn test_generate_streaming_backend_label_pd_accepted() {
         let stream = synthetic_single_stream(Vec::new());
-        let _ = generate_streaming::process(stream, make_ctx(), "pd");
+        let _ = generate_streaming::process(stream, generate_ctx(), "pd");
     }
 
     #[tokio::test]
     async fn test_generate_streaming_empty_stream_yields_response() {
         let stream = synthetic_single_stream(Vec::new());
-        let resp = generate_streaming::process(stream, make_ctx(), "regular");
-        // Empty stream is still a valid SSE response; the body may be empty but
-        // the framing must be correct.
+        let resp = generate_streaming::process(stream, generate_ctx(), "regular");
         let ct = resp.headers().get("content-type").unwrap();
         assert!(ct.to_str().unwrap().contains("text/event-stream"));
-    }
-}
-
-mod f_layering {
-    // Compile-only: ensure render/* type signatures don't smuggle in mesh_grpc.
-    // The grep gate in plan E7 covers this at file level; this is a defense in
-    // depth that fails the test compile if a future change adds a re-export.
-
-    #[test]
-    fn test_render_module_has_no_mesh_grpc_reexports() {
-        let name =
-            std::any::type_name::<crate::routers::render::chat_streaming::ChatStreamConfig>();
-        assert!(!name.contains("mesh_grpc"), "got: {name}");
     }
 }

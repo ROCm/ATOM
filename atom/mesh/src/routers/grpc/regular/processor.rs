@@ -12,16 +12,16 @@ use tracing::error;
 use crate::{
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-        common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue},
+        common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{
         error,
         grpc::{
-            common::{response_collection, response_formatting},
             context::{DispatchMetadata, ExecutionResult},
             engine::proto_stream_wrapper::ProtoGenerateComplete,
+            utils,
         },
         prepare::{
             parser_factory_lookup::{
@@ -231,8 +231,7 @@ impl ResponseProcessor {
         request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
         // Collect all responses from the execution result
-        let all_responses =
-            response_collection::collect_responses(execution_result, request_logprobs).await?;
+        let all_responses = collect_responses(execution_result, request_logprobs).await?;
 
         let history_tool_calls_count = get_history_tool_calls_count(&chat_request);
 
@@ -299,7 +298,7 @@ impl ResponseProcessor {
         }
 
         // Build usage
-        let usage = response_formatting::build_usage(&all_responses);
+        let usage = build_usage(&all_responses);
 
         // Build final ChatCompletionResponse
         Ok(
@@ -380,8 +379,7 @@ impl ResponseProcessor {
         start_time: Instant,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
         // Collect all responses from the execution result
-        let all_responses =
-            response_collection::collect_responses(execution_result, request_logprobs).await?;
+        let all_responses = collect_responses(execution_result, request_logprobs).await?;
 
         // Process each completion
         let mut result_array = Vec::new();
@@ -473,5 +471,68 @@ impl ResponseProcessor {
         }
 
         Ok(result_array)
+    }
+}
+
+async fn collect_responses(
+    execution_result: ExecutionResult,
+    merge_logprobs: bool,
+) -> Result<Vec<ProtoGenerateComplete>, axum::response::Response> {
+    let all_responses = match execution_result {
+        ExecutionResult::Single { mut stream } => {
+            let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
+            stream.mark_completed();
+            responses
+        }
+        ExecutionResult::Dual {
+            mut prefill,
+            decode,
+        } => {
+            let prefill_responses =
+                utils::collect_stream_responses(&mut prefill, "Prefill").await?;
+            let mut decode_stream = *decode;
+            let mut decode_responses =
+                utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
+            prefill.mark_completed();
+            decode_stream.mark_completed();
+            if merge_logprobs {
+                merge_prefill_logprobs(&prefill_responses, &mut decode_responses);
+            }
+            decode_responses
+        }
+    };
+
+    if all_responses.is_empty() {
+        return Err(error::internal_error(
+            "no_responses_from_server",
+            "No responses from server",
+        ));
+    }
+    Ok(all_responses)
+}
+
+fn merge_prefill_logprobs(
+    prefill_responses: &[ProtoGenerateComplete],
+    decode_responses: &mut [ProtoGenerateComplete],
+) {
+    if let Some(ProtoGenerateComplete::Sglang(prefill_first)) = prefill_responses.first() {
+        if let Some(ref prefill_input_logprobs) = prefill_first.input_logprobs {
+            for response in decode_responses.iter_mut() {
+                if let ProtoGenerateComplete::Sglang(decode_resp) = response {
+                    decode_resp.input_logprobs = Some(prefill_input_logprobs.clone());
+                }
+            }
+        }
+    }
+}
+
+fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
+    let total_prompt_tokens: u32 = responses.iter().map(|r| r.prompt_tokens() as u32).sum();
+    let total_completion_tokens: u32 = responses.iter().map(|r| r.completion_tokens() as u32).sum();
+    Usage {
+        prompt_tokens: total_prompt_tokens,
+        completion_tokens: total_completion_tokens,
+        total_tokens: total_prompt_tokens + total_completion_tokens,
+        completion_tokens_details: None,
     }
 }

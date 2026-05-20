@@ -91,7 +91,7 @@ pub fn prepare_chat(
 
     let request_id = format!("chatcmpl-{}", Uuid::new_v4());
     let payload = build_chat_payload(
-        request_id,
+        request_id.clone(),
         &req,
         &body_ref,
         &processed.text,
@@ -99,6 +99,10 @@ pub fn prepare_chat(
         tool_constraints,
     );
 
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let ctx = ResponseContext {
         original: ProtocolRequest::Chat(Arc::clone(&req)),
         model_id,
@@ -107,6 +111,12 @@ pub fn prepare_chat(
         processed_messages: Some(processed),
         tokenizer,
         stop_decoder,
+        request_id,
+        created,
+        tool_parser_factory: components.tool_parser_factory.clone(),
+        reasoning_parser_factory: components.reasoning_parser_factory.clone(),
+        configured_tool_parser: components.configured_tool_parser.clone(),
+        configured_reasoning_parser: components.configured_reasoning_parser.clone(),
     };
 
     Ok((payload, ctx))
@@ -140,8 +150,13 @@ pub fn prepare_generate(
         .rid
         .clone()
         .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
-    let payload = build_generate_payload(request_id, &req, original_text.clone(), token_ids);
+    let payload =
+        build_generate_payload(request_id.clone(), &req, original_text.clone(), token_ids);
 
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let ctx = ResponseContext {
         original: ProtocolRequest::Generate(Arc::clone(&req)),
         model_id,
@@ -150,6 +165,12 @@ pub fn prepare_generate(
         processed_messages: None,
         tokenizer,
         stop_decoder,
+        request_id,
+        created,
+        tool_parser_factory: components.tool_parser_factory.clone(),
+        reasoning_parser_factory: components.reasoning_parser_factory.clone(),
+        configured_tool_parser: components.configured_tool_parser.clone(),
+        configured_reasoning_parser: components.configured_reasoning_parser.clone(),
     };
 
     Ok((payload, ctx))
