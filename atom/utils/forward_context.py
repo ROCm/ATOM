@@ -336,6 +336,28 @@ class ForwardContext:
 
     ubatch_slices: Optional[list[Any]] = None
 
+    # Cached current_stream() captured at set_forward_context() time, so
+    # downstream code (V4 attention / MoE / metadata builder) doesn't have
+    # to query torch.cuda.current_stream() repeatedly during a forward —
+    # multiple call sites caching independent Stream handles was widening
+    # the hipStream handle pool and complicating reasoning about which
+    # logical stream each wait_stream() refers to. CG capture / TBO
+    # threads each call set_forward_context() inside their own stream
+    # context, so the cached value is correct for the captured graph or
+    # active thread.
+    main_stream: Optional[torch.cuda.Stream] = None
+
+    # True only while the model forward runs inside a CUDAGraph capture
+    # block (model_runner.capture_model loop). Components that gate
+    # multi-stream side-launches (V4 main Compressor on alt_stream,
+    # indexer.compressor on compress_stream) check this flag: side-stream
+    # work is safe to emit inside a captured graph (graph records the
+    # fork-join edges and replay re-uses the same stream layout) but
+    # racy in eager mode where launches accumulate across layers and
+    # deadlock the hipStream queue. Replay does not re-execute Python
+    # forward, so it ignores the flag entirely.
+    in_hipgraph: bool = False
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -345,6 +367,10 @@ class ForwardContext:
 
 _forward_context: Optional[ForwardContext] = ForwardContext()
 _forward_kv_cache_context: Optional[ForwardContext] = ForwardContext()
+
+# Cached once at module import — CUDA availability does not change at
+# runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
+_CUDA_AVAILABLE: bool = torch.cuda.is_available()
 
 # Thread-local storage for TBO dual-thread execution
 
@@ -373,6 +399,7 @@ def set_forward_context(
     num_tokens_across_dp: Optional[torch.Tensor] = None,
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
     ubatch_slices: Optional[list[Any]] = None,
+    in_hipgraph: bool = False,
 ) -> None:
     global _forward_context
     dp_metadata: Optional[DPMetadata] = None
@@ -392,6 +419,8 @@ def set_forward_context(
         dp_metadata=dp_metadata,
         spec_decode_metadata=spec_decode_metadata,
         ubatch_slices=ubatch_slices,
+        main_stream=(torch.cuda.current_stream() if _CUDA_AVAILABLE else None),
+        in_hipgraph=in_hipgraph,
     )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
