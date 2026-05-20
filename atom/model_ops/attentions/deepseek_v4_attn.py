@@ -556,7 +556,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             hca_main_score,
         ]
         state_slot_stride = sum(t[0, 0].numel() * t.shape[0] for t in state_tensors)
-        pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "8"))
+        pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "32"))
         state_pool = torch.zeros(
             pool_size * state_slot_stride,
             dtype=self._state_dtype,
