@@ -149,8 +149,21 @@ def build_entries(
         except (TypeError, ValueError):
             continue
 
+        # Match the dashboard entry-name suffix to the actual eval task so
+        # reviewers can tell which task a score belongs to. `gsm8k_cot`
+        # produces a different score distribution than plain `gsm8k`, and
+        # the threshold/baseline numbers in models_accuracy.json are
+        # task-specific. Default unknown tasks to an uppercased version of
+        # the task name rather than falling back to "GSM8K", which would
+        # mislabel any future task we add to models_accuracy.json.
+        if accuracy_task == "gsm8k_cot":
+            task_suffix = "GSM8K-COT"
+        elif accuracy_task == "gsm8k":
+            task_suffix = "GSM8K"
+        else:
+            task_suffix = accuracy_task.upper().replace("_", "-")
         entry = {
-            "name": f"{backend}::{model_name} accuracy (GSM8K)",
+            "name": f"{backend}::{model_name} accuracy ({task_suffix})",
             "unit": "score",
             "value": score_val,
         }
