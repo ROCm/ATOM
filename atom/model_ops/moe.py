@@ -834,7 +834,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # the layout moe_gemm_a8w4 expects and swizzles scales.
         _use_a8w4_moe = os.environ.get("ATOM_MOE_BACKEND", "matmul_ogs") == "a8w4"
         if _use_a8w4_moe and self.use_triton:
-            from aiter.ops.triton.moe.moe_op_gemm_a8w4 import swizzle_scales
+            from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+                swizzle_scales_gfx950 as swizzle_scales,
+            )
 
             # Step 3: gate/up interleave for apply_swiglu fold. Off by default.
             _interleave_w13 = os.environ.get("ATOM_A8W4_SWIGLU_FOLD", "0") == "1"
@@ -931,6 +933,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = w2_weight
             layer.w13_weight_scale = None
             layer.w2_weight_scale = None
+            self.moe_backend = "matmul_ogs"
             return
 
         # shuffle weight
@@ -1009,6 +1012,149 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             if needs_custom_routing:
+                _a8w4 = getattr(self, "moe_backend", "matmul_ogs") == "a8w4"
+
+                # DeepSeek-V4 hash-layer fully-fused fast path: replaces the
+                # Python `_hash_topk` + multi-kernel `fused_routing_from_topk`
+                # counting-sort + `compute_expt_data` (with memset) chain with
+                # ONE Triton kernel (hash_routing) + sort_tokens_fused. Same
+                # 2-kernel shape as the non-hash routing_a8w4 path.
+                #
+                # Detection: custom_routing_function is the bound method of a
+                # MoeLayer whose gate has the tid2eid lookup table.
+                _hash_layer = (
+                    _a8w4
+                    and custom_routing_function is not None
+                    and hasattr(custom_routing_function, "__self__")
+                    and hasattr(
+                        getattr(custom_routing_function.__self__, "gate", None),
+                        "tid2eid",
+                    )
+                )
+                _a8w4_hash_fused = (
+                    _hash_layer
+                    and os.environ.get("ATOM_A8W4_TRITON_ROUTING", "0") == "1"
+                    and os.environ.get("ATOM_A8W4_HASH_FAST_ROUTING", "0") == "1"
+                    and layer.num_fused_shared_experts == 0
+                )
+                if _a8w4_hash_fused:
+                    from aiter.ops.triton.moe.moe_routing.routing import (
+                        routing_a8w4_from_hash,
+                    )
+                    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
+                    from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
+
+                    moe_layer = custom_routing_function.__self__
+                    tid2eid = moe_layer.gate.tid2eid
+
+                    # Get input_ids (with DP gather, mirror _hash_topk semantics).
+                    fwd_ctx = get_forward_context()
+                    ids = fwd_ctx.context.input_ids.flatten()
+                    num_tokens = router_logits.shape[0]
+                    if ids.shape[0] < num_tokens:
+                        ids_2d = ids.unsqueeze(-1)
+                        ids_2d, _ = pad_for_all_gather(ids_2d)
+                        from aiter.dist.parallel_state import get_dp_group
+
+                        ids_2d = get_dp_group().all_gather(ids_2d, dim=0)
+                        ids = ids_2d[:num_tokens].flatten()
+                    ids = ids.clamp(0, tid2eid.shape[0] - 1)
+
+                    n_expts_tot = router_logits.shape[-1]
+                    if global_num_experts > 0:
+                        n_expts_tot = global_num_experts
+                    n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
+
+                    block_m = recommend_block_m(x.shape[-2])
+                    aiter_routing, gather_src, scatter_src = routing_a8w4_from_hash(
+                        router_logits,
+                        tid2eid,
+                        ids,
+                        n_expts_act=top_k,
+                        block_m=block_m,
+                        score_mode="sqrtsoftplus",
+                        renorm=renormalize,
+                        routed_scaling_factor=moe_layer.routed_scaling_factor,
+                    )
+                    moe_residual = getattr(layer, "_moe_residual_to_fold", None)
+                    if moe_residual is not None:
+                        layer._moe_residual_was_folded = True
+                    output = torch.empty_like(x)
+                    return _a8w4_fused_experts(
+                        output,
+                        x,
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        layer.w13_weight_scale,
+                        layer.w2_weight_scale,
+                        routing_data=None,
+                        gather_indx=gather_src,
+                        scatter_indx=scatter_src,
+                        topk=top_k,
+                        swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                        w1_bias=layer.w13_bias,
+                        w2_bias=layer.w2_bias,
+                        apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                        pre_built_aiter_routing=aiter_routing,
+                        residual=moe_residual,
+                    )
+
+                _a8w4_triton_routing = (
+                    _a8w4
+                    and os.environ.get("ATOM_A8W4_TRITON_ROUTING", "0") == "1"
+                    and scoring_func == "sqrtsoftplus"
+                    and not use_grouped_topk
+                    and custom_routing_function is None
+                    and layer.num_fused_shared_experts == 0
+                )
+                if _a8w4_triton_routing:
+                    # Step 4: aiter `routing_a8w4` does V4 math + topk + sort + ExptData
+                    # in one Triton pipeline. Skip FusedMoE.select_experts + bridge.
+                    from aiter.ops.triton.moe.moe_routing.routing import routing_a8w4
+                    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
+                    from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
+
+                    n_expts_tot = router_logits.shape[-1]
+                    if global_num_experts > 0:
+                        n_expts_tot = global_num_experts
+                    n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
+                    M = x.shape[-2]
+                    block_m = recommend_block_m(M)
+                    aiter_routing, gather_src, scatter_src = routing_a8w4(
+                        router_logits,
+                        n_expts_act=top_k,
+                        block_m=block_m,
+                        score_mode="sqrtsoftplus",
+                        bias=e_score_correction_bias,
+                        renorm=renormalize,
+                        routed_scaling_factor=layer.routed_scaling_factor,
+                    )
+                    # Step 9: V4 single-stream stashes shared-experts output on
+                    # the layer; fold it into reduce_grouped's writeback. None
+                    # for callers that didn't pre-compute shared.
+                    moe_residual = getattr(layer, "_moe_residual_to_fold", None)
+                    if moe_residual is not None:
+                        layer._moe_residual_was_folded = True
+                    output = torch.empty_like(x)
+                    return _a8w4_fused_experts(
+                        output,
+                        x,
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        layer.w13_weight_scale,
+                        layer.w2_weight_scale,
+                        routing_data=None,
+                        gather_indx=gather_src,
+                        scatter_indx=scatter_src,
+                        topk=top_k,
+                        swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                        w1_bias=layer.w13_bias,
+                        w2_bias=layer.w2_bias,
+                        apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                        pre_built_aiter_routing=aiter_routing,
+                        residual=moe_residual,
+                    )
+
                 # Use ATOM's full-featured select_experts for routing,
                 # then triton matmul_ogs for the actual MoE computation.
                 topk_weights, topk_ids = FusedMoE.select_experts(
@@ -1033,9 +1179,60 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     n_expts_tot = global_num_experts
                 n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
+                n_gates_pad = topk_weights.shape[0] * topk_weights.shape[1]
+                _a8w4_topk_fast = (
+                    _a8w4
+                    and os.environ.get("ATOM_A8W4_TRITON_ROUTING", "0") == "1"
+                    and os.environ.get("ATOM_A8W4_HASH_FAST_ROUTING", "0") == "1"
+                    and layer.num_fused_shared_experts == 0
+                    and n_gates_pad <= 4096
+                )
+                if _a8w4_topk_fast:
+                    # Custom-routing a8w4 fast path (DeepSeek-V4 hash layers):
+                    # build aiter RoutingData directly from (topk_weights, topk_ids)
+                    # via `routing_a8w4_from_topk`. Skips matmul_ogs `compute_expt_data`,
+                    # eliminating its histogram memset (`_expt_data_memset`).
+                    # Bounded by `fused_routing_from_topk`'s 4096-NK single-CTA budget;
+                    # prefill exceeds this and falls through to the matmul_ogs path
+                    # where routing overhead is amortised over much larger GEMM work.
+                    from aiter.ops.triton.moe.moe_routing.routing import (
+                        routing_a8w4_from_topk,
+                    )
+                    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
+                    from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
+
+                    block_m = recommend_block_m(x.shape[-2])
+                    aiter_routing, gather_src, scatter_src = routing_a8w4_from_topk(
+                        topk_weights, topk_ids, n_expts_tot, block_m
+                    )
+                    moe_residual = getattr(layer, "_moe_residual_to_fold", None)
+                    if moe_residual is not None:
+                        layer._moe_residual_was_folded = True
+                    output = torch.empty_like(x)
+                    return _a8w4_fused_experts(
+                        output,
+                        x,
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        layer.w13_weight_scale,
+                        layer.w2_weight_scale,
+                        routing_data=None,
+                        gather_indx=gather_src,
+                        scatter_indx=scatter_src,
+                        topk=n_expts_act,
+                        swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                        w1_bias=layer.w13_bias,
+                        w2_bias=layer.w2_bias,
+                        apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                        pre_built_aiter_routing=aiter_routing,
+                        residual=moe_residual,
+                    )
+
                 routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
                     topk_weights, topk_ids, n_expts_tot
                 )
+
+                _a8w4 = getattr(self, "moe_backend", "matmul_ogs") == "a8w4"
 
                 output = torch.empty_like(x)
                 _moe_result = triton_kernel_fused_experts(
@@ -1056,6 +1253,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
                     expert_map=expert_map,
+                    w13_weight_scale_a8w4=(layer.w13_weight_scale if _a8w4 else None),
+                    w2_weight_scale_a8w4=(layer.w2_weight_scale if _a8w4 else None),
+                    swiglu_limit_a8w4=getattr(layer, "swiglu_limit", 0.0),
                 )
                 return _moe_result
 
