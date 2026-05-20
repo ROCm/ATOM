@@ -26,7 +26,7 @@ def _gdn_decode_update_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     HEADS_PER_V: tl.constexpr,
-    threshould: tl.constexpr
+    threshold: tl.constexpr
 ):
     i_k = tl.program_id(0)
     i_v = tl.program_id(1)
@@ -79,7 +79,7 @@ def _gdn_decode_update_kernel(
     x = tl.load(a + i_n * HV + i_hv).to(tl.float32) + tl.load(
         dt_bias + i_hv
     ).to(tl.float32)
-    softplus_x = tl.where(x <= threshould, tl.log(1.0 + tl.exp(x)), x)
+    softplus_x = tl.where(x <= threshold, tl.log(1.0 + tl.exp(x)), x)
     gate = -tl.exp(tl.load(A_log + i_hv).to(tl.float32)) * softplus_x
     beta = tl.sigmoid(tl.load(b + i_n * HV + i_hv).to(tl.float32))
 
