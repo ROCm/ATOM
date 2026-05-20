@@ -761,11 +761,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or gfx.startswith("gfx12")
                 or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
-        if self.use_triton:
-            logger.warning(quant_config)
-            from atom.model_ops.utils import has_triton_kernels
-
-            assert has_triton_kernels(), "triton_kernels is not installed"
 
     def create_weights(
         self,
@@ -1011,7 +1006,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_moe_forward,
                 triton_kernel_fused_experts,
-                fused_routing_from_topk_triton,
             )
 
             # Check if the model needs custom routing that triton routing()
@@ -1048,7 +1042,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     n_expts_tot = global_num_experts
                 n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
-                routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
+                routing_data, gather_idx, scatter_idx = routing_from_topk_triton(
                     topk_weights, topk_ids, n_expts_tot
                 )
                 x_q_dtype = self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None
