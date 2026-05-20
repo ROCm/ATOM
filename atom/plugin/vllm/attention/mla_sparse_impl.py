@@ -334,6 +334,7 @@ def sparse_attn_indexer_plugin_mode(
                 k_scale.view(dtypes.fp8),
                 chunk.block_table,
                 chunk.cu_seq_lens,
+                preshuffle=preshuffle_cache,
             )
 
             logits = fp8_mqa_logits(
@@ -399,6 +400,10 @@ def sparse_attn_indexer_plugin_mode(
             decode_metadata.seq_lens,
             decode_metadata.block_table,
             max_model_len,
+            ChunkK=256,
+            KVBlockSize=kv_block_size,
+            Preshuffle=preshuffle_cache,
+            WavePerEU=2,
         )
 
         num_rows = logits.shape[0]

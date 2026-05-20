@@ -616,11 +616,8 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         )
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
 
-        max_qo_len = (
-            (query_start_loc_cpu[-1] - query_start_loc_cpu[-2]).item()
-            if query_start_loc_cpu.numel() > 1
-            else 1
-        )
+        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_qo_len = qo_len.max().item() if qo_len.numel() > 0 else 1
 
         kv_indices_generate_triton(
             block_table_tensor,

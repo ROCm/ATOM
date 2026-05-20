@@ -211,6 +211,7 @@ class AiterMLASparseIndexerMetadataBuilder(
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
         from vllm.v1.worker.cp_utils import get_total_cp_world_size
         from vllm.utils.math_utils import cdiv
+        from atom.models.utils import extract_layer_index
 
         assert isinstance(config, VllmConfig)
 
@@ -223,11 +224,21 @@ class AiterMLASparseIndexerMetadataBuilder(
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(
             self.model_config.max_model_len
         )
-        self.num_speculative_tokens = (
-            self.vllm_config.speculative_config.num_speculative_tokens
-            if self.vllm_config.speculative_config
-            else 0
-        )
+        is_draft_layer = False
+        if layer_names:
+            num_hidden_layers = config.model_config.hf_config.num_hidden_layers
+            layer_indices = [
+                extract_layer_index(layer_name) for layer_name in layer_names
+            ]
+            is_draft_layer = all(idx >= num_hidden_layers for idx in layer_indices)
+        if is_draft_layer:
+            self.num_speculative_tokens = 0
+        else:
+            self.num_speculative_tokens = (
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config
+                else 0
+            )
         self.reorder_batch_threshold += self.num_speculative_tokens
 
         sm_count = num_compute_units(self.device.index)
