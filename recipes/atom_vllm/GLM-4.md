@@ -31,6 +31,25 @@ vllm serve zai-org/GLM-4.7-FP8 \
     --no-enable-prefix-caching
 ```
 
+### GLM-4.7-FP8 MTP (TP=4/TP=8, MI355X)
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+
+vllm serve zai-org/GLM-4.7-FP8 \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 4 \
+    --kv-cache-dtype fp8 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --speculative-config.method mtp \
+    --speculative-config.num_speculative_tokens 1 \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --no-enable-prefix-caching
+```
+
 ## Step 3: Performance Benchmark
 Users can use the default vllm bench commands for performance benchmarking.
 ```bash
