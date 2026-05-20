@@ -36,12 +36,27 @@ impl Default for ConnectionModeFixture {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendFixture {
+    Sglang,
+    Vllm,
+}
+
+impl Default for BackendFixture {
+    fn default() -> Self {
+        Self::Sglang
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RouteFixture {
     #[serde(default)]
     pub worker_kind: WorkerKindFixture,
     #[serde(default)]
     pub connection_mode: ConnectionModeFixture,
+    #[serde(default)]
+    pub backend: BackendFixture,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

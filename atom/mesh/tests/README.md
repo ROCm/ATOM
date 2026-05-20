@@ -2,7 +2,7 @@
 
 This directory contains the integration test suite for **atom/mesh**, organized by functional area. All tests run with `cargo test` and do not require a GPU or real inference backend — they use mock workers and in-memory routers.
 
-**Total: ~227 tests across 25 test files.**
+**Total: ~228 tests across 25 test files.**
 
 ## Directory Structure
 
@@ -42,12 +42,15 @@ The `test_atomesh/` directory provides a reusable fixture-driven harness:
 | `virtual_worker.rs` | Axum virtual worker that replays matched fixture responses |
 | `test_harness.rs` | Starts virtual workers, builds Atomesh app context, sends requests, and asserts results |
 | `golden_assert.rs` | Shared subset assertions for dynamic response bodies |
-| `virtual_grpc_worker.rs` | Classifies gRPC fixtures and reserves the future tonic-backed virtual worker boundary |
+| `virtual_grpc_worker.rs` | Unified tonic-backed virtual worker with internal SGLang/vLLM services |
 
 The `fixtures/atomesh_harness/` directory stores the JSON samples used by the
 harness. These files are test data, not integration test entrypoints. Each
 fixture describes the request payload, expected response, route mode, connection
-mode, and virtual worker simulation settings for one reusable harness scenario.
+mode, backend (`sglang` or `vllm` for gRPC), and virtual worker simulation
+settings for one reusable harness scenario. gRPC harness fixtures target the
+native `/generate` boundary because OpenAI `/v1/completions` is adapted to the
+same backend Generate RPC inside the gRPC router.
 
 ---
 
@@ -56,7 +59,7 @@ mode, and virtual worker simulation settings for one reusable harness scenario.
 | File | Tests | Description |
 |------|-------|-------------|
 | `api_endpoints_test.rs` | 35 | Core HTTP endpoint coverage: `/liveness`, `/readiness`, `/health`, `/health_generate`, `/generate`, `/v1/chat/completions`. Tests status codes, response formats, error handling, concurrent requests, and health check behavior with healthy/unhealthy workers. |
-| `atomesh_harness_test.rs` | 6 | Atomesh harness smoke tests driven by `fixtures/atomesh_harness/`. Starts local virtual workers, sends real Atomesh API requests, and verifies regular HTTP, streaming, completions, HTTP PD worker paths, and the gRPC fixture boundary. |
+| `atomesh_harness_test.rs` | 8 | Atomesh harness smoke tests driven by `fixtures/atomesh_harness/`. Starts local virtual workers, sends real Atomesh API requests, and verifies regular HTTP, streaming, completions, HTTP PD, SGLang/vLLM gRPC regular, and SGLang gRPC PD worker paths. |
 | `parser_endpoints_test.rs` | 12 | Tests for `/parse/function_call` and `/parse/reasoning` endpoints. Verifies function call extraction from model output and reasoning/thinking block parsing. |
 | `request_formats_test.rs` | 6 | Request format validation for `/generate`, `/v1/chat/completions`, and `/v1/completions`. Tests various payload shapes: text, input_ids, batch requests, sampling params, and special parameters (logprobs, json_schema, ignore_eos). |
 | `responses_api_test.rs` | 11 | Responses API (conversations) CRUD operations. Tests creating, listing, retrieving, and deleting conversation sessions via the conversation handlers. |

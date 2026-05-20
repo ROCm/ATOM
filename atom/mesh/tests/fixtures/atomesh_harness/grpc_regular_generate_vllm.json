@@ -1,11 +1,11 @@
 {
-  "name": "grpc_regular_generate",
+  "name": "grpc_regular_generate_vllm",
   "model": "test-model",
   "endpoint": "/generate",
   "route": {
     "worker_kind": "regular",
     "connection_mode": "grpc",
-    "backend": "sglang"
+    "backend": "vllm"
   },
   "request": {
     "model": "test-model",

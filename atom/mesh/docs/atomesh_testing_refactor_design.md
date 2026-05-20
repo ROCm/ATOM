@@ -13,9 +13,10 @@ Atomesh 后续重构会持续触碰 router、worker pool、metrics、entry route
 概念边界：
 
 ```text
-测试样本 MockTestCase       = 一组 prompt/request + expected response，用来描述输入和期望输出
+测试样本 MockTestCase       = 一组 prompt/request + expected response + route/backend，用来描述输入、期望输出和目标运行模式
 虚拟请求 VirtualRequest     = 由测试样本生成的真实 Atomesh API 请求
-虚拟 Worker VirtualWorker   = 模拟 regular/PD worker，按测试样本返回响应、延迟或错误
+虚拟 Worker VirtualWorker   = 模拟 HTTP regular/PD worker，按测试样本返回响应、延迟或错误
+虚拟 gRPC Worker            = 对外保持 VirtualGrpcWorker，内部按 backend 启动 SGLang 或 vLLM tonic service
 测试执行框架 TestHarness    = 启动 Atomesh app、注册虚拟 worker、发送请求并断言结果
 
 单元测试 Unit Test          = 验证单个函数或小模块在给定输入下的输出、状态变化和错误处理
@@ -34,7 +35,7 @@ Atomesh 后续重构会持续触碰 router、worker pool、metrics、entry route
 重构后：
 
 - 测试从“直接写某个 case”升级为“用同一批测试样本驱动多种运行模式”。
-- `MockTestCase` 负责保存输入和期望输出，`VirtualRequest` 负责生成真实 Atomesh API 请求，`VirtualWorker` 负责模拟 regular/PD worker 行为。
+- `MockTestCase` 负责保存输入、期望输出和 route/backend 元数据，`VirtualRequest` 负责生成真实 Atomesh API 请求，`VirtualWorker` / `VirtualGrpcWorker` 负责模拟 HTTP 或 gRPC regular/PD worker 行为。
 - Atomesh 仍走真实路由、worker pool、connection mode 和 streaming 处理逻辑，测试重点从 mock 返回值转向完整请求链路。
 - `TestHarness` 沉淀为公共执行层，统一完成 Atomesh app 启动、virtual worker 注册、请求发送和结果断言；底层使用 readiness polling、本地 fixture 和统一测试命令，避免每个 case 重复搭环境。
 
@@ -53,8 +54,8 @@ Before
 │ Current mode coverage                                            │
 │ HTTP regular        : strong                                     │
 │ HTTP PD             : partial                                    │
-│ gRPC regular        : missing smoke                              │
-│ gRPC PD / mixed pool: weak                                       │
+│ gRPC regular        : local virtual worker smoke                 │
+│ gRPC PD / mixed pool: local virtual worker smoke                 │
 │ streaming failure   : weak                                       │
 │ conclusion          : local tests pass != every mode works       │
 └──────────────────────────────────────────────────────────────────┘
@@ -62,7 +63,7 @@ Before
 After
 ┌──────────────────────────────────────────────────────────────────┐
 │ MockTestCase                                                     │
-│ prompt/request + expected response + route mode                  │
+│ prompt/request + expected response + route mode + backend        │
 └───────────────────────────────┬──────────────────────────────────┘
                                 │
                                 ▼
@@ -81,9 +82,9 @@ After
                                 │ dispatch
                                 ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ VirtualWorker                                                    │
-│ simulate regular / prefill / decode                              │
-│ return response / latency / stream / error                       │
+│ VirtualWorker / VirtualGrpcWorker                                │
+│ HTTP: replay endpoint response                                   │
+│ gRPC: dispatch backend to SGLang/vLLM tonic service              │
 │ report worker path / request order / request id                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -115,7 +116,7 @@ tests/common/                           tests/common/
 无统一样本层                            tests/fixtures/atomesh_harness/
                                         - prompt/request
                                         - expected response
-                                        - route mode
+                                        - route mode + backend
 ```
 
 ```text
@@ -134,7 +135,7 @@ tests/
 │   ├── golden_assert.rs            # 新增：统一 response / SSE / worker path 断言
 │   ├── virtual_worker.rs           # 新增：virtual regular/PD worker
 │   ├── replay_case_store.rs        # 新增：保存和匹配可回放 mock test cases
-│   └── virtual_grpc_worker.rs      # 新增：预留 tonic-backed virtual gRPC worker
+│   └── virtual_grpc_worker.rs      # 新增：tonic-backed SGLang/vLLM virtual gRPC worker
 ├── fixtures/                        # 新增：测试数据层
 │   ├── atomesh_harness/             # prompt/request + expected response 样本
 │   │   ├── http_regular_chat.json
@@ -142,7 +143,9 @@ tests/
 │   │   ├── http_regular_chat_streaming.json
 │   │   ├── http_regular_completion.json
 │   │   ├── http_pd_chat.json
-│   │   └── grpc_regular_generate.json
+│   │   ├── grpc_regular_generate.json
+│   │   ├── grpc_regular_generate_vllm.json
+│   │   └── grpc_pd_generate.json
 ├── api/                            # 现有：继续保留
 ├── routing/                        # 现有：继续保留
 ├── reliability/                    # 现有：继续保留
@@ -163,13 +166,20 @@ tests/
 - `tests/test_atomesh/mock_test_case.rs` 和 `tests/fixtures/atomesh_harness/` 对应 `MockTestCase`，保存 prompt/request、expected response 和目标运行模式。
 - `tests/test_atomesh/virtual_request.rs` 对应 `VirtualRequest`，把测试样本转成真实 Atomesh API 请求；HTTP/gRPC 的差异发生在 Atomesh 到 worker 的后端连接。
 - `tests/test_atomesh/test_harness.rs` 对应 `TestHarness`，统一完成 app 启动、worker 注册、请求发送和结果断言。
-- `tests/test_atomesh/virtual_worker.rs` 与 `tests/test_atomesh/virtual_grpc_worker.rs` 对应 `VirtualWorker`，分别覆盖 HTTP virtual worker 和预留的 gRPC backend 边界。
+- `tests/test_atomesh/virtual_worker.rs` 与 `tests/test_atomesh/virtual_grpc_worker.rs` 对应 virtual worker 边界；HTTP 使用 Axum replay，gRPC 对外保持 `VirtualGrpcWorker`，内部按 fixture `route.backend` 拆成 `SglangVirtualGrpcService` / `VllmVirtualGrpcService`。
 - `tests/test_atomesh/replay_case_store.rs` 对应 `ReplayCaseStore`，保存一组可回放 `MockTestCase`，并按 endpoint 与请求内容匹配 virtual worker 应返回的样本。
-- `tests/fixtures/atomesh_harness/` 是新增测试样本层，不是新增测试入口；它让现有 case 可以复用同一批 prompt/request 与 expected response。
+- `tests/fixtures/atomesh_harness/` 是新增测试样本层，不是新增测试入口；它让现有 case 可以复用同一批 prompt/request 与 expected response。gRPC fixture 通过 `route.backend` 显式选择 `sglang` 或 `vllm`，默认值为 `sglang`。
 
 ## 4. Virtual Worker 设计
 
 `VirtualWorker` 的定位不是完整 SGLang/vLLM backend，而是架构图中的“Virtual regular or PD worker”：通过启动多个 fake worker，模拟 regular、prefill、decode worker 的真实推理行为。测试入口不直接调用 worker，而是先把 mock test 样本构造成 `VirtualRequest` 发给 Atomesh，再由 Atomesh 按 worker pool、connection mode 和路由策略转发到 virtual worker。
+
+当前已落地两类 virtual worker：
+
+- `VirtualWorker`：Axum HTTP worker，覆盖 `/generate`、`/v1/chat/completions`、`/v1/completions`、`/v1/responses` 等 HTTP endpoint replay。
+- `VirtualGrpcWorker`：统一的 gRPC worker 外观，启动时根据 fixture `route.backend` 选择内部 `SglangVirtualGrpcService` 或 `VllmVirtualGrpcService`。这让 harness 能在一个接口下覆盖 SGLang regular、vLLM regular 和 SGLang PD 的真实 tonic transport、health/model-info 探测和 Generate RPC。
+
+gRPC `/v1/completions` 的边界需要特别说明：当前生产 gRPC router 会先把 OpenAI completion request 通过 completion adapter 转成内部 synthetic `GenerateRequest`，再复用 backend 原生 `Generate` RPC。因此 gRPC harness fixture 保持 `/generate` endpoint，用来验证 completion 和 generate 最终共同使用的 backend 边界；公开 completion API 的包装行为由 router adapter 负责。
 
 实现选择：图中用 FastAPI 表达 fake worker 形态，但 P0 阶段建议优先复用现有 Rust Axum mock worker，避免新增 Python 运行依赖；FastAPI 版本可作为后续跨语言沙盒能力补充。
 
@@ -182,7 +192,7 @@ MockTestCase
         │
         ▼
 VirtualRequestBuilder
-  └── POST /v1/chat/completions 或 /generate
+  └── POST /v1/chat/completions、/v1/completions 或 /generate
         │
         ▼
 Atomesh
@@ -242,20 +252,44 @@ Golden Assert
 }
 ```
 
+gRPC fixture 会额外使用 `route.backend` 选择内部 tonic service：
+
+```json
+{
+  "name": "grpc_regular_generate_vllm",
+  "model": "test-model",
+  "endpoint": "/generate",
+  "route": {
+    "worker_kind": "regular",
+    "connection_mode": "grpc",
+    "backend": "vllm"
+  },
+  "request": {
+    "model": "test-model",
+    "text": "Hello world",
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "body": [
+      {
+        "text": "Hello world"
+      }
+    ]
+  }
+}
+```
+
 ### 测试调用方式
 
 ```rust
 let case = MockTestCase::from_fixture("tests/fixtures/atomesh_harness/http_regular_chat.json")?;
 
-let result = TestHarness::new()
-    .with_case(case)
-    .start_atomesh()
-    .register_virtual_workers()
-    .send_virtual_request()
-    .await?;
+let harness = TestHarness::new(case.clone());
+let result = harness.run().await?;
 
-result.assert_response()?;
-result.assert_worker_path()?;
+result.assert_response(&case);
+result.assert_worker_path_contains("/v1/chat/completions");
 ```
 
 这段代码表达的是测试使用方式，不要求每个 case 都手动启动 worker。`TestHarness` 内部负责：
@@ -268,11 +302,12 @@ result.assert_worker_path()?;
 
 ### 能力边界
 
-- `MockTestCase` 负责描述样本：prompt/request、expected response、route mode、simulation。
+- `MockTestCase` 负责描述样本：prompt/request、expected response、route mode、backend 和 simulation。
 - `VirtualRequest` 负责请求生成：从 prompt/messages/input_ids 构造 `/generate`、`/v1/chat/completions`、`/v1/completions`、`/v1/responses` 请求。
-- `VirtualWorker` 负责行为模拟：返回普通响应、stream chunk、延迟、错误，或模拟 prefill/decode 交互。
+- `VirtualWorker` 负责 HTTP 行为模拟：返回普通响应、stream chunk、延迟、错误，或模拟 prefill/decode 交互。
+- `VirtualGrpcWorker` 负责 gRPC 行为模拟：按 `route.backend` 启动 SGLang/vLLM service，并返回 fixture 驱动的 GenerateResponse。
 - `TestHarness` 负责执行链路：启动 app、注册 worker、发送请求、收集 response/trace、统一断言。
-- 同一份样本应能切换 HTTP regular、HTTP PD、gRPC regular、gRPC PD 等运行模式；gRPC smoke 可作为后续扩展逐步补齐。
+- 同一份样本应能切换 HTTP regular、HTTP PD、gRPC regular、gRPC PD 等运行模式；当前 harness 已覆盖本地 gRPC regular 和 gRPC PD generate smoke。
 
 ## 5. CI 分层
 
@@ -310,7 +345,7 @@ nightly（可选长期任务）:
 
 ## 6. 实施计划
 
-建议按 5 个工作日排布。当前已完成 Day 1 至 Day 4 的核心交付：测试命令/README 已修正，旧 `MockWorker` 与新增 harness 都已使用随机端口和 readiness polling，regular HTTP、streaming、HTTP PD、completion 和 gRPC fixture 边界已接入 `TestHarness`/`VirtualGrpcWorker`。每个 harness case 会输出真实运行时 router config、worker URLs、注册 worker 数和健康 worker 数，便于确认运行状态。真正 tonic-backed gRPC virtual worker 和 gRPC PD smoke 仍作为 P2 扩展项。
+建议按 5 个工作日排布。当前已完成 Day 1 至 Day 4 的核心交付：测试命令/README 已修正，旧 `MockWorker` 与新增 harness 都已使用随机端口和 readiness polling，regular HTTP、streaming、HTTP PD、completion、SGLang/vLLM gRPC regular 和 SGLang gRPC PD 已接入 `TestHarness`/`VirtualGrpcWorker`。每个 harness case 会输出真实运行时 router config、worker URLs、注册 worker 数和健康 worker 数，便于确认运行状态。
 
 
 | 阶段    | 时间  | 主要工作                                                                                  | 交付物                                                    | 当前状态 |
@@ -318,25 +353,25 @@ nightly（可选长期任务）:
 | Day 1 | 1 天 | 修正测试命令；改造 `MockWorker::start/shutdown`；端口和 readiness polling 收敛。 | README 命令正确；`MockWorker` 与新增 `TestHarness` 启停和 readiness 基础稳定。 | 已完成 |
 | Day 2 | 1 天 | 新增 `MockTestCase`、`VirtualRequest`、`ReplayCaseStore`、golden assert；打通 regular HTTP virtual worker。 | fixture 可生成真实 Atomesh 请求，经 regular HTTP 路由到 virtual worker，并完成 response / worker path 校验。 | 已完成 |
 | Day 3 | 1 天 | 增加 `VirtualWorker` streaming fixture、PD prefill/decode replay，并输出运行时 router/worker 状态。                                | 普通文本 SSE、HTTP PD chat prefill/decode fixture 可断言；每个 case 可打印 router mode、connection mode、policy、worker URLs、注册 worker 数和健康 worker 数。                    | 已完成 |
-| Day 4 | 1 天 | 完善 `VirtualGrpcWorker` 接口；将更多现有 case 接入 `TestHarness`；整理运行模式矩阵。                         | `/v1/completions` 已迁入 harness；gRPC regular fixture 可通过 `VirtualGrpcWorker` 边界分类，真正 tonic transport 后续扩展；运行模式矩阵已整理。                        | 已完成 |
+| Day 4 | 1 天 | 完善 `VirtualGrpcWorker` 接口；将更多现有 case 接入 `TestHarness`；整理运行模式矩阵。                         | `/v1/completions` 已迁入 HTTP harness；gRPC regular 和 gRPC PD generate fixture 可通过 tonic-backed `VirtualGrpcWorker` 执行，regular 可由 `route.backend` 选择 SGLang/vLLM；运行模式矩阵已整理。                        | 已完成 |
 | Day 5 | 1 天 | 建立重构 P0 清单；补 metrics/router/worker pool/entry routes 关键测试；整理 CI 分层。                   | 每个重构点有 P0 测试入口；CI quick/full 边界明确。                     | 未开始 |
 
 当前实现清单：
 
-- 已新增 `tests/test_atomesh/` 测试框架模块：`MockTestCase`、`VirtualRequest`、`ReplayCaseStore`、`VirtualWorker`、`VirtualGrpcWorker`、`TestHarness` 和 `GoldenAssert` 边界。
-- 已新增 `tests/fixtures/atomesh_harness/` 样本：`http_regular_chat.json`、`http_regular_generate.json`、`http_regular_chat_streaming.json`、`http_regular_completion.json`、`http_pd_chat.json`、`grpc_regular_generate.json`。
-- 已在 `tests/api/atomesh_harness_test.rs` 接入 fixture-driven regular HTTP、streaming、completion、HTTP PD chat 和 gRPC boundary smoke 测试，并通过 `cargo test -p atom-mesh --test api_tests test_atomesh_harness -- --nocapture`。
+- 已新增 `tests/test_atomesh/` 测试框架模块：`MockTestCase`、`VirtualRequest`、`ReplayCaseStore`、`VirtualWorker`、`VirtualGrpcWorker`、`TestHarness` 和 `GoldenAssert`。
+- 已新增 `tests/fixtures/atomesh_harness/` 样本：`http_regular_chat.json`、`http_regular_generate.json`、`http_regular_chat_streaming.json`、`http_regular_completion.json`、`http_pd_chat.json`、`grpc_regular_generate.json`、`grpc_regular_generate_vllm.json`、`grpc_pd_generate.json`。
+- 已在 `tests/api/atomesh_harness_test.rs` 接入 fixture-driven regular HTTP、streaming、completion、HTTP PD chat、SGLang gRPC regular、vLLM gRPC regular 和 SGLang gRPC PD smoke 测试，并通过 `cargo test --test api_tests atomesh_harness -- --nocapture`。
 - 已在 `TestHarnessResult` 中返回真实运行时 router/worker 状态：router mode、connection mode、policy、worker URLs、registered workers、healthy workers，并在 case 日志中输出。
 - 已修正 `tests/README.md` 中 package 名称和新增测试结构说明。
-- 尚未完成真正 tonic-backed gRPC regular/PD virtual worker、现有大批 case 迁移和 Day 5 P0 测试清单。
+- 尚未完成现有大批 case 迁移和 Day 5 P0 测试清单。
 
 
 如果工期紧张，优先级为：
 
 ```text
 P0: TestHarness 稳定 + MockTestCase/VirtualRequest + regular HTTP virtual worker + P0 清单
-P1: streaming replay + gRPC regular smoke + 默认测试无外部网络依赖
-P2: gRPC PD smoke + sandbox binary startup + nightly backend compatibility
+P1: streaming replay + gRPC regular/PD smoke + 默认测试无外部网络依赖
+P2: sandbox binary startup + nightly backend compatibility
 ```
 
 当前 harness 运行模式矩阵：
@@ -348,25 +383,27 @@ P2: gRPC PD smoke + sandbox binary startup + nightly backend compatibility
 | `http_regular_chat_streaming.json` | `/v1/chat/completions` | regular | HTTP | SSE JSON chunk 解析与断言 |
 | `http_regular_completion.json` | `/v1/completions` | regular | HTTP | OpenAI completions 请求迁入 harness |
 | `http_pd_chat.json` | `/v1/chat/completions` | prefill/decode | HTTP | prefill/decode worker path 断言 |
-| `grpc_regular_generate.json` | `/generate` | regular | gRPC | `VirtualGrpcWorker` 边界分类，tonic transport 后续接入 |
+| `grpc_regular_generate.json` | `/generate` | regular | gRPC / SGLang | backend 原生 `Generate` RPC；`/v1/completions` 会在 router adapter 中转换到该路径 |
+| `grpc_regular_generate_vllm.json` | `/generate` | regular | gRPC / vLLM | backend 原生 `Generate` RPC；fixture `route.backend` 选择 vLLM tonic service |
+| `grpc_pd_generate.json` | `/generate` | prefill/decode | gRPC / SGLang | backend 原生 `Generate` RPC，覆盖 PD prefill/decode metadata 注入和双 worker 路由 |
 
 ## 7. 测试与验收
 
-当前 P0/P1 HTTP harness 验收：
+当前 P0/P1 harness 验收：
 
 - 默认 fixture-driven regular HTTP smoke 不依赖 GPU、真实 engine 或外部网络。
 - 旧 `MockWorker` 与新增 `VirtualWorker` 使用随机端口和 readiness polling，不依赖固定 sleep。
 - `MockTestCase` 能生成 `VirtualRequest`，通过 Atomesh 真实入口完成请求。
 - `VirtualWorker` 能根据 mock test fixture 匹配请求并返回 golden response，支持非流式 JSON 和基础 SSE 回放。
-- `/v1/completions` 和 gRPC boundary fixture 已接入 harness 测试入口。
+- `/v1/completions`、SGLang/vLLM gRPC regular 和 SGLang gRPC PD fixture 已接入 harness 测试入口。
 - HTTP PD chat 通过 fixture-driven `TestHarness` 接入，并可断言 prefill/decode worker path。
 - case 日志能打印真实 router config 和 worker registry 摘要，而不是直接复述 fixture 声明。
 - `tests/README.md` 与实际 package name、CI quick/full/nightly 命令一致。
-- `cargo test -p atom-mesh --test api_tests test_atomesh_harness -- --nocapture` 通过。
+- `cargo test --test api_tests atomesh_harness -- --nocapture` 通过。
 
 后续验收：
 
 - reasoning 专项测试、streaming failure 和更完整的 tool-call 流式断言待后续通过更合适的 parser / gRPC / streaming 转换入口补齐。
-- 真正 tonic-backed gRPC regular、gRPC PD 作为后续 smoke 扩展项。
+- 更完整的 gRPC chat/completions、streaming 和 logprobs 行为作为后续 smoke 扩展项。
 - 重构 metrics、router、worker pool、entry routes 前，有对应 P0 测试清单。
 

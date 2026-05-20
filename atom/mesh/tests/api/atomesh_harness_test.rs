@@ -1,9 +1,6 @@
 //! Smoke tests proving the fixture-driven harness reaches regular HTTP routes.
 
-use crate::test_atomesh::{
-    ConnectionModeFixture, MockTestCase, TestHarness, TestHarnessResult, VirtualGrpcWorker,
-    WorkerKindFixture,
-};
+use crate::test_atomesh::{MockTestCase, TestHarness, TestHarnessResult};
 
 const ATOMESH_HARNESS_FIXTURE_DIR: &str = "tests/fixtures/atomesh_harness";
 
@@ -109,20 +106,46 @@ async fn test_atomesh_harness_http_pd_chat() {
 }
 
 #[tokio::test]
-async fn test_atomesh_harness_grpc_regular_generate_boundary() {
-    // This case verifies gRPC fixtures are classified before tonic support.
-    // It passes when VirtualGrpcWorker owns the fixture and the HTTP harness
-    // rejects it with the reserved gRPC transport boundary.
+async fn test_atomesh_harness_grpc_regular_generate() {
+    // This case verifies regular SGLang gRPC generate routing through Atomesh.
+    // `/v1/completions` is covered by the gRPC router adapter, which converts
+    // the public completion request into this native backend Generate RPC.
     let case = load_fixture_case("grpc_regular_generate.json");
-    assert_eq!(case.route.connection_mode, ConnectionModeFixture::Grpc);
+    let harness = TestHarness::new(case.clone());
 
-    let mut grpc_worker = VirtualGrpcWorker::new(case.clone()).unwrap();
-    assert_eq!(grpc_worker.case_name(), "grpc_regular_generate");
-    assert_eq!(grpc_worker.worker_kind(), &WorkerKindFixture::Regular);
+    let result = harness.run().await.unwrap();
+    log_case_result(&case, &result);
 
-    let grpc_error = grpc_worker.start().await.unwrap_err().to_string();
-    assert!(grpc_error.contains("tonic transport is not implemented yet"));
+    result.assert_response(&case);
+    result.assert_worker_path_contains("generate");
+}
 
-    let harness_error = TestHarness::new(case).run().await.unwrap_err().to_string();
-    assert!(harness_error.contains("gRPC fixtures are reserved for VirtualGrpcWorker"));
+#[tokio::test]
+async fn test_atomesh_harness_grpc_regular_generate_vllm() {
+    // This case verifies regular vLLM gRPC generate routing through Atomesh.
+    // The public completion endpoint reuses this backend Generate RPC via the
+    // gRPC completion adapter, so the virtual worker should log `generate`.
+    let case = load_fixture_case("grpc_regular_generate_vllm.json");
+    let harness = TestHarness::new(case.clone());
+
+    let result = harness.run().await.unwrap();
+    log_case_result(&case, &result);
+
+    result.assert_response(&case);
+    result.assert_worker_path_contains("generate");
+}
+
+#[tokio::test]
+async fn test_atomesh_harness_grpc_pd_generate() {
+    // This case verifies SGLang gRPC PD generate routing through Atomesh.
+    // Completion requests enter the same backend Generate RPC after adapter
+    // conversion, while PD metadata is injected on the native generate path.
+    let case = load_fixture_case("grpc_pd_generate.json");
+    let harness = TestHarness::new(case.clone());
+
+    let result = harness.run().await.unwrap();
+    log_case_result(&case, &result);
+
+    result.assert_response(&case);
+    result.assert_worker_path_count_at_least("generate", 2);
 }

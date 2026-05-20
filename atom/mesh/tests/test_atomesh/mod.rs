@@ -15,7 +15,7 @@ pub mod virtual_request;
 pub mod virtual_worker;
 
 pub use golden_assert::{assert_json_contains, GoldenAssert};
-pub use mock_test_case::{ConnectionModeFixture, MockTestCase, WorkerKindFixture};
+pub use mock_test_case::{BackendFixture, ConnectionModeFixture, MockTestCase, WorkerKindFixture};
 pub use replay_case_store::ReplayCaseStore;
 pub use test_harness::{TestHarness, TestHarnessResult};
 pub use virtual_grpc_worker::VirtualGrpcWorker;

@@ -7,19 +7,21 @@
 
 use http_body_util::BodyExt;
 use mesh::{
-    config::RouterConfig,
+    config::{BackendType, RouterConfig},
     core::Job,
     routers::{RouterFactory, RouterTrait},
+    tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry},
 };
 use serde_json::Value;
+use std::sync::Arc;
 use tower::ServiceExt;
 
-use crate::common::{create_test_context, test_app};
+use crate::common::{create_test_context, create_test_context_with_parsers, test_app};
 
 use super::{
     golden_assert::{assert_any_json_contains, GoldenAssert},
-    mock_test_case::{MockTestCase, WorkerKindFixture},
-    VirtualRequest, VirtualWorker,
+    mock_test_case::{BackendFixture, ConnectionModeFixture, MockTestCase, WorkerKindFixture},
+    VirtualGrpcWorker, VirtualRequest, VirtualWorker,
 };
 
 /// Result observed after one fixture has gone through Atomesh.
@@ -86,6 +88,34 @@ pub struct TestHarness {
     case: MockTestCase,
 }
 
+enum StartedVirtualWorker {
+    Http(VirtualWorker),
+    Grpc(VirtualGrpcWorker),
+}
+
+impl StartedVirtualWorker {
+    fn url(&self) -> String {
+        match self {
+            Self::Http(worker) => worker.url.clone().unwrap(),
+            Self::Grpc(worker) => worker.url.clone().unwrap(),
+        }
+    }
+
+    fn request_log(&self) -> Vec<String> {
+        match self {
+            Self::Http(worker) => worker.request_log(),
+            Self::Grpc(worker) => worker.request_log(),
+        }
+    }
+
+    async fn stop(&mut self) {
+        match self {
+            Self::Http(worker) => worker.stop().await,
+            Self::Grpc(worker) => worker.stop().await,
+        }
+    }
+}
+
 impl TestHarness {
     pub fn new(case: MockTestCase) -> Self {
         Self { case }
@@ -97,25 +127,12 @@ impl TestHarness {
 
     /// Execute the full fixture flow through Atomesh and virtual workers.
     pub async fn run(&self) -> Result<TestHarnessResult, Box<dyn std::error::Error>> {
-        // Stage 0: this harness currently drives Atomesh's HTTP front door.
-        // gRPC fixtures can reuse the same high-level shape later, but need a
-        // different virtual backend transport.
-        if !matches!(
-            self.case.route.connection_mode,
-            super::mock_test_case::ConnectionModeFixture::Http
-        ) {
-            return Err(
-                "TestHarness currently supports HTTP fixtures only; gRPC fixtures are reserved for VirtualGrpcWorker"
-                    .into(),
-            );
-        }
-
         // Stage 1: start virtual backend workers from fixture route metadata.
         // Regular mode starts one worker; PD mode starts a prefill/decode pair.
         let mut workers = self.start_virtual_workers().await?;
         let worker_urls = workers
             .iter()
-            .map(|worker| worker.url.clone().unwrap())
+            .map(StartedVirtualWorker::url)
             .collect::<Vec<_>>();
 
         // Stage 2: build the same app context pieces Atomesh uses at runtime,
@@ -123,7 +140,14 @@ impl TestHarness {
         // triggers Atomesh's own worker health/model-info probes and registry
         // insertion instead of manually registering fake workers.
         let config = self.router_config(&worker_urls);
-        let app_context = create_test_context(config.clone()).await;
+        let app_context = match self.case.route.connection_mode {
+            ConnectionModeFixture::Http => create_test_context(config.clone()).await,
+            ConnectionModeFixture::Grpc => {
+                let app_context = create_test_context_with_parsers(config.clone()).await;
+                register_mock_tokenizer(&app_context.tokenizer_registry, &self.case.model).await?;
+                app_context
+            }
+        };
         initialize_workers(&app_context, &config, worker_urls.len()).await?;
 
         // Capture runtime router state from the actual config/context used by
@@ -143,12 +167,12 @@ impl TestHarness {
         // context. Requests below enter through `server::build_app`, not by
         // directly calling router internals.
         let router = RouterFactory::create_router(&app_context).await?;
-        let router: std::sync::Arc<dyn RouterTrait> = std::sync::Arc::from(router);
+        let router: Arc<dyn RouterTrait> = Arc::from(router);
         let app = test_app::create_test_app_with_context(router, app_context);
 
         // Stage 4: convert the fixture into a real Atomesh API request and send
         // it through the app. Atomesh will select workers and forward the
-        // request to the virtual backend over HTTP.
+        // request to the virtual backend using the fixture's connection mode.
         let request = VirtualRequest::from_case(&self.case).into_axum_request();
         let response = app.oneshot(request).await?;
 
@@ -166,7 +190,7 @@ impl TestHarness {
         // business endpoint, so tests can assert routing shape when needed.
         let worker_path = workers
             .iter()
-            .flat_map(VirtualWorker::request_log)
+            .flat_map(StartedVirtualWorker::request_log)
             .collect::<Vec<_>>();
 
         // Stage 7: stop virtual workers before returning the result. Keeping
@@ -191,7 +215,7 @@ impl TestHarness {
 
     async fn start_virtual_workers(
         &self,
-    ) -> Result<Vec<VirtualWorker>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<StartedVirtualWorker>, Box<dyn std::error::Error>> {
         // The fixture's worker kind decides the topology under test.
         let worker_count = match self.case.route.worker_kind {
             WorkerKindFixture::Regular => 1,
@@ -200,8 +224,18 @@ impl TestHarness {
         let mut workers = Vec::with_capacity(worker_count);
 
         for _ in 0..worker_count {
-            let mut worker = VirtualWorker::new(self.case.clone());
-            worker.start().await?;
+            let worker = match self.case.route.connection_mode {
+                ConnectionModeFixture::Http => {
+                    let mut worker = VirtualWorker::new(self.case.clone());
+                    worker.start().await?;
+                    StartedVirtualWorker::Http(worker)
+                }
+                ConnectionModeFixture::Grpc => {
+                    let mut worker = VirtualGrpcWorker::new(self.case.clone())?;
+                    worker.start().await?;
+                    StartedVirtualWorker::Grpc(worker)
+                }
+            };
             workers.push(worker);
         }
 
@@ -212,10 +246,13 @@ impl TestHarness {
         // Keep the harness config minimal and deterministic: HTTP transport,
         // round-robin policy, no retries, and random local router port.
         let mut builder = RouterConfig::builder()
+            .backend(match self.case.route.backend {
+                BackendFixture::Sglang => BackendType::Sglang,
+                BackendFixture::Vllm => BackendType::Vllm,
+            })
             .host("127.0.0.1")
             .port(portpicker::pick_unused_port().expect("no free port for test router"))
             .round_robin_policy()
-            .http_connection()
             .max_payload_size(256 * 1024 * 1024)
             .request_timeout_secs(30)
             .worker_startup_timeout_secs(5)
@@ -223,6 +260,11 @@ impl TestHarness {
             .max_concurrent_requests(64)
             .queue_timeout_secs(60)
             .disable_retries();
+
+        builder = match self.case.route.connection_mode {
+            ConnectionModeFixture::Http => builder.http_connection(),
+            ConnectionModeFixture::Grpc => builder.grpc_connection_default(),
+        };
 
         builder = match self.case.route.worker_kind {
             WorkerKindFixture::Regular => builder.regular_mode(worker_urls.to_vec()),
@@ -247,8 +289,21 @@ fn parse_sse_events(response_text: &str) -> Vec<Value> {
         .collect()
 }
 
+async fn register_mock_tokenizer(
+    tokenizer_registry: &Arc<TokenizerRegistry>,
+    model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tokenizer_id = TokenizerRegistry::generate_id();
+    tokenizer_registry
+        .load(&tokenizer_id, model, "mock-tokenizer", || async {
+            Ok(Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>)
+        })
+        .await?;
+    Ok(())
+}
+
 async fn initialize_workers(
-    app_context: &std::sync::Arc<mesh::app_context::AppContext>,
+    app_context: &Arc<mesh::app_context::AppContext>,
     config: &RouterConfig,
     expected_count: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
