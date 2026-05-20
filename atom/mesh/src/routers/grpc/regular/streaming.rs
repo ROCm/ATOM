@@ -24,10 +24,21 @@ use crate::{
         generate::GenerateRequest,
     },
     reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser},
-    routers::grpc::{
-        context,
-        proto_wrapper::{ProtoResponseVariant, ProtoStream},
-        utils,
+    routers::{
+        grpc::{
+            context,
+            proto_wrapper::{ProtoResponseVariant, ProtoStream},
+            utils,
+        },
+        prepare::{
+            parser_factory_lookup::{
+                check_reasoning_parser_availability, check_tool_parser_availability,
+                create_reasoning_parser, create_tool_parser,
+            },
+            stop_sequence_decoder::create_stop_decoder,
+            tool_constraints::{generate_tool_call_id, get_history_tool_calls_count},
+        },
+        render::finish_reason_mapping::parse_finish_reason,
     },
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
@@ -191,7 +202,7 @@ impl StreamingProcessor {
         let separate_reasoning = original_request.separate_reasoning;
         let tool_choice = &original_request.tool_choice;
         let tools = &original_request.tools;
-        let history_tool_calls_count = utils::get_history_tool_calls_count(&original_request);
+        let history_tool_calls_count = get_history_tool_calls_count(&original_request);
         let stream_options = &original_request.stream_options;
 
         // Phase 1: Initialize state tracking (per-index for n>1 support)
@@ -225,7 +236,7 @@ impl StreamingProcessor {
 
         // Check parser availability once upfront (log warning only once per request)
         let reasoning_parser_available = separate_reasoning
-            && utils::check_reasoning_parser_availability(
+            && check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
                 model,
@@ -243,7 +254,7 @@ impl StreamingProcessor {
         let is_specific_function = matches!(tool_choice, Some(ToolChoice::Function { .. }));
 
         let tool_parser_available = tools.is_some()
-            && utils::check_tool_parser_availability(
+            && check_tool_parser_availability(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_deref(),
                 model,
@@ -287,7 +298,7 @@ impl StreamingProcessor {
                     let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
                         let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim) =
                             stop_params;
-                        utils::create_stop_decoder(
+                        create_stop_decoder(
                             &tokenizer,
                             stop.as_ref(),
                             stop_token_ids.as_ref(),
@@ -972,7 +983,7 @@ impl StreamingProcessor {
                     let e2e_latency = start_time.elapsed().as_secs_f64();
 
                     // Parse finish_reason
-                    let finish_reason = utils::parse_finish_reason(
+                    let finish_reason = parse_finish_reason(
                         complete.finish_reason(),
                         complete.completion_tokens(),
                     );
@@ -1089,7 +1100,7 @@ impl StreamingProcessor {
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         reasoning_parsers.entry(index).or_insert_with(|| {
-            let parser = utils::create_reasoning_parser(
+            let parser = create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
                 model,
@@ -1155,7 +1166,7 @@ impl StreamingProcessor {
                 // First chunk: send name and id
                 has_tool_calls.insert(index, true);
 
-                let tool_call_id = utils::generate_tool_call_id(
+                let tool_call_id = generate_tool_call_id(
                     model,
                     &function.name,
                     0,
@@ -1207,10 +1218,10 @@ impl StreamingProcessor {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         tool_parsers.entry(index).or_insert_with(|| {
             let parser = if use_json_parser {
-                utils::create_tool_parser(&self.tool_parser_factory, Some("json"), model)
+                create_tool_parser(&self.tool_parser_factory, Some("json"), model)
                     .expect("JSON parser should be available")
             } else {
-                utils::create_tool_parser(
+                create_tool_parser(
                     &self.tool_parser_factory,
                     self.configured_tool_parser.as_deref(),
                     model,
@@ -1241,7 +1252,7 @@ impl StreamingProcessor {
                         has_tool_calls.insert(index, true);
 
                         let tool_call_id = if let Some(ref name) = tool_call_item.name {
-                            Some(utils::generate_tool_call_id(
+                            Some(generate_tool_call_id(
                                 model,
                                 name,
                                 tool_call_item.tool_index,

@@ -24,6 +24,16 @@ use crate::{
             proto_wrapper::ProtoGenerateComplete,
             utils,
         },
+        prepare::{
+            parser_factory_lookup::{
+                check_reasoning_parser_availability, check_tool_parser_availability,
+                get_reasoning_parser, get_tool_parser,
+            },
+            tool_constraints::{
+                generate_tool_call_id, get_history_tool_calls_count, parse_json_schema_response,
+            },
+        },
+        render::finish_reason_mapping::parse_finish_reason,
     },
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
@@ -99,7 +109,7 @@ impl ResponseProcessor {
         let mut processed_text = final_text;
 
         if original_request.separate_reasoning && reasoning_parser_available {
-            let pooled_parser = utils::get_reasoning_parser(
+            let pooled_parser = get_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
                 &original_request.model,
@@ -136,7 +146,7 @@ impl ResponseProcessor {
             };
 
             if used_json_schema {
-                (tool_calls, processed_text) = utils::parse_json_schema_response(
+                (tool_calls, processed_text) = parse_json_schema_response(
                     &processed_text,
                     &original_request.tool_choice,
                     &original_request.model,
@@ -222,11 +232,11 @@ impl ResponseProcessor {
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
 
-        let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
+        let history_tool_calls_count = get_history_tool_calls_count(&chat_request);
 
         // Check parser availability once upfront (not per choice)
         let reasoning_parser_available = chat_request.separate_reasoning
-            && utils::check_reasoning_parser_availability(
+            && check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
                 &chat_request.model,
@@ -239,7 +249,7 @@ impl ResponseProcessor {
 
         let tool_parser_available = tool_choice_enabled
             && chat_request.tools.is_some()
-            && utils::check_tool_parser_availability(
+            && check_tool_parser_availability(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_deref(),
                 &chat_request.model,
@@ -308,7 +318,7 @@ impl ResponseProcessor {
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
-        let pooled_parser = utils::get_tool_parser(
+        let pooled_parser = get_tool_parser(
             &self.tool_parser_factory,
             self.configured_tool_parser.as_deref(),
             model,
@@ -332,7 +342,7 @@ impl ResponseProcessor {
                     .enumerate()
                     .map(|(index, tc)| {
                         // Generate ID for this tool call
-                        let id = utils::generate_tool_call_id(
+                        let id = generate_tool_call_id(
                             model,
                             &tc.function.name,
                             index,
@@ -411,7 +421,7 @@ impl ResponseProcessor {
 
             // Parse finish_reason from string to proper type
             let finish_reason =
-                utils::parse_finish_reason(finish_reason_str, complete.completion_tokens());
+                parse_finish_reason(finish_reason_str, complete.completion_tokens());
 
             // Handle matched_stop if present
             let matched_stop = complete.matched_stop().map(|matched| match matched {

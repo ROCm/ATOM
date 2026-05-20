@@ -15,6 +15,7 @@ use crate::{
             context::{PreparationOutput, RequestContext},
             utils,
         },
+        prepare::stop_sequence_decoder::create_stop_decoder,
     },
     tokenizer::traits::Tokenizer,
 };
@@ -58,7 +59,7 @@ impl GeneratePreparationStage {
 
         // Create stop sequence decoder for generate requests
         let params = request.sampling_params.as_ref();
-        let stop_decoder = utils::create_stop_decoder(
+        let stop_decoder = create_stop_decoder(
             &tokenizer,
             params.and_then(|p| p.stop.as_ref()),
             params.and_then(|p| p.stop_token_ids.as_ref()),

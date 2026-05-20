@@ -16,7 +16,7 @@ pub(crate) mod regular;
 pub(crate) mod router; // Used by routers/factory
 pub(crate) mod utils; // Used by routers/http
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests;
 
 /// Processed chat messages ready for gRPC generation

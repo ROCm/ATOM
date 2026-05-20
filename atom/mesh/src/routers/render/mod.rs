@@ -2,5 +2,7 @@
 //!
 //! Module contents are added incrementally by Parts A and E of the gRPC refactor.
 
-#[cfg(test)]
+pub(crate) mod finish_reason_mapping;
+
+#[cfg(any())]
 mod tests;

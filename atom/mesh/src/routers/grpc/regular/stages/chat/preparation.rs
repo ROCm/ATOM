@@ -15,6 +15,10 @@ use crate::{
             context::{PreparationOutput, RequestContext},
             utils,
         },
+        prepare::{
+            stop_sequence_decoder::create_stop_decoder,
+            tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constraints},
+        },
     },
 };
 
@@ -48,7 +52,7 @@ impl ChatPreparationStage {
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
 
         // Step 1: Filter tools if needed
-        let body_ref = utils::filter_chat_request_by_tool_choice(request);
+        let body_ref = filter_chat_request_by_tool_choice(request);
 
         // Step 2: Process messages and apply chat template
         let processed_messages = match utils::process_chat_messages(&body_ref, &*tokenizer) {
@@ -75,7 +79,7 @@ impl ChatPreparationStage {
 
         // Step 4: Build tool constraints if needed
         let tool_call_constraint = if let Some(tools) = body_ref.tools.as_ref() {
-            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
+            generate_tool_constraints(tools, &request.tool_choice, &request.model)
                 .map_err(|e| {
                     error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
                     error::bad_request("invalid_tool_configuration", format!("Invalid tool configuration: {}", e))
@@ -85,7 +89,7 @@ impl ChatPreparationStage {
         };
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
-        let stop_decoder = utils::create_stop_decoder(
+        let stop_decoder = create_stop_decoder(
             &tokenizer,
             request.stop.as_ref(),
             request.stop_token_ids.as_ref(),

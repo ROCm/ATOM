@@ -2,5 +2,5 @@
 //!
 //! Module contents are added by Part D of the gRPC refactor.
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests;

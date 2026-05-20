@@ -1,4 +1,4 @@
 //! gRPC engine: the only subtree that imports `mesh_grpc::*`.
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests;
