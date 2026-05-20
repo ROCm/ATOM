@@ -112,21 +112,6 @@ def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
     )
 
 
-def _transform_vllm_kv_cache_dtype_to_atom(kv_cache_dtype: str) -> str:
-    if kv_cache_dtype == "auto":
-        return "auto"
-    if kv_cache_dtype == "bfloat16":
-        return "bf16"
-    if kv_cache_dtype == "float16":
-        return "fp16"
-    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
-        # ATOM's MLA plugin uses the standard compact fp8 layout. vLLM may
-        # rename DeepSeek sparse MLA requests to fp8_ds_mla internally; keep
-        # ATOM config canonical so all ATOM cache builders use the same layout.
-        return "fp8"
-    return kv_cache_dtype
-
-
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     from atom.config import Config, CompilationConfig
 
@@ -189,9 +174,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         parallel_config=vllm_parallel_config,
         kv_cache_block_size=vllm_cache_config.block_size,
         num_kvcache_blocks=vllm_cache_config.num_gpu_blocks,
-        kv_cache_dtype=_transform_vllm_kv_cache_dtype_to_atom(
-            vllm_cache_config.cache_dtype
-        ),
+        kv_cache_dtype=vllm_cache_config.cache_dtype,
         enable_prefix_caching=vllm_cache_config.enable_prefix_caching,
         port=None,
         torch_profiler_dir=None,

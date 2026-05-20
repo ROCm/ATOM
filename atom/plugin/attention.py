@@ -30,10 +30,6 @@ def _get_aiter_kv_cache_dtype(config) -> torch.dtype:
         kv_cache_dtype = "bf16"
     elif kv_cache_dtype == "float16":
         kv_cache_dtype = "fp16"
-    elif isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
-        # ATOM's sparse MLA kernels use the standard fp8 payload layout even if
-        # vLLM has labeled the request as fp8_ds_mla for its native backend.
-        kv_cache_dtype = "fp8"
     return dtypes.d_dtypes[kv_cache_dtype]
 
 
