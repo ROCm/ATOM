@@ -92,15 +92,10 @@ class _AtomCausalLMBaseForSglang(nn.Module):
             config, skip_all_gather=plugin_skip_all_gather
         )
 
-        # Apply ds model-specific sglang patches (attn dispatch, weight hooks, etc.)
-        # TODO: will remove this after sglang supports atom attention backend
-        if self.model_arch_spec.apply_deepseek_patch:
-            from atom.plugin.sglang.models.deepseek_mla import (
-                setup_deepseek_for_sglang,
-            )
-
+        # Apply model-specific install-time adapters (attn dispatch, weight hooks, etc.).
+        if self.model_arch_spec.install_adapters is not None:
             with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
-                setup_deepseek_for_sglang(self.model)
+                self.model_arch_spec.install_adapters(self.model)
 
     def get_embed_and_head(self):
         if hasattr(self.model, "get_embed_and_head"):
@@ -180,7 +175,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                     inputs_embeds=runtime.input_embeds,
                 )
                 uses_context_only_forward = (
-                    self.model_arch_spec.apply_deepseek_patch
+                    self.model_arch_spec.install_adapters is not None
                     or self.model_arch_spec.wrapper_binds_gdn_context
                 )
                 with SGLangForwardBatchMetadata.bind(metadata):

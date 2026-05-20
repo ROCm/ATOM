@@ -7,11 +7,18 @@ from atom.plugin.sglang.runtime.context import (
     plugin_runtime_scope,
 )
 from atom.plugin.sglang.runtime.forward_context import SGLangPluginRuntime
-from atom.plugin.sglang.runtime.model_arch import MODEL_ARCH_SPECS, get_model_arch_spec
+from atom.plugin.sglang.runtime.model_arch import (
+    MODEL_ADAPTER_SPECS,
+    MODEL_ARCH_SPECS,
+    SGLangModelAdapterSpec,
+    get_model_arch_spec,
+)
 
 __all__ = [
+    "MODEL_ADAPTER_SPECS",
     "MODEL_ARCH_SPECS",
     "SGLangForwardBatchMetadata",
+    "SGLangModelAdapterSpec",
     "SGLangPluginRuntime",
     "bind_current_forward_batch",
     "get_current_forward_batch",

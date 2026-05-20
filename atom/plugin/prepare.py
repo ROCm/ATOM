@@ -74,15 +74,11 @@ def prepare_model(config: Any, engine: str):
     model_cls = _ATOM_SUPPORTED_MODELS[model_arch]
     logger.info(f"ATOM model class for {model_arch} is {model_cls}")
 
-    if model_arch in {
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
-    }:
-        from atom.plugin.sglang.models.qwen3_5 import (
-            apply_prepare_model_adaptations,
-        )
+    from atom.plugin.sglang.runtime import get_model_arch_spec
 
-        apply_prepare_model_adaptations(atom_config, model_arch)
+    model_adapter = get_model_arch_spec(model_arch)
+    if model_adapter.prepare_config is not None:
+        model_adapter.prepare_config(atom_config, model_arch)
 
     register_ops_to_sglang(atom_config=atom_config)
     set_attn_cls()
