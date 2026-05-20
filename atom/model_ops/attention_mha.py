@@ -517,6 +517,31 @@ class PagedAttentionImpl(nn.Module):
         )
 
         if self.head_dim > 256:
+            # _sdpa_varlen_fallback dispatches to _sdpa_varlen_attn, which
+            # implements only causal masking with GQA head expansion — it does
+            # NOT honor sliding_window or attention sinks. Silently taking
+            # this path with either feature active would change attention
+            # semantics (windowed -> full, sinks dropped). No current model
+            # hits this combination (Gemma 4 has head_dim=512 full-attn layers
+            # but no sinks/sliding window; gpt-oss/MiMo use sinks but
+            # head_dim<=256), but guard explicitly to keep future callers safe.
+            # Mirrors the OOT plugin guards (fbe7cbaf / 83a27eb3).
+            if self.sinks is not None:
+                raise NotImplementedError(
+                    f"prefill_attention SDPA fallback (head_dim={self.head_dim} "
+                    f"> 256) does not support attention sinks; self.sinks is "
+                    f"set. Add sink_ptr support to _sdpa_varlen_attn before "
+                    f"enabling this model."
+                )
+            # self.sliding_window stored as int (-1 == disabled, >0 == window size)
+            if self.sliding_window is not None and self.sliding_window > 0:
+                raise NotImplementedError(
+                    f"prefill_attention SDPA fallback (head_dim={self.head_dim} "
+                    f"> 256) does not support sliding_window; "
+                    f"self.sliding_window={self.sliding_window}. Add window "
+                    f"masking support to _sdpa_varlen_attn before enabling "
+                    f"this model."
+                )
             o = self._sdpa_varlen_fallback(
                 q, k, v,
                 cu_seqlens_q=attn_metadata.cu_seqlens_q,
