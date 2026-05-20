@@ -499,7 +499,7 @@ class PagedAttentionImpl(nn.Module):
     @staticmethod
     def _sdpa_varlen_fallback(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal):
         """SDPA fallback for head_dim > 256 where CK is unsupported."""
-        from atom.plugin.attention_mha import _sdpa_varlen_attn
+        from atom.model_ops.attentions.utils import _sdpa_varlen_attn
         return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
                                  softmax_scale, causal)
 
