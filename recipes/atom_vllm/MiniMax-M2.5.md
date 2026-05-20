@@ -21,7 +21,7 @@ export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 
 vllm serve MiniMaxAI/MiniMax-M2.5 \
-    --host 0.0.0.0 \
+    --host localhost \
     --port 8000 \
     --async-scheduling \
     --load-format fastsafetensors \

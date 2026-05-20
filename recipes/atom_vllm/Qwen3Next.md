@@ -21,7 +21,7 @@ export ATOM_USE_FLYDSL_GDR=0
 export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
-    --host 0.0.0.0 \
+    --host localhost \
     --port 8000 \
     --tensor-parallel-size 1 \
     --kv-cache-dtype fp8 \
@@ -44,7 +44,7 @@ export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
 if [ "${TP}" != "1" ]; then export AITER_QUICK_REDUCE_QUANTIZATION=INT4; fi
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
-    --host 0.0.0.0 \
+    --host localhost \
     --port 8000 \
     --tensor-parallel-size "${TP}" \
     --kv-cache-dtype fp8 \

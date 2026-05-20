@@ -21,7 +21,7 @@ We adopt [amd/Kimi-K2.5-MXFP4-AttnFP8](https://huggingface.co/amd/Kimi-K2.5-MXFP
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
 vllm serve amd/Kimi-K2.5-MXFP4-AttnFP8 \
-    --host 0.0.0.0 \
+    --host localhost \
     --port 8000 \
     --async-scheduling \
     --load-format fastsafetensors \

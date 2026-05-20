@@ -22,7 +22,7 @@ fi
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
 vllm serve deepseek-ai/DeepSeek-V3.2 \
-    --host 0.0.0.0 \
+    --host localhost \
     --port 8000 \
     --tensor-parallel-size "${TP}" \
     --kv-cache-dtype "${KV_CACHE_DTYPE}" \

@@ -16,9 +16,8 @@ GPT-OSS-120B is a single-GPU model, so `--tensor-parallel-size` defaults to 1 an
 
 ```bash
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1 \
-GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1 \
 vllm serve openai/gpt-oss-120b \
-    --host 0.0.0.0 \
+    --host localhost \
     --port 8000 \
     --kv-cache-dtype fp8 \
     --async-scheduling \
