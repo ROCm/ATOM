@@ -234,7 +234,11 @@ class MLPBlock(torch.nn.Module):
             self.moe_hidden_pad = 0
 
     def process_weights_after_loading(self):
-        _interleave_swiglu_weights(self.experts)
+        # The aiter path expects the CONCAT [g|u] layout produced by
+        # _interleave_swiglu_weights (matching shuffle_weight's default
+        # is_guinterleave=False). Only run the conversion for that path.
+        if not self.experts.quant_method.use_triton:
+            _interleave_swiglu_weights(self.experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         num_tokens = x.shape[0]
