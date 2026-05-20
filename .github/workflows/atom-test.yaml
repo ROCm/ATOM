@@ -21,6 +21,11 @@ on:
         required: false
         default: 'main'
         type: string
+      selected_model:
+        description: 'Optional exact models_accuracy.json model_name to run'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
@@ -211,19 +216,27 @@ jobs:
       - id: load
         env:
           EVENT_NAME: ${{ github.event_name }}
+          SELECTED_MODEL: ${{ inputs.selected_model || '' }}
         run: |
           python3 << 'PY'
           import json, os
           event = os.environ["EVENT_NAME"]
+          selected_model = os.environ.get("SELECTED_MODEL", "").strip()
           # pr → pr models only; push to main → pr+main; schedule/dispatch → all
           level_map = {"schedule": "nightly", "workflow_dispatch": "nightly", "push": "main"}
           current = level_map.get(event, "pr")
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
           filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
+          if selected_model:
+              filtered = [m for m in filtered if m["model_name"] == selected_model]
+              if not filtered:
+                  raise SystemExit(f"No enabled model matched selected_model={selected_model!r}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
+          if selected_model:
+              print(f"Selected model: {selected_model}")
           print(f"{'Model':<45} {'Level':<10} {'Runner'}")
           print("-" * 80)
           for m in models:
