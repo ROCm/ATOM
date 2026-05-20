@@ -480,7 +480,7 @@ class Gemma4Model(nn.Module):
         hidden_states = hidden_states * (self.hidden_size**0.5)
 
         residual = None
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
