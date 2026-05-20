@@ -3,6 +3,7 @@
 
 import argparse
 import logging
+import json
 from dataclasses import dataclass, fields
 from typing import List, Optional
 
@@ -53,6 +54,7 @@ class EngineArgs:
     kv_transfer_config: str = "{}"
     draft_model: Optional[str] = None
     mark_trace: bool = False
+    online_quant_config: Optional[dict] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -218,6 +220,28 @@ class EngineArgs:
             "--mark-trace",
             action="store_true",
             help="Enable graph_marker nodes for tracing/profile instrumentation.",
+        )
+        parser.add_argument(
+            "--online_quant_config",
+            type=json.loads,
+            default=None,
+            help=(
+                "Online quantization config as a JSON string. "
+                "Supported quantization formats: ptpc_fp8, mxfp4. "
+                "The JSON object has three fields "
+                "(at least one must be provided):\n"
+                '  - "global_quant_config": str, default quantization '
+                "format applied to all layers.\n"
+                '  - "layer_quant_config": dict, per-layer overrides '
+                "using glob patterns as keys. "
+                "Overrides global_quant_config for matched layers.\n"
+                '  - "exclude_layer": str or list[str], layer name '
+                "patterns to exclude from quantization.\n"
+                "Example:\n"
+                """  '{"global_quant_config": "ptpc_fp8", """
+                """"layer_quant_config": {"*expert*": "mxfp4"}, """
+                """"exclude_layer": "lm_head"}'"""
+            ),
         )
 
         return parser

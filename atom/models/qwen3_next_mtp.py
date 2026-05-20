@@ -131,8 +131,6 @@ class Qwen3NextMTP(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         config = atom_config.hf_config
-        if atom_config.enable_prefix_caching:
-            raise ValueError("Qwen3NextMTP currently does not support prefix caching")
         self.config = config
         self.model = Qwen3NextMultiTokenPredictor(
             atom_config=atom_config, prefix=maybe_prefix(prefix, "mtp")
