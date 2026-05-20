@@ -382,3 +382,73 @@ Pass 2 — **APPROVE**. Reviewer verified:
 
 **Human gates**: No (human) checks in plan §Test Part D (D15 is the rust-reviewer
 which passed). Plan defers `/mesh-e2e-test` to Parts F/G/I (live engine wiring).
+
+## Part G — 2026-05-20 — pass_count 866 (+9 vs Part F)
+
+**Scope**: Switch PD router to the new `Pipeline` and lock SSE wire bytes
+against future regression. Regular router was switched in Part F; this
+completes the migration so both routers drive the same 4-step pipeline.
+
+**G.1 — PD router rewrite** (`grpc/pd_router.rs`):
+- Dropped `legacy_pipeline::RequestPipeline` import and `SharedComponents`
+  field.
+- `pipeline: Pipeline` constructed via `Pipeline::new_pd(worker_registry,
+  policy_registry)` — matches `GrpcRouter::new` shape from Part F.
+- `app_context: Arc<AppContext>` replaces the bespoke `SharedComponents`
+  bundle; passed directly to `pipeline.execute_chat/generate(...)`.
+- `RetryExecutor` wrapping and PD-specific metric labels
+  (`WORKER_PREFILL` + `WORKER_DECODE`) preserved verbatim.
+- One-line doc-comment fix in `grpc/pipeline.rs:38` (no behavior change):
+  removed the stale "PD router still drives RequestPipeline" note.
+
+**G.0 + G2–G6 — SSE byte snapshots** (`tests/grpc_sse_snapshot.rs` +
+`tests/fixtures/sse_golden/*.bin`):
+- New integration test drives `render::chat_streaming::process` and
+  `render::generate_streaming::process` directly via `MockTokenizer` +
+  `synthetic_single_stream` from `worker_stream::test_support`.
+- `normalize_timing_fields` strips the wall-clock-derived `"e2e_latency"`
+  numeric (only present in generate's Complete `meta_info`) before byte
+  comparison; substring scan is safe for any `f64` serde_json emits.
+- 8 test names matching plan G2–G6 (chat/generate × sglang/vllm ×
+  regular/PD). All 4 chat goldens are byte-identical; all 4 generate
+  goldens are byte-identical — documented in the test file header as the
+  intentional consequence of render-layer transport-neutrality. A future
+  per-backend divergence would fail all 4 in unison.
+- Refresh command: `UPDATE_GOLDENS=1 cargo test --release --test grpc_sse_snapshot`.
+
+**Deviation from plan**:
+- Plan G.0 prescribes capturing goldens from main HEAD via a temporary
+  `git checkout main -- src/` + `--record-golden` flag, then restoring.
+  This was infeasible because the snapshot helper does not exist on main
+  (the test infrastructure is itself part of this refactor) and main's
+  render layer consumed `ExecutionResult`/`ProtoGenerateComplete` directly,
+  so a shared driver is impossible. Instead, goldens were captured from
+  the current Part F+G state of `render::*::process` and serve as a
+  forward regression guard for Parts H and I. The Part F regular-mode
+  switch already passed (human) e2e validation, so the bytes are known-good
+  against real workers.
+
+**Test gates** (plan §Test Part G):
+- G1 build clean: PASS (cargo build --release exits 0)
+- G2–G6 SSE byte snapshots: PASS (all 8 byte-identical to recorded golden)
+- G7 PD router uses new Pipeline: PASS (`grep -E 'pipeline: Pipeline,' pd_router.rs` → 1 match)
+- G8 responses uses `execute_chat_for_responses`: PASS (carried over from Part F)
+- G9 old `RequestPipeline` no longer used by any router: PASS
+  (`grep -rE 'RequestPipeline' src/routers/grpc/{router,pd_router}.rs src/routers/grpc/common/responses/` → empty)
+- G10 `/mesh-e2e-test` PD matrix: DEFERRED — human gate per plan
+- G11 rust-reviewer: PASS (Approve with two minor doc clarifications, both applied)
+
+**Test counts**: 866 passed (+9 vs Part F 857: 8 SSE snapshot tests + 1
+flaky routing test that flipped green). 15 failed (one fewer than Part 0
+baseline of 16 — same pre-existing api_tests/routing_tests failures requiring
+external workers).
+
+**Dead-code state**: After G.1, the staged infrastructure
+(`legacy_pipeline::RequestPipeline`, `common/stages/`, `regular/stages/`,
+`context::{RequestContext, ProcessingState, ...}`, `utils::resolve_tokenizer`,
+`utils::collect_stream_responses`, the proto logprob converters) is fully
+orphaned — ~60 dead-code warnings on the build. Plan §I.1 sweeps these.
+
+**Human gates**:
+- G10 `/mesh-e2e-test` PD matrix: PENDING — user must run on GPU host.
+- G11 `/v1/responses` streaming + non-streaming smoke: PENDING — same.

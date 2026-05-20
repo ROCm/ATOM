@@ -35,8 +35,8 @@ use crate::{
 };
 
 /// New transport-neutral pipeline: prepare → plan → engine.dispatch → render.
-/// Replaces the staged `RequestPipeline` for chat/generate paths; PD router
-/// still drives `RequestPipeline` until Part G switches it over.
+/// Replaces the staged `RequestPipeline` for chat/generate paths in both
+/// regular and PD routers.
 #[derive(Clone)]
 pub(crate) struct Pipeline {
     planner: Arc<dyn PdPlanner>,
