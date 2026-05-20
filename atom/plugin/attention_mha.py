@@ -144,6 +144,21 @@ def _flash_attn_varlen_with_fallback(
             alibi_slopes=alibi_slopes,
             return_lse=True,
         )
+    # head_dim > _CK_MAX_HEAD_DIM (256): fall back to SDPA. The fallback
+    # implements only causal masking with GQA head expansion; it does NOT
+    # apply attention sinks or ALiBi position biases, so silently routing a
+    # caller that passes either would change attention semantics. No current
+    # model triggers this combination (Gemma 4 has head_dim=512 full-attn
+    # layers but no sinks/ALiBi; gpt-oss / MiMo use sinks but head_dim<=256),
+    # but guard explicitly to keep future callers safe.
+    if sink_ptr is not None or alibi_slopes is not None:
+        raise NotImplementedError(
+            f"_flash_attn_varlen_with_fallback SDPA path (head_dim={head_dim} "
+            f"> {_CK_MAX_HEAD_DIM}) does not implement sink_ptr or alibi_slopes; "
+            f"got sink_ptr={'set' if sink_ptr is not None else None}, "
+            f"alibi_slopes={'set' if alibi_slopes is not None else None}. "
+            f"Add support to _sdpa_varlen_attn before enabling this model."
+        )
     return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
                              softmax_scale, causal, return_lse=True)
 
