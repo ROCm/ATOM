@@ -1336,15 +1336,12 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale = atom_parameter(max_w13_scales)
 
         # Shuffle weights for asm moe (moved from inference to load time for better performance).
-        if (
-            w13.dtype
-            in [
-                torch.int8,
-                torch.uint8,
-                torch.float8_e4m3fnuz,
-                torch.float8_e4m3fn,
-            ]
-        ):
+        if w13.dtype in [
+            torch.int8,
+            torch.uint8,
+            torch.float8_e4m3fnuz,
+            torch.float8_e4m3fn,
+        ]:
             from aiter.ops.shuffle import shuffle_weight
 
             w13.data = shuffle_weight(w13.data)
@@ -2818,15 +2815,6 @@ class FusedMoE(torch.nn.Module):
             f"ep_size={self.ep_size}, "
             f"reduce_results={self.reduce_results}, "
             f"renormalize={self.renormalize}, "
-            f"use_grouped_topk={self.use_grouped_topk}"
-        )
-
-        if self.use_grouped_topk:
-            s += f", num_expert_group={self.num_expert_group}, topk_group={self.topk_group}"  # noqa: E501
-
-        s += f", scoring_func='{self.scoring_func}', activation='{self.activation}'"  # noqa: E501
-
-        return s
             f"use_grouped_topk={self.use_grouped_topk}"
         )
 
