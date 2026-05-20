@@ -103,16 +103,16 @@
     "accuracy_baseline_model": "amd/Kimi-K2-Thinking-MXFP4"
   },
   {
-    "model_name": "Kimi-K2.5-MXFP4 TP8",
-    "model_path": "amd/Kimi-K2.5-MXFP4",
+    "model_name": "Kimi-K2.6-MXFP4 TP8",
+    "model_path": "amd/Kimi-K2.6-MXFP4",
     "extraArgs": "--tensor-parallel-size 8",
     "env_vars": "",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
     "accuracy_threshold": 0.92,
     "accuracy_baseline": 0.93,
-    "accuracy_baseline_model": "amd/Kimi-K2.5-MXFP4",
-    "_baseline_note": "Reference value from recipes/atom_vllm/Kimi-K2.5.md"
+    "accuracy_baseline_model": "amd/Kimi-K2.6-MXFP4",
+    "_baseline_note": "Reference value from recipes/atom_vllm/Kimi-K2.6.md"
   },
   {
     "model_name": "MiniMax-M2.7 TP2",
