@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
 from dataclasses import dataclass
@@ -666,6 +666,11 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
+            if self.dcp_world_size > 1:
+                num_kv_splits = max(1, 16 // self.dcp_world_size)
+            else:
+                num_kv_splits = 16
+
             _, final_lse = mla_decode_fwd(
                 q,
                 kv_buffer.view(-1, 1, 1, q.shape[-1]),
@@ -675,7 +680,7 @@ class MLAAttention(nn.Module):
                 paged_kv_indices,
                 paged_kv_last_page_lens,
                 max_q_len,
-                num_kv_splits=16,
+                num_kv_splits=num_kv_splits,
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,
                 work_indptr=work_indptr,
@@ -1002,7 +1007,7 @@ def triton_convert_req_index_to_global_index(
     # Strides in elements
     ti_stride0, ti_stride1 = token_indices_c.stride()
 
-    # Exact 2D grid: tokens × column tiles
+    # Exact 2D grid: tokens x column tiles
     grid = (num_batch, tiles_per_row)
 
     _convert_req_index_to_global_index_kernel[grid](

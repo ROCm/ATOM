@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """DCP (Decode Context Parallel) communication ops for ATOM.
 
 Implements the AG+RS backend for combining partial attention outputs
 across DCP ranks using LSE (Log-Sum-Exp) correction.
-Uses vllm-style algorithm: AllGather LSE → correct local output → ReduceScatter.
+Uses vllm-style algorithm: AllGather LSE -> correct local output -> ReduceScatter.
 """
 
 import numpy as np
@@ -161,7 +161,9 @@ def cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=None):
 
     out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx=ctx)
 
-    out = cp_group.reduce_scatter(out, dim=1)  # [B, H_local, D]
+    out = out.movedim(1, 0).contiguous()  # [B, H_full, D] -> [H_full, B, D]
+    out = cp_group.reduce_scatter(out, dim=0)
+    out = out.movedim(0, 1).contiguous()  # [H_local, B, D] -> [B, H_local, D]
     return out
 
 

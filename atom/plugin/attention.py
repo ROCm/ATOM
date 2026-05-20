@@ -21,12 +21,6 @@ _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 
-_VLLM_DTYPE_TO_AITER_DTYPE = {
-    "float32": "fp32",
-    "float16": "fp16",
-    "bfloat16": "bf16",
-}
-
 
 @dataclass
 class AiterFlashAttentionPhaseMetadata:
@@ -1262,10 +1256,6 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         )
 
         self.qo_indptr = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
-        if config.cache_config.cache_dtype in _VLLM_DTYPE_TO_AITER_DTYPE:
-            cache_dtype = _VLLM_DTYPE_TO_AITER_DTYPE[config.cache_config.cache_dtype]
-        else:
-            cache_dtype = config.cache_config.cache_dtype
 
         (
             (work_meta_data_size, work_meta_data_type),
@@ -1279,7 +1269,7 @@ def create_mla_attn_metadata_builder_init_method(base_class):
             1,
             self.padded_num_attention_heads,
             torch.bfloat16,
-            dtypes.d_dtypes[cache_dtype],
+            dtypes.d_dtypes[config.cache_config.cache_dtype],
             is_sparse=False,  # TODO: support sparse
             fast_mode=True,
         )

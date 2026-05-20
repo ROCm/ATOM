@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
 Plugin mode extensions for MLAAttention.
@@ -804,37 +804,60 @@ class MLAAttentionImplPluginModeMethods:
                 )
 
             if decode_only:
-                decode_q = torch.empty(
-                    (
-                        decode_ql_nope.shape[0],
-                        self.num_heads,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=(
-                        dtypes.fp8
-                        if self.kv_cache_dtype.startswith("fp8")
-                        else self.dtype
-                    ),
-                    device=decode_ql_nope.device,
-                )
-                aiter.fused_qk_rope_concat_and_cache_mla(
-                    decode_ql_nope,
-                    decode_q_pe,
-                    k_c_normed,
-                    k_pe.squeeze(1),
-                    kv_cache.view(
-                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                    ),
-                    decode_q,
-                    attn_metadata.plugin_metadata.slot_mapping,
-                    layer._k_scale,
-                    layer._q_scale,
-                    positions,
-                    self.rotary_emb.cos_cache,
-                    self.rotary_emb.sin_cache,
-                    is_neox=self.rotary_emb.is_neox_style,
-                    is_nope_first=True,
-                )
+                if self.dcp_world_size > 1:
+                    # DCP workaround: aiter.fused_qk_rope_concat_and_cache_mla
+                    # has DCP bug: slot_idx < 0 causes early return,
+                    # skipping Q RoPE and q_out write.
+                    # Split into separate RoPE + concat + cache write.
+                    self.rotary_emb(positions, decode_q_pe, k_pe)
+                    decode_q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
+                    if kv_cache.numel() > 0:
+                        aiter.concat_and_cache_mla(
+                            k_c_normed,
+                            k_pe.squeeze(1),
+                            kv_cache.view(
+                                kv_cache.shape[0],
+                                -1,
+                                self.kv_lora_rank + self.qk_rope_head_dim,
+                            ),
+                            attn_metadata.plugin_metadata.slot_mapping.flatten(),
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            scale=layer._k_scale,
+                        )
+                else:
+                    decode_q = torch.empty(
+                        (
+                            decode_ql_nope.shape[0],
+                            self.num_heads,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        dtype=(
+                            dtypes.fp8
+                            if self.kv_cache_dtype.startswith("fp8")
+                            else self.dtype
+                        ),
+                        device=decode_ql_nope.device,
+                    )
+                    aiter.fused_qk_rope_concat_and_cache_mla(
+                        decode_ql_nope,
+                        decode_q_pe,
+                        k_c_normed,
+                        k_pe.squeeze(1),
+                        kv_cache.view(
+                            kv_cache.shape[0],
+                            -1,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        decode_q,
+                        attn_metadata.plugin_metadata.slot_mapping,
+                        layer._k_scale,
+                        layer._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        is_nope_first=True,
+                    )
             else:
                 if fp8_attention:
                     assert decode_ql_nope.shape[0] == decode_q_pe.shape[0]
