@@ -1,4 +1,3 @@
-# # edit as required but these are all the triton_kernels components used 
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import swizzle_scales # same for a4 and a16
