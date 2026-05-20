@@ -86,3 +86,58 @@ only option compatible with §A.2 + §A.3 (alternatives would either be a body
 edit or co-move `process_chat_messages` ahead of schedule).
 **Note**: The 6 new TDD test modules remain `#[cfg(any())]`-gated; they reference
 reshaped signatures and types that are introduced in Parts B–E.
+
+## Part B — 2026-05-20 — pass_count 796 (+1)
+
+**Scope**: Single-scenario byte-equality spike per plan §B. Validate that
+`to_sglang_proto(GenerationPayload)` produces byte-identical proto bytes to
+upstream `SglangSchedulerClient::build_generate_request_from_chat()` for one
+representative chat scenario.
+
+**Outcome**: **(i) BYTE-EQUAL on first run** — no field-by-field alignment needed.
+The design hypothesis is validated for Scenario A. Proceed to Part C.
+
+**Files added** (3 new, within plan §B.1 budget of 4):
+- `src/routers/prepare/generation_payload.rs` — minimal `GenerationPayload`,
+  `SamplingParams`, `StopConfig`, `LogprobConfig` per design §3.2. No `text`,
+  no `pd_metadata` (both land in Part C.1).
+- `src/routers/grpc/engine/payload_to_proto.rs` — `to_sglang_proto(&payload,
+  text, multimodal)` with temporary 3-arg signature (text/multimodal fold into
+  the payload in Part C.1).
+- `tests/grpc_proto_snapshot_spike.rs` — Scenario A test + `oracle` module that
+  inlines upstream `build_generate_request_from_chat` + helpers verbatim from
+  `smg-grpc-client = 1.0.0` (`sglang_scheduler.rs` lines 305-518). Pin in
+  Cargo.toml ensures version-bump shows as build break.
+
+**Files modified** (3 — visibility widening only, no body edits):
+- `src/routers/grpc/mod.rs`: `pub(crate) mod engine` → `pub mod engine`
+- `src/routers/grpc/engine/mod.rs`: register `pub mod payload_to_proto`
+- `src/routers/prepare/mod.rs`: register `pub mod generation_payload`
+
+The `pub` widening is needed for the `tests/` integration test to reach the
+adapter. Reverts to `pub(crate)` in Part I cleanup.
+
+**Test gates** (all pass):
+- B1 build clean (release): PASS (1m 25s)
+- B2 spike snapshot runs: PASS (`scenario_a_byte_equal` byte-equal on first run)
+- B3 outcome recorded: see "Outcome (i)" above
+- B4 file-count footprint: 3 new files in `src/routers/{prepare,grpc/engine}` +
+  1 integration test (well within "at most 4 new files vs Part A")
+- B5 no production call-site migration: empty (no `grpc::regular` / `grpc::common`
+  imports of `generation_payload`)
+- Full release test suite: 796 pass / 15 fail (failures unchanged from Part A —
+  pre-existing api_tests + routing_tests network-dependent flakiness; +1 pass
+  is the new spike test)
+
+**Subagent review (rust-reviewer)**: BLOCKED on 1, with 5 additional findings.
+Triaged below (evidence-based, not performative):
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| 1 | BLOCKER | `return_hidden_states` + `stream` hardcoded `false`; byte-equal validated only for Scenario A defaults | **Out of scope for Part B (single-scenario spike).** Plan §C.1 adds remaining `GenerationPayload` fields. Documented as scope limitation. |
+| 2 | HIGH | `panic!` on unknown constraint type — should match upstream's `Err(...)` | **Declined.** The producer (`prepare/tool_constraints.rs::generate_tool_constraints`) only emits `"json_schema"` — confirmed by `grep -rn '"structural_tag"\|"ebnf"\|"regex"' src/routers/`. Other branches are dead in practice. Karpathy: trust internal code; the only architectural alternative is `Result` plumbing through a function that today cannot fail. |
+| 3 | HIGH | `#[cfg(any())]` is an anti-pattern | **Out of scope.** Pre-existing project TDD-gating idiom from Part 0 baseline (see Part 0 findings line 24-28). Not introduced by Part B. |
+| 4 | MEDIUM | Visibility widening vs. inline `#[cfg(test)]` mod | **Plan-aligned.** Plan §B.1 explicitly places spike in `tests/`. Widening reverts in Part I. |
+| 5 | MEDIUM | `min_new_tokens` missing from `SamplingParams` | **Part C scope** per plan §C.1 "Add the remaining fields per design §3.2." |
+| 6 | NON-BLOCKER | `LogprobConfig.input_logprobs` declared but never read in `to_sglang_proto` | **Defer to Part C.** Scenarios B/C in `grpc/engine/tests.rs` use this field to assert `return_input_logprob` plumbing. |
+| 7 | NON-BLOCKER | Oracle drift if local patches diverge from pinned crate | **Declined per Karpathy** — over-engineering for spike. Cargo.toml pin is the agreed mechanism (plan §0.b). |
