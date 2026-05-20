@@ -44,6 +44,12 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.fusions.fused_clamp_act_mul import (
+    fused_clamp_act_mul,
+)
+from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
+    fused_reduce_qk_norm_rope_swa_write,
+)
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
     Config,
@@ -117,6 +123,9 @@ _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
 # forward burns syscalls (V4-Pro: 64 layers × multiple sites per call).
 _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
+# Fused-kernel switches. Default off; flip via env to A/B against the eager path.
+_V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -124,6 +133,111 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
+
+
+def _fused_qk_norm_rope_swa_write_fake(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    kv_weight: torch.Tensor,
+    eps: float,
+    win: int,
+    swa_write_indices: Optional[torch.Tensor] = None,
+    batch_id_per_token: Optional[torch.Tensor] = None,
+    state_slot_mapping: Optional[torch.Tensor] = None,
+    swa_kv: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    M = q.shape[0]
+    return torch.empty(
+        (M, n_local_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+
+
+@torch_compile_guard(gen_fake=_fused_qk_norm_rope_swa_write_fake)
+def fused_qk_norm_rope_swa_write(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    kv_weight: torch.Tensor,
+    eps: float,
+    win: int,
+    swa_write_indices: Optional[torch.Tensor] = None,
+    batch_id_per_token: Optional[torch.Tensor] = None,
+    state_slot_mapping: Optional[torch.Tensor] = None,
+    swa_kv: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw + RoPE on
+    q/kv tail (+ SWA write) in a single triton kernel.
+
+    `kv` must already be kv_norm-applied; the kernel does not weight-norm kv.
+    `kv` is RoPE-mutated in place. When all SWA tensors are provided, the
+    kernel also writes the windowed kv into `swa_kv`; the caller must then
+    skip the standalone `swa_write` for those rows.
+    """
+    num_tokens = q.shape[0]
+    if num_tokens <= 64:
+        q_out = torch.empty(
+            (num_tokens, n_local_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        fused_reduce_qk_norm_rope_swa_write(
+            q,
+            kv,
+            None,
+            kv_weight,
+            eps,
+            eps,
+            rope_head_dim,
+            cos_cache,
+            sin_cache,
+            positions,
+            q_out=q_out,
+            is_neox=False,
+            dtype=torch.bfloat16,
+            write_indices=swa_write_indices,
+            batch_id_per_token=batch_id_per_token,
+            state_slot_mapping=state_slot_mapping,
+            swa_kv=swa_kv,
+            win=win,
+        )
+    else:
+        q = q.view(num_tokens, n_local_heads, head_dim)
+        q_out = _rmsnorm_nw(q, eps, head_dim)
+        kv = rmsnorm2d_fwd_(kv, kv_weight, eps, kv.shape[-1])
+        aiter.rope_cached_positions_2c_fwd_inplace(
+            q_out[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
+            kv[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
+            cos_cache,
+            sin_cache,
+            positions.view(1, num_tokens),
+            1,
+            reuse_freqs_front_part=True,
+            nope_first=False,
+        )
+        if swa_write_indices is not None:
+            swa_write(
+                kv,
+                swa_write_indices,
+                positions,
+                batch_id_per_token,
+                state_slot_mapping,
+                swa_kv,
+                win,
+            )
+    return q_out
 
 
 def _make_weightless_rmsnorm(dim: int, eps: float) -> RMSNorm:
@@ -691,8 +805,8 @@ class Compressor(nn.Module):
 
         # State cache (per paper §3.6.1 "uncompressed tail + B-side overlap
         # window" portion). Indexed as a single ring buffer of size
-        # `coff * compress_ratio` by `pos % STATE_SIZE` per token — no
-        # segment switching, no roll. The `forward` softmax-pool consumer
+        # `ring_size` (≥ coff * compress_ratio) by `pos % ring_size` per token
+        # — no segment switching, no roll. The `forward` softmax-pool consumer
         # resolves A-side (current block) vs B-side (previous block) by
         # block-id parity (`comp_id % 2`).
         #
@@ -700,9 +814,12 @@ class Compressor(nn.Module):
         # runs before allocate_kv_cache → build_kv_cache_tensor) sees a
         # valid tensor; afterwards `DeepseekV4AttentionMetadataBuilder.
         # build_kv_cache_tensor` setattr-replaces these attributes with
-        # views of the per-request cache pool (shape
-        # `[max_num_seqs, coff*ratio, coff*head_dim]`). The 1-slot init
-        # buffers (≈9 MB total across all layers) are GC'd once replaced.
+        # views of the per-request cache pool whose second dim is the real
+        # ring_size = coff*ratio + max_spec_steps + 1 (spec) or coff*ratio
+        # (non-spec). The 1-slot init buffers (≈9 MB total across all layers)
+        # are GC'd once replaced before any real kernel call, so the
+        # placeholder's smaller second dim never actually flows through the
+        # kernel's `state_size >= K_pool` assertion.
         self.register_buffer(
             "kv_state",
             torch.zeros(
@@ -1385,6 +1502,8 @@ class DeepseekV4Attention(nn.Module):
             self.alt_stream is not None and self.compressor is not None
         )
 
+        self.use_fuse_qk_norm_rope_swa_write = _V4_USE_TRITON_FUSION
+
         self.layer_name = prefix
         atom_config = get_current_atom_config()
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
@@ -1445,17 +1564,21 @@ class DeepseekV4Attention(nn.Module):
         Main Compressor → alt_stream (CSA + HCA).
         Indexer Compressor → compress_stream (CSA only).
         Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us."""
-        current_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self.alt_stream):
-            self.compressor(
-                x,
-                plan=plan,
-                state_slot_mapping=state_slot_mapping,
-                block_tables=block_tables,
-            )
+        current_stream = get_forward_context().main_stream
+        if self.compressor is not None and self.alt_stream is not None:
+            self.alt_stream.wait_stream(current_stream)
         if self.indexer is not None and self.compress_stream is not None:
             self.compress_stream.wait_stream(current_stream)
+
+        if self.compressor is not None and self.alt_stream is not None:
+            with torch.cuda.stream(self.alt_stream):
+                self.compressor(
+                    x,
+                    plan=plan,
+                    state_slot_mapping=state_slot_mapping,
+                    block_tables=block_tables,
+                )
+        if self.indexer is not None and self.compress_stream is not None:
             with torch.cuda.stream(self.compress_stream):
                 self.indexer.compressor(
                     x,
@@ -1496,9 +1619,48 @@ class DeepseekV4Attention(nn.Module):
         if get_forward_context().context.is_dummy_run:
             return torch.zeros_like(x)
         num_tokens = x.size(0)
-        win = self.window_size
+        # Async-compress (alt_stream main Compressor + compress_stream
+        # indexer.compressor) is only safe inside CUDAGraph capture: graph
+        # records the fork-join edges and replay re-uses the same stream
+        # layout. In eager mode the side-stream launches accumulate across
+        # 60 layers and deadlock the hipStream queue when the first splitk
+        # GEMM kernel allocates its workspace — verified hang on both
+        # small (~800-token) and large (>2k-token) prefill batches in
+        # eager. Replay does not re-execute this Python code so the flag
+        # doesn't matter then.
+        use_async_compress = (
+            self._use_async_compress and get_forward_context().in_hipgraph
+        )
+        # SWA ring-slot count per req (= window_size + max_spec_steps for
+        # MTP-aware cache). Sourced from the bound cache to avoid threading
+        # `max_spec_steps` through V4Args; for non-MTP this equals
+        # `self.window_size`. Used as the modulo in `swa_write` (and matches
+        # the per-row case_c modulo in window_topk).
+        cache_size = self.swa_kv.shape[1]
         ratio = self.compress_ratio
         rd = self.rope_head_dim
+
+        # Idempotent one-time plumb of rotary_emb into compressor / indexer
+        # (and the indexer's inner compressor). `rotary_emb` is set by the
+        # owning layer after __init__, so this can't move into __init__.
+        if self.compress_ratio and self.compressor.rotary_emb is None:
+            self.compressor.rotary_emb = self.rotary_emb
+            if self.indexer is not None:
+                self.indexer.rotary_emb = self.rotary_emb
+                self.indexer.compressor.rotary_emb = self.rotary_emb
+
+        # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
+        # All per-fwd state read once. Production prepare_decode/prefill
+        # always populates these; warmup goes through the same path
+        # (`_populate_state_slot_mapping` falls back to slot 0).
+        # Cast to V4 typed metadata so V4-specific attribute access (v4_*,
+        # compress_plans, swa_write_indices, ...) is well-typed for pyright.
+        attn_md = cast("AttentionMetaData_DSV4", get_forward_context().attn_metadata)
+        compress_plans = attn_md.compress_plans
+        swa_write_indices = attn_md.swa_write_indices
+        v4_batch_id_per_token = attn_md.batch_id_per_token
+        block_tables_gpu = attn_md.block_tables
+        state_slot_mapping = attn_md.state_slot_mapping
 
         # ----- Batched ops on full flat tensors -----
         # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
@@ -1517,7 +1679,8 @@ class DeepseekV4Attention(nn.Module):
         plan_for_layer = compress_plans[ratio] if ratio else None
 
         # ===== Triple-stream: Q/KV path + both Compressors in parallel =====
-        if self._use_async_compress:
+        current_stream = get_forward_context().main_stream
+        if use_async_compress:
             self._launch_compressors_async(
                 x, plan_for_layer, state_slot_mapping, block_tables_gpu
             )
@@ -1529,21 +1692,56 @@ class DeepseekV4Attention(nn.Module):
             not _V4_FORCE_UE8M0_QUANT
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
         qr, qr_scale = self.q_norm(q_lora)
-        # Flat q_flat is [num_tokens, n_local_heads * head_dim]; DualRMSNorm
-        # views internally to per-head shape and returns flat. Single Triton
-        # launch fuses per-head Q RMSNorm (weightless) + KV RMSNorm (both
-        # head_dim=128), replacing the prior `_rmsnorm_nw + kv_norm` pair.
-        q_flat = self.wq_b(qr, x_scale=qr_scale)
-        q_flat, kv = self.qk_norm(q_flat, kv_pre)
-        q = q_flat.view(num_tokens, self.n_local_heads, self.head_dim)
-        # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
-        # to (1, num_tokens, ...) for aiter's per-position rope kernel.
-        self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
+        q = self.wq_b(qr, x_scale=qr_scale)
+        if attn_md.is_pure_decode and self.use_fuse_qk_norm_rope_swa_write:
+            # Fused: wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw
+            # + RoPE on q tail + RoPE on kv tail (+ SWA write) in one triton
+            # kernel. KV RMSNorm stays out (kernel doesn't apply weighted norm
+            # to kv); the standalone swa_write below is gated off when this
+            # path runs since the kernel already wrote the window slots.
+            cos_cache, sin_cache = self.rotary_emb._caches(x.device)
+            if swa_write_indices is not None:
+                write_indices = swa_write_indices
+                batch_id = v4_batch_id_per_token
+                slot_map = state_slot_mapping
+                swa_kv_buf = self.swa_kv
+            else:
+                write_indices = None
+                batch_id = None
+                slot_map = None
+                swa_kv_buf = None
+            q = fused_qk_norm_rope_swa_write(
+                q,
+                kv_pre,
+                cos_cache,
+                sin_cache,
+                positions,
+                self.n_local_heads,
+                self.head_dim,
+                rd,
+                self.kv_norm.weight,
+                self.eps,
+                cache_size,
+                swa_write_indices=write_indices,
+                batch_id_per_token=batch_id,
+                state_slot_mapping=slot_map,
+                swa_kv=swa_kv_buf,
+            )
+        else:
+            # Flat q_flat is [num_tokens, n_local_heads * head_dim]; DualRMSNorm
+            # views internally to per-head shape and returns flat. Single Triton
+            # launch fuses per-head Q RMSNorm (weightless) + KV RMSNorm (both
+            # head_dim=128), replacing the prior `_rmsnorm_nw + kv_norm` pair.
+            q_flat, kv = self.qk_norm(q, kv_pre)
+            q = q_flat.view(num_tokens, self.n_local_heads, self.head_dim)
+            # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
+            # to (1, num_tokens, ...) for aiter's per-position rope kernel.
+            self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
         # ===== Compressor + Indexer =====
-        if not self._use_async_compress:
+        if not use_async_compress:
             if self.compressor is not None:
                 self.compressor(
                     x,
@@ -1559,9 +1757,9 @@ class DeepseekV4Attention(nn.Module):
                         block_tables=block_tables_gpu,
                     )
         if self.indexer is not None:
-            if self._use_async_compress:
-                torch.cuda.current_stream().wait_stream(self.alt_stream)
-                torch.cuda.current_stream().wait_stream(self.compress_stream)
+            if use_async_compress:
+                current_stream.wait_stream(self.compress_stream)
+                current_stream.wait_stream(self.alt_stream)
             indexer_topk_batched = self.indexer.forward_batched(
                 x_full=x,
                 qr_full=qr,
@@ -1574,39 +1772,41 @@ class DeepseekV4Attention(nn.Module):
             #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
             # `_fill_csa_paged_compress` dispatches internally on is_pure_decode.
             self._fill_csa_paged_compress(attn_md, indexer_topk_batched, num_tokens)
-        elif self._use_async_compress:
-            torch.cuda.current_stream().wait_stream(self.alt_stream)
+        elif use_async_compress:
+            current_stream.wait_stream(self.alt_stream)
 
         # ===== Sparse attention dispatch =====
         # Two paths over the unified KV pool. The order of `swa_write` vs
         # `sparse_attn` differs because the two kernels read SWA differently:
         #
         # decode (is_pure_decode==True):
-        #   `paged_decode` reads SWA from `unified_kv` ring slot `pos % win`.
-        #   The current decode token's K must be present in the ring before
-        #   attn fires, otherwise the token can't see its own K. So:
+        #   `paged_decode` reads SWA from `unified_kv` ring slot
+        #   `pos % cache_size`. The current decode token's K must be present
+        #   in the ring before attn fires, otherwise the token can't see its
+        #   own K. So:
         #     swa_write → paged_decode
         #
         # prefill / mixed (is_pure_decode==False):
         #   `paged_prefill` reads in-chunk K from per-fwd `kv` tensor (extend
         #   region) and prior-chunk K from `unified_kv` ring (prefix region).
-        #   `swa_write` writes the LAST `win` tokens of THIS fwd into ring
-        #   slots `pos % win`, which OVERLAP with prior-chunk slots that the
-        #   prefix SWA region wants to read (chunked prefill). So:
+        #   `swa_write` writes the LAST `cache_size` tokens of THIS fwd into
+        #   ring slots `pos % cache_size`, which OVERLAP with prior-chunk
+        #   slots that the prefix SWA region wants to read (chunked prefill):
         #     paged_prefill → swa_write
         #   Pure prefill (chunk_start==0) has prefix_swa_count==0 so no prior
         #   ring read; swa_write order is irrelevant in that subcase.
         q_sa = q.contiguous()
         if attn_md.is_pure_decode:
-            swa_write(
-                kv,
-                swa_write_indices,
-                positions,
-                v4_batch_id_per_token,
-                state_slot_mapping,
-                self.swa_kv,
-                win,
-            )
+            if not self.use_fuse_qk_norm_rope_swa_write:
+                swa_write(
+                    kv,
+                    swa_write_indices,
+                    positions,
+                    v4_batch_id_per_token,
+                    state_slot_mapping,
+                    self.swa_kv,
+                    cache_size,
+                )
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
                 kv_indptr = attn_md.kv_indptr_swa
@@ -1650,7 +1850,7 @@ class DeepseekV4Attention(nn.Module):
             )  # [S, H, head_dim]
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see
             # prior-chunk's ring contents (current swa_write would overwrite
-            # ring slots `pos % win` for positions in this chunk's tail).
+            # ring slots `pos % cache_size` for positions in this chunk's tail).
             swa_write(
                 kv,
                 swa_write_indices,
@@ -1658,7 +1858,7 @@ class DeepseekV4Attention(nn.Module):
                 v4_batch_id_per_token,
                 state_slot_mapping,
                 self.swa_kv,
-                win,
+                cache_size,
             )
 
         # Inverse RoPE on output's rope dims to remove absolute-position
@@ -1769,6 +1969,10 @@ class Expert(nn.Module):
             prefix=f"{prefix}.w2",
         )
         self.swiglu_limit = swiglu_limit
+        # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
+        # quant through a single aiter triton kernel. The fused kernel emits
+        # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
+        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
 
     def forward(
         self,
@@ -1782,6 +1986,16 @@ class Expert(nn.Module):
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        if self.use_fused_clamp_act_mul:
+            x_fp8, x_scale = fused_clamp_act_mul(
+                combined,
+                swiglu_limit=self.swiglu_limit,
+                activation="silu",
+                weights=weights,
+                dtype_quant=dtypes.fp8,
+                transpose_scale=True,
+            )
+            return self.w2(x_fp8, x_scale=x_scale)
         out = torch.empty(
             (combined.shape[0], combined.shape[-1] // 2),
             dtype=dtype,
@@ -2022,11 +2236,11 @@ class MoE(nn.Module):
         independent; main stream waits on alt_stream's completion before
         combining.
         """
-        current_stream = torch.cuda.current_stream()
+        current_stream = get_forward_context().main_stream
         self.alt_stream.wait_stream(current_stream)
+        routed = self.routed_expert_forward(x)
         with torch.cuda.stream(self.alt_stream):
             shared = self.shared_experts(x)
-        routed = self.routed_expert_forward(x)
         current_stream.wait_stream(self.alt_stream)
         return self.combine_outputs(routed, shared)
 
@@ -2298,89 +2512,15 @@ class ParallelHead(ParallelLMHead):
         return self.get_logits(norm(x))  # [bs, vocab]
 
 
-class MTPBlock(Block):
-    """MTP block: V4 dense block + e_proj/h_proj/enorm/hnorm + own hc_head params + LM head.
-
-    Port of inference/model.py:739-767. Subclass of Block reusing all HC + Attention + FFN
-    machinery; adds a token-embed projection (`e_proj`), a hidden-state projection
-    (`h_proj`), per-input RMSNorms, and its own `hc_head_fn/base/scale` parameters
-    for the final LM head reduction.
-
-    `embed` and `head` are assigned externally by `DeepseekV4Model` (shared with
-    the main model's embedding and LM head).
-    """
-
-    def __init__(self, layer_id: int, args: DeepseekV4Args, prefix: str = ""):
-        super().__init__(layer_id, args, prefix=prefix)
-        # e_proj / h_proj are FP8 on disk per index; ATOM Linear with V4QuantConfig
-        # picks per_1x128 automatically. nn.Linear at construction works for the
-        # toy/dummy path; for real-checkpoint loading, switch to ReplicatedLinear.
-        qc = args.quant_config
-        if qc is None:
-            self.e_proj = nn.Linear(args.dim, args.dim, bias=False)
-            self.h_proj = nn.Linear(args.dim, args.dim, bias=False)
-        else:
-            self.e_proj = ReplicatedLinear(
-                args.dim,
-                args.dim,
-                bias=False,
-                quant_config=qc,
-                prefix=f"{prefix}.e_proj",
-            )
-            self.h_proj = ReplicatedLinear(
-                args.dim,
-                args.dim,
-                bias=False,
-                quant_config=qc,
-                prefix=f"{prefix}.h_proj",
-            )
-        self.enorm = RMSNorm(args.dim, args.norm_eps)
-        self.hnorm = RMSNorm(args.dim, args.norm_eps)
-        self.norm = RMSNorm(args.dim, args.norm_eps)
-        # Per-MTP hc_head params (distinct from Block's hc_attn/hc_ffn params).
-        hc_mult = args.hc_mult
-        hc_dim = hc_mult * args.dim
-        self.hc_head_fn = atom_parameter(
-            torch.empty(hc_mult, hc_dim, dtype=torch.float32)
-        )
-        self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
-        self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
-        # Externally-assigned by DeepseekV4Model (shared with main model).
-        self.embed: Optional[nn.Module] = None
-        self.head: Optional[ParallelHead] = None
-
-    def forward(
-        self,
-        x: torch.Tensor,  # [num_tokens, hc, dim]  residual stream from main model
-        positions: torch.Tensor,  # [num_tokens] int  absolute positions
-        input_ids: torch.Tensor,  # [num_tokens] int
-    ) -> torch.Tensor:  # [bs, vocab]  last-token logits via self.head
-        assert (
-            self.embed is not None and self.head is not None
-        ), "MTPBlock requires .embed and .head to be assigned by the parent model"
-        e = self.enorm(self.embed(input_ids))  # [num_tokens, dim]
-        x = self.hnorm(x)  # [num_tokens, hc, dim]
-        # Mix token-embed + hidden into a fresh residual. e_proj output is
-        # [num_tokens, dim]; unsqueeze adds the hc axis so it broadcasts
-        # against h_proj(x) [num_tokens, hc, dim].
-        x = self.e_proj(e).unsqueeze(-2) + self.h_proj(x)  # [num_tokens, hc, dim]
-        x = super().forward(x, positions)  # [num_tokens, hc, dim]
-        return self.head(
-            x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
-        )
-
-
 @support_torch_compile
 class DeepseekV4Model(nn.Module):
     """Full model: embed -> expand to hc_mult copies -> N blocks -> hc_head -> logits.
 
-    Port of inference/model.py:Transformer (770-810). MTP blocks are constructed
-    and have their `.embed` and `.head` linked to the main model's, but they are
-    NOT called from the main forward path — PR5 will integrate them into ATOM's
-    EagleProposer via `self.mtp[k].forward(...)` from outside.
-
-    PR1 single-rank: uses plain `nn.Embedding` for `self.embed` (state_dict-compatible
-    with reference's `ParallelEmbedding` since both store a single `weight` parameter).
+    Port of inference/model.py:Transformer (770-810). MTP blocks live in the
+    EagleProposer wrapper (`atom.models.deepseek_v4_mtp.DeepseekV4MTP`), not
+    on this target. The ckpt's `mtp.*` weights are filtered out at
+    `loader.load_model(spec_decode=False)` via the auto-detected
+    `need_load_mtp` flag (target has no `mtp.*` params).
     """
 
     def __init__(
@@ -2425,14 +2565,6 @@ class DeepseekV4Model(nn.Module):
         self.norm = RMSNorm(args.dim, self.norm_eps)
         self.head = ParallelHead(args.vocab_size, args.dim, self.norm_eps, self.hc_eps)
 
-        # MTP blocks: constructed and linked, but only invoked externally (PR5).
-        self.mtp = nn.ModuleList()
-        for layer_id in range(args.n_mtp_layers):
-            blk = MTPBlock(args.n_layers + layer_id, args, prefix=f"mtp.{layer_id}")
-            blk.embed = self.embed
-            blk.head = self.head
-            self.mtp.append(blk)
-
         # Top-level hc_head params used to reduce the final hc_mult residual stack
         # before the LM head linear projection.
         hc_mult = args.hc_mult
@@ -2447,14 +2579,13 @@ class DeepseekV4Model(nn.Module):
         self,
         input_ids: torch.Tensor,  # [num_tokens] int  flat ragged-batch token ids
         positions: torch.Tensor,  # [num_tokens] int  abs positions (required)
-    ) -> (
-        torch.Tensor
-    ):  # [num_tokens, dim]  hidden_states (vocab head deferred to compute_logits)
+    ) -> torch.Tensor:  # [num_tokens, hc, dim]  pre-hc_head residual stream
         """Forward over `num_tokens` flat ragged-batch tokens.
 
-        Returns hidden_states `[num_tokens, dim]` — the vocab projection is
-        deferred to `compute_logits` to satisfy ATOM's CUDAGraph contract
-        (capture buffer is sized to hidden_size, not vocab).
+        Returns the mHC residual stack `[num_tokens, hc, dim]` BEFORE hc_head
+        reduction — `hc_head + RMSNorm + LM head` are all deferred to
+        `compute_logits`. Returning the hc-shaped residual lets the (future)
+        MTP draft consume it without re-expanding from a dim-reduced state.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         h = self.embed(input_ids)  # [num_tokens, dim]
@@ -2464,12 +2595,7 @@ class DeepseekV4Model(nn.Module):
         for layer in self.layers:
             h = layer(h, positions)  # [num_tokens, hc, dim]
 
-        # Reduce the mHC residual stack (hc_head + final RMSNorm); leave the
-        # vocab projection to compute_logits.
-        x_hc = self.head.hc_head(  # [num_tokens, dim]
-            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
-        )
-        return self.norm(x_hc)
+        return h
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -2512,7 +2638,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             "norm.weight": "model.norm.weight",
             "head.weight": "model.head.weight",
             "hc_head_": "model.hc_head_",
-            "mtp.": "model.mtp.",
         }
     )
     weights_mapping = {
@@ -2540,6 +2665,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         # this still works — base spec is QuantType.No.
         self.args.quant_config = make_v4_quant_config(self.hf_config)
         self.model = DeepseekV4Model(atom_config=config, args=self.args)
+        # Tell ModelRunner to size the CG outputs buffer as
+        # [max_num_batched_tokens, hc_mult, hidden_size] instead of the
+        # default [max_num_batched_tokens, hidden_size]. forward returns
+        # the un-reduced mHC residual stack [N, hc, dim].
+        self.extra_output_dims: tuple[int, ...] = (self.args.hc_mult,)
 
     def forward(
         self,
@@ -2558,12 +2688,21 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def compute_logits(
         self,
-        hidden_states: torch.Tensor,  # [num_tokens, dim]  post hc_head + final norm
+        hidden_states: torch.Tensor,  # [num_tokens, hc, dim]  pre-hc_head residual
     ) -> torch.Tensor:  # [bs, vocab]
-        # Vocab projection is split off from `model.forward` so the latter
-        # returns hidden_size-shaped tensors — required by ATOM's CUDAGraph
-        # capture contract (outputs buffer is sized to hidden_size, not vocab).
-        return self.model.head.get_logits(hidden_states)
+        # mHC reduce + final RMSNorm + LM head are all here so `model.forward`
+        # can return the un-reduced [N, hc, dim] residual stream — the future
+        # MTP draft consumes it directly without re-expanding from a dim-reduced
+        # state. CG output buffer is sized [N, hc, dim] in ModelRunner via the
+        # `extra_output_dims = (hc_mult,)` hook on this class.
+        x = self.model.head.hc_head(
+            hidden_states,
+            self.model.hc_head_fn,
+            self.model.hc_head_scale,
+            self.model.hc_head_base,
+        )
+        x = self.model.norm(x)
+        return self.model.head.get_logits(x)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Return (param_name, weight_name, expert_id, shard_id) tuples for FusedMoE.

@@ -156,16 +156,23 @@ def _fuse_qk_rmsnorm(
     k_nope: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse q/k RMSNorm without quantizing q."""
-    from atom.models.deepseek_v2 import _fused_qk_rmsnorm
-
-    return _fused_qk_rmsnorm(
+    (q_normed, _), _, k_nope_normed, _ = _fuse_rmsnorm_quant(
         q,
         attn.q_a_layernorm.weight,
         attn.q_a_layernorm.eps,
         k_nope,
         attn.kv_a_layernorm.weight,
         attn.kv_a_layernorm.eps,
+        None,
+        dtype_quant=torch.bfloat16,
+        shuffle=False,
+        scale_shuffle_padding=False,
+        group_size=128,
+        quant_type=None,
+        output_unquantized_inp1=False,
+        transpose_scale=False,
     )
+    return q_normed, k_nope_normed
 
 
 def _prepare_weight_for_bmm(
@@ -601,6 +608,16 @@ def forward_sgl_plugin_mode_mla(
     **model_kwargs,
 ) -> torch.Tensor:
     prepared = forward_sgl_prepare(attn, positions, hidden_states, **model_kwargs)
+    from atom.utils.forward_context import get_forward_context
+
+    if get_forward_context().context.is_dummy_run:
+        base_hidden_states = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        )
+        dummy_output = base_hidden_states.new_empty(
+            (base_hidden_states.shape[0], base_hidden_states.shape[-1])
+        )
+        return dummy_output
     return forward_sgl_core(attn, prepared)
 
 

@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Generic, Optional, Type, TypeVar
 
 import torch
+from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
@@ -215,6 +216,13 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.max_num_blocks_per_seq = (
             config.max_model_len + self.block_size - 1
         ) // self.block_size
+        # Per-rank attention head count. eagle.propose's mid-step path reads
+        # this to gate the `do_attn_metadata_update` branch. Subclasses that
+        # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
+        # separately (it does NOT replace this attribute).
+        self.num_attention_heads = (
+            hf_config.num_attention_heads // get_tp_group().world_size
+        )
 
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         i32_kwargs = {"dtype": torch.int32, "device": self.device}

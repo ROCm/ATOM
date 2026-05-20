@@ -490,6 +490,25 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
         )
 
 
+_BF16_IN_PROJ_MAPPING = {
+    "in_proj_qkv": ("in_proj_qkvzba", (0, 1, 2)),
+    "in_proj_z": ("in_proj_qkvzba", 3),
+    "in_proj_b": ("in_proj_qkvzba", 4),
+    "in_proj_a": ("in_proj_qkvzba", 5),
+}
+
+
+def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Config) -> dict:
+    if atom_config.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
+        return mapping
+
+    mapping.pop("in_proj_qkvz", None)
+    mapping.pop("in_proj_ba", None)
+    mapping["in_proj_qkvzba"] = ("in_proj_qkvzba", None)
+    mapping.update(_BF16_IN_PROJ_MAPPING)
+    return mapping
+
+
 class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
@@ -517,6 +536,9 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         self.config = atom_config.hf_config
+        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+            dict(self.packed_modules_mapping), atom_config
+        )
         self.visual = PPMissingLayer()
         self.language_model = Qwen3_5ForCausalLM(atom_config=atom_config, prefix="")
         self.make_empty_intermediate_tensors = (
@@ -554,6 +576,9 @@ class Qwen3_5MoeForConditionalGenerationTextOnly(
     def __init__(self, atom_config: Config, prefix: str = ""):
         nn.Module.__init__(self)
         self.config = atom_config.hf_config
+        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+            dict(self.packed_modules_mapping), atom_config
+        )
         self.visual = PPMissingLayer()
         self.language_model = Qwen3_5MoeForCausalLM(atom_config=atom_config, prefix="")
         self.make_empty_intermediate_tensors = (

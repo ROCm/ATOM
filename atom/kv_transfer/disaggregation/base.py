@@ -53,6 +53,15 @@ class KVConnectorBase(ABC):
         """
         ...
 
+    def get_finished_recv_blocks(self) -> list[int]:
+        """Return block IDs from recently completed receives for GPU memory fence.
+
+        RDMA writes to HBM may not be immediately visible to GPU compute
+        kernels. Connectors using RDMA should override this to return
+        blocks that need a GPU-side read-write cycle to ensure coherence.
+        """
+        return []
+
 
 class KVConnectorSchedulerBase(ABC):
     """Scheduler-side KV connector interface."""

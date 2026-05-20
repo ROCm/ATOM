@@ -100,10 +100,8 @@ def cp_mha_gather_cache_kernel(
                 # per-tensor: one scale per ptr, no offset
                 k_scale = tl.load(k_scale_ptr)
                 v_scale = tl.load(v_scale_ptr)
-            k_dtype = k_reg.dtype
-            v_dtype = v_reg.dtype
-            k_reg = (k_reg.to(tl.float32) * k_scale).to(k_dtype)
-            v_reg = (v_reg.to(tl.float32) * v_scale).to(v_dtype)
+            k_reg = k_reg.to(tl.float32) * k_scale
+            v_reg = v_reg.to(tl.float32) * v_scale
         tl.store(key_ptr_offset + col_offsets, k_reg)
         tl.store(value_ptr_offset + col_offsets, v_reg)
 
@@ -167,6 +165,12 @@ def cp_mha_gather_cache(
     ], "kv_cache_layout only support NHD, SHUFFLE"
     if dequant:
         assert k_scales is not None and v_scales is not None
+        if k_scales.numel() == 1 and v_scales.numel() == 1:
+            per_token_quant = False
+        else:
+            assert (
+                k_scales.numel() > 1 and v_scales.numel() > 1
+            ), "k_scales and v_scales must both be scalar or per-token"
 
     head_dim = key.shape[2]
     x = 16 // key_cache.element_size()

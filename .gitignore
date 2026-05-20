@@ -52,4 +52,5 @@ __pycache__
 debug
 aiter_logs
 *.log
+online_quant_info_*.json
 .claude/plan/

@@ -730,12 +730,6 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
-            use_prefix_cache = (
-                attn_metadata.has_cached
-                and not is_rocm_aiter_fp4bmm_enabled()
-                and self.qk_nope_head_dim == self.v_head_dim
-            )
-
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )
@@ -752,7 +746,7 @@ class MLAAttention(nn.Module):
                     scale=self._k_scale,
                 )
 
-            if use_prefix_cache:
+            if attn_metadata.has_cached:
                 # k_full/v_full are used for attention compute; gather_kv_b_proj reads
                 # fp8 from cache and dequantizes internally, so output must be model dtype
                 k_full = torch.empty(
@@ -768,7 +762,7 @@ class MLAAttention(nn.Module):
                     (
                         attn_metadata.total_kv,
                         self.num_heads,
-                        self.qk_nope_head_dim,
+                        self.v_head_dim,
                     ),
                     device=q.device,
                     dtype=self.dtype,
@@ -784,7 +778,9 @@ class MLAAttention(nn.Module):
                     self.kv_b_proj.weight_scale,
                     k_full,
                     v_full,
-                    weight_preshuffle=True,
+                    weight_preshuffle=getattr(
+                        self.kv_b_proj.weight, "is_shuffled", False
+                    ),
                 )
                 output = flash_attn_varlen_func(
                     q=prefill_q,

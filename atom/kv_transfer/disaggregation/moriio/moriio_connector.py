@@ -2,26 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-KV Cache Connector for Disaggregated Prefill-Decode (P/D) Architecture.
+Worker-side and scheduler-side KV cache connectors for disaggregated P/D.
 
-This module implements the KV cache transfer mechanism for disaggregated
-inference, where prefill and decode stages run on separate GPU instances.
-It uses RDMA-based zero-copy transfers via the MoRIIO library for efficient
+Uses RDMA-based zero-copy transfers via the MoRIIO library for efficient
 KV cache migration between producer (prefill) and consumer (decode) nodes.
-
-Key Components:
-    - KVConnector: Worker-side connector managing RDMA transfers and handshakes.
-    - KVConnectorScheduler: Scheduler-side connector coordinating transfer state.
-    - MoRIIOWrapper: Abstraction over the MoRIIO RDMA engine.
-    - ConnectorMetadata: Transfer metadata exchanged between scheduler and workers.
-
-Transfer Modes:
-    - Read mode: The decode instance reads KV cache directly from prefill memory.
-      Prefill completes first, then decode reads the blocks via RDMA.
-
-Architecture::
-
-    Proxy (service discovery) <-> Prefill Instance <--RDMA--> Decode Instance
 """
 
 from __future__ import annotations
@@ -32,26 +16,29 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any
 
 import msgpack
 import msgspec
 import numpy as np
 import zmq
 
-if TYPE_CHECKING:
-    import torch
-
 from atom.config import Config
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.disaggregation.moriio.moriio_common import (
+    MoRIIOAgentMetadata,
+    MoRIIOConstants,
+    _MORIIO_AVAILABLE,
+    get_port_offset,
+)
+from atom.kv_transfer.disaggregation.utils import chunk_tensor_for_rdma
+from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     EngineId,
-    RemoteAllocInfo,
     ReqId,
     ReqMeta,
     TransferId,
@@ -60,542 +47,32 @@ from atom.model_engine.sequence import Sequence
 from atom.utils import (
     get_open_port,
     make_zmq_path,
-    make_zmq_socket,
     zmq_socket_ctx,
 )
 from atom.utils.network import get_ip
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
-logger = logging.getLogger("atom")
-
-# ---------------------------------------------------------------------------
-# MoRIIO availability check
-# ---------------------------------------------------------------------------
-
-_MORIIO_AVAILABLE = False
-try:
+if _MORIIO_AVAILABLE:
     from mori.io import (
         BackendType,
-        EngineDesc,
         IOEngine,
         IOEngineConfig,
-        MemoryDesc,
-        MemoryLocationType,
         PollCqMode,
         RdmaBackendConfig,
     )
 
-    _MORIIO_AVAILABLE = True
-    logger.info("MoRIIO RDMA library loaded successfully")
-except ImportError:
-    logger.warning(
-        "MoRIIO is not available — KV cache disaggregation will not work. "
-        "Install the mori package to enable RDMA transfers."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Msgspec metadata structs
-# ---------------------------------------------------------------------------
-
-
-class MoRIIOAgentMetadata(
-    msgspec.Struct,
-    omit_defaults=True,
-    dict=True,
-    kw_only=True,
-):
-    """Serializable metadata exchanged during the RDMA handshake."""
-
-    engine_id: str
-    agent_metadata: bytes
-    kv_caches_base_addr: Optional[list[int]] = None
-    num_blocks: int = 0
-    block_len: int = 0
-    attn_backend_name: str = "aiter"
-
-
-# ---------------------------------------------------------------------------
-# Enums & role management
-# ---------------------------------------------------------------------------
-
-
-class Role(Enum):
-    """Role of the current engine instance in the P/D architecture."""
-
-    PRODUCER = "producer"
-    CONSUMER = "consumer"
-    NOT_INITIALIZED = "not_initialized"
-
-
-def convert_virtual_to_physical_pages(
-    virtual_pages: list[int],
-    virtual_block_size: int = 16,
-    physical_block_size: int = 1,
-) -> list[int]:
-    """Expand virtual (coarse) block IDs into physical (fine-grained) page IDs.
-
-    In paged-attention the scheduler works with *virtual* blocks of
-    ``virtual_block_size`` tokens, but the RDMA transfer operates at
-    ``physical_block_size`` granularity.
-
-    Args:
-        virtual_pages: List of virtual block IDs.
-        virtual_block_size: Tokens per virtual block.
-        physical_block_size: Tokens per physical block.
-
-    Returns:
-        Expanded list of physical page IDs.
-    """
-    block_ratio = virtual_block_size // physical_block_size
-    physical_pages: list[int] = []
-    for vp in virtual_pages:
-        start = vp * block_ratio
-        physical_pages.extend(range(start, start + block_ratio))
-    return physical_pages
-
-
-class _RoleManager:
-    """Thread-safe singleton that tracks the P/D role of this process.
-
-    Use the module-level :func:`get_role` / :func:`set_role` helpers
-    instead of accessing this class directly.
-    """
-
-    _instance: Optional[_RoleManager] = None
-    _lock = threading.Lock()
-
-    def __init__(self) -> None:
-        self._role: Role = Role.NOT_INITIALIZED
-
-    @classmethod
-    def get_instance(cls) -> _RoleManager:
-        """Return the singleton, creating it on first call."""
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    instance = object.__new__(cls)
-                    instance.__init__()
-                    cls._instance = instance
-        return cls._instance
-
-    def set_role(self, role: Role) -> None:
-        with self._lock:
-            self._role = role
-
-    @property
-    def role(self) -> Role:
-        return self._role
-
-
-def set_role(role: Role) -> None:
-    """Set the global P/D role for this process."""
-    _RoleManager.get_instance().set_role(role)
-
-
-def get_role() -> Role:
-    """Get the global P/D role for this process."""
-    return _RoleManager.get_instance().role
-
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-
-class MoRIIOConstants:
-    """Protocol constants for the MoRIIO-based KV connector."""
-
-    # ZMQ handshake message types
-    GET_META_MSG = b"get_meta_msg"
-    POP_DONE_RECV = b"pop_done_recv"
-    OVER = b"OVER"
-    COMPLETION_PREFIX = "cmpl"
-
-    # Service discovery
-    PING_INTERVAL_SECONDS = 5
-    MAX_PING_RETRIES = 100
-
-    # Networking
-    DEFAULT_HANDSHAKE_PORT = 6301
-    DEFAULT_NOTIFY_PORT = "61005"
-
-    # Timeouts
-    ABORT_REQUEST_TIMEOUT = 3600
-
-
-def get_port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
-    return (dp_rank) * tp_size + tp_rank
-
-
-MAX_RDMA_CHUNK_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024  # just under 2 GiB
-
-
-def _chunk_tensor_for_rdma(
-    tensor: torch.Tensor, block_size_in_dim0: int = 1
-) -> tuple[list[tuple[int, int]], int]:
-    """Split a tensor into <2 GiB RDMA-registrable chunks along dim 0.
-
-    Args:
-        tensor: contiguous torch.Tensor whose dim-0 is the block (or
-            token) axis.
-        block_size_in_dim0: elements per logical block in dim 0.
-            Non-MLA: 1 (dim 0 = num_blocks).
-            MLA: block_size (dim 0 = num_blocks * block_size).
-
-    Returns:
-        ``(chunks, blocks_per_chunk)`` where *chunks* is a list of
-        ``(data_ptr, size_bytes)`` pairs and *blocks_per_chunk* is
-        the number of logical blocks in each full chunk.
-    """
-    elem_sz = tensor.element_size()
-    per_block_bytes = block_size_in_dim0 * tensor.stride(0) * elem_sz
-    total_blocks = tensor.shape[0] // block_size_in_dim0
-    bpc = max(1, MAX_RDMA_CHUNK_BYTES // per_block_bytes)
-    chunks: list[tuple[int, int]] = []
-    base = tensor.data_ptr()
-    for start in range(0, total_blocks, bpc):
-        end = min(start + bpc, total_blocks)
-        chunks.append((base + start * per_block_bytes, (end - start) * per_block_bytes))
-    return chunks, bpc
+logger = logging.getLogger("atom")
 
 
 # ===================================================================
-# MoRIIOWrapper — thin abstraction over the RDMA engine
+# MoRIIOConnector — worker-side connector (runs inside each TP rank)
 # ===================================================================
 
 
-class MoRIIOWrapper:
-    """Low-level wrapper around a MoRIIO ``IOEngine``.
-
-    Provides helper methods for memory registration, session management,
-    and asynchronous RDMA read/write operations.  Both producer and
-    consumer code paths share this wrapper.
-
-    Thread-safety:
-        ``transfer_status``, ``done_req_ids``, and ``done_write_cache_req_ids``
-        are guarded by ``self.lock``.  The ZMQ socket cache ``self._sockets``
-        is *not* thread-safe — callers must ensure ``send_notify`` is invoked
-        from a single thread.
-
-    Args:
-        moriio_engine: MoRIIO IOEngine instance.
-        tp_rank: Tensor parallel rank.
-        dp_rank: Data parallel rank.
-    """
-
-    def __init__(
-        self,
-        moriio_engine: Any = None,
-        tp_rank: int = 0,
-        dp_rank: int = 0,
-    ):
-        self.tp_rank = tp_rank
-        self.dp_rank = dp_rank
-        self.moriio_engine = moriio_engine
-
-        self.remote_memory_metadata: Any = None
-        self.local_memory_registered: bool = False
-        # Raw-pointer registration produces multiple MemoryDesc per layer
-        # (e.g. K + V on MHA) to keep each ibv_reg_mr below the AINIC ~2 GiB
-        # limit. We retain handles here purely so they aren't GC'd; nothing
-        # in the active session/transfer path indexes into this list.
-        self.local_memory_descs: list[Any] = []
-        self.transfer_status: list[Any] = []
-        self.remote_engine_ip: str | None = None
-        self.notify_port: int | None = None
-
-        self.lock = threading.Lock()
-        self.done_req_ids: list[str] = []
-        self.done_write_cache_req_ids: list[str] = []
-        self.notify_thread: threading.Thread | None = None
-
-        # ZMQ socket cache keyed by endpoint path
-        self._sockets: dict[str, zmq.Socket] = {}
-
-    def set_moriio_engine(self, moriio_engine: Any) -> None:
-        """Assign the MoRIIO engine (must not be None)."""
-        if moriio_engine is None:
-            raise ValueError("Cannot assign a None MoRIIO engine")
-        self.moriio_engine = moriio_engine
-
-    def set_backend_type(self, backend_type, backend_config=None):
-        assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        if backend_config is not None:
-            self.moriio_engine.create_backend(backend_type, backend_config)
-        else:
-            self.moriio_engine.create_backend(backend_type)
-
-    def get_agent_metadata(self):
-        assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        engine_metadata = self.moriio_engine.get_engine_desc()
-        engine_metadata_packed = engine_metadata.pack()
-        return engine_metadata_packed
-
-    def register_remote_engine(self, remote_packed_engine_metadata):
-        assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        consumer_engine_metadata = EngineDesc.unpack(remote_packed_engine_metadata)
-        self.moriio_engine.register_remote_engine(consumer_engine_metadata)
-        logger.info(
-            "Registered remote engine with key: %s", consumer_engine_metadata.key
-        )
-        return consumer_engine_metadata.key
-
-    def register_local_buffer(self, ptr: int, size: int, device_id: int) -> bytes:
-        """Register one raw GPU memory region with MoRIIO.
-
-        Using ``register_memory(ptr, size, ...)`` directly (instead of
-        ``register_torch_tensor``) lets callers split a single tensor into
-        multiple smaller regions, which is required to stay under the
-        AINIC ~2 GiB ``ibv_reg_mr`` limit.
-        """
-        assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        try:
-            desc = self.moriio_engine.register_memory(
-                ptr, size, device_id, MemoryLocationType.GPU
-            )
-            assert desc is not None, "register_memory returned None"
-            packed = desc.pack()
-        except Exception as e:
-            raise ValueError(f"Failed to register local memory: {e}") from e
-        self.local_memory_descs.append(desc)
-        self.local_memory_registered = True
-        return packed
-
-    def register_local_tensor(self, tensor):
-        """Back-compat helper: register an entire contiguous torch tensor.
-
-        Prefer :meth:`register_local_buffer` from new code so that callers
-        explicitly choose how to chunk large tensors before registration.
-        """
-        if not tensor.is_contiguous():
-            raise RuntimeError("input tensor must be contiguous")
-        ptr = tensor.data_ptr()
-        size = tensor.numel() * tensor.element_size()
-        device_id = tensor.device.index if tensor.device.index is not None else -1
-        return self.register_local_buffer(ptr, size, device_id)
-
-    def get_unpack_memory_metadata(self, packed_memory_metadata):
-        return MemoryDesc.unpack(packed_memory_metadata)
-
-    def build_session(self, local_memory_metadata, remote_memory_metadata):
-        assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        tmp = self.moriio_engine.create_session(
-            local_memory_metadata, remote_memory_metadata
-        )
-
-        return tmp
-
-    def read_remote_data(
-        self, transfer_size_byte, local_offset=0, remote_offset=0, session=None
-    ):
-        assert self.local_memory_registered, "You have not register local memory data!"
-        assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        transfer_status = session.batch_read(
-            local_offset,
-            remote_offset,
-            transfer_size_byte,
-            self.moriio_engine.allocate_transfer_uid(),
-        )
-        return transfer_status
-
-    def write_remote_data(
-        self, transfer_size_byte, local_offset=0, remote_offset=0, session=None
-    ):
-        assert self.local_memory_registered, "You have not register local memory data!"
-        assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        write_uid = self.moriio_engine.allocate_transfer_uid()
-
-        transfer_status = session.batch_write(
-            local_offset, remote_offset, transfer_size_byte, write_uid
-        )
-        with self.lock:
-            self.transfer_status.append(transfer_status)
-
-    def write_remote_data_single(
-        self, transfer_size_byte, local_offset=0, remote_offset=0, sess_idx=0
-    ):
-        assert self.local_memory_registered, "You have not register local memory data!"
-        assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        transfer_status = self.sessions[sess_idx].write(
-            local_offset,
-            remote_offset,
-            transfer_size_byte,
-            self.moriio_engine.allocate_transfer_uid(),
-        )
-        with self.lock:
-            self.transfer_status.append(transfer_status)
-
-    def waiting_for_transfer_complete(self):
-        if not self.transfer_status:
-            return
-
-        transfers_to_wait = []
-        with self.lock:
-            transfers_to_wait = self.transfer_status[:]
-            self.transfer_status.clear()
-
-        for status in transfers_to_wait:
-            try:
-                status.Wait()
-                if not status.Succeeded():
-                    logger.error(
-                        "Transfer failed: %s, Code: %s", status.Message(), status.Code()
-                    )
-                    raise ValueError("MoRIIO transfer failed!")
-            except Exception as e:
-                logger.error("Transfer %s failed: %s", status, e)
-                raise
-
-    def async_wait_reqid(self):
-        assert self.notify_port is not None, "Notify port cannot be None"
-
-        if self.notify_thread is not None:
-            return
-
-        def _async_wait():
-            host = "*"
-            path = make_zmq_path("tcp", host, self.notify_port)
-            logger.info("Node starting to listen notify from path = %s", path)
-
-            with _zmq_ctx(zmq.ROUTER, path) as sock:
-                while True:
-                    try:
-                        identity, msg = sock.recv_multipart()
-                        self._dispatch_message(msg)
-                    except Exception as e:
-                        logger.error("Error processing message: %s", e)
-                        raise ValueError(f"Error processing message: {e}") from e
-
-        self.notify_thread = threading.Thread(
-            target=_async_wait, daemon=True, name="moriio-notify-listener"
-        )
-        self.notify_thread.start()
-
-    def _dispatch_message(self, msg: bytes) -> None:
-        """Route an incoming ZMQ message to the appropriate handler.
-
-        Message formats:
-            - msgpack dict with ``req_id``: remote block allocation (producer only)
-            - UTF-8 string prefixed with ``cmpl``: transfer completion signal
-        """
-        # Try msgpack structured message first (block allocation from decode)
-        try:
-            data = msgpack.loads(msg)
-            if isinstance(data, dict) and "req_id" in data:
-                self._handle_block_alloc_message(data)
-                return
-        except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException):
-            pass
-
-        # Fall back to string-encoded completion message
-        try:
-            msg_str = msg.decode("utf-8")
-        except UnicodeDecodeError:
-            logger.warning("Received non-decodable message of %d bytes", len(msg))
-            return
-
-        if msg_str.startswith(MoRIIOConstants.COMPLETION_PREFIX):
-            self._handle_completion_message(msg_str)
-        else:
-            raise ValueError(f"Unrecognized message format: {msg_str!r}")
-
-    def _handle_block_alloc_message(self, data: dict) -> None:
-        """Process a remote block allocation notification (producer side)."""
-        assert (
-            get_role() == Role.PRODUCER
-        ), "Only producer should receive block alloc messages"
-        req_id = data["req_id"]
-        block_notify_list = data.get("block_notify_list", [])
-        decode_dp_rank = data.get("decode_rank", 0)
-        assert (
-            len(block_notify_list) > 0
-        ), "block_notify_list cannot be empty in remote allocate message"
-
-        with self.lock:
-            self.done_remote_allocate_req_dict[req_id] = RemoteAllocInfo(
-                block_ids=block_notify_list, decode_dp_rank=decode_dp_rank
-            )
-
-    def _handle_completion_message(self, msg: str) -> None:
-        """Record a transfer completion notification."""
-        with self.lock:
-            if get_role() == Role.PRODUCER:
-                self.done_req_ids.append(msg)
-            else:
-                self.done_write_cache_req_ids.append(msg)
-
-    def send_notify(
-        self,
-        req_ids: str | int | list[str | int],
-        remote_ip: str,
-        remote_port: str | int,
-    ) -> None:
-        """Notify a remote engine that transfer(s) have completed."""
-        if not remote_ip or not remote_port:
-            logger.warning("Cannot send notification: missing remote_ip or remote_port")
-            return
-
-        path = make_zmq_path("tcp", remote_ip, int(remote_port))
-
-        if path not in self._sockets:
-            ctx = zmq.Context.instance()
-            self._sockets[path] = make_zmq_socket(
-                ctx=ctx, path=path, socket_type=zmq.DEALER, bind=False
-            )
-
-        id_list = req_ids if isinstance(req_ids, list) else [req_ids]
-        sock = self._sockets[path]
-        try:
-            for rid in id_list:
-                rid_str = str(rid) if isinstance(rid, int) else rid
-                if not isinstance(rid_str, str):
-                    logger.warning("Skipping non-string req_id of type %s", type(rid))
-                    continue
-                sock.send_multipart(
-                    [MoRIIOConstants.POP_DONE_RECV, rid_str.encode("utf-8")]
-                )
-        except Exception as e:
-            logger.error("Failed to send notification to %s: %s", path, e)
-            self._sockets.pop(path, None)
-            raise
-
-    def pop_finished_req_ids(self) -> set[str]:
-        """Return and clear the set of completed send-side request IDs."""
-        with self.lock:
-            result = set(self.done_req_ids)
-            self.done_req_ids.clear()
-        return result
-
-    def pop_finished_write_req_ids(self) -> set[str]:
-        """Return and clear the set of completed write-side request IDs."""
-        with self.lock:
-            result = set(self.done_write_cache_req_ids)
-            self.done_write_cache_req_ids.clear()
-        return result
-
-    def shutdown(self) -> None:
-        """Close all cached ZMQ sockets and release resources."""
-        logger.debug(
-            "Shutting down MoRIIOWrapper, closing %d sockets", len(self._sockets)
-        )
-        for path, sock in self._sockets.items():
-            try:
-                sock.close(linger=0)
-            except Exception as e:
-                logger.warning("Error closing socket for %s: %s", path, e)
-        self._sockets.clear()
-
-
-# ===================================================================
-# KVConnector — worker-side connector (runs inside each TP rank)
-# ===================================================================
-
-
-class KVConnector(KVConnectorBase):
+class MoRIIOConnector(KVConnectorBase):
     """Worker-side KV cache connector for disaggregated P/D inference.
 
-    Each tensor-parallel worker instantiates one ``KVConnector``.  It is
+    Each tensor-parallel worker instantiates one ``MoRIIOConnector``.  It is
     responsible for:
 
     1. Registering local KV cache tensors for RDMA access.
@@ -727,7 +204,7 @@ class KVConnector(KVConnectorBase):
         transfers can occur.
 
         Each K (and V, when present) tensor is split into block-aligned
-        chunks of < 2 GiB via :func:`_chunk_tensor_for_rdma` and each
+        chunks of < 2 GiB via :func:`chunk_tensor_for_rdma` and each
         chunk is registered independently with ``ibv_reg_mr``.  Per-layer
         metadata list layout:
         ``[k_chunk0, k_chunk1, ..., v_chunk0, v_chunk1, ...]``.
@@ -754,7 +231,7 @@ class KVConnector(KVConnectorBase):
             # equals the KV cache block_size (typically 16).
             # Non-MLA: dim 0 = num_blocks directly, so 1.
             bsd0 = self.kv_cache_block_size if is_mla else 1
-            k_chunks, bpc = _chunk_tensor_for_rdma(cache_tensor, bsd0)
+            k_chunks, bpc = chunk_tensor_for_rdma(cache_tensor, bsd0)
 
             if self.blocks_per_chunk is None:
                 self.blocks_per_chunk = bpc
@@ -770,7 +247,7 @@ class KVConnector(KVConnectorBase):
                 v_device_id = (
                     v_cache.device.index if v_cache.device.index is not None else -1
                 )
-                v_chunks, _ = _chunk_tensor_for_rdma(v_cache, 1)
+                v_chunks, _ = chunk_tensor_for_rdma(v_cache, 1)
                 for ptr, size in v_chunks:
                     meta_list.append(
                         self.moriio_wrapper.register_local_buffer(
@@ -1454,11 +931,11 @@ class KVConnector(KVConnectorBase):
 
 
 # ===================================================================
-# KVConnectorScheduler — scheduler-side connector
+# MoRIIOConnectorScheduler — scheduler-side connector
 # ===================================================================
 
 
-class KVConnectorScheduler(KVConnectorSchedulerBase):
+class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side KV connector that tracks transfer lifecycle.
 
     Runs in the scheduler process (not in TP workers).  Responsible for:
@@ -1564,6 +1041,7 @@ class KVConnectorScheduler(KVConnectorSchedulerBase):
         the transfer_id mapping.
         """
         # Attach output metadata for the proxy to relay
+        first_token_id = seq.output_tokens[0] if seq.output_tokens else None
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
@@ -1574,6 +1052,7 @@ class KVConnectorScheduler(KVConnectorSchedulerBase):
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
             "transfer_id": seq.id,
+            "first_token_id": first_token_id,
         }
 
         # Clean up transfer ID mapping on the consumer side

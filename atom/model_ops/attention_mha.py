@@ -354,6 +354,13 @@ class PagedAttentionImpl(nn.Module):
             block_size = k_cache.shape[1]
 
         block_tables = attn_metadata.block_tables
+        per_token_quant = (
+            self.kv_cache_dtype.startswith("fp8")
+            and k_scale is not None
+            and v_scale is not None
+            and k_scale.numel() > 1
+            and v_scale.numel() > 1
+        )
         cp_mha_gather_cache(
             key_cache=k_cache_gather,
             value_cache=v_cache_gather,
@@ -368,6 +375,7 @@ class PagedAttentionImpl(nn.Module):
             dequant=self.kv_cache_dtype.startswith("fp8"),
             kv_cache_layout="SHUFFLE" if use_shuffle else "NHD",
             total_tokens=total_tokens,
+            per_token_quant=per_token_quant,
         )
 
         return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale

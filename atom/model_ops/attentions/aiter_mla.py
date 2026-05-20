@@ -12,7 +12,6 @@ from aiter import (
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
-from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
 from atom.plugin.attention import (
@@ -60,9 +59,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         CommonAttentionBuilder.__init__(self, model_runner)
         config = model_runner.config
         hf_config = config.hf_config
-        self.num_attention_heads = (
-            hf_config.num_attention_heads // get_tp_group().world_size
-        )
+        # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.is_sparse = model_runner.is_deepseek_v32
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
@@ -611,10 +608,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if attn_metadata.has_cached:
                 # Full context (cached + new): use cu_seqlens_k for indexer
                 var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
-                    var["cu_seqlens_k"].np[:-1], counts
+                    var["cu_seqlens_k"].np[:bs], counts
                 )
                 var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = np.repeat(
-                    var["cu_seqlens_k"].np[1:], counts
+                    var["cu_seqlens_k"].np[1 : bs + 1], counts
                 )
             else:
                 var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
