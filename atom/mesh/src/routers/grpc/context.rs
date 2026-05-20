@@ -8,10 +8,8 @@ use std::sync::Arc;
 
 use axum::http::HeaderMap;
 
-use super::{
-    client::GrpcClient,
-    proto_wrapper::{ProtoRequest, ProtoStream},
-};
+use super::engine::proto_stream_wrapper::{ProtoRequest, ProtoStream};
+use super::engine::worker_client_cache::GrpcClient;
 use crate::{
     core::{Worker, WorkerLoadGuard},
     protocols::{

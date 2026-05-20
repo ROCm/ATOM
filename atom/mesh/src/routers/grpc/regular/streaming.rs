@@ -27,8 +27,7 @@ use crate::{
     routers::{
         grpc::{
             context,
-            proto_wrapper::{ProtoResponseVariant, ProtoStream},
-            utils,
+            engine::proto_stream_wrapper::{ProtoResponseVariant, ProtoStream},
         },
         prepare::{
             parser_factory_lookup::{
@@ -317,7 +316,7 @@ impl StreamingProcessor {
 
                     // Process logprobs if present
                     let choice_logprobs = if let Some(proto_logprobs) = chunk.output_logprobs() {
-                        match utils::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer) {
+                        match crate::routers::grpc::engine::proto_to_chunk::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer) {
                             Ok(logprobs) => Some(logprobs),
                             Err(e) => {
                                 warn!("Failed to process logprobs: {}", e);
@@ -854,7 +853,7 @@ impl StreamingProcessor {
                         // Extract input_logprobs from prefill Complete message (convert proto to SGLang format)
                         input_logprobs = complete
                             .input_logprobs()
-                            .map(utils::convert_generate_input_logprobs);
+                            .map(crate::routers::grpc::engine::proto_to_chunk::convert_generate_input_logprobs);
                         break;
                     }
                     ProtoResponseVariant::Error(error) => {
@@ -933,7 +932,7 @@ impl StreamingProcessor {
 
                     // Store latest output logprobs (cumulative from proto, convert to SGLang format)
                     if let Some(output_logprobs) = chunk.output_logprobs() {
-                        let converted = utils::convert_generate_output_logprobs(output_logprobs);
+                        let converted = crate::routers::grpc::engine::proto_to_chunk::convert_generate_output_logprobs(output_logprobs);
                         accumulated_output_logprobs.insert(index, Some(converted));
                     }
 

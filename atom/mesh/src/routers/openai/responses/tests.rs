@@ -378,7 +378,7 @@ mod i_layering {
 
     #[test]
     fn test_responses_only_grpc_ref_is_pipeline() {
-        // A `use crate::routers::grpc::client::*` in this file would compile,
+        // A `use crate::routers::grpc::engine::worker_client_cache::*` in this file would compile,
         // but the grep gate would catch it. The test is a behavioral check that
         // ResponsesContext does not expose a `client_registry` or `engine` field.
         let _ty = std::any::type_name::<ResponsesContext>();

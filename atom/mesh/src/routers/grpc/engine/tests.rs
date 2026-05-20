@@ -577,8 +577,8 @@ mod c_worker_client_cache {
     use std::sync::Arc;
 
     use crate::core::Worker;
-    use crate::routers::grpc::client::GrpcClient;
     use crate::routers::grpc::engine::worker_client_cache::get_grpc_client_from_worker;
+    use crate::routers::grpc::engine::worker_client_cache::GrpcClient;
 
     fn fake_grpc_worker(_url: &str) -> Arc<dyn Worker> {
         unimplemented!("grpc-configured worker fixture")

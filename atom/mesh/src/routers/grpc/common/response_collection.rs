@@ -7,7 +7,7 @@ use axum::response::Response;
 
 use crate::routers::{
     error,
-    grpc::{context::ExecutionResult, proto_wrapper::ProtoGenerateComplete, utils},
+    grpc::{context::ExecutionResult, engine::proto_stream_wrapper::ProtoGenerateComplete, utils},
 };
 
 /// Collect and merge responses from execution result

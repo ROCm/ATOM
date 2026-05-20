@@ -263,3 +263,122 @@ direct grep of `prepare/mod.rs`, not via test compilation.
 
 **Human gates**: No `(human)` checks in Part C plan §Test Part C (C11 is the
 subagent review, which is complete). Plan defers `/mesh-e2e-test` to Parts F/G/I.
+
+## Part D — 2026-05-20 — pass_count 840 (+34)
+
+**Scope**: Transport-neutral `WorkerStream<TokenChunk>` + `EngineError` boundary
+types; `merge_pd_streams` state machine; relocate `client.rs` and
+`proto_wrapper.rs` into `grpc/engine/`; relocate the OpenAI-shaped logprob
+adapters into `grpc/engine/proto_to_chunk.rs` so `utils.rs` becomes
+`mesh_grpc`-clean; minimal `GrpcEngine::dispatch` skeleton (not yet wired
+into the live pipeline — that's Part F).
+
+**Production code changes**:
+
+NEW files (10):
+- `src/routers/worker_stream/token_chunk.rs` (75 ln) — `TokenChunk`,
+  `FinishReason`, `MatchedStop`, `TokenLogprobs`, `InputLogprobs`,
+  `TokenLogprob`, `Usage`, `WorkerMeta`. All neutral.
+- `src/routers/worker_stream/engine_error.rs` (41 ln) — 7-variant
+  `EngineError` (Transport / Prefill / DecodeError / PrefillEarlyClose /
+  DecodeIncomplete / ConnectionAcquireFailed / RequestBuildFailed) per PD
+  merge spec §5.2.
+- `src/routers/worker_stream/worker_stream.rs` (85 ln) — `WorkerStream`
+  wrapper around `TokenSource` trait; `Single` variant in production, a
+  `#[cfg(test)]`-gated `Pair` variant for test fixtures.
+- `src/routers/worker_stream/test_support.rs` (189 ln) — `pub` (not
+  cfg(test)) so integration tests can use it; scripted sources with
+  poll-count / drop / mark_completed observers.
+- `src/routers/grpc/engine/proto_to_chunk.rs` (234 ln) — neutral
+  `proto_chunk_to_chunk` / `proto_complete_to_chunk` + the moved legacy
+  `convert_proto_to_openai_logprobs` / `convert_generate_output_logprobs` /
+  `convert_generate_input_logprobs`.
+- `src/routers/grpc/engine/pd_stream_merge.rs` (154 ln) — `PdMerger` state
+  machine implementing PD merge spec §3 (`WaitingPrefill` / `Streaming` /
+  `Terminal`). All I1–I6 invariants enforced; T1–T7 covered by integration
+  tests.
+- `src/routers/grpc/engine/worker_client_cache.rs` (237 ln) — moved from
+  `grpc/client.rs`; added `get_grpc_client_from_worker` (was in
+  `utils.rs`).
+- `src/routers/grpc/engine/proto_stream_wrapper.rs` (518 ln) — moved
+  verbatim from `grpc/proto_wrapper.rs`.
+- `src/routers/grpc/engine/mod.rs` (191 ln) — `GrpcEngine::dispatch` +
+  `dispatch_one(worker, payload, role)` + `ProtoStreamSource` adapter
+  with `ProtoErrorRole` classifier so PD pairs produce typed `Prefill` /
+  `DecodeError` labels per spec.
+
+DELETED files (2): `src/routers/grpc/client.rs` (198 ln), `src/routers/grpc/proto_wrapper.rs` (518 ln). No re-export stubs.
+
+REWRITTEN: `src/routers/grpc/utils.rs` (263 → 113 ln; `get_grpc_client_from_worker` + logprob converters moved out; no more `mesh_grpc::*` imports).
+
+UPDATED CALLERS (12 files, import-path only): `core/worker.rs`, `core/worker_builder.rs`, `core/steps/worker/local/{detect_connection,discover_metadata}.rs`, `routers/grpc/{context,common/response_collection,common/response_formatting,common/stages/client_acquisition,common/stages/helpers,common/stages/request_execution,regular/processor,regular/streaming}.rs`, plus the two `regular/stages/{chat,generate}/request_building.rs`.
+
+**Test additions** (integration tests under `atom/mesh/tests/`):
+- `tests/grpc_pd_merge_tests.rs` (294 ln) — 11 tests: T1–T7 from PD merge
+  spec §4 (skip-prefill, inject input_logprobs, prefill-error-fail-fast,
+  prefill-silent-after-transition, decode-transport-error, prefill-early-close,
+  consumer-drop, pending-prefill) plus 2 extras (decode-incomplete,
+  prefill-partial-silently-dropped).
+- `tests/grpc_engine_drop_tests.rs` (51 ln) — 2 tests: single-mode drop
+  closes inner mpsc; PD-mode drop closes both inner mpscs.
+
+**Test gates** (all pass):
+- D1 build clean (release): PASS (1m 27s; 0 warnings after cfg-gating)
+- D2 worker_stream tests: 21/21 PASS
+- D3–D9 pd_merge T1–T7: PASS (in `tests/grpc_pd_merge_tests.rs`)
+- D10/D11 drop propagation single + PD: PASS (in
+  `tests/grpc_engine_drop_tests.rs`)
+- D14 old `client.rs` and `proto_wrapper.rs` deleted: PASS
+- D13 worker_stream/ is grpc-free: PASS (only doc comment mentions)
+- Full release test suite: **840 pass / 15 fail** (+34 vs Part C's 806;
+  the 15 failures are pre-existing api/routing tests requiring external
+  workers, unchanged since Part 0 baseline)
+- cargo fmt clean.
+
+**D12 partial gate** ("mesh_grpc::* confined to grpc/engine/"):
+- `utils.rs` CLEAN (Part D's direct responsibility — logprob converters
+  moved into `engine/proto_to_chunk.rs`).
+- Still leak (deferred): `grpc/common/stages/helpers.rs` (PD bootstrap
+  injection — to be deleted in Part I when `common/stages/` goes away),
+  `grpc/regular/processor.rs` + `grpc/regular/streaming.rs` (use proto
+  `MatchedStop` directly — rewritten in Part E when render layer migrates
+  to `TokenChunk`).
+- Documented gap per plan §A.3.
+
+**Subagent review (rust-reviewer)**: 2 passes.
+
+Pass 1 — 2 BLOCKING + 3 HIGH + 4 MEDIUM (full triage):
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| B1 | BLOCK | `EngineError::Prefill` / `DecodeError` unreachable in production because `ProtoStreamSource` collapsed proto Error → Transport regardless of source role. | **Fixed.** Added `ProtoErrorRole { Worker, Prefill, Decode }` enum; `ProtoStreamSource::new(stream, role)`; `GrpcEngine::dispatch` passes the correct role per arm. Proto `Error` responses now produce the typed variant per spec §3. Tonic `Status` errors still flatten to `Transport`. |
+| B2 | BLOCK | `engine/tests.rs` (cfg(any())-gated) references non-existent functions (`sglang_complete_to_chunk` etc.) and a non-existent `ClientRegistry`. | **Declined.** The file is the user-owned TDD spec for Parts B/C/D/E/F (per Part 0 baseline). Gated `#[cfg(any())]`, doesn't affect compilation. Per receiving-code-review workflow + Karpathy "don't modify what wasn't asked", I left it as the user's spec. Documented as known contract drift. |
+| H1 | HIGH | `WorkerStream::Pair::mark_completed` silently skipped prefill. | **Fixed.** `Pair::mark_completed` now calls both arms. `pd()` is `pub(crate)` + `#[cfg(test)]`; the `Pair` variant itself is `#[cfg(test)]`-gated so production builds have a single-variant `Inner`, no dead code. |
+| H2 | HIGH | `ProtoStreamSource::poll_next` pinning soundness lacked a comment. | **Fixed.** Added a 4-line WHY note explaining tonic-`Streaming` registers its waker on the H2 channel (not the returned `Next` future), so recreate-per-poll is safe. |
+| H3 | HIGH | Same as B2 (test file lies about `ClientRegistry`). | **Declined** — same reason. |
+| M1 | MEDIUM | Plan-phase meta-comments ("Part E", "vanish in Part E") in `engine/proto_to_chunk.rs`. | **Fixed.** Rewrote module doc + `convert_proto_to_openai_logprobs` doc-comment to explain WHY without plan refs. |
+| M2 | MEDIUM | Unreachable `None` arm in `WaitingPrefill` / `Streaming` prefill/decode lookups. | **Fixed.** Replaced with `.expect("WaitingPrefill invariant: prefill is Some")` and the parallel decode version; tightens runtime invariant. |
+| M3 | MEDIUM | Panicking `as_sglang` / `as_vllm` accessors on moved `GrpcClient` / `ProtoGenerateRequest`. | **Declined per Karpathy.** Pre-existing from verbatim move; out of Part D scope; will be deleted in Part I along with `common/stages/`. |
+| M4 | MEDIUM | `synthetic_pd_stream` naming nit. | **Declined.** Name is fine in context. |
+
+Pass 2 — **APPROVE**. Reviewer verified:
+- B1 role threading is correct (Single→Worker, Pair→Prefill+Decode); classifier
+  returns the right variant per role; tonic Status errors still flatten to
+  Transport regardless of role.
+- H1 cfg-symmetry is right (Pair variant, pd() fn, both pattern arms all
+  gated #[cfg(test)]); Pair::mark_completed calls both arms.
+- M2 `.expect()` invariants are provably never tripped (every Terminal
+  transition sets the field to None before returning, so the loop's
+  next iteration hits Terminal arm first).
+- No new dead-code or unreachable warnings.
+
+**Line-count delta** (production source under `src/routers/`):
+- `grpc/client.rs` 198 → 0 (DELETED; moved to engine/worker_client_cache.rs)
+- `grpc/proto_wrapper.rs` 518 → 0 (DELETED; moved to engine/proto_stream_wrapper.rs)
+- `grpc/utils.rs` 263 → 113 (−150; logprob converters + `get_grpc_client_from_worker` moved out)
+- `grpc/engine/mod.rs` 6 → 191 (+185; `GrpcEngine`, `dispatch`, `ProtoStreamSource`)
+- `grpc/engine/{worker_client_cache,proto_stream_wrapper,proto_to_chunk,pd_stream_merge}.rs` 0 → 1143 (NEW; majority is the verbatim moves)
+- `worker_stream/*.rs` 7 → 599 (NEW: token_chunk, engine_error, worker_stream, test_support; plus the user-written 381-ln tests file)
+
+**Human gates**: No (human) checks in plan §Test Part D (D15 is the rust-reviewer
+which passed). Plan defers `/mesh-e2e-test` to Parts F/G/I (live engine wiring).

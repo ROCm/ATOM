@@ -1,13 +1,11 @@
 //! gRPC router implementations
 
-pub mod client; // Used by core/
 pub(crate) mod common;
 pub(crate) mod completion_adapter;
 pub(crate) mod context;
 pub mod engine;
 pub(crate) mod pd_router; // Used by routers/factory
 pub(crate) mod pipeline;
-pub(crate) mod proto_wrapper;
 pub(crate) mod regular;
 pub(crate) mod router; // Used by routers/factory
 pub(crate) mod utils; // Used by routers/http

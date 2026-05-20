@@ -21,8 +21,7 @@ use crate::{
         grpc::{
             common::{response_collection, response_formatting},
             context::{DispatchMetadata, ExecutionResult},
-            proto_wrapper::ProtoGenerateComplete,
-            utils,
+            engine::proto_stream_wrapper::ProtoGenerateComplete,
         },
         prepare::{
             parser_factory_lookup::{
@@ -184,7 +183,10 @@ impl ResponseProcessor {
 
         // Step 4: Convert output logprobs if present
         let logprobs = if let Some(proto_logprobs) = complete.output_logprobs() {
-            match utils::convert_proto_to_openai_logprobs(proto_logprobs, tokenizer) {
+            match crate::routers::grpc::engine::proto_to_chunk::convert_proto_to_openai_logprobs(
+                proto_logprobs,
+                tokenizer,
+            ) {
                 Ok(logprobs) => Some(logprobs),
                 Err(e) => {
                     error!("Failed to convert logprobs: {}", e);
@@ -431,17 +433,17 @@ impl ResponseProcessor {
 
             // Extract logprobs if requested (convert proto types to Generate format)
             let input_token_logprobs = if request_logprobs {
-                complete
-                    .input_logprobs()
-                    .map(utils::convert_generate_input_logprobs)
+                complete.input_logprobs().map(
+                    crate::routers::grpc::engine::proto_to_chunk::convert_generate_input_logprobs,
+                )
             } else {
                 None
             };
 
             let output_token_logprobs = if request_logprobs {
-                complete
-                    .output_logprobs()
-                    .map(utils::convert_generate_output_logprobs)
+                complete.output_logprobs().map(
+                    crate::routers::grpc::engine::proto_to_chunk::convert_generate_output_logprobs,
+                )
             } else {
                 None
             };

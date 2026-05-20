@@ -9,7 +9,7 @@ use crate::routers::{
     error,
     grpc::{
         context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
-        proto_wrapper::{ProtoGenerateRequest, ProtoRequest, ProtoStream},
+        engine::proto_stream_wrapper::{ProtoGenerateRequest, ProtoRequest, ProtoStream},
     },
 };
 

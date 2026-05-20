@@ -9,7 +9,7 @@ use crate::routers::{
     error,
     grpc::{
         context::{ClientSelection, RequestContext, WorkerSelection},
-        utils,
+        engine::worker_client_cache::get_grpc_client_from_worker,
     },
 };
 
@@ -32,12 +32,12 @@ impl PipelineStage for ClientAcquisitionStage {
 
         let clients = match workers {
             WorkerSelection::Single { worker } => {
-                let client = utils::get_grpc_client_from_worker(worker).await?;
+                let client = get_grpc_client_from_worker(worker).await?;
                 ClientSelection::Single { client }
             }
             WorkerSelection::Dual { prefill, decode } => {
-                let prefill_client = utils::get_grpc_client_from_worker(prefill).await?;
-                let decode_client = utils::get_grpc_client_from_worker(decode).await?;
+                let prefill_client = get_grpc_client_from_worker(prefill).await?;
+                let decode_client = get_grpc_client_from_worker(decode).await?;
 
                 // vLLM does not support dual (PD disaggregated) mode
                 if prefill_client.is_vllm() || decode_client.is_vllm() {

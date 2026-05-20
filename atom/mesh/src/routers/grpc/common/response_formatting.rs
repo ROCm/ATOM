@@ -4,7 +4,9 @@
 //! - Usage calculation from gRPC responses
 //! - ChatCompletionResponse construction
 
-use crate::{protocols::common::Usage, routers::grpc::proto_wrapper::ProtoGenerateComplete};
+use crate::{
+    protocols::common::Usage, routers::grpc::engine::proto_stream_wrapper::ProtoGenerateComplete,
+};
 
 /// Build usage information from collected gRPC responses
 ///

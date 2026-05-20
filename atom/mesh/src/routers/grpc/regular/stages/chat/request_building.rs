@@ -8,11 +8,11 @@ use uuid::Uuid;
 use crate::routers::{
     error,
     grpc::{
-        client::GrpcClient,
         common::stages::{helpers, PipelineStage},
         context::{ClientSelection, RequestContext, WorkerSelection},
         engine::payload_to_proto::{to_sglang_proto, to_vllm_proto},
-        proto_wrapper::ProtoGenerateRequest,
+        engine::proto_stream_wrapper::ProtoGenerateRequest,
+        engine::worker_client_cache::GrpcClient,
     },
     prepare::build_chat_payload,
 };
@@ -97,7 +97,9 @@ impl PipelineStage for ChatRequestBuildingStage {
         }
 
         ctx.state.proto_request = Some(
-            crate::routers::grpc::proto_wrapper::ProtoRequest::Generate(proto_request),
+            crate::routers::grpc::engine::proto_stream_wrapper::ProtoRequest::Generate(
+                proto_request,
+            ),
         );
         Ok(None)
     }

@@ -1,8 +1,15 @@
-//! Unified gRPC client wrapper for SGLang and vLLM backends
+//! Unified gRPC client wrapper for SGLang and vLLM backends, plus the
+//! per-worker client lookup used by dispatch.
 
+use std::sync::Arc;
+
+use axum::response::Response;
 use mesh_grpc::{SglangSchedulerClient, VllmEngineClient};
+use tracing::error;
 
-use crate::routers::grpc::proto_wrapper::{
+use crate::core::Worker;
+use crate::routers::error;
+use crate::routers::grpc::engine::proto_stream_wrapper::{
     ProtoEmbedRequest, ProtoEmbedResponse, ProtoGenerateRequest, ProtoStream,
 };
 
@@ -195,4 +202,36 @@ impl ModelInfo {
 
         labels
     }
+}
+
+/// Get gRPC client from worker, returning appropriate error response on failure
+pub(crate) async fn get_grpc_client_from_worker(
+    worker: &Arc<dyn Worker>,
+) -> Result<GrpcClient, Response> {
+    let client_arc = worker
+        .get_grpc_client()
+        .await
+        .map_err(|e| {
+            error!(
+                function = "get_grpc_client_from_worker",
+                error = %e,
+                "Failed to get gRPC client from worker"
+            );
+            error::internal_error(
+                "get_grpc_client_failed",
+                format!("Failed to get gRPC client: {}", e),
+            )
+        })?
+        .ok_or_else(|| {
+            error!(
+                function = "get_grpc_client_from_worker",
+                "Selected worker not configured for gRPC"
+            );
+            error::internal_error(
+                "worker_not_configured_for_grpc",
+                "Selected worker is not configured for gRPC",
+            )
+        })?;
+
+    Ok((*client_arc).clone())
 }

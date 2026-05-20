@@ -6,7 +6,7 @@ use mesh_grpc::sglang_proto::DisaggregatedParams;
 use rand::Rng;
 use tracing::debug;
 
-use crate::{core::Worker, routers::grpc::proto_wrapper::ProtoGenerateRequest};
+use crate::{core::Worker, routers::grpc::engine::proto_stream_wrapper::ProtoGenerateRequest};
 
 /// Inject PD bootstrap metadata into a gRPC request
 ///
