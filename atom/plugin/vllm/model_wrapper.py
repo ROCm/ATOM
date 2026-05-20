@@ -105,6 +105,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         model_cls = _get_atom_model_cls(model_arch)
         module_remapping = getattr(model_cls, "packed_modules_mapping", {})
         weights_mapper = getattr(model_cls, "hf_to_atom_mapper", {})
+        # `quant_exclude_name_mapping` is applied inside `remap_layer_name`
+        # itself (see QuantizationConfig.remap_layer_name), so callers in both
+        # the standalone (ModelRunner) and vLLM OOT paths only need to forward
+        # it once. An earlier OOT-only block re-applied the same mapping after
+        # the remap call, which was redundant and risked double-translation
+        # when one mapping's replacement happened to match a later mapping's
+        # key. Mirror the standalone-path call shape and rely on
+        # remap_layer_name to handle the exclude-name translation.
         exclude_mapping = getattr(model_cls, "quant_exclude_name_mapping", {})
         self.atom_config.quant_config.remap_layer_name(
             self.atom_config.hf_config,
@@ -112,13 +120,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             weights_mapper=weights_mapper,
             quant_exclude_name_mapping=exclude_mapping,
         )
-
-        # In ATOM, quant_exclude_name_mapping is used to translate the HF module names
-        # to ATOM's format. It is invoked in ATOM's model_runner initialization, but
-        # lacks correspondences in vLLM. So we invoke the translation here for vLLM OOT.
-        exclude_mapping = getattr(model_cls, "quant_exclude_name_mapping", {})
-        if exclude_mapping and self.atom_config.quant_config is not None:
-            self.atom_config.quant_config.apply_exclude_name_mapping(exclude_mapping)
 
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
         self.model = model_cls(self.atom_config)
