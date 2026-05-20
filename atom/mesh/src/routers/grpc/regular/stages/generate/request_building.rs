@@ -11,13 +11,12 @@ use crate::routers::{
         client::GrpcClient,
         common::stages::{helpers, PipelineStage},
         context::{ClientSelection, RequestContext, WorkerSelection},
+        engine::payload_to_proto::{to_sglang_proto, to_vllm_proto},
         proto_wrapper::ProtoGenerateRequest,
     },
+    prepare::build_generate_payload,
 };
 
-/// Generate request building stage
-///
-/// Extracts generate-specific request building logic from the old unified RequestBuildingStage.
 pub(crate) struct GenerateRequestBuildingStage {
     inject_pd_metadata: bool,
 }
@@ -52,51 +51,30 @@ impl PipelineStage for GenerateRequestBuildingStage {
 
         let generate_request = ctx.generate_request_arc();
 
-        // Get client for building request (use prefill client if PD mode)
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
         };
 
-        // Build generate request
         let request_id = generate_request
             .rid
             .clone()
             .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
 
-        // Dispatch to the appropriate client based on backend type
+        let payload = build_generate_payload(
+            request_id,
+            &generate_request,
+            prep.original_text.clone(),
+            prep.token_ids.clone(),
+        );
+
         let mut proto_request = match builder_client {
-            GrpcClient::Sglang(sglang_client) => {
-                let req = sglang_client
-                    .build_plain_generate_request(
-                        request_id,
-                        &generate_request,
-                        prep.original_text.clone(),
-                        prep.token_ids.clone(),
-                    )
-                    .map_err(|e| {
-                        error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build SGLang generate request");
-                        error::bad_request("build_request_failed", e)
-                    })?;
-                ProtoGenerateRequest::Sglang(Box::new(req))
+            GrpcClient::Sglang(_) => {
+                ProtoGenerateRequest::Sglang(Box::new(to_sglang_proto(&payload)))
             }
-            GrpcClient::Vllm(vllm_client) => {
-                let req = vllm_client
-                    .build_plain_generate_request(
-                        request_id,
-                        &generate_request,
-                        prep.original_text.clone(),
-                        prep.token_ids.clone(),
-                    )
-                    .map_err(|e| {
-                        error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build vLLM generate request");
-                        error::bad_request("build_request_failed", e)
-                    })?;
-                ProtoGenerateRequest::Vllm(Box::new(req))
-            }
+            GrpcClient::Vllm(_) => ProtoGenerateRequest::Vllm(Box::new(to_vllm_proto(&payload))),
         };
 
-        // Inject PD metadata if needed
         if self.inject_pd_metadata {
             if let WorkerSelection::Dual { prefill, .. } = ctx.state.workers.as_ref().unwrap() {
                 helpers::inject_bootstrap_metadata(&mut proto_request, prefill);

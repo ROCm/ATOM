@@ -16,6 +16,7 @@ use crate::{
             utils,
         },
         prepare::{
+            chat_template::process_chat_messages,
             stop_sequence_decoder::create_stop_decoder,
             tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constraints},
         },
@@ -55,7 +56,7 @@ impl ChatPreparationStage {
         let body_ref = filter_chat_request_by_tool_choice(request);
 
         // Step 2: Process messages and apply chat template
-        let processed_messages = match utils::process_chat_messages(&body_ref, &*tokenizer) {
+        let processed_messages = match process_chat_messages(&body_ref, &*tokenizer) {
             Ok(msgs) => msgs,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");

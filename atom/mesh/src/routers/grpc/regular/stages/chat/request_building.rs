@@ -11,13 +11,12 @@ use crate::routers::{
         client::GrpcClient,
         common::stages::{helpers, PipelineStage},
         context::{ClientSelection, RequestContext, WorkerSelection},
+        engine::payload_to_proto::{to_sglang_proto, to_vllm_proto},
         proto_wrapper::ProtoGenerateRequest,
     },
+    prepare::build_chat_payload,
 };
 
-/// Chat request building stage
-///
-/// Extracts chat-specific request building logic from the old unified RequestBuildingStage.
 pub(crate) struct ChatRequestBuildingStage {
     inject_pd_metadata: bool,
 }
@@ -52,56 +51,45 @@ impl PipelineStage for ChatRequestBuildingStage {
 
         let chat_request = ctx.chat_request_arc();
 
-        // Get client for building request (use prefill client if PD mode)
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
         };
 
-        // Build chat request
         let request_id = format!("chatcmpl-{}", Uuid::new_v4());
         let body_ref = prep.filtered_request.as_ref().unwrap_or(&chat_request);
+        let processed_text = prep
+            .processed_messages
+            .as_ref()
+            .ok_or_else(|| {
+                error!(
+                    function = "ChatRequestBuildingStage::execute",
+                    "Chat preparation missing processed_messages"
+                );
+                error::internal_error(
+                    "processed_messages_missing",
+                    "Chat preparation missing processed_messages",
+                )
+            })?
+            .text
+            .clone();
 
-        // Dispatch to the appropriate client based on backend type
+        let payload = build_chat_payload(
+            request_id,
+            &chat_request,
+            body_ref,
+            &processed_text,
+            prep.token_ids.clone(),
+            prep.tool_constraints.clone(),
+        );
+
         let mut proto_request = match builder_client {
-            GrpcClient::Sglang(sglang_client) => {
-                let req = sglang_client
-                    .build_generate_request_from_chat(
-                        request_id,
-                        body_ref,
-                        prep.processed_messages.as_ref().unwrap().text.clone(),
-                        prep.token_ids.clone(),
-                        prep.processed_messages
-                            .as_ref()
-                            .unwrap()
-                            .multimodal_inputs
-                            .clone(),
-                        prep.tool_constraints.clone(),
-                    )
-                    .map_err(|e| {
-                        error!(function = "ChatRequestBuildingStage::execute", error = %e, "Failed to build SGLang generate request");
-                        error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {}", e))
-                    })?;
-                ProtoGenerateRequest::Sglang(Box::new(req))
+            GrpcClient::Sglang(_) => {
+                ProtoGenerateRequest::Sglang(Box::new(to_sglang_proto(&payload)))
             }
-            GrpcClient::Vllm(vllm_client) => {
-                let req = vllm_client
-                    .build_generate_request_from_chat(
-                        request_id,
-                        body_ref,
-                        prep.processed_messages.as_ref().unwrap().text.clone(),
-                        prep.token_ids.clone(),
-                        prep.tool_constraints.clone(),
-                    )
-                    .map_err(|e| {
-                        error!(function = "ChatRequestBuildingStage::execute", error = %e, "Failed to build vLLM generate request");
-                        error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {}", e))
-                    })?;
-                ProtoGenerateRequest::Vllm(Box::new(req))
-            }
+            GrpcClient::Vllm(_) => ProtoGenerateRequest::Vllm(Box::new(to_vllm_proto(&payload))),
         };
 
-        // Inject PD metadata if needed
         if self.inject_pd_metadata {
             if let WorkerSelection::Dual { prefill, .. } = ctx.state.workers.as_ref().unwrap() {
                 helpers::inject_bootstrap_metadata(&mut proto_request, prefill);

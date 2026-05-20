@@ -95,7 +95,7 @@ pub(crate) struct PreparationOutput {
     pub token_ids: Vec<u32>,
 
     /// Processed messages (chat only)
-    pub processed_messages: Option<super::ProcessedMessages>,
+    pub processed_messages: Option<crate::routers::prepare::chat_template::ProcessedMessages>,
 
     /// Tool call constraints (if applicable)
     pub tool_constraints: Option<(String, String)>,

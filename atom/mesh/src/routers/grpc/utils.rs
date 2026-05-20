@@ -1,35 +1,21 @@
 //! Shared utilities for gRPC routers
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::response::Response;
 use mesh_grpc::sglang_proto::{InputLogProbs, OutputLogProbs};
-use serde_json::Value;
 use tracing::error;
 
 use super::{
     client::GrpcClient,
     context::RequestContext,
     proto_wrapper::{ProtoGenerateComplete, ProtoStream},
-    ProcessedMessages,
 };
 use crate::{
     core::Worker,
-    protocols::{
-        chat::ChatCompletionRequest,
-        common::{ChatLogProbs, ChatLogProbsContent, TopLogProb},
-    },
-    routers::{
-        error,
-        grpc::proto_wrapper::ProtoResponseVariant,
-        prepare::chat_template::{process_content_format, process_tool_call_arguments},
-    },
-    tokenizer::{
-        cache::CachedTokenizer,
-        chat_template::ChatTemplateParams,
-        traits::Tokenizer,
-        HuggingFaceTokenizer,
-    },
+    protocols::common::{ChatLogProbs, ChatLogProbsContent, TopLogProb},
+    routers::{error, grpc::proto_wrapper::ProtoResponseVariant},
+    tokenizer::traits::Tokenizer,
 };
 
 /// Resolve tokenizer from registry and cache it in request context.
@@ -106,128 +92,6 @@ pub(crate) async fn get_grpc_client_from_worker(
         })?;
 
     Ok((*client_arc).clone())
-}
-
-/// Process chat messages and apply template (shared by both routers)
-/// Requires HuggingFace tokenizer with chat template support
-pub(crate) fn process_chat_messages(
-    request: &ChatCompletionRequest,
-    tokenizer: &dyn Tokenizer,
-) -> Result<ProcessedMessages, String> {
-    // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
-    // First try direct downcast, then try via CachedTokenizer wrapper
-    let hf_tokenizer = tokenizer
-        .as_any()
-        .downcast_ref::<HuggingFaceTokenizer>()
-        .or_else(|| {
-            // If direct downcast fails, try to get inner tokenizer from CachedTokenizer
-            tokenizer
-                .as_any()
-                .downcast_ref::<CachedTokenizer>()
-                .and_then(|cached| {
-                    cached
-                        .inner()
-                        .as_any()
-                        .downcast_ref::<HuggingFaceTokenizer>()
-                })
-        });
-
-    let formatted_text = if let Some(hf_tokenizer) = hf_tokenizer {
-        // Get content format and transform messages accordingly
-        let content_format = hf_tokenizer.chat_template_content_format();
-        let mut transformed_messages = process_content_format(&request.messages, content_format)?;
-
-        // Process tool call arguments in assistant messages
-        process_tool_call_arguments(&mut transformed_messages)?;
-
-        // Convert tools to JSON values for template processing
-        let tools_json: Option<Vec<Value>> = request
-            .tools
-            .as_ref()
-            .map(|tools| {
-                tools
-                    .iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()
-            .map_err(|e| format!("Failed to serialize tools: {}", e))?;
-
-        let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
-        let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
-
-        // Add reasoning_effort if present (like Python does)
-        if let Some(reasoning_effort) = &request.reasoning_effort {
-            combined_template_kwargs.insert(
-                "reasoning_effort".to_string(),
-                Value::String(reasoning_effort.clone()),
-            );
-        }
-
-        // Add any additional template kwargs from request
-        if let Some(template_kwargs) = &request.chat_template_kwargs {
-            for (key, value) in template_kwargs {
-                combined_template_kwargs.insert(key.clone(), value.clone());
-            }
-        }
-
-        let final_template_kwargs = if combined_template_kwargs.is_empty() {
-            None
-        } else {
-            Some(&combined_template_kwargs)
-        };
-
-        let params = ChatTemplateParams {
-            add_generation_prompt: true,
-            tools: tools_json.as_deref(),
-            template_kwargs: final_template_kwargs,
-            ..Default::default()
-        };
-
-        // Handle assistant prefix for continue_final_message
-        let assistant_prefix = if request.continue_final_message
-            && !transformed_messages.is_empty()
-            && transformed_messages
-                .last()
-                .and_then(|msg| msg.get("role"))
-                .and_then(|v| v.as_str())
-                == Some("assistant")
-        {
-            // Pop the last message to handle it separately
-            let last_msg = transformed_messages.pop().unwrap();
-            last_msg
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
-        };
-
-        // Apply chat template with the (now possibly shorter) list of messages
-        let rendered = hf_tokenizer
-            .apply_chat_template(&transformed_messages, params)
-            .map_err(|e| format!("Failed to apply chat template: {}", e))?;
-
-        // Append assistant prefix if we have one
-        if let Some(prefix) = assistant_prefix {
-            format!("{}{}", rendered, prefix)
-        } else {
-            rendered
-        }
-    } else {
-        return Err(
-            "gRPC router requires HuggingFace tokenizer with chat template support".to_string(),
-        );
-    };
-
-    // Placeholder for multimodal inputs
-    let multimodal_inputs = None;
-
-    Ok(ProcessedMessages {
-        text: formatted_text,
-        multimodal_inputs,
-        stop_sequences: request.stop.clone(),
-    })
 }
 
 /// Collect responses from a gRPC stream

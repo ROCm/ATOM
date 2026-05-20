@@ -1,12 +1,139 @@
 //! Chat-template rendering helpers: turn `ChatMessage` lists into the JSON
 //! shape that HuggingFace chat templates consume.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
 
 use crate::{
-    protocols::chat::ChatMessage,
-    tokenizer::chat_template::ChatTemplateContentFormat,
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage},
+        common::StringOrArray,
+    },
+    tokenizer::{
+        cache::CachedTokenizer, chat_template::ChatTemplateContentFormat,
+        chat_template::ChatTemplateParams, traits::Tokenizer, HuggingFaceTokenizer,
+    },
 };
+
+/// Output of `process_chat_messages`: rendered prompt + the request's stop
+/// sequences (echoed back so the engine layer doesn't have to re-walk the
+/// request body).
+#[derive(Debug)]
+pub struct ProcessedMessages {
+    pub text: String,
+    pub stop_sequences: Option<StringOrArray>,
+}
+
+/// Process chat messages and apply the HuggingFace chat template.
+///
+/// Requires a HuggingFace tokenizer (directly or via `CachedTokenizer`); other
+/// tokenizer kinds return an error because the gRPC path expects a chat-template
+/// rendered prompt.
+pub fn process_chat_messages(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+) -> Result<ProcessedMessages, String> {
+    let hf_tokenizer = tokenizer
+        .as_any()
+        .downcast_ref::<HuggingFaceTokenizer>()
+        .or_else(|| {
+            tokenizer
+                .as_any()
+                .downcast_ref::<CachedTokenizer>()
+                .and_then(|cached| {
+                    cached
+                        .inner()
+                        .as_any()
+                        .downcast_ref::<HuggingFaceTokenizer>()
+                })
+        });
+
+    let Some(hf_tokenizer) = hf_tokenizer else {
+        return Err(
+            "gRPC router requires HuggingFace tokenizer with chat template support".to_string(),
+        );
+    };
+
+    let content_format = hf_tokenizer.chat_template_content_format();
+    let mut transformed_messages = process_content_format(&request.messages, content_format)?;
+
+    process_tool_call_arguments(&mut transformed_messages)?;
+
+    let tools_json: Option<Vec<Value>> = request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map_err(|e| format!("Failed to serialize tools: {}", e))?;
+
+    let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
+    let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
+
+    if let Some(reasoning_effort) = &request.reasoning_effort {
+        combined_template_kwargs.insert(
+            "reasoning_effort".to_string(),
+            Value::String(reasoning_effort.clone()),
+        );
+    }
+
+    if let Some(template_kwargs) = &request.chat_template_kwargs {
+        for (key, value) in template_kwargs {
+            combined_template_kwargs.insert(key.clone(), value.clone());
+        }
+    }
+
+    let final_template_kwargs = if combined_template_kwargs.is_empty() {
+        None
+    } else {
+        Some(&combined_template_kwargs)
+    };
+
+    let params = ChatTemplateParams {
+        add_generation_prompt: true,
+        tools: tools_json.as_deref(),
+        template_kwargs: final_template_kwargs,
+        ..Default::default()
+    };
+
+    // Handle assistant prefix for continue_final_message
+    let assistant_prefix = if request.continue_final_message
+        && !transformed_messages.is_empty()
+        && transformed_messages
+            .last()
+            .and_then(|msg| msg.get("role"))
+            .and_then(|v| v.as_str())
+            == Some("assistant")
+    {
+        let last_msg = transformed_messages.pop().unwrap();
+        last_msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    let rendered = hf_tokenizer
+        .apply_chat_template(&transformed_messages, params)
+        .map_err(|e| format!("Failed to apply chat template: {}", e))?;
+
+    let formatted_text = if let Some(prefix) = assistant_prefix {
+        format!("{}{}", rendered, prefix)
+    } else {
+        rendered
+    };
+
+    Ok(ProcessedMessages {
+        text: formatted_text,
+        stop_sequences: request.stop.clone(),
+    })
+}
 
 /// Process tool call arguments in messages
 /// Per Transformers docs, tool call arguments in assistant messages should be dicts
