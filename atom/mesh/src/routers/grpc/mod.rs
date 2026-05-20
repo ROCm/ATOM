@@ -4,6 +4,7 @@ pub(crate) mod common;
 pub(crate) mod completion_adapter;
 pub(crate) mod context;
 pub mod engine;
+pub(crate) mod legacy_pipeline;
 pub(crate) mod pd_router; // Used by routers/factory
 pub(crate) mod pipeline;
 pub(crate) mod regular;

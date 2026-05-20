@@ -13,8 +13,7 @@ use super::{
         completion_to_generate, wrap_generate_response_as_completion,
         wrap_streaming_generate_as_completion,
     },
-    context::SharedComponents,
-    pipeline::RequestPipeline,
+    pipeline::Pipeline,
     regular::responses,
 };
 use crate::{
@@ -35,8 +34,8 @@ use crate::{
 #[derive(Clone)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
-    pipeline: RequestPipeline,
-    shared_components: Arc<SharedComponents>,
+    pipeline: Pipeline,
+    app_context: Arc<AppContext>,
     responses_context: ResponsesContext,
     retry_config: RetryConfig,
 }
@@ -44,44 +43,20 @@ pub struct GrpcRouter {
 impl GrpcRouter {
     /// Create a new gRPC router
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
-        // Get tokenizer registry (no longer requires pre-loaded tokenizer)
-        let tokenizer_registry = ctx.tokenizer_registry.clone();
-
-        let reasoning_parser_factory = ctx
-            .reasoning_parser_factory
-            .as_ref()
-            .ok_or_else(|| "gRPC router requires reasoning parser factory".to_string())?
-            .clone();
-        let tool_parser_factory = ctx
-            .tool_parser_factory
-            .as_ref()
-            .ok_or_else(|| "gRPC router requires tool parser factory".to_string())?
-            .clone();
+        if ctx.reasoning_parser_factory.is_none() {
+            return Err("gRPC router requires reasoning parser factory".to_string());
+        }
+        if ctx.tool_parser_factory.is_none() {
+            return Err("gRPC router requires tool parser factory".to_string());
+        }
 
         let worker_registry = ctx.worker_registry.clone();
-        let _policy_registry = ctx.policy_registry.clone();
+        let pipeline = Pipeline::new_regular(worker_registry.clone(), ctx.policy_registry.clone());
+        let app_context = ctx.clone();
 
-        // Create shared components for pipeline
-        let shared_components = Arc::new(SharedComponents {
-            tokenizer_registry: tokenizer_registry.clone(),
-            tool_parser_factory: tool_parser_factory.clone(),
-            reasoning_parser_factory: reasoning_parser_factory.clone(),
-        });
-
-        // Create regular pipeline
-        let pipeline = RequestPipeline::new_regular(
-            worker_registry.clone(),
-            _policy_registry.clone(),
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            ctx.configured_tool_parser.clone(),
-            ctx.configured_reasoning_parser.clone(),
-        );
-
-        // Create responses context
         let responses_context = ResponsesContext::new(
             Arc::new(pipeline.clone()),
-            shared_components.clone(),
+            app_context.clone(),
             ctx.response_storage.clone(),
             ctx.conversation_storage.clone(),
             ctx.conversation_item_storage.clone(),
@@ -90,7 +65,7 @@ impl GrpcRouter {
         Ok(GrpcRouter {
             worker_registry,
             pipeline,
-            shared_components,
+            app_context,
             responses_context,
             retry_config: ctx.router_config.effective_retry_config(),
         })
@@ -114,7 +89,7 @@ impl GrpcRouter {
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
-        let components = self.shared_components.clone();
+        let components = self.app_context.clone();
 
         RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -167,7 +142,7 @@ impl GrpcRouter {
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
-        let components = self.shared_components.clone();
+        let components = self.app_context.clone();
         let pipeline = &self.pipeline;
 
         RetryExecutor::execute_response_with_retry(

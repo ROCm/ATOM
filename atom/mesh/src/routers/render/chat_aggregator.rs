@@ -41,22 +41,32 @@ use crate::{
 };
 
 pub async fn process(stream: WorkerStream, ctx: ResponseContext) -> Response {
+    match process_typed(stream, ctx).await {
+        Ok(resp) => axum::Json(resp).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+pub async fn process_typed(
+    stream: WorkerStream,
+    ctx: ResponseContext,
+) -> Result<ChatCompletionResponse, Response> {
     let chat_request = match &ctx.original {
         ProtocolRequest::Chat(r) => Arc::clone(r),
         ProtocolRequest::Generate(_) => {
-            return error::internal_error(
+            return Err(error::internal_error(
                 "wrong_render_path",
                 "chat_aggregator invoked with a generate request",
-            );
+            ));
         }
     };
 
-    let completes = match collect_completes(stream).await {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
+    let completes = collect_completes(stream).await?;
     if completes.is_empty() {
-        return error::internal_error("no_responses_from_server", "No responses from server");
+        return Err(error::internal_error(
+            "no_responses_from_server",
+            "No responses from server",
+        ));
     }
 
     let history_tool_calls_count = get_history_tool_calls_count(&chat_request);
@@ -113,10 +123,10 @@ pub async fn process(stream: WorkerStream, ctx: ResponseContext) -> Response {
         match res {
             Ok(c) => choices.push(c),
             Err(e) => {
-                return error::internal_error(
+                return Err(error::internal_error(
                     "process_choice_failed",
                     format!("Failed to process choice {}: {}", idx, e),
-                )
+                ))
             }
         }
     }
@@ -136,7 +146,7 @@ pub async fn process(stream: WorkerStream, ctx: ResponseContext) -> Response {
     .maybe_system_fingerprint(weight_version)
     .build();
 
-    axum::Json(response).into_response()
+    Ok(response)
 }
 
 async fn collect_completes(mut stream: WorkerStream) -> Result<Vec<TokenChunk>, Response> {

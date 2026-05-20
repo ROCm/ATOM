@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage};
 
-use crate::routers::grpc::{context::SharedComponents, pipeline::RequestPipeline};
+use crate::{app_context::AppContext, routers::grpc::pipeline::Pipeline};
 
 /// Context for /v1/responses endpoint
 ///
@@ -12,10 +12,10 @@ use crate::routers::grpc::{context::SharedComponents, pipeline::RequestPipeline}
 #[derive(Clone)]
 pub(crate) struct ResponsesContext {
     /// Chat pipeline for executing requests
-    pub pipeline: Arc<RequestPipeline>,
+    pub pipeline: Arc<Pipeline>,
 
-    /// Shared components (tokenizer, parsers)
-    pub components: Arc<SharedComponents>,
+    /// Shared components (tokenizer, parsers, configured names)
+    pub components: Arc<AppContext>,
 
     /// Response storage backend
     pub response_storage: Arc<dyn ResponseStorage>,
@@ -30,8 +30,8 @@ pub(crate) struct ResponsesContext {
 impl ResponsesContext {
     /// Create a new responses context
     pub fn new(
-        pipeline: Arc<RequestPipeline>,
-        components: Arc<SharedComponents>,
+        pipeline: Arc<Pipeline>,
+        components: Arc<AppContext>,
         response_storage: Arc<dyn ResponseStorage>,
         conversation_storage: Arc<dyn ConversationStorage>,
         conversation_item_storage: Arc<dyn ConversationItemStorage>,
