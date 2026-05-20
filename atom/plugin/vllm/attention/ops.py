@@ -2,11 +2,7 @@ from typing import Optional
 
 import torch
 
-from atom.utils.custom_register import direct_register_custom_op
-
-
-def _mark_spliting_op(op_name: str) -> None:
-    getattr(torch.ops.aiter, op_name).spliting_op = True
+from atom.utils import mark_spliting_op
 
 
 def _get_layer_context(layer_name: str):
@@ -20,6 +16,23 @@ def _get_layer_context(layer_name: str):
     return layer, attn_metadata, layer.kv_cache
 
 
+def atom_vllm_mha_attention_fake(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    layer_name: str,
+    positions: Optional[torch.Tensor] = None,
+    q_scale: Optional[torch.Tensor] = None,
+    qkv: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return torch.empty_like(query).contiguous()
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=atom_vllm_mha_attention_fake,
+    mutates_args=[],
+)
 def atom_vllm_mha_attention(
     query: torch.Tensor,
     key: Optional[torch.Tensor],
@@ -42,27 +55,21 @@ def atom_vllm_mha_attention(
     )
 
 
-def atom_vllm_mha_attention_fake(
-    query: torch.Tensor,
-    key: Optional[torch.Tensor],
-    value: Optional[torch.Tensor],
+def atom_vllm_mla_attention_fake(
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
     layer_name: str,
-    positions: Optional[torch.Tensor] = None,
-    q_scale: Optional[torch.Tensor] = None,
-    qkv: Optional[torch.Tensor] = None,
+    output_hidden_size: int,
 ) -> torch.Tensor:
-    return torch.empty_like(query).contiguous()
+    return q.new_empty((q.shape[0], output_hidden_size))
 
 
-direct_register_custom_op(
-    op_name="atom_vllm_mha_attention",
-    op_func=atom_vllm_mha_attention,
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=atom_vllm_mla_attention_fake,
     mutates_args=[],
-    fake_impl=atom_vllm_mha_attention_fake,
 )
-_mark_spliting_op("atom_vllm_mha_attention")
-
-
 def atom_vllm_mla_attention(
     q: torch.Tensor,
     kv_c_normed: torch.Tensor,
@@ -85,22 +92,3 @@ def atom_vllm_mla_attention(
         output=output,
     )
     return output
-
-
-def atom_vllm_mla_attention_fake(
-    q: torch.Tensor,
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
-    layer_name: str,
-    output_hidden_size: int,
-) -> torch.Tensor:
-    return q.new_empty((q.shape[0], output_hidden_size))
-
-
-direct_register_custom_op(
-    op_name="atom_vllm_mla_attention",
-    op_func=atom_vllm_mla_attention,
-    mutates_args=[],
-    fake_impl=atom_vllm_mla_attention_fake,
-)
-_mark_spliting_op("atom_vllm_mla_attention")
