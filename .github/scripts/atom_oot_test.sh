@@ -166,6 +166,33 @@ server_already_running() {
   return 1
 }
 
+# Return 0 if the already-running vLLM server is serving the model at
+# ${1}. We compare on the vLLM `/v1/models` `id` field (which equals the
+# model path the server was launched with), not the human-friendly
+# OOT_MODEL_NAME, because vLLM only exposes the path.
+server_running_model_matches() {
+  local expected_path="$1"
+  local served
+  served=$(curl -fsS "http://127.0.0.1:${VLLM_PORT}/v1/models" 2>/dev/null \
+           | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+ids = [m.get("id", "") for m in data.get("data", [])]
+print("\n".join(ids))
+' 2>/dev/null) || return 1
+  while IFS= read -r served_id; do
+    if [[ "${served_id}" == "${expected_path}" ]]; then
+      return 0
+    fi
+  done <<< "${served}"
+  echo "Running vLLM server is serving model(s): ${served}" >&2
+  echo "Expected model path: ${expected_path}" >&2
+  return 1
+}
+
 launch_one_model() {
   local model_name="$1"
   local model_path="$2"
@@ -176,8 +203,20 @@ launch_one_model() {
   resolved_model_path=$(resolve_model_path "${model_path}")
 
   if server_already_running; then
-    echo "Reusing already-running vLLM server (PID $(cat "${VLLM_PID_FILE}"))."
-    return 0
+    # Don't blindly reuse: verify the running server is actually serving the
+    # model we were asked to launch. Without this check, iterating multiple
+    # models (or running with KEEP_SERVER_ALIVE_ON_EXIT=1 across phases that
+    # change OOT_MODEL_PATH) would silently evaluate accuracy / benchmarks
+    # against the *previous* model and report wrong numbers.
+    if server_running_model_matches "${resolved_model_path}"; then
+      echo "Reusing already-running vLLM server (PID $(cat "${VLLM_PID_FILE}"))."
+      return 0
+    fi
+    echo "ERROR: an existing vLLM server (PID $(cat "${VLLM_PID_FILE}")) is " \
+         "running on port ${VLLM_PORT} but serves a different model than " \
+         "requested. Stop it (or unset KEEP_SERVER_ALIVE_ON_EXIT) before " \
+         "launching ${resolved_model_path}." >&2
+    return 2
   fi
 
   if [[ -n "${extra_args}" ]]; then
