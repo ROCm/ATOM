@@ -26,6 +26,10 @@ on:
         description: "DeepSeek-R1-0528-MXFP4 FP4 TP4"
         type: boolean
         default: false
+      deepseek-r1-fp4-tp4-dp4-ep4:
+        description: "DeepSeek-R1-0528-MXFP4 FP4 TP4 DP4 EP4"
+        type: boolean
+        default: false
       deepseek-r1-fp4-tp8-ep8:
         description: "DeepSeek-R1-0528-MXFP4 FP4 TP8 EP8"
         type: boolean
@@ -299,6 +303,7 @@ jobs:
           ENABLE_DEEPSEEK_R1_FP8_TP4: ${{ inputs.deepseek-r1-fp8-tp4 }}
           ENABLE_DEEPSEEK_R1_FP4_TP8: ${{ inputs.deepseek-r1-fp4-tp8 }}
           ENABLE_DEEPSEEK_R1_FP4_TP4: ${{ inputs.deepseek-r1-fp4-tp4 }}
+          ENABLE_DEEPSEEK_R1_FP4_TP4_DP4_EP4: ${{ inputs.deepseek-r1-fp4-tp4-dp4-ep4 }}
           ENABLE_DEEPSEEK_R1_FP4_TP8_EP8: ${{ inputs.deepseek-r1-fp4-tp8-ep8 }}
           ENABLE_DEEPSEEK_R1_FP4_TP8_MTP3: ${{ inputs.deepseek-r1-fp4-tp8-mtp3 }}
           ENABLE_DEEPSEEK_R1_FP4_TP8_MTP1: ${{ inputs.deepseek-r1-fp4-tp8-mtp1 }}
@@ -343,6 +348,7 @@ jobs:
                   "deepseek-r1-fp8-tp4": os.environ.get("ENABLE_DEEPSEEK_R1_FP8_TP4", ""),
                   "deepseek-r1-fp4-tp8": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8", ""),
                   "deepseek-r1-fp4-tp4": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP4", ""),
+                  "deepseek-r1-fp4-tp4-dp4-ep4": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP4_DP4_EP4", ""),
                   "deepseek-r1-fp4-tp8-ep8": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_EP8", ""),
                   "deepseek-r1-fp4-tp8-mtp3": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_MTP3", ""),
                   "deepseek-r1-fp4-tp8-mtp1": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_MTP1", ""),
@@ -622,6 +628,7 @@ jobs:
             deepseek-r1-fp8-tp4) echo "enabled=${{ inputs.deepseek-r1-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp4-tp8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp4-tp4) echo "enabled=${{ inputs.deepseek-r1-fp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp4-tp4-dp4-ep4) echo "enabled=${{ inputs.deepseek-r1-fp4-tp4-dp4-ep4 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp4-tp8-ep8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-ep8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp4-tp8-mtp3) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-mtp3 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp4-tp8-mtp1) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-mtp1 }}" >> "$GITHUB_OUTPUT" ;;
