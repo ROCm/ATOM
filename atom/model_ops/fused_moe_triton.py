@@ -31,6 +31,11 @@ from aiter.ops.triton.fusions.fused_routing_from_topk import (
 )
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from atom.model_ops.utils import has_triton_kernels
+from atom.utils import envs
+
+_A8W4_TRITON_MOE = os.environ.get(
+    "ATOM_MOE_BACKEND", "matmul_ogs"
+) == "a8w4" and envs.is_set("ATOM_USE_TRITON_MOE")
 
 logger = logging.getLogger("atom")
 
@@ -267,6 +272,8 @@ def _a8w4_fused_experts(
     pre_built_aiter_routing=None,  # if set, skip bridge and use this aiter routing directly
     # Step 9: shared-expert output to fold into GEMM2 reduce_grouped writeback.
     residual: torch.Tensor | None = None,
+    # Step 3: apply_swiglu fold into GEMM1. Requires interleaved W13 (done at weight load).
+    swiglu_fold: bool = False,
 ) -> torch.Tensor:
     """Step 1 minimum a8w4 fused experts.
 
@@ -280,8 +287,6 @@ def _a8w4_fused_experts(
 
     M, K = hidden_states.shape[-2:]
     BLOCK_M = recommend_block_m(M)
-    # Step 3: apply_swiglu fold into GEMM1. Requires interleaved W13 (done at weight load).
-    _swiglu_fold = os.environ.get("ATOM_A8W4_SWIGLU_FOLD", "0") == "1"
 
     # Pre-MoE quant: bf16 -> fp8 e4m3 + ue8m0 per-1x32.
     x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
@@ -303,10 +308,10 @@ def _a8w4_fused_experts(
     if w2_scale.dtype != torch.uint8:
         w2_scale = w2_scale.view(torch.uint8)
 
-    if _swiglu_fold:
+    if swiglu_fold:
         # Step 5: optional fold of MXFP8 (fp8 e4m3 + ue8m0 per-1×32) emit into
         # GEMM1's apply_swiglu writeback. Saves one `downcast_to_mxfp` launch.
-        _mx_emit = os.environ.get("ATOM_A8W4_GEMM1_MX_EMIT", "0") == "1"
+        _mx_emit = os.environ.get("ATOM_A8W4_TRITON_MOE_GEMM1_MX_EMIT", "1") == "1"
         if _mx_emit:
             inter_fp8, inter_scale = moe_gemm_a8w4(
                 x=x_fp8,
@@ -481,6 +486,7 @@ def triton_kernel_fused_experts(
     w13_weight_scale_a8w4: torch.Tensor | None = None,
     w2_weight_scale_a8w4: torch.Tensor | None = None,
     swiglu_limit_a8w4: float = 7.0,
+    swiglu_fold: bool = False,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
@@ -490,7 +496,7 @@ def triton_kernel_fused_experts(
     # a8w4 path: dispatched when env is set AND a8w4 scale tensors were plumbed
     # through. matmul_ogs path below stays untouched.
     _use_a8w4 = (
-        os.environ.get("ATOM_MOE_BACKEND", "matmul_ogs") == "a8w4"
+        _A8W4_TRITON_MOE
         and w13_weight_scale_a8w4 is not None
         and w2_weight_scale_a8w4 is not None
     )
@@ -510,6 +516,7 @@ def triton_kernel_fused_experts(
             w1_bias=w1_bias,
             w2_bias=w2_bias,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_fold=swiglu_fold,
         )
 
     # Shape check for matmul_ogs path (a8w4 has different layout)

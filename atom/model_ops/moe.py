@@ -58,6 +58,20 @@ from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 from atom.quantization.quark.utils import weight_dequant_fp8
 
+_A8W4_TRITON_MOE = os.environ.get(
+    "ATOM_MOE_BACKEND", "matmul_ogs"
+) == "a8w4" and envs.is_set("ATOM_USE_TRITON_MOE")
+_A8W4_TRITON_MOE_ROUTING = (
+    os.environ.get("ATOM_A8W4_TRITON_MOE_ROUTING", "1") == "1" and _A8W4_TRITON_MOE
+)
+_A8W4_TRITON_MOE_HASH_FAST_ROUTING = (
+    os.environ.get("ATOM_A8W4_TRITON_MOE_HASH_FAST_ROUTING", "1") == "1"
+    and _A8W4_TRITON_MOE
+)
+_A8W4_TRITON_MOE_INTERLEAVE_W13 = (
+    os.environ.get("ATOM_A8W4_TRITON_MOE_SWIGLU_FOLD", "1") == "1" and _A8W4_TRITON_MOE
+)
+
 
 class FusedMoeWeightScaleSupported(Enum):
     """Supported quantization strategies for MoE weight scales."""
@@ -832,14 +846,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # Step 1: a8w4 MoE backend weight-layout branch. Reorders W13/W2 into
         # the layout moe_gemm_a8w4 expects and swizzles scales.
-        _use_a8w4_moe = os.environ.get("ATOM_MOE_BACKEND", "matmul_ogs") == "a8w4"
-        if _use_a8w4_moe and self.use_triton:
+        if _A8W4_TRITON_MOE and self.use_triton:
+            # Step 3: gate/up interleave for apply_swiglu fold. Off by default.
             from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
                 swizzle_scales_gfx950 as swizzle_scales,
             )
-
-            # Step 3: gate/up interleave for apply_swiglu fold. Off by default.
-            _interleave_w13 = os.environ.get("ATOM_A8W4_SWIGLU_FOLD", "0") == "1"
 
             def _interleave_gateup(t):
                 """t: [E, 2N, *] → reorder dim=1 from [g..u..] to [g,u,g,u,...]"""
@@ -855,7 +866,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             # W1 weight: view-transpose to [E, K/2, 2N] (no .contiguous())
             w1_w = layer.w13_weight.data.view(torch.uint8)  # [E, 2N, K/2]
-            if _interleave_w13:
+            if _A8W4_TRITON_MOE_INTERLEAVE_W13:
                 w1_w = _interleave_gateup(w1_w)
             w1_w_kernel = w1_w.transpose(-1, -2)  # [E, K/2, 2N], view
             assert (
@@ -864,7 +875,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             # W1 scale: transpose + contiguous + swizzle
             w1_s = layer.w13_weight_scale.data  # [E, 2N, K/32]
-            if _interleave_w13:
+            if _A8W4_TRITON_MOE_INTERLEAVE_W13:
                 w1_s = _interleave_gateup(w1_s)
             w1_s_swz_in = w1_s.transpose(-1, -2).contiguous()  # [E, K/32, 2N]
             w1_s_E, w1_s_SCALE_K, w1_s_N = w1_s_swz_in.shape
@@ -903,7 +914,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w13_precision_config = None
             self.w2_precision_config = None
             self.moe_backend = "a8w4"
-            self.a8w4_swiglu_fold = _interleave_w13
+            self.swiglu_fold = _A8W4_TRITON_MOE_INTERLEAVE_W13
             return
 
         if self.use_triton:
@@ -997,9 +1008,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import (
+                _a8w4_fused_experts,
                 triton_kernel_moe_forward,
                 triton_kernel_fused_experts,
                 fused_routing_from_topk_triton,
+            )
+            from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
+            from aiter.ops.triton.moe.moe_routing.routing import (
+                routing_a8w4,
+                routing_a8w4_from_hash,
+                routing_a8w4_from_topk,
             )
 
             # Check if the model needs custom routing that triton routing()
@@ -1033,17 +1051,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
                 _a8w4_hash_fused = (
                     _hash_layer
-                    and os.environ.get("ATOM_A8W4_TRITON_ROUTING", "0") == "1"
-                    and os.environ.get("ATOM_A8W4_HASH_FAST_ROUTING", "0") == "1"
+                    and _A8W4_TRITON_MOE_ROUTING
+                    and _A8W4_TRITON_MOE_HASH_FAST_ROUTING
                     and layer.num_fused_shared_experts == 0
                 )
                 if _a8w4_hash_fused:
-                    from aiter.ops.triton.moe.moe_routing.routing import (
-                        routing_a8w4_from_hash,
-                    )
-                    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
-                    from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
-
                     moe_layer = custom_routing_function.__self__
                     tid2eid = moe_layer.gate.tid2eid
 
@@ -1097,11 +1109,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         apply_router_weight_on_input=layer.apply_router_weight_on_input,
                         pre_built_aiter_routing=aiter_routing,
                         residual=moe_residual,
+                        swiglu_fold=getattr(self, "swiglu_fold", False),
                     )
 
                 _a8w4_triton_routing = (
                     _a8w4
-                    and os.environ.get("ATOM_A8W4_TRITON_ROUTING", "0") == "1"
+                    and _A8W4_TRITON_MOE_ROUTING
                     and scoring_func == "sqrtsoftplus"
                     and not use_grouped_topk
                     and custom_routing_function is None
@@ -1110,10 +1123,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if _a8w4_triton_routing:
                     # Step 4: aiter `routing_a8w4` does V4 math + topk + sort + ExptData
                     # in one Triton pipeline. Skip FusedMoE.select_experts + bridge.
-                    from aiter.ops.triton.moe.moe_routing.routing import routing_a8w4
-                    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
-                    from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
-
                     n_expts_tot = router_logits.shape[-1]
                     if global_num_experts > 0:
                         n_expts_tot = global_num_experts
@@ -1153,6 +1162,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         apply_router_weight_on_input=layer.apply_router_weight_on_input,
                         pre_built_aiter_routing=aiter_routing,
                         residual=moe_residual,
+                        swiglu_fold=getattr(self, "swiglu_fold", False),
                     )
 
                 # Use ATOM's full-featured select_experts for routing,
@@ -1182,8 +1192,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_gates_pad = topk_weights.shape[0] * topk_weights.shape[1]
                 _a8w4_topk_fast = (
                     _a8w4
-                    and os.environ.get("ATOM_A8W4_TRITON_ROUTING", "0") == "1"
-                    and os.environ.get("ATOM_A8W4_HASH_FAST_ROUTING", "0") == "1"
+                    and _A8W4_TRITON_MOE_ROUTING
+                    and _A8W4_TRITON_MOE_HASH_FAST_ROUTING
                     and layer.num_fused_shared_experts == 0
                     and n_gates_pad <= 4096
                 )
@@ -1195,11 +1205,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     # Bounded by `fused_routing_from_topk`'s 4096-NK single-CTA budget;
                     # prefill exceeds this and falls through to the matmul_ogs path
                     # where routing overhead is amortised over much larger GEMM work.
-                    from aiter.ops.triton.moe.moe_routing.routing import (
-                        routing_a8w4_from_topk,
-                    )
-                    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
-                    from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
 
                     block_m = recommend_block_m(x.shape[-2])
                     aiter_routing, gather_src, scatter_src = routing_a8w4_from_topk(
@@ -1226,6 +1231,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         apply_router_weight_on_input=layer.apply_router_weight_on_input,
                         pre_built_aiter_routing=aiter_routing,
                         residual=moe_residual,
+                        swiglu_fold=getattr(self, "swiglu_fold", False),
                     )
 
                 routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
@@ -1256,6 +1262,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w13_weight_scale_a8w4=(layer.w13_weight_scale if _a8w4 else None),
                     w2_weight_scale_a8w4=(layer.w2_weight_scale if _a8w4 else None),
                     swiglu_limit_a8w4=getattr(layer, "swiglu_limit", 0.0),
+                    swiglu_fold=getattr(self, "swiglu_fold", False),
                 )
                 return _moe_result
 
