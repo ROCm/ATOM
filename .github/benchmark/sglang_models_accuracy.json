@@ -94,5 +94,29 @@
     "accuracy_baseline": null,
     "accuracy_baseline_model": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
     "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+  },
+  {
+    "model_name": "DeepSeek-R1-FP4 TP8 MTP3",
+    "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+    "extraArgs": "--tensor-parallel-size 8 --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4",
+    "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
+    "runner": "linux-atom-mi35x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+  },
+  {
+    "model_name": "DeepSeek-R1-FP4 TP8 MTP1",
+    "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+    "extraArgs": "--tensor-parallel-size 8 --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2",
+    "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
+    "runner": "linux-atom-mi35x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
   }
 ]
