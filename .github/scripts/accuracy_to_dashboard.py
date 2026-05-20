@@ -48,16 +48,28 @@ def build_entries(
         cfg = model_configs.get(model_name, {})
         accuracy_task = cfg.get("accuracy_task", "gsm8k")
 
-        # Extract accuracy scores. lm_eval keys results by the task name,
-        # so models with accuracy_task=gsm8k_cot land under results["gsm8k_cot"]
-        # rather than results["gsm8k"]. Read the configured task to avoid
-        # silently dropping non-default tasks from the dashboard.
+        # Extract accuracy scores. lm_eval keys results by task name, and the
+        # primary metric depends on the task: atom-test.yaml uses
+        # exact_match,strict-match for gsm8k_cot and exact_match,flexible-extract
+        # for plain gsm8k (see RESULT_METRIC selection around line 562). The
+        # dashboard MUST publish the same metric the CI threshold / baseline
+        # refer to, otherwise reviewers see a dashboard score that doesn't
+        # match the threshold check in the PR run.
+        if accuracy_task == "gsm8k_cot":
+            primary_metric = "exact_match,strict-match"
+            secondary_metric = "exact_match,flexible-extract"
+        else:
+            primary_metric = "exact_match,flexible-extract"
+            secondary_metric = "exact_match,strict-match"
+
         results = data.get("results", {})
         task_results = results.get(accuracy_task, {})
-        score = task_results.get("exact_match,flexible-extract")
+        score = task_results.get(primary_metric)
         if score is None:
             continue
-        strict_score = task_results.get("exact_match,strict-match")
+        # Keep the non-primary metric around for the "extra" metadata field
+        # so reviewers still see both numbers, just labelled clearly.
+        strict_score = task_results.get(secondary_metric)
 
         # Build extra metadata
         extra_parts = []
@@ -104,7 +116,11 @@ def build_entries(
 
         try:
             if strict_score is not None:
-                extra_parts.append(f"strict-match: {round(float(strict_score), 4)}")
+                # Label the secondary metric by what it actually is, not the
+                # hard-coded "strict-match" string. For gsm8k the secondary
+                # is strict-match; for gsm8k_cot it's flexible-extract.
+                secondary_label = secondary_metric.split(",", 1)[-1]
+                extra_parts.append(f"{secondary_label}: {round(float(strict_score), 4)}")
         except (TypeError, ValueError):
             pass
 
