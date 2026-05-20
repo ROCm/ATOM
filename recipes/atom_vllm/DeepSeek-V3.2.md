@@ -48,7 +48,6 @@ vllm bench serve \
     --dataset-name random \
     --random-input-len 1000 \
     --random-output-len 100 \
-    --temperature 0.0 \
     --max-concurrency 4 \
     --num-prompts 40 \
     --trust_remote_code \
