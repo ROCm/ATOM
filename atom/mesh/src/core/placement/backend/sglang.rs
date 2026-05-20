@@ -42,29 +42,27 @@ impl BackendAdapter for SglangAdapter {
         }))
     }
 
-    fn inject_prefill_fields(
-        &self,
-        body: &mut Value,
-        ctx: &PairCtx,
-    ) -> Result<(), AdapterError> {
+    fn inject_prefill_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
         let ctx = downcast(ctx)?;
         let obj = body.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
         obj.insert(
             "bootstrap_host".to_string(),
             Value::from(ctx.bootstrap_host.as_str()),
         );
-        obj.insert("bootstrap_port".to_string(), port_to_value(ctx.bootstrap_port));
-        obj.insert("bootstrap_room".to_string(), Value::from(ctx.bootstrap_room));
+        obj.insert(
+            "bootstrap_port".to_string(),
+            port_to_value(ctx.bootstrap_port),
+        );
+        obj.insert(
+            "bootstrap_room".to_string(),
+            Value::from(ctx.bootstrap_room),
+        );
         Ok(())
     }
 
     /// No-op: SGLang dual-dispatch does not inject on the decode side.
     /// Still validates ctx type so a wrong-adapter call surfaces as CtxTypeMismatch.
-    fn inject_decode_fields(
-        &self,
-        _body: &mut Value,
-        ctx: &PairCtx,
-    ) -> Result<(), AdapterError> {
+    fn inject_decode_fields(&self, _body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
         downcast(ctx)?;
         Ok(())
     }

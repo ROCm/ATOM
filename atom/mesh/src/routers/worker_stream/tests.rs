@@ -33,7 +33,10 @@ mod a_token_chunk {
             logprobs: None,
         };
         match c {
-            TokenChunk::Partial { token_ids, logprobs } => {
+            TokenChunk::Partial {
+                token_ids,
+                logprobs,
+            } => {
                 assert_eq!(token_ids, vec![10, 20]);
                 assert!(logprobs.is_none());
             }
@@ -159,10 +162,8 @@ mod a_token_chunk {
             FinishReason::Other("custom".to_string()),
         ];
         // No accidental Eq collapse — at least 6 distinct kinds at the discriminant level.
-        let kinds: std::collections::HashSet<_> = reasons
-            .iter()
-            .map(|r| std::mem::discriminant(r))
-            .collect();
+        let kinds: std::collections::HashSet<_> =
+            reasons.iter().map(|r| std::mem::discriminant(r)).collect();
         assert_eq!(kinds.len(), 6);
     }
 
@@ -230,8 +231,8 @@ mod b_engine_error {
 }
 
 mod c_worker_stream {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use futures::StreamExt;
     use tokio::sync::mpsc;
@@ -341,7 +342,9 @@ mod d_test_support_self_test {
     use futures::StreamExt;
 
     use crate::routers::worker_stream::engine_error::EngineError;
-    use crate::routers::worker_stream::test_support::{synthetic_pd_stream, synthetic_single_stream};
+    use crate::routers::worker_stream::test_support::{
+        synthetic_pd_stream, synthetic_single_stream,
+    };
     use crate::routers::worker_stream::token_chunk::TokenChunk;
 
     #[tokio::test]

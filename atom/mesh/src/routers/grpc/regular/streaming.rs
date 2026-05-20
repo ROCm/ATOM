@@ -983,10 +983,8 @@ impl StreamingProcessor {
                     let e2e_latency = start_time.elapsed().as_secs_f64();
 
                     // Parse finish_reason
-                    let finish_reason = parse_finish_reason(
-                        complete.finish_reason(),
-                        complete.completion_tokens(),
-                    );
+                    let finish_reason =
+                        parse_finish_reason(complete.finish_reason(), complete.completion_tokens());
 
                     // Send final chunk with finish_reason
                     let finish_response = json!({
@@ -1166,12 +1164,8 @@ impl StreamingProcessor {
                 // First chunk: send name and id
                 has_tool_calls.insert(index, true);
 
-                let tool_call_id = generate_tool_call_id(
-                    model,
-                    &function.name,
-                    0,
-                    history_tool_calls_count,
-                );
+                let tool_call_id =
+                    generate_tool_call_id(model, &function.name, 0, history_tool_calls_count);
 
                 chunks.push(
                     ChatCompletionStreamResponse::builder(request_id, model)

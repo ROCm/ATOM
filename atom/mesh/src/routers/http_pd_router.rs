@@ -44,8 +44,7 @@ use crate::{
         generate::GenerateRequest,
     },
     routers::{
-        error,
-        header_utils,
+        error, header_utils,
         shared::{
             metrics_utils::{error_type_from_status, route_to_endpoint},
             placement_response::placement_err_to_response,
@@ -174,7 +173,8 @@ impl PDRouter {
         let adapter: Arc<dyn BackendAdapter> = match backend {
             BackendType::Sglang => Arc::new(SglangAdapter),
             BackendType::Vllm => {
-                let info = Arc::new(Self::fetch_vllm_prefill_info(&worker_registry, &client).await?);
+                let info =
+                    Arc::new(Self::fetch_vllm_prefill_info(&worker_registry, &client).await?);
                 Arc::new(VllmAdapter::new(info))
             }
         };
@@ -221,10 +221,7 @@ impl PDRouter {
             let port = worker.bootstrap_port().unwrap_or(8998);
             let bootstrap_addr = format!("http://{}:{}", host, port);
 
-            info!(
-                "Querying vLLM prefill bootstrap: {}/query",
-                bootstrap_addr
-            );
+            info!("Querying vLLM prefill bootstrap: {}/query", bootstrap_addr);
 
             let resp = client
                 .get(format!("{}/query", bootstrap_addr))
@@ -443,15 +440,22 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut prefill_request_json = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
+                        let mut prefill_request_json =
+                            match serde_json::to_value(shared_request.as_ref()) {
+                                Ok(v) => v,
+                                Err(e) => return Self::handle_serialization_error(e),
+                            };
                         let mut decode_request_json = prefill_request_json.clone();
-                        if let Err(e) = self.adapter.inject_prefill_fields(&mut prefill_request_json, &ctx) {
+                        if let Err(e) = self
+                            .adapter
+                            .inject_prefill_fields(&mut prefill_request_json, &ctx)
+                        {
                             return Self::handle_serialization_error(e);
                         }
-                        if let Err(e) = self.adapter.inject_decode_fields(&mut decode_request_json, &ctx) {
+                        if let Err(e) = self
+                            .adapter
+                            .inject_decode_fields(&mut decode_request_json, &ctx)
+                        {
                             return Self::handle_serialization_error(e);
                         }
                         let correlation_id = self.adapter.correlation_id(&ctx);
@@ -544,8 +548,7 @@ impl PDRouter {
         );
         let prefill_url_for_log = prefill.url().to_string();
         let prefill_for_outcome = prefill.clone();
-        let correlation_for_log =
-            correlation_id.unwrap_or_else(|| "unknown".to_string());
+        let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
         tokio::spawn(async move {
             match prefill_post.send().await {
                 Ok(res) => {
@@ -703,7 +706,10 @@ impl PDRouter {
                         };
 
                         let inject_result = match context.batch_size {
-                            Some(n) => self.adapter.inject_batch_prefill_fields(&mut json_request, &ctx, n),
+                            Some(n) => {
+                                self.adapter
+                                    .inject_batch_prefill_fields(&mut json_request, &ctx, n)
+                            }
                             None => self.adapter.inject_prefill_fields(&mut json_request, &ctx),
                         };
                         if let Err(e) = inject_result {
@@ -1328,7 +1334,9 @@ impl RouterTrait for PDRouter {
             ..Default::default()
         };
         let (prefill, decode) = match self.planner.plan(&descriptor).await {
-            Ok(PlacementPlan::Pair { prefill, decode, .. }) => (prefill, decode),
+            Ok(PlacementPlan::Pair {
+                prefill, decode, ..
+            }) => (prefill, decode),
             Ok(PlacementPlan::Single { .. }) => {
                 return error::internal_error(
                     "unexpected_single_plan",
@@ -1540,9 +1548,7 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{
-        placement::backend::sglang::SglangAdapter, BasicWorkerBuilder, WorkerType,
-    };
+    use crate::core::{placement::backend::sglang::SglangAdapter, BasicWorkerBuilder, WorkerType};
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());

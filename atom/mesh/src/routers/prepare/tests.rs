@@ -76,7 +76,10 @@ mod a_chat_template {
     fn test_simple_string_content_unchanged() {
         let messages = vec![user_text("Simple text message")];
         let result = process_content_format(&messages, ChatTemplateContentFormat::String).unwrap();
-        assert_eq!(result[0]["content"].as_str().unwrap(), "Simple text message");
+        assert_eq!(
+            result[0]["content"].as_str().unwrap(),
+            "Simple text message"
+        );
     }
 
     #[test]
@@ -86,7 +89,10 @@ mod a_chat_template {
                 content: MessageContent::Text("System prompt".to_string()),
                 name: None,
             },
-            user_parts(vec![text_part("User message"), image("https://e/x.jpg", None)]),
+            user_parts(vec![
+                text_part("User message"),
+                image("https://e/x.jpg", None),
+            ]),
         ];
         let result = process_content_format(&messages, ChatTemplateContentFormat::String).unwrap();
         assert_eq!(result.len(), 2);
@@ -107,7 +113,10 @@ mod a_chat_template {
     fn test_mixed_text_and_parts_across_messages() {
         let messages = vec![
             user_text("Plain text"),
-            user_parts(vec![text_part("With image"), image("https://e/x.jpg", Some("low"))]),
+            user_parts(vec![
+                text_part("With image"),
+                image("https://e/x.jpg", Some("low")),
+            ]),
         ];
         let result_string =
             process_content_format(&messages, ChatTemplateContentFormat::String).unwrap();
@@ -139,7 +148,10 @@ mod a_chat_template {
         }];
         let result = process_content_format(&messages, ChatTemplateContentFormat::String).unwrap();
         let args = &result[0]["tool_calls"][0]["function"]["arguments"];
-        assert!(args.is_object(), "args should be parsed to object, got {args}");
+        assert!(
+            args.is_object(),
+            "args should be parsed to object, got {args}"
+        );
         assert_eq!(args["a"], json!(1));
         assert_eq!(args["b"], json!(2));
     }
@@ -194,9 +206,9 @@ mod b_tool_constraints {
         Function, JsonSchemaResponseFormat, ResponseFormat, Tool, ToolChoice, ToolChoiceValue,
     };
     use crate::routers::prepare::tool_constraints::{
-        build_required_array_schema, filter_chat_request_by_tool_choice, filter_tools_by_tool_choice,
-        generate_tool_call_id, generate_tool_constraints, get_history_tool_calls_count,
-        parse_json_schema_response,
+        build_required_array_schema, filter_chat_request_by_tool_choice,
+        filter_tools_by_tool_choice, generate_tool_call_id, generate_tool_constraints,
+        get_history_tool_calls_count, parse_json_schema_response,
     };
 
     fn tool(name: &str) -> Tool {
@@ -214,15 +226,25 @@ mod b_tool_constraints {
     #[test]
     fn test_generate_constraints_none_for_choice_none() {
         let tools = vec![tool("a"), tool("b")];
-        let constraints = generate_tool_constraints(&tools, &Some(ToolChoice::Value(ToolChoiceValue::None)), "any-model");
-        assert!(constraints.is_none(), "ToolChoice::None must yield no constraint");
+        let constraints = generate_tool_constraints(
+            &tools,
+            &Some(ToolChoice::Value(ToolChoiceValue::None)),
+            "any-model",
+        );
+        assert!(
+            constraints.is_none(),
+            "ToolChoice::None must yield no constraint"
+        );
     }
 
     #[test]
     fn test_generate_constraints_some_for_choice_required() {
         let tools = vec![tool("a")];
-        let constraints =
-            generate_tool_constraints(&tools, &Some(ToolChoice::Value(ToolChoiceValue::Required)), "m");
+        let constraints = generate_tool_constraints(
+            &tools,
+            &Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            "m",
+        );
         let (key, body) = constraints.expect("required tools must produce a constraint");
         assert!(!key.is_empty());
         assert!(!body.is_empty());
@@ -369,21 +391,24 @@ mod b_tool_constraints {
             ChatMessage::Assistant {
                 content: None,
                 name: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: "c1".to_string(),
-                    r#type: "function".to_string(),
-                    function: FunctionCallResponse {
-                        name: "x".to_string(),
-                        arguments: "{}".to_string(),
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "c1".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCallResponse {
+                            name: "x".to_string(),
+                            arguments: "{}".to_string(),
+                        },
                     },
-                }, ToolCall {
-                    id: "c2".to_string(),
-                    r#type: "function".to_string(),
-                    function: FunctionCallResponse {
-                        name: "y".to_string(),
-                        arguments: "{}".to_string(),
+                    ToolCall {
+                        id: "c2".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCallResponse {
+                            name: "y".to_string(),
+                            arguments: "{}".to_string(),
+                        },
                     },
-                }]),
+                ]),
                 reasoning_content: None,
                 refusal: None,
                 audio: None,
@@ -468,8 +493,8 @@ mod c_stop_sequence_decoder {
 
 mod d_parser_factory_lookup {
     use crate::routers::prepare::parser_factory_lookup::{
-        check_reasoning_parser_availability, check_tool_parser_availability, create_reasoning_parser,
-        create_tool_parser, get_reasoning_parser, get_tool_parser,
+        check_reasoning_parser_availability, check_tool_parser_availability,
+        create_reasoning_parser, create_tool_parser, get_reasoning_parser, get_tool_parser,
     };
 
     fn reasoning_factory() -> std::sync::Arc<crate::reasoning_parser::ParserFactory> {
@@ -755,12 +780,14 @@ mod h_prepare_chat_generate {
 
     use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
     use crate::protocols::generate::GenerateRequest;
-    use crate::routers::prepare::{prepare_chat, prepare_generate, lookup_tokenizer};
     use crate::routers::prepare::generation_payload::GenerationPayload;
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
+    use crate::routers::prepare::{lookup_tokenizer, prepare_chat, prepare_generate};
 
     fn shared_components() -> std::sync::Arc<crate::routers::http_router::SharedComponents> {
-        unimplemented!("shared components fixture — built by prepare/tests.rs::test_support when impl lands");
+        unimplemented!(
+            "shared components fixture — built by prepare/tests.rs::test_support when impl lands"
+        );
     }
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
@@ -823,8 +850,13 @@ mod h_prepare_chat_generate {
     #[test]
     fn test_prepare_chat_carries_original_text_in_context() {
         let components = shared_components();
-        let (_, ctx) =
-            prepare_chat(chat_req(false), None, Some("m".to_string()), components.as_ref()).unwrap();
+        let (_, ctx) = prepare_chat(
+            chat_req(false),
+            None,
+            Some("m".to_string()),
+            components.as_ref(),
+        )
+        .unwrap();
         assert!(ctx.original_text.is_some());
     }
 
@@ -840,7 +872,10 @@ mod h_prepare_chat_generate {
         .expect("ok");
         assert_ne!(payload.request_id, "");
         assert!(matches!(ctx.original, ProtocolRequest::Generate(_)));
-        assert!(ctx.processed_messages.is_none(), "generate path has no chat messages");
+        assert!(
+            ctx.processed_messages.is_none(),
+            "generate path has no chat messages"
+        );
     }
 
     #[test]
@@ -875,8 +910,13 @@ mod h_prepare_chat_generate {
     #[test]
     fn test_prepare_chat_does_not_share_mutable_state_with_prepare_generate() {
         let components = shared_components();
-        let (p_chat, _c_chat) =
-            prepare_chat(chat_req(false), None, Some("m".to_string()), components.as_ref()).unwrap();
+        let (p_chat, _c_chat) = prepare_chat(
+            chat_req(false),
+            None,
+            Some("m".to_string()),
+            components.as_ref(),
+        )
+        .unwrap();
         let (p_gen, _c_gen) = prepare_generate(
             generate_req(false),
             None,
@@ -910,8 +950,13 @@ mod h_prepare_chat_generate {
         };
         req.stream = false;
         let components = shared_components();
-        let (payload, _ctx) =
-            prepare_chat(Arc::new(req), None, Some("m".to_string()), components.as_ref()).unwrap();
+        let (payload, _ctx) = prepare_chat(
+            Arc::new(req),
+            None,
+            Some("m".to_string()),
+            components.as_ref(),
+        )
+        .unwrap();
         assert!(payload.tool_constraints.is_some());
     }
 
@@ -921,8 +966,13 @@ mod h_prepare_chat_generate {
         // it as None so that the engine can route to either single or PD placement
         // without prepare presuming a deployment shape.
         let components = shared_components();
-        let (payload, _) =
-            prepare_chat(chat_req(false), None, Some("m".to_string()), components.as_ref()).unwrap();
+        let (payload, _) = prepare_chat(
+            chat_req(false),
+            None,
+            Some("m".to_string()),
+            components.as_ref(),
+        )
+        .unwrap();
         assert!(payload.pd_metadata.is_none());
     }
 

@@ -152,9 +152,7 @@ mod a_payload_to_proto {
         crate::routers::grpc::engine::tests::oracle::sglang_oracle_for(p)
     }
 
-    fn upstream_vllm_proto(
-        p: &GenerationPayload,
-    ) -> mesh_grpc::vllm_proto::GenerateRequest {
+    fn upstream_vllm_proto(p: &GenerationPayload) -> mesh_grpc::vllm_proto::GenerateRequest {
         crate::routers::grpc::engine::tests::oracle::vllm_oracle_for(p)
     }
 
@@ -348,7 +346,8 @@ mod b_proto_to_chunk {
     use mesh_grpc::sglang_proto;
 
     use crate::routers::grpc::engine::proto_to_chunk::{
-        sglang_chunk_to_chunk, sglang_complete_to_chunk, vllm_chunk_to_chunk, vllm_complete_to_chunk,
+        sglang_chunk_to_chunk, sglang_complete_to_chunk, vllm_chunk_to_chunk,
+        vllm_complete_to_chunk,
     };
     use crate::routers::worker_stream::token_chunk::{FinishReason, MatchedStop, TokenChunk};
 
@@ -396,9 +395,8 @@ mod b_proto_to_chunk {
     #[test]
     fn test_sglang_complete_to_chunk_matched_stop_str() {
         let mut c = sg_complete(vec![1]);
-        c.matched_stop = Some(sglang_proto::generate_complete::MatchedStop::MatchedStopStr(
-            "<eot>".to_string(),
-        ));
+        c.matched_stop =
+            Some(sglang_proto::generate_complete::MatchedStop::MatchedStopStr("<eot>".to_string()));
         let chunk = sglang_complete_to_chunk(c);
         match chunk {
             TokenChunk::Complete {
@@ -412,9 +410,7 @@ mod b_proto_to_chunk {
     #[test]
     fn test_sglang_complete_to_chunk_matched_stop_token_id() {
         let mut c = sg_complete(vec![1]);
-        c.matched_stop = Some(
-            sglang_proto::generate_complete::MatchedStop::MatchedStopTokenId(2),
-        );
+        c.matched_stop = Some(sglang_proto::generate_complete::MatchedStop::MatchedStopTokenId(2));
         let chunk = sglang_complete_to_chunk(c);
         match chunk {
             TokenChunk::Complete {
@@ -628,7 +624,7 @@ mod d_pd_stream_merge {
     use crate::routers::grpc::engine::pd_stream_merge::merge_pd_streams;
     use crate::routers::worker_stream::engine_error::EngineError;
     use crate::routers::worker_stream::test_support::{
-        scripted_stream_with_poll_counter, scripted_stream_with_drop_observer, ScriptedItem,
+        scripted_stream_with_drop_observer, scripted_stream_with_poll_counter, ScriptedItem,
     };
     use crate::routers::worker_stream::token_chunk::{
         FinishReason, InputLogprobs, TokenChunk, TokenLogprob, Usage, WorkerMeta,
@@ -769,7 +765,10 @@ mod d_pd_stream_merge {
         let first = merged.next().await.expect("merger yields one item");
         assert!(matches!(first, Err(EngineError::Prefill(_))));
         let second = merged.next().await;
-        assert!(second.is_none(), "Terminal state must yield None subsequently");
+        assert!(
+            second.is_none(),
+            "Terminal state must yield None subsequently"
+        );
         assert_eq!(
             decode_polls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -779,9 +778,9 @@ mod d_pd_stream_merge {
 
     #[tokio::test]
     async fn pd_merge_t4_prefill_silent_after_streaming_transition() {
-        let (prefill, prefill_polls) = scripted_stream_with_poll_counter(vec![
-            ScriptedItem::Ok(complete_with_input_logprobs(Some(ip(2)))),
-        ]);
+        let (prefill, prefill_polls) = scripted_stream_with_poll_counter(vec![ScriptedItem::Ok(
+            complete_with_input_logprobs(Some(ip(2))),
+        )]);
         let (decode, _) = scripted_stream_with_poll_counter(vec![
             ScriptedItem::Ok(partial(1)),
             ScriptedItem::Ok(partial(2)),
@@ -795,17 +794,15 @@ mod d_pd_stream_merge {
         assert_eq!(items.len(), 6);
         // Exactly one poll consumed the prefill Complete; merger does not poll
         // prefill again after transition to Streaming.
-        assert_eq!(
-            prefill_polls.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(prefill_polls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn pd_merge_t5_decode_transport_error_propagates_and_prefill_dropped() {
-        let (prefill, _, prefill_drop_observed) = scripted_stream_with_drop_observer(vec![
-            ScriptedItem::Ok(complete_with_input_logprobs(None)),
-        ]);
+        let (prefill, _, prefill_drop_observed) =
+            scripted_stream_with_drop_observer(vec![ScriptedItem::Ok(
+                complete_with_input_logprobs(None),
+            )]);
         let (decode, _, _) = scripted_stream_with_drop_observer(vec![
             ScriptedItem::Ok(partial(1)),
             ScriptedItem::Ok(partial(2)),
@@ -833,9 +830,9 @@ mod d_pd_stream_merge {
     #[tokio::test]
     async fn pd_merge_t5_prefill_early_close_yields_typed_error() {
         let (prefill, _) = scripted_stream_with_poll_counter(Vec::new());
-        let (decode, _) = scripted_stream_with_poll_counter(vec![
-            ScriptedItem::Ok(complete_with_input_logprobs(None)),
-        ]);
+        let (decode, _) = scripted_stream_with_poll_counter(vec![ScriptedItem::Ok(
+            complete_with_input_logprobs(None),
+        )]);
         let mut merged = merge_pd_streams(prefill, decode, true);
         let first = merged.next().await.unwrap();
         assert!(matches!(first, Err(EngineError::PrefillEarlyClose)));
@@ -843,9 +840,10 @@ mod d_pd_stream_merge {
 
     #[tokio::test]
     async fn pd_merge_t6_consumer_drop_propagates_to_both_upstreams() {
-        let (prefill, _, prefill_drop_observed) = scripted_stream_with_drop_observer(vec![
-            ScriptedItem::Ok(complete_with_input_logprobs(None)),
-        ]);
+        let (prefill, _, prefill_drop_observed) =
+            scripted_stream_with_drop_observer(vec![ScriptedItem::Ok(
+                complete_with_input_logprobs(None),
+            )]);
         let (decode, _, decode_drop_observed) = scripted_stream_with_drop_observer(vec![
             ScriptedItem::Ok(partial(1)),
             ScriptedItem::Ok(partial(2)),
@@ -863,8 +861,7 @@ mod d_pd_stream_merge {
 
     #[tokio::test]
     async fn pd_merge_t7_pending_prefill_blocks_decode_until_timeout() {
-        let (prefill, _) =
-            crate::routers::worker_stream::test_support::pending_forever_stream();
+        let (prefill, _) = crate::routers::worker_stream::test_support::pending_forever_stream();
         let (decode, _) = scripted_stream_with_poll_counter(vec![
             ScriptedItem::Ok(partial(1)),
             ScriptedItem::Ok(complete_with_input_logprobs(None)),
@@ -881,9 +878,9 @@ mod d_pd_stream_merge {
 
     #[tokio::test]
     async fn pd_merge_decode_incomplete_yields_typed_error() {
-        let (prefill, _) = scripted_stream_with_poll_counter(vec![
-            ScriptedItem::Ok(complete_with_input_logprobs(None)),
-        ]);
+        let (prefill, _) = scripted_stream_with_poll_counter(vec![ScriptedItem::Ok(
+            complete_with_input_logprobs(None),
+        )]);
         let (decode, _) = scripted_stream_with_poll_counter(vec![ScriptedItem::Ok(partial(1))]);
         let mut merged = merge_pd_streams(prefill, decode, true);
         let _first = merged.next().await.unwrap().unwrap();
@@ -912,9 +909,9 @@ mod d_pd_stream_merge {
 mod e_engine_dispatch {
     use std::sync::Arc;
 
-    use crate::core::Worker;
     use crate::core::placement::types::PlacementPlan;
-    use crate::routers::grpc::engine::{GrpcEngine, ClientRegistry};
+    use crate::core::Worker;
+    use crate::routers::grpc::engine::{ClientRegistry, GrpcEngine};
     use crate::routers::prepare::generation_payload::{
         GenerationPayload, LogprobConfig, SamplingParams, StopConfig,
     };
@@ -1044,9 +1041,7 @@ mod f_drop_propagation {
     use crate::routers::worker_stream::test_support::{
         scripted_stream_with_drop_observer, ScriptedItem,
     };
-    use crate::routers::worker_stream::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn done() -> TokenChunk {
         TokenChunk::Complete {

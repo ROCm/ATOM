@@ -58,10 +58,7 @@ pub enum AdapterError {
     #[error("bootstrap_addr missing for prefill {prefill_url}")]
     BootstrapAddrMissing { prefill_url: String },
     #[error("engine_id missing for prefill {prefill_url} dp_rank {dp_rank}")]
-    EngineIdMissing {
-        prefill_url: String,
-        dp_rank: usize,
-    },
+    EngineIdMissing { prefill_url: String, dp_rank: usize },
     #[error("PairCtx type does not match adapter")]
     CtxTypeMismatch,
 }

@@ -72,7 +72,10 @@ impl PipelineStage for WorkerSelectionStage {
                     error = %err,
                     "Placement planner returned error"
                 );
-                Err(placement_err_to_response(err, ctx.input.model_id.as_deref()))
+                Err(placement_err_to_response(
+                    err,
+                    ctx.input.model_id.as_deref(),
+                ))
             }
         }
     }

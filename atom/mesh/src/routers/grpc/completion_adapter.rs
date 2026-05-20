@@ -118,10 +118,7 @@ pub(crate) fn completion_to_generate(c: &CompletionRequest) -> Result<GenerateRe
 }
 
 /// Convert a list of native `GenerateResponse`s into an OpenAI `CompletionResponse`.
-fn build_completion_response(
-    gens: Vec<GenerateResponse>,
-    model: String,
-) -> CompletionResponse {
+fn build_completion_response(gens: Vec<GenerateResponse>, model: String) -> CompletionResponse {
     let id = gens
         .first()
         .map(|g| g.meta_info.id.clone())
@@ -133,10 +130,7 @@ fn build_completion_response(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let prompt_tokens = gens
-        .first()
-        .map(|g| g.meta_info.prompt_tokens)
-        .unwrap_or(0);
+    let prompt_tokens = gens.first().map(|g| g.meta_info.prompt_tokens).unwrap_or(0);
     let completion_tokens: u32 = gens.iter().map(|g| g.meta_info.completion_tokens).sum();
 
     let choices = gens
@@ -335,10 +329,7 @@ pub(crate) async fn wrap_streaming_generate_as_completion(
                     Err(_) => {
                         // Forward malformed payload as-is so client sees the
                         // original error rather than silently dropping.
-                        let _ = send(
-                            &tx,
-                            format!("data: {}\n\n", trimmed),
-                        );
+                        let _ = send(&tx, format!("data: {}\n\n", trimmed));
                         continue;
                     }
                 };
@@ -350,10 +341,7 @@ pub(crate) async fn wrap_streaming_generate_as_completion(
                     continue;
                 }
 
-                let index = parsed
-                    .get("index")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
+                let index = parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let cumulative = parsed
                     .get("text")
                     .and_then(|v| v.as_str())
@@ -379,9 +367,7 @@ pub(crate) async fn wrap_streaming_generate_as_completion(
                     .and_then(|x| x);
                 let is_final = finish_reason.is_some();
 
-                let matched_stop = meta_info
-                    .and_then(|m| m.get("matched_stop"))
-                    .cloned();
+                let matched_stop = meta_info.and_then(|m| m.get("matched_stop")).cloned();
 
                 let mut choice = json!({
                     "text": delta,
@@ -469,7 +455,5 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }

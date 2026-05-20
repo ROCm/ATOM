@@ -194,15 +194,25 @@ mod e_retrieve_and_cancel {
 
     #[tokio::test]
     async fn test_get_response_returns_stored_payload_when_present() {
-        let r = retrieve::get_response_impl(ctx(), None, "resp_existing", &ResponsesGetParams::default())
-            .await;
+        let r = retrieve::get_response_impl(
+            ctx(),
+            None,
+            "resp_existing",
+            &ResponsesGetParams::default(),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_get_response_returns_404_when_missing() {
-        let r = retrieve::get_response_impl(ctx(), None, "resp_missing", &ResponsesGetParams::default())
-            .await;
+        let r = retrieve::get_response_impl(
+            ctx(),
+            None,
+            "resp_missing",
+            &ResponsesGetParams::default(),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 
@@ -252,9 +262,13 @@ mod f_persistence {
     #[tokio::test]
     async fn test_persist_response_stores_for_later_retrieve() {
         let c = ctx();
-        persist_response(c.clone(), "resp_xyz", &json!({"id":"resp_xyz","status":"completed"}))
-            .await
-            .unwrap();
+        persist_response(
+            c.clone(),
+            "resp_xyz",
+            &json!({"id":"resp_xyz","status":"completed"}),
+        )
+        .await
+        .unwrap();
     }
 }
 
@@ -270,7 +284,9 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_returns_prior_messages() {
-        let msgs = load_conversation_history(ctx(), "conv_known").await.unwrap();
+        let msgs = load_conversation_history(ctx(), "conv_known")
+            .await
+            .unwrap();
         assert!(!msgs.is_empty());
     }
 
@@ -377,6 +393,9 @@ mod i_layering {
         let _name = std::any::type_name::<
             crate::routers::openai::responses::conversions::ResponsesEnvelope,
         >();
-        assert!(!_name.contains("mesh_grpc"), "leaked mesh_grpc type: {_name}");
+        assert!(
+            !_name.contains("mesh_grpc"),
+            "leaked mesh_grpc type: {_name}"
+        );
     }
 }

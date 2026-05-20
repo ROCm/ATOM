@@ -104,7 +104,9 @@ impl PdPlanner for DefaultPlanner {
         let conn_mode = self.connection_mode(req);
 
         if let Some(m) = req.model_id {
-            let any_for_model = self.workers.workers_filtered(Some(m), None, conn_mode.clone());
+            let any_for_model = self
+                .workers
+                .workers_filtered(Some(m), None, conn_mode.clone());
             if any_for_model.is_empty() {
                 return Err(PlacementError::ModelNotFound {
                     model_id: m.to_string(),
@@ -129,9 +131,11 @@ impl PdPlanner for DefaultPlanner {
             }),
             conn_mode.clone(),
         );
-        let decode_pool =
-            self.workers
-                .workers_filtered(req.model_id, Some(WorkerType::Decode), conn_mode.clone());
+        let decode_pool = self.workers.workers_filtered(
+            req.model_id,
+            Some(WorkerType::Decode),
+            conn_mode.clone(),
+        );
 
         if !regular_pool.is_empty() {
             self.plan_single(req, regular_pool).await

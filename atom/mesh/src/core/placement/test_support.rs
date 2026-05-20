@@ -8,9 +8,7 @@ use http::HeaderMap;
 
 use super::traits::{PolicySource, WorkerSource};
 use super::types::RequestDescriptor;
-use crate::core::{
-    BasicWorkerBuilder, ConnectionMode, HashRing, RuntimeType, Worker, WorkerType,
-};
+use crate::core::{BasicWorkerBuilder, ConnectionMode, HashRing, RuntimeType, Worker, WorkerType};
 use crate::policies::{LoadBalancingPolicy, RoundRobinPolicy, SelectWorkerInfo};
 
 #[derive(Debug, Clone)]

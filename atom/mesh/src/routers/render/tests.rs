@@ -139,7 +139,10 @@ mod b_chat_aggregator {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("length"), "expected finish_reason 'length' in body: {s}");
+        assert!(
+            s.contains("length"),
+            "expected finish_reason 'length' in body: {s}"
+        );
     }
 
     #[tokio::test]
@@ -175,9 +178,7 @@ mod c_chat_streaming {
     use crate::routers::prepare::response_context::ResponseContext;
     use crate::routers::render::chat_streaming;
     use crate::routers::worker_stream::test_support::synthetic_single_stream;
-    use crate::routers::worker_stream::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn make_ctx() -> ResponseContext {
         unimplemented!("response context fixture — built when prepare/* lands");
@@ -254,9 +255,7 @@ mod d_generate_aggregator {
     use crate::routers::prepare::response_context::ResponseContext;
     use crate::routers::render::generate_aggregator;
     use crate::routers::worker_stream::test_support::synthetic_single_stream;
-    use crate::routers::worker_stream::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn make_ctx() -> ResponseContext {
         unimplemented!("response context fixture — built when prepare/* lands");
@@ -309,7 +308,10 @@ mod d_generate_aggregator {
         let resp = generate_aggregator::process(stream, make_ctx()).await;
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("\"meta_info\"") || s.contains("\"usage\""), "got: {s}");
+        assert!(
+            s.contains("\"meta_info\"") || s.contains("\"usage\""),
+            "got: {s}"
+        );
     }
 
     #[tokio::test]
@@ -327,9 +329,7 @@ mod e_generate_streaming {
     use crate::routers::prepare::response_context::ResponseContext;
     use crate::routers::render::generate_streaming;
     use crate::routers::worker_stream::test_support::synthetic_single_stream;
-    use crate::routers::worker_stream::token_chunk::{
-        FinishReason, TokenChunk, Usage, WorkerMeta,
-    };
+    use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn make_ctx() -> ResponseContext {
         unimplemented!("response context fixture — built when prepare/* lands");
@@ -394,7 +394,8 @@ mod f_layering {
 
     #[test]
     fn test_render_module_has_no_mesh_grpc_reexports() {
-        let name = std::any::type_name::<crate::routers::render::chat_streaming::ChatStreamConfig>();
+        let name =
+            std::any::type_name::<crate::routers::render::chat_streaming::ChatStreamConfig>();
         assert!(!name.contains("mesh_grpc"), "got: {name}");
     }
 }

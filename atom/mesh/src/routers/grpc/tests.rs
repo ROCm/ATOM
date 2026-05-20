@@ -46,7 +46,10 @@ mod a_pipeline_construction {
     fn test_pipeline_construction_uses_concrete_grpc_engine_not_trait() {
         // §3.2 non-goal: Engine remains a concrete type. The compiler enforces it.
         let _ty = std::any::type_name::<Pipeline>();
-        assert!(!_ty.contains("dyn Engine"), "Pipeline must not wrap dyn Engine");
+        assert!(
+            !_ty.contains("dyn Engine"),
+            "Pipeline must not wrap dyn Engine"
+        );
     }
 }
 
@@ -113,7 +116,9 @@ mod b_execute_chat {
             messages: vec![],
             ..Default::default()
         });
-        let resp = p.execute_chat(req, None, Some("m".to_string()), shared()).await;
+        let resp = p
+            .execute_chat(req, None, Some("m".to_string()), shared())
+            .await;
         assert!(resp.status().is_client_error() || resp.status().is_server_error());
     }
 
@@ -122,7 +127,12 @@ mod b_execute_chat {
         // No workers configured → planner returns NoAvailableWorkers → 503.
         let p = pipeline_regular();
         let resp = p
-            .execute_chat(chat_req(false), None, Some("missing-model".to_string()), shared())
+            .execute_chat(
+                chat_req(false),
+                None,
+                Some("missing-model".to_string()),
+                shared(),
+            )
             .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -132,7 +142,12 @@ mod b_execute_chat {
         // Force engine dispatch to fail (worker unreachable etc.).
         let p = pipeline_regular();
         let resp = p
-            .execute_chat(chat_req(false), None, Some("dead-model".to_string()), shared())
+            .execute_chat(
+                chat_req(false),
+                None,
+                Some("dead-model".to_string()),
+                shared(),
+            )
             .await;
         assert!(resp.status().is_server_error());
     }
@@ -165,9 +180,8 @@ mod b_execute_chat {
         // RetryExecutor in router.rs wraps `pipeline.execute_chat` directly;
         // its closure expects a Response return type. Validate signature shape.
         fn _assert_signature(p: &Pipeline) {
-            let _f = |req, hm, mid, shared| async move {
-                p.execute_chat(req, hm, mid, shared).await
-            };
+            let _f =
+                |req, hm, mid, shared| async move { p.execute_chat(req, hm, mid, shared).await };
         }
         let p = pipeline_regular();
         _assert_signature(&p);
@@ -326,32 +340,42 @@ mod e_metrics_labels {
     #[tokio::test]
     async fn test_metrics_router_grpc_label_recorded() {
         let p = pipeline_regular();
-        let _ = p.execute_chat(chat_req(), None, Some("m".to_string()), shared()).await;
+        let _ = p
+            .execute_chat(chat_req(), None, Some("m".to_string()), shared())
+            .await;
         // metrics observer asserts ROUTER_GRPC label appears at least once.
     }
 
     #[tokio::test]
     async fn test_metrics_backend_regular_label_recorded() {
         let p = pipeline_regular();
-        let _ = p.execute_chat(chat_req(), None, Some("m".to_string()), shared()).await;
+        let _ = p
+            .execute_chat(chat_req(), None, Some("m".to_string()), shared())
+            .await;
     }
 
     #[tokio::test]
     async fn test_metrics_backend_pd_label_recorded() {
         let p = pipeline_pd();
-        let _ = p.execute_chat(chat_req(), None, Some("m".to_string()), shared()).await;
+        let _ = p
+            .execute_chat(chat_req(), None, Some("m".to_string()), shared())
+            .await;
     }
 
     #[tokio::test]
     async fn test_metrics_endpoint_chat_label_recorded() {
         let p = pipeline_regular();
-        let _ = p.execute_chat(chat_req(), None, Some("m".to_string()), shared()).await;
+        let _ = p
+            .execute_chat(chat_req(), None, Some("m".to_string()), shared())
+            .await;
     }
 
     #[tokio::test]
     async fn test_metrics_connection_grpc_label_recorded() {
         let p = pipeline_regular();
-        let _ = p.execute_chat(chat_req(), None, Some("m".to_string()), shared()).await;
+        let _ = p
+            .execute_chat(chat_req(), None, Some("m".to_string()), shared())
+            .await;
     }
 }
 

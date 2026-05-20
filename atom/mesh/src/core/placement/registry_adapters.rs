@@ -35,9 +35,10 @@ impl WorkerSource for WorkerRegistryAdapter {
                     })
                     .collect()
             }
-            other => self
-                .registry
-                .get_workers_filtered(model_id, other, connection_mode, None, false),
+            other => {
+                self.registry
+                    .get_workers_filtered(model_id, other, connection_mode, None, false)
+            }
         }
     }
 
