@@ -321,7 +321,7 @@ class ATOMQwen35Moe(Qwen35Moe):
         finally:
             atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = origin_fn
 
-    def load(self):
+    def load(self, skip_python_model: bool = False):
         # External plugin mode: bypass rtp-llm native weight loading path and
         # use ATOM model loading only.
         if self._is_external_plugin_mode():
@@ -334,6 +334,11 @@ class ATOMQwen35Moe(Qwen35Moe):
             self.model_weights_loader = _NoopModelWeightsLoader()
             self.py_eplb = self.model_weights_loader._py_eplb
             self.weight_manager = _NoopWeightManager()
+            if skip_python_model:
+                logger.info(
+                    "External plugin mode: skip ATOM python model creation as requested"
+                )
+                return
             self._create_python_model()
             logger.info(
                 "External plugin mode: use ATOM loading path and skip rtp-llm native load"
@@ -341,7 +346,7 @@ class ATOMQwen35Moe(Qwen35Moe):
             return
 
         # Non-plugin mode keeps native behavior.
-        super().load()
+        super().load(skip_python_model=skip_python_model)
 
     def _create_python_model(self):
         # Non-external mode should keep native rtp-llm Python model path.
