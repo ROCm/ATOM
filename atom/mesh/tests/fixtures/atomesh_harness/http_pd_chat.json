@@ -1,16 +1,16 @@
 {
-  "name": "who_are_you_chat",
+  "name": "http_pd_chat",
   "model": "test-model",
   "endpoint": "/v1/chat/completions",
   "route": {
-    "worker_kind": "regular",
+    "worker_kind": "prefill_decode",
     "connection_mode": "http"
   },
   "request": {
     "messages": [
       {
         "role": "user",
-        "content": "who are you?"
+        "content": "hello pd atomesh"
       }
     ],
     "stream": false
@@ -18,7 +18,7 @@
   "expected_response": {
     "status": 200,
     "body": {
-      "id": "chatcmpl-test",
+      "id": "chatcmpl-pd-test",
       "object": "chat.completion",
       "model": "test-model",
       "choices": [
@@ -26,7 +26,7 @@
           "index": 0,
           "message": {
             "role": "assistant",
-            "content": "I am your father"
+            "content": "Hello from the PD virtual worker."
           },
           "finish_reason": "stop"
         }
@@ -34,8 +34,7 @@
     }
   },
   "simulation": {
-    "ttft_ms": 30,
-    "chunk_interval_ms": 5,
-    "fail_after_chunks": null
+    "ttft_ms": 0,
+    "chunk_interval_ms": 0
   }
 }

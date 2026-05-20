@@ -57,8 +57,6 @@ pub struct SimulationFixture {
     pub ttft_ms: u64,
     #[serde(default)]
     pub chunk_interval_ms: u64,
-    #[serde(default)]
-    pub fail_after_chunks: Option<usize>,
 }
 
 /// One fixture-backed test sample.

@@ -1,0 +1,23 @@
+{
+  "name": "grpc_regular_generate",
+  "model": "test-model",
+  "endpoint": "/generate",
+  "route": {
+    "worker_kind": "regular",
+    "connection_mode": "grpc"
+  },
+  "request": {
+    "text": "hello grpc atomesh",
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "body": {
+      "text": "Hello from the future gRPC virtual worker."
+    }
+  },
+  "simulation": {
+    "ttft_ms": 0,
+    "chunk_interval_ms": 0
+  }
+}

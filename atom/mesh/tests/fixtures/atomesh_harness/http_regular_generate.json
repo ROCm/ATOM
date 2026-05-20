@@ -1,5 +1,5 @@
 {
-  "name": "generate_basic",
+  "name": "http_regular_generate",
   "model": "test-model",
   "endpoint": "/generate",
   "route": {
@@ -24,7 +24,6 @@
   },
   "simulation": {
     "ttft_ms": 0,
-    "chunk_interval_ms": 0,
-    "fail_after_chunks": null
+    "chunk_interval_ms": 0
   }
 }

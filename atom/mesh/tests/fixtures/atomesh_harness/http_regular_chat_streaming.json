@@ -1,5 +1,5 @@
 {
-  "name": "chat_streaming_text",
+  "name": "http_regular_chat_streaming",
   "model": "test-model",
   "endpoint": "/v1/chat/completions",
   "route": {
@@ -31,7 +31,6 @@
   },
   "simulation": {
     "ttft_ms": 0,
-    "chunk_interval_ms": 0,
-    "fail_after_chunks": null
+    "chunk_interval_ms": 0
   }
 }

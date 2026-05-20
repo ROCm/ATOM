@@ -104,7 +104,10 @@ impl TestHarness {
             self.case.route.connection_mode,
             super::mock_test_case::ConnectionModeFixture::Http
         ) {
-            return Err("TestHarness currently supports HTTP fixtures only".into());
+            return Err(
+                "TestHarness currently supports HTTP fixtures only; gRPC fixtures are reserved for VirtualGrpcWorker"
+                    .into(),
+            );
         }
 
         // Stage 1: start virtual backend workers from fixture route metadata.
