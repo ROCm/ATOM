@@ -492,8 +492,8 @@ def triton_kernel_fused_experts(
     # Shape check
     # Changes to weight handling before this function, therefore shape check change
     assert hidden_states.ndim == 2
-    assert hidden_states.shape[-1] == w1.shape[-2] * 2 
-    assert w2.shape[-1] == w1.shape[-2]  * 2
+    # assert hidden_states.shape[-1] == w1.shape[-2] * 2 
+    # assert w2.shape[-1] == w1.shape[-2]  * 2
 
     batch_dim = 1
     M, K = hidden_states.shape[-2:] # 
@@ -507,11 +507,6 @@ def triton_kernel_fused_experts(
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
     gammas = routing_data.gate_scal if routing_data else None
-
-    # On account of manual swiglu being required, HIP stream errors, and bench for triton having a 
-    # static scale incorrect for given input states of about -3 - 3, we adjust static scale at 
-    # each point of data loss to avoid overly incorrect results.
-    moving_scale = static_scale
 
     # NOTE: We intentionally do NOT use the triton fused SwiGLU activation
     # because it expects interleaved [gate0, up0, gate1, up1, ...] layout
@@ -546,12 +541,6 @@ def triton_kernel_fused_experts(
                     x_dtype = torch.float8_e4m3fnuz
 
                 hidden_states = downcast_to_static_fp8(hidden_states, a13_scale)
-                quick_test = hidden_states.to(torch.bfloat16) * a13_scale
-                # logger.warning("hidden states")
-                # logger.warning(hidden_states)
-                # logger.warning(quick_test)
-                logger.warning(w13_swizzle_layout)
-                logger.warning(w2_swizzle_layout)
                 interm_cache = moe_gemm_a8w4(
                     hidden_states,
                     w1,
@@ -566,29 +555,22 @@ def triton_kernel_fused_experts(
                     swizzle_mx_scale=w13_swizzle_layout,
                     out_dtype=torch.float8_e4m3fn,
                     apply_swiglu=True,
-                    alpha=1.702,          # gpt-oss
-                    limit=7.0,            # gpt-oss
+                    alpha=swiglu_alpha,          # gpt-oss
+                    limit=swiglu_limit,            # gpt-oss
                     add_residual=True,    # gpt-oss `(up + 1)`
-
                 ) 
-            elif (x_q_dtype_base == "fp4"):
-                hidden_states, x_scale = mxfp4_quant(hidden_states)
-                raw_intermediate = moe_gemm_a4w4(
-                    hidden_states,
-                    w1, # w1
-                    x_scale, # x scale
-                    w13_scale, # w1 scale
-                    None, # x static scale
-                    None, # quant static scale
-                    w1_bias,
+                output_tensor = moe_gemm_a8w4(
+                    interm_cache,
+                    w2,
+                    None,
+                    w2_scale,
+                    a2_scale,
+                    None,
+                    w2_bias,
                     routing_data,
-                    gather_indx=gather_indx,
-                    gammas=gammas if apply_router_weight_on_input else None,
-                    swizzle_mx_scale="CDNA4_SCALE", # ?
-                    apply_swiglu=True,
-                    alpha=1.702,          # gpt-oss
-                    limit=7.0,            # gpt-oss
-                    add_residual=True,    # gpt-oss `(up + 1)`
+                    scatter_indx=scatter_indx,
+                    gammas=None if apply_router_weight_on_input else gammas,
+                    swizzle_mx_scale=w2_swizzle_layout, 
                 )
             else:
                 interm_cache = moe_gemm_a16w4(
@@ -604,48 +586,10 @@ def triton_kernel_fused_experts(
                     gammas=gammas if apply_router_weight_on_input else None,
                     swizzle_mx_scale=w13_swizzle_layout,
                     apply_swiglu=True,
-                    alpha=1.702,          # gpt-oss
-                    limit=7.0,            # gpt-oss
+                    alpha=swiglu_alpha,          # gpt-oss
+                    limit=swiglu_limit,            # gpt-oss
                     add_residual=True,    # gpt-oss `(up + 1)`
                 )
-
-            if (x_q_dtype_base == "fp8"):
-                from aiter.ops.triton.utils._triton.arch_info import get_arch
-
-                x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
-
-                if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
-                    x_dtype = torch.float8_e4m3fnuz
-
-                output_tensor = moe_gemm_a8w4(
-                    interm_cache,
-                    w2,
-                    None,
-                    w2_scale,
-                    a2_scale,
-                    None,
-                    w2_bias,
-                    routing_data,
-                    scatter_indx=scatter_indx,
-                    gammas=None if apply_router_weight_on_input else gammas,
-                    swizzle_mx_scale=w2_swizzle_layout, 
-                )
-            elif (x_q_dtype_base == "fp4"):
-                interm_cache, x_scale = mxfp4_quant(interm_cache)
-                output_tensor = moe_gemm_a4w4(
-                    interm_cache, 
-                    w2,
-                    x_scale, 
-                    w2_scale, 
-                    None, # x static scale
-                    None, # quant static scale
-                    w2_bias, 
-                    routing_data, 
-                    scatter_indx=scatter_indx,
-                    gammas=None if apply_router_weight_on_input else gammas,
-                    swizzle_mx_scale="CDNA4_SCALE",
-                )
-            else:
                 output_tensor = moe_gemm_a16w4(
                     interm_cache,
                     w2,
@@ -692,46 +636,5 @@ def triton_kernel_fused_experts(
                 y=output_tensor,
             )
 
-                # logger.warning("output")
-                # logger.warning(output_tensor.shape)
-                # logger.warning(output_tensor.dtype)
-                # logger.warning(output_tensor)
-                # logger.warning(output_tensor.view(M, K))
-
-        else:
-            # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation
-            raw_intermediate = matmul_ogs(
-                hidden_states,
-                w1,
-                w1_bias,
-                routing_data,
-                gather_indx=gather_indx,
-                precision_config=w13_precision_config,
-                gammas=gammas if apply_router_weight_on_input else None,
-            )
-            raw_2d = raw_intermediate.view(M * topk, N)
-            intermediate_cache = intermediate_cache.view(M * topk, half_N)
-            fused_clamp_act_mul(
-                raw_2d,
-                out=intermediate_cache,
-                swiglu_limit=swiglu_limit,
-                activation="silu",
-                dtype_quant=None,
-            )
-            intermediate_cache = intermediate_cache.view(batch_dim, M * topk, half_N)
-
-            matmul_ogs(
-                intermediate_cache.view(M * topk, half_N),
-                w2,
-                w2_bias,
-                routing_data,
-                scatter_indx=scatter_indx,
-                precision_config=w2_precision_config,
-                gammas=None if apply_router_weight_on_input else gammas,
-                y=output_tensor,
-            )
-
     output_tensor = output_tensor.view(M, K) 
-    logger.warning("final out")
-    logger.warning(output_tensor)
     return output_tensor

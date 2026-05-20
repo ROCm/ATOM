@@ -59,6 +59,9 @@ from transformers import PretrainedConfig
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quantization.quark.utils import weight_dequant_fp8
 
+import logging
+logger = logging.getLogger("atom")
+
 
 class FusedMoeWeightScaleSupported(Enum):
     """Supported quantization strategies for MoE weight scales."""
@@ -759,6 +762,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
         if self.use_triton:
+            logger.warning(quant_config)
             from atom.model_ops.utils import has_triton_kernels
 
             assert has_triton_kernels(), "triton_kernels is not installed"
