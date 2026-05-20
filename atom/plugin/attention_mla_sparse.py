@@ -681,6 +681,7 @@ def sparse_attn_indexer_plugin_mode(
                 weights=weights[chunk.token_start : chunk.token_end],
                 cu_starts=chunk.cu_seqlen_ks,
                 cu_ends=chunk.cu_seqlen_ke,
+                clean_logits=False,
             )
             num_rows = logits.shape[0]
             assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
