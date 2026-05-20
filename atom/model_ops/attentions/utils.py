@@ -63,6 +63,32 @@ def _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
             lse.zero_()
             return out, lse
         return out
+
+    # Memory safety guard. The batched-SDPA path below allocates three padded
+    # (num_seqs, num_heads_q, max_*, head_dim) tensors plus a dense
+    # (num_seqs, 1, max_q, max_k) mask. The mask in particular is
+    # O(num_seqs * max_q * max_k) bf16 and scales quadratically with context
+    # length: e.g. num_seqs=256, max_q=max_k=16384 = 128 GiB for the mask
+    # alone, which would OOM even a 309 GiB MI355X. For Gemma 4 (the only
+    # caller today, via head_dim=512 full-attn layers) the production benchmark
+    # shapes stay well under this, but raise explicitly before allocating an
+    # unreasonably large mask so the failure mode is "config out of supported
+    # range" rather than a cryptic CUDA OOM mid-prefill. If you hit this,
+    # switch to a per-sequence SDPA loop or wire a varlen kernel that
+    # supports head_dim > 256.
+    _MASK_BYTES_LIMIT = 8 * 1024 * 1024 * 1024  # 8 GiB
+    mask_bytes = num_seqs * max_q * max_k * q.element_size()
+    if mask_bytes > _MASK_BYTES_LIMIT:
+        raise RuntimeError(
+            f"_sdpa_varlen_attn padded mask would be "
+            f"{mask_bytes / (1024**3):.1f} GiB "
+            f"(num_seqs={num_seqs}, max_q={max_q}, max_k={max_k}, "
+            f"dtype_size={q.element_size()}), exceeding the safety limit of "
+            f"{_MASK_BYTES_LIMIT / (1024**3):.0f} GiB. The batched-SDPA fallback "
+            f"scales quadratically with context length; a per-sequence SDPA loop "
+            f"or a varlen kernel supporting head_dim > 256 is needed for this shape."
+        )
+
     batch_q = q.new_zeros((num_seqs, num_heads_q, max_q, q.shape[-1]))
     batch_k = k.new_zeros((num_seqs, num_heads_q, max_k, k.shape[-1]))
     batch_v = v.new_zeros((num_seqs, num_heads_q, max_k, v.shape[-1]))
