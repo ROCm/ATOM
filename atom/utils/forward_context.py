@@ -197,6 +197,11 @@ class AttentionMetaData:
     reduce_partial_map: Optional[torch.Tensor] = None
 
     block_tables_converted: Optional[torch.Tensor] = None
+    # Raw block_tables (logical IDs) preserved alongside `block_tables` so
+    # callers that need logical IDs (e.g. cp_gather_indexer_k_quant_cache,
+    # which indexes a kv_cache whose shape[0] == num_kvcache_blocks) can read
+    # them after the `block_tables`-with-converted override below.
+    block_tables_raw: Optional[torch.Tensor] = None
 
     # for prefix cache
     has_cached: bool = False
@@ -251,6 +256,9 @@ class AttentionMetaData:
         self.slot_mapping = slot_mapping
         self.context_lens = context_lens
         self.block_tables = block_tables
+        # Preserve raw block_tables (logical IDs) before the converted override
+        # below; cp_gather_indexer_k_quant_cache reads via .block_tables_raw.
+        self.block_tables_raw = block_tables
         self.dropout_p = dropout_p
         self.kv_indptr = kv_indptr
         self.kv_indices = kv_indices
