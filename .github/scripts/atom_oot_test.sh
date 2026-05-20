@@ -393,22 +393,41 @@ with open(result_file, "w", encoding="utf-8") as f:
 PY
   fi
 
+  # Pick the lm_eval metric to report based on the task. Keep this in sync
+  # with the standalone path (.github/workflows/atom-test.yaml, the
+  # RESULT_METRIC selection around line 562): gsm8k_cot is graded on
+  # exact_match,strict-match (the CoT extractor's flexible-match is noisy
+  # for the chat template), while plain gsm8k uses exact_match,flexible-extract.
+  # Without this branch the OOT and standalone CI flavors would report
+  # different numbers for the same model, breaking dashboard / regression
+  # comparison.
+  local metric_key
+  if [[ "${ACCURACY_TASK}" == "gsm8k_cot" ]]; then
+    metric_key="exact_match,strict-match"
+  else
+    metric_key="exact_match,flexible-extract"
+  fi
+
   local value
   if command -v jq >/dev/null 2>&1; then
-    value=$(jq ".results.${ACCURACY_TASK}[\"exact_match,flexible-extract\"]" "${result_file}")
+    value=$(jq --arg task "${ACCURACY_TASK}" --arg metric "${metric_key}" \
+              '.results[$task][$metric]' "${result_file}")
   else
-    value=$(RESULT_FILE="${result_file}" ACC_TASK="${ACCURACY_TASK}" python - <<'PY'
+    value=$(RESULT_FILE="${result_file}" \
+            ACC_TASK="${ACCURACY_TASK}" \
+            METRIC_KEY="${metric_key}" \
+            python - <<'PY'
 import json
 import os
 with open(os.environ["RESULT_FILE"], "r", encoding="utf-8") as f:
     data = json.load(f)
-print(data["results"][os.environ["ACC_TASK"]]["exact_match,flexible-extract"])
+print(data["results"][os.environ["ACC_TASK"]][os.environ["METRIC_KEY"]])
 PY
 )
   fi
 
   echo "Result file: ${result_file}"
-  echo "Flexible extract value: ${value}"
+  echo "${metric_key} value: ${value}"
 }
 
 run_for_models() {
