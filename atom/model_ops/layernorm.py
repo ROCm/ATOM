@@ -12,8 +12,6 @@ from aiter import (
     rmsnorm2d_fwd,
     rmsnorm2d_fwd_with_add,
 )
-import triton
-import triton.language as tl
 from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -208,59 +206,6 @@ def _aiter_rms_quant(
             out, x, res1, out_res1, scale, weight, eps, group_size, shuffle
         )
     return out, scale, out_res1
-
-# decode
-@triton.jit
-def _rmsnorm_gated_contiguous_128_kernel(
-    x_ptr,
-    z_ptr,
-    weight_ptr,
-    out_ptr,
-    num_heads: tl.constexpr,
-    eps: tl.constexpr,
-):
-    token_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-    offsets = tl.arange(0, 128)
-    row_offset = (token_id * num_heads + head_id) * 128
-
-    x = tl.load(x_ptr + row_offset + offsets, cache_modifier=".ca").to(tl.float32)
-    z = tl.load(z_ptr + row_offset + offsets, cache_modifier=".ca").to(tl.float32)
-    weight = tl.load(weight_ptr + offsets, cache_modifier=".ca").to(tl.float32)
-
-    variance = tl.sum(x * x, axis=0) * 0.0078125
-    inv_rms = tl.rsqrt(variance + eps)
-    gate = z * tl.sigmoid(z)
-    out = x * inv_rms * weight * gate
-
-    tl.store(out_ptr + row_offset + offsets, out)
-
-# prefill
-@triton.jit
-def _rmsnorm_gated_contiguous_128_tiled_rows_kernel(
-    x_ptr,
-    z_ptr,
-    weight_ptr,
-    out_ptr,
-    num_rows: tl.constexpr,
-    eps: tl.constexpr,
-    block_rows: tl.constexpr,
-):
-    row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
-    dim_offsets = tl.arange(0, 128)
-    mask_rows = row_offsets < num_rows
-    offsets = row_offsets[:, None] * 128 + dim_offsets[None, :]
-
-    x = tl.load(x_ptr + offsets, mask=mask_rows[:, None], other=0.0).to(tl.float32)
-    z = tl.load(z_ptr + offsets, mask=mask_rows[:, None], other=0.0).to(tl.float32)
-    weight = tl.load(weight_ptr + dim_offsets, cache_modifier=".ca").to(tl.float32)
-
-    variance = tl.sum(x * x, axis=1) * 0.0078125
-    inv_rms = tl.rsqrt(variance + eps)
-    gate = z * tl.sigmoid(z)
-    out = x * inv_rms[:, None] * weight[None, :] * gate
-
-    tl.store(out_ptr + offsets, out, mask=mask_rows[:, None])
 
 
 class RMSNorm(nn.Module):
@@ -572,84 +517,6 @@ class RMSNormGated(nn.Module):
         # out_scales: [num_tokens, (num_heads*head_dim)//group_size]
         return (out_fp8, out_scales)
 
-
-    def forward_triton(self, x: torch.Tensor, z: torch.Tensor):
-        if (
-            z is None
-            or x.ndim != 3
-            or self.group_size is not None
-            or not self.norm_before_gate
-            or x.shape[-1] != 128
-            or not x.is_contiguous()
-            or not z.is_contiguous()
-        ):
-            return self.forward_native(x, z)
-
-        num_tokens, num_heads, head_dim = x.shape
-        out = torch.empty(
-            (num_tokens, num_heads * head_dim),
-            dtype=x.dtype,
-            device=x.device,
-        )
-
-        num_rows = num_tokens * num_heads
-        if num_rows >= 65536:
-            block_rows = 32
-            _rmsnorm_gated_contiguous_128_tiled_rows_kernel[
-                (triton.cdiv(num_rows, block_rows),)
-            ](
-                x,
-                z,
-                self.weight,
-                out,
-                num_rows,
-                self.eps,
-                block_rows,
-                num_warps=4,
-                num_stages=1,
-            )
-        else:
-            _rmsnorm_gated_contiguous_128_kernel[(num_tokens, num_heads)](
-                x,
-                z,
-                self.weight,
-                out,
-                num_heads,
-                self.eps,
-                num_warps=1,
-                num_stages=1,
-            )
-
-        return (out, None)
-
-
-    def forward_aiter_gated(self, x: torch.Tensor, z: torch.Tensor):
-        try:
-            from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_bf16
-        except (ImportError, AttributeError):
-            return self.forward_triton(x, z)
-
-        if (
-            z is None
-            or x.ndim != 3
-            or self.group_size is not None
-            or not self.norm_before_gate
-            or x.shape[-1] != 128
-            or not x.is_contiguous()
-            or not z.is_contiguous()
-        ):
-            return self.forward_native(x, z)
-
-        num_tokens, num_heads, head_dim = x.shape
-        out = torch.empty(
-            (num_tokens, num_heads * head_dim),
-            dtype=x.dtype,
-            device=x.device,
-        )
-        gated_rmsnorm_bf16(out, x, z, self.weight, self.eps)
-        return (out, None)
-
-
     def forward(
         self, x: torch.Tensor, z: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -669,7 +536,7 @@ class RMSNormGated(nn.Module):
         if self.use_fused_fp8_quant:
             return self.forward_fused_fp8(x, z)
 
-        return self.forward_aiter_gated(x, z)
+        return self.forward_native(x, z)
 
 
 class GemmaRMSNorm(nn.Module):
