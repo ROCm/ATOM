@@ -13,7 +13,7 @@ on:
         description: "Manual selection slot 1: choose an accuracy model case."
         type: choice
         default: none
-        options: &accuracy-model-options
+        options:
           - none
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
@@ -21,8 +21,8 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
           - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
-          - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
           - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
@@ -49,37 +49,254 @@ on:
         description: "Manual selection slot 2: choose an accuracy model case."
         type: choice
         default: none
-        options: *accuracy-model-options
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
       model_slot_3:
         description: "Manual selection slot 3: choose an accuracy model case."
         type: choice
         default: none
-        options: *accuracy-model-options
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
       model_slot_4:
         description: "Manual selection slot 4: choose an accuracy model case."
         type: choice
         default: none
-        options: *accuracy-model-options
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
       model_slot_5:
         description: "Manual selection slot 5: choose an accuracy model case."
         type: choice
         default: none
-        options: *accuracy-model-options
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
       model_slot_6:
         description: "Manual selection slot 6: choose an accuracy model case."
         type: choice
         default: none
-        options: *accuracy-model-options
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
       model_slot_7:
         description: "Manual selection slot 7: choose an accuracy model case."
         type: choice
         default: none
-        options: *accuracy-model-options
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
       model_slot_8:
         description: "Manual selection slot 8: choose an accuracy model case."
         type: choice
         default: none
-        options: *accuracy-model-options
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
       oot_image:
         description: "Optional atom-vLLM image override. Leave empty to keep the existing nightly/manual build behavior."
         required: false
@@ -109,6 +326,9 @@ jobs:
   prepare-oot-image:
     name: Prepare validation image
     runs-on: build-only-atom
+    permissions:
+      actions: read
+      contents: read
     outputs:
       oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
       cleanup_temp_image: ${{ steps.meta.outputs.cleanup_temp_image }}
@@ -139,9 +359,54 @@ jobs:
           MODEL_SLOT_6: ${{ inputs.model_slot_6 || 'none' }}
           MODEL_SLOT_7: ${{ inputs.model_slot_7 || 'none' }}
           MODEL_SLOT_8: ${{ inputs.model_slot_8 || 'none' }}
+          GITHUB_TOKEN: ${{ github.token }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
         run: |
           set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            SCHEDULE_CREATED_AT="$(
+              python3 - <<'PY'
+          import json
+          import os
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          token = os.environ.get("GITHUB_TOKEN", "")
+          request = Request(
+              f"{api_url}/repos/{repository}/actions/runs/{run_id}",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "User-Agent": "atom-vllm-accuracy-nightly-priority",
+              },
+          )
+          try:
+              with urlopen(request, timeout=30) as response:
+                  payload = json.load(response)
+          except HTTPError as exc:
+              detail = exc.read().decode("utf-8", errors="replace").strip()
+              raise RuntimeError(
+                  f"Failed to fetch workflow run metadata: HTTP {exc.code} {detail}"
+              ) from exc
+          except URLError as exc:
+              raise RuntimeError(
+                  f"Failed to reach GitHub API for workflow run metadata: {exc}"
+              ) from exc
+
+          created_at = payload.get("created_at")
+          if not created_at:
+              raise RuntimeError("Workflow run metadata did not include created_at")
+          print(created_at)
+          PY
+            )"
+            export SCHEDULE_CREATED_AT
+          else
+            export SCHEDULE_CREATED_AT=""
+          fi
 
           # Keep this Python model list as the single source of truth for OOT
           # full-validation coverage and manual checkbox filtering.
@@ -617,6 +882,15 @@ jobs:
                   beijing_now = beijing_now.replace(tzinfo=beijing_tz)
               else:
                   beijing_now = beijing_now.astimezone(beijing_tz)
+          elif event == "schedule":
+              created_at = os.environ.get("SCHEDULE_CREATED_AT", "")
+              if not created_at:
+                  raise SystemExit(
+                      "Scheduled validation requires workflow run created_at metadata."
+                  )
+              beijing_now = datetime.fromisoformat(
+                  created_at.replace("Z", "+00:00")
+              ).astimezone(beijing_tz)
           else:
               beijing_now = datetime.now(timezone.utc).astimezone(beijing_tz)
 
