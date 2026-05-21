@@ -44,9 +44,6 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-from aiter.ops.triton.quant.fused_fp8_quant import (
-    fused_flatten_fp8_group_quant,
-)
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
@@ -2061,10 +2058,6 @@ class DeepseekV4Attention(nn.Module):
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
-        if self.wo_b.quant_type == QuantType.per_1x128:
-            o, o_scale = fused_flatten_fp8_group_quant(o, group_size=128)
-            x = self.wo_b(o, x_scale=o_scale)
-            return x
         x = self.wo_b(o.flatten(1))
         return x
 
@@ -2625,33 +2618,12 @@ class Block(nn.Module):
         )
         x = self.attn_norm(x)  # [num_tokens, dim]
         x = self.attn(x, positions)  # [num_tokens, dim]
-        # ----- Fused attn→ffn transition: hc_post (close attn) + hc_pre (open ffn) -----
-        # `hc_ffn_fn.T` is a stride-swapped view (no copy); `hc_ffn_scale` is
-        # passed unchanged — the Triton kernel `tl.load`s the alphas itself.
-        if _V4_USE_TRITON_FUSED_MHC:
-            residual, x, post, comb = fused_hc_post_pre(
-                x,
-                residual,
-                post,
-                comb,
-                self.hc_ffn_fn.T,
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                self.hc_mult,
-                self.norm_eps,
-                self.hc_eps,
-                self.HC_POST_MULT,
-                self.hc_sinkhorn_iters,
-            )
-        else:
-            x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-            # ----- FFN sub-layer with mHC mixing -----
-            residual = x  # [num_tokens, hc, dim]
-            x, post, comb = self.hc_pre(
-                x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
-            )
-
+        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
+        # ----- FFN sub-layer with mHC mixing -----
+        residual = x  # [num_tokens, hc, dim]
+        x, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
         x = self.ffn_norm(x)  # [num_tokens, dim]
         x = self.ffn(
             x
