@@ -8,6 +8,7 @@ import xxhash
 from atom.config import Config
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
+    MEDIUM_REMOTE,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
