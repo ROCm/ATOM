@@ -74,6 +74,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_dsv32_fp8_tp4:
+        description: "DeepSeek-V3.2-FP8 TP4"
+        required: false
+        type: boolean
+        default: false
       run_dsv32_fp8_tp8:
         description: "DeepSeek-V3.2-FP8 TP8"
         required: false
@@ -157,6 +162,7 @@ jobs:
           RUN_KIMI_K25_TP8: ${{ inputs.run_kimi_k25_tp8 }}
           RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
+          RUN_DSV32_FP8_TP4: ${{ inputs.run_dsv32_fp8_tp4 }}
           RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
           RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
@@ -190,7 +196,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "linux-atom-mi35x-1",
               },
               {
@@ -199,7 +205,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "linux-atom-mi35x-4",
               },
               {
@@ -208,7 +214,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 4 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
                   "accuracy_test_threshold": 0.80,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "linux-atom-mi35x-4",
               },
               {
@@ -291,6 +297,16 @@ jobs:
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
                   "runner": "linux-atom-mi35x-8",
+              },
+              {
+                  "toggle_env": "RUN_DSV32_FP8_TP4",
+                  "model_name": "DeepSeek-V3.2-FP8 TP4",
+                  "model_path": "deepseek-ai/DeepSeek-V3.2",
+                  "extra_args": "--tensor-parallel-size 4 --kv-cache-dtype auto --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi35x-4",
               },
               {
                   "toggle_env": "RUN_DSV32_FP8_TP8",
