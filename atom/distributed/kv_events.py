@@ -1,31 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""KV cache events: BlockStored, BlockRemoved, AllBlocksCleared, BlockTransferred.
-
-Wire-compatible with vLLM's `vllm.distributed.kv_events` for `BlockStored` /
-`BlockRemoved` / `AllBlocksCleared` so existing subscribers (LMCache, Mooncake
-event listener, etc.) can consume ATOM events unchanged. ATOM extends this
-with:
-
-  * Medium constants: GPU / CPU / DISK / REMOTE (vLLM has only GPU)
-  * `BlockTransferred` event for cross-tier moves (HMA tracking, P/D)
-  * Direct emission API for KV transfer connectors (Mooncake/MoriIO)
-
-Design notes
-------------
-
-The block-hash field is a 64-bit integer (ATOM uses xxhash64). vLLM's
-`ExternalBlockHash` is also typed as an integer, so the wire format matches.
-ATOM does not currently model multi-cache-groups, multi-LoRA, or multimodal
-extra-keys; the corresponding fields are emitted as default values (group_idx=0,
-lora_id=None, etc.) so the schema stays vLLM-compatible without paying the
-runtime cost of populating fields ATOM never uses.
-
-`BlockTransferred` is ATOM-only and not understood by vLLM consumers. The
-tagged-union encoding means strict subscribers will fail decoding it; opt-in
-consumers can declare the wider union including this tag.
-"""
+"""KV cache events: wire-compatible with vLLM's `vllm.distributed.kv_events`,
+plus ATOM extensions (`BlockTransferred`, CPU/DISK/REMOTE medium constants)."""
 
 from __future__ import annotations
 
@@ -34,25 +11,15 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Final
+from typing import Any, Final
 
 import msgspec
 
-if TYPE_CHECKING:
-    pass
-
-
-# ----- Medium constants --------------------------------------------------- #
-# Where a block lives. String values (not enum) for vLLM wire compatibility:
-# vLLM uses `medium: str | None` on its events.
-
+# Where a block lives.
 MEDIUM_GPU: Final[str] = "GPU"
-MEDIUM_CPU: Final[str] = "CPU"  # HMA host-memory tier
-MEDIUM_DISK: Final[str] = "DISK"  # HMA disk tier
-MEDIUM_REMOTE: Final[str] = "REMOTE"  # transferred via Mooncake/MoriIO/peer
-
-
-# ----- Event schema ------------------------------------------------------- #
+MEDIUM_CPU: Final[str] = "CPU"
+MEDIUM_DISK: Final[str] = "DISK"
+MEDIUM_REMOTE: Final[str] = "REMOTE"
 
 
 class KVCacheEvent(
@@ -62,37 +29,22 @@ class KVCacheEvent(
     gc=False,
     tag=True,
 ):
-    """Base class for all KV cache events. The `tag=True` enables msgspec's
-    tagged-union encoding so subscribers can dispatch on event type."""
+    """Tagged-union base so subscribers can dispatch on event type."""
 
 
 class BlockStored(KVCacheEvent):
-    """A run of contiguous prefix-cacheable blocks just became resident.
-
-    The fields match vLLM's `BlockStored` so existing subscribers work. The
-    only practical difference is that ATOM emits `medium=MEDIUM_GPU` by
-    default; connectors may emit with `MEDIUM_REMOTE` to indicate a block
-    received from a remote producer.
-    """
+    """A run of contiguous prefix-cacheable blocks just became resident."""
 
     block_hashes: list[int]
     parent_block_hash: int | None
     token_ids: list[int]
     block_size: int
-    # ATOM does not (yet) serve LoRA adapters; emitted as None for compat.
     lora_id: int | None = None
     medium: str | None = MEDIUM_GPU
     lora_name: str | None = None
-    # ATOM does not (yet) support multimodal extra keys; emitted as None.
     extra_keys: list[tuple[Any, ...] | None] | None = None
-    # ATOM uses a single cache group; emitted as 0 for compat.
     group_idx: int | None = 0
-    # Store events carry cache-spec metadata so consumers can classify and
-    # filter groups as they are learned. Remove events only need
-    # group_idx+hash. Layout matches vLLM PR vllm-project/vllm#40984.
-    # ATOM emits these as None until hybrid-cache wiring lands; the wire slots
-    # are reserved here so consumers built against the vLLM schema decode
-    # ATOM frames unchanged.
+    # Reserved wire slots; emitted as None until hybrid-cache wiring lands.
     kv_cache_spec_kind: str | None = None
     kv_cache_spec_sliding_window: int | None = None
 
@@ -106,26 +58,16 @@ class BlockRemoved(KVCacheEvent):
 
 
 class AllBlocksCleared(KVCacheEvent):
-    """Entire cache (optionally restricted to one medium) was cleared.
-
-    `medium=None` means all tiers cleared. vLLM's variant has no medium field
-    so subscribers reading via vLLM's struct will ignore this attribute, which
-    matches the intended "everything" semantics.
-    """
+    """Entire cache (or one medium, when set) was cleared."""
 
     medium: str | None = None
 
 
 class BlockTransferred(KVCacheEvent):
-    """ATOM extension: a block moved between tiers without changing identity.
+    """A block moved between tiers without changing identity.
 
-    Emitted on:
-      * GPU → CPU/DISK swap (when HMA offload is wired up)
-      * REMOTE → GPU receive (Mooncake/MoriIO pull on decode side)
-      * GPU → REMOTE send (Mooncake/MoriIO push on prefill side)
-
-    vLLM has no equivalent. Subscribers that don't understand this tag will
-    fail to decode it — opt-in only.
+    Emitted on GPU↔CPU/DISK swap, REMOTE→GPU receive, and GPU→REMOTE send.
+    ATOM-only — strict vLLM consumers should narrow the union to exclude it.
     """
 
     block_hashes: list[int]
@@ -244,9 +186,7 @@ class ZmqEventPublisher(EventPublisher):
         try:
             payload = self._encoder.encode(batch)
         except Exception:
-            # Encoding shouldn't fail in practice; if it does, bump a counter
-            # so operators can see broken serialization in `stats` instead of
-            # silently losing events.
+            # Surface via stats.encode_errors instead of swallowing silently.
             with self._lock:
                 self._encode_errors += 1
             return

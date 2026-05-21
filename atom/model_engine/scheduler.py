@@ -414,11 +414,6 @@ class Scheduler:
 
         self.kv_connector = get_kvconnector("scheduler", config)
 
-        # KV cache event publisher. Wired up here (not in EngineCore) because
-        # the BlockManager — which actually records events — lives on the
-        # scheduler. When disabled, NullEventPublisher is a no-op, so callers
-        # in `schedule()` can always invoke `publish_kv_events()` without
-        # checking a flag.
         from atom.distributed.kv_events import (
             EventBatch as _EventBatch,
             EventPublisher as _EventPublisher,
@@ -1046,9 +1041,7 @@ class Scheduler:
                 if blk.hash == -1:
                     continue
                 if not remote_hashes:
-                    # First full block in the run — find its parent. There
-                    # isn't one in the chain on the consumer side (the producer
-                    # owned it), so parent stays None.
+                    # Consumer-side: producer owned the chain, so parent is None.
                     parent_hash = None
                 remote_hashes.append(blk.hash)
                 remote_tokens.extend(blk.token_ids)

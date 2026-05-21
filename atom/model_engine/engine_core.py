@@ -258,9 +258,6 @@ class EngineCore:
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
 
-        # Drain KV cache events accumulated by BlockManager during this step
-        # and hand them to the publisher. No-op when KV events are disabled
-        # (NullEventPublisher swallows the call).
         self.scheduler.publish_kv_events()
         return True
 

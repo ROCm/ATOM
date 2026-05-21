@@ -928,24 +928,11 @@ class SpeculativeConfig:
 
 @dataclass
 class KVEventsConfig:
-    """Configuration for KV cache event publishing.
-
-    When `enable=False` the engine installs a `NullEventPublisher` and the
-    BlockManager skips event recording entirely — zero overhead in the
-    default config.
-
-    Wire format is documented in `atom/distributed/kv_events.py`. The
-    BlockStored/BlockRemoved/AllBlocksCleared subset is wire-compatible with
-    vLLM, so existing subscribers (LMCache, Mooncake event listener, etc.)
-    consume ATOM events unchanged. ATOM additionally emits BlockTransferred
-    for HMA / P-D-disagg tier moves; consumers that don't understand this
-    tag should narrow their decoder union.
-    """
+    """Configuration for KV cache event publishing."""
 
     enable: bool = False
     publisher: str = "null"  # "null" | "zmq"
     endpoint: str = "tcp://*:5557"
-    # Subscriber-side topic filter prefix. Empty means publish raw payload.
     topic: str = ""
     # ZMQ high-water-mark on the PUB socket (0 = unlimited).
     hwm: int = 0

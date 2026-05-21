@@ -70,10 +70,6 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
 
-        # KV cache event recording. When disabled, `_event_log` stays None and
-        # the emission helpers short-circuit — zero overhead when events are
-        # off. When enabled, the scheduler drains this list each step via
-        # `take_events()` and hands it to the EventPublisher.
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
         self._event_log: list[KVCacheEvent] | None = (
@@ -330,10 +326,7 @@ class BlockManager:
 
     @property
     def kv_events_enabled(self) -> bool:
-        """True iff KV events are being recorded. Callers that need to build
-        an event payload (e.g. the scheduler walking block_table on remote-KV
-        completion) can early-exit on this, instead of reaching into
-        ``_event_log`` directly."""
+        """True iff KV events are being recorded."""
         return self._event_log is not None
 
     def record_remote_store(
