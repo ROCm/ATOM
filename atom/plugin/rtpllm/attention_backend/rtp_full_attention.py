@@ -308,11 +308,6 @@ class RTPFullAttention(BaseAttention):
         # Effective num_kv_heads after RTP-side duplicate-KV alignment (kv_head_num<tp_size).
         # Lazy-resolved at first eager forward; capture path requires it to be set.
         self._effective_num_kv_heads: int | None = None
-        # one-shot debug flag for round-15 KV reshape investigation.
-        self._dbg_logged_reshape: bool = False
-        self._dbg_logged_forward: bool = False
-        self._dbg_logged_noncap_input_stats: bool = False
-        self._dbg_logged_noncap_input_skip: bool = False
 
     def _get_fused_qkv_buffer(
         self,
@@ -373,29 +368,6 @@ class RTPFullAttention(BaseAttention):
             )
             self._paged_kv_cache = cached
             self._paged_kv_cache_sig = signature
-            # round-15 diag: confirm whether ATOM's per-rank num_kv_heads (=1
-            # on Qwen3.5-MoE TP=4) is mismatched with raw layout.
-            if not self._dbg_logged_reshape:
-                import logging
-                logging.getLogger("atom.plugin.rtpllm").warning(
-                    "[CG-DIAG layer_%d] reshape_paged_kv_cache: "
-                    "raw.dim=%d raw.shape=%s raw.dtype=%s | "
-                    "requested num_kv_heads=%d head_dim=%d tokens_per_block=%d | "
-                    "got cached.shape=%s cached.dim=%d "
-                    "(self.num_kv_heads=%d self._effective_num_kv_heads=%s)",
-                    int(self.layer_num),
-                    int(raw.dim()),
-                    tuple(raw.shape),
-                    str(raw.dtype),
-                    int(self.num_kv_heads),
-                    int(self.head_dim),
-                    int(tokens_per_block),
-                    tuple(cached.shape),
-                    int(cached.dim()),
-                    int(self.num_kv_heads),
-                    str(self._effective_num_kv_heads),
-                )
-                self._dbg_logged_reshape = True
         return cached
 
     def _get_fused_kv_op(
@@ -461,7 +433,10 @@ class RTPFullAttention(BaseAttention):
 
         Keep ATOM fused-KV params lifecycle aligned with RTP native decode path:
         params object is persistent, and replay updates block-offset mapping
-        in-place via CKAttn.update_kv_cache_offset(...).
+        in-place via CKAttn.update_kv_cache_offset(...). The prewarmed
+        _cg_static_bufs are deliberately not refreshed here: replay slices and
+        writes them in-place, so their underlying captured addresses remain
+        stable across requests.
         """
         for params in self._fused_kv_params_cache.values():
             update_kv_cache_offset = getattr(params, "update_kv_cache_offset", None)
@@ -530,12 +505,9 @@ class RTPFullAttention(BaseAttention):
                 device=device,
             ),
             "unit_scale": torch.ones(1, dtype=torch.float32, device=device),
-            # Round 24 / Step 1 — prewarm aligned k/v buffers so capture path
-            # can do in-place writes instead of repeat_interleave (which allocs
-            # a fresh tensor each layer; ptrs get reclaimed/reused by PyTorch
-            # caching allocator and are invalid at replay time → page fault).
-            # Sized for max capture batch (decode-only: max_num_tokens covers
-            # max(decode_capture_batch_sizes)).
+            # Prewarm aligned k/v buffers so capture can write in-place instead
+            # of recording fresh repeat_interleave allocations whose addresses
+            # may be reused by PyTorch's caching allocator after capture.
             "k_aligned": torch.empty(
                 (int(max_num_tokens), int(eff_kv_heads), int(self.head_dim)),
                 dtype=query_dtype,
@@ -546,13 +518,8 @@ class RTPFullAttention(BaseAttention):
                 dtype=query_dtype,
                 device=device,
             ),
-            # Round 25 / Step 2 — same problem for q: ATOM's QKV linear writes
-            # q to a fresh PyTorch caching-pool address every forward, which is
-            # reused across layers (Round 24 audit showed q.data_ptr shared by
-            # 5 layers). Capture records this transient ptr; after capture
-            # PyTorch may hand the slot to RTP setup/replay-init alloc → replay
-            # paged_attention reads stale/unmapped memory → GPU page fault.
-            # Stabilize by copying q into a per-layer prewarm buffer.
+            # Stabilize q as well: ATOM's QKV linear can hand capture a transient
+            # caching-pool address that later gets reused before graph replay.
             "q_aligned": torch.empty(
                 (int(max_num_tokens), int(self.num_heads), int(self.head_dim)),
                 dtype=query_dtype,
@@ -616,14 +583,8 @@ class RTPFullAttention(BaseAttention):
         q = query.view(-1, self.num_heads, self.head_dim)
         k = key.view(-1, self.num_kv_heads, self.head_dim)
         v = value.view(-1, self.num_kv_heads, self.head_dim)
-        # Round 25 / Step 2 — capture-mode q stabilization. ATOM's QKV linear
-        # writes q to a fresh PyTorch caching-pool address each forward; that
-        # address is reused across layers (Round 24 audit showed q.data_ptr
-        # shared by 5 layers). Captured paged_attention reads from that ptr;
-        # after capture PyTorch may hand it to RTP's setup/replay alloc, and
-        # replay reads stale memory → GPU page fault. Mirror Step 1: in-place
-        # copy q into a per-layer prewarm buffer so the captured kernel reads
-        # from a stable address.
+        # In capture mode, copy q into a per-layer prewarm buffer so the captured
+        # kernel reads from a stable address instead of a transient allocator slot.
         if (
             torch.cuda.is_current_stream_capturing()
             and self._cg_static_bufs is not None
@@ -654,35 +615,6 @@ class RTPFullAttention(BaseAttention):
         key_cache = paged_kv.select(1, 0)
         value_cache = paged_kv.select(1, 1)
         target_kv_heads = int(key_cache.shape[1])
-        # round-15 diag: log forward state once per layer.
-        if not self._dbg_logged_forward:
-            import logging
-            in_capture = bool(torch.cuda.is_current_stream_capturing())
-            logging.getLogger("atom.plugin.rtpllm").warning(
-                "[CG-DIAG layer_%d] forward enter: in_capture=%s is_prefill=%s | "
-                "q.shape=%s k.shape=%s v.shape=%s | "
-                "self.num_heads=%d self.num_kv_heads=%d head_dim=%d | "
-                "paged_kv.shape=%s key_cache.shape=%s | "
-                "target_kv_heads=%d _effective_num_kv_heads=%s | "
-                "kernel_seq_size_per_block=%d raw.numel=%d raw.shape=%s",
-                int(self.layer_num),
-                str(in_capture),
-                str(is_prefill),
-                tuple(q.shape),
-                tuple(k.shape),
-                tuple(v.shape),
-                int(self.num_heads),
-                int(self.num_kv_heads),
-                int(self.head_dim),
-                tuple(paged_kv.shape),
-                tuple(key_cache.shape),
-                int(target_kv_heads),
-                str(self._effective_num_kv_heads),
-                int(kernel_seq_size_per_block),
-                int(raw.numel()),
-                tuple(raw.shape),
-            )
-            self._dbg_logged_forward = True
         # Latch effective num_kv_heads on first forward — RTP may duplicate KV
         # heads when kv_head_num<tp_size, and capture path must use the same
         # value as eager (see rtp+atom_graph.md §4.4 / Round-1 cache-key bug).
@@ -695,11 +627,8 @@ class RTPFullAttention(BaseAttention):
                 f"current={target_kv_heads}; cuda-graph cannot capture this layer."
             )
         if target_kv_heads != self.num_kv_heads:
-            # Round 24 / Step 1: capture-mode path uses the prewarmed
-            # `k_aligned` / `v_aligned` static buffers and writes into them
-            # IN-PLACE, so the captured kernels reference the (stable) prewarm
-            # addresses instead of fresh repeat_interleave allocs that get
-            # reclaimed by PyTorch caching allocator after capture.
+            # Capture writes into prewarmed k/v buffers so kernels reference
+            # stable addresses instead of fresh repeat_interleave allocations.
             in_capture_align = (
                 torch.cuda.is_current_stream_capturing()
                 and self._cg_static_bufs is not None
@@ -731,46 +660,12 @@ class RTPFullAttention(BaseAttention):
                     value=v,
                     target_kv_heads=target_kv_heads,
                 )
-        # round-23 per-layer audit: print key data_ptrs once per layer (during
-        # capture phase) so we can compare across all 15 full-attn layers and
-        # spot any tensor whose address moves between layers (would explain
-        # replay fault). NOTE: Python prints DO NOT fire during graph replay —
-        # this only audits what got captured.
-        in_capture_now = bool(torch.cuda.is_current_stream_capturing())
-        _dbg_first = (in_capture_now and not getattr(self, "_dbg_logged_steps", False))
-        if _dbg_first:
-            import logging as _lg
-            _dbg_log = _lg.getLogger("atom.plugin.rtpllm").warning
-            if not self._dbg_logged_noncap_input_stats and not self._dbg_logged_noncap_input_skip:
-                _dbg_log(
-                    "[CG-NONCAP-INPUT layer_%d] skipped: first observed forward already in capture; "
-                    "non-capture min/max/sample stats unavailable in this run.",
-                    self.layer_num,
-                )
-                self._dbg_logged_noncap_input_skip = True
-            _dbg_log("[CG-STEP layer_%d] A done: k.shape=%s k.data_ptr=0x%x | "
-                     "v.shape=%s v.data_ptr=0x%x | "
-                     "q.shape=%s q.data_ptr=0x%x | "
-                     "kv_cache_base.data_ptr=0x%x kv_cache_base.numel=%d",
-                     self.layer_num,
-                     tuple(k.shape), int(k.data_ptr()),
-                     tuple(v.shape), int(v.data_ptr()),
-                     tuple(q.shape), int(q.data_ptr()),
-                     int(raw.data_ptr()), int(raw.numel()))
         layer_group_map = getattr(attn_metadata, "rtp_layer_group_map", None)
         block_tables = _resolve_block_tables_for_layer(
             attn_inputs,
             int(self.layer_num),
             layer_group_map=layer_group_map,
         )
-        if _dbg_first:
-            _dbg_log("[CG-STEP layer_%d] B done: block_tables.shape=%s dtype=%s "
-                     "numel=%d data_ptr=0x%x",
-                     self.layer_num,
-                     tuple(block_tables.shape) if block_tables is not None else None,
-                     str(block_tables.dtype) if block_tables is not None else None,
-                     int(block_tables.numel()) if block_tables is not None else 0,
-                     int(block_tables.data_ptr()) if block_tables is not None else 0)
         if block_tables is None or block_tables.numel() == 0:
             raise ValueError(
                 f"RTPAttention requires block table for layer_{self.layer_num}."
@@ -779,49 +674,6 @@ class RTPFullAttention(BaseAttention):
         seq_lens = plugin_md.seq_lens
         if seq_lens is None:
             raise ValueError("RTPAttention requires block tables and sequence lengths.")
-        if (not in_capture_now) and (not self._dbg_logged_noncap_input_stats):
-            import logging as _lg
-            _diag_log = _lg.getLogger("atom.plugin.rtpllm").warning
-            try:
-                seq_lens_min = int(seq_lens.min().item())
-                seq_lens_max = int(seq_lens.max().item())
-                seq_lens_sample = seq_lens[: min(8, int(seq_lens.numel()))].detach().cpu().tolist()
-                seq_lens_sample = [int(x) for x in seq_lens_sample]
-
-                bt_rows = int(block_tables.shape[0]) if block_tables is not None and block_tables.dim() > 0 else 0
-                bt_cols = int(block_tables.shape[1]) if block_tables is not None and block_tables.dim() > 1 else 0
-                bt_sample = []
-                if bt_rows > 0 and bt_cols > 0:
-                    bt_sample = block_tables[
-                        : min(1, bt_rows),
-                        : min(8, bt_cols),
-                    ].detach().cpu().reshape(-1).tolist()
-                    bt_sample = [int(x) for x in bt_sample]
-                bt_min = int(block_tables.min().item())
-                bt_max = int(block_tables.max().item())
-                _diag_log(
-                    "[CG-NONCAP-INPUT layer_%d] seq_lens.shape=%s dtype=%s min=%d max=%d sample=%s | "
-                    "block_tables.shape=%s dtype=%s min=%d max=%d sample=%s | max_seq_len=%d",
-                    self.layer_num,
-                    tuple(seq_lens.shape),
-                    str(seq_lens.dtype),
-                    seq_lens_min,
-                    seq_lens_max,
-                    str(seq_lens_sample),
-                    tuple(block_tables.shape),
-                    str(block_tables.dtype),
-                    bt_min,
-                    bt_max,
-                    str(bt_sample),
-                    int(plugin_md.max_seq_len),
-                )
-                self._dbg_logged_noncap_input_stats = True
-            except Exception as exc:
-                _diag_log(
-                    "[CG-NONCAP-INPUT layer_%d] stats logging failed: %s",
-                    self.layer_num,
-                    str(exc),
-                )
         fused_qkv_dim = int(
             self.num_heads * self.head_dim + 2 * int(k.shape[1]) * self.head_dim
         )
@@ -831,19 +683,6 @@ class RTPFullAttention(BaseAttention):
             device=q.device,
             dtype=q.dtype,
         )
-        if _dbg_first:
-            # Also dump seq_lens.data_ptr / plugin_md.max_seq_len so we can
-            # verify the same buffer is referenced across all layers (RTP must
-            # supply ONE seq_lens tensor whose address stays stable in capture).
-            _dbg_log("[CG-STEP layer_%d] C done; about to call D (fused KV write); "
-                     "fused_qkv_buf.shape=%s data_ptr=0x%x | "
-                     "seq_lens.data_ptr=0x%x plugin_md.max_seq_len=%d "
-                     "fused_qkv_dim=%d",
-                     self.layer_num, tuple(fused_qkv_buf.shape),
-                     int(fused_qkv_buf.data_ptr()),
-                     int(seq_lens.data_ptr()),
-                     int(plugin_md.max_seq_len),
-                     int(fused_qkv_dim))
         used_fused_write = _write_kv_cache_with_rtp_fused_kernel(
             query=q,
             key=k,
@@ -865,25 +704,6 @@ class RTPFullAttention(BaseAttention):
             raise RuntimeError(
                 "RTP fused KV write is required but unavailable; "
                 "fallback slot_mapping path is removed."
-            )
-        if _dbg_first:
-            _dbg_log(
-                "[CG-STEP layer_%d] D returned; about to call E (paged attn): "
-                "num_seqs=%d max_seq_len=%d seq_lens.shape=%s seq_lens.dtype=%s "
-                "block_tables.shape=%s block_tables.dtype=%s "
-                "seq_lens.numel=%d seq_lens.data_ptr=0x%x | "
-                "block_tables.numel=%d block_tables.data_ptr=0x%x",
-                self.layer_num,
-                int(q.shape[0]),
-                int(plugin_md.max_seq_len),
-                tuple(seq_lens.shape) if seq_lens is not None else None,
-                str(seq_lens.dtype) if seq_lens is not None else None,
-                tuple(block_tables.shape) if block_tables is not None else None,
-                str(block_tables.dtype) if block_tables is not None else None,
-                int(seq_lens.numel()) if seq_lens is not None else 0,
-                int(seq_lens.data_ptr()) if seq_lens is not None else 0,
-                int(block_tables.numel()) if block_tables is not None else 0,
-                int(block_tables.data_ptr()) if block_tables is not None else 0,
             )
         cu_seqlens_q = getattr(plugin_md, "rtp_cu_seqlens_q", None)
         if is_prefill and cu_seqlens_q is not None and cu_seqlens_q.numel() > 1:
@@ -951,34 +771,6 @@ class RTPFullAttention(BaseAttention):
                 and torch.cuda.is_current_stream_capturing())
             else None
         )
-        if _dbg_first:
-            # Capture-safe: only metadata + data_ptr (no device→host sync).
-            # Dump all prewarmed static_bufs ptrs so we can verify each layer
-            # uses its OWN per-layer prewarm buffer (one set per layer); if two
-            # layers share the same output ptr → bug, replay would race.
-            sb_out = static_bufs["output"].data_ptr() if static_bufs else 0
-            sb_tmp = static_bufs["tmp_output"].data_ptr() if static_bufs else 0
-            sb_exp = static_bufs["exp_sums"].data_ptr() if static_bufs else 0
-            sb_max = static_bufs["max_logits"].data_ptr() if static_bufs else 0
-            _dbg_log("[CG-STEP layer_%d] E entering: num_seqs=%d "
-                     "plugin_md.max_seq_len=%d seq_lens.shape=%s seq_lens.dtype=%s "
-                     "block_tables.shape=%s block_tables.dtype=%s "
-                     "seq_lens.numel=%d seq_lens.data_ptr=0x%x | "
-                     "block_tables.numel=%d block_tables.data_ptr=0x%x | "
-                     "static_bufs out=0x%x tmp=0x%x exp=0x%x max_logit=0x%x | "
-                     "paged_kv.data_ptr=0x%x",
-                     self.layer_num, int(num_seqs),
-                     int(plugin_md.max_seq_len),
-                     tuple(seq_lens.shape),
-                     str(seq_lens.dtype),
-                     tuple(block_tables.shape),
-                     str(block_tables.dtype),
-                     int(seq_lens.numel()),
-                     int(seq_lens.data_ptr()),
-                     int(block_tables.numel()),
-                     int(block_tables.data_ptr()),
-                     int(sb_out), int(sb_tmp), int(sb_exp), int(sb_max),
-                     int(paged_kv.data_ptr()))
         output = _run_nonasm_paged_attention(
             query=q,
             paged_kv_cache=paged_kv,
@@ -988,12 +780,6 @@ class RTPFullAttention(BaseAttention):
             max_seq_len=int(plugin_md.max_seq_len),
             static_bufs=static_bufs,
         )
-        if _dbg_first:
-            _dbg_log("[CG-STEP layer_%d] E returned; output.shape=%s "
-                     "output.data_ptr=0x%x",
-                     self.layer_num, tuple(output.shape),
-                     int(output.data_ptr()))
-            self._dbg_logged_steps = True
         output = output.view(num_seqs, -1)
         return output
 

@@ -124,12 +124,10 @@ class RTPForwardContext:
         *,
         device: torch.device,
         seq_size_per_block: int,
-        layer_num: int | None = None,
         group_id: int | None = None,
     ) -> torch.Tensor:
         block_table = RTPForwardContext._select_block_table_for_layer(
             attn_inputs=attn_inputs,
-            layer_num=layer_num,
             group_id=group_id,
         )
         if block_table is None or block_table.numel() == 0:
@@ -255,7 +253,6 @@ class RTPForwardContext:
     @staticmethod
     def _select_block_table_for_layer(
         attn_inputs: Any,
-        layer_num: int | None,
         group_id: int | None = None,
     ) -> torch.Tensor | None:
         by_group = getattr(attn_inputs, "kv_cache_kernel_block_id_device_by_group", None)
@@ -263,7 +260,7 @@ class RTPForwardContext:
             gid = int(group_id) if group_id is not None else 0
             if gid < 0 or gid >= len(by_group):
                 raise ValueError(
-                    f"RTP plugin resolved invalid kv-cache group id {gid} for layer {layer_num}."
+                    f"RTP plugin resolved invalid kv-cache group id {gid}."
                 )
             return by_group[gid]
         return getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
@@ -328,7 +325,6 @@ class RTPForwardContext:
             is_prefill=is_prefill,
             device=device,
             seq_size_per_block=seq_size_per_block,
-            layer_num=None,
             group_id=group_id,
         )
         if state_indices_cache is not None:
@@ -436,6 +432,13 @@ class RTPForwardContext:
 
     @staticmethod
     def _build_seq_lens(attn_inputs: Any, *, device: torch.device) -> torch.Tensor:
+        """Build kernel seq_lens using RTP-native field priority.
+
+        Decode should prefer sequence_lengths when present because it carries the
+        committed context length before adding the current input token count.
+        sequence_lengths_plus_1_d is kept as the older fallback used by RTP graph
+        dummy inputs.
+        """
         input_lengths = RTPForwardContext._non_empty_int32(
             getattr(attn_inputs, "input_lengths", None),
             device=device,
@@ -721,7 +724,6 @@ class RTPForwardContext:
     ) -> AttentionMetaData:
         block_table = RTPForwardContext._select_block_table_for_layer(
             attn_inputs=attn_inputs,
-            layer_num=None,
         )
         if block_table is None or block_table.numel() == 0:
             raise ValueError(
@@ -811,7 +813,6 @@ class RTPForwardContext:
             # the metadata so RTPFullAttention can short-circuit to zeros.
             if max_seq_len <= 0:
                 is_dummy_warmup = True
-            if max_seq_len <= 0:
                 if cg_max_seq_len > 0:
                     max_seq_len = int(cg_max_seq_len)
                 else:
@@ -1173,7 +1174,6 @@ class RTPForwardContext:
         attn_md = forward_context.attn_metadata
         attn_md.gdn_metadata = forward_context.gdn_metadata
         attn_md.rtp_attn_inputs = forward_context.rtp_attn_inputs
-        attn_md.rtp_seq_size_per_block = forward_context.rtp_seq_size_per_block
         attn_md.rtp_kernel_seq_size_per_block = (
             forward_context.rtp_kernel_seq_size_per_block
         )

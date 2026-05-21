@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from contextlib import contextmanager
@@ -5,10 +6,10 @@ from typing import Any
 
 import torch
 from rtp_llm.config.model_config import ModelConfig
-from rtp_llm.model_loader.model_weight_info import ModelWeights
-from rtp_llm.models.qwen3_next.qwen3_next import Qwen35Moe
+from rtp_llm.model_loader.model_weight_info import ModelDeployWeightInfo, ModelWeights
+from rtp_llm.models.base_model import BaseModel
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
-from rtp_llm.ops import ParallelismConfig
+from rtp_llm.ops import HybridAttentionType, ParallelismConfig
 from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
 
@@ -47,6 +48,11 @@ class _NoopModelWeightsLoader:
         return None
 
 
+class _StubWeightInfo(ModelDeployWeightInfo):
+    def _get_weight_info(self):
+        return []
+
+
 class _ATOMAttnPyObj:
     """Container returned by _ATOMQwen35MoeRuntime.prepare_fmha_impl.
 
@@ -80,9 +86,8 @@ class _ATOMAttnPyObj:
         return None
 
     def prepare_cuda_graph(self, attn_inputs) -> None:
-        # Forward to each layer. Layer-side prepare_cuda_graph is a no-op today
-        # (rtp+atom_graph.md §4.1); kept here so future per-layer state refresh
-        # has a wire-up point.
+        # Replay enters here without re-running prepare_fmha_impl, so forward
+        # the latest block mapping to each layer's fused-KV params cache.
         for layer in self._rtp_full_attn_layers:
             layer.prepare_cuda_graph(attn_inputs)
 
@@ -126,14 +131,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         # cuda-graph attn_pyobj cache (see _ATOMAttnPyObj).
         self._atom_attn_pyobj: _ATOMAttnPyObj | None = None
         self._cg_layers_prewarmed: bool = False
-        # Capture budget; prewarm uses these. We want max_num_tokens to be the
-        # largest batch size that will actually be captured, NOT the runtime
-        # concurrency limit. RTP only captures graphs for batch sizes listed in
-        # decode_capture_batch_sizes (env DECODE_CAPTURE_CONFIG). Sizing prewarm
-        # for max_generate_batch_size when that's much larger (e.g. 128 vs 8)
-        # over-allocates tmp_output ≈ [N, num_heads, max_partitions, head_dim]
-        # by 16× — enough on TP=4 fp8 to push PyTorch caching allocator past
-        # the point where it can extend a 256 MiB segment during capture.
+        # Prewarm only for buckets RTP will capture; using the full concurrency
+        # limit can over-allocate graph static buffers enough to break capture.
         decode_caps = getattr(py_hw_kernel_config, "decode_capture_batch_sizes", None)
         if decode_caps:
             self._cg_max_num_tokens: int = min(
@@ -166,6 +165,25 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             return int(inputs.input_hiddens.shape[0])
         return 0
 
+    @staticmethod
+    def _build_token_positions(
+        input_lengths: torch.Tensor,
+        starts: torch.Tensor,
+    ) -> torch.Tensor | None:
+        token_starts = torch.repeat_interleave(starts, input_lengths)
+        if token_starts.numel() == 0:
+            return None
+        per_seq_base = input_lengths.cumsum(dim=0) - input_lengths
+        token_ordinal = (
+            torch.cumsum(
+                torch.repeat_interleave(torch.ones_like(input_lengths), input_lengths),
+                dim=0,
+            )
+            - 1
+        )
+        token_ordinal = token_ordinal - torch.repeat_interleave(per_seq_base, input_lengths)
+        return (token_starts + token_ordinal).to(dtype=torch.int32).contiguous()
+
     def _build_positions_from_attention_inputs(
         self, attn_inputs: Any, model_device: torch.device
     ) -> torch.Tensor | None:
@@ -190,23 +208,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             if int(prefix_lengths_i32.numel()) < int(input_lengths_i32.numel()):
                 return None
             starts = prefix_lengths_i32[: int(input_lengths_i32.numel())]
-            token_starts = torch.repeat_interleave(starts, input_lengths_i32)
-            if token_starts.numel() == 0:
-                return None
-            per_seq_base = input_lengths_i32.cumsum(dim=0) - input_lengths_i32
-            token_ordinal = (
-                torch.cumsum(
-                    torch.repeat_interleave(
-                        torch.ones_like(input_lengths_i32), input_lengths_i32
-                    ),
-                    dim=0,
-                )
-                - 1
-            )
-            token_ordinal = token_ordinal - torch.repeat_interleave(
-                per_seq_base, input_lengths_i32
-            )
-            return (token_starts + token_ordinal).to(dtype=torch.int32).contiguous()
+            return self._build_token_positions(input_lengths_i32, starts)
 
         sequence_lengths = getattr(attn_inputs, "sequence_lengths", None)
         if sequence_lengths is None or sequence_lengths.numel() == 0:
@@ -219,23 +221,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         starts = (
             sequence_lengths_i32[: int(input_lengths_i32.numel())] - input_lengths_i32 + 1
         )
-        token_starts = torch.repeat_interleave(starts, input_lengths_i32)
-        if token_starts.numel() == 0:
-            return None
-        per_seq_base = input_lengths_i32.cumsum(dim=0) - input_lengths_i32
-        token_ordinal = (
-            torch.cumsum(
-                torch.repeat_interleave(
-                    torch.ones_like(input_lengths_i32), input_lengths_i32
-                ),
-                dim=0,
-            )
-            - 1
-        )
-        token_ordinal = token_ordinal - torch.repeat_interleave(
-            per_seq_base, input_lengths_i32
-        )
-        return (token_starts + token_ordinal).to(dtype=torch.int32).contiguous()
+        return self._build_token_positions(input_lengths_i32, starts)
 
     def _extract_combo_positions(
         self, inputs: PyModelInputs, model_device: torch.device
@@ -310,17 +296,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
     def prepare_fmha_impl(
         self, inputs: PyModelInputs, is_cuda_graph: bool = False
     ) -> Any:
-        """Override base class to return ATOM-aware container.
-
-        RTP CudaGraphRunner.cc:480 calls this once during initCapture and stores
-        the returned object as ``attn_pyobj``; CudaGraphRunner.cc:122 then calls
-        ``attn_pyobj.prepare_cuda_graph(attn_inputs)`` before each replay.
-
-        Returning the base RTP fmha_impl (which has its own prepare_cuda_graph)
-        is wrong here because ATOM's RTPFullAttention reads from forward_context
-        independently and never consults the RTP fmha_impl object — see
-        rtp+atom_graph.md §4.1 (首要根因).
-        """
+        """Return ATOM-aware attention container for RTP CUDA graph hooks."""
         if self._atom_attn_pyobj is None:
             self._atom_attn_pyobj = _ATOMAttnPyObj(self)
         self._atom_attn_pyobj.is_cuda_graph = bool(is_cuda_graph)
@@ -469,13 +445,91 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         return PyModelOutputs(hidden_states)
 
 
-class ATOMQwen35Moe(Qwen35Moe):
+class ATOMQwen35Moe(BaseModel):
     """Qwen3.5-MoE model class that starts ATOM runtime in rtp-llm."""
 
     @staticmethod
     def _is_external_plugin_mode() -> bool:
         modules = os.getenv("RTP_LLM_EXTERNAL_MODEL_PACKAGES", "")
         return "atom.plugin.rtpllm.models" in modules
+
+    @staticmethod
+    def get_weight_cls():
+        return _StubWeightInfo
+
+    @classmethod
+    def _create_config(cls, ckpt_path: str) -> ModelConfig:
+        config_path = os.path.join(ckpt_path, "config.json")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"config.json not found in {ckpt_path}")
+
+        with open(config_path) as reader:
+            config_json = json.loads(reader.read())
+        config_json = config_json["text_config"]
+
+        config = ModelConfig()
+        config.ckpt_path = ckpt_path
+        config.attn_config.head_num = config_json["num_attention_heads"]
+        config.attn_config.kv_head_num = config_json["num_key_value_heads"]
+        config.attn_config.size_per_head = config_json["head_dim"]
+        config.num_layers = config_json["num_hidden_layers"]
+        config.hidden_size = config_json["hidden_size"]
+        config.vocab_size = config_json["vocab_size"]
+        config.max_seq_len = config_json["max_position_embeddings"]
+        config.tie_word_embeddings = config_json.get("tie_word_embeddings", False)
+
+        rope_parameters = config_json["rope_parameters"]
+        config.attn_config.rope_config.style = 1
+        config.attn_config.rope_config.base = rope_parameters["rope_theta"]
+        config.partial_rotary_factor = rope_parameters["partial_rotary_factor"]
+        config.attn_config.rope_config.dim = int(
+            config.attn_config.size_per_head * config.partial_rotary_factor
+        )
+
+        config.layernorm_eps = config_json["rms_norm_eps"]
+        config.norm_type = "rmsnorm"
+        config.has_pre_decoder_layernorm = False
+        config.has_post_decoder_layernorm = True
+        config.qk_norm = True
+        config.activation_type = "SiGLU"
+
+        config.moe_k = config_json["num_experts_per_tok"]
+        config.expert_num = config_json["num_experts"]
+        config.moe_inter_size = config_json["moe_intermediate_size"]
+        config.inter_size = config_json["shared_expert_intermediate_size"]
+        config.has_moe_norm = config_json.get("norm_topk_prob", True)
+        config.moe_style = 2
+
+        moe_step = config_json.get("decoder_sparse_step", 1)
+        config.moe_layer_index = [
+            idx for idx in range(config.num_layers) if (idx + 1) % moe_step == 0
+        ]
+
+        attention_step = config_json["full_attention_interval"]
+        config.hybrid_attention_config.enable_hybrid_attention = True
+        config.hybrid_attention_config.hybrid_attention_types = [
+            HybridAttentionType.NONE
+            if (idx + 1) % attention_step == 0
+            else HybridAttentionType.LINEAR
+            for idx in range(config.num_layers)
+        ]
+
+        config.linear_attention_config.linear_conv_kernel_dim = config_json[
+            "linear_conv_kernel_dim"
+        ]
+        config.linear_attention_config.linear_key_head_dim = config_json[
+            "linear_key_head_dim"
+        ]
+        config.linear_attention_config.linear_num_key_heads = config_json[
+            "linear_num_key_heads"
+        ]
+        config.linear_attention_config.linear_num_value_heads = config_json[
+            "linear_num_value_heads"
+        ]
+        config.linear_attention_config.linear_value_head_dim = config_json[
+            "linear_value_head_dim"
+        ]
+        return config
 
     def support_cuda_graph(self) -> bool:
         """Tell RTP PyWrappedModel.h:160 whether to construct CudaGraphRunner.
@@ -548,13 +602,13 @@ class ATOMQwen35Moe(Qwen35Moe):
             )
             return
 
-        # Non-plugin mode keeps native behavior.
-        super().load(skip_python_model=skip_python_model)
+        raise RuntimeError("ATOMQwen35Moe is only supported as an RTP external plugin.")
 
     def _create_python_model(self):
-        # Non-external mode should keep native rtp-llm Python model path.
         if not self._is_external_plugin_mode():
-            return super()._create_python_model()
+            raise RuntimeError(
+                "ATOMQwen35Moe is only supported as an RTP external plugin."
+            )
 
         import atom
         from atom.model_loader.loader import load_model_in_plugin_mode
