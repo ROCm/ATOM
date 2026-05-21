@@ -201,9 +201,7 @@ class TestCanAllocateWithPrefixCaching:
         assert s2.block_table[0] == s1.block_table[0]
         assert bm.blocks[s1.block_table[0]].ref_count == 2
 
-    def test_can_allocate_charges_hit_on_unreferenced_cached_block(
-        self, seq_factory
-    ):
+    def test_can_allocate_charges_hit_on_unreferenced_cached_block(self, seq_factory):
         """Regression for 'No free blocks available' raised mid-allocate.
 
         When a cached block sits in free_set (prior owner finished but
