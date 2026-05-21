@@ -381,6 +381,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `torch.as_tensor(arr)` allocations.
         self._alloc_v4_metadata_buffers()
 
+        # Grow-on-demand pinned buffer for prefill index H2D.
+        self._prefill_staging_cap = 0
+        self._prefill_staging_pinned: Optional[torch.Tensor] = None
+        self._prefill_staging_gpu: Optional[torch.Tensor] = None
+
     @property
     def prep_stream(self):
         return self.model_runner.async_execute_stream
@@ -546,7 +551,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             (n_hca, num_slots, *self.hca_main_state_shape), device
         )
 
-        # ---- RDMA staging pool, for RDMA performance ---------------------
+        # ---- RDMA staging pool, only allocated in PD disaggregation mode --
+        is_pd = bool(getattr(self.model_runner.config, "kv_transfer_config", None))
         state_tensors = [
             csa_main_kv,
             csa_main_score,
@@ -556,12 +562,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             hca_main_score,
         ]
         state_slot_stride = sum(t[0, 0].numel() * t.shape[0] for t in state_tensors)
-        pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "32"))
-        state_pool = torch.zeros(
-            pool_size * state_slot_stride,
-            dtype=self._state_dtype,
-            device=device,
-        )
+        if is_pd:
+            pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "32"))
+            state_pool = torch.zeros(
+                pool_size * state_slot_stride,
+                dtype=self._state_dtype,
+                device=device,
+            )
+        else:
+            pool_size = 0
+            state_pool = torch.empty(0, dtype=self._state_dtype, device=device)
 
         return {
             "v4_unified_kv": unified_kv,
@@ -764,7 +774,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         staging_region = None
         gather_slot = None
         scatter_slot = None
-        if hasattr(runner, "v4_state_pool"):
+        if hasattr(runner, "v4_state_pool") and runner.v4_state_pool_size > 0:
             pool = runner.v4_state_pool
             stride = runner.v4_state_slot_stride
             pool_size = runner.v4_state_pool_size
@@ -1505,7 +1515,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if num_write < swa_write_grid:
                 wi_gpu[num_write:swa_write_grid].fill_(-1)
         elif num_write > 0:
-            wi_gpu[:num_write].copy_(torch.from_numpy(write_indices_np))
+            wi_buf = var["v4_meta_swa_write_indices"]
+            wi_buf.np[:num_write] = write_indices_np
+            wi_gpu[:num_write].copy_(wi_buf.cpu[:num_write], non_blocking=True)
         attn_metadata.swa_write_indices = wi_gpu[:swa_write_grid]
 
         self._attach_v4_paged_decode_meta(
@@ -1765,7 +1777,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
           HCA:    prefix_swa_count[t] + n_committed_hca[bid]
 
         Eager-only (chunked prefill is dynamic-shaped; no CG capture). Per-fwd
-        `torch.from_numpy(...).to(device)` is fine — no forward_vars staging.
+        `torch.from_numpy(...).to(device, non_blocking=True)` avoids stream drain.
 
         Builder fills: extend buffer, prefix_swa buffer (Dense), HCA section
         of prefix_hca buffer, SWA prefix sections of all 3 prefix buffers.
@@ -1952,30 +1964,37 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
             kv_indices_prefix_hca_np[hca_comp_dst] = hca_compress_paged_np
 
-        # ----- One-shot H2D for everything -----
-        attn_metadata.kv_indices_extend = torch.from_numpy(ext_indices_np).to(device)
-        attn_metadata.kv_indptr_extend = torch.from_numpy(extend_indptr_np).to(device)
-        attn_metadata.kv_indices_prefix_swa = torch.from_numpy(
-            kv_indices_prefix_swa_np
-        ).to(device)
-        attn_metadata.kv_indptr_prefix_swa = torch.from_numpy(prefix_swa_indptr_np).to(
-            device
+        # ----- Single pinned H2D for all prefill index arrays -----
+        # Pack int32 arrays into one contiguous pinned buffer, one H2D copy
+        # (truly non_blocking on pinned memory), then slice out views.
+        fields = [
+            ("kv_indices_extend", ext_indices_np),
+            ("kv_indptr_extend", extend_indptr_np),
+            ("kv_indices_prefix_swa", kv_indices_prefix_swa_np),
+            ("kv_indptr_prefix_swa", prefix_swa_indptr_np),
+            ("kv_indices_prefix_csa", kv_indices_prefix_csa_np),
+            ("kv_indptr_prefix_csa", prefix_csa_indptr_np),
+            ("kv_indices_prefix_hca", kv_indices_prefix_hca_np),
+            ("kv_indptr_prefix_hca", prefix_hca_indptr_np),
+            ("skip_prefix_len_csa", prefix_swa_count_np),
+        ]
+        total = sum(arr.shape[0] for _, arr in fields)
+        self._ensure_prefill_staging(total)
+        pinned_np = self._prefill_staging_pinned.numpy()
+        off = 0
+        for _, arr in fields:
+            n = arr.shape[0]
+            pinned_np[off : off + n] = arr
+            off += n
+        self._prefill_staging_gpu[:total].copy_(
+            self._prefill_staging_pinned[:total], non_blocking=True
         )
-        attn_metadata.kv_indices_prefix_csa = torch.from_numpy(
-            kv_indices_prefix_csa_np
-        ).to(device)
-        attn_metadata.kv_indptr_prefix_csa = torch.from_numpy(prefix_csa_indptr_np).to(
-            device
-        )
-        attn_metadata.kv_indices_prefix_hca = torch.from_numpy(
-            kv_indices_prefix_hca_np
-        ).to(device)
-        attn_metadata.kv_indptr_prefix_hca = torch.from_numpy(prefix_hca_indptr_np).to(
-            device
-        )
-        attn_metadata.skip_prefix_len_csa = torch.from_numpy(prefix_swa_count_np).to(
-            device
-        )
+        g = self._prefill_staging_gpu
+        off = 0
+        for name, arr in fields:
+            n = arr.shape[0]
+            setattr(attn_metadata, name, g[off : off + n])
+            off += n
         attn_metadata.swa_pages = swa_pages
 
     def _build_compress_plans(
@@ -2362,6 +2381,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         buf.np[:n] = arr
         return buf.copy_to_gpu(n)
+
+    def _ensure_prefill_staging(self, n: int) -> None:
+        """Grow the pinned + GPU staging buffer pair to hold at least `n` int32 elements."""
+        if self._prefill_staging_cap >= n:
+            return
+        new_cap = max(n, self._prefill_staging_cap * 2, 1 << 20)
+        self._prefill_staging_pinned = torch.empty(
+            new_cap, dtype=torch.int32, pin_memory=True
+        )
+        self._prefill_staging_gpu = torch.empty(
+            new_cap, dtype=torch.int32, device=self.device
+        )
+        self._prefill_staging_cap = new_cap
 
     @staticmethod
     def _numel(shape: tuple) -> int:
