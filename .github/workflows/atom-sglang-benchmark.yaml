@@ -6,8 +6,11 @@ concurrency:
 
 on:
   schedule:
-    # Nightly at 23:00 Beijing time (15:00 UTC). Weekends run SGLang-Mesh.
-    - cron: '0 15 * * *'
+    # Nightly at 23:00 Beijing time (15:00 UTC).
+    - cron: '0 15 * * 1,3'  # Mon/Wed: SGLang-OOB DeepSeek group A, 6 models x 10 params = 60 cases
+    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB group B, 2 DeepSeek MTP + 2 Qwen models, 4 x 10 params = 40 cases
+    - cron: '0 15 * * 5'    # Fri: SGLang-OOB all, 10 models x 10 params = 100 cases
+    - cron: '0 15 * * 6'  # Sat: SGLang-Mesh all, 8 configs = 62 cases
   workflow_dispatch:
     inputs:
       benchmark_suite:
@@ -103,6 +106,7 @@ jobs:
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
           INPUT_WORKLOAD_LABEL: ${{ inputs.benchmark_suite || 'SGLang-OOB' }}
+          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
         run: |
           set -euo pipefail
 
@@ -135,10 +139,10 @@ jobs:
 
           WORKLOAD_LABEL="${INPUT_WORKLOAD_LABEL:-SGLang-OOB}"
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            BEIJING_WEEKDAY="$(TZ=Asia/Shanghai date +%u)"
-            if [[ "${BEIJING_WEEKDAY}" == "6" || "${BEIJING_WEEKDAY}" == "7" ]]; then
-              WORKLOAD_LABEL="SGLang-Mesh"
-            fi
+            case "${SCHEDULE_CRON}" in
+              "0 15 * * 6,0") WORKLOAD_LABEL="SGLang-Mesh" ;;
+              *) WORKLOAD_LABEL="SGLang-OOB" ;;
+            esac
           fi
           case "${WORKLOAD_LABEL}" in
             SGLang-OOB|SGLang-Mesh) ;;
@@ -351,10 +355,9 @@ jobs:
           OOB_MODEL_PRESET: ${{ inputs.oob_model_preset || 'none' }}
           MESH_CONFIG_PRESET: ${{ inputs.mesh_config_preset || 'all' }}
           WORKLOAD_LABEL: ${{ needs.resolve-atom-source.outputs.workload_label }}
+          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
         run: |
           set -euo pipefail
-
-          export BEIJING_WEEKDAY="$(TZ=Asia/Shanghai date +%u)"
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           import os
@@ -400,17 +403,17 @@ jobs:
               return prefix == preset
 
           if event == "schedule":
-              weekday = int(os.environ["BEIJING_WEEKDAY"])
-              if weekday in (1, 3):
+              schedule_cron = os.environ.get("SCHEDULE_CRON", "")
+              if schedule_cron == "0 15 * * 1,3":
                   selected_group = "A-DEEPSEEK"
                   selected = [m for m in models if m.get("nightly_group", "A") == "A" and matches_workload(m)]
-              elif weekday in (2, 4):
+              elif schedule_cron == "0 15 * * 2,4":
                   selected_group = "B-QWEN35"
                   selected = [m for m in models if m.get("nightly_group") == "B" and matches_workload(m)]
-              elif weekday == 5:
+              elif schedule_cron == "0 15 * * 5":
                   selected_group = "C-ALL"
                   selected = [m for m in models if matches_workload(m)]
-              elif weekday in (6, 7):
+              elif schedule_cron == "0 15 * * 6,0":
                   selected_group = "WEEKEND-MESH"
                   selected = [
                       m
