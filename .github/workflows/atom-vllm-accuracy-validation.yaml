@@ -19,13 +19,28 @@ on:
         required: false
         type: boolean
         default: false
+      run_qwen3_next_80b_tp2:
+        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP2"
+        required: false
+        type: boolean
+        default: false
       run_qwen3_next_80b_tp4:
         description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4"
         required: false
         type: boolean
         default: false
+      run_qwen3_next_80b_mtp_tp1:
+        description: "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1"
+        required: false
+        type: boolean
+        default: false
       run_qwen3_next_80b_mtp_tp4:
         description: "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4"
+        required: false
+        type: boolean
+        default: false
+      run_qwen35_397b_fp8_tp4:
+        description: "Qwen3.5-397B-A17B-FP8 TP4"
         required: false
         type: boolean
         default: false
@@ -54,8 +69,18 @@ on:
         required: false
         type: boolean
         default: false
+      run_kimi_k2_tp4:
+        description: "Kimi-K2-Thinking-MXFP4 TP4"
+        required: false
+        type: boolean
+        default: false
       run_kimi_k2_tp8:
         description: "Kimi-K2-Thinking-MXFP4 TP8"
+        required: false
+        type: boolean
+        default: false
+      run_kimi_k25_tp4:
+        description: "Kimi-K2.5-MXFP4 TP4"
         required: false
         type: boolean
         default: false
@@ -91,6 +116,36 @@ on:
         default: false
       run_gpt_oss_120b_tp2:
         description: "gpt-oss-120b TP2"
+        required: false
+        type: boolean
+        default: false
+      run_gpt_oss_120b_tp8:
+        description: "gpt-oss-120b TP8"
+        required: false
+        type: boolean
+        default: false
+      run_minimax_m25_tp2:
+        description: "MiniMax-M2.5 TP2"
+        required: false
+        type: boolean
+        default: false
+      run_minimax_m25_tp4:
+        description: "MiniMax-M2.5 TP4"
+        required: false
+        type: boolean
+        default: false
+      run_glm4_7_fp8_tp4:
+        description: "GLM-4.7-FP8 TP4"
+        required: false
+        type: boolean
+        default: false
+      run_glm4_7_fp8_tp8:
+        description: "GLM-4.7-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
+      run_glm4_7_fp8_mtp_tp4:
+        description: "GLM-4.7-FP8 MTP TP4"
         required: false
         type: boolean
         default: false
@@ -151,14 +206,19 @@ jobs:
         env:
           RUN_QWEN3_MOE_TP8: ${{ inputs.run_qwen3_moe_tp8 }}
           RUN_QWEN3_NEXT_80B_TP1: ${{ inputs.run_qwen3_next_80b_tp1 }}
+          RUN_QWEN3_NEXT_80B_TP2: ${{ inputs.run_qwen3_next_80b_tp2 }}
           RUN_QWEN3_NEXT_80B_TP4: ${{ inputs.run_qwen3_next_80b_tp4 }}
+          RUN_QWEN3_NEXT_80B_MTP_TP1: ${{ inputs.run_qwen3_next_80b_mtp_tp1 }}
           RUN_QWEN3_NEXT_80B_MTP_TP4: ${{ inputs.run_qwen3_next_80b_mtp_tp4 }}
+          RUN_QWEN35_397B_FP8_TP4: ${{ inputs.run_qwen35_397b_fp8_tp4 }}
           RUN_QWEN35_397B_FP8_TP8: ${{ inputs.run_qwen35_397b_fp8_tp8 }}
           RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
           RUN_QWEN35_397B_FP4_TP4: ${{ inputs.run_qwen35_397b_fp4_tp4 }}
           RUN_LLAMA405_FP8_TP8: ${{ inputs.run_llama405_fp8_tp8 }}
           RUN_LLAMA8_TP1: ${{ inputs.run_llama8_tp1 }}
+          RUN_KIMI_K2_TP4: ${{ inputs.run_kimi_k2_tp4 }}
           RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
+          RUN_KIMI_K25_TP4: ${{ inputs.run_kimi_k25_tp4 }}
           RUN_KIMI_K25_TP8: ${{ inputs.run_kimi_k25_tp8 }}
           RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
@@ -166,6 +226,12 @@ jobs:
           RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
           RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
+          RUN_GPT_OSS_120B_TP8: ${{ inputs.run_gpt_oss_120b_tp8 }}
+          RUN_MINIMAX_M25_TP2: ${{ inputs.run_minimax_m25_tp2 }}
+          RUN_MINIMAX_M25_TP4: ${{ inputs.run_minimax_m25_tp4 }}
+          RUN_GLM4_7_FP8_TP4: ${{ inputs.run_glm4_7_fp8_tp4 }}
+          RUN_GLM4_7_FP8_TP8: ${{ inputs.run_glm4_7_fp8_tp8 }}
+          RUN_GLM4_7_FP8_MTP_TP4: ${{ inputs.run_glm4_7_fp8_mtp_tp4 }}
           RUN_GLM4_7_FP8_MTP_TP8: ${{ inputs.run_glm4_7_fp8_mtp_tp8 }}
           RUN_GLM5_1_FP8_TP8: ${{ inputs.run_glm5_1_fp8_tp8 }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
@@ -200,12 +266,30 @@ jobs:
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
+                  "toggle_env": "RUN_QWEN3_NEXT_80B_TP2",
+                  "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP2",
+                  "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 32768 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
                   "toggle_env": "RUN_QWEN3_NEXT_80B_TP4",
                   "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_QWEN3_NEXT_80B_MTP_TP1",
+                  "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1",
+                  "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+                  "extra_args": "--tensor-parallel-size 1 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+                  "accuracy_test_threshold": 0.80,
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -224,6 +308,15 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_QWEN35_397B_FP8_TP4",
+                  "model_name": "Qwen3.5-397B-A17B-FP8 TP4",
+                  "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -263,12 +356,30 @@ jobs:
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
+                  "toggle_env": "RUN_KIMI_K2_TP4",
+                  "model_name": "Kimi-K2-Thinking-MXFP4 TP4",
+                  "model_path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.90,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
                   "toggle_env": "RUN_KIMI_K2_TP8",
                   "model_name": "Kimi-K2-Thinking-MXFP4 TP8",
                   "model_path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.90,
                   "env_vars": "",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_KIMI_K25_TP4",
+                  "model_name": "Kimi-K2.5-MXFP4 TP4",
+                  "model_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -339,12 +450,67 @@ jobs:
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
+                  "toggle_env": "RUN_GPT_OSS_120B_TP8",
+                  "model_name": "gpt-oss-120b TP8",
+                  "model_path": "openai/gpt-oss-120b",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
+                  "accuracy_test_threshold": 0.88,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_MINIMAX_M25_TP2",
+                  "model_name": "MiniMax-M2.5 TP2",
+                  "model_path": "MiniMaxAI/MiniMax-M2.5",
+                  "extra_args": "--tensor-parallel-size 2 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_MINIMAX_M25_TP4",
+                  "model_name": "MiniMax-M2.5 TP4",
+                  "model_path": "MiniMaxAI/MiniMax-M2.5",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_GLM4_7_FP8_TP4",
+                  "model_name": "GLM-4.7-FP8 TP4",
+                  "model_path": "zai-org/GLM-4.7-FP8",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_GLM4_7_FP8_TP8",
+                  "model_name": "GLM-4.7-FP8 TP8",
+                  "model_path": "zai-org/GLM-4.7-FP8",
+                  "extra_args": "--tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_GLM4_7_FP8_MTP_TP4",
+                  "model_name": "GLM-4.7-FP8 MTP TP4",
+                  "model_path": "zai-org/GLM-4.7-FP8",
+                  "extra_args": "--tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
                   "toggle_env": "RUN_GLM4_7_FP8_MTP_TP8",
                   "model_name": "GLM-4.7-FP8 MTP TP8",
                   "model_path": "zai-org/GLM-4.7-FP8",
                   "extra_args": "--tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
                   "accuracy_test_threshold": 0.92,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
