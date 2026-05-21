@@ -1017,7 +1017,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if self.use_triton_backend == "a8w4":
                     assert (
                         layer.num_fused_shared_experts == 0
-                    ), f"A8W4 Triton MOE does not support fused_shared_experts mode, please set ATOM_MOE_BACKEND=matmul_ogs or ATOM_USE_TRITON_MOE=0"
+                    ), "A8W4 Triton MOE does not support fused_shared_experts mode, please set ATOM_MOE_BACKEND=matmul_ogs or ATOM_USE_TRITON_MOE=0"
                     # DeepSeek-V4 hash-layer fully-fused fast path: replaces the
                     # Python `_hash_topk` + multi-kernel `fused_routing_from_topk`
                     # counting-sort + `compute_expt_data` (with memset) chain with
