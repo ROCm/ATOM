@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from collections import deque
 
 import numpy as np
 import xxhash
 from atom.config import Config
+from atom.distributed.kv_events import (
+    MEDIUM_GPU,
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    KVCacheEvent,
+)
 from atom.model_engine.sequence import Sequence
 
 
 class Block:
-
     def __init__(self, block_id):
         self.block_id = block_id
         self.ref_count = 0
@@ -27,8 +33,31 @@ class Block:
         self.token_ids = []
 
 
-class BlockManager:
+def _make_block_stored(
+    hashes: list[int],
+    tokens: list[int],
+    parent: int | None,
+    block_size: int,
+) -> BlockStored:
+    """Construct a BlockStored event from a coalesced run of new blocks."""
+    return BlockStored(
+        block_hashes=hashes,
+        parent_block_hash=parent,
+        token_ids=tokens,
+        block_size=block_size,
+        medium=MEDIUM_GPU,
+    )
 
+
+def _make_block_removed(hashes: list[int]) -> BlockRemoved:
+    return BlockRemoved(block_hashes=hashes, medium=MEDIUM_GPU)
+
+
+def _make_all_cleared() -> AllBlocksCleared:
+    return AllBlocksCleared()
+
+
+class BlockManager:
     def __init__(self, config: Config):
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
@@ -41,6 +70,15 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
 
+        # KV cache event recording. When disabled, `_event_log` stays None and
+        # the emission helpers short-circuit — zero overhead when events are
+        # off. When enabled, the scheduler drains this list each step via
+        # `take_events()` and hands it to the EventPublisher.
+        kv_events = getattr(config, "kv_events_config", None)
+        self._events_enabled: bool = bool(kv_events and kv_events.enable)
+        self._event_log: list[KVCacheEvent] | None = (
+            [] if self._events_enabled else None
+        )
         # Per-request cache: per-request slot pool + equiv-block accounting.
         # Used by attention types that maintain stateful per-request buffers
         # outside the paged KV pool — currently GDN recurrent state, future
@@ -78,9 +116,14 @@ class BlockManager:
     def _allocate_block(self, block_id: int) -> Block:
         block = self.blocks[block_id]
         assert block.ref_count == 0
-        # Evict stale hash entry before resetting
+        # Evict stale hash entry before resetting. ATOM's eviction is lazy:
+        # blocks sit in the free queue with their hash intact until the slot
+        # is re-allocated, so this point — not `deallocate()` — is the true
+        # eviction event.
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
+            if self._event_log is not None:
+                self._event_log.append(_make_block_removed([block.hash]))
         block.reset()
         self.free_block_ids_set.discard(block_id)
         self.used_block_ids.add(block_id)
@@ -139,6 +182,15 @@ class BlockManager:
         h = -1
         cache_miss = False
 
+        # Coalesce newly-stored blocks within this allocate() call into a
+        # single BlockStored event. Parent hash is the last full-block hash
+        # already in the cache when the new-store run begins (so subscribers
+        # can reconstruct the prefix chain), or None at the prompt root.
+        store_run_hashes: list[int] = []
+        store_run_tokens: list[int] = []
+        store_run_parent: int | None = None
+        last_known_hash: int | None = None
+
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
             h = (
@@ -172,9 +224,28 @@ class BlockManager:
                 else:
                     block = self._allocate_block(block_id)
             if h != -1:
+                # cache_miss && full block + real hash = a freshly stored block.
+                # cache_miss is sticky once a block is missing, so this is the
+                # right signal for "newly stored at this index".
+                if self._event_log is not None and cache_miss:
+                    if not store_run_hashes:
+                        store_run_parent = last_known_hash
+                    store_run_hashes.append(h)
+                    store_run_tokens.extend(token_ids)
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
+                last_known_hash = h
             seq.block_table.append(block_id)
+
+        if store_run_hashes and self._event_log is not None:
+            self._event_log.append(
+                _make_block_stored(
+                    store_run_hashes,
+                    store_run_tokens,
+                    store_run_parent,
+                    self.block_size,
+                )
+            )
 
         # Per-request cache: allocate equiv blocks (memory accounting) +
         # one slot index from the per-req cache pool. Slot indexes into
@@ -231,3 +302,58 @@ class BlockManager:
                 block_id = self._pop_free_block()
                 self._allocate_block(block_id)
                 block_table.append(block_id)
+
+    # ---------------- KV event API ---------------- #
+
+    def take_events(self) -> list[KVCacheEvent]:
+        """Drain and return events accumulated since the last call. Returns
+        empty list when events are disabled. The caller (Scheduler) hands the
+        returned list to the EventPublisher."""
+        if self._event_log is None or not self._event_log:
+            return []
+        events = self._event_log
+        self._event_log = []
+        return events
+
+    def clear_cache(self) -> None:
+        """Drop every prefix-cache entry. Used by `/reset_prefix_cache`-style
+        admin APIs. Does NOT touch blocks currently held by live sequences —
+        they remain valid via their block_table refs, just unhashable for
+        future requests."""
+        self.hash_to_block_id.clear()
+        for block in self.blocks:
+            if block.ref_count == 0:
+                block.hash = -1
+                block.token_ids = []
+        if self._event_log is not None:
+            self._event_log.append(_make_all_cleared())
+
+    @property
+    def kv_events_enabled(self) -> bool:
+        """True iff KV events are being recorded. Callers that need to build
+        an event payload (e.g. the scheduler walking block_table on remote-KV
+        completion) can early-exit on this, instead of reaching into
+        ``_event_log`` directly."""
+        return self._event_log is not None
+
+    def record_remote_store(
+        self,
+        block_hashes: list[int],
+        token_ids: list[int],
+        parent_block_hash: int | None = None,
+    ) -> None:
+        """Emit a BlockStored(medium=REMOTE) for blocks received from a remote
+        KV transfer producer (Mooncake/MoriIO decode side). Called by the
+        KVConnector worker once the transfer completes so external KV-cache
+        consumers (LMCache, etc.) can track remote-resident blocks."""
+        if self._event_log is None or not block_hashes:
+            return
+        self._event_log.append(
+            BlockStored(
+                block_hashes=block_hashes,
+                parent_block_hash=parent_block_hash,
+                token_ids=token_ids,
+                block_size=self.block_size,
+                medium=MEDIUM_REMOTE,
+            )
+        )

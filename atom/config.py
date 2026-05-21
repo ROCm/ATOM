@@ -927,6 +927,48 @@ class SpeculativeConfig:
 
 
 @dataclass
+class KVEventsConfig:
+    """Configuration for KV cache event publishing.
+
+    When `enable=False` the engine installs a `NullEventPublisher` and the
+    BlockManager skips event recording entirely — zero overhead in the
+    default config.
+
+    Wire format is documented in `atom/distributed/kv_events.py`. The
+    BlockStored/BlockRemoved/AllBlocksCleared subset is wire-compatible with
+    vLLM, so existing subscribers (LMCache, Mooncake event listener, etc.)
+    consume ATOM events unchanged. ATOM additionally emits BlockTransferred
+    for HMA / P-D-disagg tier moves; consumers that don't understand this
+    tag should narrow their decoder union.
+    """
+
+    enable: bool = False
+    publisher: str = "null"  # "null" | "zmq"
+    endpoint: str = "tcp://*:5557"
+    # Subscriber-side topic filter prefix. Empty means publish raw payload.
+    topic: str = ""
+    # ZMQ high-water-mark on the PUB socket (0 = unlimited).
+    hwm: int = 0
+    # Bounded in-process queue between scheduler and sender thread. When full,
+    # oldest batch is dropped — KV events are advisory, never stall inference.
+    buffer_steps: int = 10_000
+
+    @classmethod
+    def from_env(cls) -> "KVEventsConfig":
+        """Build a config from `ATOM_KV_EVENTS_*` env vars. Provides an env-only
+        opt-in path so containerized deployments can enable events without a
+        CLI flag (see `atom/utils/envs.py`)."""
+        return cls(
+            enable=envs.ATOM_KV_EVENTS_ENABLE,
+            publisher=envs.ATOM_KV_EVENTS_PUBLISHER,
+            endpoint=envs.ATOM_KV_EVENTS_ENDPOINT,
+            topic=envs.ATOM_KV_EVENTS_TOPIC,
+            hwm=envs.ATOM_KV_EVENTS_HWM,
+            buffer_steps=envs.ATOM_KV_EVENTS_BUFFER_STEPS,
+        )
+
+
+@dataclass
 class Config:
     model: str
     trust_remote_code: bool = False
@@ -963,6 +1005,7 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
+    kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False

@@ -189,6 +189,10 @@ class EngineCore:
                 break
             if not self.scheduler.is_finished():
                 self._process_engine_step()
+        # Best-effort flush + teardown of the KV event publisher's background
+        # sender. Safe to call even when KV events are disabled.
+        self.scheduler.publish_kv_events()
+        self.scheduler.shutdown_kv_events()
 
     def _process_engine_step(self):
         result = self.scheduler.schedule()
@@ -253,6 +257,11 @@ class EngineCore:
 
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
+
+        # Drain KV cache events accumulated by BlockManager during this step
+        # and hand them to the publisher. No-op when KV events are disabled
+        # (NullEventPublisher swallows the call).
+        self.scheduler.publish_kv_events()
         return True
 
     def pull_and_process_input_queue(self):
@@ -428,6 +437,9 @@ class DPEngineCoreProc(EngineCore):
                 logger.info(
                     f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
                 )
+                # Flush + tear down KV event publisher before leaving the loop.
+                self.scheduler.publish_kv_events()
+                self.scheduler.shutdown_kv_events()
                 break
 
             if not global_has_unfinished and not self.engines_running:

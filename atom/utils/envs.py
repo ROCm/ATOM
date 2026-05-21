@@ -149,6 +149,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sampler top-K logits log — int K, 0/empty disables.
     "ATOM_DEBUG_TOPK": lambda: int(os.getenv("ATOM_DEBUG_TOPK", "0") or "0"),
     "ATOM_DEBUG_TOPK_PATH": lambda: os.getenv("ATOM_DEBUG_TOPK_PATH", ""),
+    # --- KV cache events publisher ---
+    # Toggle and configure the KV cache event publisher (see
+    # atom/distributed/kv_events.py). Provides an env-driven entry point so
+    # `python -m atom.entrypoints.openai_server` can enable events without a
+    # CLI flag — useful in containerized deployments.
+    "ATOM_KV_EVENTS_ENABLE": lambda: os.getenv("ATOM_KV_EVENTS_ENABLE", "0") == "1",
+    "ATOM_KV_EVENTS_PUBLISHER": lambda: os.getenv("ATOM_KV_EVENTS_PUBLISHER", "zmq"),
+    "ATOM_KV_EVENTS_ENDPOINT": lambda: os.getenv(
+        "ATOM_KV_EVENTS_ENDPOINT", "tcp://0.0.0.0:5557"
+    ),
+    "ATOM_KV_EVENTS_TOPIC": lambda: os.getenv("ATOM_KV_EVENTS_TOPIC", ""),
+    "ATOM_KV_EVENTS_HWM": lambda: int(os.getenv("ATOM_KV_EVENTS_HWM", "0") or "0"),
+    "ATOM_KV_EVENTS_BUFFER_STEPS": lambda: int(
+        os.getenv("ATOM_KV_EVENTS_BUFFER_STEPS", "10000") or "10000"
+    ),
 }
 
 

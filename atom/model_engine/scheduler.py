@@ -123,7 +123,7 @@ class SpecStats:
             f"Accepted tokens distribution: { {k: f'{v / iv_steps:.2%}' for k, v in self._interval_distribution.items()} }"
         )
         logger.info(
-            f"[MTP Stats         ] Average toks/fwd: {1+self.total_accepted / ts:.2f}, "
+            f"[MTP Stats         ] Average toks/fwd: {1 + self.total_accepted / ts:.2f}, "
             f"Accepted/Total Draft tokens: {self.total_accepted}/{self.total_draft_tokens}, "
             f"Acceptance rate: {self.acceptance_rate:.2%}, "
             f"Accepted tokens distribution: { {k: f'{v / ts:.2%}' for k, v in self.distribution.items()} }"
@@ -413,6 +413,64 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+
+        # KV cache event publisher. Wired up here (not in EngineCore) because
+        # the BlockManager — which actually records events — lives on the
+        # scheduler. When disabled, NullEventPublisher is a no-op, so callers
+        # in `schedule()` can always invoke `publish_kv_events()` without
+        # checking a flag.
+        from atom.distributed.kv_events import (
+            EventBatch as _EventBatch,
+            EventPublisher as _EventPublisher,
+            make_publisher as _make_publisher,
+        )
+
+        self._EventBatch = _EventBatch
+        kv_events_cfg = getattr(config, "kv_events_config", None)
+        parallel_cfg = getattr(config, "parallel_config", None)
+        dp_rank = (
+            getattr(parallel_cfg, "data_parallel_rank", None)
+            if parallel_cfg is not None
+            else None
+        )
+        if kv_events_cfg is not None and kv_events_cfg.enable:
+            self.kv_event_publisher: _EventPublisher = _make_publisher(
+                enabled=True,
+                publisher_kind=kv_events_cfg.publisher,
+                endpoint=kv_events_cfg.endpoint,
+                topic=kv_events_cfg.topic,
+                hwm=kv_events_cfg.hwm,
+                buffer_steps=kv_events_cfg.buffer_steps,
+                data_parallel_rank=dp_rank,
+            )
+            logger.info(
+                "KV event publisher enabled: kind=%s endpoint=%s dp_rank=%s",
+                kv_events_cfg.publisher,
+                kv_events_cfg.endpoint,
+                dp_rank,
+            )
+        else:
+            self.kv_event_publisher = _make_publisher(
+                enabled=False,
+                publisher_kind="null",
+                endpoint="",
+            )
+
+    def publish_kv_events(self) -> None:
+        """Drain BlockManager's event log and publish as one EventBatch. Called
+        by EngineCore at the end of each scheduler step. No-op when events are
+        disabled (NullEventPublisher swallows the publish call)."""
+        events = self.block_manager.take_events()
+        if events:
+            self.kv_event_publisher.publish(events)
+
+    def shutdown_kv_events(self) -> None:
+        """Tear down the publisher background thread and ZMQ socket. Called
+        by EngineCore on engine shutdown."""
+        try:
+            self.kv_event_publisher.shutdown()
+        except Exception:
+            logger.exception("KV event publisher shutdown failed")
 
     def is_finished(self):
         # `_rejected` must be considered too: if a batch of seqs is all
@@ -973,6 +1031,33 @@ class Scheduler:
 
         self.finished_recving_kv_req_ids.remove(seq.id)
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
+
+        # Consumer-side P/D: blocks were pre-allocated via the normal allocate()
+        # path (so their hashes are set), and remote KV data has now landed in
+        # them. Emit BlockStored(medium=REMOTE) so external consumers (LMCache,
+        # downstream KV-aware schedulers) can track which blocks are now
+        # remote-sourced. Doesn't alter GPU-side bookkeeping.
+        if self.block_manager.kv_events_enabled:
+            remote_hashes: list[int] = []
+            remote_tokens: list[int] = []
+            parent_hash: int | None = None
+            for block_id in seq.block_table:
+                blk = self.block_manager.blocks[block_id]
+                if blk.hash == -1:
+                    continue
+                if not remote_hashes:
+                    # First full block in the run — find its parent. There
+                    # isn't one in the chain on the consumer side (the producer
+                    # owned it), so parent stays None.
+                    parent_hash = None
+                remote_hashes.append(blk.hash)
+                remote_tokens.extend(blk.token_ids)
+            if remote_hashes:
+                self.block_manager.record_remote_store(
+                    block_hashes=remote_hashes,
+                    token_ids=remote_tokens,
+                    parent_block_hash=parent_hash,
+                )
         return True
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
@@ -986,20 +1071,20 @@ class Scheduler:
             return
 
         for req_id in kv_connector_output.finished_recving or ():
-            assert (
-                not self.kv_connector.is_producer
-            ), "Only consumer should update recving KV status"
+            assert not self.kv_connector.is_producer, (
+                "Only consumer should update recving KV status"
+            )
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.finished_sending or ():
-            assert (
-                self.kv_connector.is_producer
-            ), "Only producer should free blocks after sending KV"
+            assert self.kv_connector.is_producer, (
+                "Only producer should free blocks after sending KV"
+            )
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert (
-                req_id in self.deferred_free_blocks
-            ), f"req_id={req_id} not found in deferred_free_blocks"
+            assert req_id in self.deferred_free_blocks, (
+                f"req_id={req_id} not found in deferred_free_blocks"
+            )
             self.block_manager.deallocate(self.deferred_free_blocks.pop(req_id))
 
     def get_request_counts(self) -> tuple[int, int]:
