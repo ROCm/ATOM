@@ -1,132 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779330324005,
+  "lastUpdate": 1779332064808,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "Lingpeng Jin",
-            "username": "valarLip",
-            "email": "103567126+valarLip@users.noreply.github.com"
-          },
-          "committer": {
-            "name": "Lingpeng Jin",
-            "username": "valarLip",
-            "email": "103567126+valarLip@users.noreply.github.com"
-          },
-          "id": "9b5e462fee1c35354ec10952011513a8650e6b9d",
-          "message": "fix(deepseek_v4): ruff lint + restore prep_stream sync + cache_size in fused swa_write\n\n- Drop unused `device` / `lru_cache` / first `prep_stream` assignment\n- Restore `prep_stream.wait_stream` / `with torch.cuda.stream(prep_stream)`\n  around prepare_prefill H2D staging (suspected root for CG+MTP-3 tail\n  deadlock at recv_mtp_status_async)\n- fused_qk_norm_rope_swa_write: pass `cache_size` instead of undefined\n  `win` so the ring stride matches `swa_kv.shape[1]` under MTP",
-          "timestamp": "2026-05-17T16:24:48Z",
-          "url": "https://github.com/ROCm/ATOM/commit/9b5e462fee1c35354ec10952011513a8650e6b9d"
-        },
-        "date": 1779085766216,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 throughput (tok/s)",
-            "value": 3897.92,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 Total Tput (tok/s)",
-            "value": 7804.4,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 TTFT (ms)",
-            "value": 222.85,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 TPOT (ms)",
-            "value": 31.8,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 _gpu_count",
-            "value": 1,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 _tp",
-            "value": 1,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=32 throughput (tok/s)",
-            "value": 831.6,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=32 Total Tput (tok/s)",
-            "value": 1660.57,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=32 TTFT (ms)",
-            "value": 320.17,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=32 TPOT (ms)",
-            "value": 37.27,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=32 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=32 _tp",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=8 throughput (tok/s)",
-            "value": 339.04,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=8 Total Tput (tok/s)",
-            "value": 675.58,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=8 TTFT (ms)",
-            "value": 284.1,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=8 TPOT (ms)",
-            "value": 22.76,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26016494354 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171531"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=8 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro 1024/1024 c=8 _tp",
-            "value": 8,
-            "unit": ""
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -34610,6 +34486,94 @@ window.BENCHMARK_DATA = {
           {
             "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=8 _tp",
             "value": 1,
+            "unit": ""
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Zhang Lirong",
+            "email": "zhanglirong@amd.com"
+          },
+          "committer": {
+            "name": "Zhang Lirong",
+            "email": "zhanglirong@amd.com"
+          },
+          "id": "918be0d0ebc82728db64adf7b4d8ec782e097a73",
+          "message": "ci(pd): route all 4 PD container starts through vendored mori/ci_run.sh\n\nSymptom: nightly run 26168317437 (PD-Prefill DeepSeek-R1-PD-1P4-1D8) hit\n60-min step timeout after completing only 2.5 of 14 bench configs because\nmooncake silently fell back to TCP and threw 170+ 'TcpTransport ...\nconnect: Connection timed out'. Inside the container, 'ibv_devices' listed\n0 devices despite the host having rdma0..rdma7 + uverbs0..uverbs7 mounted.\n\nRoot cause: the inline NIC detection (duplicated across atom-benchmark.yaml\nand atom_pd_test.sh) only matched device names against bnxt_re*/mlx5*/\nionic*. On hosts whose NICs are udev-renamed (rdma0..rdmaN, rocep*s0, etc.)\nthe case statement fell through, NIC_TYPE silently stayed at the default\n'mlx5', NIC_MOUNTS stayed empty, libibverbs had no userspace provider, and\nmooncake fell back to TCP. The mori reference implementation already has\na driver-symlink fallback for exactly this case but ATOM's copy dropped\nthat branch.\n\nFix: vendor ROCm/mori's docker/ci_run.sh verbatim into .github/scripts/\n(logic byte-identical to upstream; only an ATOM-specific header added).\nAll four post-refactor PD container starts now delegate to it:\n\n  workflow line 543  pd-smoke-prefill   (previously had NO RDMA mounts!)\n  workflow line 712  pd-smoke-decode    (previously had NO RDMA mounts!)\n  workflow line 873  pd-prefill         (had broken inline detection)\n  workflow line 1245 pd-decode          (had broken inline detection)\n\nPlus atom_pd_test.sh:launch_consumer_remote now scps ci_run.sh to the\ndecode host before ssh-launching the consumer container, and the three\nduplicate helper functions (detect_nic_type / find_host_ibverbs /\nnic_mount_flags) are dropped — all RDMA-mount logic now lives in one\nfile. Net diff: -164 +68.",
+          "timestamp": "2026-05-21T02:50:28Z",
+          "url": "https://github.com/ROCm/ATOM/commit/918be0d0ebc82728db64adf7b4d8ec782e097a73"
+        },
+        "date": 1779332059341,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 throughput (tok/s)",
+            "value": 187.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26168317437"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 373.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26168317437"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 TTFT (ms)",
+            "value": 85753.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26168317437"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 TPOT (ms)",
+            "value": 12.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26168317437"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 throughput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26168317437"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26168317437"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 TTFT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26168317437"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 TPOT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26168317437"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 _tp",
+            "value": 8,
             "unit": ""
           }
         ]
