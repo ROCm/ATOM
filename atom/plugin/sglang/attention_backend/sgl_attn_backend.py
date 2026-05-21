@@ -1757,9 +1757,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 qo_indptr,
                 forward_batch,
             )
-        if (
-            forward_batch.forward_mode.is_draft_extend()
-            and (k is None or v is None or layer.qk_head_dim == K_Buffer.shape[-1])
+        if forward_batch.forward_mode.is_draft_extend() and (
+            k is None or v is None or layer.qk_head_dim == K_Buffer.shape[-1]
         ):
             return self._forward_extend_mla_speculative(
                 q,
@@ -1824,9 +1823,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         """MLA prefill/extend using explicit q/k/v instead of absorbed decode."""
         extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
         extend_no_prefix = (
-            False
-            if extend_prefix_lens_cpu is None
-            else not any(extend_prefix_lens_cpu)
+            False if extend_prefix_lens_cpu is None else not any(extend_prefix_lens_cpu)
         )
 
         if kv_indices.shape[0] == 0 or extend_no_prefix:
