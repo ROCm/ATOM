@@ -19,7 +19,6 @@ if [ "${TP}" = "4" ]; then
 else
     KV_CACHE_DTYPE=fp8
 fi
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
 vllm serve deepseek-ai/DeepSeek-V3.2 \
     --host localhost \
