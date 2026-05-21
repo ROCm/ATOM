@@ -931,8 +931,8 @@ class KVEventsConfig:
     """Configuration for KV cache event publishing."""
 
     enable: bool = False
-    publisher: str = "null"  # "null" | "zmq"
-    endpoint: str = "tcp://*:5557"
+    publisher: str = "zmq"  # "null" | "zmq"
+    endpoint: str = "tcp://0.0.0.0:5557"
     topic: str = ""
     # ZMQ high-water-mark on the PUB socket (0 = unlimited).
     hwm: int = 0
