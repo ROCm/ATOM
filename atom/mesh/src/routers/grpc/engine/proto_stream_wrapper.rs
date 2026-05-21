@@ -1,7 +1,5 @@
-//! Protocol buffer type wrappers for SGLang and vLLM backends
-//!
-//! This module provides unified enums that wrap proto types from both SGLang and vLLM,
-//! allowing the router to work with either backend transparently.
+//! Unified enums wrapping SGLang and vLLM proto types so the router can work
+//! with either backend transparently.
 
 use futures_util::StreamExt;
 use mesh_grpc::{
@@ -11,14 +9,12 @@ use mesh_grpc::{
     vllm_proto as vllm,
 };
 
-/// Unified ProtoRequest
 #[derive(Clone)]
 pub enum ProtoRequest {
     Generate(ProtoGenerateRequest),
 }
 
 impl ProtoRequest {
-    /// Get request ID from either variant
     pub fn request_id(&self) -> &str {
         match self {
             Self::Generate(req) => req.request_id(),
@@ -26,7 +22,6 @@ impl ProtoRequest {
     }
 }
 
-/// Unified GenerateRequest that works with both backends
 #[derive(Clone)]
 pub enum ProtoGenerateRequest {
     Sglang(Box<sglang::GenerateRequest>),
@@ -34,7 +29,6 @@ pub enum ProtoGenerateRequest {
 }
 
 impl ProtoGenerateRequest {
-    /// Get SGLang variant (panics if vLLM)
     pub fn as_sglang(&self) -> &sglang::GenerateRequest {
         match self {
             Self::Sglang(req) => req,
@@ -42,7 +36,6 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Get mutable SGLang variant (panics if vLLM)
     pub fn as_sglang_mut(&mut self) -> &mut sglang::GenerateRequest {
         match self {
             Self::Sglang(req) => req,
@@ -50,7 +43,6 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Get vLLM variant (panics if SGLang)
     pub fn as_vllm(&self) -> &vllm::GenerateRequest {
         match self {
             Self::Vllm(req) => req,
@@ -58,7 +50,6 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Get mutable vLLM variant (panics if SGLang)
     pub fn as_vllm_mut(&mut self) -> &mut vllm::GenerateRequest {
         match self {
             Self::Vllm(req) => req,
@@ -66,22 +57,18 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Check if this is SGLang
     pub fn is_sglang(&self) -> bool {
         matches!(self, Self::Sglang(_))
     }
 
-    /// Check if this is vLLM
     pub fn is_vllm(&self) -> bool {
         matches!(self, Self::Vllm(_))
     }
 
-    /// Clone the inner request (for passing to generate())
     pub fn clone_inner(&self) -> Self {
         self.clone()
     }
 
-    /// Get request ID
     pub fn request_id(&self) -> &str {
         match self {
             Self::Sglang(req) => &req.request_id,
@@ -90,16 +77,13 @@ impl ProtoGenerateRequest {
     }
 }
 
-/// Unified GenerateResponse from stream
 pub enum ProtoGenerateResponse {
     Sglang(Box<sglang::GenerateResponse>),
     Vllm(vllm::GenerateResponse),
 }
 
 impl ProtoGenerateResponse {
-    /// Get the response variant (chunk, complete, or error)
-    ///
-    /// Consumes self to avoid cloning large proto messages in hot streaming path
+    /// Consumes self to avoid cloning large proto messages on the streaming hot path.
     pub fn into_response(self) -> ProtoResponseVariant {
         match self {
             Self::Sglang(resp) => match resp.response {
@@ -121,14 +105,13 @@ impl ProtoGenerateResponse {
                 Some(vllm::generate_response::Response::Complete(complete)) => {
                     ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(complete))
                 }
-                // Note: vLLM proto no longer has Error variant in GenerateResponse
+                // vLLM proto has no Error variant; errors flow via gRPC status.
                 None => ProtoResponseVariant::None,
             },
         }
     }
 }
 
-/// Response variant extracted from GenerateResponse
 pub enum ProtoResponseVariant {
     Chunk(ProtoGenerateStreamChunk),
     Complete(ProtoGenerateComplete),
@@ -136,7 +119,6 @@ pub enum ProtoResponseVariant {
     None,
 }
 
-/// Unified GenerateStreamChunk
 #[derive(Clone)]
 pub enum ProtoGenerateStreamChunk {
     Sglang(sglang::GenerateStreamChunk),
@@ -144,7 +126,6 @@ pub enum ProtoGenerateStreamChunk {
 }
 
 impl ProtoGenerateStreamChunk {
-    /// Get SGLang variant (panics if vLLM)
     pub fn as_sglang(&self) -> &sglang::GenerateStreamChunk {
         match self {
             Self::Sglang(chunk) => chunk,
@@ -152,7 +133,6 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Get vLLM variant (panics if SGLang)
     pub fn as_vllm(&self) -> &vllm::GenerateStreamChunk {
         match self {
             Self::Vllm(chunk) => chunk,
@@ -160,17 +140,14 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Check if this is SGLang
     pub fn is_sglang(&self) -> bool {
         matches!(self, Self::Sglang(_))
     }
 
-    /// Check if this is vLLM
     pub fn is_vllm(&self) -> bool {
         matches!(self, Self::Vllm(_))
     }
 
-    /// Get token IDs from chunk (common field)
     pub fn token_ids(&self) -> &[u32] {
         match self {
             Self::Sglang(c) => &c.token_ids,
@@ -178,24 +155,22 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Get index (for n>1 support)
-    /// vLLM doesn't support n>1, so always returns 0
+    /// vLLM does not support `n>1`; always returns 0.
     pub fn index(&self) -> u32 {
         match self {
             Self::Sglang(c) => c.index,
-            Self::Vllm(_) => 0, // vLLM doesn't support n>1
+            Self::Vllm(_) => 0,
         }
     }
 
-    /// Get output logprobs (SGLang only, returns None for vLLM)
+    /// SGLang only; returns `None` for vLLM.
     pub fn output_logprobs(&self) -> Option<&sglang::OutputLogProbs> {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref(),
-            Self::Vllm(_) => None, // TODO: vLLM logprobs mapping
+            Self::Vllm(_) => None,
         }
     }
 
-    /// Get prompt tokens (cumulative)
     pub fn prompt_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.prompt_tokens,
@@ -203,7 +178,6 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Get completion tokens (cumulative)
     pub fn completion_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.completion_tokens,
@@ -211,7 +185,6 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Get cached tokens (cumulative)
     pub fn cached_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.cached_tokens,
@@ -220,7 +193,6 @@ impl ProtoGenerateStreamChunk {
     }
 }
 
-/// Unified GenerateComplete response
 #[derive(Clone)]
 pub enum ProtoGenerateComplete {
     Sglang(sglang::GenerateComplete),
@@ -228,7 +200,6 @@ pub enum ProtoGenerateComplete {
 }
 
 impl ProtoGenerateComplete {
-    /// Get SGLang variant (panics if vLLM)
     pub fn as_sglang(&self) -> &sglang::GenerateComplete {
         match self {
             Self::Sglang(complete) => complete,
@@ -236,7 +207,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get mutable SGLang variant (panics if vLLM)
     pub fn as_sglang_mut(&mut self) -> &mut sglang::GenerateComplete {
         match self {
             Self::Sglang(complete) => complete,
@@ -244,7 +214,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get vLLM variant (panics if SGLang)
     pub fn as_vllm(&self) -> &vllm::GenerateComplete {
         match self {
             Self::Vllm(complete) => complete,
@@ -252,17 +221,14 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Check if this is SGLang
     pub fn is_sglang(&self) -> bool {
         matches!(self, Self::Sglang(_))
     }
 
-    /// Check if this is vLLM
     pub fn is_vllm(&self) -> bool {
         matches!(self, Self::Vllm(_))
     }
 
-    /// Get token IDs from either backend (output_ids in proto)
     pub fn token_ids(&self) -> &[u32] {
         match self {
             Self::Sglang(c) => &c.output_ids,
@@ -270,7 +236,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get prompt tokens
     pub fn prompt_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.prompt_tokens,
@@ -278,7 +243,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get completion tokens
     pub fn completion_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.completion_tokens,
@@ -286,7 +250,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get finish reason
     pub fn finish_reason(&self) -> &str {
         match self {
             Self::Sglang(c) => &c.finish_reason,
@@ -294,25 +257,22 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get index (for n>1 support)
-    /// vLLM doesn't support n>1, so always returns 0
+    /// vLLM does not support `n>1`; always returns 0.
     pub fn index(&self) -> u32 {
         match self {
             Self::Sglang(c) => c.index,
-            Self::Vllm(_) => 0, // vLLM doesn't have index field (n>1 not supported)
+            Self::Vllm(_) => 0,
         }
     }
 
-    /// Get matched stop (SGLang only, returns oneof)
-    /// vLLM doesn't have matched_stop, returns None
+    /// SGLang only; vLLM has no matched_stop and returns `None`.
     pub fn matched_stop(&self) -> Option<&MatchedStop> {
         match self {
             Self::Sglang(c) => c.matched_stop.as_ref(),
-            Self::Vllm(_) => None, // vLLM doesn't have matched_stop
+            Self::Vllm(_) => None,
         }
     }
 
-    /// Get output IDs (decode tokens only)
     pub fn output_ids(&self) -> &[u32] {
         match self {
             Self::Sglang(c) => &c.output_ids,
@@ -320,7 +280,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get cached tokens
     pub fn cached_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.cached_tokens,
@@ -328,32 +287,30 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get input logprobs (SGLang only)
+    /// SGLang only; returns `None` for vLLM.
     pub fn input_logprobs(&self) -> Option<&sglang::InputLogProbs> {
         match self {
             Self::Sglang(c) => c.input_logprobs.as_ref(),
-            Self::Vllm(_) => None, // vLLM doesn't have input_logprobs
+            Self::Vllm(_) => None,
         }
     }
 
-    /// Get output logprobs
+    /// SGLang only; returns `None` for vLLM.
     pub fn output_logprobs(&self) -> Option<&sglang::OutputLogProbs> {
         match self {
             Self::Sglang(c) => c.output_logprobs.as_ref(),
-            Self::Vllm(_) => None, // TODO: vLLM logprobs mapping
+            Self::Vllm(_) => None,
         }
     }
 }
 
-/// Unified GenerateError
-/// Note: vLLM proto no longer has GenerateError - errors are returned via gRPC status
+/// vLLM proto has no GenerateError variant; vLLM errors flow via gRPC status.
 #[derive(Clone)]
 pub enum ProtoGenerateError {
     Sglang(sglang::GenerateError),
 }
 
 impl ProtoGenerateError {
-    /// Get error message
     pub fn message(&self) -> &str {
         match self {
             Self::Sglang(e) => &e.message,
@@ -361,14 +318,12 @@ impl ProtoGenerateError {
     }
 }
 
-/// Unified stream wrapper
 pub enum ProtoStream {
     Sglang(SglangStream),
     Vllm(VllmStream),
 }
 
 impl ProtoStream {
-    /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         match self {
             Self::Sglang(stream) => stream
@@ -382,7 +337,6 @@ impl ProtoStream {
         }
     }
 
-    /// Mark stream as completed (no abort needed)
     pub fn mark_completed(&mut self) {
         match self {
             Self::Sglang(stream) => stream.mark_completed(),
@@ -391,38 +345,32 @@ impl ProtoStream {
     }
 }
 
-/// Unified EmbedRequest that works with both backends
 #[derive(Clone)]
 pub enum ProtoEmbedRequest {
     Sglang(Box<sglang::EmbedRequest>),
 }
 
 impl ProtoEmbedRequest {
-    /// Get SGLang variant
     pub fn as_sglang(&self) -> &sglang::EmbedRequest {
         match self {
             Self::Sglang(req) => req,
         }
     }
 
-    /// Get mutable SGLang variant
     pub fn as_sglang_mut(&mut self) -> &mut sglang::EmbedRequest {
         match self {
             Self::Sglang(req) => req,
         }
     }
 
-    /// Check if this is SGLang
     pub fn is_sglang(&self) -> bool {
         matches!(self, Self::Sglang(_))
     }
 
-    /// Clone the inner request (for passing to embed())
     pub fn clone_inner(&self) -> Self {
         self.clone()
     }
 
-    /// Get request ID
     pub fn request_id(&self) -> &str {
         match self {
             Self::Sglang(req) => &req.request_id,
@@ -430,13 +378,11 @@ impl ProtoEmbedRequest {
     }
 }
 
-/// Unified EmbedResponse
 pub enum ProtoEmbedResponse {
     Sglang(sglang::EmbedResponse),
 }
 
 impl ProtoEmbedResponse {
-    /// Get the response variant (complete or error)
     pub fn into_response(self) -> ProtoEmbedResponseVariant {
         match self {
             Self::Sglang(resp) => match resp.response {
@@ -452,42 +398,36 @@ impl ProtoEmbedResponse {
     }
 }
 
-/// Response variant extracted from EmbedResponse
 pub enum ProtoEmbedResponseVariant {
     Complete(ProtoEmbedComplete),
     Error(ProtoEmbedError),
     None,
 }
 
-/// Unified EmbedComplete response
 #[derive(Clone)]
 pub enum ProtoEmbedComplete {
     Sglang(sglang::EmbedComplete),
 }
 
 impl ProtoEmbedComplete {
-    /// Get embeddings
     pub fn embedding(&self) -> &[f32] {
         match self {
             Self::Sglang(c) => &c.embedding,
         }
     }
 
-    /// Get prompt tokens
     pub fn prompt_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.prompt_tokens,
         }
     }
 
-    /// Get cached tokens
     pub fn cached_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.cached_tokens,
         }
     }
 
-    /// Get embedding dimension
     pub fn embedding_dim(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.embedding_dim,
@@ -495,21 +435,18 @@ impl ProtoEmbedComplete {
     }
 }
 
-/// Unified EmbedError
 #[derive(Clone)]
 pub enum ProtoEmbedError {
     Sglang(sglang::EmbedError),
 }
 
 impl ProtoEmbedError {
-    /// Get error message
     pub fn message(&self) -> &str {
         match self {
             Self::Sglang(e) => &e.message,
         }
     }
 
-    /// Get error code
     pub fn code(&self) -> &str {
         match self {
             Self::Sglang(e) => &e.code,

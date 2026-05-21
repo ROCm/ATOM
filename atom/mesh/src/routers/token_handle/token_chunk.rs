@@ -10,11 +10,8 @@ pub enum TokenChunk {
         token_ids: Vec<u32>,
         logprobs: Option<TokenLogprobs>,
     },
-    /// Single-mode source: all fields populated by the worker's proto
-    /// `Complete`. PD mode source: every field comes from the decode
-    /// worker EXCEPT `input_logprobs`, which the PD merger injects from
-    /// the prefill worker's `Complete`. See
-    /// `docs/2026-05-19-grpc-pd-merge-spec.md` §2.
+    /// In PD mode, `input_logprobs` is injected by the merger from the prefill
+    /// worker's Complete; all other fields come from the decode worker.
     Complete {
         token_ids: Vec<u32>,
         finish_reason: FinishReason,

@@ -34,7 +34,6 @@ pub(crate) fn extract_tools_from_response_tools(
         .collect()
 }
 
-/// Persist response to storage if store=true
 pub(crate) async fn persist_response_if_needed(
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,

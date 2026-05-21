@@ -1,4 +1,4 @@
-//! Relocated /v1/responses implementation; depends on grpc::Pipeline (concrete type only).
+//! /v1/responses endpoint implementation.
 
 pub(crate) mod context;
 pub(crate) mod conversation;
@@ -9,5 +9,5 @@ pub(crate) mod persistence;
 pub(crate) mod retrieve;
 pub(crate) mod streaming;
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests;

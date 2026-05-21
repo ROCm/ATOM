@@ -1,4 +1,4 @@
-//! Shared response handlers for retrieving and cancelling responses.
+//! GET /v1/responses/{id} and POST /v1/responses/{id}/cancel handlers.
 
 use axum::response::{IntoResponse, Response};
 use data_connector::ResponseId;
@@ -6,13 +6,9 @@ use data_connector::ResponseId;
 use super::context::ResponsesContext;
 use crate::routers::error;
 
-/// Implementation for GET /v1/responses/{response_id}
-///
-/// Retrieves a stored response from the database.
 pub(crate) async fn get_response_impl(ctx: &ResponsesContext, response_id: &str) -> Response {
     let resp_id = ResponseId::from(response_id);
 
-    // Retrieve response from storage
     match ctx.response_storage.get_response(&resp_id).await {
         Ok(Some(stored_response)) => axum::Json(stored_response.raw_response).into_response(),
         Ok(None) => error::not_found(
@@ -26,14 +22,9 @@ pub(crate) async fn get_response_impl(ctx: &ResponsesContext, response_id: &str)
     }
 }
 
-/// Implementation for POST /v1/responses/{response_id}/cancel
-///
-/// Background mode is no longer supported, so this endpoint always returns
-/// an error indicating that cancellation is not available.
 pub(crate) async fn cancel_response_impl(ctx: &ResponsesContext, response_id: &str) -> Response {
     let resp_id = ResponseId::from(response_id);
 
-    // Check if response exists
     match ctx.response_storage.get_response(&resp_id).await {
         Ok(Some(stored_response)) => {
             let current_status = stored_response
@@ -50,13 +41,10 @@ pub(crate) async fn cancel_response_impl(ctx: &ResponsesContext, response_id: &s
                 "failed" => {
                     error::bad_request("response_already_failed", "Cannot cancel failed response")
                 }
-                _ => {
-                    // Background mode is no longer supported, so there's nothing to cancel
-                    error::bad_request(
-                        "cancellation_not_supported",
-                        "Background mode is not supported. Synchronous and streaming responses cannot be cancelled.",
-                    )
-                }
+                _ => error::bad_request(
+                    "cancellation_not_supported",
+                    "Background mode is not supported. Synchronous and streaming responses cannot be cancelled.",
+                ),
             }
         }
         Ok(None) => error::not_found(

@@ -1,19 +1,5 @@
-//! Handler functions for /v1/responses endpoints
-//!
-//! # Public API
-//!
-//! - `route_responses()` - POST /v1/responses (main entry point)
-//!
-//! # Architecture
-//!
-//! This module provides the entry point for the /v1/responses endpoint.
-//! It supports two execution modes:
-//!
-//! 1. **Synchronous** - Returns complete response immediately (non_streaming.rs)
-//! 2. **Streaming** - Returns SSE stream with real-time events (streaming.rs)
-//!
-//! Note: Background mode is no longer supported. Requests with background=true
-//! will be rejected with a 400 error.
+//! Entry handler for POST /v1/responses. Dispatches to streaming or
+//! synchronous execution; background mode is not supported.
 
 use std::sync::Arc;
 
@@ -29,16 +15,12 @@ use super::{
 };
 use crate::{protocols::responses::ResponsesRequest, routers::error};
 
-/// Main handler for POST /v1/responses
-///
-/// Validates request, determines execution mode (sync/streaming), and delegates
 pub(crate) async fn route_responses(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
 ) -> Response {
-    // 1. Reject background mode (no longer supported)
     let is_background = request.background.unwrap_or(false);
     if is_background {
         return error::bad_request(
@@ -47,22 +29,15 @@ pub(crate) async fn route_responses(
         );
     }
 
-    // 2. Route based on execution mode
     let is_streaming = request.stream.unwrap_or(false);
     if is_streaming {
         route_responses_streaming(ctx, request, headers, model_id).await
     } else {
-        // Generate response ID for synchronous execution
         let response_id = Some(format!("resp_{}", Uuid::new_v4()));
         route_responses_sync(ctx, request, headers, model_id, response_id).await
     }
 }
 
-// ============================================================================
-// Synchronous Entry Point
-// ============================================================================
-
-/// Execute synchronous responses request
 async fn route_responses_sync(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
@@ -74,28 +49,21 @@ async fn route_responses_sync(
         .await
     {
         Ok(responses_response) => axum::Json(responses_response).into_response(),
-        Err(response) => response, // Already a Response with proper status code
+        Err(response) => response,
     }
 }
 
-// ============================================================================
-// Streaming Entry Point
-// ============================================================================
-
-/// Execute streaming responses request
 async fn route_responses_streaming(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
 ) -> Response {
-    // 1. Load conversation history
     let modified_request = match load_conversation_history(ctx, &request).await {
         Ok(req) => req,
         Err(response) => return response,
     };
 
-    // 2. Convert ResponsesRequest → ChatCompletionRequest
     let chat_request = match conversions::responses_to_chat(&modified_request) {
         Ok(req) => Arc::new(req),
         Err(e) => {
@@ -106,7 +74,6 @@ async fn route_responses_streaming(
         }
     };
 
-    // 3. Execute chat pipeline and convert streaming format
     streaming::convert_chat_stream_to_responses_stream(
         ctx,
         chat_request,

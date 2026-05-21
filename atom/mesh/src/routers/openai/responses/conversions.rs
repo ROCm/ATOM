@@ -1,11 +1,5 @@
-//! Conversion utilities for translating between /v1/responses and /v1/chat/completions formats
-//!
-//! This module implements the conversion approach where:
-//! 1. ResponsesRequest → ChatCompletionRequest (for backend processing)
-//! 2. ChatCompletionResponse → ResponsesResponse (for client response)
-//!
-//! This allows the gRPC router to reuse the existing chat pipeline infrastructure
-//! without requiring Python backend changes.
+//! Conversion between /v1/responses and /v1/chat/completions request/response
+//! shapes, so the gRPC chat pipeline backs both endpoints.
 
 use crate::{
     protocols::{
@@ -24,19 +18,9 @@ use crate::{
     routers::openai::responses::persistence::extract_tools_from_response_tools,
 };
 
-/// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
-///
-/// # Conversion Logic
-/// - `input` (text/items) → `messages` (chat messages)
-/// - `instructions` → system message (prepended)
-/// - `max_output_tokens` → `max_completion_tokens`
-/// - `tools` → function tools extracted from ResponseTools
-/// - `tool_choice` → passed through from request
-/// - Response-specific fields (previous_response_id, conversation) are handled by router
 pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
     let mut messages = Vec::new();
 
-    // 1. Add system message if instructions provided
     if let Some(instructions) = &req.instructions {
         messages.push(ChatMessage::System {
             content: MessageContent::Text(instructions.clone()),
@@ -44,25 +28,21 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         });
     }
 
-    // 2. Convert input to chat messages
     match &req.input {
         ResponseInput::Text(text) => {
-            // Simple text input → user message
             messages.push(ChatMessage::User {
                 content: MessageContent::Text(text.clone()),
                 name: None,
             });
         }
         ResponseInput::Items(items) => {
-            // Structured items → convert each to appropriate chat message
             for item in items {
                 match item {
                     ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
-                        // Convert SimpleInputMessage to chat message
                         let text = match content {
                             StringOrContentParts::String(s) => s.clone(),
                             StringOrContentParts::Array(parts) => {
-                                // Extract text from content parts (only InputText supported)
+                                // Only InputText parts contribute to the chat message text.
                                 parts
                                     .iter()
                                     .filter_map(|part| match part {
@@ -79,9 +59,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         messages.push(role_to_chat_message(role.as_str(), text));
                     }
                     ResponseInputOutputItem::Message { role, content, .. } => {
-                        // Extract text from content parts
                         let text = extract_text_from_content(content);
-
                         messages.push(role_to_chat_message(role.as_str(), text));
                     }
                     ResponseInputOutputItem::FunctionToolCall {
@@ -91,10 +69,6 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         output,
                         ..
                     } => {
-                        // Tool call from history - add as assistant message with tool call
-                        // followed by tool response if output exists
-
-                        // Add assistant message with tool_calls (the LLM's decision)
                         messages.push(ChatMessage::Assistant {
                             content: None,
                             name: None,
@@ -109,7 +83,6 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                             reasoning_content: None,
                         });
 
-                        // Add tool result message if output exists
                         if let Some(output_text) = output {
                             messages.push(ChatMessage::Tool {
                                 content: MessageContent::Text(output_text.clone()),
@@ -118,7 +91,6 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         }
                     }
                     ResponseInputOutputItem::Reasoning { content, .. } => {
-                        // Reasoning content - add as assistant message with reasoning_content
                         let reasoning_text = content
                             .iter()
                             .map(|c| match c {
@@ -137,8 +109,6 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                     ResponseInputOutputItem::FunctionCallOutput {
                         call_id, output, ..
                     } => {
-                        // Function call output - add as tool message
-                        // Function call output - use call_id for tool message
                         messages.push(ChatMessage::Tool {
                             content: MessageContent::Text(output.clone()),
                             tool_call_id: call_id.clone(),
@@ -149,13 +119,10 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         }
     }
 
-    // Ensure we have at least one message
     if messages.is_empty() {
         return Err("Request must contain at least one message".to_string());
     }
 
-    // 3. Extract function tools from ResponseTools
-    // Extract function tools from ResponseTools
     let function_tools = extract_tools_from_response_tools(req.tools.as_deref());
     let tools = if function_tools.is_empty() {
         None
@@ -163,7 +130,6 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         Some(function_tools)
     };
 
-    // 4. Build ChatCompletionRequest
     let is_streaming = req.stream.unwrap_or(false);
 
     Ok(ChatCompletionRequest {
@@ -194,7 +160,6 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
     })
 }
 
-/// Extract text content from ResponseContentPart array
 fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
     content
         .iter()
@@ -207,7 +172,6 @@ fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
         .join("")
 }
 
-/// Convert role and text to ChatMessage
 fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
     match role {
         "user" => ChatMessage::User {
@@ -224,20 +188,14 @@ fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
             content: MessageContent::Text(text),
             name: None,
         },
-        _ => {
-            // Unknown role, treat as user message
-            ChatMessage::User {
-                content: MessageContent::Text(text),
-                name: None,
-            }
-        }
+        // Unknown roles fall through to user.
+        _ => ChatMessage::User {
+            content: MessageContent::Text(text),
+            name: None,
+        },
     }
 }
 
-/// Map TextConfig from Responses API to ResponseFormat for Chat API
-///
-/// Converts the structured output configuration from the Responses API format
-/// to the Chat API format.
 fn map_text_to_response_format(text: &Option<TextConfig>) -> Option<ResponseFormat> {
     let text_config = text.as_ref()?;
     let format = text_config.format.as_ref()?;
@@ -260,29 +218,19 @@ fn map_text_to_response_format(text: &Option<TextConfig>) -> Option<ResponseForm
     }
 }
 
-/// Convert a ChatCompletionResponse to ResponsesResponse
-///
-/// # Conversion Logic
-/// - `id` → `response_id_override` if provided, otherwise `chat_resp.id`
-/// - `model` → `model` (pass through)
-/// - `choices[0].message` → `output` array (convert to ResponseOutputItem::Message)
-/// - `choices[0].finish_reason` → determines `status` (stop/length → Completed)
-/// - `created` timestamp → `created_at`
 pub(crate) fn chat_to_responses(
     chat_resp: &ChatCompletionResponse,
     original_req: &ResponsesRequest,
     response_id_override: Option<String>,
 ) -> Result<ResponsesResponse, String> {
-    // Extract the first choice (responses API doesn't support n>1)
+    // Responses API does not support n>1; only the first choice contributes.
     let choice = chat_resp
         .choices
         .first()
         .ok_or_else(|| "Chat response contains no choices".to_string())?;
 
-    // Convert assistant message to output items
     let mut output: Vec<ResponseOutputItem> = Vec::new();
 
-    // Convert message content to output item
     if let Some(content) = &choice.message.content {
         if !content.is_empty() {
             output.push(ResponseOutputItem::Message {
@@ -298,7 +246,6 @@ pub(crate) fn chat_to_responses(
         }
     }
 
-    // Convert reasoning content if present (O1-style models)
     if let Some(reasoning) = &choice.message.reasoning_content {
         if !reasoning.is_empty() {
             output.push(ResponseOutputItem::Reasoning {
@@ -312,7 +259,6 @@ pub(crate) fn chat_to_responses(
         }
     }
 
-    // Convert tool calls if present
     if let Some(tool_calls) = &choice.message.tool_calls {
         for tool_call in tool_calls {
             output.push(ResponseOutputItem::FunctionToolCall {
@@ -320,21 +266,20 @@ pub(crate) fn chat_to_responses(
                 call_id: tool_call.id.clone(),
                 name: tool_call.function.name.clone(),
                 arguments: tool_call.function.arguments.clone().unwrap_or_default(),
-                output: None, // Tool hasn't been executed yet
+                output: None,
                 status: "in_progress".to_string(),
             });
         }
     }
 
-    // Determine response status based on finish_reason
     let status = match choice.finish_reason.as_deref() {
         Some("stop") | Some("length") => ResponseStatus::Completed,
-        Some("tool_calls") => ResponseStatus::Completed, // Model finished; tool execution is caller's responsibility
+        // Model finished cleanly; running the tool is the caller's responsibility.
+        Some("tool_calls") => ResponseStatus::Completed,
         Some("failed") | Some("error") => ResponseStatus::Failed,
-        _ => ResponseStatus::Completed, // Default to completed
+        _ => ResponseStatus::Completed,
     };
 
-    // Convert usage from Usage to UsageInfo, then wrap in ResponsesUsage
     let usage = chat_resp.usage.as_ref().map(|u| {
         let usage_info = UsageInfo {
             prompt_tokens: u.prompt_tokens,
@@ -344,12 +289,12 @@ pub(crate) fn chat_to_responses(
                 .completion_tokens_details
                 .as_ref()
                 .and_then(|d| d.reasoning_tokens),
-            prompt_tokens_details: None, // Chat response doesn't have this
+            // Chat response does not surface prompt token details.
+            prompt_tokens_details: None,
         };
         ResponsesUsage::Classic(usage_info)
     });
 
-    // Generate response
     let response_id = response_id_override.unwrap_or_else(|| chat_resp.id.clone());
     Ok(ResponsesResponse::builder(&response_id, &chat_resp.model)
         .copy_from_request(original_req)

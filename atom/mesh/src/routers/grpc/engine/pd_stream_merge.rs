@@ -1,6 +1,5 @@
 //! `merge_pd_streams` — state machine that combines prefill + decode worker
-//! streams into one `TokenHandle`. See
-//! `docs/2026-05-19-grpc-pd-merge-spec.md` §3 for the binding semantics.
+//! streams into one `TokenHandle`.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -60,18 +59,17 @@ impl Stream for PdMerger {
                     match Pin::new(prefill).poll_next(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Some(Ok(TokenChunk::Partial { .. }))) => {
-                            // I1: prefill Partials in WaitingPrefill are silently dropped.
+                            // Drop prefill Partials while waiting; only the Complete carries input_logprobs.
                             continue;
                         }
                         Poll::Ready(Some(Ok(TokenChunk::Complete { input_logprobs, .. }))) => {
                             this.state = State::Streaming {
                                 pending_input_logprobs: input_logprobs,
                             };
-                            // Stay in loop; pull decode next.
                             continue;
                         }
                         Poll::Ready(Some(Err(e))) => {
-                            // I5: drop decode without mark_completed.
+                            // Prefill failed: cancel decode by dropping (no mark_completed → H2 RST).
                             this.decode = None;
                             this.prefill = None;
                             this.state = State::Terminal;
@@ -108,7 +106,7 @@ impl Stream for PdMerger {
                         }))) => {
                             let merged_input_logprobs =
                                 pending_input_logprobs.take().or(decode_input_logprobs);
-                            // I4: mark prefill completed BEFORE dropping it.
+                            // mark_completed BEFORE drop, so prefill exits cleanly instead of RST.
                             if let Some(p) = this.prefill.as_mut() {
                                 p.mark_completed();
                             }
@@ -126,7 +124,7 @@ impl Stream for PdMerger {
                             })));
                         }
                         Poll::Ready(Some(Err(e))) => {
-                            // I5: drop prefill without mark_completed.
+                            // Decode failed: cancel prefill by dropping (no mark_completed → H2 RST).
                             this.prefill = None;
                             this.decode = None;
                             this.state = State::Terminal;

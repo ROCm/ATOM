@@ -1,6 +1,4 @@
 //! Transport-neutral request preparation: HTTP request → (GenerationPayload, ResponseContext).
-//!
-//! Module contents are added incrementally by Parts A–C of the gRPC refactor.
 
 use std::sync::Arc;
 
@@ -24,21 +22,18 @@ pub(crate) mod chat_template;
 pub mod generation_payload;
 pub(crate) mod parser_factory_lookup;
 pub mod response_context;
-pub(crate) mod stop_sequence_decoder;
+pub(crate) mod stop_decoder_builder;
 pub(crate) mod tool_constraints;
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests;
 
 use chat_template::process_chat_messages;
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
-use stop_sequence_decoder::create_stop_decoder;
+use stop_decoder_builder::create_stop_decoder;
 use tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constraints};
 
-/// Look up a tokenizer in the registry by model id, returning a 5xx `Response`
-/// if the registry has no entry. Pure helper — the caller owns the resulting
-/// `Arc<dyn Tokenizer>` and decides where to thread it.
 pub fn lookup_tokenizer(
     model_id: &str,
     registry: &TokenizerRegistry,
@@ -186,8 +181,8 @@ pub(crate) fn build_chat_payload(
 ) -> GenerationPayload {
     use crate::protocols::common::{ToolChoice, ToolChoiceValue};
 
-    // Mirror upstream's skip_special_tokens override: when tools are present
-    // and tool_choice is not "none", force-disable to keep special tokens.
+    // When tools are present and tool_choice is not "none", force-disable
+    // skip_special_tokens so tool-call markers survive the decoder.
     let skip_special_tokens = if req.tools.is_some() {
         match &req.tool_choice {
             Some(ToolChoice::Value(ToolChoiceValue::None)) => req.skip_special_tokens,

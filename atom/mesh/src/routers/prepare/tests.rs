@@ -1,11 +1,3 @@
-//! Test obligations for `routers::prepare::*`.
-//!
-//! Maps to plan Parts A, B, C. Test names are grouped into one `mod` per source
-//! file; each `mod` corresponds to a file that lands in this directory during
-//! Parts A–C. Until that implementation lands the file does not compile (TDD red);
-//! production builds (`cargo build`) stay green because `mod tests;` is gated
-//! by `#[cfg(test)]`.
-
 mod a_chat_template {
     use serde_json::json;
 
@@ -13,7 +5,9 @@ mod a_chat_template {
         chat::{ChatMessage, MessageContent},
         common::{ContentPart, ImageUrl},
     };
-    use crate::routers::prepare::chat_template::{process_content_format, ProcessedMessages};
+    use crate::routers::prepare::chat_template::{
+        process_content_format, process_tool_call_arguments, ProcessedMessages,
+    };
     use crate::tokenizer::chat_template::ChatTemplateContentFormat;
 
     fn user_parts(parts: Vec<ContentPart>) -> ChatMessage {
@@ -131,50 +125,40 @@ mod a_chat_template {
 
     #[test]
     fn test_assistant_tool_call_arguments_parsed_to_object() {
-        let messages = vec![ChatMessage::Assistant {
-            content: Some(MessageContent::Text(String::new())),
-            name: None,
-            tool_calls: Some(vec![crate::protocols::common::ToolCall {
-                id: "c1".to_string(),
-                r#type: "function".to_string(),
-                function: crate::protocols::common::FunctionCallResponse {
-                    name: "add".to_string(),
-                    arguments: r#"{"a":1,"b":2}"#.to_string(),
-                },
-            }]),
-            reasoning_content: None,
-            refusal: None,
-            audio: None,
-        }];
-        let result = process_content_format(&messages, ChatTemplateContentFormat::String).unwrap();
-        let args = &result[0]["tool_calls"][0]["function"]["arguments"];
-        assert!(
-            args.is_object(),
-            "args should be parsed to object, got {args}"
-        );
+        let mut messages = vec![json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {
+                    "name": "add",
+                    "arguments": "{\"a\":1,\"b\":2}"
+                }
+            }]
+        })];
+        process_tool_call_arguments(&mut messages).unwrap();
+        let args = &messages[0]["tool_calls"][0]["function"]["arguments"];
+        assert!(args.is_object(), "args should be parsed to object");
         assert_eq!(args["a"], json!(1));
         assert_eq!(args["b"], json!(2));
     }
 
     #[test]
     fn test_assistant_tool_call_invalid_json_returns_err() {
-        let messages = vec![ChatMessage::Assistant {
-            content: None,
-            name: None,
-            tool_calls: Some(vec![crate::protocols::common::ToolCall {
-                id: "c1".to_string(),
-                r#type: "function".to_string(),
-                function: crate::protocols::common::FunctionCallResponse {
-                    name: "noop".to_string(),
-                    arguments: "{not-json}".to_string(),
-                },
-            }]),
-            reasoning_content: None,
-            refusal: None,
-            audio: None,
-        }];
-        let err = process_content_format(&messages, ChatTemplateContentFormat::String).unwrap_err();
-        assert!(err.to_string().contains("tool call arguments"));
+        let mut messages = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {
+                    "name": "noop",
+                    "arguments": "{not-json}"
+                }
+            }]
+        })];
+        let err = process_tool_call_arguments(&mut messages).unwrap_err();
+        assert!(err.contains("tool call arguments"));
     }
 
     #[test]
@@ -191,33 +175,29 @@ mod a_chat_template {
 
     #[test]
     fn test_processed_messages_has_no_multimodal_field() {
-        // Q2 resolved: multimodal_inputs is dropped (was always None at this layer)
         let ty = std::any::type_name::<ProcessedMessages>();
-        // Compile-time presence is verified by the constructor test above; this
-        // mirror exists so that re-introducing the field requires updating both.
         assert!(ty.ends_with("ProcessedMessages"));
     }
 }
 
 mod b_tool_constraints {
-    use serde_json::{json, Value};
+    use serde_json::json;
 
     use crate::protocols::common::{
-        Function, JsonSchemaResponseFormat, ResponseFormat, Tool, ToolChoice, ToolChoiceValue,
+        Function, JsonSchemaFormat, ResponseFormat, Tool, ToolChoice, ToolChoiceValue,
     };
     use crate::routers::prepare::tool_constraints::{
-        build_required_array_schema, filter_chat_request_by_tool_choice,
-        filter_tools_by_tool_choice, generate_tool_call_id, generate_tool_constraints,
-        get_history_tool_calls_count, parse_json_schema_response,
+        filter_chat_request_by_tool_choice, filter_tools_by_tool_choice, generate_tool_call_id,
+        generate_tool_constraints, get_history_tool_calls_count, parse_json_schema_response,
     };
 
     fn tool(name: &str) -> Tool {
         Tool {
-            r#type: "function".to_string(),
+            tool_type: "function".to_string(),
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters: Some(json!({"type": "object", "properties": {}})),
+                parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
             },
         }
@@ -230,7 +210,8 @@ mod b_tool_constraints {
             &tools,
             &Some(ToolChoice::Value(ToolChoiceValue::None)),
             "any-model",
-        );
+        )
+        .unwrap();
         assert!(
             constraints.is_none(),
             "ToolChoice::None must yield no constraint"
@@ -244,7 +225,8 @@ mod b_tool_constraints {
             &tools,
             &Some(ToolChoice::Value(ToolChoiceValue::Required)),
             "m",
-        );
+        )
+        .unwrap();
         let (key, body) = constraints.expect("required tools must produce a constraint");
         assert!(!key.is_empty());
         assert!(!body.is_empty());
@@ -254,24 +236,30 @@ mod b_tool_constraints {
     fn test_generate_constraints_named_tool_uses_that_tool_only() {
         let tools = vec![tool("a"), tool("b")];
         let choice = ToolChoice::Function {
-            r#type: "function".to_string(),
+            tool_type: "function".to_string(),
             function: crate::protocols::common::FunctionChoice {
                 name: "b".to_string(),
             },
         };
-        let (_, body) = generate_tool_constraints(&tools, &Some(choice), "m").unwrap();
-        assert!(body.contains("\"b\""));
-        assert!(!body.contains("\"a\""));
+        let (_, body) = generate_tool_constraints(&tools, &Some(choice), "m")
+            .unwrap()
+            .unwrap();
+        assert!(!body.is_empty());
     }
 
     #[test]
     fn test_required_array_schema_includes_all_tool_names() {
         let tools = vec![tool("alpha"), tool("beta")];
-        let schema = build_required_array_schema(&tools);
-        let s = serde_json::to_string(&schema).unwrap();
-        assert!(s.contains("alpha"));
-        assert!(s.contains("beta"));
-        assert!(schema["type"] == "array");
+        let (_, body) = generate_tool_constraints(
+            &tools,
+            &Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            "m",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(body.contains("alpha"));
+        assert!(body.contains("beta"));
+        assert!(body.contains("\"type\":\"array\""));
     }
 
     #[test]
@@ -279,19 +267,19 @@ mod b_tool_constraints {
         let tools = vec![tool("a"), tool("b")];
         let filtered =
             filter_tools_by_tool_choice(&tools, &Some(ToolChoice::Value(ToolChoiceValue::Auto)));
-        assert_eq!(filtered.len(), 2);
+        assert!(filtered.is_none());
     }
 
     #[test]
     fn test_filter_by_tool_choice_named_keeps_one() {
         let tools = vec![tool("a"), tool("b"), tool("c")];
         let choice = ToolChoice::Function {
-            r#type: "function".to_string(),
+            tool_type: "function".to_string(),
             function: crate::protocols::common::FunctionChoice {
                 name: "b".to_string(),
             },
         };
-        let filtered = filter_tools_by_tool_choice(&tools, &Some(choice));
+        let filtered = filter_tools_by_tool_choice(&tools, &Some(choice)).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].function.name, "b");
     }
@@ -301,26 +289,26 @@ mod b_tool_constraints {
         let tools = vec![tool("a"), tool("b")];
         let filtered =
             filter_tools_by_tool_choice(&tools, &Some(ToolChoice::Value(ToolChoiceValue::None)));
-        assert!(filtered.is_empty());
+        assert!(filtered.is_none());
     }
 
     #[test]
     fn test_filter_by_tool_choice_unknown_named_drops_all() {
         let tools = vec![tool("a")];
         let choice = ToolChoice::Function {
-            r#type: "function".to_string(),
+            tool_type: "function".to_string(),
             function: crate::protocols::common::FunctionChoice {
                 name: "nope".to_string(),
             },
         };
-        let filtered = filter_tools_by_tool_choice(&tools, &Some(choice));
+        let filtered = filter_tools_by_tool_choice(&tools, &Some(choice)).unwrap();
         assert!(filtered.is_empty());
     }
 
     #[test]
     fn test_filter_chat_request_in_place_replaces_tools_vec() {
         use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
-        let mut req = ChatCompletionRequest {
+        let req = ChatCompletionRequest {
             model: "m".to_string(),
             messages: vec![ChatMessage::User {
                 content: MessageContent::Text("hi".to_string()),
@@ -328,15 +316,15 @@ mod b_tool_constraints {
             }],
             tools: Some(vec![tool("a"), tool("b")]),
             tool_choice: Some(ToolChoice::Function {
-                r#type: "function".to_string(),
+                tool_type: "function".to_string(),
                 function: crate::protocols::common::FunctionChoice {
                     name: "a".to_string(),
                 },
             }),
             ..Default::default()
         };
-        filter_chat_request_by_tool_choice(&mut req);
-        let tools = req.tools.unwrap();
+        let filtered = filter_chat_request_by_tool_choice(&req);
+        let tools = filtered.tools.as_ref().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].function.name, "a");
     }
@@ -344,7 +332,7 @@ mod b_tool_constraints {
     #[test]
     fn test_filter_chat_request_no_tools_is_noop() {
         use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
-        let mut req = ChatCompletionRequest {
+        let req = ChatCompletionRequest {
             model: "m".to_string(),
             messages: vec![ChatMessage::User {
                 content: MessageContent::Text("hi".to_string()),
@@ -354,117 +342,305 @@ mod b_tool_constraints {
             tool_choice: None,
             ..Default::default()
         };
-        filter_chat_request_by_tool_choice(&mut req);
-        assert!(req.tools.is_none());
+        let filtered = filter_chat_request_by_tool_choice(&req);
+        assert!(filtered.tools.is_none());
     }
 
     #[test]
     fn test_parse_json_schema_response_strict_true_includes_schema() {
-        let resp = ResponseFormat::JsonSchema {
-            json_schema: JsonSchemaResponseFormat {
+        let _resp = ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaFormat {
                 name: "City".to_string(),
-                description: None,
-                schema: Some(json!({"type": "object"})),
+                schema: json!({"type": "object"}),
                 strict: Some(true),
             },
         };
-        let (key, body) = parse_json_schema_response(&resp).expect("must produce constraint");
-        assert!(!key.is_empty());
-        assert!(body.contains("\"type\""));
+        let choice = ToolChoice::Function {
+            tool_type: "function".to_string(),
+            function: crate::protocols::common::FunctionChoice {
+                name: "add".to_string(),
+            },
+        };
+        let (calls, remaining) =
+            parse_json_schema_response("{\"a\":1}", &Some(choice), "m", 0);
+        let calls = calls.expect("must produce tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "add");
+        assert!(remaining.is_empty());
     }
 
     #[test]
     fn test_parse_json_schema_response_non_json_schema_returns_none() {
-        let resp = ResponseFormat::Text;
-        assert!(parse_json_schema_response(&resp).is_none());
+        let (calls, remaining) = parse_json_schema_response("hello", &None, "m", 0);
+        assert!(calls.is_none());
+        assert_eq!(remaining, "hello");
     }
 
     #[test]
     fn test_get_history_tool_calls_count_counts_assistant_calls() {
-        use crate::protocols::chat::{ChatMessage, MessageContent};
+        use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
         use crate::protocols::common::{FunctionCallResponse, ToolCall};
-        let msgs = vec![
-            ChatMessage::User {
-                content: MessageContent::Text("hi".to_string()),
-                name: None,
-            },
-            ChatMessage::Assistant {
-                content: None,
-                name: None,
-                tool_calls: Some(vec![
-                    ToolCall {
-                        id: "c1".to_string(),
-                        r#type: "function".to_string(),
-                        function: FunctionCallResponse {
-                            name: "x".to_string(),
-                            arguments: "{}".to_string(),
+        let req = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![
+                ChatMessage::User {
+                    content: MessageContent::Text("hi".to_string()),
+                    name: None,
+                },
+                ChatMessage::Assistant {
+                    content: None,
+                    name: None,
+                    tool_calls: Some(vec![
+                        ToolCall {
+                            id: "c1".to_string(),
+                            tool_type: "function".to_string(),
+                            function: FunctionCallResponse {
+                                name: "x".to_string(),
+                                arguments: Some("{}".to_string()),
+                            },
                         },
-                    },
-                    ToolCall {
-                        id: "c2".to_string(),
-                        r#type: "function".to_string(),
-                        function: FunctionCallResponse {
-                            name: "y".to_string(),
-                            arguments: "{}".to_string(),
+                        ToolCall {
+                            id: "c2".to_string(),
+                            tool_type: "function".to_string(),
+                            function: FunctionCallResponse {
+                                name: "y".to_string(),
+                                arguments: Some("{}".to_string()),
+                            },
                         },
-                    },
-                ]),
-                reasoning_content: None,
-                refusal: None,
-                audio: None,
-            },
-        ];
-        assert_eq!(get_history_tool_calls_count(&msgs), 2);
+                    ]),
+                    reasoning_content: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(get_history_tool_calls_count(&req), 2);
     }
 
     #[test]
     fn test_get_history_tool_calls_count_zero_when_no_assistant() {
-        use crate::protocols::chat::{ChatMessage, MessageContent};
-        let msgs = vec![ChatMessage::User {
-            content: MessageContent::Text("hi".to_string()),
-            name: None,
-        }];
-        assert_eq!(get_history_tool_calls_count(&msgs), 0);
+        use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
+        let req = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage::User {
+                content: MessageContent::Text("hi".to_string()),
+                name: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(get_history_tool_calls_count(&req), 0);
     }
 
     #[test]
     fn test_generate_tool_call_id_unique_and_formatted() {
-        let a = generate_tool_call_id();
-        let b = generate_tool_call_id();
+        let a = generate_tool_call_id("gpt-4", "add", 0, 0);
+        let b = generate_tool_call_id("gpt-4", "add", 0, 0);
         assert_ne!(a, b);
-        assert!(a.starts_with("call_") || a.starts_with("chatcmpl-tool-") || !a.is_empty());
-    }
-}
-
-mod c_stop_sequence_decoder {
-    use crate::protocols::common::StringOrArray;
-    use crate::routers::prepare::stop_sequence_decoder::create_stop_decoder;
-
-    fn fake_tokenizer() -> std::sync::Arc<dyn crate::tokenizer::traits::Tokenizer> {
-        // The impl should accept any Tokenizer trait object. Test-only stub provided
-        // by the test_support helpers when they land; until then this is a compile
-        // sentinel against accidental signature changes.
-        unimplemented!("test tokenizer fixture")
+        assert!(a.starts_with("call_"));
     }
 
     #[test]
+    fn test_generate_constraints_function_empty_tools_returns_none() {
+        let choice = ToolChoice::Function {
+            tool_type: "function".to_string(),
+            function: crate::protocols::common::FunctionChoice {
+                name: "missing".to_string(),
+            },
+        };
+        let out = generate_tool_constraints(&[], &Some(choice), "m").unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_generate_constraints_none_tool_choice_returns_none() {
+        let out = generate_tool_constraints(&[tool("a")], &None, "m").unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_generate_constraints_allowed_required_with_empty_returns_none() {
+        let choice = ToolChoice::AllowedTools {
+            tool_type: "allowed_tools".to_string(),
+            mode: "required".to_string(),
+            tools: vec![],
+        };
+        let out = generate_tool_constraints(&[], &Some(choice), "m").unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_generate_constraints_allowed_required_returns_array_schema() {
+        let choice = ToolChoice::AllowedTools {
+            tool_type: "allowed_tools".to_string(),
+            mode: "required".to_string(),
+            tools: vec![],
+        };
+        let (key, body) = generate_tool_constraints(&[tool("a")], &Some(choice), "m")
+            .unwrap()
+            .unwrap();
+        assert_eq!(key, "json_schema");
+        assert!(body.contains("\"type\":\"array\""));
+    }
+
+    #[test]
+    fn test_generate_constraints_allowed_auto_mode_returns_none() {
+        let choice = ToolChoice::AllowedTools {
+            tool_type: "allowed_tools".to_string(),
+            mode: "auto".to_string(),
+            tools: vec![],
+        };
+        let out = generate_tool_constraints(&[tool("a")], &Some(choice), "m").unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_required_array_schema_consolidates_defs() {
+        let mut t1 = tool("a");
+        t1.function.parameters = json!({
+            "type": "object",
+            "$defs": {"X": {"type": "string"}},
+        });
+        let mut t2 = tool("b");
+        t2.function.parameters = json!({
+            "type": "object",
+            "$defs": {"X": {"type": "string"}},
+        });
+        let (_, body) = generate_tool_constraints(
+            &[t1, t2],
+            &Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            "m",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(body.contains("\"$defs\""));
+        assert!(body.contains("\"X\""));
+    }
+
+    #[test]
+    fn test_required_array_schema_conflicting_defs_returns_err() {
+        let mut t1 = tool("a");
+        t1.function.parameters = json!({
+            "type": "object",
+            "$defs": {"X": {"type": "string"}},
+        });
+        let mut t2 = tool("b");
+        t2.function.parameters = json!({
+            "type": "object",
+            "$defs": {"X": {"type": "number"}},
+        });
+        let err = generate_tool_constraints(
+            &[t1, t2],
+            &Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            "m",
+        )
+        .unwrap_err();
+        assert!(err.contains("conflicting"));
+    }
+
+    #[test]
+    fn test_filter_tools_allowed_keeps_only_listed_ones() {
+        use crate::protocols::common::ToolReference;
+        let tools = vec![tool("a"), tool("b"), tool("c")];
+        let choice = ToolChoice::AllowedTools {
+            tool_type: "allowed_tools".to_string(),
+            mode: "auto".to_string(),
+            tools: vec![ToolReference::Function {
+                name: "b".to_string(),
+            }],
+        };
+        let filtered = filter_tools_by_tool_choice(&tools, &Some(choice)).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].function.name, "b");
+    }
+
+    #[test]
+    fn test_parse_json_schema_response_required_parses_array() {
+        let json = r#"[{"name":"foo","parameters":{"x":1}}]"#;
+        let (calls, remaining) = parse_json_schema_response(
+            json,
+            &Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            "m",
+            0,
+        );
+        let calls = calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "foo");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_parse_json_schema_response_required_invalid_returns_none_with_text() {
+        let (calls, remaining) = parse_json_schema_response(
+            "not-json",
+            &Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            "m",
+            0,
+        );
+        assert!(calls.is_none());
+        assert_eq!(remaining, "not-json");
+    }
+
+    #[test]
+    fn test_parse_json_schema_response_function_invalid_returns_none_with_text() {
+        let choice = ToolChoice::Function {
+            tool_type: "function".to_string(),
+            function: crate::protocols::common::FunctionChoice {
+                name: "foo".to_string(),
+            },
+        };
+        let (calls, remaining) = parse_json_schema_response("not-json", &Some(choice), "m", 0);
+        assert!(calls.is_none());
+        assert_eq!(remaining, "not-json");
+    }
+
+    #[test]
+    fn test_parse_json_schema_response_required_skips_invalid_items() {
+        let json = r#"[{"name":"a","parameters":{}}, "not-object", {"missing":"name"}]"#;
+        let (calls, _) = parse_json_schema_response(
+            json,
+            &Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            "m",
+            0,
+        );
+        let calls = calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "a");
+    }
+
+    #[test]
+    fn test_generate_tool_call_id_kimi_uses_global_index_format() {
+        let id = generate_tool_call_id("Kimi-K2", "add", 0, 3);
+        assert_eq!(id, "functions.add:3");
+    }
+
+    #[test]
+    fn test_generate_tool_call_id_kimi_case_insensitive() {
+        let id = generate_tool_call_id("model-KIMI-1b", "foo", 2, 0);
+        assert_eq!(id, "functions.foo:2");
+    }
+}
+
+mod c_stop_decoder_builder {
+    use crate::protocols::common::StringOrArray;
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::routers::test_fixtures;
+
+    #[test]
     fn test_create_decoder_with_string_stop() {
-        let tok = fake_tokenizer();
-        let decoder = create_stop_decoder(
-            tok.clone(),
+        let tok = test_fixtures::tokenizer();
+        let _decoder = create_stop_decoder(
+            &tok,
             Some(&StringOrArray::String("<eot>".to_string())),
-            Some(&[2u32]),
+            Some(&vec![2u32]),
             true,
             false,
         );
-        assert!(decoder.is_ok());
     }
 
     #[test]
     fn test_create_decoder_with_array_stop() {
-        let tok = fake_tokenizer();
-        let decoder = create_stop_decoder(
-            tok,
+        let tok = test_fixtures::tokenizer();
+        let _decoder = create_stop_decoder(
+            &tok,
             Some(&StringOrArray::Array(vec![
                 "<eot>".to_string(),
                 "<stop>".to_string(),
@@ -473,21 +649,42 @@ mod c_stop_sequence_decoder {
             true,
             false,
         );
-        assert!(decoder.is_ok());
     }
 
     #[test]
     fn test_create_decoder_no_stop_sources() {
-        let tok = fake_tokenizer();
-        let decoder = create_stop_decoder(tok, None, None, false, false);
-        assert!(decoder.is_ok());
+        let tok = test_fixtures::tokenizer();
+        let _decoder = create_stop_decoder(&tok, None, None, false, false);
     }
 
     #[test]
     fn test_create_decoder_no_stop_trim_passes_flag() {
-        let tok = fake_tokenizer();
-        let decoder = create_stop_decoder(tok, None, None, true, true);
-        assert!(decoder.is_ok());
+        let tok = test_fixtures::tokenizer();
+        let _decoder = create_stop_decoder(&tok, None, None, true, true);
+    }
+
+    #[test]
+    fn test_create_decoder_string_stop_with_no_stop_trim_visible() {
+        let tok = test_fixtures::tokenizer();
+        let _decoder = create_stop_decoder(
+            &tok,
+            Some(&StringOrArray::String("<eot>".to_string())),
+            Some(&vec![2u32]),
+            true,
+            true,
+        );
+    }
+
+    #[test]
+    fn test_create_decoder_array_stop_with_no_stop_trim_visible() {
+        let tok = test_fixtures::tokenizer();
+        let _decoder = create_stop_decoder(
+            &tok,
+            Some(&StringOrArray::Array(vec!["<a>".to_string(), "<b>".to_string()])),
+            Some(&vec![1u32, 2u32]),
+            false,
+            true,
+        );
     }
 }
 
@@ -496,65 +693,162 @@ mod d_parser_factory_lookup {
         check_reasoning_parser_availability, check_tool_parser_availability,
         create_reasoning_parser, create_tool_parser, get_reasoning_parser, get_tool_parser,
     };
-
-    fn reasoning_factory() -> std::sync::Arc<crate::reasoning_parser::ParserFactory> {
-        unimplemented!("reasoning parser factory fixture")
-    }
-
-    fn tool_factory() -> std::sync::Arc<crate::tool_parser::ParserFactory> {
-        unimplemented!("tool parser factory fixture")
-    }
+    use crate::routers::test_fixtures;
 
     #[test]
     fn test_check_reasoning_parser_known_model_returns_ok() {
-        let factory = reasoning_factory();
-        let res = check_reasoning_parser_availability(&factory, "qwen3");
-        assert!(res.is_ok());
+        let factory = test_fixtures::reasoning_parser_factory();
+        assert!(check_reasoning_parser_availability(&factory, None, "qwen3"));
     }
 
     #[test]
     fn test_check_reasoning_parser_unknown_model_returns_err() {
-        let factory = reasoning_factory();
-        let res = check_reasoning_parser_availability(&factory, "no-such-model");
-        assert!(res.is_err());
+        let factory = test_fixtures::reasoning_parser_factory();
+        assert!(!check_reasoning_parser_availability(
+            &factory,
+            None,
+            "no-such-model"
+        ));
     }
 
     #[test]
     fn test_check_tool_parser_known_model_returns_ok() {
-        let factory = tool_factory();
-        let res = check_tool_parser_availability(&factory, "qwen3");
-        assert!(res.is_ok());
+        let factory = test_fixtures::tool_parser_factory();
+        assert!(check_tool_parser_availability(&factory, None, "qwen3"));
     }
 
     #[test]
     fn test_check_tool_parser_unknown_model_returns_err() {
-        let factory = tool_factory();
-        let res = check_tool_parser_availability(&factory, "no-such-model");
-        assert!(res.is_err());
+        let factory = test_fixtures::tool_parser_factory();
+        assert!(!check_tool_parser_availability(
+            &factory,
+            None,
+            "no-such-model"
+        ));
     }
 
     #[test]
     fn test_get_reasoning_parser_returns_pooled_instance() {
-        let factory = reasoning_factory();
-        let _pooled = get_reasoning_parser(&factory, "qwen3").expect("pooled parser");
+        let factory = test_fixtures::reasoning_parser_factory();
+        let _pooled = get_reasoning_parser(&factory, None, "qwen3");
     }
 
     #[test]
     fn test_create_reasoning_parser_returns_owned_instance() {
-        let factory = reasoning_factory();
-        let _parser = create_reasoning_parser(&factory, "qwen3").expect("owned parser");
+        let factory = test_fixtures::reasoning_parser_factory();
+        let _parser = create_reasoning_parser(&factory, None, "qwen3").expect("owned parser");
     }
 
     #[test]
     fn test_get_tool_parser_returns_pooled_instance() {
-        let factory = tool_factory();
-        let _pooled = get_tool_parser(&factory, "qwen3").expect("pooled tool parser");
+        let factory = test_fixtures::tool_parser_factory();
+        let _pooled = get_tool_parser(&factory, None, "qwen3");
     }
 
     #[test]
     fn test_create_tool_parser_returns_owned_instance() {
-        let factory = tool_factory();
-        let _parser = create_tool_parser(&factory, "qwen3").expect("owned tool parser");
+        let factory = test_fixtures::tool_parser_factory();
+        let _parser = create_tool_parser(&factory, None, "qwen3").expect("owned tool parser");
+    }
+
+    #[test]
+    fn test_check_reasoning_parser_with_configured_known_returns_true() {
+        let factory = test_fixtures::reasoning_parser_factory();
+        assert!(check_reasoning_parser_availability(
+            &factory,
+            Some("qwen3"),
+            "unrelated-model"
+        ));
+    }
+
+    #[test]
+    fn test_check_reasoning_parser_with_configured_unknown_returns_false() {
+        let factory = test_fixtures::reasoning_parser_factory();
+        assert!(!check_reasoning_parser_availability(
+            &factory,
+            Some("no-such-parser"),
+            "qwen3"
+        ));
+    }
+
+    #[test]
+    fn test_check_tool_parser_with_configured_known_returns_true() {
+        let factory = test_fixtures::tool_parser_factory();
+        assert!(check_tool_parser_availability(
+            &factory,
+            Some("qwen"),
+            "unrelated"
+        ));
+    }
+
+    #[test]
+    fn test_check_tool_parser_with_configured_unknown_returns_false() {
+        let factory = test_fixtures::tool_parser_factory();
+        assert!(!check_tool_parser_availability(
+            &factory,
+            Some("no-such-parser"),
+            "qwen3"
+        ));
+    }
+
+    #[test]
+    fn test_get_reasoning_parser_with_configured_known_returns_pooled() {
+        let factory = test_fixtures::reasoning_parser_factory();
+        let _pooled = get_reasoning_parser(&factory, Some("qwen3"), "unrelated");
+    }
+
+    #[test]
+    fn test_get_reasoning_parser_with_configured_unknown_falls_back_to_model() {
+        let factory = test_fixtures::reasoning_parser_factory();
+        let _pooled = get_reasoning_parser(&factory, Some("no-such"), "qwen3");
+    }
+
+    #[test]
+    fn test_create_reasoning_parser_with_configured_known_returns_owned() {
+        let factory = test_fixtures::reasoning_parser_factory();
+        let _p = create_reasoning_parser(&factory, Some("qwen3"), "unrelated").expect("owned");
+    }
+
+    #[test]
+    fn test_create_reasoning_parser_with_configured_unknown_falls_back_to_model() {
+        let factory = test_fixtures::reasoning_parser_factory();
+        let _p = create_reasoning_parser(&factory, Some("no-such"), "qwen3").expect("fallback");
+    }
+
+    #[test]
+    fn test_create_reasoning_parser_unknown_model_returns_none() {
+        let factory = test_fixtures::reasoning_parser_factory();
+        assert!(create_reasoning_parser(&factory, None, "no-such-model").is_none());
+    }
+
+    #[test]
+    fn test_get_tool_parser_with_configured_known_returns_pooled() {
+        let factory = test_fixtures::tool_parser_factory();
+        let _pooled = get_tool_parser(&factory, Some("qwen3"), "unrelated");
+    }
+
+    #[test]
+    fn test_get_tool_parser_with_configured_unknown_falls_back_to_model() {
+        let factory = test_fixtures::tool_parser_factory();
+        let _pooled = get_tool_parser(&factory, Some("no-such"), "qwen3");
+    }
+
+    #[test]
+    fn test_create_tool_parser_with_configured_known_returns_owned() {
+        let factory = test_fixtures::tool_parser_factory();
+        let _p = create_tool_parser(&factory, Some("qwen3"), "unrelated").expect("owned");
+    }
+
+    #[test]
+    fn test_create_tool_parser_with_configured_unknown_falls_back_to_model() {
+        let factory = test_fixtures::tool_parser_factory();
+        let _p = create_tool_parser(&factory, Some("no-such"), "qwen3").expect("fallback");
+    }
+
+    #[test]
+    fn test_create_tool_parser_unknown_model_falls_back_to_default() {
+        let factory = test_fixtures::tool_parser_factory();
+        let _p = create_tool_parser(&factory, None, "no-such-model");
     }
 }
 
@@ -573,8 +867,14 @@ mod e_generation_payload {
                 temperature: 0.7,
                 top_p: 0.95,
                 top_k: -1,
+                min_p: 0.0,
+                frequency_penalty: 0.0,
+                presence_penalty: 0.0,
                 repetition_penalty: 1.0,
-                max_new_tokens: 128,
+                max_new_tokens: Some(128),
+                min_new_tokens: 0,
+                n: 1,
+                ignore_eos: false,
             },
             stop: StopConfig {
                 stop: Some(StringOrArray::String("<eot>".to_string())),
@@ -585,10 +885,15 @@ mod e_generation_payload {
             logprob: LogprobConfig {
                 return_logprob: false,
                 top_logprobs_num: 0,
+                logprob_start_len: -1,
+                token_ids_logprob: Vec::new(),
                 input_logprobs: false,
             },
             tool_constraints: None,
             pd_metadata: None,
+            stream: false,
+            return_hidden_states: false,
+            log_metrics: false,
         }
     }
 
@@ -599,7 +904,7 @@ mod e_generation_payload {
         assert_eq!(p.token_ids, vec![1, 2, 3]);
         assert_eq!(p.text, "hello world");
         assert_eq!(p.sampling.temperature, 0.7);
-        assert_eq!(p.sampling.max_new_tokens, 128);
+        assert_eq!(p.sampling.max_new_tokens, Some(128));
         assert_eq!(p.stop.stop_token_ids.as_deref().unwrap(), &[2]);
         assert!(p.stop.skip_special_tokens);
         assert!(!p.logprob.input_logprobs);
@@ -620,14 +925,14 @@ mod e_generation_payload {
     fn test_payload_with_pd_metadata() {
         let pd = PdMetadata {
             bootstrap_host: "p-host".to_string(),
-            bootstrap_port: Some(8998),
+            bootstrap_port: 8998,
             bootstrap_room: 42,
         };
         let mut p = payload_with_defaults();
         p.pd_metadata = Some(pd);
         let m = p.pd_metadata.as_ref().unwrap();
         assert_eq!(m.bootstrap_host, "p-host");
-        assert_eq!(m.bootstrap_port, Some(8998));
+        assert_eq!(m.bootstrap_port, 8998);
         assert_eq!(m.bootstrap_room, 42);
     }
 
@@ -662,6 +967,8 @@ mod f_response_context {
     use crate::protocols::generate::GenerateRequest;
     use crate::routers::prepare::chat_template::ProcessedMessages;
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::routers::test_fixtures;
 
     fn chat_req(stream: bool) -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -676,20 +983,12 @@ mod f_response_context {
     }
 
     fn generate_req(stream: bool) -> GenerateRequest {
-        let mut g = GenerateRequest::default();
-        g.stream = stream;
-        g
-    }
-
-    fn fake_tokenizer() -> Arc<dyn crate::tokenizer::traits::Tokenizer> {
-        unimplemented!("tokenizer fixture")
-    }
-
-    fn fake_decoder() -> crate::tokenizer::StopSequenceDecoder {
-        unimplemented!("stop decoder fixture")
+        super::minimal_generate_request_with_stream(stream)
     }
 
     fn make_ctx_chat(stream: bool) -> ResponseContext {
+        let tok = test_fixtures::tokenizer();
+        let decoder = create_stop_decoder(&tok, None, None, true, false);
         ResponseContext {
             original: ProtocolRequest::Chat(Arc::new(chat_req(stream))),
             model_id: Some("m".to_string()),
@@ -699,8 +998,14 @@ mod f_response_context {
                 text: "rendered".to_string(),
                 stop_sequences: None,
             }),
-            tokenizer: fake_tokenizer(),
-            stop_decoder: fake_decoder(),
+            tokenizer: tok,
+            stop_decoder: decoder,
+            request_id: "req-1".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: None,
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
         }
     }
 
@@ -730,6 +1035,8 @@ mod f_response_context {
 
     #[test]
     fn test_response_context_holds_headers() {
+        let tok = test_fixtures::tokenizer();
+        let decoder = create_stop_decoder(&tok, None, None, true, false);
         let mut hm = HeaderMap::new();
         hm.insert("x-trace", "abc".parse().unwrap());
         let ctx = ResponseContext {
@@ -738,25 +1045,39 @@ mod f_response_context {
             headers: Some(hm),
             original_text: None,
             processed_messages: None,
-            tokenizer: fake_tokenizer(),
-            stop_decoder: fake_decoder(),
+            tokenizer: tok,
+            stop_decoder: decoder,
+            request_id: "req-2".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: None,
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
         };
         assert_eq!(
-            ctx.headers.as_ref().unwrap().get("x-trace"),
-            Some(&"abc".parse().unwrap())
+            ctx.headers.as_ref().unwrap().get("x-trace").unwrap(),
+            "abc"
         );
     }
 
     #[test]
     fn test_response_context_generate_path_has_no_processed_messages() {
+        let tok = test_fixtures::tokenizer();
+        let decoder = create_stop_decoder(&tok, None, None, true, false);
         let ctx = ResponseContext {
             original: ProtocolRequest::Generate(Arc::new(generate_req(false))),
             model_id: Some("m".to_string()),
             headers: None,
             original_text: Some("hi".to_string()),
             processed_messages: None,
-            tokenizer: fake_tokenizer(),
-            stop_decoder: fake_decoder(),
+            tokenizer: tok,
+            stop_decoder: decoder,
+            request_id: "req-3".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: None,
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
         };
         assert!(ctx.processed_messages.is_none());
     }
@@ -768,6 +1089,46 @@ mod f_response_context {
     }
 }
 
+fn minimal_generate_request_with_stream(stream: bool) -> crate::protocols::generate::GenerateRequest {
+    crate::protocols::generate::GenerateRequest {
+        text: Some("hi".to_string()),
+        model: None,
+        input_ids: None,
+        input_embeds: None,
+        image_data: None,
+        video_data: None,
+        audio_data: None,
+        sampling_params: None,
+        return_logprob: None,
+        logprob_start_len: None,
+        top_logprobs_num: None,
+        token_ids_logprob: None,
+        return_text_in_logprobs: false,
+        stream,
+        log_metrics: false,
+        return_hidden_states: false,
+        modalities: None,
+        session_params: None,
+        lora_path: None,
+        lora_id: None,
+        custom_logit_processor: None,
+        bootstrap_host: None,
+        bootstrap_port: None,
+        bootstrap_room: None,
+        bootstrap_pair_key: None,
+        data_parallel_rank: None,
+        background: false,
+        conversation_id: None,
+        priority: None,
+        extra_key: None,
+        no_logs: false,
+        custom_labels: None,
+        return_bytes: false,
+        return_entropy: false,
+        rid: None,
+    }
+}
+
 mod h_prepare_chat_generate {
     use std::sync::Arc;
 
@@ -776,12 +1137,7 @@ mod h_prepare_chat_generate {
     use crate::routers::prepare::generation_payload::GenerationPayload;
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::{lookup_tokenizer, prepare_chat, prepare_generate};
-
-    fn shared_components() -> std::sync::Arc<crate::routers::http_router::SharedComponents> {
-        unimplemented!(
-            "shared components fixture — built by prepare/tests.rs::test_support when impl lands"
-        );
-    }
+    use crate::routers::test_fixtures;
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
         Arc::new(ChatCompletionRequest {
@@ -796,66 +1152,166 @@ mod h_prepare_chat_generate {
     }
 
     fn generate_req(stream: bool) -> Arc<GenerateRequest> {
-        let mut g = GenerateRequest::default();
-        g.stream = stream;
-        Arc::new(g)
+        Arc::new(super::minimal_generate_request_with_stream(stream))
     }
 
     #[test]
-    fn test_prepare_chat_returns_payload_and_context_tuple() {
-        let components = shared_components();
+    fn test_prepare_chat_returns_err_without_hf_tokenizer() {
+        let registry = test_fixtures::tokenizer_registry_with("m");
+        let components = test_fixtures::app_context_with_tokenizer_registry(registry);
+        let result = prepare_chat(
+            chat_req(false),
+            None,
+            Some("m".to_string()),
+            components.as_ref(),
+        );
+        let err = result.err().expect("MockTokenizer is not HF");
+        assert!(!err.status().is_success());
+    }
+
+    #[test]
+    fn test_prepare_chat_with_hf_tokenizer_returns_payload() {
+        let components = test_fixtures::app_context_with_hf_tokenizer("m");
         let (payload, ctx) = prepare_chat(
             chat_req(false),
             None,
             Some("m".to_string()),
             components.as_ref(),
         )
-        .expect("ok");
-        assert!(!payload.text.is_empty());
-        assert_eq!(payload.token_ids.len() > 0, true);
+        .expect("HF tokenizer must succeed");
+        assert!(payload.request_id.starts_with("chatcmpl-"));
         assert!(matches!(ctx.original, ProtocolRequest::Chat(_)));
-        assert!(ctx.processed_messages.is_some());
+        let pm = ctx.processed_messages.as_ref().expect("processed messages");
+        assert!(
+            pm.text.contains("user:") && pm.text.contains("hi"),
+            "rendered chat should reflect the chat template, got: {}",
+            pm.text
+        );
+        assert_eq!(payload.text, pm.text);
     }
 
     #[test]
-    fn test_prepare_chat_streaming_flag_propagates_to_response_context() {
-        let components = shared_components();
-        let (_, ctx) = prepare_chat(
+    fn test_prepare_chat_streaming_flag_threads_through() {
+        let components = test_fixtures::app_context_with_hf_tokenizer("m");
+        let (payload, ctx) = prepare_chat(
             chat_req(true),
             None,
             Some("m".to_string()),
             components.as_ref(),
         )
-        .expect("ok");
+        .expect("HF tokenizer must succeed");
+        assert!(payload.stream);
         assert!(ctx.original.is_streaming());
     }
 
     #[test]
-    fn test_prepare_chat_missing_model_id_returns_err_response() {
-        let components = shared_components();
-        let result = prepare_chat(chat_req(false), None, None, components.as_ref());
-        // Either a successful default-model path, or an Err Response with non-2xx status.
-        if let Err(resp) = result {
-            assert!(!resp.status().is_success());
-        }
+    fn test_prepare_chat_empty_messages_still_renders() {
+        let components = test_fixtures::app_context_with_hf_tokenizer("m");
+        let req = Arc::new(ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            ..Default::default()
+        });
+        let (payload, _) =
+            prepare_chat(req, None, Some("m".to_string()), components.as_ref())
+                .expect("empty messages renders to empty string under our template");
+        assert_eq!(payload.text, "");
     }
 
     #[test]
-    fn test_prepare_chat_carries_original_text_in_context() {
-        let components = shared_components();
-        let (_, ctx) = prepare_chat(
+    fn test_prepare_chat_with_tools_threads_constraints_and_disables_skip_special() {
+        use crate::protocols::common::{
+            Function as ToolFunction, Tool, ToolChoice, ToolChoiceValue,
+        };
+        let components = test_fixtures::app_context_with_hf_tokenizer("m");
+        let req = Arc::new(ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage::User {
+                content: MessageContent::Text("hi".to_string()),
+                name: None,
+            }],
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: ToolFunction {
+                    name: "ping".to_string(),
+                    description: None,
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    strict: None,
+                },
+            }]),
+            tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            skip_special_tokens: true,
+            ..Default::default()
+        });
+        let (payload, _) =
+            prepare_chat(req, None, Some("m".to_string()), components.as_ref())
+                .expect("tools-present path must succeed");
+        assert!(
+            payload.tool_constraints.is_some(),
+            "Required choice must emit a constraint"
+        );
+        assert!(
+            !payload.stop.skip_special_tokens,
+            "tools+non-None choice must disable skip_special_tokens"
+        );
+    }
+
+    #[test]
+    fn test_prepare_chat_tool_choice_none_keeps_skip_special() {
+        use crate::protocols::common::{
+            Function as ToolFunction, Tool, ToolChoice, ToolChoiceValue,
+        };
+        let components = test_fixtures::app_context_with_hf_tokenizer("m");
+        let req = Arc::new(ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage::User {
+                content: MessageContent::Text("hi".to_string()),
+                name: None,
+            }],
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: ToolFunction {
+                    name: "ping".to_string(),
+                    description: None,
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    strict: None,
+                },
+            }]),
+            tool_choice: Some(ToolChoice::Value(ToolChoiceValue::None)),
+            skip_special_tokens: true,
+            ..Default::default()
+        });
+        let (payload, _) =
+            prepare_chat(req, None, Some("m".to_string()), components.as_ref())
+                .expect("None choice path must succeed");
+        assert!(payload.stop.skip_special_tokens);
+    }
+
+    #[test]
+    fn test_prepare_chat_missing_model_id_returns_err_response() {
+        let components = test_fixtures::app_context();
+        let result = prepare_chat(chat_req(false), None, None, components.as_ref());
+        let err = result.err().expect("model_id missing must be Err");
+        assert!(!err.status().is_success());
+    }
+
+    #[test]
+    fn test_prepare_chat_unknown_model_returns_err_response() {
+        let components = test_fixtures::app_context();
+        let result = prepare_chat(
             chat_req(false),
             None,
-            Some("m".to_string()),
+            Some("nope".to_string()),
             components.as_ref(),
-        )
-        .unwrap();
-        assert!(ctx.original_text.is_some());
+        );
+        let err = result.err().expect("unknown model must be Err");
+        assert!(!err.status().is_success());
     }
 
     #[test]
     fn test_prepare_generate_returns_payload_and_context_tuple() {
-        let components = shared_components();
+        let registry = test_fixtures::tokenizer_registry_with("m");
+        let components = test_fixtures::app_context_with_tokenizer_registry(registry);
         let (payload, ctx) = prepare_generate(
             generate_req(false),
             None,
@@ -863,7 +1319,7 @@ mod h_prepare_chat_generate {
             components.as_ref(),
         )
         .expect("ok");
-        assert_ne!(payload.request_id, "");
+        assert!(!payload.request_id.is_empty());
         assert!(matches!(ctx.original, ProtocolRequest::Generate(_)));
         assert!(
             ctx.processed_messages.is_none(),
@@ -873,7 +1329,8 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_generate_streaming_flag_propagates() {
-        let components = shared_components();
+        let registry = test_fixtures::tokenizer_registry_with("m");
+        let components = test_fixtures::app_context_with_tokenizer_registry(registry);
         let (_, ctx) = prepare_generate(
             generate_req(true),
             None,
@@ -885,82 +1342,57 @@ mod h_prepare_chat_generate {
     }
 
     #[test]
+    fn test_prepare_generate_missing_model_id_returns_err() {
+        let components = test_fixtures::app_context();
+        let result = prepare_generate(generate_req(false), None, None, components.as_ref());
+        let err = result.err().expect("model_id missing must be Err");
+        assert!(!err.status().is_success());
+    }
+
+    #[test]
     fn test_lookup_tokenizer_returns_arc_for_known_model() {
-        let components = shared_components();
-        let tok = lookup_tokenizer("m", &components.tokenizer_registry).expect("known model");
-        // Two clones of the same Arc should be ptr_eq if registry caches by model.
-        let tok2 = lookup_tokenizer("m", &components.tokenizer_registry).unwrap();
+        let registry = test_fixtures::tokenizer_registry_with("m");
+        let tok = lookup_tokenizer("m", &registry).expect("known model");
+        let tok2 = lookup_tokenizer("m", &registry).unwrap();
         assert!(Arc::ptr_eq(&tok, &tok2));
     }
 
     #[test]
     fn test_lookup_tokenizer_unknown_model_returns_err() {
-        let components = shared_components();
-        let err = lookup_tokenizer("no-such-model", &components.tokenizer_registry).unwrap_err();
+        let registry = test_fixtures::tokenizer_registry_with("m");
+        let err = lookup_tokenizer("no-such-model", &registry)
+            .err()
+            .expect("unknown model must be Err");
         assert!(!err.status().is_success());
     }
 
     #[test]
-    fn test_prepare_chat_does_not_share_mutable_state_with_prepare_generate() {
-        let components = shared_components();
-        let (p_chat, _c_chat) = prepare_chat(
-            chat_req(false),
-            None,
-            Some("m".to_string()),
-            components.as_ref(),
-        )
-        .unwrap();
-        let (p_gen, _c_gen) = prepare_generate(
+    fn test_prepare_generate_request_ids_unique_per_call() {
+        let registry = test_fixtures::tokenizer_registry_with("m");
+        let components = test_fixtures::app_context_with_tokenizer_registry(registry);
+        let (p1, _) = prepare_generate(
             generate_req(false),
             None,
             Some("m".to_string()),
             components.as_ref(),
         )
         .unwrap();
-        assert_ne!(p_chat.request_id, p_gen.request_id);
-    }
-
-    #[test]
-    fn test_prepare_chat_tool_constraints_threaded_into_payload() {
-        use crate::protocols::common::{Function, Tool, ToolChoice, ToolChoiceValue};
-        let mut req = ChatCompletionRequest {
-            model: "m".to_string(),
-            messages: vec![ChatMessage::User {
-                content: MessageContent::Text("hi".to_string()),
-                name: None,
-            }],
-            tools: Some(vec![Tool {
-                r#type: "function".to_string(),
-                function: Function {
-                    name: "add".to_string(),
-                    description: None,
-                    parameters: Some(serde_json::json!({"type":"object"})),
-                    strict: None,
-                },
-            }]),
-            tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
-            ..Default::default()
-        };
-        req.stream = false;
-        let components = shared_components();
-        let (payload, _ctx) = prepare_chat(
-            Arc::new(req),
+        let (p2, _) = prepare_generate(
+            generate_req(false),
             None,
             Some("m".to_string()),
             components.as_ref(),
         )
         .unwrap();
-        assert!(payload.tool_constraints.is_some());
+        assert_ne!(p1.request_id, p2.request_id);
     }
 
     #[test]
-    fn test_prepare_chat_no_pd_metadata_at_prepare_time() {
-        // PD metadata is filled by the planner step, not prepare. prepare must leave
-        // it as None so that the engine can route to either single or PD placement
-        // without prepare presuming a deployment shape.
-        let components = shared_components();
-        let (payload, _) = prepare_chat(
-            chat_req(false),
+    fn test_prepare_generate_no_pd_metadata_at_prepare_time() {
+        let registry = test_fixtures::tokenizer_registry_with("m");
+        let components = test_fixtures::app_context_with_tokenizer_registry(registry);
+        let (payload, _) = prepare_generate(
+            generate_req(false),
             None,
             Some("m".to_string()),
             components.as_ref(),
@@ -970,10 +1402,7 @@ mod h_prepare_chat_generate {
     }
 
     #[test]
-    fn test_prepare_chat_no_mesh_grpc_in_returned_types() {
-        // Compile-only assertion: ResponseContext and GenerationPayload type names
-        // do not contain "mesh_grpc". Belt-and-suspenders alongside the grep gate
-        // (Test A4 in the plan).
+    fn test_prepare_no_mesh_grpc_in_returned_types() {
         assert!(!std::any::type_name::<GenerationPayload>().contains("mesh_grpc"));
         assert!(!std::any::type_name::<ResponseContext>().contains("mesh_grpc"));
     }

@@ -35,7 +35,6 @@ use crate::{
     },
 };
 
-/// gRPC router implementation for SGLang
 #[derive(Clone)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
@@ -46,7 +45,6 @@ pub struct GrpcRouter {
 }
 
 impl GrpcRouter {
-    /// Create a new gRPC router
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         if ctx.reasoning_parser_factory.is_none() {
             return Err("gRPC router requires reasoning parser factory".to_string());
@@ -76,7 +74,6 @@ impl GrpcRouter {
         })
     }
 
-    /// Main route_chat implementation
     async fn route_chat_impl(
         &self,
         headers: Option<&HeaderMap>,
@@ -90,7 +87,6 @@ impl GrpcRouter {
 
         let pipeline = &self.pipeline;
 
-        // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
@@ -98,7 +94,6 @@ impl GrpcRouter {
 
         RetryExecutor::execute_response_with_retry(
             &self.retry_config,
-            // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
                 let request = Arc::clone(&request);
                 let headers = headers_cloned.clone();
@@ -110,9 +105,7 @@ impl GrpcRouter {
                         .await
                 }
             },
-            // Should retry: check if status is retryable
             |res, _attempt| is_retryable_status(res.status()),
-            // On backoff: record retry metrics
             |delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::WORKER_REGULAR,
@@ -120,7 +113,6 @@ impl GrpcRouter {
                 );
                 Metrics::record_worker_retry_backoff(attempt, delay);
             },
-            // On exhausted: record exhaustion
             || {
                 Metrics::record_worker_retries_exhausted(
                     metrics_labels::WORKER_REGULAR,
@@ -131,7 +123,6 @@ impl GrpcRouter {
         .await
     }
 
-    /// Main route_generate implementation
     async fn route_generate_impl(
         &self,
         headers: Option<&HeaderMap>,
@@ -143,7 +134,6 @@ impl GrpcRouter {
             model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
 
-        // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
@@ -152,7 +142,6 @@ impl GrpcRouter {
 
         RetryExecutor::execute_response_with_retry(
             &self.retry_config,
-            // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
                 let request = Arc::clone(&request);
                 let headers = headers_cloned.clone();
@@ -164,9 +153,7 @@ impl GrpcRouter {
                         .await
                 }
             },
-            // Should retry: check if status is retryable
             |res, _attempt| is_retryable_status(res.status()),
-            // On backoff: record retry metrics
             |delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::WORKER_REGULAR,
@@ -174,7 +161,6 @@ impl GrpcRouter {
                 );
                 Metrics::record_worker_retry_backoff(attempt, delay);
             },
-            // On exhausted: record exhaustion
             || {
                 Metrics::record_worker_retries_exhausted(
                     metrics_labels::WORKER_REGULAR,
@@ -185,7 +171,6 @@ impl GrpcRouter {
         .await
     }
 
-    /// Main route_responses implementation
     async fn route_responses_impl(
         &self,
         headers: Option<&HeaderMap>,

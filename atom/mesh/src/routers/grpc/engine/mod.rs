@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use async_trait::async_trait;
 use futures::Stream;
 
 use crate::core::placement::PlacementPlan;
@@ -26,6 +27,26 @@ use crate::routers::token_handle::token_handle::{TokenSource, TokenHandle};
 
 pub use pd_stream_merge::merge_pd_streams;
 
+#[async_trait]
+pub(crate) trait Dispatcher: Send + Sync {
+    async fn dispatch(
+        &self,
+        placement: &PlacementPlan,
+        payload: &GenerationPayload,
+    ) -> Result<TokenHandle, EngineError>;
+}
+
+#[async_trait]
+impl Dispatcher for GrpcEngine {
+    async fn dispatch(
+        &self,
+        placement: &PlacementPlan,
+        payload: &GenerationPayload,
+    ) -> Result<TokenHandle, EngineError> {
+        GrpcEngine::dispatch(self, placement, payload).await
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct GrpcEngine {}
 
@@ -34,9 +55,6 @@ impl GrpcEngine {
         Self {}
     }
 
-    /// Build the proto, dial the worker(s), and hand back a single
-    /// `TokenHandle` for the render layer to consume. PD pairs are merged
-    /// internally so the render layer never sees two upstreams.
     pub async fn dispatch(
         &self,
         placement: &PlacementPlan,
@@ -103,8 +121,6 @@ pub(crate) enum ProtoErrorRole {
     Decode,
 }
 
-/// Adapts the backend-specific `ProtoStream` into the neutral
-/// `TokenChunk` source consumed by the render layer.
 pub(crate) struct ProtoStreamSource {
     stream: ProtoStream,
     role: ProtoErrorRole,
@@ -187,5 +203,5 @@ impl TokenSource for ProtoStreamSource {
     }
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests;

@@ -14,9 +14,6 @@ use crate::{
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
-/// The original protocol request, in `Arc` form so the render layer can hand
-/// it back to downstream callers (e.g. Responses-API echoes the chat request)
-/// without cloning.
 pub enum ProtocolRequest {
     Chat(Arc<ChatCompletionRequest>),
     Generate(Arc<GenerateRequest>),

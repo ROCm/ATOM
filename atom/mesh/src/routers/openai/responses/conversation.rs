@@ -1,8 +1,5 @@
-//! Shared helpers and state tracking for Regular Responses
-//!
-//! This module contains common utilities used by both streaming and non-streaming paths:
-//! - Helper functions for tool extraction
-//! - Conversation history loading
+//! Conversation history loading for the Responses API, used by both streaming
+//! and non-streaming paths.
 
 use axum::response::Response;
 use data_connector::{self, ConversationId, ResponseId};
@@ -16,7 +13,6 @@ use crate::{
     routers::error,
 };
 
-/// Load conversation history and response chains, returning modified request
 pub(super) async fn load_conversation_history(
     ctx: &ResponsesContext,
     request: &ResponsesRequest,
@@ -24,7 +20,6 @@ pub(super) async fn load_conversation_history(
     let mut modified_request = request.clone();
     let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
 
-    // Handle previous_response_id by loading response chain
     if let Some(ref prev_id_str) = modified_request.previous_response_id {
         let prev_id = ResponseId::from(prev_id_str.as_str());
         match ctx
@@ -79,7 +74,6 @@ pub(super) async fn load_conversation_history(
         }
     }
 
-    // Handle conversation by loading conversation history
     if let Some(ref conv_id_str) = request.conversation {
         let conv_id = ConversationId::from(conv_id_str.as_str());
 
@@ -158,7 +152,6 @@ pub(super) async fn load_conversation_history(
         }
     }
 
-    // If we have conversation_items from previous_response_id, merge them
     if let Some(mut items) = conversation_items {
         match &modified_request.input {
             ResponseInput::Text(text) => {

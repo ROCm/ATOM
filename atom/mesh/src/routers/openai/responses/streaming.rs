@@ -75,14 +75,13 @@ pub(crate) struct ResponseStreamEventEmitter {
     has_emitted_in_progress: bool,
     has_emitted_output_item_added: bool,
     has_emitted_content_part_added: bool,
-    // Output item tracking
     output_items: Vec<OutputItemState>,
     next_output_index: usize,
-    current_message_output_index: Option<usize>, // Tracks output_index of current message
-    current_item_id: Option<String>,             // Tracks item_id of current item
+    current_message_output_index: Option<usize>,
+    current_item_id: Option<String>,
     original_request: Option<ResponsesRequest>,
-    // Tool call tracking: maps tool_call delta index → (output_index, item_id, accumulated_args)
-    tool_call_items: Vec<(usize, String, String, String)>, // (output_index, item_id, name, accumulated_args)
+    // Maps tool_call delta index → (output_index, item_id, name, accumulated_args).
+    tool_call_items: Vec<(usize, String, String, String)>,
 }
 
 impl ResponseStreamEventEmitter {
@@ -109,7 +108,6 @@ impl ResponseStreamEventEmitter {
         }
     }
 
-    /// Set the original request for including all fields in response.completed
     pub fn set_original_request(&mut self, request: ResponsesRequest) {
         self.original_request = Some(request);
     }
@@ -223,7 +221,6 @@ impl ResponseStreamEventEmitter {
     }
 
     pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
-        // Build output array from tracked items
         let output: Vec<serde_json::Value> = self
             .output_items
             .iter()
@@ -236,7 +233,7 @@ impl ResponseStreamEventEmitter {
             })
             .collect();
 
-        // If no items were tracked (legacy path), fall back to generic message
+        // Fall back to a generic assistant message when no items were tracked.
         let output = if output.is_empty() {
             vec![json!({
                 "id": self.message_id.clone(),
@@ -251,7 +248,6 @@ impl ResponseStreamEventEmitter {
             output
         };
 
-        // Build base response object
         let mut response_obj = json!({
             "id": self.response_id,
             "object": "response",
@@ -261,12 +257,10 @@ impl ResponseStreamEventEmitter {
             "output": output
         });
 
-        // Add usage if provided
         if let Some(usage_val) = usage {
             response_obj["usage"] = usage_val.clone();
         }
 
-        // Add all original request fields if available
         if let Some(ref req) = self.original_request {
             Self::add_optional_field(&mut response_obj, "instructions", &req.instructions);
             Self::add_optional_field(
@@ -291,7 +285,6 @@ impl ResponseStreamEventEmitter {
             response_obj["tools"] = json!(req.tools.as_ref().unwrap_or(&vec![]));
             response_obj["metadata"] = json!(req.metadata.as_ref().unwrap_or(&Default::default()));
 
-            // tool_choice: serialize if present, otherwise use "auto"
             if let Some(ref tc) = req.tool_choice {
                 response_obj["tool_choice"] = json!(tc);
             } else {
@@ -306,7 +299,6 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    /// Helper to add optional fields to JSON object
     fn add_optional_field<T: serde::Serialize>(
         obj: &mut serde_json::Value,
         key: &str,
@@ -316,10 +308,6 @@ impl ResponseStreamEventEmitter {
             obj[key] = json!(val);
         }
     }
-
-    // ========================================================================
-    // Function Call Event Emission Methods
-    // ========================================================================
 
     pub fn emit_function_call_arguments_delta(
         &mut self,
@@ -351,11 +339,6 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    // ========================================================================
-    // Output Item Wrapper Events
-    // ========================================================================
-
-    /// Emit response.output_item.added event
     pub fn emit_output_item_added(
         &mut self,
         output_index: usize,
@@ -369,13 +352,12 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    /// Emit response.output_item.done event
     pub fn emit_output_item_done(
         &mut self,
         output_index: usize,
         item: &serde_json::Value,
     ) -> serde_json::Value {
-        // Store the item data for later use in emit_completed
+        // emit_completed later replays stored item_data for tracked items.
         self.store_output_item_data(output_index, item.clone());
 
         json!({
@@ -386,12 +368,10 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    /// Generate unique ID for item type
     fn generate_item_id(prefix: &str) -> String {
         format!("{}_{}", prefix, Uuid::new_v4().to_string().replace("-", ""))
     }
 
-    /// Allocate next output index and track item
     pub fn allocate_output_index(&mut self, item_type: OutputItemType) -> (usize, String) {
         let index = self.next_output_index;
         self.next_output_index += 1;
@@ -412,7 +392,6 @@ impl ResponseStreamEventEmitter {
         (index, id)
     }
 
-    /// Mark output item as completed and store its data
     pub fn complete_output_item(&mut self, output_index: usize) {
         if let Some(item) = self
             .output_items
@@ -423,7 +402,6 @@ impl ResponseStreamEventEmitter {
         }
     }
 
-    /// Store output item data when emitting output_item.done
     pub fn store_output_item_data(&mut self, output_index: usize, item_data: serde_json::Value) {
         if let Some(item) = self
             .output_items
@@ -434,22 +412,18 @@ impl ResponseStreamEventEmitter {
         }
     }
 
-    /// Process a chunk and emit appropriate events
     pub fn process_chunk(
         &mut self,
         chunk: &ChatCompletionStreamResponse,
         tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
     ) -> Result<(), String> {
-        // Process content if present
         if let Some(choice) = chunk.choices.first() {
             if let Some(content) = &choice.delta.content {
                 if !content.is_empty() {
-                    // Allocate output_index and item_id for this message item (once per message)
                     if self.current_item_id.is_none() {
                         let (output_index, item_id) =
                             self.allocate_output_index(OutputItemType::Message);
 
-                        // Build message item structure
                         let item = json!({
                             "id": item_id,
                             "type": "message",
@@ -457,7 +431,6 @@ impl ResponseStreamEventEmitter {
                             "content": []
                         });
 
-                        // Emit output_item.added
                         let event = self.emit_output_item_added(output_index, &item);
                         self.send_event(&event, tx)?;
                         self.has_emitted_output_item_added = true;
@@ -479,19 +452,16 @@ impl ResponseStreamEventEmitter {
                         self.has_emitted_content_part_added = true;
                     }
 
-                    // Emit text delta
                     let event =
                         self.emit_text_delta(content, output_index, &item_id, content_index);
                     self.send_event(&event, tx)?;
                 }
             }
 
-            // Process tool call deltas
             if let Some(tool_call_deltas) = &choice.delta.tool_calls {
                 for delta in tool_call_deltas {
                     let tc_index = delta.index as usize;
 
-                    // Ensure we have a tracked item for this tool call index
                     while self.tool_call_items.len() <= tc_index {
                         let (output_index, item_id) =
                             self.allocate_output_index(OutputItemType::FunctionCall);
@@ -503,14 +473,13 @@ impl ResponseStreamEventEmitter {
                         ));
                     }
 
-                    // Accumulate name from first delta
                     if let Some(function) = &delta.function {
                         if let Some(name) = &function.name {
                             self.tool_call_items[tc_index].2.push_str(name);
                         }
                     }
 
-                    // First delta for this tool call: emit output_item.added
+                    // First delta for the tool call carries its id; emit output_item.added once.
                     if let Some(delta_id) = &delta.id {
                         let output_index = self.tool_call_items[tc_index].0;
                         let item_id = self.tool_call_items[tc_index].1.clone();
@@ -527,7 +496,6 @@ impl ResponseStreamEventEmitter {
                         self.send_event(&event, tx)?;
                     }
 
-                    // Emit arguments delta
                     if let Some(function) = &delta.function {
                         if let Some(args) = &function.arguments {
                             if !args.is_empty() {
@@ -546,13 +514,10 @@ impl ResponseStreamEventEmitter {
                 }
             }
 
-            // Check for finish_reason to emit completion events
             if let Some(reason) = &choice.finish_reason {
                 if reason == "tool_calls" {
-                    // Emit done events for all tracked tool calls
                     let tool_calls: Vec<_> = self.tool_call_items.clone();
                     for (output_index, item_id, tc_name, accumulated_args) in &tool_calls {
-                        // Emit function_call_arguments.done
                         let event = self.emit_function_call_arguments_done(
                             *output_index,
                             item_id,
@@ -560,7 +525,6 @@ impl ResponseStreamEventEmitter {
                         );
                         self.send_event(&event, tx)?;
 
-                        // Emit output_item.done with complete function call item
                         let item = json!({
                             "id": item_id,
                             "type": "function_call",
@@ -577,10 +541,10 @@ impl ResponseStreamEventEmitter {
 
                 if reason == "stop" || reason == "length" {
                     let output_index = self.current_message_output_index.unwrap();
-                    let item_id = self.current_item_id.clone().unwrap(); // Clone to avoid borrow checker issues
+                    // Clone to release the borrow on `self` before calling &mut self methods.
+                    let item_id = self.current_item_id.clone().unwrap();
                     let content_index = 0;
 
-                    // Emit closing events
                     if self.has_emitted_content_part_added {
                         let event = self.emit_text_done(output_index, &item_id, content_index);
                         self.send_event(&event, tx)?;
@@ -590,7 +554,6 @@ impl ResponseStreamEventEmitter {
                     }
 
                     if self.has_emitted_output_item_added {
-                        // Build complete message item for output_item.done
                         let item = json!({
                             "id": item_id,
                             "type": "message",
@@ -604,7 +567,6 @@ impl ResponseStreamEventEmitter {
                         self.send_event(&event, tx)?;
                     }
 
-                    // Mark item as completed
                     self.complete_output_item(output_index);
                 }
             }
@@ -621,13 +583,11 @@ impl ResponseStreamEventEmitter {
         let event_json = serde_json::to_string(event)
             .map_err(|e| format!("Failed to serialize event: {}", e))?;
 
-        // Extract event type from the JSON for SSE event field
         let event_type = event
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("message");
 
-        // Format as SSE with event: field
         let sse_message = format!("event: {}\ndata: {}\n\n", event_type, event_json);
 
         if tx.send(Ok(Bytes::from(sse_message))).is_err() {
@@ -638,9 +598,6 @@ impl ResponseStreamEventEmitter {
     }
 }
 
-/// Build a Server-Sent Events (SSE) response
-///
-/// Creates a Response with proper SSE headers and streaming body.
 pub(crate) fn build_sse_response(
     rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>,
 ) -> Response {
@@ -654,18 +611,6 @@ pub(crate) fn build_sse_response(
         .unwrap()
 }
 
-// ============================================================================
-// Streaming Path
-// ============================================================================
-
-/// Convert chat streaming response to responses streaming format
-///
-/// This function:
-/// 1. Gets chat SSE stream from pipeline
-/// 2. Intercepts and parses each SSE event
-/// 3. Converts ChatCompletionStreamResponse → ResponsesResponse delta
-/// 4. Accumulates response state for final persistence
-/// 5. Emits transformed SSE events in responses format
 pub(super) async fn convert_chat_stream_to_responses_stream(
     ctx: &ResponsesContext,
     chat_request: Arc<ChatCompletionRequest>,
@@ -719,15 +664,12 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", error_event))));
         }
 
-        // Send final [DONE] event
         let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
     });
 
-    // Build SSE response with transformed stream
     build_sse_response(rx)
 }
 
-/// Process chat SSE stream and transform to responses format
 async fn process_and_transform_sse_stream(
     body: Body,
     original_request: ResponsesRequest,
@@ -736,17 +678,14 @@ async fn process_and_transform_sse_stream(
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
-    // Create accumulator for final response
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
 
-    // Create event emitter for OpenAI-compatible streaming
     let response_id = format!("resp_{}", Uuid::new_v4());
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
     event_emitter.set_original_request(original_request.clone());
 
-    // Emit initial response.created and response.in_progress events
     let event = event_emitter.emit_created();
     event_emitter
         .send_event(&event, &tx)
@@ -757,37 +696,29 @@ async fn process_and_transform_sse_stream(
         .send_event(&event, &tx)
         .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
-    // Convert body to data stream
     let mut stream = body.into_data_stream();
 
-    // Process stream chunks (each chunk is a complete SSE event)
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| format!("Stream read error: {}", e))?;
 
-        // Convert chunk to string
         let event_str = String::from_utf8_lossy(&chunk);
         let event = event_str.trim();
 
-        // Check for end of stream
         if event == "data: [DONE]" {
             break;
         }
 
-        // Parse SSE event (format: "data: {...}\n\n" or "data: {...}")
+        // SSE wire format: each chunk is "data: <json>\n\n" or "data: <json>".
         if let Some(json_str) = event.strip_prefix("data: ") {
             let json_str = json_str.trim();
 
-            // Try to parse as ChatCompletionStreamResponse
             match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
                 Ok(chat_chunk) => {
-                    // Update accumulator
                     accumulator.process_chunk(&chat_chunk);
-
-                    // Process chunk through event emitter (emits proper OpenAI events)
                     event_emitter.process_chunk(&chat_chunk, &tx)?;
                 }
                 Err(_) => {
-                    // Not a valid chat chunk - might be error event, pass through
+                    // Not a chat chunk (error event, keep-alive, …): pass through unchanged.
                     debug!("Non-chunk SSE event, passing through: {}", event);
                     if tx.send(Ok(Bytes::from(format!("{}\n\n", event)))).is_err() {
                         return Err("Client disconnected".to_string());
@@ -797,7 +728,6 @@ async fn process_and_transform_sse_stream(
         }
     }
 
-    // Emit final response.completed event with accumulated usage
     let usage_json = accumulator.usage.as_ref().map(|u| {
         let mut usage_obj = json!({
             "input_tokens": u.prompt_tokens,
@@ -805,7 +735,6 @@ async fn process_and_transform_sse_stream(
             "total_tokens": u.total_tokens
         });
 
-        // Include reasoning_tokens if present
         if let Some(details) = &u.completion_tokens_details {
             if let Some(reasoning_tokens) = details.reasoning_tokens {
                 usage_obj["output_tokens_details"] =
@@ -819,7 +748,6 @@ async fn process_and_transform_sse_stream(
     let completed_event = event_emitter.emit_completed(usage_json.as_ref());
     event_emitter.send_event(&completed_event, &tx)?;
 
-    // Finalize and persist accumulated response
     let final_response = accumulator.finalize();
     persist_response_if_needed(
         conversation_storage,
@@ -833,23 +761,18 @@ async fn process_and_transform_sse_stream(
     Ok(())
 }
 
-/// Response accumulator for streaming responses
 struct StreamingResponseAccumulator {
-    // Response metadata
     response_id: String,
     model: String,
     created_at: i64,
 
-    // Accumulated content
     content_buffer: String,
     reasoning_buffer: String,
     tool_calls: Vec<ResponseOutputItem>,
 
-    // Completion state
     finish_reason: Option<String>,
     usage: Option<Usage>,
 
-    // Original request for final response construction
     original_request: ResponsesRequest,
 }
 
@@ -869,32 +792,27 @@ impl StreamingResponseAccumulator {
     }
 
     fn process_chunk(&mut self, chunk: &ChatCompletionStreamResponse) {
-        // Initialize metadata on first chunk
         if self.response_id.is_empty() {
             self.response_id = chunk.id.clone();
             self.model = chunk.model.clone();
             self.created_at = chunk.created as i64;
         }
 
-        // Process first choice (responses API doesn't support n>1)
+        // Responses API does not support n>1; only the first choice is processed.
         if let Some(choice) = chunk.choices.first() {
-            // Accumulate content
             if let Some(content) = &choice.delta.content {
                 self.content_buffer.push_str(content);
             }
 
-            // Accumulate reasoning
             if let Some(reasoning) = &choice.delta.reasoning_content {
                 self.reasoning_buffer.push_str(reasoning);
             }
 
-            // Process tool call deltas
             if let Some(tool_call_deltas) = &choice.delta.tool_calls {
                 for delta in tool_call_deltas {
-                    // Use index directly (it's a u32, not Option<u32>)
+                    // delta.index is a u32 here (not Option<u32> as in some chat APIs).
                     let index = delta.index as usize;
 
-                    // Ensure we have enough tool calls
                     while self.tool_calls.len() <= index {
                         self.tool_calls.push(ResponseOutputItem::FunctionToolCall {
                             id: String::new(),
@@ -929,13 +847,11 @@ impl StreamingResponseAccumulator {
                 }
             }
 
-            // Update finish reason
             if let Some(reason) = &choice.finish_reason {
                 self.finish_reason = Some(reason.clone());
             }
         }
 
-        // Update usage
         if let Some(usage) = &chunk.usage {
             self.usage = Some(usage.clone());
         }
@@ -944,7 +860,6 @@ impl StreamingResponseAccumulator {
     fn finalize(self) -> ResponsesResponse {
         let mut output: Vec<ResponseOutputItem> = Vec::new();
 
-        // Add message content if present
         if !self.content_buffer.is_empty() {
             output.push(ResponseOutputItem::Message {
                 id: format!("msg_{}", self.response_id),
@@ -958,7 +873,6 @@ impl StreamingResponseAccumulator {
             });
         }
 
-        // Add reasoning if present
         if !self.reasoning_buffer.is_empty() {
             output.push(ResponseOutputItem::Reasoning {
                 id: format!("reasoning_{}", self.response_id),
@@ -970,10 +884,8 @@ impl StreamingResponseAccumulator {
             });
         }
 
-        // Add tool calls
         output.extend(self.tool_calls);
 
-        // Determine final status
         let status = match self.finish_reason.as_deref() {
             Some("stop") | Some("length") => ResponseStatus::Completed,
             Some("tool_calls") => ResponseStatus::Completed,
@@ -981,7 +893,6 @@ impl StreamingResponseAccumulator {
             _ => ResponseStatus::Completed,
         };
 
-        // Convert usage
         let usage = self.usage.as_ref().map(|u| {
             let usage_info = UsageInfo {
                 prompt_tokens: u.prompt_tokens,

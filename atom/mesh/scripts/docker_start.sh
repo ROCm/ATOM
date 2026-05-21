@@ -8,7 +8,8 @@ set -euo pipefail
 #   DOCKER_IMAGE=rocm/atom-dev:mesh-sglang-latest
 
 CONTAINER="${CONTAINER:-atom_sglang_mesh}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
+#DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:sglang-latest}"
 
 echo "[docker] starting container=${CONTAINER} image=${DOCKER_IMAGE}"
 

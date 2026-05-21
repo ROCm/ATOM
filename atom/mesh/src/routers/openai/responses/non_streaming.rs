@@ -1,7 +1,4 @@
-//! Non-streaming execution for Regular Responses API
-//!
-//! This module handles non-streaming request execution:
-//! - `route_responses_internal` - Core execution orchestration
+//! Non-streaming execution for /v1/responses.
 
 use std::sync::Arc;
 
@@ -17,14 +14,6 @@ use crate::{
     routers::error,
 };
 
-/// Internal implementation for non-streaming responses
-///
-/// This is the core execution path that:
-/// 1. Loads conversation history / response chain
-/// 2. Converts to chat format
-/// 3. Executes chat pipeline
-/// 4. Converts back to responses format
-/// 5. Persists to storage
 pub(super) async fn route_responses_internal(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
@@ -32,10 +21,8 @@ pub(super) async fn route_responses_internal(
     model_id: Option<String>,
     response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
-    // 1. Load conversation history and build modified request
     let modified_request = load_conversation_history(ctx, &request).await?;
 
-    // 2. Convert ResponsesRequest → ChatCompletionRequest
     let chat_request = conversions::responses_to_chat(&modified_request).map_err(|e| {
         error!(
             function = "route_responses_internal",
@@ -48,7 +35,6 @@ pub(super) async fn route_responses_internal(
         )
     })?;
 
-    // 3. Execute chat pipeline
     let chat_response = ctx
         .pipeline
         .execute_chat_for_responses(
@@ -59,7 +45,6 @@ pub(super) async fn route_responses_internal(
         )
         .await?;
 
-    // 4. Convert ChatCompletionResponse → ResponsesResponse
     let responses_response = conversions::chat_to_responses(&chat_response, &request, response_id)
         .map_err(|e| {
             error!(
@@ -73,7 +58,6 @@ pub(super) async fn route_responses_internal(
             )
         })?;
 
-    // 5. Persist response to storage if store=true
     persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),

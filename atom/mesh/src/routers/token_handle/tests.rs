@@ -1,8 +1,5 @@
-//! Test obligations for `routers::token_handle::*` (Part D).
-//!
-//! Covers `TokenChunk`, `MatchedStop`, `FinishReason`, `TokenLogprobs`,
-//! `Usage`, `WorkerMeta`, `InputLogprobs`, `TokenHandle`, `EngineError`,
-//! plus the `Drop` propagation contract (plan D10/D11).
+//! Tests for `routers::token_handle::*` — boundary types plus the `Drop`
+//! propagation contract on `TokenHandle`.
 
 mod a_token_chunk {
     use crate::routers::token_handle::token_chunk::{
@@ -102,9 +99,8 @@ mod a_token_chunk {
 
     #[test]
     fn test_complete_chunk_input_logprobs_is_optional() {
-        // Per PD merge spec §2: input_logprobs is filled in single-mode from worker
-        // Complete; in PD mode it is injected by merge_pd_streams. Either way the
-        // field is Option, and tests must accept None as a valid state.
+        // input_logprobs is Option: filled from worker Complete in single-mode,
+        // injected by merge_pd_streams in PD mode. None is a valid state either way.
         let lp = InputLogprobs {
             items: vec![TokenLogprob {
                 token_id: 1,
@@ -228,6 +224,47 @@ mod b_engine_error {
         let s = format!("{}", EngineError::DecodeIncomplete);
         assert!(s.to_lowercase().contains("decode"));
     }
+
+    #[test]
+    fn test_engine_error_prefill_display_includes_message() {
+        let e = EngineError::Prefill("kv mismatch".to_string());
+        assert!(format!("{e}").contains("kv mismatch"));
+    }
+
+    #[test]
+    fn test_engine_error_decode_error_display_includes_message() {
+        let e = EngineError::DecodeError("xx".to_string());
+        assert!(format!("{e}").contains("xx"));
+    }
+
+    #[test]
+    fn test_engine_error_debug_renders_variant_name() {
+        let e = EngineError::PrefillEarlyClose;
+        let d = format!("{:?}", e);
+        assert!(d.contains("PrefillEarlyClose"));
+    }
+
+    #[test]
+    fn test_engine_error_source_transport_is_some() {
+        use std::error::Error;
+        let e = EngineError::Transport(tonic::Status::cancelled("c"));
+        assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn test_engine_error_source_non_transport_is_none() {
+        use std::error::Error;
+        assert!(EngineError::PrefillEarlyClose.source().is_none());
+        assert!(EngineError::DecodeIncomplete.source().is_none());
+        assert!(EngineError::Prefill("x".to_string()).source().is_none());
+        assert!(EngineError::DecodeError("y".to_string()).source().is_none());
+        assert!(EngineError::ConnectionAcquireFailed("z".to_string())
+            .source()
+            .is_none());
+        assert!(EngineError::RequestBuildFailed("w".to_string())
+            .source()
+            .is_none());
+    }
 }
 
 mod c_token_handle {
@@ -325,6 +362,56 @@ mod c_token_handle {
     }
 
     #[tokio::test]
+    async fn test_mark_completed_propagates_to_single_source() {
+        let chunks = vec![Ok(complete_chunk())];
+        let items: Vec<crate::routers::token_handle::test_support::ScriptedItem> = chunks
+            .into_iter()
+            .map(|r| match r {
+                Ok(c) => crate::routers::token_handle::test_support::ScriptedItem::Ok(c),
+                Err(e) => crate::routers::token_handle::test_support::ScriptedItem::Err(e),
+            })
+            .collect();
+        let (mut stream, mark_obs, _drop_obs) =
+            crate::routers::token_handle::test_support::scripted_with_mark_completed(items);
+        stream.mark_completed();
+        assert!(mark_obs.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_mark_completed_propagates_to_pd_pair() {
+        let p_items = vec![crate::routers::token_handle::test_support::ScriptedItem::Ok(
+            complete_chunk(),
+        )];
+        let d_items = vec![crate::routers::token_handle::test_support::ScriptedItem::Ok(
+            complete_chunk(),
+        )];
+        let (p_stream, p_mark, _p_drop) =
+            crate::routers::token_handle::test_support::scripted_with_mark_completed(p_items);
+        let (d_stream, d_mark, _d_drop) =
+            crate::routers::token_handle::test_support::scripted_with_mark_completed(d_items);
+        let mut merged = TokenHandle::pd(p_stream, d_stream);
+        merged.mark_completed();
+        assert!(p_mark.load(Ordering::SeqCst));
+        assert!(d_mark.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_pd_stream_poll_uses_decode_arm() {
+        use futures::StreamExt;
+        let (p_tx, p_rx) = mpsc::channel::<Result<TokenChunk, EngineError>>(1);
+        let (d_tx, d_rx) = mpsc::channel::<Result<TokenChunk, EngineError>>(1);
+        let prefill = crate::routers::token_handle::test_support::single_from_receiver(p_rx);
+        let decode = crate::routers::token_handle::test_support::single_from_receiver(d_rx);
+        let mut merged = TokenHandle::pd(prefill, decode);
+        drop(p_tx);
+        d_tx.send(Ok(complete_chunk())).await.unwrap();
+        drop(d_tx);
+        let item = merged.next().await.unwrap();
+        assert!(matches!(item, Ok(TokenChunk::Complete { .. })));
+        assert!(merged.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_synthetic_drop_observer_counts_invocations() {
         // The test_support helper exposes a counter incremented when the wrapping
         // adapter is dropped. Lets PD tests assert "both upstreams aborted exactly
@@ -337,8 +424,8 @@ mod c_token_handle {
 }
 
 mod d_test_support_self_test {
-    // Smoke tests for the synthetic_stream helpers themselves, so failures in
-    // the rest of Part D tests can be triaged quickly (real bug vs broken fixture).
+    // Smoke tests for the synthetic_stream helpers, so failures elsewhere can
+    // be triaged as real bugs vs broken fixtures.
     use futures::StreamExt;
 
     use crate::routers::token_handle::engine_error::EngineError;

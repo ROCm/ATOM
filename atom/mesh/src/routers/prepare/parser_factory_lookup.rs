@@ -13,7 +13,6 @@ use crate::{
     },
 };
 
-/// Check if a reasoning parser is available for the given model
 pub(crate) fn check_reasoning_parser_availability(
     reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&str>,
@@ -28,7 +27,6 @@ pub(crate) fn check_reasoning_parser_availability(
     }
 }
 
-/// Check if a tool parser is available for the given model
 pub(crate) fn check_tool_parser_availability(
     tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&str>,
@@ -41,18 +39,13 @@ pub(crate) fn check_tool_parser_availability(
     }
 }
 
-/// Get the appropriate reasoning parser for a model
-///
-/// If a parser name is explicitly configured, use that parser.
-/// Otherwise, auto-detect based on the model name.
-/// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
+/// Pooled reasoning parser, suitable for non-streaming where state is not preserved across calls.
 pub(crate) fn get_reasoning_parser(
     reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&str>,
     model: &str,
 ) -> ReasoningPooledParser {
     if let Some(parser_name) = configured_parser {
-        // Use configured parser if specified
         reasoning_parser_factory
             .registry()
             .get_pooled_parser(parser_name)
@@ -64,19 +57,17 @@ pub(crate) fn get_reasoning_parser(
                 reasoning_parser_factory.get_pooled(model)
             })
     } else {
-        // Auto-detect based on model
         reasoning_parser_factory.get_pooled(model)
     }
 }
 
-/// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
+/// Fresh reasoning parser instance; use for streaming where per-request state isolation matters.
 pub(crate) fn create_reasoning_parser(
     reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&str>,
     model: &str,
 ) -> Option<Box<dyn ReasoningParser>> {
     if let Some(parser_name) = configured_parser {
-        // Use configured parser if specified
         reasoning_parser_factory
             .registry()
             .create_parser(parser_name)
@@ -88,23 +79,17 @@ pub(crate) fn create_reasoning_parser(
                 reasoning_parser_factory.registry().create_for_model(model)
             })
     } else {
-        // Auto-detect based on model
         reasoning_parser_factory.registry().create_for_model(model)
     }
 }
 
-/// Get the appropriate tool parser for a model
-///
-/// If a parser name is explicitly configured, use that parser.
-/// Otherwise, auto-detect based on the model name.
-/// Get a pooled tool parser (for non-streaming where state doesn't matter)
+/// Pooled tool parser, suitable for non-streaming where state is not preserved across calls.
 pub(crate) fn get_tool_parser(
     tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&str>,
     model: &str,
 ) -> ToolPooledParser {
     if let Some(parser_name) = configured_parser {
-        // Use configured parser if specified
         tool_parser_factory
             .registry()
             .get_pooled_parser(parser_name)
@@ -116,19 +101,17 @@ pub(crate) fn get_tool_parser(
                 tool_parser_factory.get_pooled(model)
             })
     } else {
-        // Auto-detect based on model
         tool_parser_factory.get_pooled(model)
     }
 }
 
-/// Create a fresh tool parser instance (for streaming where state isolation is needed)
+/// Fresh tool parser instance; use for streaming where per-request state isolation matters.
 pub(crate) fn create_tool_parser(
     tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&str>,
     model: &str,
 ) -> Option<Box<dyn ToolParser>> {
     if let Some(parser_name) = configured_parser {
-        // Use configured parser if specified
         tool_parser_factory
             .registry()
             .create_parser(parser_name)
@@ -140,7 +123,6 @@ pub(crate) fn create_tool_parser(
                 tool_parser_factory.registry().create_for_model(model)
             })
     } else {
-        // Auto-detect based on model
         tool_parser_factory.registry().create_for_model(model)
     }
 }

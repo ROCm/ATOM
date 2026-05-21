@@ -101,7 +101,6 @@ pub fn process_chat_messages(
         ..Default::default()
     };
 
-    // Handle assistant prefix for continue_final_message
     let assistant_prefix = if request.continue_final_message
         && !transformed_messages.is_empty()
         && transformed_messages
@@ -135,8 +134,8 @@ pub fn process_chat_messages(
     })
 }
 
-/// Process tool call arguments in messages
-/// Per Transformers docs, tool call arguments in assistant messages should be dicts
+/// Transformers chat templates expect assistant tool-call arguments as JSON
+/// objects, not as serialized JSON strings.
 pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
     for msg in messages {
         let role = msg.get("role").and_then(|v| v.as_str());
@@ -174,7 +173,6 @@ pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), 
     Ok(())
 }
 
-/// Process messages based on content format for ANY message type
 pub(crate) fn process_content_format(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,

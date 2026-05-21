@@ -31,6 +31,8 @@ pub mod prepare;
 pub mod render;
 pub mod router_manager;
 pub mod shared;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 pub mod tokenize;
 pub mod token_handle;
 

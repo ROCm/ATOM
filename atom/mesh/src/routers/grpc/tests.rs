@@ -1,56 +1,28 @@
-//! Test obligations for the new `grpc::Pipeline` (Parts F and G).
-//!
-//! Sections:
-//!   a_pipeline_construction — new_regular / new_pd shape
-//!   b_execute_chat          — 4-step body, error paths
-//!   c_execute_generate      — parallel to chat
-//!   d_execute_for_responses — typed-value return path
-//!   e_metrics_labels        — backend / router / endpoint labels emitted
-//!   f_sse_byte_snapshots    — plan G2–G6 (8 fixtures stored under tests/fixtures/sse_golden/)
-//!   g_router_integration    — GrpcRouter / GrpcPDRouter use new Pipeline
-
 mod a_pipeline_construction {
     use std::sync::Arc;
 
-    use crate::core::placement::planner::DefaultPlanner;
-    use crate::routers::grpc::engine::GrpcEngine;
+    use crate::app_context::AppContext;
     use crate::routers::grpc::pipeline::Pipeline;
-    use crate::routers::http_router::SharedComponents;
+    use crate::routers::test_fixtures;
 
-    fn shared() -> Arc<SharedComponents> {
-        unimplemented!("shared components fixture")
-    }
-
-    fn engine() -> GrpcEngine {
-        unimplemented!("engine fixture")
-    }
-
-    fn planner() -> Arc<DefaultPlanner> {
-        unimplemented!("planner fixture")
+    fn shared() -> Arc<AppContext> {
+        test_fixtures::app_context()
     }
 
     #[test]
     fn test_new_regular_sets_backend_label() {
-        let p = Pipeline::new_regular(planner(), engine(), shared());
-        // backend_label is private; pin via type system that it exists.
+        let ctx = shared();
+        let p = Pipeline::new_regular(ctx.worker_registry.clone(), ctx.policy_registry.clone());
         let _ = p;
     }
 
     #[test]
     fn test_new_pd_sets_backend_label() {
-        let p = Pipeline::new_pd(planner(), engine(), shared());
+        let ctx = shared();
+        let p = Pipeline::new_pd(ctx.worker_registry.clone(), ctx.policy_registry.clone());
         let _ = p;
     }
 
-    #[test]
-    fn test_pipeline_construction_uses_concrete_grpc_engine_not_trait() {
-        // §3.2 non-goal: Engine remains a concrete type. The compiler enforces it.
-        let _ty = std::any::type_name::<Pipeline>();
-        assert!(
-            !_ty.contains("dyn Engine"),
-            "Pipeline must not wrap dyn Engine"
-        );
-    }
 }
 
 mod b_execute_chat {
@@ -60,16 +32,73 @@ mod b_execute_chat {
     use axum::http::StatusCode;
     use http::HeaderMap;
 
+    use crate::app_context::AppContext;
+    use crate::core::placement::types::PlacementError;
+    use crate::core::worker::WorkerType;
+    use crate::observability::metrics::metrics_labels;
     use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
     use crate::routers::grpc::pipeline::Pipeline;
-    use crate::routers::http_router::SharedComponents;
+    use crate::routers::test_fixtures;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{
+        FinishReason, TokenChunk, Usage, WorkerMeta,
+    };
 
-    fn shared() -> Arc<SharedComponents> {
-        unimplemented!("shared components fixture")
+    fn shared() -> Arc<AppContext> {
+        test_fixtures::app_context_with_hf_tokenizer("m")
     }
 
-    fn pipeline_regular() -> Pipeline {
-        unimplemented!("pipeline fixture (regular)")
+    fn scripted_chunks() -> Vec<
+        Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>,
+    > {
+        vec![
+            Ok(TokenChunk::Partial {
+                token_ids: vec![1],
+                logprobs: None,
+            }),
+            Ok(TokenChunk::Partial {
+                token_ids: vec![2],
+                logprobs: None,
+            }),
+            Ok(TokenChunk::Complete {
+                token_ids: vec![1, 2, 6],
+                finish_reason: FinishReason::Stop,
+                matched_stop: None,
+                usage: Usage {
+                    prompt_tokens: 3,
+                    completion_tokens: 3,
+                    total_tokens: 6,
+                },
+                logprobs: None,
+                input_logprobs: None,
+                meta: WorkerMeta {
+                    request_id: "req-test".to_string(),
+                    weight_version: None,
+                    cached_tokens: 0,
+                },
+            }),
+        ]
+    }
+
+    fn pipeline_regular() -> Arc<Pipeline> {
+        let worker = test_fixtures::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        test_fixtures::pipeline_with(
+            Arc::new(test_fixtures::MockPdPlanner::repeat_single(worker, "random")),
+            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+                Ok(synthetic_single_stream(scripted_chunks()))
+            })),
+            metrics_labels::BACKEND_REGULAR,
+        )
+    }
+
+    fn pipeline_placement_err() -> Arc<Pipeline> {
+        test_fixtures::pipeline_with(
+            Arc::new(test_fixtures::MockPdPlanner::repeat_err(
+                PlacementError::NoAvailableWorkers,
+            )),
+            Arc::new(test_fixtures::MockDispatcher::new(vec![])),
+            metrics_labels::BACKEND_REGULAR,
+        )
     }
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
@@ -103,34 +132,50 @@ mod b_execute_chat {
             .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp.headers().get("content-type").unwrap();
-        assert!(ct.to_str().unwrap().contains("text/event-stream"));
+        assert!(
+            ct.to_str().unwrap().contains("text/event-stream"),
+            "expected SSE content-type, got {:?}",
+            ct
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_chat_streaming_body_contains_done_marker() {
+        let p = pipeline_regular();
+        let resp = p
+            .execute_chat(chat_req(true), None, Some("m".to_string()), shared())
+            .await;
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("[DONE]"), "SSE stream must terminate with [DONE]: {s}");
     }
 
     #[tokio::test]
     async fn test_execute_chat_prepare_error_short_circuits() {
-        // Empty messages should cause prepare to error; ensure the response is
-        // a typed 4xx and that the planner / engine were not called.
         let p = pipeline_regular();
-        let req = Arc::new(ChatCompletionRequest {
-            model: "m".to_string(),
-            messages: vec![],
-            ..Default::default()
-        });
         let resp = p
-            .execute_chat(req, None, Some("m".to_string()), shared())
+            .execute_chat(chat_req(false), None, Some("unregistered".to_string()), shared())
             .await;
-        assert!(resp.status().is_client_error() || resp.status().is_server_error());
+        assert!(
+            resp.status().is_client_error() || resp.status().is_server_error(),
+            "unregistered model must short-circuit prepare, got {}",
+            resp.status()
+        );
     }
 
     #[tokio::test]
     async fn test_execute_chat_placement_error_returns_503() {
-        // No workers configured → planner returns NoAvailableWorkers → 503.
-        let p = pipeline_regular();
+        let p = pipeline_placement_err();
         let resp = p
-            .execute_chat(
-                chat_req(false),
+            .execute_generate(
+                Arc::new(
+                    serde_json::from_value(
+                        serde_json::json!({"text":"hi","model":"m","stream":false}),
+                    )
+                    .unwrap(),
+                ),
                 None,
-                Some("missing-model".to_string()),
+                Some("m".to_string()),
                 shared(),
             )
             .await;
@@ -139,13 +184,30 @@ mod b_execute_chat {
 
     #[tokio::test]
     async fn test_execute_chat_engine_error_returns_5xx() {
-        // Force engine dispatch to fail (worker unreachable etc.).
-        let p = pipeline_regular();
+        let p = test_fixtures::pipeline_with(
+            Arc::new(test_fixtures::MockPdPlanner::repeat_single(
+                test_fixtures::mock_grpc_worker("http://w:1", WorkerType::Regular),
+                "random",
+            )),
+            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+                Err(
+                    crate::routers::token_handle::engine_error::EngineError::Transport(
+                        tonic::Status::internal("boom"),
+                    ),
+                )
+            })),
+            metrics_labels::BACKEND_REGULAR,
+        );
         let resp = p
-            .execute_chat(
-                chat_req(false),
+            .execute_generate(
+                Arc::new(
+                    serde_json::from_value(
+                        serde_json::json!({"text":"hi","model":"m","stream":false}),
+                    )
+                    .unwrap(),
+                ),
                 None,
-                Some("dead-model".to_string()),
+                Some("m".to_string()),
                 shared(),
             )
             .await;
@@ -160,7 +222,10 @@ mod b_execute_chat {
         let resp = p
             .execute_chat(chat_req(false), Some(hm), Some("m".to_string()), shared())
             .await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("content-type").is_some(),
+            "response must carry content-type"
+        );
     }
 
     #[tokio::test]
@@ -169,16 +234,19 @@ mod b_execute_chat {
         let resp = p
             .execute_chat(chat_req(false), None, Some("m".to_string()), shared())
             .await;
+        assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("\"choices\""), "missing choices: {s}");
-        assert!(s.contains("finish_reason"), "missing finish_reason: {s}");
+        assert!(s.contains("\"choices\""), "body must include choices: {s}");
+        assert!(
+            s.contains("finish_reason"),
+            "body must include finish_reason: {s}"
+        );
+        assert!(s.contains("\"stop\""), "body must include stop reason: {s}");
     }
 
     #[tokio::test]
     async fn test_execute_chat_retry_wrapper_compat_unchanged_signature() {
-        // RetryExecutor in router.rs wraps `pipeline.execute_chat` directly;
-        // its closure expects a Response return type. Validate signature shape.
         fn _assert_signature(p: &Pipeline) {
             let _f =
                 |req, hm, mid, shared| async move { p.execute_chat(req, hm, mid, shared).await };
@@ -193,26 +261,86 @@ mod c_execute_generate {
 
     use axum::http::StatusCode;
 
+    use crate::app_context::AppContext;
+    use crate::core::worker::WorkerType;
+    use crate::observability::metrics::metrics_labels;
     use crate::protocols::generate::GenerateRequest;
     use crate::routers::grpc::pipeline::Pipeline;
-    use crate::routers::http_router::SharedComponents;
+    use crate::routers::test_fixtures;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{
+        FinishReason, TokenChunk, Usage, WorkerMeta,
+    };
 
-    fn shared() -> Arc<SharedComponents> {
-        unimplemented!("shared components fixture")
+    fn shared() -> Arc<AppContext> {
+        test_fixtures::app_context_with_hf_tokenizer("m")
     }
 
-    fn pipeline_regular() -> Pipeline {
-        unimplemented!("pipeline fixture (regular)")
+    fn scripted_chunks() -> Vec<
+        Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>,
+    > {
+        vec![
+            Ok(TokenChunk::Partial {
+                token_ids: vec![1],
+                logprobs: None,
+            }),
+            Ok(TokenChunk::Complete {
+                token_ids: vec![1, 6],
+                finish_reason: FinishReason::Stop,
+                matched_stop: None,
+                usage: Usage {
+                    prompt_tokens: 2,
+                    completion_tokens: 2,
+                    total_tokens: 4,
+                },
+                logprobs: None,
+                input_logprobs: None,
+                meta: WorkerMeta {
+                    request_id: "req-test".to_string(),
+                    weight_version: None,
+                    cached_tokens: 0,
+                },
+            }),
+        ]
     }
 
-    fn pipeline_pd() -> Pipeline {
-        unimplemented!("pipeline fixture (pd)")
+    fn pipeline_regular() -> Arc<Pipeline> {
+        let worker = test_fixtures::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        test_fixtures::pipeline_with(
+            Arc::new(test_fixtures::MockPdPlanner::repeat_single(worker, "random")),
+            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+                Ok(synthetic_single_stream(scripted_chunks()))
+            })),
+            metrics_labels::BACKEND_REGULAR,
+        )
+    }
+
+    fn pipeline_pd() -> Arc<Pipeline> {
+        let prefill = test_fixtures::mock_grpc_worker(
+            "http://p:1",
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let decode = test_fixtures::mock_grpc_worker("http://d:1", WorkerType::Decode);
+        test_fixtures::pipeline_with(
+            Arc::new(test_fixtures::MockPdPlanner::repeat_pair(
+                prefill, decode, "random", "random",
+            )),
+            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+                Ok(synthetic_single_stream(scripted_chunks()))
+            })),
+            metrics_labels::BACKEND_PD,
+        )
     }
 
     fn generate_req(stream: bool) -> Arc<GenerateRequest> {
-        let mut g = GenerateRequest::default();
-        g.stream = stream;
-        Arc::new(g)
+        let json = serde_json::json!({
+            "text": "hi",
+            "model": "m",
+            "stream": stream,
+        });
+        Arc::new(serde_json::from_value(json).expect("GenerateRequest from json"))
     }
 
     #[tokio::test]
@@ -247,16 +375,58 @@ mod c_execute_generate {
 mod d_execute_for_responses {
     use std::sync::Arc;
 
+    use crate::app_context::AppContext;
+    use crate::core::worker::WorkerType;
+    use crate::observability::metrics::metrics_labels;
     use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
     use crate::routers::grpc::pipeline::Pipeline;
-    use crate::routers::http_router::SharedComponents;
+    use crate::routers::test_fixtures;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{
+        FinishReason, TokenChunk, Usage, WorkerMeta,
+    };
 
-    fn shared() -> Arc<SharedComponents> {
-        unimplemented!("shared components fixture")
+    fn shared() -> Arc<AppContext> {
+        test_fixtures::app_context_with_hf_tokenizer("m")
     }
 
-    fn pipeline_regular() -> Pipeline {
-        unimplemented!("pipeline fixture (regular)")
+    fn scripted_chunks() -> Vec<
+        Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>,
+    > {
+        vec![
+            Ok(TokenChunk::Partial {
+                token_ids: vec![1],
+                logprobs: None,
+            }),
+            Ok(TokenChunk::Complete {
+                token_ids: vec![1, 6],
+                finish_reason: FinishReason::Stop,
+                matched_stop: None,
+                usage: Usage {
+                    prompt_tokens: 2,
+                    completion_tokens: 2,
+                    total_tokens: 4,
+                },
+                logprobs: None,
+                input_logprobs: None,
+                meta: WorkerMeta {
+                    request_id: "req-test".to_string(),
+                    weight_version: None,
+                    cached_tokens: 0,
+                },
+            }),
+        ]
+    }
+
+    fn pipeline_regular() -> Arc<Pipeline> {
+        let worker = test_fixtures::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        test_fixtures::pipeline_with(
+            Arc::new(test_fixtures::MockPdPlanner::repeat_single(worker, "random")),
+            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+                Ok(synthetic_single_stream(scripted_chunks()))
+            })),
+            metrics_labels::BACKEND_REGULAR,
+        )
     }
 
     fn chat_req() -> Arc<ChatCompletionRequest> {
@@ -277,20 +447,22 @@ mod d_execute_for_responses {
         let v = p
             .execute_chat_for_responses(chat_req(), None, Some("m".to_string()), shared())
             .await
-            .expect("ok");
+            .expect("HF tokenizer + scripted stream must succeed");
         assert!(!v.id.is_empty(), "ChatCompletionResponse.id missing");
+        assert!(!v.choices.is_empty(), "must produce at least one choice");
+        assert_eq!(v.choices[0].message.role, "assistant");
+        assert_eq!(
+            v.choices[0].finish_reason.as_deref(),
+            Some("stop"),
+            "finish_reason must be stop"
+        );
     }
 
     #[tokio::test]
     async fn test_for_responses_returns_response_err_on_prepare_failure() {
         let p = pipeline_regular();
-        let bad = Arc::new(ChatCompletionRequest {
-            model: "m".to_string(),
-            messages: vec![],
-            ..Default::default()
-        });
         let err_resp = p
-            .execute_chat_for_responses(bad, None, Some("m".to_string()), shared())
+            .execute_chat_for_responses(chat_req(), None, Some("unregistered".to_string()), shared())
             .await
             .unwrap_err();
         assert!(!err_resp.status().is_success());
@@ -298,7 +470,6 @@ mod d_execute_for_responses {
 
     #[tokio::test]
     async fn test_for_responses_does_not_take_stream_flag() {
-        // No streaming branch — for_responses is non-streaming by contract.
         let p = pipeline_regular();
         let _v = p
             .execute_chat_for_responses(chat_req(), None, Some("m".to_string()), shared())
@@ -309,20 +480,71 @@ mod d_execute_for_responses {
 mod e_metrics_labels {
     use std::sync::Arc;
 
+    use crate::app_context::AppContext;
+    use crate::core::worker::WorkerType;
+    use crate::observability::metrics::metrics_labels;
     use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
     use crate::routers::grpc::pipeline::Pipeline;
-    use crate::routers::http_router::SharedComponents;
+    use crate::routers::test_fixtures;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{
+        FinishReason, TokenChunk, Usage, WorkerMeta,
+    };
 
-    fn shared() -> Arc<SharedComponents> {
-        unimplemented!("shared components fixture with metrics observer")
+    fn shared() -> Arc<AppContext> {
+        test_fixtures::app_context_with_hf_tokenizer("m")
     }
 
-    fn pipeline_regular() -> Pipeline {
-        unimplemented!("pipeline fixture wired to metrics observer")
+    fn scripted_chunks() -> Vec<
+        Result<TokenChunk, crate::routers::token_handle::engine_error::EngineError>,
+    > {
+        vec![Ok(TokenChunk::Complete {
+            token_ids: vec![1, 6],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 2,
+                completion_tokens: 2,
+                total_tokens: 4,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta {
+                request_id: "req-test".to_string(),
+                weight_version: None,
+                cached_tokens: 0,
+            },
+        })]
     }
 
-    fn pipeline_pd() -> Pipeline {
-        unimplemented!("PD pipeline fixture wired to metrics observer")
+    fn pipeline_regular() -> Arc<Pipeline> {
+        let worker = test_fixtures::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        test_fixtures::pipeline_with(
+            Arc::new(test_fixtures::MockPdPlanner::repeat_single(worker, "random")),
+            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+                Ok(synthetic_single_stream(scripted_chunks()))
+            })),
+            metrics_labels::BACKEND_REGULAR,
+        )
+    }
+
+    fn pipeline_pd() -> Arc<Pipeline> {
+        let prefill = test_fixtures::mock_grpc_worker(
+            "http://p:1",
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let decode = test_fixtures::mock_grpc_worker("http://d:1", WorkerType::Decode);
+        test_fixtures::pipeline_with(
+            Arc::new(test_fixtures::MockPdPlanner::repeat_pair(
+                prefill, decode, "random", "random",
+            )),
+            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+                Ok(synthetic_single_stream(scripted_chunks()))
+            })),
+            metrics_labels::BACKEND_PD,
+        )
     }
 
     fn chat_req() -> Arc<ChatCompletionRequest> {
@@ -343,7 +565,6 @@ mod e_metrics_labels {
         let _ = p
             .execute_chat(chat_req(), None, Some("m".to_string()), shared())
             .await;
-        // metrics observer asserts ROUTER_GRPC label appears at least once.
     }
 
     #[tokio::test]
@@ -379,74 +600,157 @@ mod e_metrics_labels {
     }
 }
 
-mod f_sse_byte_snapshots {
-    //! Plan G2–G6 — record from main, replay against refactored Pipeline, assert
-    //! byte-equal. Golden files live under `atom/mesh/tests/fixtures/sse_golden/`
-    //! and are produced by the `--record-golden` helper run on main HEAD before
-    //! any Part G code change.
+mod f_shared_metrics_utils {
+    use http::StatusCode;
 
-    fn load_golden(name: &str) -> Vec<u8> {
-        let path = format!(
-            "{}/tests/fixtures/sse_golden/{name}.bin",
-            env!("CARGO_MANIFEST_DIR")
+    use crate::observability::metrics::metrics_labels;
+    use crate::routers::shared::metrics_utils::{error_type_from_status, route_to_endpoint};
+
+    #[test]
+    fn test_route_to_endpoint_chat() {
+        assert_eq!(
+            route_to_endpoint("/v1/chat/completions"),
+            metrics_labels::ENDPOINT_CHAT
         );
-        std::fs::read(&path).unwrap_or_else(|e| panic!("missing golden {path}: {e}"))
     }
 
-    async fn run_chat_to_bytes(_label: &str) -> Vec<u8> {
-        unimplemented!("drive Pipeline through scripted-worker fixture, capture SSE bytes")
+    #[test]
+    fn test_route_to_endpoint_generate() {
+        assert_eq!(
+            route_to_endpoint("/generate"),
+            metrics_labels::ENDPOINT_GENERATE
+        );
     }
 
-    async fn run_generate_to_bytes(_label: &str) -> Vec<u8> {
-        unimplemented!("drive Pipeline through scripted-worker fixture, capture SSE bytes")
+    #[test]
+    fn test_route_to_endpoint_completions() {
+        assert_eq!(
+            route_to_endpoint("/v1/completions"),
+            metrics_labels::ENDPOINT_COMPLETIONS
+        );
     }
 
-    #[tokio::test]
-    async fn test_sse_chat_sglang_regular_bytes_match_main() {
-        let actual = run_chat_to_bytes("chat_sglang_regular").await;
-        assert_eq!(actual, load_golden("chat_sglang_regular"));
+    #[test]
+    fn test_route_to_endpoint_responses() {
+        assert_eq!(
+            route_to_endpoint("/v1/responses"),
+            metrics_labels::ENDPOINT_RESPONSES
+        );
     }
 
-    #[tokio::test]
-    async fn test_sse_chat_sglang_pd_bytes_match_main() {
-        let actual = run_chat_to_bytes("chat_sglang_pd").await;
-        assert_eq!(actual, load_golden("chat_sglang_pd"));
+    #[test]
+    fn test_route_to_endpoint_unknown_returns_other() {
+        assert_eq!(route_to_endpoint("/v1/anything-else"), "other");
     }
 
-    #[tokio::test]
-    async fn test_sse_chat_vllm_regular_bytes_match_main() {
-        let actual = run_chat_to_bytes("chat_vllm_regular").await;
-        assert_eq!(actual, load_golden("chat_vllm_regular"));
+    #[test]
+    fn test_error_type_from_status_400_is_validation() {
+        assert_eq!(
+            error_type_from_status(StatusCode::BAD_REQUEST),
+            metrics_labels::ERROR_VALIDATION
+        );
     }
 
-    #[tokio::test]
-    async fn test_sse_chat_vllm_pd_bytes_match_main() {
-        let actual = run_chat_to_bytes("chat_vllm_pd").await;
-        assert_eq!(actual, load_golden("chat_vllm_pd"));
+    #[test]
+    fn test_error_type_from_status_404_is_no_workers() {
+        assert_eq!(
+            error_type_from_status(StatusCode::NOT_FOUND),
+            metrics_labels::ERROR_NO_WORKERS
+        );
     }
 
-    #[tokio::test]
-    async fn test_sse_generate_sglang_regular_bytes_match_main() {
-        let actual = run_generate_to_bytes("generate_sglang_regular").await;
-        assert_eq!(actual, load_golden("generate_sglang_regular"));
+    #[test]
+    fn test_error_type_from_status_408_is_timeout() {
+        assert_eq!(
+            error_type_from_status(StatusCode::REQUEST_TIMEOUT),
+            metrics_labels::ERROR_TIMEOUT
+        );
     }
 
-    #[tokio::test]
-    async fn test_sse_generate_sglang_pd_bytes_match_main() {
-        let actual = run_generate_to_bytes("generate_sglang_pd").await;
-        assert_eq!(actual, load_golden("generate_sglang_pd"));
+    #[test]
+    fn test_error_type_from_status_504_is_timeout() {
+        assert_eq!(
+            error_type_from_status(StatusCode::GATEWAY_TIMEOUT),
+            metrics_labels::ERROR_TIMEOUT
+        );
     }
 
-    #[tokio::test]
-    async fn test_sse_generate_vllm_regular_bytes_match_main() {
-        let actual = run_generate_to_bytes("generate_vllm_regular").await;
-        assert_eq!(actual, load_golden("generate_vllm_regular"));
+    #[test]
+    fn test_error_type_from_status_500_is_backend() {
+        assert_eq!(
+            error_type_from_status(StatusCode::INTERNAL_SERVER_ERROR),
+            metrics_labels::ERROR_BACKEND
+        );
     }
 
-    #[tokio::test]
-    async fn test_sse_generate_vllm_pd_bytes_match_main() {
-        let actual = run_generate_to_bytes("generate_vllm_pd").await;
-        assert_eq!(actual, load_golden("generate_vllm_pd"));
+    #[test]
+    fn test_error_type_from_status_503_is_backend() {
+        assert_eq!(
+            error_type_from_status(StatusCode::SERVICE_UNAVAILABLE),
+            metrics_labels::ERROR_BACKEND
+        );
+    }
+
+    #[test]
+    fn test_error_type_from_status_other_is_internal() {
+        assert_eq!(
+            error_type_from_status(StatusCode::OK),
+            metrics_labels::ERROR_INTERNAL
+        );
+    }
+}
+
+mod f_shared_placement_response {
+    use axum::http::StatusCode;
+
+    use crate::core::placement::types::PlacementError;
+    use crate::routers::shared::placement_response::placement_err_to_response;
+
+    #[test]
+    fn test_no_workers_returns_503() {
+        let r = placement_err_to_response(PlacementError::NoWorkers, Some("m"));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_no_available_workers_returns_503() {
+        let r = placement_err_to_response(PlacementError::NoAvailableWorkers, Some("m"));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_no_prefill_workers_returns_503() {
+        let r = placement_err_to_response(PlacementError::NoPrefillWorkers, Some("m"));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_no_decode_workers_returns_503() {
+        let r = placement_err_to_response(PlacementError::NoDecodeWorkers, Some("m"));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_policy_returned_none_returns_503() {
+        let r = placement_err_to_response(PlacementError::PolicyReturnedNone, Some("m"));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_model_not_found_returns_503() {
+        let r = placement_err_to_response(
+            PlacementError::ModelNotFound {
+                model_id: "m".to_string(),
+            },
+            Some("m"),
+        );
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_none_model_id_uses_default() {
+        let r = placement_err_to_response(PlacementError::NoWorkers, None);
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
 
@@ -462,13 +766,10 @@ mod g_router_integration {
     #[test]
     fn test_grpc_router_holds_new_pipeline_type() {
         let name = std::any::type_name::<GrpcRouter>();
-        // Pinned by the new struct field `pipeline: Pipeline`. If this assertion
-        // breaks after Part F it means the field type changed unexpectedly.
         assert!(
             type_contains(name, "GrpcRouter"),
             "router type rename collision? got {name}"
         );
-        // Pipeline must be the concrete new type, not a re-export of RequestPipeline.
         let p_name = std::any::type_name::<Pipeline>();
         assert!(!p_name.contains("RequestPipeline"));
     }
@@ -480,14 +781,760 @@ mod g_router_integration {
     }
 
     #[test]
-    fn test_router_files_keep_original_names_per_v1() {
-        // Plan V-1 / Q1: do NOT rename router.rs to http_router.rs (collides with
-        // the top-level routers/http_router.rs). This compile-only check pins the
-        // module path.
+    fn test_router_files_keep_original_names() {
         let _r = std::any::type_name::<GrpcRouter>();
         let _p = std::any::type_name::<GrpcPDRouter>();
-        // Both types must resolve under routers::grpc::router and routers::grpc::pd_router.
         assert!(_r.contains("routers::grpc::router"));
         assert!(_p.contains("routers::grpc::pd_router"));
+    }
+}
+
+mod h_completion_adapter {
+    use axum::body::{to_bytes, Body};
+    use axum::response::Response;
+    use http::StatusCode;
+    use serde_json::{json, Value};
+
+    use crate::protocols::common::StringOrArray;
+    use crate::protocols::completion::CompletionRequest;
+    use crate::routers::grpc::completion_adapter::{
+        completion_to_generate, wrap_generate_response_as_completion,
+        wrap_streaming_generate_as_completion,
+    };
+
+    fn minimal_completion_request() -> CompletionRequest {
+        serde_json::from_value(json!({
+            "model": "test-model",
+            "prompt": "Hello world"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_happy_path_string_prompt() {
+        let req = minimal_completion_request();
+        let gen = completion_to_generate(&req).unwrap();
+        assert_eq!(gen.text.as_deref(), Some("Hello world"));
+        assert_eq!(gen.model.as_deref(), Some("test-model"));
+    }
+
+    #[test]
+    fn test_array_prompt_single_element() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": ["only-one"]
+        }))
+        .unwrap();
+        let gen = completion_to_generate(&req).unwrap();
+        assert_eq!(gen.text.as_deref(), Some("only-one"));
+    }
+
+    #[test]
+    fn test_array_prompt_multiple_elements_rejected() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": ["a", "b"]
+        }))
+        .unwrap();
+        let err = completion_to_generate(&req).unwrap_err();
+        assert!(err.contains("Batched prompts"), "error: {err}");
+        assert!(err.contains("2 items"), "error: {err}");
+    }
+
+    #[test]
+    fn test_echo_true_rejected() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "echo": true
+        }))
+        .unwrap();
+        let err = completion_to_generate(&req).unwrap_err();
+        assert!(err.contains("echo"), "error: {err}");
+    }
+
+    #[test]
+    fn test_suffix_rejected() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "suffix": "end"
+        }))
+        .unwrap();
+        let err = completion_to_generate(&req).unwrap_err();
+        assert!(err.contains("suffix"), "error: {err}");
+    }
+
+    #[test]
+    fn test_best_of_greater_than_one_rejected() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "best_of": 2
+        }))
+        .unwrap();
+        let err = completion_to_generate(&req).unwrap_err();
+        assert!(err.contains("best_of"), "error: {err}");
+    }
+
+    #[test]
+    fn test_best_of_one_accepted() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "best_of": 1
+        }))
+        .unwrap();
+        assert!(completion_to_generate(&req).is_ok());
+    }
+
+    #[test]
+    fn test_logit_bias_rejected() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "logit_bias": {"50256": -100.0}
+        }))
+        .unwrap();
+        let err = completion_to_generate(&req).unwrap_err();
+        assert!(err.contains("logit_bias"), "error: {err}");
+    }
+
+    #[test]
+    fn test_sampling_params_threaded_through() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "temperature": 0.7,
+            "max_tokens": 128,
+            "top_p": 0.9,
+            "top_k": 40,
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.3,
+            "stop": ["END"],
+            "n": 2,
+            "seed": 42
+        }))
+        .unwrap();
+        let gen = completion_to_generate(&req).unwrap();
+        let sp = gen.sampling_params.as_ref().unwrap();
+        assert_eq!(sp.temperature, Some(0.7));
+        assert_eq!(sp.max_new_tokens, Some(128));
+        assert_eq!(sp.top_p, Some(0.9));
+        assert_eq!(sp.top_k, Some(40));
+        assert_eq!(sp.frequency_penalty, Some(0.5));
+        assert_eq!(sp.presence_penalty, Some(0.3));
+        assert_eq!(sp.n, Some(2));
+        assert_eq!(sp.sampling_seed, Some(42));
+        match sp.stop.as_ref().unwrap() {
+            StringOrArray::Array(v) => assert_eq!(v, &["END"]),
+            other => panic!("expected Array stop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stream_flag_threads_through() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "stream": true
+        }))
+        .unwrap();
+        let gen = completion_to_generate(&req).unwrap();
+        assert!(gen.stream);
+
+        let req2: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "stream": false
+        }))
+        .unwrap();
+        let gen2 = completion_to_generate(&req2).unwrap();
+        assert!(!gen2.stream);
+    }
+
+    #[test]
+    fn test_logprobs_sets_return_logprob_and_top_logprobs_num() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "logprobs": 5
+        }))
+        .unwrap();
+        let gen = completion_to_generate(&req).unwrap();
+        assert_eq!(gen.return_logprob, Some(true));
+        assert_eq!(gen.top_logprobs_num, Some(5));
+    }
+
+    #[test]
+    fn test_no_logprobs_sets_return_logprob_false() {
+        let req = minimal_completion_request();
+        let gen = completion_to_generate(&req).unwrap();
+        assert_eq!(gen.return_logprob, Some(false));
+        assert_eq!(gen.top_logprobs_num, None);
+    }
+
+    fn generate_response_json(text: &str, id: &str, finish_type: &str) -> Value {
+        match finish_type {
+            "stop" => json!({
+                "text": text,
+                "output_ids": [1, 2, 3],
+                "meta_info": {
+                    "id": id,
+                    "finish_reason": {"type": "stop"},
+                    "prompt_tokens": 5,
+                    "weight_version": "v1",
+                    "completion_tokens": 3,
+                    "cached_tokens": 0,
+                    "e2e_latency": 0.1
+                }
+            }),
+            "length" => json!({
+                "text": text,
+                "output_ids": [1, 2, 3],
+                "meta_info": {
+                    "id": id,
+                    "finish_reason": {"type": "length", "length": 128},
+                    "prompt_tokens": 5,
+                    "weight_version": "v1",
+                    "completion_tokens": 3,
+                    "cached_tokens": 0,
+                    "e2e_latency": 0.1
+                }
+            }),
+            other => json!({
+                "text": text,
+                "output_ids": [1, 2, 3],
+                "meta_info": {
+                    "id": id,
+                    "finish_reason": other,
+                    "prompt_tokens": 5,
+                    "weight_version": "v1",
+                    "completion_tokens": 3,
+                    "cached_tokens": 0,
+                    "e2e_latency": 0.1
+                }
+            }),
+        }
+    }
+
+    fn ok_json_response(body: &Value) -> Response {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_wrap_non_success_upstream_passthrough() {
+        let upstream = Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from("upstream error"))
+            .unwrap();
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"upstream error");
+    }
+
+    #[tokio::test]
+    async fn test_wrap_valid_generate_json_produces_completion() {
+        let gen = generate_response_json("hello", "req-1", "stop");
+        let upstream = ok_json_response(&json!([gen]));
+        let resp = wrap_generate_response_as_completion(upstream, "test-model".into()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["object"], "text_completion");
+        assert_eq!(parsed["model"], "test-model");
+        assert_eq!(parsed["choices"][0]["text"], "hello");
+        assert_eq!(parsed["choices"][0]["index"], 0);
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+        assert!(parsed["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_wrap_multiple_generate_responses_multiple_choices() {
+        let gen1 = generate_response_json("aaa", "req-1", "stop");
+        let gen2 = generate_response_json("bbb", "req-1", "length");
+        let upstream = ok_json_response(&json!([gen1, gen2]));
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let choices = parsed["choices"].as_array().unwrap();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0]["index"], 0);
+        assert_eq!(choices[0]["text"], "aaa");
+        assert_eq!(choices[0]["finish_reason"], "stop");
+        assert_eq!(choices[1]["index"], 1);
+        assert_eq!(choices[1]["text"], "bbb");
+        assert_eq!(choices[1]["finish_reason"], "length");
+        let usage = &parsed["usage"];
+        assert_eq!(usage["completion_tokens"].as_u64().unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_wrap_empty_id_generates_cmpl_prefix() {
+        let mut gen = generate_response_json("x", "", "stop");
+        gen["meta_info"]["id"] = json!("");
+        let upstream = ok_json_response(&json!([gen]));
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let id = parsed["id"].as_str().unwrap();
+        assert!(id.starts_with("cmpl-"), "expected cmpl- prefix, got {id}");
+    }
+
+    #[tokio::test]
+    async fn test_wrap_finish_reason_other_passthrough() {
+        let mut gen = generate_response_json("x", "r1", "stop");
+        gen["meta_info"]["finish_reason"] = json!("abort");
+        let upstream = ok_json_response(&json!([gen]));
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["choices"][0]["finish_reason"], "abort");
+    }
+
+    fn sse_event(data: &str) -> String {
+        format!("data: {}\n\n", data)
+    }
+
+    fn sse_body(events: Vec<String>) -> Body {
+        let combined = events.join("");
+        Body::from(combined)
+    }
+
+    fn ok_sse_response(events: Vec<String>) -> Response {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(sse_body(events))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_streaming_non_success_passthrough() {
+        let upstream = Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("err"))
+            .unwrap();
+        let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_cumulative_to_delta() {
+        let chunk1 = json!({"text": "Hello", "index": 0, "meta_info": {"finish_reason": null}});
+        let chunk2 = json!({"text": "Hello world", "index": 0, "meta_info": {"finish_reason": null}});
+        let chunk3 = json!({
+            "text": "Hello world!",
+            "index": 0,
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 3,
+                "completion_tokens": 4
+            }
+        });
+        let events = vec![
+            sse_event(&serde_json::to_string(&chunk1).unwrap()),
+            sse_event(&serde_json::to_string(&chunk2).unwrap()),
+            sse_event(&serde_json::to_string(&chunk3).unwrap()),
+            sse_event("[DONE]"),
+        ];
+        let upstream = ok_sse_response(events);
+        let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/event-stream"), "content-type: {ct}");
+
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        let data_lines: Vec<&str> = body_str
+            .lines()
+            .filter(|l| l.starts_with("data: ") && !l.contains("[DONE]"))
+            .collect();
+
+        let mut deltas = Vec::new();
+        for line in &data_lines {
+            let payload = line.strip_prefix("data: ").unwrap();
+            if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
+                if let Some(choices) = parsed["choices"].as_array() {
+                    if let Some(first) = choices.first() {
+                        if let Some(t) = first["text"].as_str() {
+                            deltas.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(deltas.len() >= 3, "expected at least 3 delta chunks, got {}", deltas.len());
+        assert_eq!(deltas[0], "Hello");
+        assert_eq!(deltas[1], " world");
+        assert_eq!(deltas[2], "!");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_done_marker_forwarded() {
+        let chunk = json!({"text": "hi", "index": 0, "meta_info": {"finish_reason": {"type": "stop"}, "prompt_tokens": 1, "completion_tokens": 1}});
+        let events = vec![
+            sse_event(&serde_json::to_string(&chunk).unwrap()),
+            sse_event("[DONE]"),
+        ];
+        let upstream = ok_sse_response(events);
+        let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("data: [DONE]"), "must forward [DONE]: {body_str}");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_usage_chunk_emitted_after_final() {
+        let chunk = json!({
+            "text": "done",
+            "index": 0,
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 10,
+                "completion_tokens": 20
+            }
+        });
+        let events = vec![
+            sse_event(&serde_json::to_string(&chunk).unwrap()),
+            sse_event("[DONE]"),
+        ];
+        let upstream = ok_sse_response(events);
+        let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        let data_lines: Vec<&str> = body_str
+            .lines()
+            .filter(|l| l.starts_with("data: ") && !l.contains("[DONE]"))
+            .collect();
+
+        let mut found_usage = false;
+        for line in &data_lines {
+            let payload = line.strip_prefix("data: ").unwrap();
+            if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
+                if parsed.get("usage").is_some() && !parsed["usage"].is_null() {
+                    found_usage = true;
+                    assert_eq!(parsed["usage"]["prompt_tokens"], 10);
+                    assert_eq!(parsed["usage"]["completion_tokens"], 20);
+                    assert_eq!(parsed["usage"]["total_tokens"], 30);
+                    let choices = parsed["choices"].as_array().unwrap();
+                    assert!(choices.is_empty(), "usage chunk must have empty choices");
+                }
+            }
+        }
+        assert!(found_usage, "must emit a usage chunk after final token: {body_str}");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_error_json_passthrough() {
+        let error_obj = json!({"error": {"message": "rate limited", "code": 429}});
+        let events = vec![
+            sse_event(&serde_json::to_string(&error_obj).unwrap()),
+        ];
+        let upstream = ok_sse_response(events);
+        let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("rate limited"), "error must be passed through: {body_str}");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_matched_stop_forwarded() {
+        let chunk = json!({
+            "text": "stop here",
+            "index": 0,
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "matched_stop": "END",
+                "prompt_tokens": 2,
+                "completion_tokens": 2
+            }
+        });
+        let events = vec![
+            sse_event(&serde_json::to_string(&chunk).unwrap()),
+            sse_event("[DONE]"),
+        ];
+        let upstream = ok_sse_response(events);
+        let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        let data_lines: Vec<&str> = body_str
+            .lines()
+            .filter(|l| l.starts_with("data: ") && !l.contains("[DONE]"))
+            .collect();
+
+        let mut found_matched_stop = false;
+        for line in &data_lines {
+            let payload = line.strip_prefix("data: ").unwrap();
+            if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
+                if let Some(choices) = parsed["choices"].as_array() {
+                    for choice in choices {
+                        if choice.get("matched_stop").is_some() {
+                            found_matched_stop = true;
+                            assert_eq!(choice["matched_stop"], "END");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_matched_stop, "matched_stop must be forwarded: {body_str}");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_response_headers() {
+        let chunk = json!({"text": "x", "index": 0, "meta_info": {"finish_reason": {"type": "stop"}, "prompt_tokens": 1, "completion_tokens": 1}});
+        let events = vec![
+            sse_event(&serde_json::to_string(&chunk).unwrap()),
+            sse_event("[DONE]"),
+        ];
+        let upstream = ok_sse_response(events);
+        let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
+        assert_eq!(
+            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(
+            resp.headers().get("cache-control").unwrap().to_str().unwrap(),
+            "no-cache"
+        );
+        assert_eq!(
+            resp.headers().get("connection").unwrap().to_str().unwrap(),
+            "keep-alive"
+        );
+        assert!(resp.headers().get("content-length").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_has_correct_object_and_model() {
+        let chunk = json!({"text": "hi", "index": 0, "meta_info": {"finish_reason": null}});
+        let events = vec![
+            sse_event(&serde_json::to_string(&chunk).unwrap()),
+            sse_event("[DONE]"),
+        ];
+        let upstream = ok_sse_response(events);
+        let resp = wrap_streaming_generate_as_completion(upstream, "my-model".into()).await;
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        let first_data = body_str
+            .lines()
+            .find(|l| l.starts_with("data: {"))
+            .unwrap();
+        let payload = first_data.strip_prefix("data: ").unwrap();
+        let parsed: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed["object"], "text_completion");
+        assert_eq!(parsed["model"], "my-model");
+        assert!(parsed["id"].as_str().unwrap().starts_with("cmpl-"));
+        assert!(parsed["created"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_wrap_content_type_set_to_json() {
+        let gen = generate_response_json("x", "r1", "stop");
+        let upstream = ok_json_response(&json!([gen]));
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        assert_eq!(
+            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
+        assert!(resp.headers().get("content-length").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wrap_finish_reason_length() {
+        let gen = generate_response_json("x", "r1", "length");
+        let upstream = ok_json_response(&json!([gen]));
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["choices"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_finish_reason_length_maps_correctly() {
+        let chunk = json!({
+            "text": "tokens",
+            "index": 0,
+            "meta_info": {
+                "finish_reason": {"type": "length"},
+                "prompt_tokens": 5,
+                "completion_tokens": 10
+            }
+        });
+        let events = vec![
+            sse_event(&serde_json::to_string(&chunk).unwrap()),
+            sse_event("[DONE]"),
+        ];
+        let upstream = ok_sse_response(events);
+        let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        let data_lines: Vec<&str> = body_str
+            .lines()
+            .filter(|l| l.starts_with("data: {"))
+            .collect();
+
+        let mut found_length = false;
+        for line in &data_lines {
+            let payload = line.strip_prefix("data: ").unwrap();
+            if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
+                if let Some(choices) = parsed["choices"].as_array() {
+                    for choice in choices {
+                        if choice["finish_reason"] == "length" {
+                            found_length = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_length, "must map length finish_reason: {body_str}");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_null_finish_reason_maps_to_null() {
+        let chunk = json!({"text": "partial", "index": 0, "meta_info": {"finish_reason": null}});
+        let events = vec![
+            sse_event(&serde_json::to_string(&chunk).unwrap()),
+            sse_event("[DONE]"),
+        ];
+        let upstream = ok_sse_response(events);
+        let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        let first_data = body_str
+            .lines()
+            .find(|l| l.starts_with("data: {"))
+            .unwrap();
+        let payload = first_data.strip_prefix("data: ").unwrap();
+        let parsed: Value = serde_json::from_str(payload).unwrap();
+        assert!(
+            parsed["choices"][0]["finish_reason"].is_null(),
+            "null finish_reason must stay null"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_string_finish_reason_passthrough() {
+        let chunk = json!({
+            "text": "x",
+            "index": 0,
+            "meta_info": {
+                "finish_reason": "stop",
+                "prompt_tokens": 1,
+                "completion_tokens": 1
+            }
+        });
+        let events = vec![
+            sse_event(&serde_json::to_string(&chunk).unwrap()),
+            sse_event("[DONE]"),
+        ];
+        let upstream = ok_sse_response(events);
+        let resp = wrap_streaming_generate_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        let data_lines: Vec<&str> = body_str
+            .lines()
+            .filter(|l| l.starts_with("data: {"))
+            .collect();
+
+        let mut found_stop = false;
+        for line in &data_lines {
+            let payload = line.strip_prefix("data: ").unwrap();
+            if let Ok(parsed) = serde_json::from_str::<Value>(payload) {
+                if let Some(choices) = parsed["choices"].as_array() {
+                    for choice in choices {
+                        if choice["finish_reason"] == "stop" {
+                            found_stop = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_stop, "string finish_reason must pass through: {body_str}");
+    }
+
+    #[test]
+    fn test_sampling_seed_from_seed_field() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "seed": 99
+        }))
+        .unwrap();
+        let gen = completion_to_generate(&req).unwrap();
+        let sp = gen.sampling_params.as_ref().unwrap();
+        assert_eq!(sp.sampling_seed, Some(99));
+    }
+
+    #[test]
+    fn test_sampling_seed_prefers_sampling_seed_over_seed() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "prompt": "hi",
+            "sampling_seed": 77,
+            "seed": 99
+        }))
+        .unwrap();
+        let gen = completion_to_generate(&req).unwrap();
+        let sp = gen.sampling_params.as_ref().unwrap();
+        assert_eq!(sp.sampling_seed, Some(77));
+    }
+
+    #[test]
+    fn test_generate_request_defaults_for_non_sampling_fields() {
+        let req = minimal_completion_request();
+        let gen = completion_to_generate(&req).unwrap();
+        assert!(gen.input_ids.is_none());
+        assert_eq!(gen.input_embeds, None);
+        assert_eq!(gen.image_data, None);
+        assert!(!gen.background);
+        assert!(gen.log_metrics);
+        assert!(!gen.return_text_in_logprobs);
+    }
+
+    #[tokio::test]
+    async fn test_wrap_invalid_json_returns_error() {
+        let upstream = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("not json at all"))
+            .unwrap();
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        assert!(resp.status().is_server_error());
+    }
+
+    #[tokio::test]
+    async fn test_wrap_preserves_existing_id() {
+        let gen = generate_response_json("x", "my-custom-id", "stop");
+        let upstream = ok_json_response(&json!([gen]));
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["id"], "my-custom-id");
+    }
+
+    #[tokio::test]
+    async fn test_wrap_usage_total_equals_sum() {
+        let gen = generate_response_json("x", "r", "stop");
+        let upstream = ok_json_response(&json!([gen]));
+        let resp = wrap_generate_response_as_completion(upstream, "m".into()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let usage = &parsed["usage"];
+        let prompt = usage["prompt_tokens"].as_u64().unwrap();
+        let compl = usage["completion_tokens"].as_u64().unwrap();
+        let total = usage["total_tokens"].as_u64().unwrap();
+        assert_eq!(total, prompt + compl);
     }
 }

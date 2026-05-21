@@ -27,7 +27,6 @@ use crate::{
     routers::{error, RouterTrait},
 };
 
-/// gRPC PD (Prefill-Decode) router implementation for SGLang
 #[derive(Clone)]
 pub struct GrpcPDRouter {
     worker_registry: Arc<WorkerRegistry>,
@@ -37,7 +36,6 @@ pub struct GrpcPDRouter {
 }
 
 impl GrpcPDRouter {
-    /// Create a new gRPC PD router
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         if ctx.reasoning_parser_factory.is_none() {
             return Err("gRPC PD router requires reasoning parser factory".to_string());
@@ -57,7 +55,6 @@ impl GrpcPDRouter {
         })
     }
 
-    /// Main route_generate implementation with PD dual dispatch
     async fn route_generate_impl(
         &self,
         headers: Option<&HeaderMap>,
@@ -69,7 +66,6 @@ impl GrpcPDRouter {
             model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
 
-        // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
@@ -115,7 +111,6 @@ impl GrpcPDRouter {
         .await
     }
 
-    /// Main route_chat implementation with PD dual dispatch
     async fn route_chat_impl(
         &self,
         headers: Option<&HeaderMap>,
@@ -127,7 +122,6 @@ impl GrpcPDRouter {
             model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
 
-        // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());

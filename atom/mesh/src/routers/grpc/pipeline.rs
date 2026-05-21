@@ -6,7 +6,7 @@ use axum::response::Response;
 use http::HeaderMap;
 use tracing::error;
 
-use super::engine::GrpcEngine;
+use super::engine::{Dispatcher, GrpcEngine};
 use crate::{
     app_context::AppContext,
     core::{
@@ -35,12 +35,26 @@ use crate::{
     },
 };
 
-/// Transport-neutral pipeline: prepare → plan → engine.dispatch → render.
 #[derive(Clone)]
 pub(crate) struct Pipeline {
     planner: Arc<dyn PdPlanner>,
-    engine: GrpcEngine,
+    engine: Arc<dyn Dispatcher>,
     backend_label: &'static str,
+}
+
+#[cfg(test)]
+impl Pipeline {
+    pub(crate) fn with_injected(
+        planner: Arc<dyn PdPlanner>,
+        engine: Arc<dyn Dispatcher>,
+        backend_label: &'static str,
+    ) -> Self {
+        Self {
+            planner,
+            engine,
+            backend_label,
+        }
+    }
 }
 
 impl Pipeline {
@@ -73,7 +87,7 @@ impl Pipeline {
         ));
         Self {
             planner,
-            engine: GrpcEngine::new(),
+            engine: Arc::new(GrpcEngine::new()),
             backend_label,
         }
     }
