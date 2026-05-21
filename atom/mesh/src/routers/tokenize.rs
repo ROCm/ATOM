@@ -1,8 +1,3 @@
-//! Tokenize and detokenize handlers
-//!
-//! Provides tokenization, detokenization, and tokenizer management operations.
-//! These handlers use the TokenizerRegistry for tokenizer storage and retrieval.
-
 use std::sync::Arc;
 
 use axum::{
@@ -23,7 +18,6 @@ use crate::{
     tokenizer::{registry::TokenizerEntry, traits::Tokenizer, TokenizerRegistry},
 };
 
-/// Helper to create error responses
 fn error_response(status: StatusCode, message: &str, error_type: &str) -> Response {
     (
         status,
@@ -37,17 +31,13 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
         .into_response()
 }
 
-/// Get a tokenizer by model name, with fallback strategies
 fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn Tokenizer>, String> {
-    // First, try exact match (by name or ID)
     if let Some(tokenizer) = registry.get(model) {
         debug!("Found tokenizer for model: {}", model);
         return Ok(tokenizer);
     }
 
-    // Try UNKNOWN_MODEL_ID if model is "unknown" or empty
     if model == UNKNOWN_MODEL_ID || model.is_empty() {
-        // Try to find any tokenizer as fallback
         let entries = registry.list();
         if let Some(first) = entries.first() {
             debug!(
@@ -58,7 +48,6 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
         }
     }
 
-    // List available tokenizers for error message
     let entries = registry.list();
     if entries.is_empty() {
         Err("No tokenizers available. Use POST /v1/tokenizers to add one.".to_string())
@@ -72,11 +61,6 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
     }
 }
 
-// ============================================================================
-// Tokenize / Detokenize Handlers
-// ============================================================================
-
-/// Handle POST /v1/tokenize
 pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeRequest) -> Response {
     debug!("Tokenize request for model: {}", request.model);
 
@@ -90,13 +74,11 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
     let texts = request.prompt.as_strings();
     let is_batch = request.prompt.is_batch();
 
-    // Tokenize each text
     let mut all_tokens: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
     let mut all_counts: Vec<i32> = Vec::with_capacity(texts.len());
     let mut all_char_counts: Vec<i32> = Vec::with_capacity(texts.len());
 
     for text in texts {
-        // Don't add special tokens for tokenize API (matches Python behavior)
         let encoding = match tokenizer.encode(text, false) {
             Ok(enc) => enc,
             Err(e) => {
@@ -117,7 +99,6 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
         all_char_counts.push(text.chars().count() as i32);
     }
 
-    // Format response based on single vs batch
     let (tokens, count, char_count) = if is_batch {
         (
             TokensResult::Batch(all_tokens),
@@ -140,7 +121,6 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
     .into_response()
 }
 
-/// Handle POST /v1/detokenize
 pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRequest) -> Response {
     debug!("Detokenize request for model: {}", request.model);
 
@@ -154,7 +134,6 @@ pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRe
     let sequences = request.tokens.sequences();
     let is_batch = request.tokens.is_batch();
 
-    // Detokenize each sequence
     let mut all_texts: Vec<String> = Vec::with_capacity(sequences.len());
 
     for seq in sequences {
@@ -172,7 +151,6 @@ pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRe
         all_texts.push(text);
     }
 
-    // Format response based on single vs batch
     let text = if is_batch {
         TextResult::Batch(all_texts)
     } else {
@@ -182,15 +160,8 @@ pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRe
     Json(DetokenizeResponse { text }).into_response()
 }
 
-// ============================================================================
-// Tokenizer Management Handlers
-// ============================================================================
-
-/// Handle POST /v1/tokenizers - async version using job queue
 pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerRequest) -> Response {
-    // Check if tokenizer already exists by name
     if context.tokenizer_registry.contains(&request.name) {
-        // Return the existing tokenizer's ID
         if let Some(entry) = context.tokenizer_registry.get_by_name(&request.name) {
             return (
                 StatusCode::CONFLICT,
@@ -205,7 +176,6 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         }
     }
 
-    // Get the job queue
     let job_queue = match context.worker_job_queue.get() {
         Some(queue) => queue,
         None => {
@@ -223,12 +193,8 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         }
     };
 
-    // Generate UUID for this tokenizer
     let tokenizer_id = TokenizerRegistry::generate_id();
 
-    // Create the job with the pre-generated ID
-    // Note: API-initiated tokenizer loads don't use caching by default
-    // Caching is applied for startup and worker-initiated loads based on router config
     let config = TokenizerConfigRequest {
         id: tokenizer_id.clone(),
         name: request.name.clone(),
@@ -242,7 +208,6 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         config: Box::new(config),
     };
 
-    // Submit the job
     match job_queue.submit(job).await {
         Ok(()) => (
             StatusCode::ACCEPTED,
@@ -273,7 +238,6 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
     }
 }
 
-/// Handle GET /v1/tokenizers
 pub async fn list_tokenizers(registry: &Arc<TokenizerRegistry>) -> Response {
     debug!("List tokenizers request");
 
@@ -291,9 +255,7 @@ pub async fn list_tokenizers(registry: &Arc<TokenizerRegistry>) -> Response {
     Json(ListTokenizersResponse { tokenizers }).into_response()
 }
 
-/// Handle DELETE /v1/tokenizers/{tokenizer_id}
 pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> Response {
-    // Try to remove by ID first, then by name for backward compatibility
     let removed = context
         .tokenizer_registry
         .remove_by_id(tokenizer_id)
@@ -322,11 +284,9 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
     }
 }
 
-/// Handle GET /v1/tokenizers/{tokenizer_id}
 pub async fn get_tokenizer_info(context: &Arc<AppContext>, tokenizer_id: &str) -> Response {
     debug!("Get tokenizer info for '{}'", tokenizer_id);
 
-    // Try by ID first, then by name
     let entry: Option<TokenizerEntry> = context
         .tokenizer_registry
         .get_by_id(tokenizer_id)
@@ -350,11 +310,9 @@ pub async fn get_tokenizer_info(context: &Arc<AppContext>, tokenizer_id: &str) -
     }
 }
 
-/// Handle GET /v1/tokenizers/{tokenizer_id}/status
 pub async fn get_tokenizer_status(context: &Arc<AppContext>, tokenizer_id: &str) -> Response {
     debug!("Get tokenizer status for '{}'", tokenizer_id);
 
-    // First check if tokenizer is already loaded (by ID or name)
     let entry = context
         .tokenizer_registry
         .get_by_id(tokenizer_id)
@@ -370,7 +328,6 @@ pub async fn get_tokenizer_status(context: &Arc<AppContext>, tokenizer_id: &str)
         .into_response();
     }
 
-    // Check job status (jobs are tracked by ID)
     if let Some(job_queue) = context.worker_job_queue.get() {
         if let Some(job_status) = job_queue.get_status(tokenizer_id) {
             return Json(AddTokenizerResponse {
@@ -385,7 +342,6 @@ pub async fn get_tokenizer_status(context: &Arc<AppContext>, tokenizer_id: &str)
         }
     }
 
-    // Not found
     error_response(
         StatusCode::NOT_FOUND,
         &format!("Tokenizer '{}' not found and no pending job", tokenizer_id),

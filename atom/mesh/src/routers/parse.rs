@@ -1,5 +1,3 @@
-//! Parser handlers for function calls and reasoning extraction
-
 use std::sync::Arc;
 
 use axum::{
@@ -14,7 +12,6 @@ use crate::{
     protocols::parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
 };
 
-/// Helper to create error responses
 fn error_response(status: StatusCode, message: &str) -> Response {
     (
         status,
@@ -26,7 +23,6 @@ fn error_response(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
-/// Parse function calls from model output text
 pub async fn parse_function_call(
     ctx: &Arc<AppContext>,
     req: &ParseFunctionCallRequest,
@@ -66,7 +62,6 @@ pub async fn parse_function_call(
     }
 }
 
-/// Parse and separate reasoning from normal text
 pub async fn parse_reasoning(ctx: &Arc<AppContext>, req: &SeparateReasoningRequest) -> Response {
     let Some(factory) = &ctx.reasoning_parser_factory else {
         return error_response(

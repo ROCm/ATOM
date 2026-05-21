@@ -1,5 +1,3 @@
-//! Conversation CRUD handlers for the /v1/conversations API - shared across routers
-
 use std::sync::Arc;
 
 use axum::{
@@ -16,10 +14,6 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::routers::persistence_utils::item_to_json;
-
-// ============================================================================
-// Constants
-// ============================================================================
 
 pub const MAX_METADATA_PROPERTIES: usize = 16;
 const MAX_ITEMS_PER_REQUEST: usize = 20;
@@ -43,10 +37,6 @@ const SUPPORTED_ITEM_TYPES: &[&str] = &[
 ];
 
 const IMPLEMENTED_ITEM_TYPES: &[&str] = &["message", "reasoning", "item_reference"];
-
-// ============================================================================
-// Error Response Helpers
-// ============================================================================
 
 fn bad_request(message: impl Into<String>) -> Response {
     (
@@ -76,10 +66,6 @@ fn bad_request_structured(error_obj: Value) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error": error_obj}))).into_response()
 }
 
-// ============================================================================
-// Storage Helpers
-// ============================================================================
-
 async fn ensure_conversation_exists(
     storage: &Arc<dyn ConversationStorage>,
     conv_id: &ConversationId,
@@ -90,10 +76,6 @@ async fn ensure_conversation_exists(
         Err(e) => Err(internal_error(format!("Failed to get conversation: {e}"))),
     }
 }
-
-// ============================================================================
-// Metadata Operations
-// ============================================================================
 
 fn validate_metadata(value: &Value) -> Result<Option<serde_json::Map<String, Value>>, String> {
     match value.get("metadata") {
@@ -142,10 +124,6 @@ fn apply_metadata_patches(
         Some(result)
     })
 }
-
-// ============================================================================
-// Conversation CRUD Handlers
-// ============================================================================
 
 pub async fn create_conversation(storage: &Arc<dyn ConversationStorage>, body: Value) -> Response {
     let metadata = match validate_metadata(&body) {
@@ -232,10 +210,6 @@ pub async fn delete_conversation(
         Err(e) => internal_error(format!("Failed to delete conversation: {e}")),
     }
 }
-
-// ============================================================================
-// Conversation Item Handlers
-// ============================================================================
 
 pub async fn list_conversation_items(
     conversation_storage: &Arc<dyn ConversationStorage>,
@@ -350,7 +324,6 @@ pub async fn create_conversation_items(
     (StatusCode::OK, Json(response)).into_response()
 }
 
-/// Process a single item for creation/linking
 async fn process_item(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
@@ -362,7 +335,6 @@ async fn process_item(
         .and_then(|v| v.as_str())
         .unwrap_or("message");
 
-    // Handle item_reference specially - just link existing item
     if item_type == "item_reference" {
         return process_item_reference(item_storage, conversation_id, item_val, added_at).await;
     }
@@ -375,7 +347,6 @@ async fn process_item(
         process_new_item(item_storage, item_val).await?
     };
 
-    // Link item to conversation
     if let Err(e) = item_storage
         .link_item(conversation_id, &item.id, added_at)
         .await
@@ -386,7 +357,6 @@ async fn process_item(
     Ok((item_to_json(&item), warning))
 }
 
-/// Process an item_reference - link an existing item to the conversation
 async fn process_item_reference(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
@@ -420,7 +390,6 @@ async fn process_item_reference(
     Ok((item_to_json(&existing_item), None))
 }
 
-/// Process an item with a user-provided ID
 async fn process_item_with_id(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
@@ -429,7 +398,6 @@ async fn process_item_with_id(
 ) -> Result<(ConversationItem, Option<String>), Response> {
     let item_id = ConversationItemId::from(id_str);
 
-    // Check if already linked
     let is_linked = item_storage
         .is_item_linked(conversation_id, &item_id)
         .await
@@ -444,11 +412,9 @@ async fn process_item_with_id(
         })));
     }
 
-    // Check if item exists globally
     match item_storage.get_item(&item_id).await {
         Ok(Some(existing)) => Ok((existing, None)),
         Ok(None) => {
-            // Create new item with the provided ID
             let (mut new_item, warning) = parse_item_from_value(item_val).map_err(bad_request)?;
             new_item.id = Some(item_id);
 
@@ -465,7 +431,6 @@ async fn process_item_with_id(
     }
 }
 
-/// Process a new item without a user-provided ID
 async fn process_new_item(
     item_storage: &Arc<dyn ConversationItemStorage>,
     item_val: &Value,
@@ -541,10 +506,6 @@ pub async fn delete_conversation_item(
         Err(e) => internal_error(format!("Failed to delete item: {e}")),
     }
 }
-
-// ============================================================================
-// Parsing and Serialization
-// ============================================================================
 
 fn parse_item_from_value(
     item_val: &Value,
