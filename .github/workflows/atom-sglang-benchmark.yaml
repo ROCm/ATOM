@@ -42,6 +42,10 @@ on:
         description: "DeepSeek-R1-0528-MXFP4 FP4 TP8 MTP1"
         type: boolean
         default: false
+      deepseek-r1-fp4-mesh:
+        description: "DeepSeek-R1-0528-MXFP4 SGLang-Mesh configs (TP8/DPA, non-MTP + MTP)"
+        type: boolean
+        default: false
       qwen3-5-397b-a17b-fp8-tp4:
         description: "Qwen3.5-397B-A17B-FP8 TP4"
         type: boolean
@@ -50,23 +54,39 @@ on:
         description: "Qwen3.5-397B-A17B-FP8 TP8"
         type: boolean
         default: false
+      workload_label:
+        description: "Workload label to run and publish"
+        type: choice
+        options:
+          - SGLang-OOB
+          - SGLang-Mesh
+        default: SGLang-OOB
+      docker_image:
+        description: "Optional Docker image override. Use this for mori+sglang benchmark images."
+        type: string
+        default: ""
       sglang_image:
-        description: "Optional SGLang benchmark image override. Leave empty to use sglang-latest on main or rebuild from the selected non-main branch."
+        description: "Optional SGLang benchmark image override. Kept for compatibility; docker_image takes precedence when both are set."
         type: string
         default: ""
       publish_to_dashboard:
         description: "Upload benchmark results to the dashboard"
         type: boolean
         default: true
+      upload_to_custom_dashboard:
+        description: "Upload benchmark results to the LLM-Booster dashboard"
+        type: boolean
+        default: true
       param_lists:
         description: |
-          "Benchmark parameter lists.
+          "Optional benchmark parameter lists.
           Input as a single or multiple sets (comma-separated, semicolon between sets),
           format: input_length,output_length,concurrency,random_range_ratio.
+          Leave empty to use workload_label defaults.
           Example (single set): 1024,1024,64,0.8
           Example (multiple sets): 1024,1024,64,0.8;2048,1024,32,0.7"
         type: string
-        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
+        default: ""
 
 jobs:
   resolve-atom-source:
@@ -83,6 +103,8 @@ jobs:
       sglang_base_image: ${{ steps.resolve.outputs.sglang_base_image }}
       sglang_image_source: ${{ steps.resolve.outputs.sglang_image_source }}
       publish_to_dashboard: ${{ steps.resolve.outputs.publish_to_dashboard }}
+      upload_to_custom_dashboard: ${{ steps.resolve.outputs.upload_to_custom_dashboard }}
+      workload_label: ${{ steps.resolve.outputs.workload_label }}
     steps:
       - name: Checkout selected branch
         uses: actions/checkout@v6
@@ -90,8 +112,10 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
-          INPUT_SGLANG_IMAGE: ${{ inputs.sglang_image || '' }}
+          INPUT_SGLANG_IMAGE: ${{ inputs.docker_image || inputs.sglang_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
+          INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
+          INPUT_WORKLOAD_LABEL: ${{ inputs.workload_label || 'SGLang-OOB' }}
         run: |
           set -euo pipefail
 
@@ -122,7 +146,22 @@ jobs:
             SGLANG_IMAGE_SOURCE="rebuild"
           fi
 
-          PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
+          WORKLOAD_LABEL="${INPUT_WORKLOAD_LABEL:-SGLang-OOB}"
+          case "${WORKLOAD_LABEL}" in
+            SGLang-OOB|SGLang-Mesh) ;;
+            *)
+              echo "Unsupported workload_label: ${WORKLOAD_LABEL}. Expected SGLang-OOB or SGLang-Mesh."
+              exit 1
+              ;;
+          esac
+
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            PUBLISH_TO_DASHBOARD=true
+            UPLOAD_TO_CUSTOM_DASHBOARD=true
+          else
+            PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
+            UPLOAD_TO_CUSTOM_DASHBOARD="${INPUT_UPLOAD_TO_CUSTOM_DASHBOARD:-true}"
+          fi
 
           mapfile -t VLLM_META < <(python3 - <<'PY'
           import re
@@ -187,6 +226,8 @@ jobs:
             echo "sglang_base_image=${SGLANG_BASE_IMAGE}"
             echo "sglang_image_source=${SGLANG_IMAGE_SOURCE}"
             echo "publish_to_dashboard=${PUBLISH_TO_DASHBOARD}"
+            echo "upload_to_custom_dashboard=${UPLOAD_TO_CUSTOM_DASHBOARD}"
+            echo "workload_label=${WORKLOAD_LABEL}"
           } >> "$GITHUB_OUTPUT"
 
           printf '### SGLang benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
@@ -241,8 +282,10 @@ jobs:
             esac
           fi
 
-          printf -- '- Upload to dashboard: `%s`\n' \
-            "${PUBLISH_TO_DASHBOARD}" >> "$GITHUB_STEP_SUMMARY"
+          printf -- '- Workload label: `%s`\n- Upload to dashboard: `%s`\n- Upload to LLM-Booster: `%s`\n' \
+            "${WORKLOAD_LABEL}" \
+            "${PUBLISH_TO_DASHBOARD}" \
+            "${UPLOAD_TO_CUSTOM_DASHBOARD}" >> "$GITHUB_STEP_SUMMARY"
 
           if [[ "${PUBLISH_TO_DASHBOARD}" != "true" ]]; then
             printf '\nDashboard upload is disabled by workflow input, so results are kept in artifacts and run summaries only.\n' \
@@ -251,6 +294,7 @@ jobs:
 
   parse-param-lists:
     name: Parse parameter lists
+    needs: [resolve-atom-source]
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
@@ -258,8 +302,19 @@ jobs:
     steps:
       - name: Parse parameter lists
         id: parse-param-lists
+        env:
+          INPUT_PARAM_LISTS: ${{ inputs.param_lists || '' }}
+          WORKLOAD_LABEL: ${{ needs.resolve-atom-source.outputs.workload_label }}
         run: |
-          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8' }}"
+          DEFAULT_OOB_PARAMS="1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
+          DEFAULT_MESH_PARAMS="8192,1,2,0.8;8192,1,4,0.8;8192,1,8,0.8;8192,1,16,0.8;8192,1,32,0.8;8192,1,64,0.8;8192,1,128,0.8;8192,1,256,0.8;1,1024,2,0.8;1,1024,4,0.8;1,1024,8,0.8;1,1024,16,0.8;1,1024,32,0.8;1,1024,64,0.8;1,1024,128,0.8;1,1024,256,0.8;8192,1,1024,0.8;8192,1,2048,0.8;8192,1,4096,0.8;1,1024,1024,0.8;1,1024,2048,0.8;1,1024,4096,0.8"
+          if [[ -n "${INPUT_PARAM_LISTS}" ]]; then
+            PARAM_LISTS="${INPUT_PARAM_LISTS}"
+          elif [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" ]]; then
+            PARAM_LISTS="${DEFAULT_MESH_PARAMS}"
+          else
+            PARAM_LISTS="${DEFAULT_OOB_PARAMS}"
+          fi
           echo "Using param_lists: ${PARAM_LISTS}"
           printf 'param_lists=%s\n' "${PARAM_LISTS}" >> "$GITHUB_OUTPUT"
           IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
@@ -271,13 +326,10 @@ jobs:
             OUTPUT_LEN="${PARAMS[1]}"
             CONCURRENCY="${PARAMS[2]}"
             RANDOM_RANGE_RATIO="${PARAMS[3]}"
-            case "${CONCURRENCY}" in
-              4|8|16|32|64|128|256) ;;
-              *)
-                echo "Unsupported concurrency: ${CONCURRENCY}. Allowed values: 4,8,16,32,64,128,256"
-                exit 1
-                ;;
-            esac
+            if ! [[ "${CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Unsupported concurrency: ${CONCURRENCY}. Expected a positive integer."
+              exit 1
+            fi
             MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
             SEP=","
           done
@@ -290,6 +342,7 @@ jobs:
 
   load-models:
     name: Load SGLang model configs
+    needs: [resolve-atom-source]
     runs-on: ubuntu-latest
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
@@ -307,8 +360,10 @@ jobs:
           ENABLE_DEEPSEEK_R1_FP4_TP8_EP8: ${{ inputs.deepseek-r1-fp4-tp8-ep8 }}
           ENABLE_DEEPSEEK_R1_FP4_TP8_MTP3: ${{ inputs.deepseek-r1-fp4-tp8-mtp3 }}
           ENABLE_DEEPSEEK_R1_FP4_TP8_MTP1: ${{ inputs.deepseek-r1-fp4-tp8-mtp1 }}
+          ENABLE_DEEPSEEK_R1_FP4_MESH: ${{ inputs.deepseek-r1-fp4-mesh }}
           ENABLE_QWEN3_5_397B_A17B_FP8_TP4: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}
           ENABLE_QWEN3_5_397B_A17B_FP8_TP8: ${{ inputs.qwen3-5-397b-a17b-fp8-tp8 }}
+          WORKLOAD_LABEL: ${{ needs.resolve-atom-source.outputs.workload_label }}
         run: |
           set -euo pipefail
 
@@ -326,19 +381,26 @@ jobs:
           )
 
           event = os.environ["GITHUB_EVENT_NAME"]
+          workload_label = os.environ.get("WORKLOAD_LABEL") or "SGLang-OOB"
           selected_group = ""
+
+          def model_workload(model):
+              return str(model.get("workload_label") or "SGLang-OOB")
+
+          def matches_workload(model):
+              return model_workload(model) == workload_label
 
           if event == "schedule":
               weekday = int(os.environ["BEIJING_WEEKDAY"])
               if weekday in (1, 3):
                   selected_group = "A-DEEPSEEK"
-                  selected = [m for m in models if m.get("nightly_group", "A") == "A"]
+                  selected = [m for m in models if m.get("nightly_group", "A") == "A" and matches_workload(m)]
               elif weekday in (2, 4):
                   selected_group = "B-QWEN35"
-                  selected = [m for m in models if m.get("nightly_group") == "B"]
+                  selected = [m for m in models if m.get("nightly_group") == "B" and matches_workload(m)]
               elif weekday == 5:
                   selected_group = "C-ALL"
-                  selected = list(models)
+                  selected = [m for m in models if matches_workload(m)]
               else:
                   selected_group = "SKIP-WEEKEND"
                   selected = []
@@ -352,15 +414,21 @@ jobs:
                   "deepseek-r1-fp4-tp8-ep8": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_EP8", ""),
                   "deepseek-r1-fp4-tp8-mtp3": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_MTP3", ""),
                   "deepseek-r1-fp4-tp8-mtp1": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_MTP1", ""),
+                  "deepseek-r1-fp4-mesh": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_MESH", ""),
                   "qwen3-5-397b-a17b-fp8-tp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP4", ""),
                   "qwen3-5-397b-a17b-fp8-tp8": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP8", ""),
               }
               selected = [
                   model
                   for model in models
-                  if enabled_by_prefix.get(str(model.get("prefix")), "").lower() == "true"
+                  if matches_workload(model)
+                  and enabled_by_prefix.get(
+                      str(model.get("selector_prefix") or model.get("prefix")), ""
+                  ).lower()
+                  == "true"
               ]
 
+          print(f"SGLang workload label: {workload_label}", file=sys.stderr)
           if selected_group:
               print(f"Scheduled SGLang benchmark group: {selected_group}", file=sys.stderr)
           if not selected:
@@ -414,6 +482,13 @@ jobs:
           for model in models:
               supported_pairs = set(model.get("supported_input_output_pairs", []))
               excluded_pairs = set(model.get("excluded_input_output_pairs", []))
+              supported_concurrency_values = {
+                  int(value) for value in model.get("supported_concurrency_values", [])
+              }
+              supported_concurrency_by_pair = {
+                  str(pair): {int(value) for value in values}
+                  for pair, values in model.get("supported_concurrency_values_by_pair", {}).items()
+              }
               model_params = []
               seen = set()
 
@@ -437,6 +512,11 @@ jobs:
                   if supported_pairs and pair not in supported_pairs:
                       continue
                   if pair in excluded_pairs:
+                      continue
+                  pair_concurrency_values = supported_concurrency_by_pair.get(pair)
+                  if pair_concurrency_values and int(param["concurrency"]) not in pair_concurrency_values:
+                      continue
+                  if supported_concurrency_values and int(param["concurrency"]) not in supported_concurrency_values:
                       continue
                   
                   include.append({"model": model, "params": param})
@@ -590,6 +670,7 @@ jobs:
       CONC: ${{ matrix.params.concurrency }}
       RANDOM_RANGE_RATIO: ${{ matrix.params.random_range_ratio }}
       RESULT_FILENAME: ${{ matrix.model.prefix }}-${{ matrix.params.input_length }}-${{ matrix.params.output_length }}-${{ matrix.params.concurrency }}-${{ matrix.params.random_range_ratio }}
+      WORKLOAD_LABEL: ${{ matrix.model.workload_label || needs.resolve-atom-source.outputs.workload_label }}
       CONTAINER_NAME: atom_sglang_benchmark_${{ strategy.job-index }}
       CONTAINER_RESULT_DIR: /tmp/sglang-benchmark-results
       CONTAINER_BENCH_SERVING_DIR: /tmp/sglang-benchmark/bench_serving
@@ -601,6 +682,7 @@ jobs:
       SGLANG_REF_USED: ${{ needs.resolve-atom-source.outputs.selected_sglang_ref }}
       SGLANG_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
       PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
+      UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
     steps:
       - name: Detect container engine
         run: |
@@ -884,6 +966,8 @@ jobs:
             -e SGLANG_IMAGE_SOURCE="${SGLANG_IMAGE_SOURCE}" \
             -e SGLANG_IMAGE_TAG_USED="${SGLANG_IMAGE_TAG}" \
             -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
+            -e UPLOAD_TO_CUSTOM_DASHBOARD="${UPLOAD_TO_CUSTOM_DASHBOARD}" \
+            -e WORKLOAD_LABEL="${WORKLOAD_LABEL}" \
             "$CONTAINER_NAME" python3 - <<'PY'
           import json
           import os
@@ -895,18 +979,31 @@ jobs:
 
           data["random_input_len"] = int(os.environ["ISL"])
           data["random_output_len"] = int(os.environ["OSL"])
-          data["benchmark_backend"] = "ATOM-SGLang"
+          workload_label = os.environ.get("WORKLOAD_LABEL") or "SGLang-OOB"
+          data["workload_label"] = workload_label
+          data["benchmark_backend"] = workload_label
 
           display_name = os.environ.get("DASHBOARD_MODEL_NAME", "")
           if display_name:
               data["benchmark_model_name"] = display_name
 
+          extra_args_text = os.environ.get("EXTRA_ARGS_TEXT", "")
           tp_match = re.search(
-              r"--tensor-parallel-size\s+(\d+)",
-              os.environ.get("EXTRA_ARGS_TEXT", ""),
+              r"(?:--tensor-parallel-size|--tp-size|--tp|(?:^|\s)-tp)\s+(\d+)",
+              extra_args_text,
           )
           if tp_match:
               data["tensor_parallel_size"] = int(tp_match.group(1))
+          dp_match = re.search(
+              r"(?:--data-parallel-size|--dp-size|--dp|(?:^|\s)-dp)\s+(\d+)",
+              extra_args_text,
+          )
+          if dp_match:
+              data["data_parallel_size"] = int(dp_match.group(1))
+          ep_match = re.search(r"--expert-parallel-size\s+(\d+)", extra_args_text)
+          if ep_match:
+              data["expert_parallel_size"] = int(ep_match.group(1))
+          data["enable_dp_attention"] = "--enable-dp-attention" in extra_args_text
 
           data["atom_source_repository"] = os.environ.get("ATOM_SOURCE_REPOSITORY", "")
           data["atom_source_ref"] = os.environ.get("ATOM_SOURCE_REF", "")
@@ -917,6 +1014,9 @@ jobs:
           data["sglang_image_tag"] = os.environ.get("SGLANG_IMAGE_TAG_USED", "")
           data["dashboard_publish_allowed"] = (
               os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
+          )
+          data["custom_dashboard_publish_allowed"] = (
+              os.environ.get("UPLOAD_TO_CUSTOM_DASHBOARD", "false").lower() == "true"
           )
 
           with open(result_path, "w", encoding="utf-8") as f:
@@ -1006,15 +1106,24 @@ jobs:
       - name: Note summary behavior
         run: |
           if [[ "${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}" == "true" ]]; then
-            printf '### Summary mode\nResults from `%s@%s` using `%s` SGLang image mode are shown below as a workflow summary table. Because dashboard upload is enabled for this run, this final Ubuntu summary job collects benchmark artifacts from all completed GPU cases and publishes the available successful results in one pass, then reconciles the completed run for regression comparison.\n' \
+            printf '### Summary mode\nResults from `%s@%s` using `%s` SGLang image mode and `%s` workload are shown below as a workflow summary table. Because dashboard upload is enabled for this run, this final Ubuntu summary job collects benchmark artifacts from all completed GPU cases and publishes the available successful results in one pass, then reconciles the completed run for regression comparison.\n' \
               "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
               "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-              "${{ needs.resolve-atom-source.outputs.sglang_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+              "${{ needs.resolve-atom-source.outputs.sglang_image_source }}" \
+              "${{ needs.resolve-atom-source.outputs.workload_label }}" >> "$GITHUB_STEP_SUMMARY"
           else
-            printf '### Summary mode\nResults from `%s@%s` using `%s` SGLang image mode are shown below as a workflow summary table only. Dashboard upload is disabled for this run.\n' \
+            printf '### Summary mode\nResults from `%s@%s` using `%s` SGLang image mode and `%s` workload are shown below as a workflow summary table only. Dashboard upload is disabled for this run.\n' \
               "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
               "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-              "${{ needs.resolve-atom-source.outputs.sglang_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+              "${{ needs.resolve-atom-source.outputs.sglang_image_source }}" \
+              "${{ needs.resolve-atom-source.outputs.workload_label }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ "${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}" == "true" ]]; then
+            printf 'LLM-Booster dashboard publish is enabled for this run.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'LLM-Booster dashboard publish is disabled for this run.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Generate SGLang benchmark summary table
@@ -1044,6 +1153,274 @@ jobs:
         with:
           name: sglang-benchmark-summary
           path: sglang_benchmark_summary.json
+
+      - name: Note skipped LLM-Booster dashboard publish
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases == '0'
+        run: |
+          printf '\nNo successful benchmark result JSONs were produced, so LLM-Booster dashboard publish was skipped.\n' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check LLM-Booster deploy key
+        id: llmbooster-key
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        env:
+          LLM_BOOSTER_DEPLOY_KEY: ${{ secrets.LLM_BOOSTER_DEPLOY_KEY }}
+        run: |
+          if [[ -n "${LLM_BOOSTER_DEPLOY_KEY}" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::LLM_BOOSTER_DEPLOY_KEY is not configured; skipping LLM-Booster dashboard publish."
+            printf '\nLLM-Booster dashboard publish skipped because secret `LLM_BOOSTER_DEPLOY_KEY` is not configured.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Checkout LLM-Booster dashboard repo
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: ROCm/LLM-Booster
+          ref: main
+          path: llm-booster-repo
+          ssh-key: ${{ secrets.LLM_BOOSTER_DEPLOY_KEY }}
+          fetch-depth: 1
+
+      - name: Build LLM-Booster dashboard files
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
+          ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
+          SGLANG_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.sglang_image_source }}
+          WORKLOAD_LABEL: ${{ needs.resolve-atom-source.outputs.workload_label }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(".")
+          llm_booster_dashboard = root / "llm-booster-repo" / "dashboard"
+          llm_booster_data_dir = llm_booster_dashboard / "data" / "sglang-atom"
+          llm_booster_data_dir.mkdir(parents=True, exist_ok=True)
+
+          sys.path.insert(0, str(llm_booster_dashboard))
+          from update_data import index_root_for, rebuild_index  # noqa: E402
+
+          catalog = json.loads(
+              (root / ".github" / "benchmark" / "sglang_benchmark_models.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          def slugify(text: str) -> str:
+              return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "unknown"
+
+          def precision_from_model(model: str):
+              upper = model.upper()
+              if "MXFP4" in upper or "FP4" in upper:
+                  return "fp4"
+              if "FP8" in upper:
+                  return "fp8"
+              return None
+
+          def model_name_for_variant(variant: dict) -> str:
+              if variant.get("dashboard_model"):
+                  return str(variant["dashboard_model"])
+              display = str(variant["display"])
+              return display.replace(" TP", "-tp").replace(" ", "-")
+
+          prefix_map = {str(item["prefix"]): item for item in catalog}
+
+          def parse_result_filename(path: Path):
+              prefix, isl, osl, concurrency, ratio = path.stem.rsplit("-", 4)
+              return prefix, int(isl), int(osl), int(concurrency), float(ratio) if ratio else 0.0
+
+          grouped = defaultdict(list)
+          for path in sorted(root.glob("*.json")):
+              if path.name in {"sglang_benchmark_summary.json", "regression_report.json"}:
+                  continue
+              try:
+                  payload = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                  continue
+              if "output_throughput" not in payload:
+                  continue
+              custom_dashboard_flag = str(
+                  payload.get("custom_dashboard_publish_allowed", True)
+              ).strip().lower()
+              if custom_dashboard_flag in {"0", "false", "no"}:
+                  continue
+
+              prefix, isl, osl, concurrency, ratio = parse_result_filename(path)
+              variant = prefix_map.get(prefix)
+              if variant is None:
+                  raise SystemExit(f"Unknown benchmark prefix in result file {path.name}: {prefix}")
+
+              model = model_name_for_variant(variant)
+              precision = precision_from_model(model)
+              workload_label = str(
+                  payload.get("workload_label")
+                  or variant.get("workload_label")
+                  or os.environ.get("WORKLOAD_LABEL")
+                  or "SGLang-OOB"
+              )
+              backend = str(payload.get("benchmark_backend") or workload_label)
+              atom_source_sha = str(payload.get("atom_source_sha", "")) or "unknown"
+              sha7 = atom_source_sha[:7] if atom_source_sha else "unknown"
+              day = time.strftime("%Y-%m-%d", time.gmtime())
+              grouped[(day, sha7, backend, model, isl, osl)].append(
+                  (path, payload, precision, concurrency, ratio)
+              )
+
+          written_files = set()
+          for (day, sha7, backend, model, isl, osl), entries in sorted(grouped.items()):
+              entries.sort(key=lambda item: (item[3], item[4]))
+              timestamp_ms = int(time.time() * 1000)
+              precision = entries[0][2]
+              first_payload = entries[0][1]
+              tp = first_payload.get("tensor_parallel_size")
+              dp = first_payload.get("data_parallel_size", 1)
+              ep = first_payload.get("expert_parallel_size")
+              try:
+                  tp_int = int(tp) if tp not in (None, "", 0) else None
+              except (TypeError, ValueError):
+                  tp_int = None
+              try:
+                  dp_int = int(dp) if dp not in (None, "", 0) else 1
+              except (TypeError, ValueError):
+                  dp_int = 1
+              try:
+                  ep_int = int(ep) if ep not in (None, "", 0) else None
+              except (TypeError, ValueError):
+                  ep_int = None
+
+              enable_dp_attention = bool(first_payload.get("enable_dp_attention"))
+              total_gpu = (tp_int or 1) if enable_dp_attention else (tp_int or 1) * max(dp_int, 1)
+              model_slug = slugify(model)
+              backend_slug = slugify(backend)
+              run_id = (
+                  f"atom_sglang_{backend_slug}_{day.replace('-', '')}_{model_slug}_"
+                  f"isl{isl}_osl{osl}_{sha7}_{os.environ['GITHUB_RUN_ID']}"
+              )
+              config_label = f"atom-sglang_{backend_slug}_{model_slug}"
+              if precision:
+                  config_label += f"_{precision}"
+              if tp_int:
+                  config_label += f"_tp{tp_int}"
+              if dp_int and dp_int != 1:
+                  config_label += f"_dp{dp_int}"
+              if ep_int:
+                  config_label += f"_ep{ep_int}"
+
+              points = []
+              for _, payload, precision, concurrency, ratio in entries:
+                  output_tput = payload.get("output_throughput")
+                  total_tput = payload.get("total_token_throughput")
+                  points.append(
+                      {
+                          "isl": isl,
+                          "osl": osl,
+                          "concurrency": concurrency,
+                          "ratio": ratio,
+                          "client_bench": "sglang bench_serving",
+                          "ttft_ms": payload.get("mean_ttft_ms"),
+                          "ttft_p99": payload.get("p99_ttft_ms"),
+                          "tpot_ms": payload.get("mean_tpot_ms"),
+                          "tpot_p99": payload.get("p99_tpot_ms"),
+                          "itl_ms": payload.get("mean_itl_ms"),
+                          "e2el_ms": payload.get("mean_e2el_ms"),
+                          "interactivity": (output_tput / concurrency) if output_tput and concurrency else None,
+                          "tput_per_gpu": (total_tput / total_gpu) if total_tput and total_gpu else None,
+                          "output_tput_per_gpu": (output_tput / total_gpu) if output_tput and total_gpu else None,
+                          "input_tput_per_gpu": None,
+                          "output_tput": output_tput,
+                          "total_tput": total_tput,
+                          "req_tput": payload.get("request_throughput"),
+                          "completed": payload.get("completed"),
+                          "duration": payload.get("duration"),
+                          "num_prompts": payload.get("num_prompts"),
+                          "prefill_tp": None,
+                          "decode_tp": None,
+                          "tensor_parallel_size": tp_int,
+                          "data_parallel_size": dp_int,
+                          "expert_parallel_size": ep_int,
+                          "enable_dp_attention": payload.get("enable_dp_attention"),
+                          "num_prefill_gpu": None,
+                          "num_decode_gpu": None,
+                          "total_gpu": total_gpu,
+                          "gpu_name": payload.get("gpu_name"),
+                          "image": payload.get("sglang_image_tag") or payload.get("docker_image"),
+                          "rocm": payload.get("rocm_version"),
+                          "run_url": os.environ["RUN_URL"],
+                          "model_path": payload.get("model_id"),
+                          "point_date": day,
+                          "precision": precision,
+                          "hardware": "mi355x",
+                      }
+                  )
+
+              run = {
+                  "run_id": run_id,
+                  "date": day,
+                  "timestamp": timestamp_ms,
+                  "model": model,
+                  "backend": backend,
+                  "config_label": config_label,
+                  "precision": precision,
+                  "source": "ATOM Dashboard",
+                  "client_bench": "sglang bench_serving",
+                  "hardware": "mi355x",
+                  "commit": {
+                      "id": first_payload.get("atom_source_sha"),
+                      "message": f"ATOM benchmark run {os.environ['GITHUB_RUN_ID']}",
+                      "timestamp": datetime.now(timezone.utc).isoformat(),
+                      "url": f"https://github.com/{os.environ['ATOM_SOURCE_REPOSITORY']}/commit/{first_payload.get('atom_source_sha', '')}",
+                      "author": {},
+                      "committer": {},
+                  },
+                  "points": points,
+                  "gsm8k": None,
+              }
+
+              run_file = llm_booster_data_dir / f"{run_id}.json"
+              run_file.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+              written_files.add(run_file)
+
+          rebuild_index(index_root_for(llm_booster_data_dir))
+          print(f"Wrote {len(written_files)} LLM-Booster ATOM SGLang run files.")
+          PY
+
+      - name: Upload LLM-Booster dashboard preview artifact
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-benchmark-llm-booster-preview
+          path: |
+            llm-booster-repo/dashboard/data/index.json
+            llm-booster-repo/dashboard/data/sglang-atom/*.json
+
+      - name: Push LLM-Booster dashboard data
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        working-directory: llm-booster-repo
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
+        run: |
+          git add dashboard/data/index.json dashboard/data/sglang-atom
+          if git diff --cached --quiet; then
+            echo "No LLM-Booster dashboard data changes to push."
+            exit 0
+          fi
+          git commit -m "Update ATOM SGLang benchmark dashboard data"
+          git push origin HEAD:main
 
       - name: Download baseline from previous successful main run
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
