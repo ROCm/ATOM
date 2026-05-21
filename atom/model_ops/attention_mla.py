@@ -492,7 +492,16 @@ class MLAAttention(nn.Module):
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
-            if self.kv_cache_dtype.startswith("fp8"):
+            # fp8 mla_decode_fwd only has dispatch entries for q_len <= 4 and is
+            # numerically broken even at q_len=4 (see probe_mla_decode_long_q).
+            # The bf16 absorbed prefill kernel works at any q_len, so for the
+            # dense prefix-cache prefill path (no DSA, large q_len) we dequant
+            # fp8 KV to bf16 on the fly and route through mla_prefill_fwd.
+            use_fp8_decode = (
+                self.kv_cache_dtype.startswith("fp8")
+                and self.topk_indices_buffer is not None
+            )
+            if use_fp8_decode:
                 mla_decode_fwd(
                     q,
                     kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
@@ -507,13 +516,39 @@ class MLAAttention(nn.Module):
                     kv_scale=self._k_scale,
                 )
             else:
+                if self.kv_cache_dtype.startswith("fp8"):
+                    # paged_kv_indices is a persistent buffer sized for
+                    # max_bs * max_num_blocks_per_seq; only the first total_kv
+                    # entries are live (kernels read via kv_indptr). Slice
+                    # before the explicit gather or we materialize the whole
+                    # persistent buffer in fp32 and OOM.
+                    active_kv = int(attn_metadata.total_kv)
+                    k_scale = self._k_scale.to(q.device, non_blocking=True)
+                    q_scale = self._q_scale.to(q.device, non_blocking=True)
+                    gathered_fp8 = kv_c_and_k_pe_cache.view(-1, q.shape[-1])[
+                        paged_kv_indices[:active_kv].long()
+                    ]
+                    gathered_bf16 = (gathered_fp8.to(torch.float32) * k_scale).to(
+                        self.dtype
+                    )
+                    kv_buffer = gathered_bf16.view(-1, 1, 1, q.shape[-1])
+                    kv_indices = torch.arange(
+                        active_kv,
+                        dtype=torch.int32,
+                        device=q.device,
+                    )
+                    q_in = (q.to(torch.float32) * q_scale).to(self.dtype)
+                else:
+                    kv_buffer = kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1])
+                    kv_indices = paged_kv_indices
+                    q_in = q
                 mla_prefill_fwd(
-                    q,
-                    kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+                    q_in,
+                    kv_buffer,
                     o,
                     paged_cu_seqlens_q,
                     paged_kv_indptr,
-                    paged_kv_indices,
+                    kv_indices,
                     kv_last_page_lens,
                     max_q_len,
                     self.scale,
@@ -686,6 +721,11 @@ class MLAAttention(nn.Module):
         use_prefill_mla = (
             self.topk_indices_buffer is not None
             and attn_metadata.max_seqlen_k > self.topk_indices_buffer.shape[1]
+        ) or (
+            context.is_prefill
+            and attn_metadata.has_cached
+            and attn_metadata.total_kv is not None
+            and attn_metadata.total_kv > envs.ATOM_MLA_PREFILL_KV_THRESHOLD
         )
         if forward_context.context.is_dummy_run:
             output_shape = list(q.shape)
