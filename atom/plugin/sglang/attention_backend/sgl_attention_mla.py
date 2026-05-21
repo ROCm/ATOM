@@ -16,6 +16,7 @@ natively by ATOM's attention ops, making this sglang-specific module unnecessary
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import torch
@@ -23,6 +24,7 @@ from aiter import dtypes
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size, get_tp_group
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mla import (
+    concat_and_cache_mla,
     dynamic_per_batched_tensor_quant,
     fused_qk_rope_concat_and_cache_mla,
 )
@@ -57,6 +59,9 @@ from sglang.srt.utils import bind_or_assign, get_bool_env_var
 
 if TYPE_CHECKING:
     from atom.models.deepseek_v2 import DeepseekV2MLAAttention
+
+
+logger = logging.getLogger(__name__)
 
 
 # bmm_fp8 custom-op wrapper (adapted from sglang forward_mla.py)
@@ -625,6 +630,34 @@ def _get_sglang_radix_attn(attn_module):
     return attn_module.attn if hasattr(attn_module, "attn") else attn_module
 
 
+def _concat_mha_k_for_sgl_mha(
+    attn: DeepseekV2MLAAttention,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> torch.Tensor:
+    k = k_nope.new_empty(
+        k_nope.shape[0],
+        attn.num_local_heads,
+        attn.qk_nope_head_dim + attn.qk_rope_head_dim,
+    )
+
+    try:
+        from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
+    except ImportError as exc:
+        logger.warning(
+            "Unable to import concat_and_cast_mha_k_triton; "
+            "falling back to torch native MHA K concat: %s",
+            exc,
+        )
+    else:
+        concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+        return k
+
+    k[..., : attn.qk_nope_head_dim] = k_nope
+    k[..., attn.qk_nope_head_dim :] = k_pe
+    return k
+
+
 def _set_mla_kv_buffer_for_mha(
     attn: DeepseekV2MLAAttention,
     kv_a: torch.Tensor,
@@ -632,12 +665,17 @@ def _set_mla_kv_buffer_for_mha(
     forward_batch,
 ) -> None:
     attn_mha = _get_sglang_radix_attn(attn.attn_mha)
-    cache_k = torch.cat([kv_a.unsqueeze(1), k_pe], dim=-1)
-    forward_batch.token_to_kv_pool.set_kv_buffer(
-        attn_mha,
-        forward_batch.out_cache_loc,
-        cache_k,
-        cache_k,
+
+    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(attn_mha.layer_id)
+    concat_and_cache_mla(
+        kv_a,
+        k_pe.squeeze(1),
+        kv_cache,
+        forward_batch.out_cache_loc.flatten(),
+        kv_cache_dtype=(
+            "fp8" if str(attn.kv_cache_dtype).startswith("fp8") else "auto"
+        ),
+        scale=attn_mha.k_scale,
     )
 
 
@@ -771,10 +809,7 @@ def forward_sgl_mha_prepare(
     kv = kv.view(-1, attn.num_local_heads, attn.qk_nope_head_dim + attn.v_head_dim)
     k_nope = kv[..., : attn.qk_nope_head_dim]
     v = kv[..., attn.qk_nope_head_dim :]
-    k = torch.cat(
-        [k_nope, k_pe.expand(-1, attn.num_local_heads, -1)],
-        dim=-1,
-    )
+    k = _concat_mha_k_for_sgl_mha(attn, k_nope, k_pe)
     return SglMhaPrepareResult(q=q, k=k, v=v, forward_batch=forward_batch)
 
 
