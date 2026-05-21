@@ -1,4 +1,4 @@
-//! Aggregate a `WorkerStream<TokenChunk>` into a non-streaming
+//! Aggregate a `TokenHandle<TokenChunk>` into a non-streaming
 //! `ChatCompletionResponse`.
 
 use std::sync::Arc;
@@ -27,10 +27,10 @@ use crate::{
             },
         },
         render::logprob_conversion::token_logprobs_to_chat,
-        worker_stream::{
+        token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
-            worker_stream::WorkerStream,
+            token_handle::TokenHandle,
         },
     },
     tokenizer::{
@@ -40,7 +40,7 @@ use crate::{
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
-pub async fn process(stream: WorkerStream, ctx: ResponseContext) -> Response {
+pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
     match process_typed(stream, ctx).await {
         Ok(resp) => axum::Json(resp).into_response(),
         Err(resp) => resp,
@@ -48,7 +48,7 @@ pub async fn process(stream: WorkerStream, ctx: ResponseContext) -> Response {
 }
 
 pub async fn process_typed(
-    stream: WorkerStream,
+    stream: TokenHandle,
     ctx: ResponseContext,
 ) -> Result<ChatCompletionResponse, Response> {
     let chat_request = match &ctx.original {
@@ -149,7 +149,7 @@ pub async fn process_typed(
     Ok(response)
 }
 
-async fn collect_completes(mut stream: WorkerStream) -> Result<Vec<TokenChunk>, Response> {
+async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {
     let mut completes = Vec::new();
     while let Some(item) = stream.next().await {
         match item {

@@ -1,4 +1,4 @@
-//! Transport-neutral response rendering: WorkerStream<TokenChunk> + ResponseContext → axum::Response.
+//! Transport-neutral response rendering: TokenHandle<TokenChunk> + ResponseContext → axum::Response.
 
 pub mod chat_aggregator;
 pub mod chat_streaming;

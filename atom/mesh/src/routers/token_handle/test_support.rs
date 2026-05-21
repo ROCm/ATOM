@@ -1,8 +1,8 @@
-//! Synthetic `WorkerStream` builders used by `worker_stream/tests.rs`,
+//! Synthetic `TokenHandle` builders used by `token_handle/tests.rs`,
 //! `tests/grpc_pd_merge_tests.rs`, and `tests/grpc_engine_drop_tests.rs`.
 //!
 //! Always-compiled (not `cfg(test)`-gated) so integration-test binaries can
-//! reach the helpers via `mesh::routers::worker_stream::test_support::*`.
+//! reach the helpers via `mesh::routers::token_handle::test_support::*`.
 
 #![allow(dead_code)]
 
@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use super::engine_error::EngineError;
 use super::token_chunk::TokenChunk;
-use super::worker_stream::{TokenSource, WorkerStream};
+use super::token_handle::{TokenSource, TokenHandle};
 
 #[derive(Debug)]
 pub enum ScriptedItem {
@@ -71,31 +71,31 @@ impl TokenSource for ScriptedSource {
 
 pub fn scripted_stream_with_poll_counter(
     items: Vec<ScriptedItem>,
-) -> (WorkerStream, Arc<AtomicUsize>) {
+) -> (TokenHandle, Arc<AtomicUsize>) {
     let src = ScriptedSource::new(items);
     let counter = src.poll_count.clone();
-    (WorkerStream::new(src), counter)
+    (TokenHandle::new(src), counter)
 }
 
 pub fn scripted_stream_with_drop_observer(
     items: Vec<ScriptedItem>,
-) -> (WorkerStream, Arc<AtomicUsize>, Arc<AtomicBool>) {
+) -> (TokenHandle, Arc<AtomicUsize>, Arc<AtomicBool>) {
     let src = ScriptedSource::new(items);
     let poll = src.poll_count.clone();
     let drop_obs = src.drop_observed.clone();
-    (WorkerStream::new(src), poll, drop_obs)
+    (TokenHandle::new(src), poll, drop_obs)
 }
 
 pub fn scripted_with_mark_completed(
     items: Vec<ScriptedItem>,
-) -> (WorkerStream, Arc<AtomicBool>, Arc<AtomicBool>) {
+) -> (TokenHandle, Arc<AtomicBool>, Arc<AtomicBool>) {
     let src = ScriptedSource::new(items);
     let mark_obs = src.mark_completed_observed.clone();
     let drop_obs = src.drop_observed.clone();
-    (WorkerStream::new(src), mark_obs, drop_obs)
+    (TokenHandle::new(src), mark_obs, drop_obs)
 }
 
-pub fn synthetic_single_stream(chunks: Vec<Result<TokenChunk, EngineError>>) -> WorkerStream {
+pub fn synthetic_single_stream(chunks: Vec<Result<TokenChunk, EngineError>>) -> TokenHandle {
     let items = chunks
         .into_iter()
         .map(|r| match r {
@@ -110,7 +110,7 @@ pub fn synthetic_single_stream(chunks: Vec<Result<TokenChunk, EngineError>>) -> 
 pub fn synthetic_pd_stream(
     prefill: Vec<Result<TokenChunk, EngineError>>,
     decode: Vec<Result<TokenChunk, EngineError>>,
-) -> (WorkerStream, WorkerStream) {
+) -> (TokenHandle, TokenHandle) {
     (
         synthetic_single_stream(prefill),
         synthetic_single_stream(decode),
@@ -133,8 +133,8 @@ impl TokenSource for ChannelSource {
     fn mark_completed(&mut self) {}
 }
 
-pub fn single_from_receiver(rx: mpsc::Receiver<Result<TokenChunk, EngineError>>) -> WorkerStream {
-    WorkerStream::new(ChannelSource { rx })
+pub fn single_from_receiver(rx: mpsc::Receiver<Result<TokenChunk, EngineError>>) -> TokenHandle {
+    TokenHandle::new(ChannelSource { rx })
 }
 
 struct CountedDropSource {
@@ -159,8 +159,8 @@ impl TokenSource for CountedDropSource {
     fn mark_completed(&mut self) {}
 }
 
-pub fn counted_drop_stream(counter: Arc<AtomicUsize>) -> WorkerStream {
-    WorkerStream::new(CountedDropSource { counter })
+pub fn counted_drop_stream(counter: Arc<AtomicUsize>) -> TokenHandle {
+    TokenHandle::new(CountedDropSource { counter })
 }
 
 struct PendingForever {
@@ -180,10 +180,10 @@ impl TokenSource for PendingForever {
     fn mark_completed(&mut self) {}
 }
 
-pub fn pending_forever_stream() -> (WorkerStream, Arc<AtomicUsize>) {
+pub fn pending_forever_stream() -> (TokenHandle, Arc<AtomicUsize>) {
     let counter = Arc::new(AtomicUsize::new(0));
     let src = PendingForever {
         poll_count: counter.clone(),
     };
-    (WorkerStream::new(src), counter)
+    (TokenHandle::new(src), counter)
 }

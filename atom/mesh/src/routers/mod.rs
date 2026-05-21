@@ -32,7 +32,7 @@ pub mod render;
 pub mod router_manager;
 pub mod shared;
 pub mod tokenize;
-pub mod worker_stream;
+pub mod token_handle;
 
 pub use factory::RouterFactory;
 

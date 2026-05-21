@@ -9,7 +9,7 @@ use mesh_grpc::sglang_proto::{
 use crate::routers::grpc::engine::proto_stream_wrapper::{
     ProtoGenerateComplete, ProtoGenerateStreamChunk,
 };
-use crate::routers::worker_stream::token_chunk::{
+use crate::routers::token_handle::token_chunk::{
     FinishReason, InputLogprobs, MatchedStop, TokenChunk, TokenLogprob, TokenLogprobs, Usage,
     WorkerMeta,
 };

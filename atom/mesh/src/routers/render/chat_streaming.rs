@@ -1,4 +1,4 @@
-//! Stream a `WorkerStream<TokenChunk>` as Server-Sent Events for
+//! Stream a `TokenHandle<TokenChunk>` as Server-Sent Events for
 //! `ChatCompletionStreamResponse`.
 
 use std::{io, sync::Arc, time::Instant};
@@ -29,10 +29,10 @@ use crate::{
             tool_constraints::{generate_tool_call_id, get_history_tool_calls_count},
         },
         render::logprob_conversion::token_logprobs_to_chat,
-        worker_stream::{
+        token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
-            worker_stream::WorkerStream,
+            token_handle::TokenHandle,
         },
     },
     tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder},
@@ -44,7 +44,7 @@ pub(crate) struct ChatStreamConfig {
 }
 
 pub fn process(
-    stream: WorkerStream,
+    stream: TokenHandle,
     ctx: ResponseContext,
     backend_label: &'static str,
 ) -> Response {
@@ -71,7 +71,7 @@ pub fn process(
 }
 
 async fn run_chat_stream(
-    mut stream: WorkerStream,
+    mut stream: TokenHandle,
     ctx: ResponseContext,
     chat_request: Arc<ChatCompletionRequest>,
     cfg: ChatStreamConfig,

@@ -20,9 +20,9 @@ use crate::routers::grpc::engine::proto_stream_wrapper::{
 };
 use crate::routers::grpc::engine::worker_client_cache::{get_grpc_client_from_worker, GrpcClient};
 use crate::routers::prepare::generation_payload::GenerationPayload;
-use crate::routers::worker_stream::engine_error::EngineError;
-use crate::routers::worker_stream::token_chunk::TokenChunk;
-use crate::routers::worker_stream::worker_stream::{TokenSource, WorkerStream};
+use crate::routers::token_handle::engine_error::EngineError;
+use crate::routers::token_handle::token_chunk::TokenChunk;
+use crate::routers::token_handle::token_handle::{TokenSource, TokenHandle};
 
 pub use pd_stream_merge::merge_pd_streams;
 
@@ -35,13 +35,13 @@ impl GrpcEngine {
     }
 
     /// Build the proto, dial the worker(s), and hand back a single
-    /// `WorkerStream` for the render layer to consume. PD pairs are merged
+    /// `TokenHandle` for the render layer to consume. PD pairs are merged
     /// internally so the render layer never sees two upstreams.
     pub async fn dispatch(
         &self,
         placement: &PlacementPlan,
         payload: &GenerationPayload,
-    ) -> Result<WorkerStream, EngineError> {
+    ) -> Result<TokenHandle, EngineError> {
         match placement {
             PlacementPlan::Single { worker, .. } => {
                 self.dispatch_one(worker, payload, ProtoErrorRole::Worker)
@@ -70,7 +70,7 @@ impl GrpcEngine {
         worker: &Arc<dyn Worker>,
         payload: &GenerationPayload,
         role: ProtoErrorRole,
-    ) -> Result<WorkerStream, EngineError> {
+    ) -> Result<TokenHandle, EngineError> {
         let mut client = get_grpc_client_from_worker(worker)
             .await
             .map_err(|_| EngineError::ConnectionAcquireFailed(worker.url().to_string()))?;
@@ -89,7 +89,7 @@ impl GrpcEngine {
             .await
             .map_err(|e| EngineError::RequestBuildFailed(e.to_string()))?;
 
-        Ok(WorkerStream::new(ProtoStreamSource::new(stream, role)))
+        Ok(TokenHandle::new(ProtoStreamSource::new(stream, role)))
     }
 }
 

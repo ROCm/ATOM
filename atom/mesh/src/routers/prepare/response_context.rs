@@ -1,5 +1,5 @@
 //! Transport-neutral response context: everything the render layer needs to
-//! turn `WorkerStream<TokenChunk>` into an HTTP `Response`. Built by the
+//! turn `TokenHandle<TokenChunk>` into an HTTP `Response`. Built by the
 //! `prepare_chat` / `prepare_generate` helpers alongside `GenerationPayload`.
 
 use std::sync::Arc;

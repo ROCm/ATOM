@@ -1,4 +1,4 @@
-//! Aggregate a `WorkerStream<TokenChunk>` into a non-streaming
+//! Aggregate a `TokenHandle<TokenChunk>` into a non-streaming
 //! `Vec<GenerateResponse>` (SGLang native generate format).
 
 use std::time::Instant;
@@ -13,16 +13,16 @@ use crate::{
         error,
         prepare::response_context::{ProtocolRequest, ResponseContext},
         render::logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
-        worker_stream::{
+        token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
-            worker_stream::WorkerStream,
+            token_handle::TokenHandle,
         },
     },
     tokenizer::stop::SequenceDecoderOutput,
 };
 
-pub async fn process(stream: WorkerStream, ctx: ResponseContext) -> Response {
+pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
     let start = Instant::now();
 
     if !matches!(&ctx.original, ProtocolRequest::Generate(_)) {
@@ -137,7 +137,7 @@ pub async fn process(stream: WorkerStream, ctx: ResponseContext) -> Response {
     axum::Json(result_array).into_response()
 }
 
-async fn collect_completes(mut stream: WorkerStream) -> Result<Vec<TokenChunk>, Response> {
+async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {
     let mut completes = Vec::new();
     while let Some(item) = stream.next().await {
         match item {

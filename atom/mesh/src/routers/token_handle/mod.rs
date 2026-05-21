@@ -1,10 +1,10 @@
-//! Transport-neutral engine boundary types: TokenChunk, WorkerStream, EngineError.
+//! Transport-neutral engine boundary types: TokenChunk, TokenHandle, EngineError.
 
 pub mod engine_error;
 pub mod test_support;
 pub mod token_chunk;
 #[allow(clippy::module_inception)]
-pub mod worker_stream;
+pub mod token_handle;
 
 #[cfg(test)]
 mod tests;

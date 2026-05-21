@@ -31,7 +31,7 @@ use crate::{
         shared::{
             metrics_utils::error_type_from_status, placement_response::placement_err_to_response,
         },
-        worker_stream::engine_error::EngineError,
+        token_handle::engine_error::EngineError,
     },
 };
 

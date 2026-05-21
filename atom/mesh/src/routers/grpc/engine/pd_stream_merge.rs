@@ -1,5 +1,5 @@
 //! `merge_pd_streams` — state machine that combines prefill + decode worker
-//! streams into one `WorkerStream`. See
+//! streams into one `TokenHandle`. See
 //! `docs/2026-05-19-grpc-pd-merge-spec.md` §3 for the binding semantics.
 
 use std::pin::Pin;
@@ -7,15 +7,15 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 
-use crate::routers::worker_stream::engine_error::EngineError;
-use crate::routers::worker_stream::token_chunk::{InputLogprobs, TokenChunk};
-use crate::routers::worker_stream::worker_stream::{TokenSource, WorkerStream};
+use crate::routers::token_handle::engine_error::EngineError;
+use crate::routers::token_handle::token_chunk::{InputLogprobs, TokenChunk};
+use crate::routers::token_handle::token_handle::{TokenSource, TokenHandle};
 
 pub fn merge_pd_streams(
-    prefill: WorkerStream,
-    decode: WorkerStream,
+    prefill: TokenHandle,
+    decode: TokenHandle,
     need_input_logprobs: bool,
-) -> WorkerStream {
+) -> TokenHandle {
     let state = if need_input_logprobs {
         State::WaitingPrefill
     } else {
@@ -23,7 +23,7 @@ pub fn merge_pd_streams(
             pending_input_logprobs: None,
         }
     };
-    WorkerStream::new(PdMerger {
+    TokenHandle::new(PdMerger {
         prefill: Some(prefill),
         decode: Some(decode),
         state,
@@ -31,8 +31,8 @@ pub fn merge_pd_streams(
 }
 
 struct PdMerger {
-    prefill: Option<WorkerStream>,
-    decode: Option<WorkerStream>,
+    prefill: Option<TokenHandle>,
+    decode: Option<TokenHandle>,
     state: State,
 }
 

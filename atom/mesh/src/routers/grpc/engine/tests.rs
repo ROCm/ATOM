@@ -349,7 +349,7 @@ mod b_proto_to_chunk {
         sglang_chunk_to_chunk, sglang_complete_to_chunk, vllm_chunk_to_chunk,
         vllm_complete_to_chunk,
     };
-    use crate::routers::worker_stream::token_chunk::{FinishReason, MatchedStop, TokenChunk};
+    use crate::routers::token_handle::token_chunk::{FinishReason, MatchedStop, TokenChunk};
 
     fn sg_complete(token_ids: Vec<u32>) -> sglang_proto::GenerateComplete {
         sglang_proto::GenerateComplete {
@@ -622,11 +622,11 @@ mod d_pd_stream_merge {
     use futures::StreamExt;
 
     use crate::routers::grpc::engine::pd_stream_merge::merge_pd_streams;
-    use crate::routers::worker_stream::engine_error::EngineError;
-    use crate::routers::worker_stream::test_support::{
+    use crate::routers::token_handle::engine_error::EngineError;
+    use crate::routers::token_handle::test_support::{
         scripted_stream_with_drop_observer, scripted_stream_with_poll_counter, ScriptedItem,
     };
-    use crate::routers::worker_stream::token_chunk::{
+    use crate::routers::token_handle::token_chunk::{
         FinishReason, InputLogprobs, TokenChunk, TokenLogprob, Usage, WorkerMeta,
     };
 
@@ -861,7 +861,7 @@ mod d_pd_stream_merge {
 
     #[tokio::test]
     async fn pd_merge_t7_pending_prefill_blocks_decode_until_timeout() {
-        let (prefill, _) = crate::routers::worker_stream::test_support::pending_forever_stream();
+        let (prefill, _) = crate::routers::token_handle::test_support::pending_forever_stream();
         let (decode, _) = scripted_stream_with_poll_counter(vec![
             ScriptedItem::Ok(partial(1)),
             ScriptedItem::Ok(complete_with_input_logprobs(None)),
@@ -873,7 +873,7 @@ mod d_pd_stream_merge {
             "T7 documents that the merger has NO internal timeout — \
              pending prefill blocks decode yields"
         );
-        // Dropping the WorkerStream cleanly aborts both upstreams (covered by T6).
+        // Dropping the TokenHandle cleanly aborts both upstreams (covered by T6).
     }
 
     #[tokio::test]
@@ -915,7 +915,7 @@ mod e_engine_dispatch {
     use crate::routers::prepare::generation_payload::{
         GenerationPayload, LogprobConfig, SamplingParams, StopConfig,
     };
-    use crate::routers::worker_stream::engine_error::EngineError;
+    use crate::routers::token_handle::engine_error::EngineError;
 
     fn engine() -> GrpcEngine {
         unimplemented!("GrpcEngine fixture with in-memory ClientRegistry")
@@ -954,7 +954,7 @@ mod e_engine_dispatch {
     }
 
     #[tokio::test]
-    async fn test_dispatch_single_returns_worker_stream() {
+    async fn test_dispatch_single_returns_token_handle() {
         let e = engine();
         let plan = PlacementPlan::Single {
             worker: fake_worker("http://w:8000"),
@@ -1031,17 +1031,17 @@ mod e_engine_dispatch {
 
 mod f_drop_propagation {
     //! Plan D10/D11 — Drop propagation in single + PD modes after construction
-    //! via the engine. Distinct from the inline drop tests in worker_stream/tests.rs::c
+    //! via the engine. Distinct from the inline drop tests in token_handle/tests.rs::c
     //! because here the stream is owned by an engine-internal wrapper.
 
     use std::sync::atomic::Ordering;
 
     use crate::routers::grpc::engine::pd_stream_merge::merge_pd_streams;
-    use crate::routers::worker_stream::engine_error::EngineError;
-    use crate::routers::worker_stream::test_support::{
+    use crate::routers::token_handle::engine_error::EngineError;
+    use crate::routers::token_handle::test_support::{
         scripted_stream_with_drop_observer, ScriptedItem,
     };
-    use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn done() -> TokenChunk {
         TokenChunk::Complete {
@@ -1086,7 +1086,7 @@ mod f_drop_propagation {
         // Invariant I4 — on clean exit, prefill is mark_completed() so its
         // AbortOnDrop wrapper does NOT send a cancellation.
         let (p, mark_completed_observed, p_drop) =
-            crate::routers::worker_stream::test_support::scripted_with_mark_completed(vec![
+            crate::routers::token_handle::test_support::scripted_with_mark_completed(vec![
                 ScriptedItem::Ok(done()),
             ]);
         let (d, _, _) = scripted_stream_with_drop_observer(vec![ScriptedItem::Ok(done())]);
@@ -1105,7 +1105,7 @@ mod f_drop_propagation {
     async fn test_non_clean_exit_does_not_mark_completed() {
         // Invariant I5
         let (p, mark_completed_observed, _) =
-            crate::routers::worker_stream::test_support::scripted_with_mark_completed(vec![
+            crate::routers::token_handle::test_support::scripted_with_mark_completed(vec![
                 ScriptedItem::Err(EngineError::Prefill(Default::default())),
             ]);
         let (d, _, _) = scripted_stream_with_drop_observer(vec![ScriptedItem::Ok(done())]);

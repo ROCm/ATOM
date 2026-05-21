@@ -1,4 +1,4 @@
-//! Stream a `WorkerStream<TokenChunk>` as SGLang-style SSE for the
+//! Stream a `TokenHandle<TokenChunk>` as SGLang-style SSE for the
 //! `/generate` endpoint.
 
 use std::{io, sync::Arc, time::Instant};
@@ -18,10 +18,10 @@ use crate::{
     routers::{
         prepare::response_context::{ProtocolRequest, ResponseContext},
         render::logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
-        worker_stream::{
+        token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, TokenChunk},
-            worker_stream::WorkerStream,
+            token_handle::TokenHandle,
         },
     },
     tokenizer::traits::Tokenizer,
@@ -32,7 +32,7 @@ pub(crate) struct GenerateStreamConfig {
 }
 
 pub fn process(
-    stream: WorkerStream,
+    stream: TokenHandle,
     ctx: ResponseContext,
     backend_label: &'static str,
 ) -> Response {
@@ -78,7 +78,7 @@ pub fn process(
 }
 
 async fn run_generate_stream(
-    mut stream: WorkerStream,
+    mut stream: TokenHandle,
     tokenizer: Arc<dyn Tokenizer>,
     _generate_request: Arc<GenerateRequest>,
     request_id: String,

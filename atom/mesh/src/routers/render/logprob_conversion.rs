@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::{
     protocols::common::{ChatLogProbs, ChatLogProbsContent, TopLogProb},
-    routers::worker_stream::token_chunk::{InputLogprobs, TokenLogprobs},
+    routers::token_handle::token_chunk::{InputLogprobs, TokenLogprobs},
     tokenizer::traits::Tokenizer,
 };
 

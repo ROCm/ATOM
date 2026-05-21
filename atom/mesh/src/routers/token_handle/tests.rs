@@ -1,11 +1,11 @@
-//! Test obligations for `routers::worker_stream::*` (Part D).
+//! Test obligations for `routers::token_handle::*` (Part D).
 //!
 //! Covers `TokenChunk`, `MatchedStop`, `FinishReason`, `TokenLogprobs`,
-//! `Usage`, `WorkerMeta`, `InputLogprobs`, `WorkerStream`, `EngineError`,
+//! `Usage`, `WorkerMeta`, `InputLogprobs`, `TokenHandle`, `EngineError`,
 //! plus the `Drop` propagation contract (plan D10/D11).
 
 mod a_token_chunk {
-    use crate::routers::worker_stream::token_chunk::{
+    use crate::routers::token_handle::token_chunk::{
         FinishReason, InputLogprobs, MatchedStop, TokenChunk, TokenLogprob, TokenLogprobs, Usage,
         WorkerMeta,
     };
@@ -184,7 +184,7 @@ mod a_token_chunk {
 }
 
 mod b_engine_error {
-    use crate::routers::worker_stream::engine_error::EngineError;
+    use crate::routers::token_handle::engine_error::EngineError;
 
     #[test]
     fn test_engine_error_seven_variants_exist() {
@@ -230,17 +230,17 @@ mod b_engine_error {
     }
 }
 
-mod c_worker_stream {
+mod c_token_handle {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use futures::StreamExt;
     use tokio::sync::mpsc;
 
-    use crate::routers::worker_stream::engine_error::EngineError;
-    use crate::routers::worker_stream::test_support::synthetic_single_stream;
-    use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
-    use crate::routers::worker_stream::worker_stream::WorkerStream;
+    use crate::routers::token_handle::engine_error::EngineError;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+    use crate::routers::token_handle::token_handle::TokenHandle;
 
     fn complete_chunk() -> TokenChunk {
         TokenChunk::Complete {
@@ -300,10 +300,10 @@ mod c_worker_stream {
     #[tokio::test]
     async fn test_single_stream_drop_closes_underlying() {
         // Synthetic single stream is backed by an mpsc channel; if we drop the
-        // WorkerStream the sender's receiver count should drop to zero so the
+        // TokenHandle the sender's receiver count should drop to zero so the
         // sender can observe send failure on the next push.
         let (tx, rx) = mpsc::channel::<Result<TokenChunk, EngineError>>(1);
-        let stream = crate::routers::worker_stream::test_support::single_from_receiver(rx);
+        let stream = crate::routers::token_handle::test_support::single_from_receiver(rx);
         tx.send(Ok(complete_chunk())).await.expect("first send ok");
         drop(stream);
         let send_after_drop = tx.send(Ok(complete_chunk())).await;
@@ -314,9 +314,9 @@ mod c_worker_stream {
     async fn test_pd_stream_drop_closes_both_inner_streams() {
         let (p_tx, p_rx) = mpsc::channel::<Result<TokenChunk, EngineError>>(1);
         let (d_tx, d_rx) = mpsc::channel::<Result<TokenChunk, EngineError>>(1);
-        let prefill = crate::routers::worker_stream::test_support::single_from_receiver(p_rx);
-        let decode = crate::routers::worker_stream::test_support::single_from_receiver(d_rx);
-        let merged = WorkerStream::pd(prefill, decode);
+        let prefill = crate::routers::token_handle::test_support::single_from_receiver(p_rx);
+        let decode = crate::routers::token_handle::test_support::single_from_receiver(d_rx);
+        let merged = TokenHandle::pd(prefill, decode);
         drop(merged);
         let p_err = p_tx.send(Ok(complete_chunk())).await;
         let d_err = d_tx.send(Ok(complete_chunk())).await;
@@ -330,7 +330,7 @@ mod c_worker_stream {
         // adapter is dropped. Lets PD tests assert "both upstreams aborted exactly
         // once" without leaning on side-channel timing.
         let counter = Arc::new(AtomicUsize::new(0));
-        let s = crate::routers::worker_stream::test_support::counted_drop_stream(counter.clone());
+        let s = crate::routers::token_handle::test_support::counted_drop_stream(counter.clone());
         drop(s);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
@@ -341,11 +341,11 @@ mod d_test_support_self_test {
     // the rest of Part D tests can be triaged quickly (real bug vs broken fixture).
     use futures::StreamExt;
 
-    use crate::routers::worker_stream::engine_error::EngineError;
-    use crate::routers::worker_stream::test_support::{
+    use crate::routers::token_handle::engine_error::EngineError;
+    use crate::routers::token_handle::test_support::{
         synthetic_pd_stream, synthetic_single_stream,
     };
-    use crate::routers::worker_stream::token_chunk::TokenChunk;
+    use crate::routers::token_handle::token_chunk::TokenChunk;
 
     #[tokio::test]
     async fn test_synthetic_single_stream_empty_returns_zero_items() {

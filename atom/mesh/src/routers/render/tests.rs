@@ -64,8 +64,8 @@ mod b_chat_aggregator {
 
     use super::test_support::chat_ctx;
     use crate::routers::render::chat_aggregator;
-    use crate::routers::worker_stream::test_support::synthetic_single_stream;
-    use crate::routers::worker_stream::token_chunk::{
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{
         FinishReason, MatchedStop, TokenChunk, Usage, WorkerMeta,
     };
 
@@ -146,7 +146,7 @@ mod b_chat_aggregator {
 
     #[tokio::test]
     async fn test_aggregator_propagates_error_as_5xx() {
-        use crate::routers::worker_stream::engine_error::EngineError;
+        use crate::routers::token_handle::engine_error::EngineError;
         let stream = synthetic_single_stream(vec![Err(EngineError::Transport(
             tonic::Status::unavailable("dead"),
         ))]);
@@ -174,8 +174,8 @@ mod c_chat_streaming {
 
     use super::test_support::chat_ctx;
     use crate::routers::render::chat_streaming;
-    use crate::routers::worker_stream::test_support::synthetic_single_stream;
-    use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn meta() -> WorkerMeta {
         WorkerMeta {
@@ -244,8 +244,8 @@ mod d_generate_aggregator {
 
     use super::test_support::generate_ctx;
     use crate::routers::render::generate_aggregator;
-    use crate::routers::worker_stream::test_support::synthetic_single_stream;
-    use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn meta() -> WorkerMeta {
         WorkerMeta {
@@ -299,7 +299,7 @@ mod d_generate_aggregator {
 
     #[tokio::test]
     async fn test_generate_aggregator_propagates_engine_error() {
-        use crate::routers::worker_stream::engine_error::EngineError;
+        use crate::routers::token_handle::engine_error::EngineError;
         let stream = synthetic_single_stream(vec![Err(EngineError::PrefillEarlyClose)]);
         let resp = generate_aggregator::process(stream, generate_ctx()).await;
         assert!(resp.status().is_server_error());
@@ -311,8 +311,8 @@ mod e_generate_streaming {
 
     use super::test_support::generate_ctx;
     use crate::routers::render::generate_streaming;
-    use crate::routers::worker_stream::test_support::synthetic_single_stream;
-    use crate::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn meta() -> WorkerMeta {
         WorkerMeta {

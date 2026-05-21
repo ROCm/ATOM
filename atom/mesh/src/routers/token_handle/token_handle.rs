@@ -1,4 +1,4 @@
-//! `WorkerStream`: the only stream type the render layer sees.
+//! `TokenHandle`: the only stream type the render layer sees.
 //!
 //! Single mode holds one source; PD mode holds both upstreams. Drop in
 //! either case propagates cancellation downward (single mode → the inner
@@ -19,7 +19,7 @@ pub trait TokenSource: Stream<Item = Result<TokenChunk, EngineError>> + Send + U
     fn mark_completed(&mut self);
 }
 
-pub struct WorkerStream {
+pub struct TokenHandle {
     inner: Inner,
 }
 
@@ -28,16 +28,16 @@ enum Inner {
     /// state machine wrapped as a single source).
     Single(Box<dyn TokenSource>),
     /// Test-only fixture that binds two upstreams' lifetimes together so
-    /// dropping the outer `WorkerStream` drops both. Production PD
+    /// dropping the outer `TokenHandle` drops both. Production PD
     /// dispatch wraps a `PdMerger` in the `Single` variant — not this one.
     #[cfg(test)]
     Pair {
-        prefill: Box<WorkerStream>,
-        decode: Box<WorkerStream>,
+        prefill: Box<TokenHandle>,
+        decode: Box<TokenHandle>,
     },
 }
 
-impl WorkerStream {
+impl TokenHandle {
     pub fn new<S>(source: S) -> Self
     where
         S: TokenSource + 'static,
@@ -48,7 +48,7 @@ impl WorkerStream {
     }
 
     #[cfg(test)]
-    pub(crate) fn pd(prefill: WorkerStream, decode: WorkerStream) -> Self {
+    pub(crate) fn pd(prefill: TokenHandle, decode: TokenHandle) -> Self {
         Self {
             inner: Inner::Pair {
                 prefill: Box::new(prefill),
@@ -71,7 +71,7 @@ impl WorkerStream {
     }
 }
 
-impl Stream for WorkerStream {
+impl Stream for TokenHandle {
     type Item = Result<TokenChunk, EngineError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
