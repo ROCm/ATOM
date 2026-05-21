@@ -8,7 +8,7 @@ Atomesh 后续重构会持续触碰 router、worker pool、metrics、entry route
 
 架构示意图：
 
-![atomesh_test_arch](atomesh_test.png) 
+![atomesh_test_arch](atomesh_test.svg)
 
 概念边界：
 
