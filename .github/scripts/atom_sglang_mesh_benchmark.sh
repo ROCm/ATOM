@@ -138,12 +138,23 @@ fi
 
 if [[ "${SPEC_MODE}" == "mtp" ]]; then
   export SGLANG_ENABLE_SPEC_V2="${SGLANG_ENABLE_SPEC_V2:-1}"
-  server_args+=(
-    --speculative-algorithm EAGLE
-    --speculative-num-steps 3
-    --speculative-eagle-topk 1
-    --speculative-num-draft-tokens 4
-  )
+  if [[ "${SERVER_EXTRA_ARGS}" != *"--speculative-algorithm"* ]]; then
+    server_args+=(
+      --speculative-algorithm NEXTN
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+    )
+  fi
+  if [[ "${SERVER_EXTRA_ARGS}" != *"--max-running-requests"* ]]; then
+    server_args+=(--max-running-requests 128)
+  fi
+  if [[ "${SERVER_EXTRA_ARGS}" != *"--cuda-graph-bs"* ]]; then
+    server_args+=(--cuda-graph-bs)
+    for bs in $(seq 1 128); do
+      server_args+=("${bs}")
+    done
+  fi
 fi
 
 rm -rf "${RESULT_DIR}"
