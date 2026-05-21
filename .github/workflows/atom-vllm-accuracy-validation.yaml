@@ -9,156 +9,11 @@ on:
     # from") as the ATOM branch selector, so users do not need to type branch
     # names.
     inputs:
-      run_qwen3_moe_tp8:
-        description: "Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8"
+      selected_models:
+        description: "Optional manual model list. Use comma/newline separated model_name values, or 'all'. Leave empty to require an explicit selection."
         required: false
-        type: boolean
-        default: false
-      run_qwen3_next_80b_tp1:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1"
-        required: false
-        type: boolean
-        default: false
-      run_qwen3_next_80b_tp2:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP2"
-        required: false
-        type: boolean
-        default: false
-      run_qwen3_next_80b_tp4:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_qwen3_next_80b_mtp_tp1:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1"
-        required: false
-        type: boolean
-        default: false
-      run_qwen3_next_80b_mtp_tp4:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_fp8_tp4:
-        description: "Qwen3.5-397B-A17B-FP8 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_fp8_tp8:
-        description: "Qwen3.5-397B-A17B-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_tp8:
-        description: "Qwen3.5-397B-A17B TP8"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_fp4_tp4:
-        description: "Qwen3.5-397B-A17B-MXFP4 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_llama405_fp8_tp8:
-        description: "Meta-Llama-3.1-405B-Instruct-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_llama8_tp1:
-        description: "Llama-3.1-8B-Instruct TP1"
-        required: false
-        type: boolean
-        default: false
-      run_kimi_k2_tp4:
-        description: "Kimi-K2-Thinking-MXFP4 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_kimi_k2_tp8:
-        description: "Kimi-K2-Thinking-MXFP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_kimi_k25_tp4:
-        description: "Kimi-K2.5-MXFP4 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_kimi_k25_tp8:
-        description: "Kimi-K2.5-MXFP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp8_tp8:
-        description: "DeepSeek-R1-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp4_tp8:
-        description: "DeepSeek-R1-0528-MXFP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsv32_fp8_tp4:
-        description: "DeepSeek-V3.2-FP8 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_dsv32_fp8_tp8:
-        description: "DeepSeek-V3.2-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_gpt_oss_120b_tp1:
-        description: "gpt-oss-120b TP1"
-        required: false
-        type: boolean
-        default: false
-      run_gpt_oss_120b_tp2:
-        description: "gpt-oss-120b TP2"
-        required: false
-        type: boolean
-        default: false
-      run_gpt_oss_120b_tp8:
-        description: "gpt-oss-120b TP8"
-        required: false
-        type: boolean
-        default: false
-      run_minimax_m25_tp2:
-        description: "MiniMax-M2.5 TP2"
-        required: false
-        type: boolean
-        default: false
-      run_minimax_m25_tp4:
-        description: "MiniMax-M2.5 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_glm4_7_fp8_tp4:
-        description: "GLM-4.7-FP8 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_glm4_7_fp8_tp8:
-        description: "GLM-4.7-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_glm4_7_fp8_mtp_tp4:
-        description: "GLM-4.7-FP8 MTP TP4"
-        required: false
-        type: boolean
-        default: false
-      run_glm4_7_fp8_mtp_tp8:
-        description: "GLM-4.7-FP8 MTP TP8"
-        required: false
-        type: boolean
-        default: false
-      run_glm5_1_fp8_tp8:
-        description: "GLM-5.1-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
+        type: string
+        default: ""
       oot_image:
         description: "Optional atom-vLLM image override. Leave empty to keep the existing nightly/manual build behavior."
         required: false
@@ -210,36 +65,7 @@ jobs:
       - name: Resolve image source and model matrix
         id: meta
         env:
-          RUN_QWEN3_MOE_TP8: ${{ inputs.run_qwen3_moe_tp8 }}
-          RUN_QWEN3_NEXT_80B_TP1: ${{ inputs.run_qwen3_next_80b_tp1 }}
-          RUN_QWEN3_NEXT_80B_TP2: ${{ inputs.run_qwen3_next_80b_tp2 }}
-          RUN_QWEN3_NEXT_80B_TP4: ${{ inputs.run_qwen3_next_80b_tp4 }}
-          RUN_QWEN3_NEXT_80B_MTP_TP1: ${{ inputs.run_qwen3_next_80b_mtp_tp1 }}
-          RUN_QWEN3_NEXT_80B_MTP_TP4: ${{ inputs.run_qwen3_next_80b_mtp_tp4 }}
-          RUN_QWEN35_397B_FP8_TP4: ${{ inputs.run_qwen35_397b_fp8_tp4 }}
-          RUN_QWEN35_397B_FP8_TP8: ${{ inputs.run_qwen35_397b_fp8_tp8 }}
-          RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
-          RUN_QWEN35_397B_FP4_TP4: ${{ inputs.run_qwen35_397b_fp4_tp4 }}
-          RUN_LLAMA405_FP8_TP8: ${{ inputs.run_llama405_fp8_tp8 }}
-          RUN_LLAMA8_TP1: ${{ inputs.run_llama8_tp1 }}
-          RUN_KIMI_K2_TP4: ${{ inputs.run_kimi_k2_tp4 }}
-          RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
-          RUN_KIMI_K25_TP4: ${{ inputs.run_kimi_k25_tp4 }}
-          RUN_KIMI_K25_TP8: ${{ inputs.run_kimi_k25_tp8 }}
-          RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
-          RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
-          RUN_DSV32_FP8_TP4: ${{ inputs.run_dsv32_fp8_tp4 }}
-          RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
-          RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
-          RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
-          RUN_GPT_OSS_120B_TP8: ${{ inputs.run_gpt_oss_120b_tp8 }}
-          RUN_MINIMAX_M25_TP2: ${{ inputs.run_minimax_m25_tp2 }}
-          RUN_MINIMAX_M25_TP4: ${{ inputs.run_minimax_m25_tp4 }}
-          RUN_GLM4_7_FP8_TP4: ${{ inputs.run_glm4_7_fp8_tp4 }}
-          RUN_GLM4_7_FP8_TP8: ${{ inputs.run_glm4_7_fp8_tp8 }}
-          RUN_GLM4_7_FP8_MTP_TP4: ${{ inputs.run_glm4_7_fp8_mtp_tp4 }}
-          RUN_GLM4_7_FP8_MTP_TP8: ${{ inputs.run_glm4_7_fp8_mtp_tp8 }}
-          RUN_GLM5_1_FP8_TP8: ${{ inputs.run_glm5_1_fp8_tp8 }}
+          SELECTED_MODELS: ${{ inputs.selected_models || '' }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
         run: |
           set -euo pipefail
@@ -676,14 +502,47 @@ jobs:
               model.update(BENCHMARK_OVERRIDES.get(model["model_name"], {}))
               model["priority"] = priority_for(model["model_name"])
 
+          def matrix_entry(model):
+              return {k: v for k, v in model.items() if k != "toggle_env"}
+
           selected = []
-          for model in models:
-              enabled = event != "workflow_dispatch" or os.environ.get(model["toggle_env"], "").lower() == "true"
-              if enabled:
-                  selected.append({k: v for k, v in model.items() if k != "toggle_env"})
+          if event == "workflow_dispatch":
+              raw_selection = os.environ.get("SELECTED_MODELS", "").strip()
+              tokens = [
+                  token.strip()
+                  for chunk in raw_selection.splitlines()
+                  for token in chunk.split(",")
+                  if token.strip()
+              ]
+              if len(tokens) == 1 and tokens[0].lower() == "all":
+                  selected = [matrix_entry(model) for model in models]
+              else:
+                  by_name = {model["model_name"]: model for model in models}
+                  missing = [token for token in tokens if token not in by_name]
+                  if missing:
+                      print(
+                          "Unknown selected model(s): " + ", ".join(missing),
+                          file=sys.stderr,
+                      )
+                      print("Available model_name values:", file=sys.stderr)
+                      for name in by_name:
+                          print(f" - {name}", file=sys.stderr)
+                      sys.exit(1)
+
+                  seen = set()
+                  for token in tokens:
+                      if token in seen:
+                          continue
+                      selected.append(matrix_entry(by_name[token]))
+                      seen.add(token)
+          else:
+              selected = [matrix_entry(model) for model in models]
 
           if event == "workflow_dispatch" and not selected:
-              print("No models selected for manual run.", file=sys.stderr)
+              print(
+                  "No models selected for manual run. Set selected_models to one or more model_name values, or 'all'.",
+                  file=sys.stderr,
+              )
               sys.exit(1)
 
           beijing_tz = timezone(timedelta(hours=8))
