@@ -1144,6 +1144,16 @@ jobs:
             echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
           fi
 
+      - name: Persist benchmark matrix payload
+        run: |
+          printf '%s' '${{ steps.build.outputs.benchmark_matrix }}' > benchmark_matrix.json
+
+      - name: Upload benchmark matrix payload
+        uses: actions/upload-artifact@v8
+        with:
+          name: oot-benchmark-matrix
+          path: benchmark_matrix.json
+
   build-oot-image:
     name: Build custom OOT benchmark image
     needs: [resolve-atom-source, build-benchmark-matrix]
@@ -1850,6 +1860,12 @@ jobs:
           echo "downloaded_count=${#json_files[@]}" >> "$GITHUB_OUTPUT"
           printf 'Downloaded %s benchmark result files\n' "${#json_files[@]}"
 
+      - name: Download benchmark matrix payload
+        uses: actions/download-artifact@v8
+        with:
+          name: oot-benchmark-matrix
+          path: .
+
       - name: Note summary behavior
         run: |
           printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table.\n- Benchmark client: `%s`\n- Upload to dashboard: `%s`\n- Upload to custom dashboard: `%s`\n' \
@@ -1878,12 +1894,11 @@ jobs:
 
       - name: Generate OOT benchmark summary table
         env:
-          BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 .github/scripts/plugin_benchmark_summary.py \
             --result-dir . \
-            --matrix-json "${BENCHMARK_MATRIX}" \
+            --matrix-json-file benchmark_matrix.json \
             --run-url "${RUN_URL}" \
             --output-json oot_benchmark_summary.json \
             --title "ATOM-vLLM Benchmark Summary" \
