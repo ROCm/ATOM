@@ -1051,6 +1051,8 @@ def sparse_attn_indexer(
         weights = weights_out
     else:
         q_fp8 = q_input
+        k = k.contiguous()
+        weights = weights.contiguous()
         indexer_k_quant_and_cache(
             k,
             kv_cache,
@@ -1416,10 +1418,10 @@ class Indexer(nn.Module):
         else:
             k = self.wk(hidden_states)
             weights = self.weights_proj(hidden_states)
-        k = k.contiguous()
-        weights = weights.contiguous()
 
         if not self.use_qk_rope_cache_fusion:
+            k = k.contiguous()
+            weights = weights.contiguous()
             q_pe, _ = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )

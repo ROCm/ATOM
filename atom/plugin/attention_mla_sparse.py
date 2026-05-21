@@ -640,6 +640,8 @@ def sparse_attn_indexer_plugin_mode(
         weights = weights_out
     else:
         q_fp8 = q_input
+        k = k.contiguous()
+        weights = weights.contiguous()
         indexer_k_quant_and_cache(
             k,
             kv_cache,
