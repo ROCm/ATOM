@@ -129,6 +129,14 @@ class BlockManager:
                 cache_miss = True
             if cache_miss:
                 needed_free += 1
+            elif block_id not in self.used_block_ids:
+                # Cache HIT on a block sitting unreferenced in free_set.
+                # allocate() will claim it via _allocate_block(), which
+                # removes it from free_set just like a miss-then-pop.
+                # Must charge the free budget or allocate() can race past
+                # can_allocate() and raise mid-loop when later misses run
+                # the pool dry.
+                needed_free += 1
         return (
             len(self.free_block_ids_set) >= needed_free + per_req_cache_cost
             and per_req_cache_slot_ok

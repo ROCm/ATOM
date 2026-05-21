@@ -180,22 +180,67 @@ class TestMayAppend:
 
 class TestCanAllocateWithPrefixCaching:
     def test_can_allocate_accounts_for_cache_hits(self, seq_factory):
-        """With 3 blocks total, allocate 2-block seq, deallocate, then a new
-        2-block seq sharing block 1 should need only 1 free block."""
+        """Cache HITs on blocks still held by a running seq cost 0 free
+        slots (just bump ref_count). With s1 keeping prefix blocks in
+        used_set, s2 sharing that prefix only needs 1 free block for its
+        own tail-of-prompt MISS."""
         cfg = MockConfig(
             num_kvcache_blocks=3, kv_cache_block_size=4, enable_prefix_caching=True
         )
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
-        bm.allocate(s1)
-        bm.deallocate(s1)  # blocks freed, hashes retained
+        bm.allocate(s1)  # 2 blocks → free_set has 1 slot left
 
-        # Use up 2 of the 3 free blocks
-        filler = seq_factory([50, 51, 52, 53, 60, 61, 62, 63])
-        bm.allocate(filler)
-        # Only 1 free block left; s2 needs 2 blocks but first is cached
+        # s2 shares prefix block 0 with s1 (which is still running). s2
+        # needs 2 blocks total; block 0 hits an in-use cached block (free
+        # cost 0), block 1 is a fresh MISS (cost 1). 1 free slot suffices.
         s2 = seq_factory([1, 2, 3, 4, 9, 10, 11, 12])
         assert bm.can_allocate(s2)
+        bm.allocate(s2)
+        # The HIT block was shared, not popped from the free pool.
+        assert s2.block_table[0] == s1.block_table[0]
+        assert bm.blocks[s1.block_table[0]].ref_count == 2
+
+    def test_can_allocate_charges_hit_on_unreferenced_cached_block(
+        self, seq_factory
+    ):
+        """Regression for 'No free blocks available' raised mid-allocate.
+
+        When a cached block sits in free_set (prior owner finished but
+        hash retained for prefix sharing), a HIT on it still consumes a
+        free_set slot via _allocate_block. can_allocate must charge those
+        hits too, otherwise it can pass while allocate later runs the
+        pool dry on subsequent misses.
+
+        Setup: 5-block pool, seed 4 cached-but-unreferenced blocks via a
+        sacrificial seq, then pin 2 slots with an unrelated seq. Free
+        pool now has 3 slots (all cached for the prefix). Target seq
+        wants those 3 HITs plus 2 MISSes — total 5 slots from a pool of
+        3. can_allocate must say no; before the fix it said yes and
+        allocate raised AssertionError.
+        """
+        cfg = MockConfig(
+            num_kvcache_blocks=5, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        bm = BlockManager(cfg)
+
+        # Seed cached hashes for prefix blocks 0..3 then free them.
+        prefix_tokens = list(range(16))  # 4 full blocks
+        s_seed = seq_factory(prefix_tokens)
+        bm.allocate(s_seed)
+        bm.deallocate(s_seed)
+
+        # Occupy 2 free slots with an unrelated seq.
+        s_other = seq_factory([100, 101, 102, 103, 110, 111, 112, 113])
+        bm.allocate(s_other)
+        # 3 slots remain, all carrying prefix-block hashes.
+
+        # Target wants the same 4-block prefix + 2 fresh tokens.
+        target = seq_factory(prefix_tokens + [200, 201])
+        # If can_allocate returned True here, allocate would raise
+        # mid-loop after the HITs exhaust the pool.
+        if bm.can_allocate(target):
+            bm.allocate(target)  # must not raise if can_allocate said yes
 
     def test_can_allocate_no_false_positive(self, seq_factory):
         """can_allocate should return False when even with cache hits
