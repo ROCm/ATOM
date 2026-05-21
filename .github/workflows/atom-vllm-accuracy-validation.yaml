@@ -188,7 +188,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --enable-expert-parallel",
                   "accuracy_test_threshold": 0.87,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN3_NEXT_80B_TP1",
@@ -197,7 +197,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-1",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN3_NEXT_80B_TP4",
@@ -206,7 +206,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN3_NEXT_80B_MTP_TP4",
@@ -215,7 +215,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
                   "accuracy_test_threshold": 0.80,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_FP8_TP8",
@@ -224,7 +224,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_TP8",
@@ -233,7 +233,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_FP4_TP4",
@@ -242,7 +242,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_LLAMA405_FP8_TP8",
@@ -251,7 +251,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --load-format safetensors --allow-deprecated-quantization",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_LLAMA8_TP1",
@@ -260,7 +260,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.73,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-1",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_KIMI_K2_TP8",
@@ -269,7 +269,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.90,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_KIMI_K25_TP8",
@@ -278,7 +278,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_DSR1_FP8_TP8",
@@ -287,7 +287,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_DSR1_FP4_TP8",
@@ -296,7 +296,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_DSV32_FP8_TP4",
@@ -306,7 +306,7 @@ jobs:
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_DSV32_FP8_TP8",
@@ -316,7 +316,7 @@ jobs:
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_GPT_OSS_120B_TP1",
@@ -326,7 +326,7 @@ jobs:
                   "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
                   "accuracy_test_threshold": 0.88,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-1",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_GPT_OSS_120B_TP2",
@@ -336,7 +336,7 @@ jobs:
                   "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
                   "accuracy_test_threshold": 0.88,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_GLM4_7_FP8_MTP_TP8",
@@ -345,7 +345,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
                   "accuracy_test_threshold": 0.92,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_GLM5_1_FP8_TP8",
@@ -355,7 +355,7 @@ jobs:
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.88,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
           ]
 
