@@ -3,10 +3,10 @@ mod a_pipeline_construction {
 
     use crate::app_context::AppContext;
     use crate::routers::grpc::pipeline::Pipeline;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     fn shared() -> Arc<AppContext> {
-        test_fixtures::app_context()
+        test_mocks::app_context()
     }
 
     #[test]
@@ -38,14 +38,14 @@ mod b_execute_chat {
     use crate::observability::metrics::metrics_labels;
     use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
     use crate::routers::grpc::pipeline::Pipeline;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
         FinishReason, TokenChunk, Usage, WorkerMeta,
     };
 
     fn shared() -> Arc<AppContext> {
-        test_fixtures::app_context_with_hf_tokenizer("m")
+        test_mocks::app_context_with_hf_tokenizer("m")
     }
 
     fn scripted_chunks() -> Vec<
@@ -81,10 +81,10 @@ mod b_execute_chat {
     }
 
     fn pipeline_regular() -> Arc<Pipeline> {
-        let worker = test_fixtures::mock_grpc_worker("http://w:1", WorkerType::Regular);
-        test_fixtures::pipeline_with(
-            Arc::new(test_fixtures::MockPdPlanner::repeat_single(worker, "random")),
-            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+        let worker = test_mocks::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        test_mocks::pipeline_with(
+            Arc::new(test_mocks::MockPdPlanner::repeat_single(worker, "random")),
+            Arc::new(test_mocks::MockDispatcher::repeat_with_stream(|| {
                 Ok(synthetic_single_stream(scripted_chunks()))
             })),
             metrics_labels::BACKEND_REGULAR,
@@ -92,11 +92,11 @@ mod b_execute_chat {
     }
 
     fn pipeline_placement_err() -> Arc<Pipeline> {
-        test_fixtures::pipeline_with(
-            Arc::new(test_fixtures::MockPdPlanner::repeat_err(
+        test_mocks::pipeline_with(
+            Arc::new(test_mocks::MockPdPlanner::repeat_err(
                 PlacementError::NoAvailableWorkers,
             )),
-            Arc::new(test_fixtures::MockDispatcher::new(vec![])),
+            Arc::new(test_mocks::MockDispatcher::new(vec![])),
             metrics_labels::BACKEND_REGULAR,
         )
     }
@@ -184,12 +184,12 @@ mod b_execute_chat {
 
     #[tokio::test]
     async fn test_execute_chat_engine_error_returns_5xx() {
-        let p = test_fixtures::pipeline_with(
-            Arc::new(test_fixtures::MockPdPlanner::repeat_single(
-                test_fixtures::mock_grpc_worker("http://w:1", WorkerType::Regular),
+        let p = test_mocks::pipeline_with(
+            Arc::new(test_mocks::MockPdPlanner::repeat_single(
+                test_mocks::mock_grpc_worker("http://w:1", WorkerType::Regular),
                 "random",
             )),
-            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+            Arc::new(test_mocks::MockDispatcher::repeat_with_stream(|| {
                 Err(
                     crate::routers::token_handle::engine_error::EngineError::Transport(
                         tonic::Status::internal("boom"),
@@ -266,14 +266,14 @@ mod c_execute_generate {
     use crate::observability::metrics::metrics_labels;
     use crate::protocols::generate::GenerateRequest;
     use crate::routers::grpc::pipeline::Pipeline;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
         FinishReason, TokenChunk, Usage, WorkerMeta,
     };
 
     fn shared() -> Arc<AppContext> {
-        test_fixtures::app_context_with_hf_tokenizer("m")
+        test_mocks::app_context_with_hf_tokenizer("m")
     }
 
     fn scripted_chunks() -> Vec<
@@ -305,10 +305,10 @@ mod c_execute_generate {
     }
 
     fn pipeline_regular() -> Arc<Pipeline> {
-        let worker = test_fixtures::mock_grpc_worker("http://w:1", WorkerType::Regular);
-        test_fixtures::pipeline_with(
-            Arc::new(test_fixtures::MockPdPlanner::repeat_single(worker, "random")),
-            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+        let worker = test_mocks::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        test_mocks::pipeline_with(
+            Arc::new(test_mocks::MockPdPlanner::repeat_single(worker, "random")),
+            Arc::new(test_mocks::MockDispatcher::repeat_with_stream(|| {
                 Ok(synthetic_single_stream(scripted_chunks()))
             })),
             metrics_labels::BACKEND_REGULAR,
@@ -316,18 +316,18 @@ mod c_execute_generate {
     }
 
     fn pipeline_pd() -> Arc<Pipeline> {
-        let prefill = test_fixtures::mock_grpc_worker(
+        let prefill = test_mocks::mock_grpc_worker(
             "http://p:1",
             WorkerType::Prefill {
                 bootstrap_port: None,
             },
         );
-        let decode = test_fixtures::mock_grpc_worker("http://d:1", WorkerType::Decode);
-        test_fixtures::pipeline_with(
-            Arc::new(test_fixtures::MockPdPlanner::repeat_pair(
+        let decode = test_mocks::mock_grpc_worker("http://d:1", WorkerType::Decode);
+        test_mocks::pipeline_with(
+            Arc::new(test_mocks::MockPdPlanner::repeat_pair(
                 prefill, decode, "random", "random",
             )),
-            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+            Arc::new(test_mocks::MockDispatcher::repeat_with_stream(|| {
                 Ok(synthetic_single_stream(scripted_chunks()))
             })),
             metrics_labels::BACKEND_PD,
@@ -380,14 +380,14 @@ mod d_execute_for_responses {
     use crate::observability::metrics::metrics_labels;
     use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
     use crate::routers::grpc::pipeline::Pipeline;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
         FinishReason, TokenChunk, Usage, WorkerMeta,
     };
 
     fn shared() -> Arc<AppContext> {
-        test_fixtures::app_context_with_hf_tokenizer("m")
+        test_mocks::app_context_with_hf_tokenizer("m")
     }
 
     fn scripted_chunks() -> Vec<
@@ -419,10 +419,10 @@ mod d_execute_for_responses {
     }
 
     fn pipeline_regular() -> Arc<Pipeline> {
-        let worker = test_fixtures::mock_grpc_worker("http://w:1", WorkerType::Regular);
-        test_fixtures::pipeline_with(
-            Arc::new(test_fixtures::MockPdPlanner::repeat_single(worker, "random")),
-            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+        let worker = test_mocks::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        test_mocks::pipeline_with(
+            Arc::new(test_mocks::MockPdPlanner::repeat_single(worker, "random")),
+            Arc::new(test_mocks::MockDispatcher::repeat_with_stream(|| {
                 Ok(synthetic_single_stream(scripted_chunks()))
             })),
             metrics_labels::BACKEND_REGULAR,
@@ -485,14 +485,14 @@ mod e_metrics_labels {
     use crate::observability::metrics::metrics_labels;
     use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
     use crate::routers::grpc::pipeline::Pipeline;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
         FinishReason, TokenChunk, Usage, WorkerMeta,
     };
 
     fn shared() -> Arc<AppContext> {
-        test_fixtures::app_context_with_hf_tokenizer("m")
+        test_mocks::app_context_with_hf_tokenizer("m")
     }
 
     fn scripted_chunks() -> Vec<
@@ -518,10 +518,10 @@ mod e_metrics_labels {
     }
 
     fn pipeline_regular() -> Arc<Pipeline> {
-        let worker = test_fixtures::mock_grpc_worker("http://w:1", WorkerType::Regular);
-        test_fixtures::pipeline_with(
-            Arc::new(test_fixtures::MockPdPlanner::repeat_single(worker, "random")),
-            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+        let worker = test_mocks::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        test_mocks::pipeline_with(
+            Arc::new(test_mocks::MockPdPlanner::repeat_single(worker, "random")),
+            Arc::new(test_mocks::MockDispatcher::repeat_with_stream(|| {
                 Ok(synthetic_single_stream(scripted_chunks()))
             })),
             metrics_labels::BACKEND_REGULAR,
@@ -529,18 +529,18 @@ mod e_metrics_labels {
     }
 
     fn pipeline_pd() -> Arc<Pipeline> {
-        let prefill = test_fixtures::mock_grpc_worker(
+        let prefill = test_mocks::mock_grpc_worker(
             "http://p:1",
             WorkerType::Prefill {
                 bootstrap_port: None,
             },
         );
-        let decode = test_fixtures::mock_grpc_worker("http://d:1", WorkerType::Decode);
-        test_fixtures::pipeline_with(
-            Arc::new(test_fixtures::MockPdPlanner::repeat_pair(
+        let decode = test_mocks::mock_grpc_worker("http://d:1", WorkerType::Decode);
+        test_mocks::pipeline_with(
+            Arc::new(test_mocks::MockPdPlanner::repeat_pair(
                 prefill, decode, "random", "random",
             )),
-            Arc::new(test_fixtures::MockDispatcher::repeat_with_stream(|| {
+            Arc::new(test_mocks::MockDispatcher::repeat_with_stream(|| {
                 Ok(synthetic_single_stream(scripted_chunks()))
             })),
             metrics_labels::BACKEND_PD,

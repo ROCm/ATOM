@@ -179,7 +179,7 @@ mod b2_chat_aggregator_branches {
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
     use crate::routers::render::chat_aggregator;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
     use crate::routers::token_handle::engine_error::EngineError;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
@@ -208,8 +208,8 @@ mod b2_chat_aggregator_branches {
             stop_decoder,
             request_id: "rid".to_string(),
             created: 0,
-            tool_parser_factory: Some(test_fixtures::tool_parser_factory()),
-            reasoning_parser_factory: Some(test_fixtures::reasoning_parser_factory()),
+            tool_parser_factory: Some(test_mocks::tool_parser_factory()),
+            reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
         }
@@ -1285,7 +1285,7 @@ mod c3_chat_streaming_parsers {
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
     use crate::routers::render::chat_streaming;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
         FinishReason, TokenChunk, Usage, WorkerMeta,
@@ -1311,7 +1311,7 @@ mod c3_chat_streaming_parsers {
         configured_tool: Option<&str>,
         configured_reasoning: Option<&str>,
     ) -> ResponseContext {
-        let tokenizer: Arc<dyn Tokenizer> = test_fixtures::hf_tokenizer();
+        let tokenizer: Arc<dyn Tokenizer> = test_mocks::hf_tokenizer();
         let _ = HuggingFaceTokenizer::from_file;
         let stop_decoder = create_stop_decoder(&tokenizer, None, None, true, false);
         ResponseContext {
@@ -1324,8 +1324,8 @@ mod c3_chat_streaming_parsers {
             stop_decoder,
             request_id: "rid".to_string(),
             created: 0,
-            tool_parser_factory: Some(test_fixtures::tool_parser_factory()),
-            reasoning_parser_factory: Some(test_fixtures::reasoning_parser_factory()),
+            tool_parser_factory: Some(test_mocks::tool_parser_factory()),
+            reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: configured_tool.map(|s| s.to_string()),
             configured_reasoning_parser: configured_reasoning.map(|s| s.to_string()),
         }
@@ -1478,7 +1478,7 @@ mod c4_chat_streaming_coverage {
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
     use crate::routers::render::chat_streaming;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
     use crate::routers::token_handle::engine_error::EngineError;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
     use crate::routers::token_handle::token_chunk::{
@@ -1537,7 +1537,7 @@ mod c4_chat_streaming_coverage {
     }
 
     fn ctx_with_parsers(req: ChatCompletionRequest) -> ResponseContext {
-        let tokenizer: Arc<dyn Tokenizer> = test_fixtures::hf_tokenizer();
+        let tokenizer: Arc<dyn Tokenizer> = test_mocks::hf_tokenizer();
         let _ = HuggingFaceTokenizer::from_file;
         let stop_decoder = create_stop_decoder(&tokenizer, None, None, true, false);
         ResponseContext {
@@ -1550,8 +1550,8 @@ mod c4_chat_streaming_coverage {
             stop_decoder,
             request_id: "rid".to_string(),
             created: 42,
-            tool_parser_factory: Some(test_fixtures::tool_parser_factory()),
-            reasoning_parser_factory: Some(test_fixtures::reasoning_parser_factory()),
+            tool_parser_factory: Some(test_mocks::tool_parser_factory()),
+            reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
         }

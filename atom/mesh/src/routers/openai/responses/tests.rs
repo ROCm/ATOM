@@ -2,7 +2,7 @@
 
 mod a_context {
     use crate::routers::openai::responses::context::ResponsesContext;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     #[test]
     fn test_responses_context_holds_concrete_pipeline_not_trait() {
@@ -15,12 +15,12 @@ mod a_context {
 
     #[test]
     fn test_responses_context_new_constructor() {
-        let _ctx = test_fixtures::responses_context();
+        let _ctx = test_mocks::responses_context();
     }
 
     #[test]
     fn test_responses_context_pipeline_field_is_arc_wrapped() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let _pipeline = ctx.pipeline.clone();
     }
 }
@@ -32,7 +32,7 @@ mod b_handlers_dispatch {
 
     use crate::protocols::responses::{ResponseInput, ResponsesRequest};
     use crate::routers::openai::responses::handlers;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     fn req(stream: bool) -> ResponsesRequest {
         let mut r = ResponsesRequest::default();
@@ -44,7 +44,7 @@ mod b_handlers_dispatch {
 
     #[tokio::test]
     async fn test_post_responses_streaming_dispatches_to_streaming_module() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let r =
             handlers::route_responses(&ctx, Arc::new(req(true)), None, Some("m".to_string())).await;
         assert_eq!(r.status(), StatusCode::OK);
@@ -54,7 +54,7 @@ mod b_handlers_dispatch {
 
     #[tokio::test]
     async fn test_post_responses_non_streaming_dispatches_to_non_streaming_module() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let r = handlers::route_responses(&ctx, Arc::new(req(false)), None, Some("m".to_string()))
             .await;
         assert_eq!(r.status(), StatusCode::OK);
@@ -64,7 +64,7 @@ mod b_handlers_dispatch {
 
     #[tokio::test]
     async fn test_post_responses_unknown_model_returns_error_status() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let mut r = req(false);
         r.model = "no-such-model".to_string();
         let resp = handlers::route_responses(
@@ -83,7 +83,7 @@ mod b_handlers_dispatch {
 
     #[tokio::test]
     async fn test_post_responses_background_mode_rejected() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let mut r = req(false);
         r.background = Some(true);
         let resp = handlers::route_responses(&ctx, Arc::new(r), None, Some("m".to_string())).await;
@@ -99,7 +99,7 @@ mod c_non_streaming {
 
     use crate::protocols::responses::{ResponseInput, ResponsesRequest};
     use crate::routers::openai::responses::handlers;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     fn req() -> ResponsesRequest {
         let mut r = ResponsesRequest::default();
@@ -111,7 +111,7 @@ mod c_non_streaming {
 
     #[tokio::test]
     async fn test_non_streaming_returns_responses_response_envelope() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let resp =
             handlers::route_responses(&ctx, Arc::new(req()), None, Some("m".to_string())).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -123,7 +123,7 @@ mod c_non_streaming {
 
     #[tokio::test]
     async fn test_non_streaming_persists_response_when_store_true() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let mut r = req();
         r.store = Some(true);
         let resp = handlers::route_responses(&ctx, Arc::new(r), None, Some("m".to_string())).await;
@@ -132,7 +132,7 @@ mod c_non_streaming {
 
     #[tokio::test]
     async fn test_non_streaming_does_not_persist_when_store_false() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let mut r = req();
         r.store = Some(false);
         let resp = handlers::route_responses(&ctx, Arc::new(r), None, Some("m".to_string())).await;
@@ -148,7 +148,7 @@ mod d_streaming {
 
     use crate::protocols::responses::{ResponseInput, ResponsesRequest};
     use crate::routers::openai::responses::handlers;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     fn req() -> ResponsesRequest {
         let mut r = ResponsesRequest::default();
@@ -165,7 +165,7 @@ mod d_streaming {
 
     #[tokio::test]
     async fn test_streaming_emits_response_created_event_first() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let resp =
             handlers::route_responses(&ctx, Arc::new(req()), None, Some("m".to_string())).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -185,7 +185,7 @@ mod d_streaming {
 
     #[tokio::test]
     async fn test_streaming_emits_response_completed_event_last() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let resp =
             handlers::route_responses(&ctx, Arc::new(req()), None, Some("m".to_string())).await;
         let s = collect_body(resp).await;
@@ -201,7 +201,7 @@ mod d_streaming {
 
     #[tokio::test]
     async fn test_streaming_emits_output_text_delta_events() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let resp =
             handlers::route_responses(&ctx, Arc::new(req()), None, Some("m".to_string())).await;
         let s = collect_body(resp).await;
@@ -226,7 +226,7 @@ mod e_retrieve_and_cancel {
 
     use crate::routers::openai::responses::context::ResponsesContext;
     use crate::routers::openai::responses::retrieve;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     async fn store_with_raw(ctx: &ResponsesContext, id: &str, raw: serde_json::Value) {
         let mut s = StoredResponse::new(None);
@@ -237,7 +237,7 @@ mod e_retrieve_and_cancel {
 
     #[tokio::test]
     async fn test_get_response_returns_stored_payload_when_present() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         store_with_raw(&ctx, "resp_existing", json!({"id": "resp_existing"})).await;
         let r = retrieve::get_response_impl(&ctx, "resp_existing").await;
         assert_eq!(r.status(), StatusCode::OK);
@@ -245,14 +245,14 @@ mod e_retrieve_and_cancel {
 
     #[tokio::test]
     async fn test_get_response_returns_404_when_missing() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let r = retrieve::get_response_impl(&ctx, "resp_missing").await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn test_cancel_completed_response_returns_bad_request() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         store_with_raw(&ctx, "resp_done", json!({"status": "completed"})).await;
         let r = retrieve::cancel_response_impl(&ctx, "resp_done").await;
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
@@ -260,7 +260,7 @@ mod e_retrieve_and_cancel {
 
     #[tokio::test]
     async fn test_cancel_failed_response_returns_bad_request() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         store_with_raw(&ctx, "resp_fail", json!({"status": "failed"})).await;
         let r = retrieve::cancel_response_impl(&ctx, "resp_fail").await;
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
@@ -268,7 +268,7 @@ mod e_retrieve_and_cancel {
 
     #[tokio::test]
     async fn test_cancel_in_progress_returns_not_supported() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         store_with_raw(&ctx, "resp_run", json!({"status": "in_progress"})).await;
         let r = retrieve::cancel_response_impl(&ctx, "resp_run").await;
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
@@ -276,7 +276,7 @@ mod e_retrieve_and_cancel {
 
     #[tokio::test]
     async fn test_cancel_response_without_status_field_returns_not_supported() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         store_with_raw(&ctx, "resp_nosta", json!({"id": "x"})).await;
         let r = retrieve::cancel_response_impl(&ctx, "resp_nosta").await;
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
@@ -284,7 +284,7 @@ mod e_retrieve_and_cancel {
 
     #[tokio::test]
     async fn test_cancel_unknown_response_returns_404() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let r = retrieve::cancel_response_impl(&ctx, "resp_missing").await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
@@ -320,9 +320,9 @@ mod f_persistence {
     #[tokio::test]
     async fn test_persist_response_stores_for_later_retrieve() {
         use crate::routers::openai::responses::persistence::persist_response_if_needed;
-        use crate::routers::test_fixtures;
+        use crate::routers::test_mocks;
 
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let mut req = crate::protocols::responses::ResponsesRequest::default();
         req.store = Some(true);
         let resp = crate::protocols::responses::ResponsesResponse::builder("resp_xyz", "m")
@@ -341,9 +341,9 @@ mod f_persistence {
     #[tokio::test]
     async fn test_persist_response_noop_when_store_false() {
         use crate::routers::openai::responses::persistence::persist_response_if_needed;
-        use crate::routers::test_fixtures;
+        use crate::routers::test_mocks;
 
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let mut req = crate::protocols::responses::ResponsesRequest::default();
         req.store = Some(false);
         let resp = crate::protocols::responses::ResponsesResponse::builder("resp_skip", "m")
@@ -368,9 +368,9 @@ mod f_persistence {
     #[tokio::test]
     async fn test_persist_response_default_store_true_persists() {
         use crate::routers::openai::responses::persistence::persist_response_if_needed;
-        use crate::routers::test_fixtures;
+        use crate::routers::test_mocks;
 
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let req = crate::protocols::responses::ResponsesRequest::default();
         let resp = crate::protocols::responses::ResponsesResponse::builder("resp_def", "m")
             .status(crate::protocols::responses::ResponseStatus::Completed)
@@ -415,7 +415,7 @@ mod g_conversation {
     use crate::protocols::responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest};
     use crate::routers::openai::responses::conversation::load_conversation_history;
     use crate::routers::openai::responses::context::ResponsesContext;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     async fn store_prev(ctx: &ResponsesContext, id: &str, input: serde_json::Value, output: serde_json::Value) {
         let mut s = StoredResponse::new(None);
@@ -427,7 +427,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_returns_prior_messages() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let msg = json!({
             "type": "message",
             "role": "user",
@@ -448,7 +448,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_unknown_id_clears_prev_id() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let mut req = ResponsesRequest::default();
         req.previous_response_id = Some("resp_missing".to_string());
         req.input = ResponseInput::Text("now".to_string());
@@ -458,7 +458,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_no_previous_id_returns_clone() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let mut req = ResponsesRequest::default();
         req.input = ResponseInput::Text("hi".to_string());
         let modified = load_conversation_history(&ctx, &req).await.unwrap();
@@ -467,7 +467,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_missing_conversation_returns_404() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let mut req = ResponsesRequest::default();
         req.conversation = Some("conv_missing".to_string());
         req.input = ResponseInput::Text("hi".to_string());
@@ -477,7 +477,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_existing_conversation_with_items() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let conv_id = ConversationId::from("conv_x");
         ctx.conversation_storage
             .create_conversation(NewConversation {
@@ -514,7 +514,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_existing_conversation_with_items_input() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let conv_id = ConversationId::from("conv_y");
         ctx.conversation_storage
             .create_conversation(NewConversation {
@@ -542,7 +542,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_prev_output_items_are_loaded() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let out_msg = json!({
             "type": "message",
             "role": "assistant",
@@ -563,7 +563,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_prev_invalid_input_item_skipped() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let invalid = json!({"type": "unknown_type", "garbage": true});
         store_prev(&ctx, "resp_bad", json!([invalid]), json!([])).await;
         let mut req = ResponsesRequest::default();
@@ -575,7 +575,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_prev_invalid_output_item_skipped() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let invalid = json!({"type": "unknown_type", "garbage": true});
         store_prev(&ctx, "resp_bado", json!([]), json!([invalid])).await;
         let mut req = ResponsesRequest::default();
@@ -587,7 +587,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_conv_item_without_role_defaults_user() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let conv_id = ConversationId::from("conv_norole");
         ctx.conversation_storage
             .create_conversation(NewConversation {
@@ -624,7 +624,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_conv_item_non_message_type_skipped() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let conv_id = ConversationId::from("conv_nonmsg");
         ctx.conversation_storage
             .create_conversation(NewConversation {
@@ -657,7 +657,7 @@ mod g_conversation {
 
     #[tokio::test]
     async fn test_load_conversation_history_prev_with_items_input() {
-        let ctx = test_fixtures::responses_context();
+        let ctx = test_mocks::responses_context();
         let msg = json!({
             "type": "message",
             "role": "user",
@@ -1399,7 +1399,7 @@ mod k_streaming_end_to_end {
 
     use crate::protocols::responses::{ResponseInput, ResponsesRequest};
     use crate::routers::openai::responses::handlers;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     async fn body_of(resp: axum::response::Response) -> String {
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
@@ -1416,7 +1416,7 @@ mod k_streaming_end_to_end {
 
     #[tokio::test]
     async fn test_streaming_emits_in_progress_event() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let resp =
             handlers::route_responses(&ctx, Arc::new(req()), None, Some("m".to_string())).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1426,7 +1426,7 @@ mod k_streaming_end_to_end {
 
     #[tokio::test]
     async fn test_streaming_with_instructions_includes_in_completed_response() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let mut r = req();
         r.instructions = Some("be brief".to_string());
         let resp = handlers::route_responses(&ctx, Arc::new(r), None, Some("m".to_string())).await;
@@ -1437,7 +1437,7 @@ mod k_streaming_end_to_end {
 
     #[tokio::test]
     async fn test_streaming_with_store_false_skips_persistence() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let mut r = req();
         r.store = Some(false);
         let resp = handlers::route_responses(&ctx, Arc::new(r), None, Some("m".to_string())).await;
@@ -1758,7 +1758,7 @@ mod k2_streaming_accumulator {
 
     use crate::protocols::responses::{ResponseInput, ResponsesRequest};
     use crate::routers::openai::responses::handlers;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     async fn body_of(resp: axum::response::Response) -> String {
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
@@ -1776,7 +1776,7 @@ mod k2_streaming_accumulator {
 
     #[tokio::test]
     async fn test_streaming_output_text_delta_contains_content() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let resp =
             handlers::route_responses(&ctx, Arc::new(req_with_store(None)), None, Some("m".to_string()))
                 .await;
@@ -1787,7 +1787,7 @@ mod k2_streaming_accumulator {
 
     #[tokio::test]
     async fn test_streaming_default_store_true_persists() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let resp = handlers::route_responses(
             &ctx,
             Arc::new(req_with_store(Some(true))),
@@ -1801,7 +1801,7 @@ mod k2_streaming_accumulator {
 
     #[tokio::test]
     async fn test_streaming_event_order_created_before_completed() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let resp = handlers::route_responses(
             &ctx,
             Arc::new(req_with_store(None)),
@@ -1817,7 +1817,7 @@ mod k2_streaming_accumulator {
 
     #[tokio::test]
     async fn test_streaming_done_marker_is_last() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let resp = handlers::route_responses(
             &ctx,
             Arc::new(req_with_store(None)),
@@ -1838,7 +1838,7 @@ mod l_non_streaming_branches {
 
     use crate::protocols::responses::{ResponseInput, ResponsesRequest};
     use crate::routers::openai::responses::handlers;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     fn req() -> ResponsesRequest {
         let mut r = ResponsesRequest::default();
@@ -1850,7 +1850,7 @@ mod l_non_streaming_branches {
 
     #[tokio::test]
     async fn test_non_streaming_with_response_id_override() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let resp =
             handlers::route_responses(&ctx, Arc::new(req()), None, Some("m".to_string())).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1861,7 +1861,7 @@ mod l_non_streaming_branches {
 
     #[tokio::test]
     async fn test_non_streaming_passes_instructions_through_to_request() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let mut r = req();
         r.instructions = Some("be brief".to_string());
         let resp = handlers::route_responses(&ctx, Arc::new(r), None, Some("m".to_string())).await;
@@ -1870,7 +1870,7 @@ mod l_non_streaming_branches {
 
     #[tokio::test]
     async fn test_non_streaming_empty_input_items_returns_400() {
-        let ctx = test_fixtures::responses_context_with_chat_path("m");
+        let ctx = test_mocks::responses_context_with_chat_path("m");
         let mut r = req();
         r.input = ResponseInput::Items(vec![]);
         let resp = handlers::route_responses(&ctx, Arc::new(r), None, Some("m".to_string())).await;

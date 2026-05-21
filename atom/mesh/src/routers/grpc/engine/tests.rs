@@ -454,7 +454,7 @@ mod b_proto_to_chunk {
 mod c_worker_client_cache {
     use crate::core::worker::WorkerType;
     use crate::routers::grpc::engine::worker_client_cache::get_grpc_client_from_worker;
-    use crate::routers::test_fixtures::{mock_grpc_worker, mock_http_only_worker};
+    use crate::routers::test_mocks::{mock_grpc_worker, mock_http_only_worker};
 
     #[tokio::test]
     async fn test_get_client_from_http_only_worker_returns_5xx_response() {
@@ -777,7 +777,7 @@ mod e_engine_dispatch {
     use crate::routers::prepare::generation_payload::{
         GenerationPayload, LogprobConfig, SamplingParams, StopConfig,
     };
-    use crate::routers::test_fixtures::{mock_grpc_worker, mock_http_only_worker, MockDispatcher};
+    use crate::routers::test_mocks::{mock_grpc_worker, mock_http_only_worker, MockDispatcher};
     use crate::routers::token_handle::engine_error::EngineError;
     use crate::routers::token_handle::test_support::synthetic_single_stream;
 

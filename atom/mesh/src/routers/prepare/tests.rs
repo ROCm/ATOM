@@ -622,11 +622,11 @@ mod b_tool_constraints {
 mod c_stop_decoder_builder {
     use crate::protocols::common::StringOrArray;
     use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     #[test]
     fn test_create_decoder_with_string_stop() {
-        let tok = test_fixtures::tokenizer();
+        let tok = test_mocks::tokenizer();
         let _decoder = create_stop_decoder(
             &tok,
             Some(&StringOrArray::String("<eot>".to_string())),
@@ -638,7 +638,7 @@ mod c_stop_decoder_builder {
 
     #[test]
     fn test_create_decoder_with_array_stop() {
-        let tok = test_fixtures::tokenizer();
+        let tok = test_mocks::tokenizer();
         let _decoder = create_stop_decoder(
             &tok,
             Some(&StringOrArray::Array(vec![
@@ -653,19 +653,19 @@ mod c_stop_decoder_builder {
 
     #[test]
     fn test_create_decoder_no_stop_sources() {
-        let tok = test_fixtures::tokenizer();
+        let tok = test_mocks::tokenizer();
         let _decoder = create_stop_decoder(&tok, None, None, false, false);
     }
 
     #[test]
     fn test_create_decoder_no_stop_trim_passes_flag() {
-        let tok = test_fixtures::tokenizer();
+        let tok = test_mocks::tokenizer();
         let _decoder = create_stop_decoder(&tok, None, None, true, true);
     }
 
     #[test]
     fn test_create_decoder_string_stop_with_no_stop_trim_visible() {
-        let tok = test_fixtures::tokenizer();
+        let tok = test_mocks::tokenizer();
         let _decoder = create_stop_decoder(
             &tok,
             Some(&StringOrArray::String("<eot>".to_string())),
@@ -677,7 +677,7 @@ mod c_stop_decoder_builder {
 
     #[test]
     fn test_create_decoder_array_stop_with_no_stop_trim_visible() {
-        let tok = test_fixtures::tokenizer();
+        let tok = test_mocks::tokenizer();
         let _decoder = create_stop_decoder(
             &tok,
             Some(&StringOrArray::Array(vec!["<a>".to_string(), "<b>".to_string()])),
@@ -693,17 +693,17 @@ mod d_parser_factory_lookup {
         check_reasoning_parser_availability, check_tool_parser_availability,
         create_reasoning_parser, create_tool_parser, get_reasoning_parser, get_tool_parser,
     };
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     #[test]
     fn test_check_reasoning_parser_known_model_returns_ok() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         assert!(check_reasoning_parser_availability(&factory, None, "qwen3"));
     }
 
     #[test]
     fn test_check_reasoning_parser_unknown_model_returns_err() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         assert!(!check_reasoning_parser_availability(
             &factory,
             None,
@@ -713,13 +713,13 @@ mod d_parser_factory_lookup {
 
     #[test]
     fn test_check_tool_parser_known_model_returns_ok() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         assert!(check_tool_parser_availability(&factory, None, "qwen3"));
     }
 
     #[test]
     fn test_check_tool_parser_unknown_model_returns_err() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         assert!(!check_tool_parser_availability(
             &factory,
             None,
@@ -729,31 +729,31 @@ mod d_parser_factory_lookup {
 
     #[test]
     fn test_get_reasoning_parser_returns_pooled_instance() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         let _pooled = get_reasoning_parser(&factory, None, "qwen3");
     }
 
     #[test]
     fn test_create_reasoning_parser_returns_owned_instance() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         let _parser = create_reasoning_parser(&factory, None, "qwen3").expect("owned parser");
     }
 
     #[test]
     fn test_get_tool_parser_returns_pooled_instance() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         let _pooled = get_tool_parser(&factory, None, "qwen3");
     }
 
     #[test]
     fn test_create_tool_parser_returns_owned_instance() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         let _parser = create_tool_parser(&factory, None, "qwen3").expect("owned tool parser");
     }
 
     #[test]
     fn test_check_reasoning_parser_with_configured_known_returns_true() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         assert!(check_reasoning_parser_availability(
             &factory,
             Some("qwen3"),
@@ -763,7 +763,7 @@ mod d_parser_factory_lookup {
 
     #[test]
     fn test_check_reasoning_parser_with_configured_unknown_returns_false() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         assert!(!check_reasoning_parser_availability(
             &factory,
             Some("no-such-parser"),
@@ -773,7 +773,7 @@ mod d_parser_factory_lookup {
 
     #[test]
     fn test_check_tool_parser_with_configured_known_returns_true() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         assert!(check_tool_parser_availability(
             &factory,
             Some("qwen"),
@@ -783,7 +783,7 @@ mod d_parser_factory_lookup {
 
     #[test]
     fn test_check_tool_parser_with_configured_unknown_returns_false() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         assert!(!check_tool_parser_availability(
             &factory,
             Some("no-such-parser"),
@@ -793,61 +793,61 @@ mod d_parser_factory_lookup {
 
     #[test]
     fn test_get_reasoning_parser_with_configured_known_returns_pooled() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         let _pooled = get_reasoning_parser(&factory, Some("qwen3"), "unrelated");
     }
 
     #[test]
     fn test_get_reasoning_parser_with_configured_unknown_falls_back_to_model() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         let _pooled = get_reasoning_parser(&factory, Some("no-such"), "qwen3");
     }
 
     #[test]
     fn test_create_reasoning_parser_with_configured_known_returns_owned() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         let _p = create_reasoning_parser(&factory, Some("qwen3"), "unrelated").expect("owned");
     }
 
     #[test]
     fn test_create_reasoning_parser_with_configured_unknown_falls_back_to_model() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         let _p = create_reasoning_parser(&factory, Some("no-such"), "qwen3").expect("fallback");
     }
 
     #[test]
     fn test_create_reasoning_parser_unknown_model_returns_none() {
-        let factory = test_fixtures::reasoning_parser_factory();
+        let factory = test_mocks::reasoning_parser_factory();
         assert!(create_reasoning_parser(&factory, None, "no-such-model").is_none());
     }
 
     #[test]
     fn test_get_tool_parser_with_configured_known_returns_pooled() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         let _pooled = get_tool_parser(&factory, Some("qwen3"), "unrelated");
     }
 
     #[test]
     fn test_get_tool_parser_with_configured_unknown_falls_back_to_model() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         let _pooled = get_tool_parser(&factory, Some("no-such"), "qwen3");
     }
 
     #[test]
     fn test_create_tool_parser_with_configured_known_returns_owned() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         let _p = create_tool_parser(&factory, Some("qwen3"), "unrelated").expect("owned");
     }
 
     #[test]
     fn test_create_tool_parser_with_configured_unknown_falls_back_to_model() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         let _p = create_tool_parser(&factory, Some("no-such"), "qwen3").expect("fallback");
     }
 
     #[test]
     fn test_create_tool_parser_unknown_model_falls_back_to_default() {
-        let factory = test_fixtures::tool_parser_factory();
+        let factory = test_mocks::tool_parser_factory();
         let _p = create_tool_parser(&factory, None, "no-such-model");
     }
 }
@@ -968,7 +968,7 @@ mod f_response_context {
     use crate::routers::prepare::chat_template::ProcessedMessages;
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     fn chat_req(stream: bool) -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -987,7 +987,7 @@ mod f_response_context {
     }
 
     fn make_ctx_chat(stream: bool) -> ResponseContext {
-        let tok = test_fixtures::tokenizer();
+        let tok = test_mocks::tokenizer();
         let decoder = create_stop_decoder(&tok, None, None, true, false);
         ResponseContext {
             original: ProtocolRequest::Chat(Arc::new(chat_req(stream))),
@@ -1035,7 +1035,7 @@ mod f_response_context {
 
     #[test]
     fn test_response_context_holds_headers() {
-        let tok = test_fixtures::tokenizer();
+        let tok = test_mocks::tokenizer();
         let decoder = create_stop_decoder(&tok, None, None, true, false);
         let mut hm = HeaderMap::new();
         hm.insert("x-trace", "abc".parse().unwrap());
@@ -1062,7 +1062,7 @@ mod f_response_context {
 
     #[test]
     fn test_response_context_generate_path_has_no_processed_messages() {
-        let tok = test_fixtures::tokenizer();
+        let tok = test_mocks::tokenizer();
         let decoder = create_stop_decoder(&tok, None, None, true, false);
         let ctx = ResponseContext {
             original: ProtocolRequest::Generate(Arc::new(generate_req(false))),
@@ -1137,7 +1137,7 @@ mod h_prepare_chat_generate {
     use crate::routers::prepare::generation_payload::GenerationPayload;
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
     use crate::routers::prepare::{lookup_tokenizer, prepare_chat, prepare_generate};
-    use crate::routers::test_fixtures;
+    use crate::routers::test_mocks;
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
         Arc::new(ChatCompletionRequest {
@@ -1157,8 +1157,8 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_chat_returns_err_without_hf_tokenizer() {
-        let registry = test_fixtures::tokenizer_registry_with("m");
-        let components = test_fixtures::app_context_with_tokenizer_registry(registry);
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
         let result = prepare_chat(
             chat_req(false),
             None,
@@ -1171,7 +1171,7 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_chat_with_hf_tokenizer_returns_payload() {
-        let components = test_fixtures::app_context_with_hf_tokenizer("m");
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
         let (payload, ctx) = prepare_chat(
             chat_req(false),
             None,
@@ -1192,7 +1192,7 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_chat_streaming_flag_threads_through() {
-        let components = test_fixtures::app_context_with_hf_tokenizer("m");
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
         let (payload, ctx) = prepare_chat(
             chat_req(true),
             None,
@@ -1206,7 +1206,7 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_chat_empty_messages_still_renders() {
-        let components = test_fixtures::app_context_with_hf_tokenizer("m");
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
         let req = Arc::new(ChatCompletionRequest {
             model: "m".to_string(),
             messages: vec![],
@@ -1223,7 +1223,7 @@ mod h_prepare_chat_generate {
         use crate::protocols::common::{
             Function as ToolFunction, Tool, ToolChoice, ToolChoiceValue,
         };
-        let components = test_fixtures::app_context_with_hf_tokenizer("m");
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
         let req = Arc::new(ChatCompletionRequest {
             model: "m".to_string(),
             messages: vec![ChatMessage::User {
@@ -1261,7 +1261,7 @@ mod h_prepare_chat_generate {
         use crate::protocols::common::{
             Function as ToolFunction, Tool, ToolChoice, ToolChoiceValue,
         };
-        let components = test_fixtures::app_context_with_hf_tokenizer("m");
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
         let req = Arc::new(ChatCompletionRequest {
             model: "m".to_string(),
             messages: vec![ChatMessage::User {
@@ -1289,7 +1289,7 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_chat_missing_model_id_returns_err_response() {
-        let components = test_fixtures::app_context();
+        let components = test_mocks::app_context();
         let result = prepare_chat(chat_req(false), None, None, components.as_ref());
         let err = result.err().expect("model_id missing must be Err");
         assert!(!err.status().is_success());
@@ -1297,7 +1297,7 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_chat_unknown_model_returns_err_response() {
-        let components = test_fixtures::app_context();
+        let components = test_mocks::app_context();
         let result = prepare_chat(
             chat_req(false),
             None,
@@ -1310,8 +1310,8 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_generate_returns_payload_and_context_tuple() {
-        let registry = test_fixtures::tokenizer_registry_with("m");
-        let components = test_fixtures::app_context_with_tokenizer_registry(registry);
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
         let (payload, ctx) = prepare_generate(
             generate_req(false),
             None,
@@ -1329,8 +1329,8 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_generate_streaming_flag_propagates() {
-        let registry = test_fixtures::tokenizer_registry_with("m");
-        let components = test_fixtures::app_context_with_tokenizer_registry(registry);
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
         let (_, ctx) = prepare_generate(
             generate_req(true),
             None,
@@ -1343,7 +1343,7 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_generate_missing_model_id_returns_err() {
-        let components = test_fixtures::app_context();
+        let components = test_mocks::app_context();
         let result = prepare_generate(generate_req(false), None, None, components.as_ref());
         let err = result.err().expect("model_id missing must be Err");
         assert!(!err.status().is_success());
@@ -1351,7 +1351,7 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_lookup_tokenizer_returns_arc_for_known_model() {
-        let registry = test_fixtures::tokenizer_registry_with("m");
+        let registry = test_mocks::tokenizer_registry_with("m");
         let tok = lookup_tokenizer("m", &registry).expect("known model");
         let tok2 = lookup_tokenizer("m", &registry).unwrap();
         assert!(Arc::ptr_eq(&tok, &tok2));
@@ -1359,7 +1359,7 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_lookup_tokenizer_unknown_model_returns_err() {
-        let registry = test_fixtures::tokenizer_registry_with("m");
+        let registry = test_mocks::tokenizer_registry_with("m");
         let err = lookup_tokenizer("no-such-model", &registry)
             .err()
             .expect("unknown model must be Err");
@@ -1368,8 +1368,8 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_generate_request_ids_unique_per_call() {
-        let registry = test_fixtures::tokenizer_registry_with("m");
-        let components = test_fixtures::app_context_with_tokenizer_registry(registry);
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
         let (p1, _) = prepare_generate(
             generate_req(false),
             None,
@@ -1389,8 +1389,8 @@ mod h_prepare_chat_generate {
 
     #[test]
     fn test_prepare_generate_no_pd_metadata_at_prepare_time() {
-        let registry = test_fixtures::tokenizer_registry_with("m");
-        let components = test_fixtures::app_context_with_tokenizer_registry(registry);
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
         let (payload, _) = prepare_generate(
             generate_req(false),
             None,
