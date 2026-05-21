@@ -277,10 +277,7 @@ class InputOutputProcessor:
             except (TypeError, ValueError) as exc:
                 raise ValueError("max_tokens must be an integer or None") from exc
         sampling_params.max_tokens = max_tokens
-        if (
-            max_model_len is not None
-            and prompt_len + max_tokens > max_model_len
-        ):
+        if max_model_len is not None and prompt_len + max_tokens > max_model_len:
             raise ValueError(
                 f"Requested context length is {prompt_len + max_tokens} "
                 f"tokens ({prompt_len} input + {max_tokens} max output), "
