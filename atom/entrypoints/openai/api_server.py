@@ -235,6 +235,8 @@ def _enqueue_decoded_stream_chunk_direct(
     stream_queue: asyncio.Queue,
 ) -> None:
     """Decode and enqueue one direct stream chunk on the event loop thread."""
+    if _stream_queues.get(request_id) is not stream_queue:
+        return
     new_text = _decode_stream_delta((request_id, 0), output_tokens, finished)
     started_at = _request_start_times.get(request_id)
     chunk_data = {
@@ -279,6 +281,8 @@ def _enqueue_decoded_stream_chunk_tagged(
     stream_queue: asyncio.Queue,
 ) -> None:
     """Decode and enqueue one fan-out stream chunk on the event loop thread."""
+    if _stream_queues.get(request_id) is not stream_queue:
+        return
     new_text = _decode_stream_delta(
         (request_id, sibling_index),
         output_tokens,

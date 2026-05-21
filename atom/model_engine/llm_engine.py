@@ -4,7 +4,7 @@
 import itertools
 import logging
 import time
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import List, Optional, Union
 
 from atom.config import Config
@@ -271,12 +271,10 @@ class InputOutputProcessor:
         raw_max_tokens = getattr(sampling_params, "max_tokens", 0)
         if raw_max_tokens is None:
             max_tokens = 0
+        elif isinstance(raw_max_tokens, bool) or not isinstance(raw_max_tokens, int):
+            raise ValueError("max_tokens must be an integer or None")
         else:
-            try:
-                max_tokens = max(0, int(raw_max_tokens))
-            except (TypeError, ValueError) as exc:
-                raise ValueError("max_tokens must be an integer or None") from exc
-        sampling_params.max_tokens = max_tokens
+            max_tokens = max(0, raw_max_tokens)
         if max_model_len is not None and prompt_len + max_tokens > max_model_len:
             raise ValueError(
                 f"Requested context length is {prompt_len + max_tokens} "
@@ -285,6 +283,7 @@ class InputOutputProcessor:
                 "prompt, lower max_tokens, or restart the server with a "
                 "larger --max-model-len."
             )
+        sequence_sampling_params = replace(sampling_params, max_tokens=max_tokens)
 
         stop_token_sequences = []
         if sampling_params.stop_strings:
@@ -311,7 +310,7 @@ class InputOutputProcessor:
             seq = Sequence(
                 tokens,
                 self.block_size,
-                sampling_params,
+                sequence_sampling_params,
                 stop_token_sequences,
                 stream_callback=cb,
                 num_draft_tokens=self.num_speculative_tokens,

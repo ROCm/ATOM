@@ -139,9 +139,11 @@ class TestCoerceN:
 class TestStreamDecodeDelta:
     def setup_method(self):
         api_server._stream_decode_states.clear()
+        api_server._stream_queues.clear()
 
     def teardown_method(self):
         api_server._stream_decode_states.clear()
+        api_server._stream_queues.clear()
 
     def test_common_prefix_len(self):
         assert api_server._common_prefix_len("abcdef", "abcXYZ") == 3
@@ -221,6 +223,7 @@ class TestStreamDecodeDelta:
         async def run_stream_callback():
             stream_queue = asyncio.Queue()
             loop = asyncio.get_running_loop()
+            api_server._stream_queues["req"] = stream_queue
             request_output = SimpleNamespace(
                 output_tokens=[0],
                 finished=False,
@@ -242,6 +245,36 @@ class TestStreamDecodeDelta:
 
         assert chunk["text"] == "a"
         assert api_server._stream_decode_states["req"][0]["token_ids"] == [0]
+
+    def test_direct_enqueue_skips_cleaned_request(self, monkeypatch):
+        class FakeTokenizer:
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "".join(chr(ord("a") + token_id) for token_id in token_ids)
+
+        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+        stream_queue = asyncio.Queue()
+
+        api_server._enqueue_decoded_stream_chunk_direct(
+            "req", [0], False, None, None, stream_queue
+        )
+
+        assert "req" not in api_server._stream_decode_states
+        assert stream_queue.empty()
+
+    def test_tagged_enqueue_skips_cleaned_request(self, monkeypatch):
+        class FakeTokenizer:
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "".join(chr(ord("a") + token_id) for token_id in token_ids)
+
+        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+        stream_queue = asyncio.Queue()
+
+        api_server._enqueue_decoded_stream_chunk_tagged(
+            "req", 1, [0], False, None, None, stream_queue
+        )
+
+        assert "req" not in api_server._stream_decode_states
+        assert stream_queue.empty()
 
 
 class TestBuildSamplingParams:
