@@ -218,16 +218,66 @@ class TestStreamDecodeDelta:
 
         api_server._init_stream_decode_state("req", 0, [0, 1, 2])
         state = api_server._stream_decode_states["req"][0]
-        assert state["token_ids"] == [0, 1, 2]
         assert state["tokens"] == ["a", "b", "c"]
         assert state["prefix_offset"] == 0
         assert state["read_offset"] == 3
 
         assert api_server._decode_stream_delta(("req", 0), [3]) == "d"
-        assert state["token_ids"] == [0, 1, 2, 3]
-        assert state["tokens"] == ["a", "b", "c", "d"]
-        assert state["prefix_offset"] == 3
-        assert state["read_offset"] == 4
+        assert state["tokens"] == ["d"]
+        assert state["prefix_offset"] == 0
+        assert state["read_offset"] == 1
+
+    def test_long_decode_prunes_state_without_changing_output(self, monkeypatch):
+        class FakeTokenizer:
+            is_fast = True
+
+            def __len__(self):
+                return 8
+
+            def get_added_vocab(self):
+                return {}
+
+            def convert_ids_to_tokens(self, token_ids, skip_special_tokens=True):
+                return [str(token_id) for token_id in token_ids]
+
+            def convert_tokens_to_string(self, tokens):
+                return "|".join(tokens)
+
+        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+
+        baseline_state = {
+            "tokens": [],
+            "prefix_offset": 0,
+            "read_offset": 0,
+        }
+        expected_chunks = []
+        for token_id in [idx % 8 for idx in range(100)]:
+            new_tokens, decoded_text, prefix_offset, read_offset = (
+                api_server._detokenize_incrementally(
+                    tokenizer=api_server.tokenizer,
+                    new_token_id=token_id,
+                    prev_tokens=baseline_state["tokens"],
+                    prefix_offset=baseline_state["prefix_offset"],
+                    read_offset=baseline_state["read_offset"],
+                    skip_special_tokens=True,
+                )
+            )
+            baseline_state["tokens"].extend(new_tokens)
+            baseline_state["prefix_offset"] = prefix_offset
+            baseline_state["read_offset"] = read_offset
+            expected_chunks.append(decoded_text)
+
+        actual_chunks = [
+            api_server._decode_stream_delta(("req", 0), [idx % 8]) for idx in range(100)
+        ]
+        state = api_server._stream_decode_states["req"][0]
+
+        assert actual_chunks == expected_chunks
+        assert len(state["tokens"]) <= 1
+        assert state["prefix_offset"] == 0
+        assert state["read_offset"] <= 1
+        assert "token_ids" not in state
+        assert "output_text" not in state
 
     def test_cleanup_removes_request_decode_bucket(self, monkeypatch):
         api_server._stream_decode_states["req-a"] = {0: {}, 1: {}}
@@ -284,7 +334,7 @@ class TestStreamDecodeDelta:
         chunk = asyncio.run(run_stream_callback())
 
         assert chunk["text"] == "a"
-        assert api_server._stream_decode_states["req"][0]["token_ids"] == [0]
+        assert api_server._stream_decode_states["req"][0]["tokens"] == ["a"]
 
     def test_direct_enqueue_skips_cleaned_request(self, monkeypatch):
         class FakeTokenizer:

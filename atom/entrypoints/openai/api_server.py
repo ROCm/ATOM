@@ -232,14 +232,13 @@ def _convert_prompt_ids_to_tokens(
 
 def _detokenize_incrementally(
     tokenizer: AutoTokenizer,
-    all_input_ids: List[int],
+    new_token_id: int,
     prev_tokens: List[str],
     prefix_offset: int,
     read_offset: int,
     skip_special_tokens: bool = False,
     spaces_between_special_tokens: bool = True,
 ) -> Tuple[List[str], str, int, int]:
-    new_token_id = all_input_ids[-1]
     if 0 <= new_token_id < len(tokenizer):
         new_tokens = tokenizer.convert_ids_to_tokens(
             [new_token_id], skip_special_tokens=skip_special_tokens
@@ -278,6 +277,17 @@ def _detokenize_incrementally(
     return new_tokens, new_text, read_offset, len(output_tokens)
 
 
+def _prune_stream_decode_state(state: Dict[str, Any]) -> None:
+    """Drop token prefixes no longer needed by incremental detokenization."""
+    prefix_offset = state["prefix_offset"]
+    if prefix_offset <= 0:
+        return
+
+    del state["tokens"][:prefix_offset]
+    state["prefix_offset"] -= prefix_offset
+    state["read_offset"] -= prefix_offset
+
+
 def _init_stream_decode_state(
     request_id: str,
     sibling_index: int,
@@ -290,11 +300,9 @@ def _init_stream_decode_state(
     )
     states_for_request = _stream_decode_states.setdefault(request_id, {})
     states_for_request[sibling_index] = {
-        "token_ids": list(prompt_token_ids),
         "tokens": tokens,
         "prefix_offset": prefix_offset,
         "read_offset": read_offset,
-        "output_text": "",
     }
 
 
@@ -319,11 +327,10 @@ def _decode_stream_delta(
 
     decoded_chunks = []
     for new_token_id in new_token_ids:
-        state["token_ids"].append(new_token_id)
         new_tokens, decoded_text, prefix_offset, read_offset = (
             _detokenize_incrementally(
                 tokenizer=tokenizer,
-                all_input_ids=state["token_ids"],
+                new_token_id=new_token_id,
                 prev_tokens=state["tokens"],
                 prefix_offset=state["prefix_offset"],
                 read_offset=state["read_offset"],
@@ -333,7 +340,7 @@ def _decode_stream_delta(
         state["tokens"].extend(new_tokens)
         state["prefix_offset"] = prefix_offset
         state["read_offset"] = read_offset
-        state["output_text"] += decoded_text
+        _prune_stream_decode_state(state)
         decoded_chunks.append(decoded_text)
 
     return "".join(decoded_chunks)
