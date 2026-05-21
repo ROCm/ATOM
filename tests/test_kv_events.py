@@ -257,9 +257,9 @@ class TestPublisher:
         # process-wide zmq.Context.instance() the publisher binds to.
         endpoint = "inproc://test-kv-events-roundtrip"
         pub = ZmqEventPublisher(endpoint=endpoint, buffer_steps=16)
+        ctx = zmq.Context.instance()
+        sub = ctx.socket(zmq.SUB)
         try:
-            ctx = zmq.Context.instance()
-            sub = ctx.socket(zmq.SUB)
             sub.setsockopt(zmq.SUBSCRIBE, b"")
             sub.connect(endpoint)
             # zmq PUB/SUB slow-joiner: send some warmup batches until the
@@ -278,6 +278,6 @@ class TestPublisher:
             batch = decoder.decode(payload)
             assert len(batch.events) == 1
             assert isinstance(batch.events[0], BlockRemoved)
-            sub.close(linger=0)
         finally:
+            sub.close(linger=0)
             pub.shutdown()

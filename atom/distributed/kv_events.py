@@ -131,8 +131,10 @@ class ZmqEventPublisher(EventPublisher):
     batch is dropped — KV events are advisory and a missed eviction is
     cheaper than stalling inference.
 
-    Topic prefix can be set so consumers can subscribe selectively
-    (e.g. one topic per DP rank).
+    With `topic=""` (default) each message is a single msgpack frame; with a
+    non-empty `topic` the publisher sends two-frame multipart messages
+    (`[topic, payload]`), so consumers must use `recv_multipart()` to read
+    the payload.
     """
 
     def __init__(

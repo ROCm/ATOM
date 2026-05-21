@@ -183,16 +183,18 @@ class EngineCore:
 
     def busy_loop(self):
         shutdown = False
-        while True:
-            shutdown = shutdown or self.pull_and_process_input_queue()
-            if shutdown:
-                break
-            if not self.scheduler.is_finished():
-                self._process_engine_step()
-        # Best-effort flush + teardown of the KV event publisher's background
-        # sender. Safe to call even when KV events are disabled.
-        self.scheduler.publish_kv_events()
-        self.scheduler.shutdown_kv_events()
+        try:
+            while True:
+                shutdown = shutdown or self.pull_and_process_input_queue()
+                if shutdown:
+                    break
+                if not self.scheduler.is_finished():
+                    self._process_engine_step()
+        finally:
+            # Teardown runs even on exceptions so the sender thread/socket
+            # don't leak.
+            self.scheduler.publish_kv_events()
+            self.scheduler.shutdown_kv_events()
 
     def _process_engine_step(self):
         result = self.scheduler.schedule()
@@ -408,70 +410,71 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
-        while True:
-            shutdown = shutdown or self.pull_and_process_input_queue()
+        try:
+            while True:
+                shutdown = shutdown or self.pull_and_process_input_queue()
 
-            local_is_prefill, local_num_tokens, local_num_reqs = (
-                self.scheduler.get_next_batch_info()
-            )
-            local_unfinished = not self.scheduler.is_finished()
-
-            (
-                global_has_prefill,
-                global_max_tokens,
-                global_max_reqs,
-                global_has_unfinished,
-                global_shutdown,
-            ) = self._sync_dp_state(
-                local_is_prefill,
-                local_num_tokens,
-                local_num_reqs,
-                local_unfinished,
-                shutdown,
-            )
-
-            if global_shutdown and not global_has_unfinished:
-                logger.info(
-                    f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
+                local_is_prefill, local_num_tokens, local_num_reqs = (
+                    self.scheduler.get_next_batch_info()
                 )
-                # Flush + tear down KV event publisher before leaving the loop.
-                self.scheduler.publish_kv_events()
-                self.scheduler.shutdown_kv_events()
-                break
+                local_unfinished = not self.scheduler.is_finished()
 
-            if not global_has_unfinished and not self.engines_running:
-                self.engines_running = False
-                continue
-
-            if global_has_prefill and not local_is_prefill:
-                # We must do dummy prefill to sync here
-                # Since we want to split mori output in moe, we need to make dp all run prefill or all run decode
-                dummy_reqs = min(
-                    global_max_reqs, 2
-                )  # dummy reqs at 2: just enough for TBO agreement, avoid wasting compute.
-                logger.info(
-                    f"{self.label}: Running dummy prefill ({global_max_tokens} tokens, {dummy_reqs} reqs) "
-                    f"to sync with other DP ranks doing prefill"
+                (
+                    global_has_prefill,
+                    global_max_tokens,
+                    global_max_reqs,
+                    global_has_unfinished,
+                    global_shutdown,
+                ) = self._sync_dp_state(
+                    local_is_prefill,
+                    local_num_tokens,
+                    local_num_reqs,
+                    local_unfinished,
+                    shutdown,
                 )
-                self._execute_dummy_prefill(global_max_tokens, dummy_reqs)
-            else:
-                executed = self._process_engine_step()
-                if not executed:
-                    if global_has_prefill:
-                        # get_next_batch_info predicted prefill but schedule()
-                        # skipped it (e.g. WAITING_FOR_REMOTE_KVS).  Other DP
-                        # ranks already committed to dummy_prefill, so we must
-                        # match to keep the all-reduce in sync.
-                        logger.info(
-                            f"{self.label}: Predicted prefill was not scheduled, "
-                            f"falling back to dummy prefill ({global_max_tokens} "
-                            f"tokens) to stay in sync with other DP ranks"
-                        )
-                        self._execute_dummy_prefill(global_max_tokens)
-                    else:
-                        self._execute_dummy_batch()
 
-            self.engines_running = global_has_unfinished
+                if global_shutdown and not global_has_unfinished:
+                    logger.info(
+                        f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
+                    )
+                    break
+
+                if not global_has_unfinished and not self.engines_running:
+                    self.engines_running = False
+                    continue
+
+                if global_has_prefill and not local_is_prefill:
+                    # We must do dummy prefill to sync here
+                    # Since we want to split mori output in moe, we need to make dp all run prefill or all run decode
+                    dummy_reqs = min(
+                        global_max_reqs, 2
+                    )  # dummy reqs at 2: just enough for TBO agreement, avoid wasting compute.
+                    logger.info(
+                        f"{self.label}: Running dummy prefill ({global_max_tokens} tokens, {dummy_reqs} reqs) "
+                        f"to sync with other DP ranks doing prefill"
+                    )
+                    self._execute_dummy_prefill(global_max_tokens, dummy_reqs)
+                else:
+                    executed = self._process_engine_step()
+                    if not executed:
+                        if global_has_prefill:
+                            # get_next_batch_info predicted prefill but schedule()
+                            # skipped it (e.g. WAITING_FOR_REMOTE_KVS).  Other DP
+                            # ranks already committed to dummy_prefill, so we must
+                            # match to keep the all-reduce in sync.
+                            logger.info(
+                                f"{self.label}: Predicted prefill was not scheduled, "
+                                f"falling back to dummy prefill ({global_max_tokens} "
+                                f"tokens) to stay in sync with other DP ranks"
+                            )
+                            self._execute_dummy_prefill(global_max_tokens)
+                        else:
+                            self._execute_dummy_batch()
+
+                self.engines_running = global_has_unfinished
+        finally:
+            self.scheduler.publish_kv_events()
+            self.scheduler.shutdown_kv_events()
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)
