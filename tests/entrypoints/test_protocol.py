@@ -280,6 +280,16 @@ class TestChatCompletionRequest:
         assert req.top_k == -1
         assert req.n == 1
 
+    @pytest.mark.parametrize("max_tokens", [3.7, True, "3"])
+    def test_rejects_non_strict_integer_max_tokens(self, max_tokens):
+        with pytest.raises(ValueError):
+            ChatCompletionRequest.model_validate(
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": max_tokens,
+                }
+            )
+
     def test_n_greater_than_one(self):
         req = ChatCompletionRequest.model_validate(
             {
@@ -324,6 +334,13 @@ class TestCompletionRequest:
             {"prompt": "Hello", "unknown": "ignored"}
         )
         assert req.prompt == "Hello"
+
+    @pytest.mark.parametrize("max_tokens", [3.7, True, "3"])
+    def test_rejects_non_strict_integer_max_tokens(self, max_tokens):
+        with pytest.raises(ValueError):
+            CompletionRequest.model_validate(
+                {"prompt": "Hello", "max_tokens": max_tokens}
+            )
 
     def test_n_parameter_accepted(self):
         req = CompletionRequest.model_validate({"prompt": "Hi", "n": 3})
