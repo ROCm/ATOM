@@ -40,16 +40,18 @@ on:
         description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"
         type: choice
         options:
-          - "ds-fp4-all (all Mesh configs: 44 cases)"
+          - "ds-fp4-all (all Mesh configs: 62 cases)"
           - "ds-fp4-tp8 (8192x1/1x1024: [2,4,8,16,32,64,128,256])"
           - "ds-fp4-tp8-mtp (8192x1/1x1024: [2,4,8,16,32,64,128,256])"
-          - "ds-fp4-dpa4-ep4 (8192x1: [1024,2048,4096])"
-          - "ds-fp4-dpa4-ep4-mtp (8192x1: [1024,2048,4096])"
-          - "ds-fp4-dpa8-ep8 (1x1024: [1024,2048,4096])"
-          - "ds-fp4-dpa8-ep8-mtp (1x1024: [1024,2048,4096])"
-          - "ds-fp4-non-mtp (tp8 + dpa4-ep4 + dpa8-ep8)"
-          - "ds-fp4-mtp (tp8-mtp + dpa4-ep4-mtp + dpa8-ep8-mtp)"
-        default: "ds-fp4-all (all Mesh configs: 44 cases)"
+          - "ds-fp4-tp4 (8192x1/1x1024: [64,128,256])"
+          - "ds-fp4-tp4-mtp (8192x1/1x1024: [64,128,256])"
+          - "ds-fp4-dpa4-ep4 (8192x1: [256,512,1024])"
+          - "ds-fp4-dpa4-ep4-mtp (8192x1: [256,512,1024])"
+          - "ds-fp4-dpa8-ep8 (8192x1: [512,1024,2048]; 1x1024: [1024,2048,4096])"
+          - "ds-fp4-dpa8-ep8-mtp (8192x1: [512,1024,2048]; 1x1024: [1024,2048,4096])"
+          - "ds-fp4-non-mtp (tp8 + tp4 + dpa4-ep4 + dpa8-ep8)"
+          - "ds-fp4-mtp (tp8-mtp + tp4-mtp + dpa4-ep4-mtp + dpa8-ep8-mtp)"
+        default: "ds-fp4-all (all Mesh configs: 62 cases)"
       docker_image:
         description: "Optional Docker image override. Use this for mori+sglang benchmark images."
         type: string
@@ -301,7 +303,7 @@ jobs:
           WORKLOAD_LABEL: ${{ needs.resolve-atom-source.outputs.workload_label }}
         run: |
           DEFAULT_OOB_PARAMS="1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
-          DEFAULT_MESH_PARAMS="8192,1,2,0.8;8192,1,4,0.8;8192,1,8,0.8;8192,1,16,0.8;8192,1,32,0.8;8192,1,64,0.8;8192,1,128,0.8;8192,1,256,0.8;1,1024,2,0.8;1,1024,4,0.8;1,1024,8,0.8;1,1024,16,0.8;1,1024,32,0.8;1,1024,64,0.8;1,1024,128,0.8;1,1024,256,0.8;8192,1,1024,0.8;8192,1,2048,0.8;8192,1,4096,0.8;1,1024,1024,0.8;1,1024,2048,0.8;1,1024,4096,0.8"
+          DEFAULT_MESH_PARAMS="8192,1,2,1;8192,1,4,1;8192,1,8,1;8192,1,16,1;8192,1,32,1;8192,1,64,1;8192,1,128,1;8192,1,256,1;8192,1,512,1;8192,1,1024,1;8192,1,2048,1;1,1024,2,1;1,1024,4,1;1,1024,8,1;1,1024,16,1;1,1024,32,1;1,1024,64,1;1,1024,128,1;1,1024,256,1;1,1024,1024,1;1,1024,2048,1;1,1024,4096,1"
           if [[ -n "${INPUT_PARAM_LISTS}" ]]; then
             PARAM_LISTS="${INPUT_PARAM_LISTS}"
           elif [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" ]]; then
