@@ -112,7 +112,7 @@ async def _logged_stream(
 async def _logged_stream_with_cleanup(
     gen: AsyncGenerator[str, None], request_id: str, seq_ids: List[int]
 ) -> AsyncGenerator[str, None]:
-    """Log a stream and clean request state if the client disconnects."""
+    """Log a stream and clean request state on completion or disconnect."""
     try:
         async for chunk in _logged_stream(gen, request_id):
             yield chunk
@@ -216,6 +216,8 @@ def _convert_prompt_ids_to_tokens(
     prompt_ids: List[int],
     skip_special_tokens: bool = False,
 ) -> Tuple[List[str], int, int]:
+    # Match vLLM's prompt suffix offset, with two extra tokens for special
+    # token boundaries during incremental detokenization.
     new_tokens = tokenizer.convert_ids_to_tokens(
         prompt_ids[-INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET - 2 :],
         skip_special_tokens=skip_special_tokens,
@@ -299,7 +301,6 @@ def _init_stream_decode_state(
 def _decode_stream_delta(
     state_key: Tuple[str, int],
     new_token_ids: List[int],
-    finished: bool,
 ) -> str:
     """Decode streaming output with vLLM-style incremental detokenization.
 
@@ -349,7 +350,7 @@ def _enqueue_decoded_stream_chunk_direct(
     """Decode and enqueue one direct stream chunk on the event loop thread."""
     if _stream_queues.get(request_id) is not stream_queue:
         return
-    new_text = _decode_stream_delta((request_id, 0), output_tokens, finished)
+    new_text = _decode_stream_delta((request_id, 0), output_tokens)
     started_at = _request_start_times.get(request_id)
     chunk_data = {
         "text": new_text,
@@ -398,7 +399,6 @@ def _enqueue_decoded_stream_chunk_tagged(
     new_text = _decode_stream_delta(
         (request_id, sibling_index),
         output_tokens,
-        finished,
     )
     chunk_data = {
         "text": new_text,
