@@ -18,6 +18,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import os
 import torch
 from contextlib import contextmanager
@@ -370,7 +372,18 @@ def _build_static_lora_routing(
         lora_ids,
     )
     if expert_map is not None:
-        expert_ids = expert_map[expert_ids]
+        mapped_expert_ids = torch.full_like(expert_ids, -1)
+        valid_blocks = int(num_tokens_post_padded[0].item()) // block_size
+        if valid_blocks > 0:
+            valid_expert_ids = expert_ids[:valid_blocks].long()
+            valid_mask = (valid_expert_ids >= 0) & (
+                valid_expert_ids < expert_map.numel()
+            )
+            if bool(valid_mask.any().item()):
+                mapped_expert_ids[:valid_blocks][valid_mask] = expert_map[
+                    valid_expert_ids[valid_mask]
+                ].to(mapped_expert_ids.dtype)
+        expert_ids = mapped_expert_ids
 
     return (
         sorted_token_ids.view(max_loras, -1),

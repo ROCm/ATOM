@@ -503,11 +503,15 @@ class LinearBase(nn.Module):
         otype=dtypes.bf16,
         lora_x: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        lora_x = (
-            (x if lora_x is None else lora_x)
-            if self._static_lora_adapters
-            else None
-        )
+        if self._static_lora_adapters:
+            if lora_x is None and x_scale is not None:
+                raise ValueError(
+                    f"Static LoRA for {self.prefix} requires unquantized lora_x "
+                    "when x_scale is supplied."
+                )
+            lora_x = x if lora_x is None else lora_x
+        else:
+            lora_x = None
         if self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(
                 x,

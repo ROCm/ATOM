@@ -23,6 +23,16 @@ _ROUTED_EXPERT_RE = re.compile(
     r"^(?P<prefix>.+\.mlp)\.experts\.(?P<expert_id>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)$"
 )
+_UNSUPPORTED_ADAPTER_CONFIG_KEYS = (
+    "use_dora",
+    "use_qalora",
+    "loftq_config",
+)
+_UNSUPPORTED_TENSOR_SUBSTRINGS = (
+    ".lora_magnitude_vector",
+    ".lora_embedding_A",
+    ".lora_embedding_B",
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +97,30 @@ def _load_adapter_config(adapter_path: str) -> dict[str, Any]:
         return json.load(f)
 
 
+def _validate_supported_adapter_config(
+    adapter_config: dict[str, Any],
+    adapter_path: str,
+) -> None:
+    unsupported = []
+    for key in _UNSUPPORTED_ADAPTER_CONFIG_KEYS:
+        value = adapter_config.get(key)
+        if key == "loftq_config":
+            if value:
+                unsupported.append(key)
+        elif value:
+            unsupported.append(key)
+    if adapter_config.get("bias", "none") not in (None, "none"):
+        unsupported.append("bias")
+    if adapter_config.get("modules_to_save"):
+        unsupported.append("modules_to_save")
+    if unsupported:
+        raise ValueError(
+            "Static LoRA loading supports vanilla LoRA adapters only; "
+            f"{adapter_path} uses unsupported option(s): "
+            + ", ".join(sorted(unsupported))
+        )
+
+
 def _pattern_value(
     pattern: dict[str, Any] | None,
     module_name: str,
@@ -119,16 +153,27 @@ def _lora_scaling(
 
 def load_lora_tensors(adapter_path: str) -> list[LoRATensorPair]:
     adapter_config = _load_adapter_config(adapter_path)
+    _validate_supported_adapter_config(adapter_config, adapter_path)
     weights_path = _find_adapter_weights(adapter_path)
 
     tensors: dict[str, dict[str, torch.Tensor]] = {}
+    unsupported_tensors = []
     with safe_open(weights_path, framework="pt", device="cpu") as f:
         for tensor_name in f.keys():
+            if any(part in tensor_name for part in _UNSUPPORTED_TENSOR_SUBSTRINGS):
+                unsupported_tensors.append(tensor_name)
+                continue
             parsed = parse_lora_tensor_name(tensor_name)
             if parsed is None:
                 continue
             module_name, side = parsed
             tensors.setdefault(module_name, {})[side] = f.get_tensor(tensor_name)
+    if unsupported_tensors:
+        raise ValueError(
+            "Static LoRA loading supports vanilla lora_A/lora_B weights only; "
+            f"unsupported tensor(s) found in {weights_path}: "
+            + ", ".join(unsupported_tensors[:8])
+        )
 
     pairs: list[LoRATensorPair] = []
     incomplete = []
@@ -183,11 +228,21 @@ def load_lora_tensors(adapter_path: str) -> list[LoRATensorPair]:
 def iter_lora_tensor_module_names(adapter_path: str) -> list[str]:
     weights_path = _find_adapter_weights(adapter_path)
     module_names = set()
+    unsupported_tensors = []
     with safe_open(weights_path, framework="pt", device="cpu") as f:
         for tensor_name in f.keys():
+            if any(part in tensor_name for part in _UNSUPPORTED_TENSOR_SUBSTRINGS):
+                unsupported_tensors.append(tensor_name)
+                continue
             parsed = parse_lora_tensor_name(tensor_name)
             if parsed is not None:
                 module_names.add(parsed[0])
+    if unsupported_tensors:
+        raise ValueError(
+            "Static LoRA loading supports vanilla lora_A/lora_B weights only; "
+            f"unsupported tensor(s) found in {weights_path}: "
+            + ", ".join(unsupported_tensors[:8])
+        )
     return sorted(module_names)
 
 
@@ -197,7 +252,7 @@ def validate_lora_adapters_supported(lora_modules: list[str] | None) -> None:
 
     for entry in lora_modules:
         spec = parse_lora_module_entry(entry)
-        _load_adapter_config(spec.path)
+        _validate_supported_adapter_config(_load_adapter_config(spec.path), spec.path)
         iter_lora_tensor_module_names(spec.path)
 
 
@@ -221,6 +276,8 @@ def mark_static_routed_lora_targets(
             experts = model_modules.get(experts_name)
             if experts is None:
                 continue
+            if _map_routed_expert_id(experts, int(match.group("expert_id"))) is None:
+                continue
             if not getattr(experts, "_static_routed_lora_requires_unshuffled", False):
                 marked += 1
             experts._static_routed_lora_requires_unshuffled = True
@@ -240,6 +297,19 @@ def any_module_has_static_lora_adapters(*modules: nn.Module | None) -> bool:
     return any(module_has_static_lora_adapters(module) for module in modules)
 
 
+def _is_pp_missing_lora_target(
+    module_name: str,
+    model_modules: dict[str, nn.Module],
+) -> bool:
+    parts = module_name.split(".")
+    for i in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:i])
+        module = model_modules.get(candidate)
+        if module is not None and module.__class__.__name__ == "PPMissingLayer":
+            return True
+    return False
+
+
 def _endswith_module_name(module_name: str, suffix: str) -> bool:
     return module_name == suffix or module_name.endswith(f".{suffix}")
 
@@ -250,6 +320,8 @@ def resolve_lora_target(
     packed_modules_mapping: dict[str, Any],
 ) -> tuple[str, Any | None]:
     if module_name in model_modules:
+        return module_name, None
+    if _is_pp_missing_lora_target(module_name, model_modules):
         return module_name, None
 
     for checkpoint_name, packed_value in packed_modules_mapping.items():
@@ -264,6 +336,8 @@ def resolve_lora_target(
         target_name = module_name[: -len(checkpoint_name)] + packed_name
         if target_name in model_modules:
             return target_name, shard_id
+        if _is_pp_missing_lora_target(target_name, model_modules):
+            return target_name, shard_id
 
     if ".mlp.experts." in module_name:
         raise NotImplementedError(
@@ -272,6 +346,15 @@ def resolve_lora_target(
         )
 
     raise KeyError(f"LoRA target module not found in model: {module_name}")
+
+
+def _is_pp_missing_target(
+    target_name: str, model_modules: dict[str, nn.Module]
+) -> bool:
+    module = model_modules.get(target_name)
+    if module is not None and module.__class__.__name__ == "PPMissingLayer":
+        return True
+    return _is_pp_missing_lora_target(target_name, model_modules)
 
 
 def _slice_or_validate(
@@ -816,6 +899,13 @@ def apply_lora_adapters(
                 model_modules,
                 packed_modules_mapping,
             )
+            if _is_pp_missing_target(target_name, model_modules):
+                logger.debug(
+                    "Skipping static LoRA adapter %s for PP-missing target %s",
+                    spec.name,
+                    target_name,
+                )
+                continue
             target_module = model_modules[target_name]
             if shard_id is None and _looks_like_vocab_parallel_head(target_module):
                 _load_vocab_parallel_lora(

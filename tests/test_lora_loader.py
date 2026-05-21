@@ -148,6 +148,10 @@ class FakeParallelLMHead(nn.Module):
         self.loaded_loras.append((lora_a, lora_b, scaling, kwargs))
 
 
+class PPMissingLayer(nn.Identity):
+    pass
+
+
 def _write_adapter(path, tensors, r=2, alpha=4):
     path.mkdir()
     (path / "adapter_config.json").write_text(
@@ -155,6 +159,13 @@ def _write_adapter(path, tensors, r=2, alpha=4):
         encoding="utf-8",
     )
     save_file(tensors, path / "adapter_model.safetensors")
+
+
+def _write_adapter_config(path, config):
+    config_path = path / "adapter_config.json"
+    current = json.loads(config_path.read_text(encoding="utf-8"))
+    current.update(config)
+    config_path.write_text(json.dumps(current), encoding="utf-8")
 
 
 def _prepare_real_model_ops_import():
@@ -255,6 +266,36 @@ def test_lora_scaling_respects_zero_alpha_pattern(tmp_path):
     pairs = load_lora_tensors(str(adapter_path))
 
     assert pairs[0].scaling == 0.0
+
+
+def test_load_lora_tensors_rejects_dora_config(tmp_path):
+    adapter_path = tmp_path / "adapter"
+    _write_adapter(
+        adapter_path,
+        {
+            "base_model.model.q_proj.lora_A.weight": torch.ones(2, 3),
+            "base_model.model.q_proj.lora_B.weight": torch.ones(4, 2),
+        },
+    )
+    _write_adapter_config(adapter_path, {"use_dora": True})
+
+    with pytest.raises(ValueError, match="unsupported option.*use_dora"):
+        load_lora_tensors(str(adapter_path))
+
+
+def test_validate_lora_adapters_rejects_extra_lora_tensors(tmp_path):
+    adapter_path = tmp_path / "adapter"
+    _write_adapter(
+        adapter_path,
+        {
+            "base_model.model.q_proj.lora_A.weight": torch.ones(2, 3),
+            "base_model.model.q_proj.lora_B.weight": torch.ones(4, 2),
+            "base_model.model.q_proj.lora_magnitude_vector.weight": torch.ones(4),
+        },
+    )
+
+    with pytest.raises(ValueError, match="unsupported tensor"):
+        validate_lora_adapters_supported([f"user={adapter_path}"])
 
 
 def test_load_lora_tensors_rejects_non_2d_tensors(tmp_path):
@@ -396,9 +437,9 @@ def test_apply_lora_adapters_maps_glm_shared_expert_down_proj(tmp_path):
         },
     )
 
-    loaded_a, loaded_b, scaling, output_offset, _ = (
-        model.model.layers[10].mlp.shared_experts.w2.loaded_loras[0]
-    )
+    loaded_a, loaded_b, scaling, output_offset, _ = model.model.layers[
+        10
+    ].mlp.shared_experts.w2.loaded_loras[0]
     assert torch.equal(loaded_a.cpu(), lora_a[:, 3:6].to(torch.bfloat16))
     assert torch.equal(loaded_b.cpu(), lora_b.to(torch.bfloat16))
     assert scaling == 2.0
@@ -514,6 +555,32 @@ def test_mark_static_routed_lora_targets_preserves_unshuffled_moe_weights(tmp_pa
         model.model.layers[1].mlp.experts,
         "_static_routed_lora_requires_unshuffled",
     )
+
+
+def test_mark_static_routed_lora_targets_ignores_nonlocal_expert(tmp_path):
+    adapter_path = tmp_path / "adapter"
+    _write_adapter(
+        adapter_path,
+        {
+            "base_model.model.model.layers.0.mlp.experts.0.gate_proj."
+            "lora_A.weight": torch.ones(1, 4),
+            "base_model.model.model.layers.0.mlp.experts.0.gate_proj."
+            "lora_B.weight": torch.ones(2, 1),
+        },
+        r=1,
+        alpha=1,
+    )
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([nn.Module()])
+    model.model.layers[0].mlp = nn.Module()
+    experts = FakeFp8BlockFusedMoE()
+    experts.expert_map = torch.tensor([-1])
+    model.model.layers[0].mlp.experts = experts
+
+    mark_static_routed_lora_targets(model, [f"test={adapter_path}"])
+
+    assert not hasattr(experts, "_static_routed_lora_requires_unshuffled")
 
 
 def test_apply_lora_adapters_registers_routed_expert_lora_when_supported(tmp_path):
@@ -632,6 +699,108 @@ def test_static_routed_lora_reference_matches_manual_moe():
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_static_routed_lora_reference_applies_biases():
+    pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
+    from aiter import ActivationType
+    from atom.model_ops.moe import _apply_static_routed_lora_reference
+
+    layer = nn.Module()
+    layer.intermediate_size_per_partition = 2
+    layer.local_num_experts = 1
+    layer.quant_method = None
+    layer._static_routed_lora_dtype = torch.float32
+    layer._static_routed_lora = {0: {"gate_proj": []}}
+    layer.w13_weight = nn.Parameter(torch.zeros(1, 4, 3), requires_grad=False)
+    layer.w2_weight = nn.Parameter(torch.ones(1, 3, 2), requires_grad=False)
+    layer.w13_bias = nn.Parameter(
+        torch.tensor([[1.0, -1.0, 2.0, 3.0]]), requires_grad=False
+    )
+    layer.w2_bias = nn.Parameter(
+        torch.tensor([[0.5, -0.25, 0.75]]), requires_grad=False
+    )
+    x = torch.ones(1, 3)
+    topk_ids = torch.zeros(1, 1, dtype=torch.int64)
+    topk_weights = torch.ones(1, 1)
+
+    actual = _apply_static_routed_lora_reference(
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        activation=ActivationType.Silu,
+    )
+
+    gate = layer.w13_bias[:, :2]
+    up = layer.w13_bias[:, 2:]
+    hidden = torch.nn.functional.silu(gate) * up
+    expected = hidden @ layer.w2_weight[0].t() + layer.w2_bias
+    assert torch.allclose(actual, expected)
+
+
+def test_static_routed_lora_reference_rejects_unsupported_activation():
+    pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
+    from aiter import ActivationType
+    from atom.model_ops.moe import _apply_static_routed_lora_reference
+
+    layer = nn.Module()
+    layer.intermediate_size_per_partition = 1
+    layer.local_num_experts = 1
+    layer.quant_method = None
+    layer._static_routed_lora_dtype = torch.float32
+    layer._static_routed_lora = {0: {"gate_proj": []}}
+    layer.w13_weight = nn.Parameter(torch.zeros(1, 2, 2), requires_grad=False)
+    layer.w2_weight = nn.Parameter(torch.zeros(1, 2, 1), requires_grad=False)
+
+    with pytest.raises(NotImplementedError, match="does not support"):
+        _apply_static_routed_lora_reference(
+            layer,
+            torch.ones(1, 2),
+            torch.ones(1, 1),
+            torch.zeros(1, 1, dtype=torch.int64),
+            expert_map=None,
+            apply_router_weight_on_input=False,
+            activation=ActivationType.Swiglu,
+        )
+
+
+def test_static_routed_lora_reference_uses_layer_expert_map_over_mask():
+    pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
+    from atom.model_ops.moe import _apply_static_routed_lora_reference
+
+    layer = nn.Module()
+    layer.intermediate_size_per_partition = 1
+    layer.local_num_experts = 1
+    layer.quant_method = None
+    layer.expert_map = torch.tensor([-1, 0], dtype=torch.int32)
+    layer._static_routed_lora_dtype = torch.float32
+    layer._static_routed_lora = {1: {"gate_proj": []}}
+    layer.w13_weight = nn.Parameter(
+        torch.tensor([[[1.0, 0.0], [0.0, 1.0]]]),
+        requires_grad=False,
+    )
+    layer.w2_weight = nn.Parameter(
+        torch.tensor([[[2.0]]]),
+        requires_grad=False,
+    )
+
+    actual = _apply_static_routed_lora_reference(
+        layer,
+        torch.tensor([[3.0, 4.0]]),
+        torch.ones(1, 1),
+        torch.ones(1, 1, dtype=torch.int64),
+        expert_map=torch.tensor([0, 1], dtype=torch.int32),
+        apply_router_weight_on_input=False,
+    )
+
+    expected_hidden = torch.nn.functional.silu(torch.tensor([[3.0]])) * 4.0
+    assert torch.allclose(actual, expected_hidden * 2.0)
+
+
 def test_fused_moe_static_routed_lora_keeps_vllm_stacked_layout(monkeypatch):
     pytest.importorskip("aiter")
     _prepare_real_model_ops_import()
@@ -693,6 +862,81 @@ def test_fused_moe_static_routed_lora_keeps_vllm_stacked_layout(monkeypatch):
         down_b * 0.25,
     )
     assert layer._static_routed_lora_expert_enabled.cpu().tolist() == [0, 1]
+
+
+def test_fused_moe_static_routed_lora_rejects_duplicate_projection(monkeypatch):
+    pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
+    import atom.model_ops.moe as moe_mod
+    from atom.model_ops.moe import FusedMoE
+
+    class FakeDPGroup:
+        world_size = 1
+        rank_in_group = 0
+
+    monkeypatch.setattr(moe_mod, "get_dp_group", lambda: FakeDPGroup())
+
+    layer = FusedMoE(
+        num_experts=1,
+        top_k=1,
+        hidden_size=3,
+        intermediate_size=2,
+        params_dtype=torch.bfloat16,
+        tp_size=1,
+        dp_size=1,
+    )
+    layer.add_static_routed_lora(
+        0,
+        "gate_proj",
+        torch.ones(1, 3),
+        torch.ones(2, 1),
+        1.0,
+        "a",
+    )
+
+    with pytest.raises(ValueError, match="duplicate target"):
+        layer.add_static_routed_lora(
+            0,
+            "gate_proj",
+            torch.ones(1, 3),
+            torch.ones(2, 1),
+            1.0,
+            "b",
+        )
+
+
+def test_fused_moe_static_routed_lora_marks_bias_path_for_reference(monkeypatch):
+    pytest.importorskip("aiter")
+    _prepare_real_model_ops_import()
+    import atom.model_ops.moe as moe_mod
+    from atom.model_ops.moe import FusedMoE, _static_routed_lora_requires_reference_path
+
+    class FakeDPGroup:
+        world_size = 1
+        rank_in_group = 0
+
+    monkeypatch.setattr(moe_mod, "get_dp_group", lambda: FakeDPGroup())
+
+    layer = FusedMoE(
+        num_experts=1,
+        top_k=1,
+        hidden_size=3,
+        intermediate_size=2,
+        params_dtype=torch.bfloat16,
+        tp_size=1,
+        dp_size=1,
+        has_bias=True,
+    )
+    layer.add_static_routed_lora(
+        0,
+        "gate_proj",
+        torch.ones(1, 3),
+        torch.ones(2, 1),
+        1.0,
+        "test",
+    )
+
+    assert _static_routed_lora_requires_reference_path(layer)
 
 
 def test_fp8_moe_static_routed_lora_uses_vllm_triton_path(monkeypatch):
@@ -778,6 +1022,29 @@ def test_apply_lora_adapters_registers_vocab_parallel_lm_head(tmp_path):
     assert torch.equal(loaded_b.cpu(), lora_b[3:6].to(torch.bfloat16))
     assert scaling == 2.0
     assert kwargs["adapter_name"] == "test"
+
+
+def test_apply_lora_adapters_skips_pp_missing_layer_targets(tmp_path, caplog):
+    adapter_path = tmp_path / "adapter"
+    _write_adapter(
+        adapter_path,
+        {
+            "base_model.model.model.layers.1.self_attn.q_proj.lora_A.weight": (
+                torch.ones(2, 3)
+            ),
+            "base_model.model.model.layers.1.self_attn.q_proj.lora_B.weight": (
+                torch.ones(4, 2)
+            ),
+        },
+    )
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([nn.Module(), PPMissingLayer()])
+
+    with caplog.at_level("INFO", logger="atom"):
+        apply_lora_adapters(model, [f"test={adapter_path}"])
+
+    assert "Loaded 0 static LoRA tensor pairs" in caplog.text
 
 
 def test_parallel_lm_head_lora_applies_delta_before_gather(monkeypatch):
