@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import importlib
 
 import torch
 import triton
@@ -15,7 +14,6 @@ from atom.model_ops.fla_ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
 )
-from atom.model_ops.fla_ops.gdn_decode_fast import gdn_decode_update_fast
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -163,6 +161,7 @@ class GatedDeltaNet(nn.Module):
         layer_name: str,
     ):
         from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
+
         fwd_ctx: ForwardContext = get_forward_context()
         gdn_metadata: GDNAttentionMetadata = getattr(
             fwd_ctx.attn_metadata, "gdn_metadata", None
@@ -285,41 +284,24 @@ class GatedDeltaNet(nn.Module):
                 1, num_tokens_nonspec, -1, self.head_v_dim
             )
 
-        use_gdn_decode_fast_kernel = (
-            gdn_metadata.num_prefills == 0
-            and gdn_metadata.num_decodes > 0
-            and spec_sequence_masks is None
-        )
+        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 
-        needs_materialized_gates = (
-            gdn_metadata.num_prefills > 0
-            or spec_sequence_masks is not None
-            or (gdn_metadata.num_decodes > 0 and not use_gdn_decode_fast_kernel)
-        )
-
-        if needs_materialized_gates:
-            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-            if spec_sequence_masks is not None:
-                if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
-                    g_spec = g
-                    beta_spec = beta
-                    g_non_spec = None
-                    beta_non_spec = None
-                else:
-                    g_spec = g.index_select(1, spec_token_indx)
-                    beta_spec = beta.index_select(1, spec_token_indx)
-                    g_non_spec = g.index_select(1, non_spec_token_indx)
-                    beta_non_spec = beta.index_select(1, non_spec_token_indx)
+        if spec_sequence_masks is not None:
+            if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
+                g_spec = g
+                beta_spec = beta
+                g_non_spec = None
+                beta_non_spec = None
             else:
-                g_spec = None
-                beta_spec = None
-                g_non_spec = g
-                beta_non_spec = beta
+                g_spec = g.index_select(1, spec_token_indx)
+                beta_spec = beta.index_select(1, spec_token_indx)
+                g_non_spec = g.index_select(1, non_spec_token_indx)
+                beta_non_spec = beta.index_select(1, non_spec_token_indx)
         else:
             g_spec = None
             beta_spec = None
-            g_non_spec = None
-            beta_non_spec = None
+            g_non_spec = g
+            beta_non_spec = beta
 
         # 2. Recurrent attention
 
@@ -365,43 +347,20 @@ class GatedDeltaNet(nn.Module):
                 ssm_state.dtype
             )
         elif gdn_metadata.num_decodes > 0:
-            if use_gdn_decode_fast_kernel:
-                core_attn_out_non_spec = gdn_decode_update_fast(
-                    A_log=self.A_log,
-                    a=a,
-                    b=b,
-                    dt_bias=self.dt_bias,
+            core_attn_out_non_spec, last_recurrent_state = (
+                fused_recurrent_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    beta=1.0,
-                    threshold=20.0,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
                     initial_state=ssm_state,
                     inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[
-                        : gdn_metadata.num_decodes + 1
-                    ],
+                    cu_seqlens=non_spec_query_start_loc[: gdn_metadata.num_decodes + 1],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
                 )
-                last_recurrent_state = None
-            else:
-                core_attn_out_non_spec, last_recurrent_state = (
-                    fused_recurrent_gated_delta_rule(
-                        q=query_non_spec,
-                        k=key_non_spec,
-                        v=value_non_spec,
-                        g=g_non_spec,
-                        beta=beta_non_spec,
-                        initial_state=ssm_state,
-                        inplace_final_state=True,
-                        cu_seqlens=non_spec_query_start_loc[
-                            : gdn_metadata.num_decodes + 1
-                        ],
-                        ssm_state_indices=non_spec_state_indices_tensor,
-                        use_qk_l2norm_in_kernel=True,
-                    )
-                )
+            )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
