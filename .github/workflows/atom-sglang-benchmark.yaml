@@ -10,67 +10,52 @@ on:
     - cron: '0 15 * * 1-5'
   workflow_dispatch:
     inputs:
-      deepseek-r1-fp8-tp8:
-        description: "DeepSeek-R1-0528 FP8 TP8"
-        type: boolean
-        default: false
-      deepseek-r1-fp8-tp4:
-        description: "DeepSeek-R1-0528 FP8 TP4"
-        type: boolean
-        default: false
-      deepseek-r1-fp4-tp8:
-        description: "DeepSeek-R1-0528-MXFP4 FP4 TP8"
-        type: boolean
-        default: false
-      deepseek-r1-fp4-tp4:
-        description: "DeepSeek-R1-0528-MXFP4 FP4 TP4"
-        type: boolean
-        default: false
-      deepseek-r1-fp4-tp4-dp4-ep4:
-        description: "DeepSeek-R1-0528-MXFP4 FP4 TP4 DP4 EP4"
-        type: boolean
-        default: false
-      deepseek-r1-fp4-tp8-ep8:
-        description: "DeepSeek-R1-0528-MXFP4 FP4 TP8 EP8"
-        type: boolean
-        default: false
-      deepseek-r1-fp4-tp8-mtp3:
-        description: "DeepSeek-R1-0528-MXFP4 FP4 TP8 MTP3"
-        type: boolean
-        default: false
-      deepseek-r1-fp4-tp8-mtp1:
-        description: "DeepSeek-R1-0528-MXFP4 FP4 TP8 MTP1"
-        type: boolean
-        default: false
-      deepseek-r1-fp4-mesh:
-        description: "DeepSeek-R1-0528-MXFP4 SGLang-Mesh configs (TP8/DPA, non-MTP + MTP)"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8-tp4:
-        description: "Qwen3.5-397B-A17B-FP8 TP4"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8-tp8:
-        description: "Qwen3.5-397B-A17B-FP8 TP8"
-        type: boolean
-        default: false
-      workload_label:
-        description: "Workload label to run and publish"
+      benchmark_suite:
+        description: "Benchmark suite"
         type: choice
         options:
           - SGLang-OOB
           - SGLang-Mesh
         default: SGLang-OOB
+      oob_model_preset:
+        description: "SGLang-OOB model preset (ignored for SGLang-Mesh)"
+        type: choice
+        options:
+          - none
+          - deepseek-r1-fp8-tp8
+          - deepseek-r1-fp8-tp4
+          - deepseek-r1-fp4-tp8
+          - deepseek-r1-fp4-tp4
+          - deepseek-r1-fp4-tp4-dp4-ep4
+          - deepseek-r1-fp4-tp8-ep8
+          - deepseek-r1-fp4-tp8-mtp3
+          - deepseek-r1-fp4-tp8-mtp1
+          - qwen3-5-397b-a17b-fp8-tp4
+          - qwen3-5-397b-a17b-fp8-tp8
+          - all-deepseek
+          - all-qwen
+          - all-oob
+        default: none
+      mesh_config_preset:
+        description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"
+        type: choice
+        options:
+          - all
+          - tp8
+          - tp8-mtp
+          - dpa4-ep4
+          - dpa4-ep4-mtp
+          - dpa8-ep8
+          - dpa8-ep8-mtp
+          - non-mtp
+          - mtp
+        default: all
       docker_image:
         description: "Optional Docker image override. Use this for mori+sglang benchmark images."
         type: string
         default: ""
-      sglang_image:
-        description: "Optional SGLang benchmark image override. Kept for compatibility; docker_image takes precedence when both are set."
-        type: string
-        default: ""
       publish_to_dashboard:
-        description: "Upload benchmark results to the dashboard"
+        description: "Upload SGLang-OOB results to the ATOM dashboard. SGLang-Mesh is LLM-Booster only."
         type: boolean
         default: true
       upload_to_custom_dashboard:
@@ -112,10 +97,10 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
-          INPUT_SGLANG_IMAGE: ${{ inputs.docker_image || inputs.sglang_image || '' }}
+          INPUT_SGLANG_IMAGE: ${{ inputs.docker_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
-          INPUT_WORKLOAD_LABEL: ${{ inputs.workload_label || 'SGLang-OOB' }}
+          INPUT_WORKLOAD_LABEL: ${{ inputs.benchmark_suite || 'SGLang-OOB' }}
         run: |
           set -euo pipefail
 
@@ -161,6 +146,9 @@ jobs:
           else
             PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
             UPLOAD_TO_CUSTOM_DASHBOARD="${INPUT_UPLOAD_TO_CUSTOM_DASHBOARD:-true}"
+          fi
+          if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" ]]; then
+            PUBLISH_TO_DASHBOARD=false
           fi
 
           mapfile -t VLLM_META < <(python3 - <<'PY'
@@ -240,14 +228,14 @@ jobs:
               "${PREBUILT_SGLANG_IMAGE}" \
               "${SELECTED_SGLANG_VERSION}" \
               "${SELECTED_SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
-            printf -- '\nBecause an explicit `sglang_image` input was provided, this run uses that image directly and skips branch-based rebuild logic.\n' \
+            printf -- '\nBecause an explicit `docker_image` input was provided, this run uses that image directly and skips branch-based rebuild logic.\n' \
               >> "$GITHUB_STEP_SUMMARY"
           elif [[ "${REBUILD_SGLANG_IMAGE}" == "true" ]]; then
             printf -- '- Base image: `%s`\n- SGLang version: `%s`\n- SGLang commit: `%s`\n- SGLang source: `.github/workflows/docker-release.yaml`\n' \
               "${SGLANG_BASE_IMAGE}" \
               "${SELECTED_SGLANG_VERSION}" \
               "${SELECTED_SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
-            printf -- '\nBecause branch `%s` is not `main` and no `sglang_image` override was provided, a custom SGLang docker is rebuilt from the selected branch.\n' \
+            printf -- '\nBecause branch `%s` is not `main` and no `docker_image` override was provided, a custom SGLang docker is rebuilt from the selected branch.\n' \
               "${ATOM_REF}" >> "$GITHUB_STEP_SUMMARY"
           else
             printf -- '- Prebuilt image: `%s`\n- Expected SGLang version: `%s`\n- Expected SGLang commit: `%s`\n' \
@@ -352,17 +340,8 @@ jobs:
       - uses: actions/checkout@v6
       - id: load
         env:
-          ENABLE_DEEPSEEK_R1_FP8_TP8: ${{ inputs.deepseek-r1-fp8-tp8 }}
-          ENABLE_DEEPSEEK_R1_FP8_TP4: ${{ inputs.deepseek-r1-fp8-tp4 }}
-          ENABLE_DEEPSEEK_R1_FP4_TP8: ${{ inputs.deepseek-r1-fp4-tp8 }}
-          ENABLE_DEEPSEEK_R1_FP4_TP4: ${{ inputs.deepseek-r1-fp4-tp4 }}
-          ENABLE_DEEPSEEK_R1_FP4_TP4_DP4_EP4: ${{ inputs.deepseek-r1-fp4-tp4-dp4-ep4 }}
-          ENABLE_DEEPSEEK_R1_FP4_TP8_EP8: ${{ inputs.deepseek-r1-fp4-tp8-ep8 }}
-          ENABLE_DEEPSEEK_R1_FP4_TP8_MTP3: ${{ inputs.deepseek-r1-fp4-tp8-mtp3 }}
-          ENABLE_DEEPSEEK_R1_FP4_TP8_MTP1: ${{ inputs.deepseek-r1-fp4-tp8-mtp1 }}
-          ENABLE_DEEPSEEK_R1_FP4_MESH: ${{ inputs.deepseek-r1-fp4-mesh }}
-          ENABLE_QWEN3_5_397B_A17B_FP8_TP4: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}
-          ENABLE_QWEN3_5_397B_A17B_FP8_TP8: ${{ inputs.qwen3-5-397b-a17b-fp8-tp8 }}
+          OOB_MODEL_PRESET: ${{ inputs.oob_model_preset || 'none' }}
+          MESH_CONFIG_PRESET: ${{ inputs.mesh_config_preset || 'all' }}
           WORKLOAD_LABEL: ${{ needs.resolve-atom-source.outputs.workload_label }}
         run: |
           set -euo pipefail
@@ -390,6 +369,22 @@ jobs:
           def matches_workload(model):
               return model_workload(model) == workload_label
 
+          def has_mesh_preset(model, preset):
+              presets = {str(value) for value in model.get("mesh_presets", [])}
+              return preset in presets
+
+          def oob_selected_by_preset(model, preset):
+              prefix = str(model.get("prefix", ""))
+              if preset == "none":
+                  return False
+              if preset == "all-oob":
+                  return True
+              if preset == "all-deepseek":
+                  return prefix.startswith("deepseek-")
+              if preset == "all-qwen":
+                  return prefix.startswith("qwen")
+              return prefix == preset
+
           if event == "schedule":
               weekday = int(os.environ["BEIJING_WEEKDAY"])
               if weekday in (1, 3):
@@ -405,28 +400,20 @@ jobs:
                   selected_group = "SKIP-WEEKEND"
                   selected = []
           else:
-              enabled_by_prefix = {
-                  "deepseek-r1-fp8-tp8": os.environ.get("ENABLE_DEEPSEEK_R1_FP8_TP8", ""),
-                  "deepseek-r1-fp8-tp4": os.environ.get("ENABLE_DEEPSEEK_R1_FP8_TP4", ""),
-                  "deepseek-r1-fp4-tp8": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8", ""),
-                  "deepseek-r1-fp4-tp4": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP4", ""),
-                  "deepseek-r1-fp4-tp4-dp4-ep4": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP4_DP4_EP4", ""),
-                  "deepseek-r1-fp4-tp8-ep8": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_EP8", ""),
-                  "deepseek-r1-fp4-tp8-mtp3": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_MTP3", ""),
-                  "deepseek-r1-fp4-tp8-mtp1": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_MTP1", ""),
-                  "deepseek-r1-fp4-mesh": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_MESH", ""),
-                  "qwen3-5-397b-a17b-fp8-tp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP4", ""),
-                  "qwen3-5-397b-a17b-fp8-tp8": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP8", ""),
-              }
-              selected = [
-                  model
-                  for model in models
-                  if matches_workload(model)
-                  and enabled_by_prefix.get(
-                      str(model.get("selector_prefix") or model.get("prefix")), ""
-                  ).lower()
-                  == "true"
-              ]
+              if workload_label == "SGLang-Mesh":
+                  mesh_preset = os.environ.get("MESH_CONFIG_PRESET") or "all"
+                  selected = [
+                      model
+                      for model in models
+                      if matches_workload(model) and has_mesh_preset(model, mesh_preset)
+                  ]
+              else:
+                  oob_preset = os.environ.get("OOB_MODEL_PRESET") or "none"
+                  selected = [
+                      model
+                      for model in models
+                      if matches_workload(model) and oob_selected_by_preset(model, oob_preset)
+                  ]
 
           print(f"SGLang workload label: {workload_label}", file=sys.stderr)
           if selected_group:
@@ -664,6 +651,11 @@ jobs:
       MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
       SGLANG_EXTRA_ARGS: ${{ matrix.model.extra_args }}
       BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
+      BENCHMARK_RUNNER: ${{ matrix.model.benchmark_runner || 'sglang_atom' }}
+      MESH_SPEC_MODE: ${{ matrix.model.mesh_spec_mode || 'none' }}
+      MESH_TP_SIZE: ${{ matrix.model.tp_size || '' }}
+      MESH_DP_SIZE: ${{ matrix.model.dp_size || '' }}
+      MESH_EP_SIZE: ${{ matrix.model.ep_size || '' }}
       RESULT_PREFIX: ${{ matrix.model.prefix }}
       ISL: ${{ matrix.params.input_length }}
       OSL: ${{ matrix.params.output_length }}
@@ -700,24 +692,7 @@ jobs:
       - name: Check if model is enabled
         id: check
         run: |
-          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          case "${{ matrix.model.prefix }}" in
-            deepseek-r1-fp8-tp8) echo "enabled=${{ inputs.deepseek-r1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-fp8-tp4) echo "enabled=${{ inputs.deepseek-r1-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-fp4-tp8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-fp4-tp4) echo "enabled=${{ inputs.deepseek-r1-fp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-fp4-tp4-dp4-ep4) echo "enabled=${{ inputs.deepseek-r1-fp4-tp4-dp4-ep4 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-fp4-tp8-ep8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-ep8 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-fp4-tp8-mtp3) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-mtp3 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-fp4-tp8-mtp1) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-mtp1 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8-tp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
-          esac
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Clean up containers and workspace
         if: steps.check.outputs.enabled == 'true'
@@ -901,56 +876,80 @@ jobs:
           STREAM_SGLANG_LOGS: "1"
         run: |
           set -euo pipefail
-          $CONTAINER_ENGINE exec \
-            -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
-            -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
-            -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
-            -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
-            -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
-            -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
-            "$CONTAINER_NAME" bash -lc "
-              set -euo pipefail
-              bash .github/scripts/atom_sglang_test.sh launch
-            "
-
-          TRUST_REMOTE_CODE_ARG=""
-          if [[ "${SGLANG_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
-            TRUST_REMOTE_CODE_ARG="--trust-remote-code"
-          fi
-
           echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
+          if [[ "${BENCHMARK_RUNNER}" == "mori_sglang_mesh" ]]; then
+            $CONTAINER_ENGINE exec \
+              -e MODEL="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
+              -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
+              -e TP="${MESH_TP_SIZE}" \
+              -e DP_SIZE="${MESH_DP_SIZE:-1}" \
+              -e EP_SIZE="${MESH_EP_SIZE:-1}" \
+              -e CONC="${CONC}" \
+              -e ISL="${ISL}" \
+              -e OSL="${OSL}" \
+              -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+              -e RESULT_FILENAME="${RESULT_FILENAME}" \
+              -e RESULT_DIR="${CONTAINER_RESULT_DIR}" \
+              -e BENCH_SERVING_DIR="${CONTAINER_BENCH_SERVING_DIR}" \
+              -e SERVER_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
+              -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+              -e SPEC_MODE="${MESH_SPEC_MODE}" \
+              -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
+              -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
+              "$CONTAINER_NAME" bash -lc "
+                set -euo pipefail
+                bash .github/scripts/atom_sglang_mesh_benchmark.sh
+              "
+          else
+            $CONTAINER_ENGINE exec \
+              -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
+              -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
+              -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
+              -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
+              -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
+              -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
+              "$CONTAINER_NAME" bash -lc "
+                set -euo pipefail
+                bash .github/scripts/atom_sglang_test.sh launch
+              "
 
-          $CONTAINER_ENGINE exec \
-            -e ISL="${ISL}" \
-            -e OSL="${OSL}" \
-            -e CONC="${CONC}" \
-            -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
-            -e RESULT_FILENAME="${RESULT_FILENAME}" \
-            -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
-            "$CONTAINER_NAME" bash -lc "
-              set -euo pipefail
-              rm -rf \"${CONTAINER_RESULT_DIR}\"
-              mkdir -p \"${CONTAINER_RESULT_DIR}\"
-              PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
-                --model=\"${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
-                --backend=sglang \
-                --base-url=http://127.0.0.1:8000 \
-                --dataset-name=random \
-                --random-input-len=\"${ISL}\" \
-                --random-output-len=\"${OSL}\" \
-                --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
-                --num-prompts=\"$(( CONC * 10 ))\" \
-                --max-concurrency=\"${CONC}\" \
-                ${TRUST_REMOTE_CODE_ARG} \
-                --num-warmups=\"$(( 2 * CONC ))\" \
-                --request-rate=inf \
-                --ignore-eos \
-                --save-result \
-                --percentile-metrics=\"ttft,tpot,itl,e2el\" \
-                --result-dir=\"${CONTAINER_RESULT_DIR}\" \
-                --result-filename=\"${RESULT_FILENAME}.json\" \
-                ${BENCH_EXTRA_ARGS:-}
-            "
+            TRUST_REMOTE_CODE_ARG=""
+            if [[ "${SGLANG_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
+              TRUST_REMOTE_CODE_ARG="--trust-remote-code"
+            fi
+
+            $CONTAINER_ENGINE exec \
+              -e ISL="${ISL}" \
+              -e OSL="${OSL}" \
+              -e CONC="${CONC}" \
+              -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+              -e RESULT_FILENAME="${RESULT_FILENAME}" \
+              -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+              "$CONTAINER_NAME" bash -lc "
+                set -euo pipefail
+                rm -rf \"${CONTAINER_RESULT_DIR}\"
+                mkdir -p \"${CONTAINER_RESULT_DIR}\"
+                PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
+                  --model=\"${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                  --backend=sglang \
+                  --base-url=http://127.0.0.1:8000 \
+                  --dataset-name=random \
+                  --random-input-len=\"${ISL}\" \
+                  --random-output-len=\"${OSL}\" \
+                  --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                  --num-prompts=\"$(( CONC * 10 ))\" \
+                  --max-concurrency=\"${CONC}\" \
+                  ${TRUST_REMOTE_CODE_ARG} \
+                  --num-warmups=\"$(( 2 * CONC ))\" \
+                  --request-rate=inf \
+                  --ignore-eos \
+                  --save-result \
+                  --percentile-metrics=\"ttft,tpot,itl,e2el\" \
+                  --result-dir=\"${CONTAINER_RESULT_DIR}\" \
+                  --result-filename=\"${RESULT_FILENAME}.json\" \
+                  ${BENCH_EXTRA_ARGS:-}
+              "
+          fi
 
           $CONTAINER_ENGINE exec -i \
             -e RESULT_PATH="${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" \
@@ -968,6 +967,11 @@ jobs:
             -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
             -e UPLOAD_TO_CUSTOM_DASHBOARD="${UPLOAD_TO_CUSTOM_DASHBOARD}" \
             -e WORKLOAD_LABEL="${WORKLOAD_LABEL}" \
+            -e BENCHMARK_RUNNER="${BENCHMARK_RUNNER}" \
+            -e MESH_SPEC_MODE="${MESH_SPEC_MODE}" \
+            -e MESH_TP_SIZE="${MESH_TP_SIZE}" \
+            -e MESH_DP_SIZE="${MESH_DP_SIZE}" \
+            -e MESH_EP_SIZE="${MESH_EP_SIZE}" \
             "$CONTAINER_NAME" python3 - <<'PY'
           import json
           import os
@@ -994,16 +998,24 @@ jobs:
           )
           if tp_match:
               data["tensor_parallel_size"] = int(tp_match.group(1))
+          elif os.environ.get("MESH_TP_SIZE"):
+              data["tensor_parallel_size"] = int(os.environ["MESH_TP_SIZE"])
           dp_match = re.search(
               r"(?:--data-parallel-size|--dp-size|--dp|(?:^|\s)-dp)\s+(\d+)",
               extra_args_text,
           )
           if dp_match:
               data["data_parallel_size"] = int(dp_match.group(1))
-          ep_match = re.search(r"--expert-parallel-size\s+(\d+)", extra_args_text)
+          elif os.environ.get("MESH_DP_SIZE"):
+              data["data_parallel_size"] = int(os.environ["MESH_DP_SIZE"])
+          ep_match = re.search(r"(?:--expert-parallel-size|--ep-size)\s+(\d+)", extra_args_text)
           if ep_match:
               data["expert_parallel_size"] = int(ep_match.group(1))
+          elif os.environ.get("MESH_EP_SIZE"):
+              data["expert_parallel_size"] = int(os.environ["MESH_EP_SIZE"])
           data["enable_dp_attention"] = "--enable-dp-attention" in extra_args_text
+          data["benchmark_runner"] = os.environ.get("BENCHMARK_RUNNER", "")
+          data["spec_mode"] = os.environ.get("MESH_SPEC_MODE", "")
 
           data["atom_source_repository"] = os.environ.get("ATOM_SOURCE_REPOSITORY", "")
           data["atom_source_ref"] = os.environ.get("ATOM_SOURCE_REF", "")
@@ -1014,6 +1026,7 @@ jobs:
           data["sglang_image_tag"] = os.environ.get("SGLANG_IMAGE_TAG_USED", "")
           data["dashboard_publish_allowed"] = (
               os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
+              and workload_label != "SGLang-Mesh"
           )
           data["custom_dashboard_publish_allowed"] = (
               os.environ.get("UPLOAD_TO_CUSTOM_DASHBOARD", "false").lower() == "true"
@@ -1373,7 +1386,7 @@ jobs:
                   "backend": backend,
                   "config_label": config_label,
                   "precision": precision,
-                  "source": "ATOM Dashboard",
+                  "source": "ATOM SGLang Benchmark",
                   "client_bench": "sglang bench_serving",
                   "hardware": "mi355x",
                   "commit": {
