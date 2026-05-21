@@ -545,14 +545,21 @@ jobs:
 
       - name: Start prefill container
         run: |
-          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          # Delegate to vendored .github/scripts/ci_run.sh for RDMA NIC
+          # detection + userspace driver bind-mounts (see ci_run.sh header).
+          # ci_run.sh already supplies: --device=/dev/kfd, --device=/dev/dri,
+          # --device=/dev/infiniband, --group-add video, --network=host,
+          # --ipc=host, --privileged, -d, plus NIC mount flags.
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "")
           MODEL_MOUNT=""
           [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          bash .github/scripts/ci_run.sh \
+            -t \
+            $DEVICE_FLAG \
             $MODEL_MOUNT \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-            -w /workspace --ipc=host --group-add video \
-            --shm-size=16G --privileged --network=host \
+            -w /workspace \
+            --shm-size=16G \
             -e ATOM_DISABLE_MMAP=true -e AITER_LOG_LEVEL=WARNING \
             --name atom-smoke-prefill \
             ${{ env.ATOM_DOCKER_IMAGE }}
@@ -714,14 +721,18 @@ jobs:
 
       - name: Start decode container
         run: |
-          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          # Delegate to vendored .github/scripts/ci_run.sh for RDMA NIC
+          # detection + userspace driver bind-mounts (see ci_run.sh header).
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "")
           MODEL_MOUNT=""
           [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          bash .github/scripts/ci_run.sh \
+            -t \
+            $DEVICE_FLAG \
             $MODEL_MOUNT \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-            -w /workspace --ipc=host --group-add video \
-            --shm-size=16G --privileged --network=host \
+            -w /workspace \
+            --shm-size=16G \
             -e ATOM_DISABLE_MMAP=true -e AITER_LOG_LEVEL=WARNING \
             --name atom-smoke-decode \
             ${{ env.ATOM_DOCKER_IMAGE }}
@@ -875,42 +886,26 @@ jobs:
 
       - name: Start prefill container
         run: |
-          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          # Delegate to vendored .github/scripts/ci_run.sh for RDMA NIC
+          # detection + userspace driver bind-mounts. ci_run.sh does two-stage
+          # detection (device-name THEN driver-symlink fallback) — the previous
+          # inline detection only matched by device name and silently fell
+          # through to NIC_TYPE=mlx5 on hosts with udev-renamed NICs
+          # (rdma0..rdmaN, rocep*s0, etc.), leaving libibverbs with no
+          # userspace provider → mooncake fell back to TCP → ~170 connect
+          # timeouts per nightly + PD throughput tanked.
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "")
           MODEL_MOUNT=""
           [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
-          IB_FLAG=""
-          [ -e "/dev/infiniband" ] && IB_FLAG="--device=/dev/infiniband"
 
-          NIC_MOUNTS=""
-          NIC_TYPE="mlx5"
-          if [ -d /sys/class/infiniband ]; then
-            for dev in /sys/class/infiniband/*; do
-              name=$(basename "$dev")
-              case "$name" in bnxt_re*) NIC_TYPE="bnxt"; break ;; ionic*) NIC_TYPE="ionic"; break ;; esac
-            done
-          fi
-          if [ "$NIC_TYPE" = "bnxt" ]; then
-            for c in /usr/lib64/libibverbs.so.1 /lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so.1; do
-              resolved=$(readlink -f "$c" 2>/dev/null || true)
-              if [ -f "$resolved" ]; then NIC_MOUNTS="$NIC_MOUNTS -v $resolved:/lib/x86_64-linux-gnu/libibverbs.so.1"; break; fi
-            done
-            for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
-              [ -f "$lib" ] && NIC_MOUNTS="$NIC_MOUNTS -v $lib:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename $lib)"
-            done
-            for lib in /usr/local/lib/libbnxt_re.so; do
-              [ -f "$lib" ] && NIC_MOUNTS="$NIC_MOUNTS -v $lib:/usr/lib/x86_64-linux-gnu/$(basename $lib)"
-            done
-            [ -d /etc/libibverbs.d ] && NIC_MOUNTS="$NIC_MOUNTS -v /etc/libibverbs.d:/etc/libibverbs.d:ro"
-          fi
-
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG $IB_FLAG \
-            $NIC_MOUNTS \
+          bash .github/scripts/ci_run.sh \
+            -t \
+            $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
-            -w /workspace --ipc=host --group-add video \
-            --shm-size=16G --privileged --cap-add=SYS_PTRACE \
+            -w /workspace \
+            --shm-size=16G --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
-            --network=host \
             -e ATOM_DISABLE_MMAP=true \
             -e NCCL_SOCKET_IFNAME=lo \
             -e AITER_LOG_LEVEL=WARNING \
@@ -1247,42 +1242,21 @@ jobs:
 
       - name: Start decode container
         run: |
-          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          # Delegate to vendored .github/scripts/ci_run.sh for RDMA NIC
+          # detection + userspace driver bind-mounts (see ci_run.sh header
+          # for full rationale).
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "")
           MODEL_MOUNT=""
           [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
-          IB_FLAG=""
-          [ -e "/dev/infiniband" ] && IB_FLAG="--device=/dev/infiniband"
 
-          NIC_MOUNTS=""
-          NIC_TYPE="mlx5"
-          if [ -d /sys/class/infiniband ]; then
-            for dev in /sys/class/infiniband/*; do
-              name=$(basename "$dev")
-              case "$name" in bnxt_re*) NIC_TYPE="bnxt"; break ;; ionic*) NIC_TYPE="ionic"; break ;; esac
-            done
-          fi
-          if [ "$NIC_TYPE" = "bnxt" ]; then
-            for c in /usr/lib64/libibverbs.so.1 /lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so.1; do
-              resolved=$(readlink -f "$c" 2>/dev/null || true)
-              if [ -f "$resolved" ]; then NIC_MOUNTS="$NIC_MOUNTS -v $resolved:/lib/x86_64-linux-gnu/libibverbs.so.1"; break; fi
-            done
-            for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
-              [ -f "$lib" ] && NIC_MOUNTS="$NIC_MOUNTS -v $lib:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename $lib)"
-            done
-            for lib in /usr/local/lib/libbnxt_re.so; do
-              [ -f "$lib" ] && NIC_MOUNTS="$NIC_MOUNTS -v $lib:/usr/lib/x86_64-linux-gnu/$(basename $lib)"
-            done
-            [ -d /etc/libibverbs.d ] && NIC_MOUNTS="$NIC_MOUNTS -v /etc/libibverbs.d:/etc/libibverbs.d:ro"
-          fi
-
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG $IB_FLAG \
-            $NIC_MOUNTS \
+          bash .github/scripts/ci_run.sh \
+            -t \
+            $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
-            -w /workspace --ipc=host --group-add video \
-            --shm-size=16G --privileged --cap-add=SYS_PTRACE \
+            -w /workspace \
+            --shm-size=16G --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
-            --network=host \
             -e ATOM_DISABLE_MMAP=true \
             -e NCCL_SOCKET_IFNAME=lo \
             -e AITER_LOG_LEVEL=WARNING \

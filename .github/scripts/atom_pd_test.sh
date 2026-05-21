@@ -42,71 +42,9 @@ DECODE_HOSTS_FILE="/tmp/atom_pd_decode_hosts"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes"
 
-# ── RDMA NIC detection (ported from mori/docker/ci_run.sh) ─────────
-
-detect_nic_type() {
-    if [[ -n "${MORI_NIC_TYPE:-}" ]]; then echo "$MORI_NIC_TYPE"; return; fi
-    local bnxt=0 mlx5=0 ionic=0
-    if [[ -d /sys/class/infiniband ]]; then
-        for dev in /sys/class/infiniband/*; do
-            local name; name=$(basename "$dev")
-            case "$name" in
-                bnxt_re*) ((bnxt++)) ;; mlx5*) ((mlx5++)) ;; ionic*) ((ionic++)) ;;
-                *)
-                    local drv; drv=$(basename "$(readlink -f "$dev/device/driver" 2>/dev/null)" 2>/dev/null || true)
-                    case "$drv" in bnxt*) ((bnxt++)) ;; mlx5*) ((mlx5++)) ;; ionic*) ((ionic++)) ;; esac ;;
-            esac
-        done
-    fi
-    if (( bnxt >= mlx5 && bnxt >= ionic && bnxt > 0 )); then echo "bnxt"
-    elif (( ionic >= mlx5 && ionic > 0 )); then echo "ionic"
-    else echo "mlx5"; fi
-}
-
-find_host_ibverbs() {
-    for c in /usr/lib64/libibverbs.so.1 /lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so.1; do
-        local resolved; resolved=$(readlink -f "$c" 2>/dev/null || true)
-        if [[ -f "$resolved" ]]; then echo "$resolved"; return; fi
-    done
-}
-
-nic_mount_flags() {
-    local nic_type="$1" flags=()
-    case "$nic_type" in
-        bnxt)
-            local hib; hib=$(find_host_ibverbs)
-            [[ -n "$hib" ]] && flags+=(-v "$hib:/lib/x86_64-linux-gnu/libibverbs.so.1")
-            for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
-                [[ -f "$lib" ]] && flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename "$lib")")
-            done
-            for lib in /usr/local/lib/libbnxt_re.so; do
-                [[ -f "$lib" ]] && flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
-            done
-            [[ -d /etc/libibverbs.d ]] && flags+=(-v /etc/libibverbs.d:/etc/libibverbs.d:ro)
-            ;;
-        ionic)
-            local hib; hib=$(find_host_ibverbs)
-            [[ -n "$hib" ]] && flags+=(-v "$hib:/lib/x86_64-linux-gnu/libibverbs.so.1")
-            for dir in /usr/local/lib /usr/lib/x86_64-linux-gnu; do
-                for lib in "$dir"/libionic*.so; do
-                    if [[ -f "$lib" ]]; then
-                        local real; real=$(readlink -f "$lib")
-                        [[ -f "$real" ]] && flags+=(-v "$real:$real")
-                        flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
-                    fi
-                done
-            done
-            local pdir=/usr/lib/x86_64-linux-gnu/libibverbs
-            if [[ -d "$pdir" ]]; then
-                for lib in "$pdir"/libionic-rdmav*.so; do
-                    [[ -f "$lib" ]] && flags+=(-v "$lib:$lib")
-                done
-            fi
-            [[ -d /etc/libibverbs.d ]] && flags+=(-v /etc/libibverbs.d:/etc/libibverbs.d:ro)
-            ;;
-    esac
-    echo "${flags[@]}"
-}
+# RDMA NIC detection + userspace driver mounts now live in ./ci_run.sh
+# (vendored from ROCm/mori). All container launches go through it so the
+# device-name + driver-symlink two-stage detection is applied consistently.
 
 # ── Node discovery ──────────────────────────────────────────────────
 
@@ -263,6 +201,17 @@ launch_consumer_remote() {
 KVJSON
 )
 
+    # Ship ci_run.sh to the decode host so the consumer container also gets
+    # the proper RDMA NIC userspace-driver mounts (see ci_run.sh header for
+    # why the previous inline detection silently TCP-fell-back).
+    local ci_run_local="$(dirname "${BASH_SOURCE[0]}")/ci_run.sh"
+    if [ ! -f "$ci_run_local" ]; then
+        echo "ERROR: ci_run.sh not found next to atom_pd_test.sh at $ci_run_local" >&2
+        return 1
+    fi
+    # shellcheck disable=SC2086
+    scp $SSH_OPTS "$ci_run_local" "${decode_host}:/tmp/atom_ci_run.sh"
+
     # shellcheck disable=SC2029,SC2086
     ssh $SSH_OPTS "$decode_host" bash -l <<REMOTE_EOF
 set -euo pipefail
@@ -274,46 +223,27 @@ if [ -n "\$containers" ]; then
     docker rm \$containers || true
 fi
 
-DEVICE_FLAG=\$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+chmod +x /tmp/atom_ci_run.sh
+
+DEVICE_FLAG=\$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "")
 MODEL_MOUNT=""
 [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
-IB_FLAG=""
-[ -e "/dev/infiniband" ] && IB_FLAG="--device=/dev/infiniband"
 
-# NIC detection for RDMA userspace libs (ported from mori)
-NIC_MOUNTS=""
-NIC_TYPE="mlx5"
-if [ -d /sys/class/infiniband ]; then
-    for dev in /sys/class/infiniband/*; do
-        name=\$(basename "\$dev")
-        case "\$name" in bnxt_re*) NIC_TYPE="bnxt"; break ;; ionic*) NIC_TYPE="ionic"; break ;; esac
-    done
-fi
-if [ "\$NIC_TYPE" = "bnxt" ]; then
-    for c in /usr/lib64/libibverbs.so.1 /lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so.1; do
-        resolved=\$(readlink -f "\$c" 2>/dev/null || true)
-        if [ -f "\$resolved" ]; then NIC_MOUNTS="\$NIC_MOUNTS -v \$resolved:/lib/x86_64-linux-gnu/libibverbs.so.1"; break; fi
-    done
-    for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
-        [ -f "\$lib" ] && NIC_MOUNTS="\$NIC_MOUNTS -v \$lib:/usr/lib/x86_64-linux-gnu/libibverbs/\$(basename \$lib)"
-    done
-    for lib in /usr/local/lib/libbnxt_re.so; do
-        [ -f "\$lib" ] && NIC_MOUNTS="\$NIC_MOUNTS -v \$lib:/usr/lib/x86_64-linux-gnu/\$(basename \$lib)"
-    done
-    [ -d /etc/libibverbs.d ] && NIC_MOUNTS="\$NIC_MOUNTS -v /etc/libibverbs.d:/etc/libibverbs.d:ro"
-fi
-
-docker run -dt --device=/dev/kfd \$DEVICE_FLAG \$IB_FLAG \
-    \$NIC_MOUNTS \
+# ci_run.sh already supplies: --device=/dev/kfd, --device=/dev/dri,
+# --device=/dev/infiniband, --group-add video, --network=host, --ipc=host,
+# --privileged, -d, plus NIC userspace lib mounts (libbnxt_re / libionic /
+# libmlx5) detected via BOTH device-name AND driver-symlink fallback.
+bash /tmp/atom_ci_run.sh \
+    -t \
+    \$DEVICE_FLAG \
     \$MODEL_MOUNT \
-    -w /workspace --ipc=host --group-add video \
-    --shm-size=16G --privileged --cap-add=SYS_PTRACE \
+    -w /workspace \
+    --shm-size=16G --cap-add=SYS_PTRACE \
     --security-opt seccomp=unconfined \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -e ATOM_DISABLE_MMAP=true \
     -e NCCL_SOCKET_IFNAME=lo \
     -e AITER_LOG_LEVEL=WARNING \
-    --network=host \
     --name ${container_name} \
     ${ATOM_DOCKER_IMAGE:-rocm/atom-dev:latest}
 
