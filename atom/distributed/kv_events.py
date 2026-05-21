@@ -168,6 +168,7 @@ class ZmqEventPublisher(EventPublisher):
         self._drops = 0
         self._sent = 0
         self._encode_errors = 0
+        self._closing = False
         self._lock = threading.Lock()
         self._sender = threading.Thread(
             target=self._run, name="atom-kv-event-sender", daemon=True
@@ -175,6 +176,8 @@ class ZmqEventPublisher(EventPublisher):
         self._sender.start()
 
     def publish(self, events: Iterable[KVCacheEvent]) -> None:
+        if self._closing:
+            return
         evt_list = list(events)
         if not evt_list:
             return
@@ -205,15 +208,16 @@ class ZmqEventPublisher(EventPublisher):
                     pass
 
     def shutdown(self) -> None:
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            # Force-poison: clear and inject.
+        self._closing = True  # publish() will return early from here on
+        while True:
             try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                pass
-            self._queue.put_nowait(None)
+                self._queue.put_nowait(None)
+                break
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
         self._sender.join(timeout=2.0)
         try:
             self._socket.close(linger=0)

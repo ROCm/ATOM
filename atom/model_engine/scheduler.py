@@ -415,12 +415,10 @@ class Scheduler:
         self.kv_connector = get_kvconnector("scheduler", config)
 
         from atom.distributed.kv_events import (
-            EventBatch as _EventBatch,
             EventPublisher as _EventPublisher,
             make_publisher as _make_publisher,
         )
 
-        self._EventBatch = _EventBatch
         kv_events_cfg = getattr(config, "kv_events_config", None)
         parallel_cfg = getattr(config, "parallel_config", None)
         dp_rank = (
