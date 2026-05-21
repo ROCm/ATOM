@@ -768,13 +768,6 @@ mod f_response_context {
     }
 }
 
-mod g_render_finish_reason {
-    // finish_reason_mapping lives under render/, but its tests cover the boundary
-    // that prepare_*' assertions about FinishReason source enums depend on. See
-    // sibling render/tests.rs::a_finish_reason for the live coverage; keep this
-    // mod empty to avoid duplication.
-}
-
 mod h_prepare_chat_generate {
     use std::sync::Arc;
 

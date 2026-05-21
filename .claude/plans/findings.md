@@ -534,3 +534,142 @@ The 15 failures are pre-existing api_tests/routing_tests requiring external work
 - H11 `/v1/responses` streaming + non-streaming smoke: PENDING — user must run
   on GPU host via `/mesh-e2e-test`. Refactor functionality unchanged; the path
   through `pipeline.execute_chat_for_responses` was already validated by F9/G10.
+
+## Part I — 2026-05-21 — pass_count 860 (-6 vs Part H, accounted for)
+
+**Scope**: Final cleanup sweep. Delete everything orphaned by Parts A–H so the
+refactored tree matches design §3.1.
+
+**Deletions** (35 files, 4361 lines removed, 25 added):
+
+Production:
+- `grpc/legacy_pipeline.rs` (283 ln) — old staged `RequestPipeline`, no callers
+  after Part G switched PD router.
+- `grpc/context.rs` (388 ln) — `RequestContext`, `ProcessingState`,
+  `PreparationOutput`, `WorkerSelection`, `ClientSelection`, `DispatchMetadata`,
+  `LoadGuards`, `ExecutionResult`, `FinalResponse`, `ResponseState`. The new
+  `Pipeline` carries `(GenerationPayload, ResponseContext)` directly; `LoadGuards`
+  was not moved (Pipeline already had its own `make_load_guards` returning
+  `Vec<WorkerLoadGuard>`).
+- `grpc/common/` (entire dir, 6 files, 580 ln) — `PipelineStage` trait + helpers
+  + 5 stages.
+- `grpc/regular/` (entire dir, 14 files, 2885 ln) — `streaming.rs` (1330 ln),
+  `processor.rs` (538 ln), all stage dispatchers + chat/generate substages.
+- `grpc/utils.rs` (113 ln) — `resolve_tokenizer`, `collect_stream_responses`,
+  `error_type_from_status` re-export. Pipeline now imports `error_type_from_status`
+  directly from `shared::metrics_utils`.
+- `render/finish_reason_mapping.rs` (38 ln) — render layer operates on the typed
+  `worker_stream::FinishReason` enum via per-file `finish_reason_to_str` /
+  `finish_reason_to_generate` helpers; the string-parsing variant became dead
+  in Part D.
+- 3 OpenAI-shape logprob converters in `engine/proto_to_chunk.rs` and their
+  imports (`Arc`, `Tokenizer`, `ChatLogProbs*`, `TopLogProb`) — only legacy
+  `regular/streaming.rs` + `regular/processor.rs` consumed them. The neutral
+  `TokenLogprobs` path in `proto_complete_to_chunk` is now the sole consumer.
+
+Tests:
+- `src/core/placement/tests.rs:1611-1657` — 2 tests (49 ln) that exercised
+  `plan_to_worker_selection` (deleted helper in `common/stages/`) +
+  `WorkerSelection` enum (deleted from `context.rs`). Planner behavior remains
+  covered by `h_integration` block.
+- `src/routers/render/tests.rs::a_finish_reason` (4 tests, 36 ln) — exercised
+  the deleted `render/finish_reason_mapping.rs::parse_finish_reason`.
+  finish_reason coverage for the live render path comes from
+  `b_chat_aggregator` / `c_chat_streaming` / `d_generate_aggregator` /
+  `e_generate_streaming` + `tests/grpc_sse_snapshot.rs` (8 fixtures).
+- `src/routers/prepare/tests.rs::g_render_finish_reason` — removed the empty
+  mod and its stale cross-reference comment pointing at the deleted
+  `render/tests.rs::a_finish_reason` (rust-reviewer MEDIUM finding).
+
+Modifications:
+- `grpc/mod.rs` — registers only `completion_adapter`, `engine`, `pd_router`,
+  `pipeline`, `router` (plus cfg(any())-gated `tests`).
+- `grpc/pipeline.rs` — absorbed `error_type_from_status` into the existing
+  `routers::shared::{...}` import block; dropped historical "replaces the
+  staged RequestPipeline" doc comment.
+- `grpc/router.rs` + `grpc/pd_router.rs` — added 1-line `//!` headers per
+  plan §6.5 (the only files in the refactored tree that lacked one).
+- `grpc/engine/proto_to_chunk.rs` — module doc rewritten to drop the
+  "regular/streaming.rs and regular/processor.rs" provenance (those files
+  no longer exist).
+- `render/mod.rs`, `render/tests.rs` — unregistered the deleted module + its
+  tests.
+
+**Test gates** (plan §Test Part I):
+- I1 build clean: PASS (zero warnings; 1m 28s)
+- I2 no regression: PASS — 860 passed / 15 failed. The −6 vs Part H exactly
+  matches the 2 placement + 4 render tests removed alongside the dead code
+  they exercised. The 15 failures remain the pre-existing api_tests +
+  routing_tests requiring external workers (unchanged since Part 0).
+- I3 §6.1 `mesh_grpc::*` only in `grpc/engine/`: PASS for `use` statements.
+  3 `//!` doc-comment references survive (`prepare/generation_payload.rs:5`
+  describes the convention; `worker_stream/token_chunk.rs:4` asserts none
+  appear; `openai/responses/tests.rs:370,390` quote §6.13 in test scaffolding)
+  — same Part H precedent.
+- I4 §6.2 `prepare/`, `render/`, `worker_stream/` grpc-free: PASS (empty).
+- I5 §6.3 no `ProcessingState`: PASS (empty).
+- I6 §6.4 no `PipelineStage` trait or `Vec<Box<dyn PipelineStage>>`: PASS.
+- I7 §6.5 every file has `//`/`//!` header: PASS (added headers to
+  `router.rs` and `pd_router.rs`).
+- I8 §6.6 no umbrella filenames (`utils.rs`, `common.rs`, `helpers.rs`,
+  `chunk.rs`, `payload.rs`): PASS (empty).
+- I9 §6.7 `prepare` + `render` tests pass without `mesh_grpc::`: PASS
+  (6 prepare + 14 render unit tests).
+- I10 §6.8 proto snapshots A–D: PASS (11/11 in `tests/grpc_proto_snapshot.rs`).
+- I11 §6.9 PD merge T1–T7: PASS (11/11 in `tests/grpc_pd_merge_tests.rs`).
+- I12 §6.10 `WorkerStream::Drop` single + PD: PASS (2/2 in
+  `tests/grpc_engine_drop_tests.rs`).
+- I13 §6.11 `openai/responses/` references `grpc` only via `Pipeline`: PASS
+  for `use` statements.
+- I14 §6.12 `grpc/` does not reference `openai/`: PASS (empty).
+- I15 §6.13 no `mesh_grpc::*` in `openai/responses/` `use` lines: PASS.
+- I16 §6.14 SSE byte snapshots stable: PASS (8/8 in
+  `tests/grpc_sse_snapshot.rs`).
+- I17 (cargo machete / cargo udeps) — tooling not available in container;
+  proxy via zero-warning `cargo build --release` confirms no orphan
+  warnings remain.
+- I18 old paths gone: PASS (`utils.rs`, `common/`, `regular/`, `context.rs`,
+  `legacy_pipeline.rs` all absent).
+- I19 line-count sanity: `grpc/` totals 4325 ln vs plan target ≤ 2500.
+  Excluding cfg(any())-gated `grpc/tests.rs` (493) and `grpc/engine/tests.rs`
+  (1121), the production-only `grpc/` is 2711 ln — slightly over the 2500
+  target. The overflow lives in `completion_adapter.rs` (459 ln, in scope —
+  `/v1/completions`→`/generate` adapter), the engine subdirectory (1380 ln
+  of proto wiring), `pipeline.rs` (~313), `router.rs` (~294), `pd_router.rs`
+  (~260). Nothing further is dead. Karpathy: no speculative refactor to hit
+  a round number.
+- cargo fmt clean.
+
+**Subagent review (rust-reviewer)**: APPROVE on first pass. 1 MEDIUM
+(stale cross-reference comment in `prepare/tests.rs:771-776`) + 2
+NON-BLOCKERs (historical doc comments naming `RequestPipeline`). MEDIUM
+fixed in same commit; one NON-BLOCKER fixed (`pipeline.rs:38-39` doc);
+the other lives in cfg(any())-gated `grpc/tests.rs` and is harmless.
+
+**Final line-count delta** (production source under `src/routers/`):
+
+| Path | Part 0 | Part I | Delta |
+|---|---|---|---|
+| `grpc/` total | 9280 (lib pre-refactor) | 4325 (incl 1614 gated tests) | -4955 |
+| `grpc/` production-only | 9280 | 2711 | -6569 |
+| `prepare/` | 0 | 2356 | +2356 |
+| `render/` | 0 | 1931 | +1931 |
+| `worker_stream/` | 0 | 781 | +781 |
+| `openai/responses/` | (was in `grpc/`) | 2429 | (moved) |
+
+Total refactored tree (production-only, excluding gated test scaffolds):
+~10208 ln across 5 modular subtrees, vs the pre-refactor 9280 ln single
+god-tree. The growth comes from neutral boundary types
+(`worker_stream/`), explicit byte-equality oracles
+(`tests/grpc_proto_snapshot.rs`), and split-by-concern files replacing
+prior umbrella `utils.rs`/`processor.rs` files.
+
+**Human gates** (plan §Test Part I I20):
+- `/mesh-e2e-test` full matrix: PENDING — user must run on GPU host.
+  Refactor preserves byte-equivalent proto requests (4/4 scenarios) and
+  byte-identical SSE wire bytes (8/8 fixtures). All previously-validated
+  Part F (regular) and Part G/H (PD + responses) paths are unaffected by
+  Part I (which only deletes dead code).
+- Plan §6.15 final acceptance criterion (I21 final rust-reviewer): COMPLETE
+  — APPROVE delivered above; medium/non-blocker findings addressed.
+

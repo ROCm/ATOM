@@ -1,44 +1,7 @@
 //! Tests for `routers::render::*`.
 //!
-//! Covers `finish_reason_mapping` (Part A) and the four render functions that
-//! replace `regular/streaming.rs` + `regular/processor.rs` (Part E).
-
-mod a_finish_reason {
-    use serde_json::Value;
-
-    use crate::protocols::generate::GenerateFinishReason;
-    use crate::routers::render::finish_reason_mapping::parse_finish_reason;
-
-    #[test]
-    fn test_parse_stop_returns_stop() {
-        let r = parse_finish_reason("stop", 0);
-        assert!(matches!(r, GenerateFinishReason::Stop));
-    }
-
-    #[test]
-    fn test_parse_length_returns_length() {
-        let r = parse_finish_reason("length", 100);
-        match r {
-            GenerateFinishReason::Length { length } => assert_eq!(length, 100),
-            other => panic!("expected Length, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_other_passes_through_string() {
-        let r = parse_finish_reason("eos_token", 0);
-        match r {
-            GenerateFinishReason::Other(Value::String(v)) => assert_eq!(v, "eos_token"),
-            other => panic!("expected Other(String), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_empty_returns_other() {
-        let r = parse_finish_reason("", 0);
-        assert!(matches!(r, GenerateFinishReason::Other(_)));
-    }
-}
+//! Covers the four render functions that replace `regular/streaming.rs` +
+//! `regular/processor.rs` (Part E).
 
 #[cfg(test)]
 mod test_support {

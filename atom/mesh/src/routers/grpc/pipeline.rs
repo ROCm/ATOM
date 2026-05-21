@@ -7,7 +7,6 @@ use http::HeaderMap;
 use tracing::error;
 
 use super::engine::GrpcEngine;
-use super::utils::error_type_from_status;
 use crate::{
     app_context::AppContext,
     core::{
@@ -29,14 +28,14 @@ use crate::{
         error,
         prepare::{self, generation_payload::GenerationPayload, response_context::ResponseContext},
         render,
-        shared::placement_response::placement_err_to_response,
+        shared::{
+            metrics_utils::error_type_from_status, placement_response::placement_err_to_response,
+        },
         worker_stream::engine_error::EngineError,
     },
 };
 
-/// New transport-neutral pipeline: prepare → plan → engine.dispatch → render.
-/// Replaces the staged `RequestPipeline` for chat/generate paths in both
-/// regular and PD routers.
+/// Transport-neutral pipeline: prepare → plan → engine.dispatch → render.
 #[derive(Clone)]
 pub(crate) struct Pipeline {
     planner: Arc<dyn PdPlanner>,
@@ -49,7 +48,11 @@ impl Pipeline {
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
     ) -> Self {
-        Self::with_label(worker_registry, policy_registry, metrics_labels::BACKEND_REGULAR)
+        Self::with_label(
+            worker_registry,
+            policy_registry,
+            metrics_labels::BACKEND_REGULAR,
+        )
     }
 
     pub fn new_pd(
@@ -268,7 +271,9 @@ fn make_load_guards(plan: &PlacementPlan, headers: Option<&HeaderMap>) -> Vec<Wo
         PlacementPlan::Single { worker, .. } => {
             vec![WorkerLoadGuard::new(worker.clone(), headers)]
         }
-        PlacementPlan::Pair { prefill, decode, .. } => vec![
+        PlacementPlan::Pair {
+            prefill, decode, ..
+        } => vec![
             WorkerLoadGuard::new(prefill.clone(), headers),
             WorkerLoadGuard::new(decode.clone(), headers),
         ],
@@ -287,10 +292,9 @@ fn placement_err_to_response_log(err: PlacementError, model_id: Option<&str>) ->
 
 fn engine_err_to_response(err: EngineError) -> Response {
     match err {
-        EngineError::Transport(s) => error::service_unavailable(
-            "engine_transport_error",
-            format!("transport error: {}", s),
-        ),
+        EngineError::Transport(s) => {
+            error::service_unavailable("engine_transport_error", format!("transport error: {}", s))
+        }
         EngineError::Prefill(m) => {
             error::internal_error("engine_prefill_error", format!("prefill error: {}", m))
         }

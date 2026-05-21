@@ -1,3 +1,5 @@
+//! gRPC router for regular (single-worker) chat/generate/completion paths.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

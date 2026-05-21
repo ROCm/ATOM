@@ -1,3 +1,5 @@
+//! gRPC router for prefill/decode (PD) dual-dispatch chat/generate paths.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

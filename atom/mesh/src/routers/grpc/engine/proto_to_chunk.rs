@@ -1,16 +1,11 @@
 //! Convert backend-specific proto chunks/completes into the transport-neutral
-//! `TokenChunk` consumed by the render layer. Also hosts OpenAI-shaped
-//! logprob adapters used by `regular/streaming.rs` and `regular/processor.rs`,
-//! which still consume `ProtoStream` directly.
-
-use std::sync::Arc;
+//! `TokenChunk` consumed by the render layer.
 
 use mesh_grpc::sglang_proto::{
     generate_complete::MatchedStop as SglangMatchedStop, InputLogProbs as SglangInputLogProbs,
     OutputLogProbs as SglangOutputLogProbs,
 };
 
-use crate::protocols::common::{ChatLogProbs, ChatLogProbsContent, TopLogProb};
 use crate::routers::grpc::engine::proto_stream_wrapper::{
     ProtoGenerateComplete, ProtoGenerateStreamChunk,
 };
@@ -18,7 +13,6 @@ use crate::routers::worker_stream::token_chunk::{
     FinishReason, InputLogprobs, MatchedStop, TokenChunk, TokenLogprob, TokenLogprobs, Usage,
     WorkerMeta,
 };
-use crate::tokenizer::traits::Tokenizer;
 
 pub(crate) fn proto_chunk_to_chunk(chunk: ProtoGenerateStreamChunk) -> TokenChunk {
     let token_ids = chunk.token_ids().to_vec();
@@ -135,100 +129,4 @@ fn sglang_input_to_input_logprobs(lp: &SglangInputLogProbs) -> InputLogprobs {
         });
     }
     InputLogprobs { items }
-}
-
-/// OpenAI-shaped logprob converter for callers that have not migrated to
-/// the neutral [`proto_complete_to_chunk`] output.
-pub(crate) fn convert_proto_to_openai_logprobs(
-    proto_logprobs: &SglangOutputLogProbs,
-    tokenizer: &Arc<dyn Tokenizer>,
-) -> Result<ChatLogProbs, String> {
-    let mut content_items = Vec::with_capacity(proto_logprobs.token_logprobs.len());
-
-    let token_texts: Vec<String> = proto_logprobs
-        .token_ids
-        .iter()
-        .map(|&token_id| {
-            tokenizer
-                .decode(&[token_id as u32], false)
-                .unwrap_or_else(|_| format!("<token_{}>", token_id))
-        })
-        .collect();
-
-    for (i, (&logprob, token_text)) in proto_logprobs
-        .token_logprobs
-        .iter()
-        .zip(token_texts.into_iter())
-        .enumerate()
-    {
-        let bytes = Some(token_text.as_bytes().to_vec());
-
-        let top_logprobs = if let Some(top_logprobs_entry) = proto_logprobs.top_logprobs.get(i) {
-            let mut top_logprobs = Vec::with_capacity(top_logprobs_entry.values.len());
-
-            let top_token_texts: Vec<String> = top_logprobs_entry
-                .token_ids
-                .iter()
-                .map(|&tid| {
-                    tokenizer
-                        .decode(&[tid as u32], false)
-                        .unwrap_or_else(|_| format!("<token_{}>", tid))
-                })
-                .collect();
-
-            for (j, (&top_logprob, &_top_token_id)) in top_logprobs_entry
-                .values
-                .iter()
-                .zip(top_logprobs_entry.token_ids.iter())
-                .enumerate()
-            {
-                if let Some(top_token_text) = top_token_texts.get(j) {
-                    top_logprobs.push(TopLogProb {
-                        token: top_token_text.clone(),
-                        logprob: top_logprob,
-                        bytes: Some(top_token_text.as_bytes().to_vec()),
-                    });
-                }
-            }
-            top_logprobs
-        } else {
-            Vec::new()
-        };
-
-        content_items.push(ChatLogProbsContent {
-            token: token_text,
-            logprob,
-            bytes,
-            top_logprobs,
-        });
-    }
-
-    Ok(ChatLogProbs::Detailed {
-        content: (!content_items.is_empty()).then_some(content_items),
-    })
-}
-
-pub(crate) fn convert_generate_output_logprobs(
-    proto_logprobs: &SglangOutputLogProbs,
-) -> Vec<Vec<Option<f64>>> {
-    proto_logprobs
-        .token_logprobs
-        .iter()
-        .zip(proto_logprobs.token_ids.iter())
-        .map(|(&logprob, &token_id)| vec![Some(logprob as f64), Some(token_id as f64)])
-        .collect()
-}
-
-pub(crate) fn convert_generate_input_logprobs(
-    proto_logprobs: &SglangInputLogProbs,
-) -> Vec<Vec<Option<f64>>> {
-    proto_logprobs
-        .token_logprobs
-        .iter()
-        .zip(proto_logprobs.token_ids.iter())
-        .map(|(token_logprob, &token_id)| {
-            let logprob_value = token_logprob.value.map(|v| v as f64);
-            vec![logprob_value, Some(token_id as f64)]
-        })
-        .collect()
 }
