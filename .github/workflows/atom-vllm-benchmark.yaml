@@ -1570,11 +1570,10 @@ jobs:
                     --random-input-len \"${ISL}\" \
                     --random-output-len \"${OSL}\" \
                     ${RANDOM_RANGE_RATIO:+--random-range-ratio \"${RANDOM_RANGE_RATIO}\"} \
-                    --temperature 0.0 \
-                    --num-prompts \"$(( CONC * 10 ))\" \
+                    --num-prompts \"$(( CONC * 8 ))\" \
                     --max-concurrency \"${CONC}\" \
                     ${TRUST_REMOTE_CODE_ARG} \
-                    --num-warmups \"$(( 2 * CONC ))\" \
+                    --num-warmups \"${CONC}\" \
                     --request-rate inf \
                     --ignore-eos \
                     --disable-tqdm \
