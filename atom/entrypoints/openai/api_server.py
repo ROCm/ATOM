@@ -74,7 +74,7 @@ _stream_loops: Dict[str, AbstractEventLoop] = {}
 _request_start_times: Dict[str, float] = {}
 _stream_decode_states: Dict[str, Dict[int, Dict[str, Any]]] = {}
 _request_logger: Optional[logging.Logger] = None
-STREAM_DECODE_CONTEXT_TOKENS = 16
+INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
 # ============================================================================
@@ -173,13 +173,127 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
     return n
 
 
-def _common_prefix_len(left: str, right: str) -> int:
-    """Return the character prefix shared by two decoded text snapshots."""
-    limit = min(len(left), len(right))
-    idx = 0
-    while idx < limit and left[idx] == right[idx]:
-        idx += 1
-    return idx
+def _replace_none_with_empty(tokens: List[Optional[str]]) -> None:
+    for idx, token in enumerate(tokens):
+        if token is None:
+            tokens[idx] = ""
+
+
+def _convert_tokens_to_string_with_added_encoders(
+    tokenizer: AutoTokenizer,
+    output_tokens: List[str],
+    skip_special_tokens: bool,
+    spaces_between_special_tokens: bool,
+) -> str:
+    sub_texts: List[str] = []
+    current_sub_text: List[str] = []
+    added_vocab_set = set(tokenizer.get_added_vocab())
+    all_special_tokens = (
+        set(tokenizer.all_special_tokens) if skip_special_tokens else set()
+    )
+
+    for token in output_tokens:
+        if token in all_special_tokens:
+            continue
+        if token in added_vocab_set:
+            if current_sub_text:
+                sub_texts.append(tokenizer.convert_tokens_to_string(current_sub_text))
+                current_sub_text.clear()
+            sub_texts.append(token)
+        else:
+            current_sub_text.append(token)
+
+    if current_sub_text:
+        sub_texts.append(tokenizer.convert_tokens_to_string(current_sub_text))
+
+    if spaces_between_special_tokens:
+        return " ".join(sub_texts)
+    return "".join(sub_texts)
+
+
+def _convert_prompt_ids_to_tokens(
+    tokenizer: AutoTokenizer,
+    prompt_ids: List[int],
+    skip_special_tokens: bool = False,
+) -> Tuple[List[str], int, int]:
+    new_tokens = tokenizer.convert_ids_to_tokens(
+        prompt_ids[-INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET - 2 :],
+        skip_special_tokens=skip_special_tokens,
+    )
+    if isinstance(new_tokens, str):
+        new_tokens = [new_tokens]
+    read_offset = len(new_tokens)
+    prefix_offset = max(read_offset - INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET, 0)
+    _replace_none_with_empty(new_tokens)
+    return new_tokens, prefix_offset, read_offset
+
+
+def _detokenize_incrementally(
+    tokenizer: AutoTokenizer,
+    all_input_ids: List[int],
+    prev_tokens: List[str],
+    prefix_offset: int,
+    read_offset: int,
+    skip_special_tokens: bool = False,
+    spaces_between_special_tokens: bool = True,
+) -> Tuple[List[str], str, int, int]:
+    new_token_id = all_input_ids[-1]
+    if 0 <= new_token_id < len(tokenizer):
+        new_tokens = tokenizer.convert_ids_to_tokens(
+            [new_token_id], skip_special_tokens=skip_special_tokens
+        )
+        if isinstance(new_tokens, str):
+            new_tokens = [new_tokens]
+        else:
+            _replace_none_with_empty(new_tokens)
+    else:
+        new_tokens = [""]
+
+    output_tokens = prev_tokens + new_tokens
+    if tokenizer.is_fast or not tokenizer.get_added_vocab():
+        prefix_text = tokenizer.convert_tokens_to_string(
+            output_tokens[prefix_offset:read_offset]
+        )
+        new_text = tokenizer.convert_tokens_to_string(output_tokens[prefix_offset:])
+    else:
+        prefix_text = _convert_tokens_to_string_with_added_encoders(
+            tokenizer,
+            output_tokens[prefix_offset:read_offset],
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+        )
+        new_text = _convert_tokens_to_string_with_added_encoders(
+            tokenizer,
+            output_tokens[prefix_offset:],
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+        )
+
+    if len(new_text) <= len(prefix_text) or new_text.endswith("\ufffd"):
+        return new_tokens, "", prefix_offset, read_offset
+
+    new_text = new_text[len(prefix_text) :]
+    return new_tokens, new_text, read_offset, len(output_tokens)
+
+
+def _init_stream_decode_state(
+    request_id: str,
+    sibling_index: int,
+    prompt_token_ids: List[int],
+) -> None:
+    global tokenizer
+
+    tokens, prefix_offset, read_offset = _convert_prompt_ids_to_tokens(
+        tokenizer, prompt_token_ids, skip_special_tokens=True
+    )
+    states_for_request = _stream_decode_states.setdefault(request_id, {})
+    states_for_request[sibling_index] = {
+        "token_ids": list(prompt_token_ids),
+        "tokens": tokens,
+        "prefix_offset": prefix_offset,
+        "read_offset": read_offset,
+        "output_text": "",
+    }
 
 
 def _decode_stream_delta(
@@ -187,43 +301,41 @@ def _decode_stream_delta(
     new_token_ids: List[int],
     finished: bool,
 ) -> str:
-    """Decode streaming output with request-local token context.
+    """Decode streaming output with vLLM-style incremental detokenization.
 
     The scheduler sends only newly generated token ids. Decoding that slice
     directly can split byte-fallback or multi-token Unicode sequences and
-    emit U+FFFD. Keep per-stream token context and return only the newly
-    decoded suffix, similar to vLLM's incremental detokenizer.
+    emit U+FFFD. Keep per-stream tokens plus prefix/read offsets and return
+    only the newly decoded text, matching vLLM's slow incremental detokenizer.
     """
     global tokenizer
 
     request_id, sibling_index = state_key
     states_for_request = _stream_decode_states.setdefault(request_id, {})
-    state = states_for_request.setdefault(
-        sibling_index,
-        {"token_ids": [], "context_text": ""},
-    )
-    state["token_ids"].extend(new_token_ids)
+    if sibling_index not in states_for_request:
+        _init_stream_decode_state(request_id, sibling_index, [])
+    state = states_for_request[sibling_index]
 
-    token_ids = state["token_ids"]
-    decoded_text = tokenizer.decode(token_ids, skip_special_tokens=True)
-    sent_context_text = state["context_text"]
+    decoded_chunks = []
+    for new_token_id in new_token_ids:
+        state["token_ids"].append(new_token_id)
+        new_tokens, decoded_text, prefix_offset, read_offset = (
+            _detokenize_incrementally(
+                tokenizer=tokenizer,
+                all_input_ids=state["token_ids"],
+                prev_tokens=state["tokens"],
+                prefix_offset=state["prefix_offset"],
+                read_offset=state["read_offset"],
+                skip_special_tokens=True,
+            )
+        )
+        state["tokens"].extend(new_tokens)
+        state["prefix_offset"] = prefix_offset
+        state["read_offset"] = read_offset
+        state["output_text"] += decoded_text
+        decoded_chunks.append(decoded_text)
 
-    if decoded_text.startswith(sent_context_text):
-        delta = decoded_text[len(sent_context_text) :]
-    else:
-        # Tokenizers may normalize text around the rolling context boundary.
-        # Fall back to the changed suffix instead of replaying the full text.
-        prefix_len = _common_prefix_len(decoded_text, sent_context_text)
-        delta = decoded_text[prefix_len:]
-
-    if delta.endswith("\ufffd") and not finished:
-        return ""
-
-    state["token_ids"] = token_ids[-STREAM_DECODE_CONTEXT_TOKENS:]
-    state["context_text"] = tokenizer.decode(
-        state["token_ids"], skip_special_tokens=True
-    )
-    return delta
+    return "".join(decoded_chunks)
 
 
 def _enqueue_decoded_stream_chunk_direct(
@@ -563,6 +675,7 @@ async def setup_streaming_request(
 
     seq = await executor_loop.run_in_executor(None, do_preprocess)
     seq_id = seq.id
+    _init_stream_decode_state(request_id, 0, seq.prompt_token_ids)
 
     logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}")
     engine.core_mgr.add_request([seq])
@@ -638,6 +751,8 @@ async def setup_streaming_request_fanout(
 
     seqs = await executor_loop.run_in_executor(None, do_preprocess)
     seq_ids = [seq.id for seq in seqs]
+    for idx, seq in enumerate(seqs):
+        _init_stream_decode_state(request_id, idx, seq.prompt_token_ids)
     logger.info(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )

@@ -145,23 +145,27 @@ class TestStreamDecodeDelta:
         api_server._stream_decode_states.clear()
         api_server._stream_queues.clear()
 
-    def test_common_prefix_len(self):
-        assert api_server._common_prefix_len("abcdef", "abcXYZ") == 3
-        assert api_server._common_prefix_len("abc", "abc") == 3
-        assert api_server._common_prefix_len("abc", "xyz") == 0
-
     def test_withholds_replacement_char_until_sequence_resolves(self, monkeypatch):
         class FakeTokenizer:
-            def decode(self, token_ids, skip_special_tokens=True):
+            is_fast = True
+
+            def __len__(self):
+                return 4
+
+            def get_added_vocab(self):
+                return {}
+
+            def convert_ids_to_tokens(self, token_ids, skip_special_tokens=True):
                 assert skip_special_tokens is True
-                token_ids = tuple(token_ids)
-                if token_ids == (1,):
-                    return "A"
-                if token_ids == (1, 2):
-                    return "A\ufffd"
-                if token_ids == (1, 2, 3):
+                vocab = {1: "A", 2: "\ufffd", 3: "\u00e9"}
+                return [vocab[token_id] for token_id in token_ids]
+
+            def convert_tokens_to_string(self, tokens):
+                if tokens == ["A", "\ufffd", "\u00e9"]:
                     return "A\u00e9"
-                return "".join(str(token_id) for token_id in token_ids)
+                if tokens == ["\ufffd", "\u00e9"]:
+                    return "\u00e9"
+                return "".join(tokens)
 
         monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
 
@@ -171,8 +175,19 @@ class TestStreamDecodeDelta:
 
     def test_keeps_decode_state_bucketed_by_request(self, monkeypatch):
         class FakeTokenizer:
-            def decode(self, token_ids, skip_special_tokens=True):
-                return "".join(chr(ord("a") + token_id) for token_id in token_ids)
+            is_fast = True
+
+            def __len__(self):
+                return 3
+
+            def get_added_vocab(self):
+                return {}
+
+            def convert_ids_to_tokens(self, token_ids, skip_special_tokens=True):
+                return [chr(ord("a") + token_id) for token_id in token_ids]
+
+            def convert_tokens_to_string(self, tokens):
+                return "".join(tokens)
 
         monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
 
@@ -183,22 +198,36 @@ class TestStreamDecodeDelta:
         assert set(api_server._stream_decode_states) == {"req-a", "req-b"}
         assert set(api_server._stream_decode_states["req-a"]) == {0, 1}
 
-    def test_prunes_decode_state_to_rolling_context(self, monkeypatch):
+    def test_init_decode_state_from_prompt_tokens(self, monkeypatch):
         class FakeTokenizer:
-            def decode(self, token_ids, skip_special_tokens=True):
-                return "".join(chr(ord("a") + token_id) for token_id in token_ids)
+            is_fast = True
+
+            def __len__(self):
+                return 5
+
+            def get_added_vocab(self):
+                return {}
+
+            def convert_ids_to_tokens(self, token_ids, skip_special_tokens=True):
+                return [chr(ord("a") + token_id) for token_id in token_ids]
+
+            def convert_tokens_to_string(self, tokens):
+                return "".join(tokens)
 
         monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
-        monkeypatch.setattr(api_server, "STREAM_DECODE_CONTEXT_TOKENS", 2)
 
-        assert api_server._decode_stream_delta(("req", 0), [0, 1, 2], False) == "abc"
+        api_server._init_stream_decode_state("req", 0, [0, 1, 2])
         state = api_server._stream_decode_states["req"][0]
-        assert state["token_ids"] == [1, 2]
-        assert state["context_text"] == "bc"
+        assert state["token_ids"] == [0, 1, 2]
+        assert state["tokens"] == ["a", "b", "c"]
+        assert state["prefix_offset"] == 0
+        assert state["read_offset"] == 3
 
         assert api_server._decode_stream_delta(("req", 0), [3], False) == "d"
-        assert state["token_ids"] == [2, 3]
-        assert state["context_text"] == "cd"
+        assert state["token_ids"] == [0, 1, 2, 3]
+        assert state["tokens"] == ["a", "b", "c", "d"]
+        assert state["prefix_offset"] == 3
+        assert state["read_offset"] == 4
 
     def test_cleanup_removes_request_decode_bucket(self, monkeypatch):
         api_server._stream_decode_states["req-a"] = {0: {}, 1: {}}
@@ -217,8 +246,19 @@ class TestStreamDecodeDelta:
 
     def test_send_stream_chunk_direct_decodes_on_event_loop(self, monkeypatch):
         class FakeTokenizer:
-            def decode(self, token_ids, skip_special_tokens=True):
-                return "".join(chr(ord("a") + token_id) for token_id in token_ids)
+            is_fast = True
+
+            def __len__(self):
+                return 1
+
+            def get_added_vocab(self):
+                return {}
+
+            def convert_ids_to_tokens(self, token_ids, skip_special_tokens=True):
+                return [chr(ord("a") + token_id) for token_id in token_ids]
+
+            def convert_tokens_to_string(self, tokens):
+                return "".join(tokens)
 
         async def run_stream_callback():
             stream_queue = asyncio.Queue()
@@ -248,8 +288,13 @@ class TestStreamDecodeDelta:
 
     def test_direct_enqueue_skips_cleaned_request(self, monkeypatch):
         class FakeTokenizer:
-            def decode(self, token_ids, skip_special_tokens=True):
-                return "".join(chr(ord("a") + token_id) for token_id in token_ids)
+            is_fast = True
+
+            def __len__(self):
+                return 1
+
+            def get_added_vocab(self):
+                return {}
 
         monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
         stream_queue = asyncio.Queue()
@@ -263,8 +308,13 @@ class TestStreamDecodeDelta:
 
     def test_tagged_enqueue_skips_cleaned_request(self, monkeypatch):
         class FakeTokenizer:
-            def decode(self, token_ids, skip_special_tokens=True):
-                return "".join(chr(ord("a") + token_id) for token_id in token_ids)
+            is_fast = True
+
+            def __len__(self):
+                return 1
+
+            def get_added_vocab(self):
+                return {}
 
         monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
         stream_queue = asyncio.Queue()
