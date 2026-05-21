@@ -53,6 +53,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_quant_x import (
 from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
 )
+from aiter.ops.triton.quant.quant_mxfp8 import fused_flatten_mxfp8_quant
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.tuned_gemm import tgemm
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -139,9 +140,6 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 _V4_USE_MXFP8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
 _V4_DISABLE_FCAM = os.environ.get("ATOM_V4_DISABLE_FCAM", "0") == "1"
 _MXFP8_BYPASS_FCAM = os.environ.get("ATOM_MXFP8_BYPASS_FCAM", "0") == "1"
-_A8W4_TRITON_MOE = os.environ.get(
-    "ATOM_MOE_BACKEND", "matmul_ogs"
-) == "a8w4" and envs.is_set("ATOM_USE_TRITON_MOE")
 
 
 def _fuse_rmsnorm_mxfp8_quant(
@@ -1956,6 +1954,9 @@ class DeepseekV4Attention(nn.Module):
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        if _V4_USE_MXFP8:
+            x_fp8, x_scale = fused_flatten_mxfp8_quant(o)
+            return self.wo_b(x_fp8, x_scale=x_scale)
         x = self.wo_b(o.flatten(1))
         return x
 
@@ -2253,7 +2254,9 @@ class MoE(nn.Module):
         if self.experts.quant_method.__class__ is Mxfp4MoEMethod and getattr(
             self.experts.quant_method, "use_triton", False
         ):
-            self._use_a8w4_triton_moe = _A8W4_TRITON_MOE
+            self._use_a8w4_triton_moe = (
+                getattr(self.experts.quant_method, "use_triton_backend", None) == "a8w4"
+            )
 
     def _hash_topk(
         self,

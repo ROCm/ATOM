@@ -31,11 +31,6 @@ from aiter.ops.triton.fusions.fused_routing_from_topk import (
 )
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from atom.model_ops.utils import has_triton_kernels
-from atom.utils import envs
-
-_A8W4_TRITON_MOE = os.environ.get(
-    "ATOM_MOE_BACKEND", "matmul_ogs"
-) == "a8w4" and envs.is_set("ATOM_USE_TRITON_MOE")
 
 logger = logging.getLogger("atom")
 
@@ -272,9 +267,8 @@ def _a8w4_fused_experts(
     pre_built_aiter_routing=None,  # if set, skip bridge and use this aiter routing directly
     # Step 9: shared-expert output to fold into GEMM2 reduce_grouped writeback.
     residual: torch.Tensor | None = None,
-    # Step 3: apply_swiglu fold into GEMM1. Requires interleaved W13 (done at weight load).
-    swiglu_fold: bool = False,
     x_scale: torch.Tensor | None = None,
+    swiglu_fold: bool = True,
 ) -> torch.Tensor:
     """Step 1 minimum a8w4 fused experts.
 
@@ -311,50 +305,23 @@ def _a8w4_fused_experts(
     w2_scale = w2_scale.view(torch.uint8)
 
     if swiglu_fold:
-        # Step 5: optional fold of MXFP8 (fp8 e4m3 + ue8m0 per-1×32) emit into
-        # GEMM1's apply_swiglu writeback. Saves one `downcast_to_mxfp` launch.
-        _mx_emit = os.environ.get("ATOM_A8W4_TRITON_MOE_GEMM1_MX_EMIT", "1") == "1"
-        if _mx_emit:
-            inter_fp8, inter_scale = moe_gemm_a8w4(
-                x=x_fp8,
-                w=w1,
-                x_scales=x_scale,
-                w_scales=w1_scale,
-                bias=w1_bias,
-                routing_data=aiter_routing,
-                gather_indx=gather_src_indx,
-                gammas=gammas if apply_router_weight_on_input else None,
-                swizzle_mx_scale="CDNA4_SCALE",
-                apply_swiglu=True,
-                alpha=1.0,
-                limit=swiglu_limit,
-                add_residual=False,
-                out_dtype=torch.bfloat16,  # ignored when out_mx_quant=True
-                out_mx_quant=True,
-            )
-        else:
-            # Step 3: GEMM1 with apply_swiglu=True. Reads interleaved W13. Returns bf16 [M*topk, N].
-            # add_residual=False = V4-Flash semantics (silu(gate) * up). True would compute s*(up+1).
-            inter_bf16 = moe_gemm_a8w4(
-                x=x_fp8,
-                w=w1,
-                x_scales=x_scale,
-                w_scales=w1_scale,
-                bias=w1_bias,
-                routing_data=aiter_routing,
-                gather_indx=gather_src_indx,
-                gammas=gammas if apply_router_weight_on_input else None,
-                swizzle_mx_scale="CDNA4_SCALE",
-                apply_swiglu=True,
-                alpha=1.0,
-                limit=swiglu_limit,
-                add_residual=False,
-                out_dtype=torch.bfloat16,
-            )
-            inter_bf16 = inter_bf16.view(inter_bf16.shape[-2], inter_bf16.shape[-1])
-            inter_fp8, inter_scale = downcast_to_mxfp(
-                inter_bf16, torch.float8_e4m3fn, axis=-1
-            )
+        inter_fp8, inter_scale = moe_gemm_a8w4(
+            x=x_fp8,
+            w=w1,
+            x_scales=x_scale,
+            w_scales=w1_scale,
+            bias=w1_bias,
+            routing_data=aiter_routing,
+            gather_indx=gather_src_indx,
+            gammas=gammas if apply_router_weight_on_input else None,
+            swizzle_mx_scale="CDNA4_SCALE",
+            apply_swiglu=True,
+            alpha=1.0,
+            limit=swiglu_limit,
+            add_residual=False,
+            out_dtype=torch.bfloat16,  # ignored when out_mx_quant=True
+            out_mx_quant=True,
+        )
     else:
         # GEMM1: fp8 act x fp4 weight, bf16 output [M*topk, 2N].
         raw_intermediate = moe_gemm_a8w4(
@@ -485,41 +452,11 @@ def triton_kernel_fused_experts(
     expert_map: torch.Tensor | None = None,
     intermediate_cache: torch.Tensor | None = None,
     a1q_scale: torch.Tensor | None = None,
-    w13_weight_scale_a8w4: torch.Tensor | None = None,
-    w2_weight_scale_a8w4: torch.Tensor | None = None,
-    swiglu_limit_a8w4: float = 7.0,
-    swiglu_fold: bool = False,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
     assert w1_bias is None or w1_bias.dtype == torch.float32
     assert w2_bias is None or w2_bias.dtype == torch.float32
-
-    # a8w4 path: dispatched when env is set AND a8w4 scale tensors were plumbed
-    # through. matmul_ogs path below stays untouched.
-    _use_a8w4 = (
-        _A8W4_TRITON_MOE
-        and w13_weight_scale_a8w4 is not None
-        and w2_weight_scale_a8w4 is not None
-    )
-    if _use_a8w4:
-        return _a8w4_fused_experts(
-            output_tensor,
-            hidden_states,
-            w1,
-            w2,
-            w13_weight_scale_a8w4,
-            w2_weight_scale_a8w4,
-            routing_data,
-            gather_indx,
-            scatter_indx,
-            topk,
-            swiglu_limit=swiglu_limit_a8w4,
-            w1_bias=w1_bias,
-            w2_bias=w2_bias,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            swiglu_fold=swiglu_fold,
-        )
 
     # Shape check for matmul_ogs path (a8w4 has different layout)
     assert hidden_states.ndim == 2
