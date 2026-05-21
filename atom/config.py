@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Optional, Union
 
@@ -1181,3 +1182,16 @@ def get_current_atom_config() -> Config:
             return forward_atom_config
     assert _current_atom_config is not None, "Current atom config is not set"
     return _current_atom_config
+
+
+@contextmanager
+def use_custom_atom_config(custom_atom_config: Config):
+    # Temporarily masquerade the custom atom_config as the current atom_config
+    # for the current context and restore upon exit
+    global _current_atom_config
+    prev = _current_atom_config
+    _current_atom_config = custom_atom_config
+    try:
+        yield custom_atom_config
+    finally:
+        _current_atom_config = prev
