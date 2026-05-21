@@ -1749,9 +1749,17 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         assert len(q.shape) == 3
 
+        if forward_batch.forward_mode.is_target_verify():
+            return self._forward_extend_mla_speculative(
+                q,
+                layer,
+                K_Buffer,
+                qo_indptr,
+                forward_batch,
+            )
         if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+            forward_batch.forward_mode.is_draft_extend()
+            and (k is None or v is None or layer.qk_head_dim == K_Buffer.shape[-1])
         ):
             return self._forward_extend_mla_speculative(
                 q,
@@ -1760,7 +1768,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 qo_indptr,
                 forward_batch,
             )
-        if not forward_batch.forward_mode.is_extend():
+        if (
+            not forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend()
+        ):
             raise ValueError(
                 f"Invalid forward mode for MLA extend: {forward_batch.forward_mode=}"
             )
@@ -1810,8 +1821,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         kv_indices,
         qo_indptr,
     ):
-        """Normal MLA extend (not target_verify, not draft_extend)."""
-        extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+        """MLA prefill/extend using explicit q/k/v instead of absorbed decode."""
+        extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        extend_no_prefix = (
+            False
+            if extend_prefix_lens_cpu is None
+            else not any(extend_prefix_lens_cpu)
+        )
 
         if kv_indices.shape[0] == 0 or extend_no_prefix:
             return self._extend_mla_no_prefix(
@@ -2017,10 +2033,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             dim=-1,
         )
 
-        assert (
-            forward_batch.extend_prefix_lens.shape
-            == forward_batch.extend_seq_lens.shape
-        )
+        extend_prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
+        if extend_prefix_lens is not None:
+            assert extend_prefix_lens.shape == forward_batch.extend_seq_lens.shape
 
         return flash_attn_varlen_func(
             q,

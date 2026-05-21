@@ -589,8 +589,9 @@ def forward_sgl_core(
 def _dispatch_sgl_plugin_attn_path(forward_batch) -> str:
     """Decide the attention algorithm for this batch based on forward_mode.
 
-    Returns "mha" for extend/prefill (uses standard Q×K×V with flash_attn)
-    or "mla" for decode (uses absorbed weights + mla_decode_fwd).
+    Returns "mha" for extend/prefill-style batches (uses standard Q×K×V
+    with flash_attn) or "mla" for decode/verify batches (uses absorbed
+    weights + mla_decode_fwd).
 
     This is the per-batch *routing* decision, distinct from
     ``_can_run_sgl_mha_now`` which is a *capability* gate checking whether
@@ -598,6 +599,17 @@ def _dispatch_sgl_plugin_attn_path(forward_batch) -> str:
     """
     if forward_batch.forward_mode.is_extend_without_speculative():
         return "mha"
+
+    if forward_batch.forward_mode.is_draft_extend():
+        # The explicit K/V path is only memory-friendly for no-prefix draft
+        # extend.  With prefix/context, SGLang's MLA backend has to materialize
+        # full k_prefix/v_prefix from latent cache, which can OOM during graph
+        # capture.  Use absorbed MLA for those batches until chunked prefix
+        # expansion exists here.
+        extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        if extend_prefix_lens_cpu is not None and not any(extend_prefix_lens_cpu):
+            return "mha"
+
     return "mla"
 
 
@@ -641,17 +653,42 @@ def _set_mla_kv_buffer_for_mha(
     )
 
 
+def _is_mxfp4_kv_b_proj(attn: DeepseekV2MLAAttention) -> bool:
+    kv_b_proj = attn.kv_b_proj
+    params_dtype = getattr(kv_b_proj, "params_dtype", None)
+    if params_dtype == dtypes.fp4x2 or params_dtype == getattr(
+        torch, "float4_e2m1fn_x2", None
+    ):
+        return True
+
+    quant_type = getattr(kv_b_proj, "quant_type", None)
+    if getattr(quant_type, "name", "") == "per_1x32" or str(quant_type).endswith(
+        "per_1x32"
+    ):
+        return True
+
+    quant_method = getattr(kv_b_proj, "quant_method", None)
+    quant_config = getattr(quant_method, "quant_config", None)
+    return bool(
+        quant_config is not None
+        and quant_config.get_name() == "quark"
+        and kv_b_proj.weight.dtype == torch.uint8
+    )
+
+
 def _can_run_sgl_mha_now(attn: DeepseekV2MLAAttention, forward_batch) -> bool:
     """Check if the model configuration supports the MHA attention path.
 
-    This is a *capability* gate — NSA models and MXFP4-quantised weights
-    (uint8) cannot use the MHA path. Distinct from
+    This is a *capability* gate — NSA models cannot use the MHA path.
+    MXFP4 ``kv_b_proj`` weights are supported here because the MHA prepare
+    path expands K/V through ``attn.kv_b_proj`` itself, which already owns
+    the per_1x32 GEMM implementation. Distinct from
     ``_dispatch_sgl_plugin_attn_path`` which routes each batch.
     """
     del forward_batch
     if attn.use_nsa:
         return False
-    if attn.kv_b_proj.weight.dtype == torch.uint8:
+    if attn.kv_b_proj.weight.dtype == torch.uint8 and not _is_mxfp4_kv_b_proj(attn):
         return False
     return True
 
