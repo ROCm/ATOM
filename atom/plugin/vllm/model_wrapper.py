@@ -160,7 +160,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.is_mtp_draft_model = self.is_mtp and model_arch != main_model_arch
         if self.is_mtp_draft_model:
             # Generate separate config for main model and draft model to make sure
-            # that draft model has its own compilation config rather than carried 
+            # that draft model has its own compilation config rather than carried
             # over from main model. Also get the mutated hf_config from main model
             main_atom_config = get_current_atom_config()
             self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
