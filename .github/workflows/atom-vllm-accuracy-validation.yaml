@@ -9,11 +9,77 @@ on:
     # from") as the ATOM branch selector, so users do not need to type branch
     # names.
     inputs:
-      selected_models:
-        description: "Optional manual model list. Use comma/newline separated model_name values, or 'all'. Leave empty to require an explicit selection."
-        required: false
-        type: string
-        default: ""
+      model_slot_1:
+        description: "Manual selection slot 1: choose an accuracy model case."
+        type: choice
+        default: none
+        options: &accuracy-model-options
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
+      model_slot_2:
+        description: "Manual selection slot 2: choose an accuracy model case."
+        type: choice
+        default: none
+        options: *accuracy-model-options
+      model_slot_3:
+        description: "Manual selection slot 3: choose an accuracy model case."
+        type: choice
+        default: none
+        options: *accuracy-model-options
+      model_slot_4:
+        description: "Manual selection slot 4: choose an accuracy model case."
+        type: choice
+        default: none
+        options: *accuracy-model-options
+      model_slot_5:
+        description: "Manual selection slot 5: choose an accuracy model case."
+        type: choice
+        default: none
+        options: *accuracy-model-options
+      model_slot_6:
+        description: "Manual selection slot 6: choose an accuracy model case."
+        type: choice
+        default: none
+        options: *accuracy-model-options
+      model_slot_7:
+        description: "Manual selection slot 7: choose an accuracy model case."
+        type: choice
+        default: none
+        options: *accuracy-model-options
+      model_slot_8:
+        description: "Manual selection slot 8: choose an accuracy model case."
+        type: choice
+        default: none
+        options: *accuracy-model-options
       oot_image:
         description: "Optional atom-vLLM image override. Leave empty to keep the existing nightly/manual build behavior."
         required: false
@@ -65,7 +131,14 @@ jobs:
       - name: Resolve image source and model matrix
         id: meta
         env:
-          SELECTED_MODELS: ${{ inputs.selected_models || '' }}
+          MODEL_SLOT_1: ${{ inputs.model_slot_1 || 'none' }}
+          MODEL_SLOT_2: ${{ inputs.model_slot_2 || 'none' }}
+          MODEL_SLOT_3: ${{ inputs.model_slot_3 || 'none' }}
+          MODEL_SLOT_4: ${{ inputs.model_slot_4 || 'none' }}
+          MODEL_SLOT_5: ${{ inputs.model_slot_5 || 'none' }}
+          MODEL_SLOT_6: ${{ inputs.model_slot_6 || 'none' }}
+          MODEL_SLOT_7: ${{ inputs.model_slot_7 || 'none' }}
+          MODEL_SLOT_8: ${{ inputs.model_slot_8 || 'none' }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
         run: |
           set -euo pipefail
@@ -507,40 +580,31 @@ jobs:
 
           selected = []
           if event == "workflow_dispatch":
-              raw_selection = os.environ.get("SELECTED_MODELS", "").strip()
-              tokens = [
-                  token.strip()
-                  for chunk in raw_selection.splitlines()
-                  for token in chunk.split(",")
-                  if token.strip()
-              ]
-              if len(tokens) == 1 and tokens[0].lower() == "all":
-                  selected = [matrix_entry(model) for model in models]
-              else:
-                  by_name = {model["model_name"]: model for model in models}
-                  missing = [token for token in tokens if token not in by_name]
-                  if missing:
+              by_name = {model["model_name"]: model for model in models}
+              seen = set()
+              for slot_idx in range(1, 9):
+                  label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
+                  if not label or label == "none":
+                      continue
+                  if label not in by_name:
                       print(
-                          "Unknown selected model(s): " + ", ".join(missing),
+                          f"Unknown model_slot_{slot_idx} selection: {label}",
                           file=sys.stderr,
                       )
                       print("Available model_name values:", file=sys.stderr)
                       for name in by_name:
                           print(f" - {name}", file=sys.stderr)
                       sys.exit(1)
-
-                  seen = set()
-                  for token in tokens:
-                      if token in seen:
-                          continue
-                      selected.append(matrix_entry(by_name[token]))
-                      seen.add(token)
+                  if label in seen:
+                      continue
+                  selected.append(matrix_entry(by_name[label]))
+                  seen.add(label)
           else:
               selected = [matrix_entry(model) for model in models]
 
           if event == "workflow_dispatch" and not selected:
               print(
-                  "No models selected for manual run. Set selected_models to one or more model_name values, or 'all'.",
+                  "No models selected for manual run. Choose at least one model_slot value.",
                   file=sys.stderr,
               )
               sys.exit(1)
