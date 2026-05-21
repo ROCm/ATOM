@@ -129,7 +129,11 @@ class ConnectorMetadata:
             remote_handshake_port=kv_transfer_params["remote_handshake_port"],
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
-            tp_size=kv_transfer_params.get("tp_size", 1),
+            tp_size=(
+                kv_transfer_params.get("tp_size")
+                if "tp_size" in kv_transfer_params
+                else kv_transfer_params.get("remote_tp_size", 1)
+            ),
             transfer_id=kv_transfer_params.get("transfer_id", 0),
         )
 

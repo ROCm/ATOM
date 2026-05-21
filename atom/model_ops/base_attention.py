@@ -165,6 +165,12 @@ def cp_mha_gather_cache(
     ], "kv_cache_layout only support NHD, SHUFFLE"
     if dequant:
         assert k_scales is not None and v_scales is not None
+        if k_scales.numel() == 1 and v_scales.numel() == 1:
+            per_token_quant = False
+        else:
+            assert (
+                k_scales.numel() > 1 and v_scales.numel() > 1
+            ), "k_scales and v_scales must both be scalar or per-token"
 
     head_dim = key.shape[2]
     x = 16 // key_cache.element_size()

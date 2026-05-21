@@ -28,10 +28,10 @@ __all__ = ["KVOutputAggregator"]
 class KVOutputAggregator:
     """Aggregates :class:`KVConnectorOutput` from all TP workers.
 
-    Uses a countdown approach: when a request ID first appears, a counter
-    is initialized to ``world_size``.  Each worker that reports it as
-    finished decrements the counter.  When the counter reaches zero,
-    the request is considered globally complete and is emitted.
+    Tracks which unique worker indices have reported each request as
+    finished.  A request is globally complete only when all
+    ``world_size`` workers have reported it — duplicate reports from
+    the same worker (e.g. from retried notifications) are ignored.
 
     Args:
         world_size: Number of TP workers to aggregate over.
@@ -48,8 +48,8 @@ class KVOutputAggregator:
         if world_size <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}")
         self._world_size = world_size
-        self._remaining_sending: dict[str, int] = {}
-        self._remaining_recving: dict[str, int] = {}
+        self._seen_sending: dict[str, set[int]] = {}
+        self._seen_recving: dict[str, set[int]] = {}
 
     @property
     def world_size(self) -> int:
@@ -60,6 +60,7 @@ class KVOutputAggregator:
 
         Args:
             worker_outputs: One :class:`KVConnectorOutput` per worker.
+                The list index is the worker index.
 
         Returns:
             A new :class:`KVConnectorOutput` containing only request IDs
@@ -68,40 +69,29 @@ class KVOutputAggregator:
         if not worker_outputs:
             return KVConnectorOutput()
 
-        all_sending_ids: set[str] = set()
-        all_recving_ids: set[str] = set()
-        for wo in worker_outputs:
-            if wo.finished_sending:
-                all_sending_ids.update(wo.finished_sending)
-            if wo.finished_recving:
-                all_recving_ids.update(wo.finished_recving)
-
-        for rid in all_sending_ids:
-            if rid not in self._remaining_sending:
-                self._remaining_sending[rid] = self._world_size
-
-        for rid in all_recving_ids:
-            if rid not in self._remaining_recving:
-                self._remaining_recving[rid] = self._world_size
-
-        for wo in worker_outputs:
+        for worker_idx, wo in enumerate(worker_outputs):
             if wo.finished_sending:
                 for rid in wo.finished_sending:
-                    if rid in self._remaining_sending:
-                        self._remaining_sending[rid] -= 1
-
+                    self._seen_sending.setdefault(rid, set()).add(worker_idx)
             if wo.finished_recving:
                 for rid in wo.finished_recving:
-                    if rid in self._remaining_recving:
-                        self._remaining_recving[rid] -= 1
+                    self._seen_recving.setdefault(rid, set()).add(worker_idx)
 
-        done_sending = {rid for rid, cnt in self._remaining_sending.items() if cnt <= 0}
-        done_recving = {rid for rid, cnt in self._remaining_recving.items() if cnt <= 0}
+        done_sending = {
+            rid
+            for rid, workers in self._seen_sending.items()
+            if len(workers) >= self._world_size
+        }
+        done_recving = {
+            rid
+            for rid, workers in self._seen_recving.items()
+            if len(workers) >= self._world_size
+        }
 
         for rid in done_sending:
-            del self._remaining_sending[rid]
+            del self._seen_sending[rid]
         for rid in done_recving:
-            del self._remaining_recving[rid]
+            del self._seen_recving[rid]
 
         return KVConnectorOutput(
             finished_sending=done_sending,
@@ -110,10 +100,10 @@ class KVOutputAggregator:
 
     def reset(self) -> None:
         """Clear all internal tracking state."""
-        self._remaining_sending.clear()
-        self._remaining_recving.clear()
+        self._seen_sending.clear()
+        self._seen_recving.clear()
 
     @property
     def pending_count(self) -> tuple[int, int]:
         """Return ``(num_pending_sending, num_pending_recving)``."""
-        return len(self._remaining_sending), len(self._remaining_recving)
+        return len(self._seen_sending), len(self._seen_recving)

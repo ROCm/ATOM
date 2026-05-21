@@ -27,6 +27,8 @@ Users can use this command to launch the FP8 server with the same settings as th
 
 ```bash
 
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
+
 model_path=[Qwen/Qwen3.5-397B-A17B-FP8](https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8) # [Qwen/Qwen3-Next-80B-A3B-Instruct-FP8](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8)
 tp=4
 
@@ -35,7 +37,6 @@ python3 -m sglang.launch_server \
   --port 8000 \
   --tensor-parallel-size ${tp} \
   --mem-fraction-static 0.9 \
-  --cuda-graph-max-bs 256 \
   --reasoning-parser qwen3 \
   --disable-radix-cache
 ```
@@ -86,10 +87,9 @@ Then append `--profile` to the `sglang.bench_serving` command in Step 3.
 ```bash
 
 lm_eval --model local-completions \
-        --model_args model=${model_path},base_url=http://localhost:30000/v1/completions,num_concurrent=256,max_retries=2,tokenized_requests=False,trust_remote_code=True \
+        --model_args model=${model_path},base_url=http://localhost:30000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
         --tasks gsm8k \
-        --batch_size auto \
-        --num_fewshot 5 \
+        --num_fewshot 3 \
         --trust_remote_code
 ```
 

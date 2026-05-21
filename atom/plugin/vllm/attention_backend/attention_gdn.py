@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fla.ops import (
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
+
 from atom.utils import envs
 
 from torch import nn
@@ -385,7 +386,13 @@ class GatedDeltaNet(nn.Module):
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
-            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+            # Only write directly when there are no spec tokens. With spec
+            # decode active, mixed_qkv was index_select'd by non_spec_token_indx
+            # so core_attn_out_non_spec has fewer rows than num_actual_tokens.
+            # The merge below (index_copy_) handles the scatter back to the
+            # correct slot positions.
+            if spec_sequence_masks is None:
+                core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
         elif attn_metadata.num_decodes > 0:
             o = core_attn_out[: attn_metadata.num_decode_tokens]
             if USE_FLYDSL_GDR:

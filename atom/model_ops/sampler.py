@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import warnings
-from functools import lru_cache
 
 import torch
 from aiter import mixed_sample_outer_exponential

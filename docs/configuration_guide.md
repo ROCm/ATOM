@@ -208,6 +208,45 @@ parameters:
 
 Linear layers, MoE layers, and fused ops call `quant_config.get_layer_quant_config(prefix)` to obtain the appropriate `LayerQuantConfig` for their position in the model. This enables mixed-precision quantization where different layers can have different quant types and dtypes (e.g., FP8 for attention, FP4 for MLP).
 
+### 3.7 Online Quantization at Load Time
+
+ATOM can re-quantize model weights while loading them by passing
+`--online_quant_config` to the engine. This is useful when the source checkpoint
+is unquantized or uses a different supported quantization layout than the runtime
+layout you want to benchmark.
+
+The flag accepts a JSON object:
+
+```bash
+--online_quant_config '{
+  "global_quant_config": "ptpc_fp8",
+  "layer_quant_config": {"*expert*": "mxfp4"},
+  "exclude_layer": ["lm_head", "*.gate.*"]
+}'
+```
+
+Fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `global_quant_config` | `str` | Default target quantization format for all layers. |
+| `layer_quant_config` | `dict[str, str]` | Per-layer target overrides. Keys are fnmatch-style layer patterns such as `"*expert*"`. |
+| `exclude_layer` | `str \| list[str]` | Layers to leave unquantized. Supports exact/prefix matches, glob patterns, and `re:` regex entries. Prefer a JSON list when excluding multiple patterns. |
+
+Supported target format strings:
+
+| Format | Target config |
+|---|---|
+| `ptpc_fp8` | `QuantType.per_Token` with FP8 weights |
+| `mxfp4` | `QuantType.per_1x32` with packed MXFP4 weights |
+
+Notes:
+
+- An empty JSON object (`--online_quant_config '{}'`) is treated the same as not passing the flag and does not enable online quantization.
+- Online quantization currently applies when the source model is unquantized or uses supported FP8 block quantization (`QuantType.per_1x128`). The loader dequantizes FP8 block weights before applying the requested target format.
+- Tensor-parallel weights are gathered before quantization only when local quantization would produce different scales than quantizing the full unpartitioned weight.
+- Rank 0 writes an `online_quant_info_*.json` summary with elapsed time and per-layer target formats. The file is written under `ATOM_TORCH_PROFILER_DIR` when set, otherwise the current working directory.
+
 ---
 
 ## 4. Parallel Configuration (`ParallelConfig`)
@@ -340,6 +379,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 -- 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |
+| `--online_quant_config` | | JSON string | `None` | Load-time online quantization override; see Section 3.7 |
 
 **Example:**
 

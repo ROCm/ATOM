@@ -71,9 +71,7 @@ class AiterAttentionMetadataBuilder:
         CommonAttentionBuilder.__init__(self, model_runner)
         config = model_runner.config
         hf_config = config.hf_config
-        self.num_attention_heads = (
-            hf_config.num_attention_heads // get_tp_group().world_size
-        )
+        # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
         # For speculative decode (MTP), max_qlen = num_speculative_tokens + 1
         if (
             config.speculative_config is not None

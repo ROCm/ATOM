@@ -118,6 +118,15 @@ class BlockManager:
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
+            # If the entire prompt would be cached, force the last full block
+            # to recompute so prefill has at least one token to forward and
+            # produce logits for the next-token sampler.
+            if (
+                not cache_miss
+                and i == seq.num_blocks - 1
+                and len(token_ids) == self.block_size
+            ):
+                cache_miss = True
             if cache_miss:
                 needed_free += 1
         return (
@@ -141,6 +150,16 @@ class BlockManager:
                 self.hash_to_block_id.get(h, -1) if self.enable_prefix_caching else -1
             )
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                cache_miss = True
+            # If the entire prompt would be cached, force the last full block
+            # to recompute so prefill has at least one token to forward and
+            # produce logits for the next-token sampler. Must mirror the same
+            # condition in can_allocate() so the block budget agrees.
+            if (
+                not cache_miss
+                and i == seq.num_blocks - 1
+                and len(token_ids) == self.block_size
+            ):
                 cache_miss = True
             if cache_miss:
                 block_id = self._pop_free_block()

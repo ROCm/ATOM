@@ -85,8 +85,8 @@ class tokenIDProcessor:
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         # Deferred output is disabled when running in P/D disaggregation mode
         # (kv_transfer_config is set), enabled otherwise.
-        # TODO: enable deferred output in P/D disaggregation mode
-        self.is_deferred_out = not bool(runner.config.kv_transfer_config)
+        # TODO: In P/D disaggregation mode, if have issue, we can disable it
+        self.is_deferred_out = True
 
         self.runner = runner
         device = runner.device
@@ -310,6 +310,15 @@ class tokenIDProcessor:
             if self.use_spec:
                 token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
 
+            self.input_ids.np[:total_tokens_decode] = token_ids
+            return self.input_ids.copy_to_gpu(total_tokens_decode)
+
+        # PD consumer first decode: no prior prefill step initialized
+        # prev_batch, so use scheduled_tokens directly for this step.
+        if self.prev_batch is None:
+            token_ids = scheduled_tokens[
+                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
+            ]
             self.input_ids.np[:total_tokens_decode] = token_ids
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
@@ -726,9 +735,18 @@ class ModelRunner:
         return False
 
     def is_deepseek_v4(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        return self.hf_text_config.model_type == "deepseek_v4"
+        # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
+        # `_CONFIG_REGISTRY` maps deepseek_v4 → deepseek_v3 (V4 reuses V3 schema).
+        # Use `architectures` (preserved by get_hf_config:567) instead. Covers
+        # both target (DeepseekV4ForCausalLM[NextN]) and draft (whose model_type
+        # SpeculativeConfig stamps as deepseek_v4_mtp).
+        arches = getattr(self.hf_text_config, "architectures", None) or []
+        if any("DeepseekV4" in str(a) for a in arches):
+            return True
+        return getattr(self.hf_text_config, "model_type", None) in (
+            "deepseek_v4",
+            "deepseek_v4_mtp",
+        )
 
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -1073,8 +1091,15 @@ class ModelRunner:
             "top_ks": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "top_ps": CpuGpuBuffer(self.max_bs, **f32_kwargs),
             # Keep enough space for MTP decode (max_q_len > 1).
+            # `extra_output_dims` lets a model insert dims between N and dim
+            # (e.g. DeepSeek-V4 returns the un-reduced mHC residual
+            # [N, hc_mult, dim] from forward, with hc_head + LM head deferred
+            # to compute_logits). Default `()` keeps the standard 2D layout.
             "outputs": torch.empty(
-                self.max_num_batched_tokens, hidden_size, dtype=hidden_type
+                self.max_num_batched_tokens,
+                *getattr(self.model, "extra_output_dims", ()),
+                hidden_size,
+                dtype=hidden_type,
             ),
         }
         if hasattr(self, "drafter"):
@@ -1879,6 +1904,7 @@ class ModelRunner:
         if connector is None:
             return KVConnectorOutput(finished_sending=[], finished_recving=[])
         done_sending, done_recving = connector.get_finished()
+
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
         )
@@ -2007,6 +2033,7 @@ class ModelRunner:
                     num_tokens=num_tokens,
                     num_tokens_across_dp=num_tokens_across_dp,
                     ubatch_slices=ubatch_slices,
+                    in_hipgraph=True,
                 )
 
                 # Warmup

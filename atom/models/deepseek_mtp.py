@@ -63,6 +63,20 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             prefix=maybe_prefix(prefix, "eh_proj"),
         )
 
+        if hasattr(config, "index_topk"):
+            max_num_batched_tokens = getattr(
+                atom_config, "max_num_batched_tokens", atom_config.max_num_seqs
+            )
+            buffer_device = getattr(atom_config, "device", "cuda")
+            topk_indices_buffer = torch.empty(
+                max_num_batched_tokens,
+                config.index_topk,
+                dtype=torch.int32,
+                device=buffer_device,
+            )
+        else:
+            topk_indices_buffer = None
+
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=atom_config.quant_config
         )
@@ -88,9 +102,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        # masked_inputs_embeds = torch.where(
-        #     positions.unsqueeze(-1) == 0, 0, inputs_embeds
-        # )
         masked_inputs_embeds = inputs_embeds
         inputs_embeds = self.enorm(masked_inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)

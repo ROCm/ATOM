@@ -19,10 +19,28 @@ Fix:
 import sys
 import unittest
 
-# Clear cached atom modules (conftest.py stubs)
-for mod_name in list(sys.modules):
-    if mod_name.startswith("atom"):
-        del sys.modules[mod_name]
+# This test needs to inspect real atom source (not conftest.py stubs), so it
+# wipes any cached `atom.*` modules at module-import time. Previously this
+# also wiped the conftest stubs and never restored them, polluting later
+# tests (test_arg_utils_spec / test_scheduler / test_sequence) that depend
+# on the stubs. setUpModule / tearDownModule now snapshots-and-restores
+# sys.modules so this file's effect is local to its own collection.
+_saved_atom_modules: dict[str, object] = {}
+
+
+def setUpModule():
+    global _saved_atom_modules
+    _saved_atom_modules = {
+        name: mod for name, mod in sys.modules.items() if name.startswith("atom")
+    }
+    for name in list(_saved_atom_modules):
+        del sys.modules[name]
+
+
+def tearDownModule():
+    for name in [n for n in sys.modules if n.startswith("atom")]:
+        del sys.modules[name]
+    sys.modules.update(_saved_atom_modules)
 
 
 class TestFusedMoEDefaultHasBias(unittest.TestCase):
@@ -201,6 +219,15 @@ class TestSwiGLUInterleavingWithoutBias(unittest.TestCase):
       and guard only the bias interleaving on ``layer.w13_bias is not None``.
     """
 
+    @unittest.skip(
+        "Obsolete: Mxfp4MoEMethod.process_weights_after_loading no longer "
+        "branches on `layer.activation == ActivationType.Swiglu`. The function "
+        "now routes via `use_triton` (Triton swizzle) vs. the AITER shuffle "
+        "path, with bias cast handled unconditionally up top. The original "
+        "regression this guard was added for — the SwiGLU branch being "
+        "incorrectly gated on `w13_bias is not None` — cannot recur in the "
+        "current structure. Re-evaluate or delete when revisiting Mxfp4 MoE."
+    )
     def test_swiglu_branch_condition_no_bias_check(self):
         """The SwiGLU branch must NOT require bias to be present."""
         import inspect
