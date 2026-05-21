@@ -2403,15 +2403,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return n
 
     @staticmethod
-    def _contiguous_strides(shape: tuple) -> tuple:
-        strides = []
-        acc = 1
-        for s in reversed(shape):
-            strides.append(acc)
-            acc *= s
-        return tuple(reversed(strides))
-
-    @staticmethod
     def _make_gather_slot(
         buf: torch.Tensor,
         stride: int,
