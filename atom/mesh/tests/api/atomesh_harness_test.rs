@@ -30,6 +30,10 @@ fn log_case_result(case: &MockTestCase, result: &TestHarnessResult) {
     );
 }
 
+fn assert_harness_runtime(case: &MockTestCase, result: &TestHarnessResult) {
+    result.assert_runtime_state(case);
+}
+
 #[tokio::test]
 async fn test_atomesh_harness_http_regular_chat() {
     // This case verifies non-streaming regular HTTP chat routing.
@@ -41,6 +45,7 @@ async fn test_atomesh_harness_http_regular_chat() {
     let result = harness.run().await.unwrap();
     log_case_result(&case, &result);
 
+    assert_harness_runtime(&case, &result);
     result.assert_response(&case);
     result.assert_worker_path_contains("/v1/chat/completions");
 }
@@ -56,6 +61,7 @@ async fn test_atomesh_harness_http_regular_generate() {
     let result = harness.run().await.unwrap();
     log_case_result(&case, &result);
 
+    assert_harness_runtime(&case, &result);
     result.assert_response(&case);
     result.assert_worker_path_contains("/generate");
 }
@@ -71,6 +77,7 @@ async fn test_atomesh_harness_http_regular_chat_streaming() {
     let result = harness.run().await.unwrap();
     log_case_result(&case, &result);
 
+    assert_harness_runtime(&case, &result);
     result.assert_response(&case);
     result.assert_worker_path_contains("/v1/chat/completions");
 }
@@ -86,6 +93,7 @@ async fn test_atomesh_harness_http_regular_completion() {
     let result = harness.run().await.unwrap();
     log_case_result(&case, &result);
 
+    assert_harness_runtime(&case, &result);
     result.assert_response(&case);
     result.assert_worker_path_contains("/v1/completions");
 }
@@ -101,6 +109,7 @@ async fn test_atomesh_harness_http_pd_chat() {
     let result = harness.run().await.unwrap();
     log_case_result(&case, &result);
 
+    assert_harness_runtime(&case, &result);
     result.assert_response(&case);
     result.assert_worker_path_count_at_least("/v1/chat/completions", 2);
 }
@@ -116,6 +125,7 @@ async fn test_atomesh_harness_grpc_regular_generate() {
     let result = harness.run().await.unwrap();
     log_case_result(&case, &result);
 
+    assert_harness_runtime(&case, &result);
     result.assert_response(&case);
     result.assert_worker_path_contains("generate");
 }
@@ -131,6 +141,7 @@ async fn test_atomesh_harness_grpc_regular_generate_vllm() {
     let result = harness.run().await.unwrap();
     log_case_result(&case, &result);
 
+    assert_harness_runtime(&case, &result);
     result.assert_response(&case);
     result.assert_worker_path_contains("generate");
 }
@@ -146,6 +157,7 @@ async fn test_atomesh_harness_grpc_pd_generate() {
     let result = harness.run().await.unwrap();
     log_case_result(&case, &result);
 
+    assert_harness_runtime(&case, &result);
     result.assert_response(&case);
     result.assert_worker_path_count_at_least("generate", 2);
 }

@@ -81,6 +81,64 @@ impl TestHarnessResult {
             expected_count
         );
     }
+
+    /// Assert the runtime router and worker-pool state implied by the fixture.
+    ///
+    /// These checks protect the harness from silently exercising the wrong
+    /// Atomesh branch. A response can be correct even if the fixture accidentally
+    /// built a regular router instead of PD, or HTTP instead of gRPC; this
+    /// assertion ties the observed runtime config and registry state back to the
+    /// route metadata.
+    pub fn assert_runtime_state(&self, case: &MockTestCase) {
+        let expected_worker_count = match case.route.worker_kind {
+            WorkerKindFixture::Regular => 1,
+            WorkerKindFixture::PrefillDecode => 2,
+        };
+
+        match case.route.worker_kind {
+            WorkerKindFixture::Regular => assert!(
+                self.router_mode.starts_with("Regular"),
+                "router mode {:?} did not match regular fixture {}",
+                self.router_mode,
+                case.name
+            ),
+            WorkerKindFixture::PrefillDecode => assert!(
+                self.router_mode.starts_with("PrefillDecode"),
+                "router mode {:?} did not match PD fixture {}",
+                self.router_mode,
+                case.name
+            ),
+        }
+
+        match case.route.connection_mode {
+            ConnectionModeFixture::Http => assert_eq!(self.connection_mode, "Http"),
+            ConnectionModeFixture::Grpc => assert!(
+                self.connection_mode.starts_with("Grpc"),
+                "connection mode {:?} did not match gRPC fixture {}",
+                self.connection_mode,
+                case.name
+            ),
+        }
+
+        assert_eq!(
+            self.worker_urls.len(),
+            expected_worker_count,
+            "fixture {} expected {} worker URLs, got {:?}",
+            case.name,
+            expected_worker_count,
+            self.worker_urls
+        );
+        assert_eq!(
+            self.registered_workers, expected_worker_count,
+            "fixture {} registered unexpected worker count",
+            case.name
+        );
+        assert_eq!(
+            self.healthy_workers, expected_worker_count,
+            "fixture {} healthy worker count did not match expected pool size",
+            case.name
+        );
+    }
 }
 
 /// Runs one fixture case through a real Atomesh app and virtual backend pool.

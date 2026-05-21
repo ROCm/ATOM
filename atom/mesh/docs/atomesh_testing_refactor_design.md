@@ -340,12 +340,12 @@ nightly（可选长期任务）:
 
 - `local quick` 包含 `test_atomesh_harness` 过滤命令，便于本地查看每个 harness case 打印的 router/worker 运行状态。
 - `ci quick` 只运行当前稳定的无外部依赖入口；`api_tests` 先通过 `test_atomesh_harness` 过滤执行，避免 legacy API case 的既有失败影响本次 harness 重构验收。
-- `ci full` 中的完整 `api_tests`、`grpc_tests`、`sandbox_tests` 是修复 legacy API case 和补齐 gRPC/sandbox 后的扩展入口，不作为本次主结构的前置条件。
+- `ci full` 中的完整 `api_tests`、后续 `grpc_tests`、`sandbox_tests` 是修复 legacy API case 和补齐更广运行模式后的扩展入口，不作为当前阶段的前置条件。
 - 默认回归必须无 GPU、无真实 inference backend、无外部网络下载，并默认使用随机端口。
 
 ## 6. 实施计划
 
-建议按 5 个工作日排布。当前已完成 Day 1 至 Day 4 的核心交付：测试命令/README 已修正，旧 `MockWorker` 与新增 harness 都已使用随机端口和 readiness polling，regular HTTP、streaming、HTTP PD、completion、SGLang/vLLM gRPC regular 和 SGLang gRPC PD 已接入 `TestHarness`/`VirtualGrpcWorker`。每个 harness case 会输出真实运行时 router config、worker URLs、注册 worker 数和健康 worker 数，便于确认运行状态。
+按阶段推进。当前阶段已完成 Day 1 至 Day 4 的核心交付：测试命令/README 已修正，旧 `MockWorker` 与新增 harness 都已使用随机端口和 readiness polling，fixture-driven regular HTTP、streaming、HTTP PD、completion、SGLang/vLLM gRPC regular 和 SGLang gRPC PD 已接入 `TestHarness` / `VirtualGrpcWorker`。每个 harness case 会输出并断言真实运行时 router config、worker URLs、注册 worker 数和健康 worker 数，便于确认运行状态。Day 5 之后的 metrics/router/entry routes 等 guardrail 属于更广测试体系建设，不作为本轮 virtual worker harness 的完成条件。
 
 
 | 阶段    | 时间  | 主要工作                                                                                  | 交付物                                                    | 当前状态 |
@@ -353,25 +353,25 @@ nightly（可选长期任务）:
 | Day 1 | 1 天 | 修正测试命令；改造 `MockWorker::start/shutdown`；端口和 readiness polling 收敛。 | README 命令正确；`MockWorker` 与新增 `TestHarness` 启停和 readiness 基础稳定。 | 已完成 |
 | Day 2 | 1 天 | 新增 `MockTestCase`、`VirtualRequest`、`ReplayCaseStore`、golden assert；打通 regular HTTP virtual worker。 | fixture 可生成真实 Atomesh 请求，经 regular HTTP 路由到 virtual worker，并完成 response / worker path 校验。 | 已完成 |
 | Day 3 | 1 天 | 增加 `VirtualWorker` streaming fixture、PD prefill/decode replay，并输出运行时 router/worker 状态。                                | 普通文本 SSE、HTTP PD chat prefill/decode fixture 可断言；每个 case 可打印 router mode、connection mode、policy、worker URLs、注册 worker 数和健康 worker 数。                    | 已完成 |
-| Day 4 | 1 天 | 完善 `VirtualGrpcWorker` 接口；将更多现有 case 接入 `TestHarness`；整理运行模式矩阵。                         | `/v1/completions` 已迁入 HTTP harness；gRPC regular 和 gRPC PD generate fixture 可通过 tonic-backed `VirtualGrpcWorker` 执行，regular 可由 `route.backend` 选择 SGLang/vLLM；运行模式矩阵已整理。                        | 已完成 |
-| Day 5 | 1 天 | 建立重构 P0 清单；补 metrics/router/worker pool/entry routes 关键测试；整理 CI 分层。                   | 每个重构点有 P0 测试入口；CI quick/full 边界明确。                     | 未开始 |
+| Day 4 | 1 天 | 支持 gRPC Virtual Worker；对外保持统一 `VirtualGrpcWorker`，内部按 fixture `route.backend` 拆分 SGLang/vLLM tonic service；接入 gRPC regular 和 SGLang gRPC PD fixture；整理运行模式矩阵。 | gRPC regular 和 gRPC PD generate fixture 可通过 tonic-backed `VirtualGrpcWorker` 执行；regular 可由 `route.backend` 选择 SGLang/vLLM；`TestHarness` 可统一启动 HTTP/gRPC regular/PD virtual workers。 | 已完成 |
+| Day 5 | 后续 | 在当前 harness 稳定后，再补 metrics/router/worker pool/entry routes 等更广泛 P0/P1 guardrail，并视情况整理独立 CI 脚本或 workflow。 | metrics helper、`/engine_metrics`、RouterFactory 四象限、worker management POST/DELETE、tokenize/detokenize、tokenizer CRUD 等测试作为后续扩展，不阻塞当前 harness 阶段。 | 后续待完成 |
 
 当前实现清单：
 
 - 已新增 `tests/test_atomesh/` 测试框架模块：`MockTestCase`、`VirtualRequest`、`ReplayCaseStore`、`VirtualWorker`、`VirtualGrpcWorker`、`TestHarness` 和 `GoldenAssert`。
 - 已新增 `tests/fixtures/atomesh_harness/` 样本：`http_regular_chat.json`、`http_regular_generate.json`、`http_regular_chat_streaming.json`、`http_regular_completion.json`、`http_pd_chat.json`、`grpc_regular_generate.json`、`grpc_regular_generate_vllm.json`、`grpc_pd_generate.json`。
 - 已在 `tests/api/atomesh_harness_test.rs` 接入 fixture-driven regular HTTP、streaming、completion、HTTP PD chat、SGLang gRPC regular、vLLM gRPC regular 和 SGLang gRPC PD smoke 测试，并通过 `cargo test --test api_tests atomesh_harness -- --nocapture`。
-- 已在 `TestHarnessResult` 中返回真实运行时 router/worker 状态：router mode、connection mode、policy、worker URLs、registered workers、healthy workers，并在 case 日志中输出。
-- 已修正 `tests/README.md` 中 package 名称和新增测试结构说明。
-- 尚未完成现有大批 case 迁移和 Day 5 P0 测试清单。
+- 已在 `TestHarnessResult` 中返回并断言真实运行时 router/worker 状态：router mode、connection mode、policy、worker URLs、registered workers、healthy workers。
+- 已修正 `tests/README.md` 中 package 名称、新增测试结构和 harness 运行命令说明。
+- 当前阶段不继续扩展 metrics/router/entry routes 等外围测试；这些测试与现有大批 case 迁移、gRPC chat/completions public API、streaming/logprobs/tool-call 等更细行为一起作为后续工作。
 
 
-如果工期紧张，优先级为：
+当前阶段优先级为：
 
 ```text
-P0: TestHarness 稳定 + MockTestCase/VirtualRequest + regular HTTP virtual worker + P0 清单
-P1: streaming replay + gRPC regular/PD smoke + 默认测试无外部网络依赖
-P2: sandbox binary startup + nightly backend compatibility
+P0: TestHarness 稳定 + MockTestCase/VirtualRequest + HTTP regular/PD virtual worker
+P1: streaming replay + gRPC Virtual Worker regular/PD smoke + 默认测试无外部网络依赖
+P2: metrics/router/entry route guardrail + sandbox binary startup + nightly backend compatibility
 ```
 
 当前 harness 运行模式矩阵：
@@ -389,7 +389,7 @@ P2: sandbox binary startup + nightly backend compatibility
 
 ## 7. 测试与验收
 
-当前 P0/P1 harness 验收：
+当前阶段 harness 验收：
 
 - 默认 fixture-driven regular HTTP smoke 不依赖 GPU、真实 engine 或外部网络。
 - 旧 `MockWorker` 与新增 `VirtualWorker` 使用随机端口和 readiness polling，不依赖固定 sleep。
@@ -398,12 +398,13 @@ P2: sandbox binary startup + nightly backend compatibility
 - `/v1/completions`、SGLang/vLLM gRPC regular 和 SGLang gRPC PD fixture 已接入 harness 测试入口。
 - HTTP PD chat 通过 fixture-driven `TestHarness` 接入，并可断言 prefill/decode worker path。
 - case 日志能打印真实 router config 和 worker registry 摘要，而不是直接复述 fixture 声明。
-- `tests/README.md` 与实际 package name、CI quick/full/nightly 命令一致。
+- harness case 会断言运行时 router mode、connection mode、worker URLs 和 healthy/registered worker 数与 fixture 拓扑一致。
+- `tests/README.md` 与实际 package name、harness 结构和当前阶段测试命令一致。
 - `cargo test --test api_tests atomesh_harness -- --nocapture` 通过。
 
 后续验收：
 
 - reasoning 专项测试、streaming failure 和更完整的 tool-call 流式断言待后续通过更合适的 parser / gRPC / streaming 转换入口补齐。
 - 更完整的 gRPC chat/completions、streaming 和 logprobs 行为作为后续 smoke 扩展项。
-- 重构 metrics、router、worker pool、entry routes 前，有对应 P0 测试清单。
+- metrics helper、`/engine_metrics`、RouterFactory 四象限、worker management `POST /workers` / `DELETE /workers/{id}`、tokenize/detokenize 和 tokenizer CRUD entry routes 作为后续 P1/P2 guardrail，不属于当前 harness 阶段的完成条件。
 

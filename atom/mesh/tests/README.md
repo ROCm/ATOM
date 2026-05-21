@@ -2,7 +2,7 @@
 
 This directory contains the integration test suite for **atom/mesh**, organized by functional area. All tests run with `cargo test` and do not require a GPU or real inference backend — they use mock workers and in-memory routers.
 
-**Total: ~228 tests across 25 test files.**
+**Total: ~232 tests across 25 test files.**
 
 ## Directory Structure
 
