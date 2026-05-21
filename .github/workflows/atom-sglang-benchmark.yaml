@@ -40,16 +40,16 @@ on:
         description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"
         type: choice
         options:
-          - "ds-fp4-all / DeepSeek-R1-0528-MXFP4 FP4 (all Mesh configs: 44 cases)"
-          - "ds-fp4-tp8 / DeepSeek-R1-0528-MXFP4 FP4 TP8 (8192x1/1x1024: [2,4,8,16,32,64,128,256])"
-          - "ds-fp4-tp8-mtp / DeepSeek-R1-0528-MXFP4 FP4 TP8 MTP (8192x1/1x1024: [2,4,8,16,32,64,128,256])"
-          - "ds-fp4-dpa4-ep4 / DeepSeek-R1-0528-MXFP4 FP4 DPA4 EP4 (8192x1: [1024,2048,4096])"
-          - "ds-fp4-dpa4-ep4-mtp / DeepSeek-R1-0528-MXFP4 FP4 DPA4 EP4 MTP (8192x1: [1024,2048,4096])"
-          - "ds-fp4-dpa8-ep8 / DeepSeek-R1-0528-MXFP4 FP4 DPA8 EP8 (1x1024: [1024,2048,4096])"
-          - "ds-fp4-dpa8-ep8-mtp / DeepSeek-R1-0528-MXFP4 FP4 DPA8 EP8 MTP (1x1024: [1024,2048,4096])"
-          - "ds-fp4-non-mtp / DeepSeek-R1-0528-MXFP4 FP4 (tp8 + dpa4-ep4 + dpa8-ep8)"
-          - "ds-fp4-mtp / DeepSeek-R1-0528-MXFP4 FP4 MTP (tp8-mtp + dpa4-ep4-mtp + dpa8-ep8-mtp)"
-        default: "ds-fp4-all / DeepSeek-R1-0528-MXFP4 FP4 (all Mesh configs: 44 cases)"
+          - "ds-fp4-all (all Mesh configs: 44 cases)"
+          - "ds-fp4-tp8 (8192x1/1x1024: [2,4,8,16,32,64,128,256])"
+          - "ds-fp4-tp8-mtp (8192x1/1x1024: [2,4,8,16,32,64,128,256])"
+          - "ds-fp4-dpa4-ep4 (8192x1: [1024,2048,4096])"
+          - "ds-fp4-dpa4-ep4-mtp (8192x1: [1024,2048,4096])"
+          - "ds-fp4-dpa8-ep8 (1x1024: [1024,2048,4096])"
+          - "ds-fp4-dpa8-ep8-mtp (1x1024: [1024,2048,4096])"
+          - "ds-fp4-non-mtp (tp8 + dpa4-ep4 + dpa8-ep8)"
+          - "ds-fp4-mtp (tp8-mtp + dpa4-ep4-mtp + dpa8-ep8-mtp)"
+        default: "ds-fp4-all (all Mesh configs: 44 cases)"
       docker_image:
         description: "Optional Docker image override. Use this for mori+sglang benchmark images."
         type: string
