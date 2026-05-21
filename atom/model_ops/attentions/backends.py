@@ -10,7 +10,6 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
-from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
 from atom.utils.forward_context import AttentionMetaData
 from torch import nn
@@ -233,12 +232,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             # seq_starts for cp_mha_gather_cache: always zeros (prefix at position 0)
             "seq_starts": CpuGpuBuffer(self.max_bs, **i32_kwargs),
         }
-        if self.block_ratio > 1:
-            attn_metadata["block_tables_converted"] = CpuGpuBuffer(
-                self.max_bs,
-                self.max_num_blocks_per_seq,
-                **i32_kwargs,
-            )
 
         attn_metadata["cu_seqlens_q"].cpu.copy_(
             torch.arange(0, self.max_bs + 1, step=1, dtype=torch.int32)
@@ -330,14 +323,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             vars_used.append(("seq_starts", bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
-        if self.block_ratio > 1 and "block_tables" in ctx:
-            block_table_convert_triton(
-                var["block_tables"].gpu[:bs],
-                var["block_tables_converted"].gpu[:bs],
-                var["context_lens"].gpu[:bs],
-                self.block_ratio,
-            )
-            ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         num_cached_tokens = None
         if has_cached:
             num_cached_tokens = torch.tensor(

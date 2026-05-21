@@ -476,24 +476,12 @@ class MLAAttention(nn.Module):
         kv_last_page_lens = attn_metadata.kv_last_page_lens
         max_q_len = attn_metadata.max_seqlen_q
         if self.topk_indices_buffer is not None:
-            # The kernel computes out = block_table[req,blk] * PAGE_SIZE + offset
-            # with PAGE_SIZE = logical block_size. With block_ratio > 1,
-            # attn_metadata.block_tables is the CONVERTED (physical-id per
-            # physical slot) view; using it here multiplies by PAGE_SIZE again
-            # and over-indexes the flat kv_cache by block_ratio×. Use the raw
-            # logical block_table so raw_val * PAGE_SIZE lands on the correct
-            # physical slot.
-            block_table_for_dsa = (
-                attn_metadata.block_tables_raw
-                if attn_metadata.block_tables_raw is not None
-                else attn_metadata.block_tables
-            )
             sparse_kv_indices = triton_convert_req_index_to_global_index_dsa_prefill(
                 attn_metadata.sparse_cu_seqlens_q,
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.token_to_seq_idxs,
                 self.topk_indices_buffer[:B],
-                block_table_for_dsa,
+                attn_metadata.block_tables,
                 attn_metadata.cu_seqlens_k,
                 NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
                 PAGE_SIZE=get_current_atom_config().kv_cache_block_size,

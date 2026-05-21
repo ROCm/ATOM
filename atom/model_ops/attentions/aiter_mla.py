@@ -249,12 +249,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.max_num_blocks_per_seq // self.block_ratio,
                 **i32_kwargs,
             )
-            if self.block_ratio > 1:
-                var[f"{p}block_tables_converted"] = CpuGpuBuffer(
-                    ub_max_bs,
-                    self.max_num_blocks_per_seq,
-                    **i32_kwargs,
-                )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
                 torch.arange(
@@ -662,10 +656,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
 
-            # kv_indices_generate_triton expects RAW block_tables (physical block ids,
-            # one per block_ratio tokens). When is_sparse, attn_metadata.block_tables
-            # may have been overwritten with block_tables_converted (slot per token).
-            # Always use raw block_tables for kv_indices.
+            # kv_indices_generate_triton expects logical block_tables (one entry
+            # per block_ratio tokens). Re-copy from var to get a fresh logical
+            # snapshot independent of attn_metadata.block_tables sharing.
             self.prepare_block_tables(batch)
             block_tables_for_kv = var["block_tables"].copy_to_gpu(bs)
             kv_indices_generate_triton(
@@ -1099,11 +1092,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             sparse_kv_indptr=(
                 var[f"{p}sparse_kv_indptr"].gpu[: padded_bs + 1]
                 if self.is_sparse
-                else None
-            ),
-            block_tables_converted=(
-                var[f"{p}block_tables_converted"].gpu[:padded_bs]
-                if f"{p}block_tables_converted" in var
                 else None
             ),
             work_meta_data=var[f"{p}work_meta_data"],

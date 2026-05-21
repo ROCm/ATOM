@@ -196,13 +196,6 @@ class AttentionMetaData:
     reduce_final_map: Optional[torch.Tensor] = None
     reduce_partial_map: Optional[torch.Tensor] = None
 
-    block_tables_converted: Optional[torch.Tensor] = None
-    # Raw block_tables (logical IDs) preserved alongside `block_tables` so
-    # callers that need logical IDs (e.g. cp_gather_indexer_k_quant_cache,
-    # which indexes a kv_cache whose shape[0] == num_kvcache_blocks) can read
-    # them after the `block_tables`-with-converted override below.
-    block_tables_raw: Optional[torch.Tensor] = None
-
     # for prefix cache
     has_cached: bool = False
     total_kv: Optional[int] = None
@@ -235,7 +228,6 @@ class AttentionMetaData:
         reduce_indptr: Optional[torch.Tensor] = None,
         reduce_final_map: Optional[torch.Tensor] = None,
         reduce_partial_map: Optional[torch.Tensor] = None,
-        block_tables_converted: Optional[torch.Tensor] = None,
         sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
         token_to_seq_idxs: Optional[torch.Tensor] = None,
         plugin_metadata: Optional["MetadataForPluginMode"] = None,
@@ -256,9 +248,6 @@ class AttentionMetaData:
         self.slot_mapping = slot_mapping
         self.context_lens = context_lens
         self.block_tables = block_tables
-        # Preserve raw block_tables (logical IDs) before the converted override
-        # below; cp_gather_indexer_k_quant_cache reads via .block_tables_raw.
-        self.block_tables_raw = block_tables
         self.dropout_p = dropout_p
         self.kv_indptr = kv_indptr
         self.kv_indices = kv_indices
@@ -272,8 +261,6 @@ class AttentionMetaData:
         self.reduce_indptr = reduce_indptr
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
-        if block_tables_converted is not None:
-            self.block_tables = block_tables_converted
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs
         if plugin_metadata is not None:

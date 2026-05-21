@@ -1079,24 +1079,11 @@ def sparse_attn_indexer(
                 dtype=torch.long,
                 device=prefill_metadata.block_tables.device,
             )
-        # cp_gather indexes kv_cache.view(-1, runner_block_size, ...) whose
-        # shape[0] == num_kvcache_blocks (LOGICAL). With block_ratio>1,
-        # prefill_metadata.block_tables may be the converted (physical-id)
-        # table — use block_tables_raw (logical) preserved at construction.
-        block_tables_for_cp = (
-            prefill_metadata.block_tables_raw
-            if (
-                prefill_metadata.block_tables_raw is not None
-                and prefill_metadata.block_tables_raw.shape[0]
-                == prefill_metadata.block_tables.shape[0]
-            )
-            else prefill_metadata.block_tables
-        )
         cp_gather_indexer_k_quant_cache(
             kv_cache,
             k_fp8,
             k_scale.view(dtypes.fp8),
-            block_tables_for_cp,
+            prefill_metadata.block_tables,
             (
                 prefill_metadata.cu_seqlens_k
                 if prefill_metadata.has_cached
@@ -1146,19 +1133,13 @@ def sparse_attn_indexer(
         logits = torch.empty(
             [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
         )
-        # Same logical-id requirement as cp_gather (see prefill branch above).
-        block_tables_for_mqa = (
-            attn_metadata.block_tables_raw
-            if attn_metadata.block_tables_raw is not None
-            else attn_metadata.block_tables
-        )
         deepgemm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
             weights[:num_padded_tokens],
             logits,
             decode_metadata.context_lens,
-            block_tables_for_mqa,
+            attn_metadata.block_tables,
             max_model_len,
             KVBlockSize=runner_block_size,
             Preshuffle=True,
