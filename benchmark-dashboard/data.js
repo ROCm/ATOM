@@ -1,62 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779325998188,
+  "lastUpdate": 1779330324005,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "root",
-            "email": "root@hjbog-srdc-24.amd.com"
-          },
-          "committer": {
-            "name": "root",
-            "email": "root@hjbog-srdc-24.amd.com"
-          },
-          "id": "0035bc4a12de4e883c7ab367f68959fc3bb1286a",
-          "message": "fix: add execute permission to atom_pd_test.sh\n\nCo-Authored-By: Claude Opus 4 <noreply@anthropic.com>",
-          "timestamp": "2026-05-18T04:38:39Z",
-          "url": "https://github.com/ROCm/ATOM/commit/0035bc4a12de4e883c7ab367f68959fc3bb1286a"
-        },
-        "date": 1779081996352,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 throughput (tok/s)",
-            "value": 3920.53,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26013871113 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171131-mooncake_build"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 Total Tput (tok/s)",
-            "value": 7849.67,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26013871113 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171131-mooncake_build"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 TTFT (ms)",
-            "value": 214.79,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26013871113 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171131-mooncake_build"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 TPOT (ms)",
-            "value": 31.61,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26013871113 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171131-mooncake_build"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 _gpu_count",
-            "value": 1,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 _tp",
-            "value": 1,
-            "unit": ""
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -34029,6 +33975,640 @@ window.BENCHMARK_DATA = {
           },
           {
             "name": "ATOM-vLLM::Qwen3-Next-80B-A3B-Instruct-FP8-aw-tp1 5000/500 c=8 _tp",
+            "value": 1,
+            "unit": ""
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "junyyang-amd",
+            "username": "junyyang-amd",
+            "email": "junyyang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "ed94dc7ce1903a02b99a5a799eb58373bd508624",
+          "message": "[ATOM SGL] Add deepseek fp4 mtp nightly accuracy cases and ds fp4-dp4-ep4 nightly accuracy case and banchmark case. (#846)\n\n* add DeepSeek-R1-0528-MXFP4_FP4_TP8_MTP3/MTP1 case for sglang accuracy nightly\n\n* add ds fp4 dp+ep4 case\n\n---------\n\nCo-authored-by: root <root@hjbog-srdc-19.amd.com>",
+          "timestamp": "2026-05-21T02:24:27Z",
+          "url": "https://github.com/ROCm/ATOM/commit/ed94dc7ce1903a02b99a5a799eb58373bd508624"
+        },
+        "date": 1779330319150,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=128 throughput (tok/s)",
+            "value": 4786.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=128 Total Tput (tok/s)",
+            "value": 52652.77,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=128 TTFT (ms)",
+            "value": 820.57,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=128 TPOT (ms)",
+            "value": 18.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=128 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=128 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=16 throughput (tok/s)",
+            "value": 2073.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=16 Total Tput (tok/s)",
+            "value": 22803.32,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=16 TTFT (ms)",
+            "value": 186.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=16 TPOT (ms)",
+            "value": 5.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=16 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=256 throughput (tok/s)",
+            "value": 6043.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=256 Total Tput (tok/s)",
+            "value": 66477.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=256 TTFT (ms)",
+            "value": 1180.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=256 TPOT (ms)",
+            "value": 30.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=256 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=256 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=32 throughput (tok/s)",
+            "value": 1993.01,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=32 Total Tput (tok/s)",
+            "value": 21923.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=32 TTFT (ms)",
+            "value": 835.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=32 TPOT (ms)",
+            "value": 7.75,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=32 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=512 throughput (tok/s)",
+            "value": 8322.79,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=512 Total Tput (tok/s)",
+            "value": 91550.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=512 TTFT (ms)",
+            "value": 876.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=512 TPOT (ms)",
+            "value": 52.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=512 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=512 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=64 throughput (tok/s)",
+            "value": 2499.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=64 Total Tput (tok/s)",
+            "value": 27490.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=64 TTFT (ms)",
+            "value": 1207.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=64 TPOT (ms)",
+            "value": 13.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=8 throughput (tok/s)",
+            "value": 1286.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=8 Total Tput (tok/s)",
+            "value": 14150.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=8 TTFT (ms)",
+            "value": 117.61,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=8 TPOT (ms)",
+            "value": 5.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 1000/100 c=8 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=128 throughput (tok/s)",
+            "value": 4590.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=128 Total Tput (tok/s)",
+            "value": 50497.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=128 TTFT (ms)",
+            "value": 2187.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=128 TPOT (ms)",
+            "value": 25.65,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=128 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=128 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=16 throughput (tok/s)",
+            "value": 1931.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=16 Total Tput (tok/s)",
+            "value": 21250.21,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=16 TTFT (ms)",
+            "value": 973.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=16 TPOT (ms)",
+            "value": 7.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=16 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=256 throughput (tok/s)",
+            "value": 5679.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=256 Total Tput (tok/s)",
+            "value": 62470.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=256 TTFT (ms)",
+            "value": 2185.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=256 TPOT (ms)",
+            "value": 42.79,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=256 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=256 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=32 throughput (tok/s)",
+            "value": 2772.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=32 Total Tput (tok/s)",
+            "value": 30494.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=32 TTFT (ms)",
+            "value": 1194.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=32 TPOT (ms)",
+            "value": 10.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=32 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=64 throughput (tok/s)",
+            "value": 3891.76,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=64 Total Tput (tok/s)",
+            "value": 42809.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=64 TTFT (ms)",
+            "value": 1089.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=64 TPOT (ms)",
+            "value": 15.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=8 throughput (tok/s)",
+            "value": 1366.19,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=8 Total Tput (tok/s)",
+            "value": 15028.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=8 TTFT (ms)",
+            "value": 545.79,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=8 TPOT (ms)",
+            "value": 5.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 10000/1000 c=8 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=16 throughput (tok/s)",
+            "value": 2064.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=16 Total Tput (tok/s)",
+            "value": 22708.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=16 TTFT (ms)",
+            "value": 531.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=16 TPOT (ms)",
+            "value": 6.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=16 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=4 throughput (tok/s)",
+            "value": 724.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=4 Total Tput (tok/s)",
+            "value": 7971.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=4 TTFT (ms)",
+            "value": 524.55,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=4 TPOT (ms)",
+            "value": 4.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=4 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=4 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=512 throughput (tok/s)",
+            "value": 7660.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=512 Total Tput (tok/s)",
+            "value": 84264.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=512 TTFT (ms)",
+            "value": 2081.66,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=512 TPOT (ms)",
+            "value": 62.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=512 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=512 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=64 throughput (tok/s)",
+            "value": 4047.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=64 Total Tput (tok/s)",
+            "value": 44521.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=64 TTFT (ms)",
+            "value": 1026.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=64 TPOT (ms)",
+            "value": 13.76,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=8 throughput (tok/s)",
+            "value": 1218.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=8 Total Tput (tok/s)",
+            "value": 13403.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=8 TTFT (ms)",
+            "value": 475.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=8 TPOT (ms)",
+            "value": 5.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26198930888 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260520-qwen3"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b-aw-tp1 5000/500 c=8 _tp",
             "value": 1,
             "unit": ""
           }
