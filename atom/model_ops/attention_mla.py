@@ -492,11 +492,11 @@ class MLAAttention(nn.Module):
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
-            # fp8 mla_decode_fwd only has dispatch entries for q_len <= 4 and is
-            # numerically broken even at q_len=4 (see probe_mla_decode_long_q).
-            # The bf16 absorbed prefill kernel works at any q_len, so for the
-            # dense prefix-cache prefill path (no DSA, large q_len) we dequant
-            # fp8 KV to bf16 on the fly and route through mla_prefill_fwd.
+            # Restrict fp8 mla_decode_fwd to the sparse/DSA path. The absorbed
+            # bf16 prefill kernel supports arbitrary q_len, so for the dense
+            # prefix-cache prefill path (no DSA, potentially larger q_len) we
+            # dequant fp8 KV to bf16 on the fly and route through
+            # mla_prefill_fwd instead.
             use_fp8_decode = (
                 self.kv_cache_dtype.startswith("fp8")
                 and self.topk_indices_buffer is not None
@@ -523,21 +523,16 @@ class MLAAttention(nn.Module):
                     # before the explicit gather or we materialize the whole
                     # persistent buffer in fp32 and OOM.
                     active_kv = int(attn_metadata.total_kv)
-                    k_scale = self._k_scale.to(q.device, non_blocking=True)
-                    q_scale = self._q_scale.to(q.device, non_blocking=True)
                     gathered_fp8 = kv_c_and_k_pe_cache.view(-1, q.shape[-1])[
                         paged_kv_indices[:active_kv].long()
                     ]
-                    gathered_bf16 = (gathered_fp8.to(torch.float32) * k_scale).to(
-                        self.dtype
-                    )
-                    kv_buffer = gathered_bf16.view(-1, 1, 1, q.shape[-1])
+                    kv_buffer = gathered_fp8.to(self.dtype).view(-1, 1, 1, q.shape[-1])
                     kv_indices = torch.arange(
                         active_kv,
                         dtype=torch.int32,
                         device=q.device,
                     )
-                    q_in = (q.to(torch.float32) * q_scale).to(self.dtype)
+                    q_in = q
                 else:
                     kv_buffer = kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1])
                     kv_indices = paged_kv_indices

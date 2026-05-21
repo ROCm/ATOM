@@ -90,11 +90,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cache is dequantized to bf16 on the fly before calling the bf16 absorbed
     # kernel, since fp8 mla_decode_fwd only supports q_len <= 4.
     #
-    # Default 131072 is the empirical latency crossover from
-    # atom/examples/bench_mla_prefix_paths.py on DSR1 (TP=8, nhead=16,
-    # q_len=8): old path wins by ~1.3-2x for total_kv <= 65K, new path wins
-    # by ~1.25-1.5x for total_kv >= 197K, crossover ≈ 128K. Old path OOMs
-    # around total_kv >= 1M, so this threshold leaves ~8x safety margin
+    # Default 131072 is the empirical latency crossover from internal
+    # benchmarking on DSR1 (TP=8, nhead=16, q_len=8): old path wins by
+    # ~1.3-2x for total_kv <= 65K, new path wins by ~1.25-1.5x for
+    # total_kv >= 197K, crossover ≈ 128K. Old path OOMs around
+    # total_kv >= 1M, so this threshold leaves ~8x safety margin
     # before VRAM pressure forces the new path regardless of latency.
     "ATOM_MLA_PREFILL_KV_THRESHOLD": lambda: int(
         os.getenv("ATOM_MLA_PREFILL_KV_THRESHOLD", "131072")
