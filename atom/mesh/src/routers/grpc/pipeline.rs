@@ -25,10 +25,10 @@ use crate::{
         generate::GenerateRequest,
     },
     routers::{
-        error,
+        comm::error,
         prepare::{self, generation_payload::GenerationPayload, response_context::ResponseContext},
         render,
-        shared::{
+        comm::{
             metrics_utils::error_type_from_status, placement_response::placement_err_to_response,
         },
         token_handle::engine_error::EngineError,

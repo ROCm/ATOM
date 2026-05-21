@@ -1,7 +1,7 @@
 use axum::response::Response;
 
 use crate::core::{placement::types::PlacementError, UNKNOWN_MODEL_ID};
-use crate::routers::error;
+use crate::routers::comm::error;
 
 pub fn placement_err_to_response(err: PlacementError, model_id: Option<&str>) -> Response {
     let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);

@@ -29,7 +29,7 @@ use crate::{
         inflight_tracker::InFlightRequestTracker,
         metrics::{method_to_static_str, metrics_labels, Metrics},
     },
-    routers::error::extract_error_code_from_response,
+    routers::comm::error::extract_error_code_from_response,
     server::AppState,
 };
 

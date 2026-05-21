@@ -8,7 +8,7 @@ use mesh_grpc::{SglangSchedulerClient, VllmEngineClient};
 use tracing::error;
 
 use crate::core::Worker;
-use crate::routers::error;
+use crate::routers::comm::error;
 use crate::routers::grpc::engine::proto_stream_wrapper::{
     ProtoEmbedRequest, ProtoEmbedResponse, ProtoGenerateRequest, ProtoStream,
 };

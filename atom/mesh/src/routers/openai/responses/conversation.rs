@@ -10,7 +10,7 @@ use crate::{
     protocols::responses::{
         self, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest,
     },
-    routers::error,
+    routers::comm::error,
 };
 
 pub(super) async fn load_conversation_history(

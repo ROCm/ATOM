@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Response};
 use data_connector::ResponseId;
 
 use super::context::ResponsesContext;
-use crate::routers::error;
+use crate::routers::comm::error;
 
 pub(crate) async fn get_response_impl(ctx: &ResponsesContext, response_id: &str) -> Response {
     let resp_id = ResponseId::from(response_id);

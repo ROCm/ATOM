@@ -44,8 +44,8 @@ use crate::{
         generate::GenerateRequest,
     },
     routers::{
-        error, header_utils,
-        shared::{
+        comm::{error, header_utils},
+        comm::{
             metrics_utils::{error_type_from_status, route_to_endpoint},
             placement_response::placement_err_to_response,
         },

@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     protocols::responses::{ResponsesRequest, ResponsesResponse},
-    routers::error,
+    routers::comm::error,
 };
 
 pub(super) async fn route_responses_internal(

@@ -22,7 +22,7 @@ use crate::{
         generate::{GenerateFinishReason, GenerateRequest, GenerateResponse},
         sampling_params::SamplingParams,
     },
-    routers::error,
+    routers::comm::error,
 };
 
 /// Build a synthetic SGLang `GenerateRequest` from an OpenAI `CompletionRequest`.

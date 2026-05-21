@@ -25,7 +25,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error,
+        comm::error,
         openai::responses::{
             context::ResponsesContext,
             handlers as responses_handlers,

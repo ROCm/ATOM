@@ -24,7 +24,7 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     },
-    routers::{error, RouterTrait},
+    routers::{comm::error, RouterTrait},
 };
 
 #[derive(Clone)]

@@ -14,7 +14,7 @@ use crate::{
         common::{InputIds, StringOrArray},
         generate::GenerateRequest,
     },
-    routers::error,
+    routers::comm::error,
     tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
 };
 

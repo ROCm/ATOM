@@ -13,7 +13,7 @@ use data_connector::{
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::routers::persistence_utils::item_to_json;
+use crate::routers::comm::persistence_utils::item_to_json;
 
 pub const MAX_METADATA_PROPERTIES: usize = 16;
 const MAX_ITEMS_PER_REQUEST: usize = 20;

@@ -15,7 +15,7 @@ use crate::{
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{
-        error,
+        comm::error,
         prepare::{
             parser_factory_lookup::{
                 check_reasoning_parser_availability, check_tool_parser_availability,

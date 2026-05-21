@@ -604,7 +604,7 @@ mod f_shared_metrics_utils {
     use http::StatusCode;
 
     use crate::observability::metrics::metrics_labels;
-    use crate::routers::shared::metrics_utils::{error_type_from_status, route_to_endpoint};
+    use crate::routers::comm::metrics_utils::{error_type_from_status, route_to_endpoint};
 
     #[test]
     fn test_route_to_endpoint_chat() {
@@ -704,7 +704,7 @@ mod f_shared_placement_response {
     use axum::http::StatusCode;
 
     use crate::core::placement::types::PlacementError;
-    use crate::routers::shared::placement_response::placement_err_to_response;
+    use crate::routers::comm::placement_response::placement_err_to_response;
 
     #[test]
     fn test_no_workers_returns_503() {

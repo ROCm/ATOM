@@ -1532,7 +1532,7 @@ mod h_integration {
         use crate::core::placement::planner::DefaultPlanner;
         use crate::core::placement::traits::PdPlanner;
         use crate::core::placement::types::{PlacementError, Protocol, RequestDescriptor};
-        use crate::routers::shared::placement_response::placement_err_to_response;
+        use crate::routers::comm::placement_response::placement_err_to_response;
         use axum::body::to_bytes;
         use axum::http::StatusCode;
         use std::sync::Arc;
@@ -1569,7 +1569,7 @@ mod h_integration {
         use crate::core::placement::planner::DefaultPlanner;
         use crate::core::placement::traits::PdPlanner;
         use crate::core::placement::types::{PlacementError, Protocol, RequestDescriptor};
-        use crate::routers::shared::placement_response::placement_err_to_response;
+        use crate::routers::comm::placement_response::placement_err_to_response;
         use axum::body::to_bytes;
         use axum::http::StatusCode;
         use std::sync::Arc;
@@ -1610,7 +1610,7 @@ mod h_integration {
     #[tokio::test]
     async fn test_grpc_stage_planner_err_returns_service_unavailable() {
         use crate::core::placement::types::PlacementError;
-        use crate::routers::shared::placement_response::placement_err_to_response;
+        use crate::routers::comm::placement_response::placement_err_to_response;
         use axum::body::to_bytes;
         use axum::http::StatusCode;
 

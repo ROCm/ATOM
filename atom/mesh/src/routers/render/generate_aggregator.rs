@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::{
     protocols::generate::{GenerateFinishReason, GenerateMetaInfo, GenerateResponse},
     routers::{
-        error,
+        comm::error,
         prepare::response_context::{ProtocolRequest, ResponseContext},
         render::logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
         token_handle::{

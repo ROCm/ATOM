@@ -13,7 +13,7 @@ use super::{
     context::ResponsesContext, conversation::load_conversation_history, conversions, non_streaming,
     streaming,
 };
-use crate::{protocols::responses::ResponsesRequest, routers::error};
+use crate::{protocols::responses::ResponsesRequest, routers::comm::error};
 
 pub(crate) async fn route_responses(
     ctx: &ResponsesContext,
