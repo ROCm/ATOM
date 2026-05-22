@@ -249,12 +249,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.max_num_blocks_per_seq // self.block_ratio,
                 **i32_kwargs,
             )
-            if self.block_ratio > 1:
-                var[f"{p}block_tables_converted"] = CpuGpuBuffer(
-                    ub_max_bs,
-                    self.max_num_blocks_per_seq,
-                    **i32_kwargs,
-                )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
                 torch.arange(
@@ -587,6 +581,47 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             v_scale=None,
         )
 
+    def get_kv_transfer_tensors(self):
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferRegion,
+            KVTransferTensors,
+        )
+
+        runner = self.model_runner
+        if not hasattr(runner, "kv_cache"):
+            return None
+
+        block_regions: list[KVTransferRegion] = []
+        num_layers = runner.kv_cache.shape[0]
+        for layer_id in range(num_layers):
+            t = runner.kv_cache[layer_id]
+            bpb = t.stride(0) * t.element_size()
+            block_regions.append(
+                KVTransferRegion(
+                    base_addr=t.data_ptr(),
+                    total_bytes=t.numel() * t.element_size(),
+                    unit_bytes=bpb,
+                )
+            )
+
+        if hasattr(runner, "index_cache"):
+            for layer_id in range(runner.index_cache.shape[0]):
+                t = runner.index_cache[layer_id]
+                bpb = t.stride(0) * t.element_size()
+                block_regions.append(
+                    KVTransferRegion(
+                        base_addr=t.data_ptr(),
+                        total_bytes=t.numel() * t.element_size(),
+                        unit_bytes=bpb,
+                    )
+                )
+
+        return KVTransferTensors(
+            block_regions=block_regions,
+            slot_regions=[],
+            num_blocks=runner.num_physical_kvcache_blocks,
+        )
+
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
         bs = batch.total_seqs_num_prefill
@@ -662,10 +697,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
 
-            # kv_indices_generate_triton expects RAW block_tables (physical block ids,
-            # one per block_ratio tokens). When is_sparse, attn_metadata.block_tables
-            # may have been overwritten with block_tables_converted (slot per token).
-            # Always use raw block_tables for kv_indices.
+            # kv_indices_generate_triton expects logical block_tables (one entry
+            # per block_ratio tokens). Re-copy from var to get a fresh logical
+            # snapshot independent of attn_metadata.block_tables sharing.
             self.prepare_block_tables(batch)
             block_tables_for_kv = var["block_tables"].copy_to_gpu(bs)
             kv_indices_generate_triton(
@@ -1099,11 +1133,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             sparse_kv_indptr=(
                 var[f"{p}sparse_kv_indptr"].gpu[: padded_bs + 1]
                 if self.is_sparse
-                else None
-            ),
-            block_tables_converted=(
-                var[f"{p}block_tables_converted"].gpu[:padded_bs]
-                if f"{p}block_tables_converted" in var
                 else None
             ),
             work_meta_data=var[f"{p}work_meta_data"],

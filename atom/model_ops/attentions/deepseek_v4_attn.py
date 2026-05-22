@@ -35,6 +35,7 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
   Total                                      = ~26.5 MB / slot
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Type, cast
 
@@ -380,6 +381,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `torch.as_tensor(arr)` allocations.
         self._alloc_v4_metadata_buffers()
 
+        # Grow-on-demand pinned buffer for prefill index H2D.
+        self._prefill_staging_cap = 0
+        self._prefill_staging_pinned: Optional[torch.Tensor] = None
+        self._prefill_staging_gpu: Optional[torch.Tensor] = None
+
     @property
     def prep_stream(self):
         return self.model_runner.async_execute_stream
@@ -525,29 +531,59 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             )
 
+        # ---- Compressor state tensors (compute-contiguous) ------------------
+        csa_main_kv = self._zero_state(
+            (n_csa, num_slots, *self.csa_main_state_shape), device
+        )
+        csa_main_score = self._neg_inf_state(
+            (n_csa, num_slots, *self.csa_main_state_shape), device
+        )
+        csa_idx_kv = self._zero_state(
+            (n_csa, num_slots, *self.csa_idx_state_shape), device
+        )
+        csa_idx_score = self._neg_inf_state(
+            (n_csa, num_slots, *self.csa_idx_state_shape), device
+        )
+        hca_main_kv = self._zero_state(
+            (n_hca, num_slots, *self.hca_main_state_shape), device
+        )
+        hca_main_score = self._neg_inf_state(
+            (n_hca, num_slots, *self.hca_main_state_shape), device
+        )
+
+        # ---- RDMA staging pool, only allocated in PD disaggregation mode --
+        is_pd = bool(getattr(self.model_runner.config, "kv_transfer_config", None))
+        state_tensors = [
+            csa_main_kv,
+            csa_main_score,
+            csa_idx_kv,
+            csa_idx_score,
+            hca_main_kv,
+            hca_main_score,
+        ]
+        state_slot_stride = sum(t[0, 0].numel() * t.shape[0] for t in state_tensors)
+        if is_pd:
+            pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "32"))
+            state_pool = torch.zeros(
+                pool_size * state_slot_stride,
+                dtype=self._state_dtype,
+                device=device,
+            )
+        else:
+            pool_size = 0
+            state_pool = torch.empty(0, dtype=self._state_dtype, device=device)
+
         return {
             "v4_unified_kv": unified_kv,
-            # CSA Main Compressor state.
-            "v4_csa_main_kv_state": self._zero_state(
-                (n_csa, num_slots, *self.csa_main_state_shape), device
-            ),
-            "v4_csa_main_score_state": self._neg_inf_state(
-                (n_csa, num_slots, *self.csa_main_state_shape), device
-            ),
-            # CSA Indexer's inner Compressor.
-            "v4_csa_idx_kv_state": self._zero_state(
-                (n_csa, num_slots, *self.csa_idx_state_shape), device
-            ),
-            "v4_csa_idx_score_state": self._neg_inf_state(
-                (n_csa, num_slots, *self.csa_idx_state_shape), device
-            ),
-            # HCA Main Compressor.
-            "v4_hca_main_kv_state": self._zero_state(
-                (n_hca, num_slots, *self.hca_main_state_shape), device
-            ),
-            "v4_hca_main_score_state": self._neg_inf_state(
-                (n_hca, num_slots, *self.hca_main_state_shape), device
-            ),
+            "v4_csa_main_kv_state": csa_main_kv,
+            "v4_csa_main_score_state": csa_main_score,
+            "v4_csa_idx_kv_state": csa_idx_kv,
+            "v4_csa_idx_score_state": csa_idx_score,
+            "v4_hca_main_kv_state": hca_main_kv,
+            "v4_hca_main_score_state": hca_main_score,
+            "v4_state_pool": state_pool,
+            "v4_state_pool_size": pool_size,
+            "v4_state_slot_stride": state_slot_stride,
         }
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -676,6 +712,98 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return None
 
         return super().build_kv_cache_tensor(layer_id, module)
+
+    def get_kv_transfer_tensors(self):
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferRegion,
+            KVTransferTensors,
+        )
+
+        runner = self.model_runner
+        if not hasattr(runner, "v4_unified_kv"):
+            return None
+
+        num_slots = runner.max_per_req_cache_slots
+        swa_pages = num_slots * self.window_size
+        elem_bf16 = 2
+        elem_fp32 = 4
+
+        block_regions: list[KVTransferRegion] = []
+        slot_regions: list[KVTransferRegion] = []
+
+        # Block regions: compress tail per layer
+        for layer_id in range(self.num_layers):
+            uv = runner.v4_unified_kv[layer_id]
+            compress_base = uv.data_ptr() + swa_pages * self.head_dim * elem_bf16
+            compress_total = (
+                uv.numel() * elem_bf16 - swa_pages * self.head_dim * elem_bf16
+            )
+            if compress_total <= 0:
+                continue
+            ratio = self.compress_ratios[layer_id]
+            if ratio == 4:
+                bpb = self.k1_csa * self.head_dim * elem_bf16
+            elif ratio == 128:
+                bpb = self.k2_hca * self.head_dim * elem_bf16
+            else:
+                continue
+            block_regions.append(KVTransferRegion(compress_base, compress_total, bpb))
+
+        # Block regions: CSA Indexer KV (FP8)
+        for pos in range(len(self.csa_layers)):
+            t = runner.v4_csa_idx_kv[pos]
+            bpb = self.k1_csa * self._aligned_index_dim
+            block_regions.append(
+                KVTransferRegion(t.data_ptr(), t.numel() * t.element_size(), bpb)
+            )
+
+        # Slot regions: SWA per layer
+        swa_slot_bytes = self.window_size * self.head_dim * elem_bf16
+        for layer_id in range(self.num_layers):
+            uv = runner.v4_unified_kv[layer_id]
+            slot_regions.append(
+                KVTransferRegion(
+                    uv.data_ptr(),
+                    swa_pages * self.head_dim * elem_bf16,
+                    swa_slot_bytes,
+                )
+            )
+
+        # Staging pool for compressor states (not in slot_regions — managed
+        # separately by the connector with pool acquire/release).
+        staging_region = None
+        gather_slot = None
+        scatter_slot = None
+        if hasattr(runner, "v4_state_pool") and runner.v4_state_pool_size > 0:
+            pool = runner.v4_state_pool
+            stride = runner.v4_state_slot_stride
+            pool_size = runner.v4_state_pool_size
+            staging_region = KVTransferRegion(
+                pool.data_ptr(),
+                pool.numel() * elem_fp32,
+                stride * elem_fp32,
+            )
+            state_tensors = [
+                runner.v4_csa_main_kv_state,
+                runner.v4_csa_main_score_state,
+                runner.v4_csa_idx_kv_state,
+                runner.v4_csa_idx_score_state,
+                runner.v4_hca_main_kv_state,
+                runner.v4_hca_main_score_state,
+            ]
+            gather_slot = self._make_gather_slot(pool, stride, state_tensors)
+            scatter_slot = self._make_scatter_slot(pool, stride, state_tensors)
+
+        return KVTransferTensors(
+            block_regions=block_regions,
+            slot_regions=slot_regions,
+            num_blocks=runner.num_physical_kvcache_blocks,
+            num_slots=num_slots,
+            staging_region=staging_region,
+            staging_pool_size=pool_size if staging_region else 0,
+            gather_slot=gather_slot,
+            scatter_slot=scatter_slot,
+        )
 
     # ------------------------------------------------------------------ #
     # CommonAttentionBuilder abstract methods (V4 forward consumes only  #
@@ -1387,7 +1515,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if num_write < swa_write_grid:
                 wi_gpu[num_write:swa_write_grid].fill_(-1)
         elif num_write > 0:
-            wi_gpu[:num_write].copy_(torch.from_numpy(write_indices_np))
+            wi_buf = var["v4_meta_swa_write_indices"]
+            wi_buf.np[:num_write] = write_indices_np
+            wi_gpu[:num_write].copy_(wi_buf.cpu[:num_write], non_blocking=True)
         attn_metadata.swa_write_indices = wi_gpu[:swa_write_grid]
 
         self._attach_v4_paged_decode_meta(
@@ -1647,7 +1777,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
           HCA:    prefix_swa_count[t] + n_committed_hca[bid]
 
         Eager-only (chunked prefill is dynamic-shaped; no CG capture). Per-fwd
-        `torch.from_numpy(...).to(device)` is fine — no forward_vars staging.
+        `torch.from_numpy(...).to(device, non_blocking=True)` avoids stream drain.
 
         Builder fills: extend buffer, prefix_swa buffer (Dense), HCA section
         of prefix_hca buffer, SWA prefix sections of all 3 prefix buffers.
@@ -1834,30 +1964,37 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
             kv_indices_prefix_hca_np[hca_comp_dst] = hca_compress_paged_np
 
-        # ----- One-shot H2D for everything -----
-        attn_metadata.kv_indices_extend = torch.from_numpy(ext_indices_np).to(device)
-        attn_metadata.kv_indptr_extend = torch.from_numpy(extend_indptr_np).to(device)
-        attn_metadata.kv_indices_prefix_swa = torch.from_numpy(
-            kv_indices_prefix_swa_np
-        ).to(device)
-        attn_metadata.kv_indptr_prefix_swa = torch.from_numpy(prefix_swa_indptr_np).to(
-            device
+        # ----- Single pinned H2D for all prefill index arrays -----
+        # Pack int32 arrays into one contiguous pinned buffer, one H2D copy
+        # (truly non_blocking on pinned memory), then slice out views.
+        fields = [
+            ("kv_indices_extend", ext_indices_np),
+            ("kv_indptr_extend", extend_indptr_np),
+            ("kv_indices_prefix_swa", kv_indices_prefix_swa_np),
+            ("kv_indptr_prefix_swa", prefix_swa_indptr_np),
+            ("kv_indices_prefix_csa", kv_indices_prefix_csa_np),
+            ("kv_indptr_prefix_csa", prefix_csa_indptr_np),
+            ("kv_indices_prefix_hca", kv_indices_prefix_hca_np),
+            ("kv_indptr_prefix_hca", prefix_hca_indptr_np),
+            ("skip_prefix_len_csa", prefix_swa_count_np),
+        ]
+        total = sum(arr.shape[0] for _, arr in fields)
+        self._ensure_prefill_staging(total)
+        pinned_np = self._prefill_staging_pinned.numpy()
+        off = 0
+        for _, arr in fields:
+            n = arr.shape[0]
+            pinned_np[off : off + n] = arr
+            off += n
+        self._prefill_staging_gpu[:total].copy_(
+            self._prefill_staging_pinned[:total], non_blocking=True
         )
-        attn_metadata.kv_indices_prefix_csa = torch.from_numpy(
-            kv_indices_prefix_csa_np
-        ).to(device)
-        attn_metadata.kv_indptr_prefix_csa = torch.from_numpy(prefix_csa_indptr_np).to(
-            device
-        )
-        attn_metadata.kv_indices_prefix_hca = torch.from_numpy(
-            kv_indices_prefix_hca_np
-        ).to(device)
-        attn_metadata.kv_indptr_prefix_hca = torch.from_numpy(prefix_hca_indptr_np).to(
-            device
-        )
-        attn_metadata.skip_prefix_len_csa = torch.from_numpy(prefix_swa_count_np).to(
-            device
-        )
+        g = self._prefill_staging_gpu
+        off = 0
+        for name, arr in fields:
+            n = arr.shape[0]
+            setattr(attn_metadata, name, g[off : off + n])
+            off += n
         attn_metadata.swa_pages = swa_pages
 
     def _build_compress_plans(
@@ -2245,12 +2382,76 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         buf.np[:n] = arr
         return buf.copy_to_gpu(n)
 
+    def _ensure_prefill_staging(self, n: int) -> None:
+        """Grow the pinned + GPU staging buffer pair to hold at least `n` int32 elements."""
+        if self._prefill_staging_cap >= n:
+            return
+        new_cap = max(n, self._prefill_staging_cap * 2, 1 << 20)
+        self._prefill_staging_pinned = torch.empty(
+            new_cap, dtype=torch.int32, pin_memory=True
+        )
+        self._prefill_staging_gpu = torch.empty(
+            new_cap, dtype=torch.int32, device=self.device
+        )
+        self._prefill_staging_cap = new_cap
+
     @staticmethod
     def _numel(shape: tuple) -> int:
         n = 1
         for s in shape:
             n *= s
         return n
+
+    @staticmethod
+    def _make_gather_slot(
+        buf: torch.Tensor,
+        stride: int,
+        state_tensors: list[torch.Tensor],
+    ):
+        """Return a callable that copies compute tensors → staging buffer for one slot."""
+        offsets_and_sizes = []
+        off = 0
+        for t in state_tensors:
+            n_layers = t.shape[0]
+            per_layer = t[0, 0].numel()
+            total = n_layers * per_layer
+            offsets_and_sizes.append((off, n_layers, per_layer))
+            off += total
+        assert off == stride
+
+        def gather_slot(compute_slot: int, pool_idx: int) -> None:
+            dst_start = pool_idx * stride
+            for t, (off, n_layers, per_layer) in zip(state_tensors, offsets_and_sizes):
+                buf[dst_start + off : dst_start + off + n_layers * per_layer] = t[
+                    :, compute_slot
+                ].reshape(-1)
+
+        return gather_slot
+
+    @staticmethod
+    def _make_scatter_slot(
+        buf: torch.Tensor,
+        stride: int,
+        state_tensors: list[torch.Tensor],
+    ):
+        """Return a callable that copies staging buffer → compute tensors for one slot."""
+        offsets_and_sizes = []
+        off = 0
+        for t in state_tensors:
+            n_layers = t.shape[0]
+            per_layer = t[0, 0].numel()
+            total = n_layers * per_layer
+            offsets_and_sizes.append((off, n_layers, per_layer))
+            off += total
+        assert off == stride
+
+        def scatter_slot(compute_slot: int, pool_idx: int) -> None:
+            src_start = pool_idx * stride
+            for t, (off, n_layers, per_layer) in zip(state_tensors, offsets_and_sizes):
+                chunk = buf[src_start + off : src_start + off + n_layers * per_layer]
+                t[:, compute_slot] = chunk.view(t[:, compute_slot].shape)
+
+        return scatter_slot
 
     def _zero_state(self, shape: tuple, device) -> torch.Tensor:
         return torch.zeros(shape, dtype=self._state_dtype, device=device)

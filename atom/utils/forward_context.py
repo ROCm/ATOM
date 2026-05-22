@@ -196,8 +196,6 @@ class AttentionMetaData:
     reduce_final_map: Optional[torch.Tensor] = None
     reduce_partial_map: Optional[torch.Tensor] = None
 
-    block_tables_converted: Optional[torch.Tensor] = None
-
     # for prefix cache
     has_cached: bool = False
     total_kv: Optional[int] = None
@@ -230,7 +228,6 @@ class AttentionMetaData:
         reduce_indptr: Optional[torch.Tensor] = None,
         reduce_final_map: Optional[torch.Tensor] = None,
         reduce_partial_map: Optional[torch.Tensor] = None,
-        block_tables_converted: Optional[torch.Tensor] = None,
         sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
         token_to_seq_idxs: Optional[torch.Tensor] = None,
         plugin_metadata: Optional["MetadataForPluginMode"] = None,
@@ -264,8 +261,6 @@ class AttentionMetaData:
         self.reduce_indptr = reduce_indptr
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
-        if block_tables_converted is not None:
-            self.block_tables = block_tables_converted
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs
         if plugin_metadata is not None:
@@ -498,7 +493,9 @@ def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> An
 
 
 def set_kv_cache_data(
-    kv_cache_data: dict[int, KVCacheTensor], config: Optional[Config] = None
+    kv_cache_data: dict[int, KVCacheTensor],
+    config: Optional[Config] = None,
+    transfer_tensors: Any = None,
 ) -> None:
     """Register KV cache data globally and with the KV connector if enabled."""
     global _forward_kv_cache_context
@@ -506,6 +503,6 @@ def set_kv_cache_data(
     if hasattr(config, "kv_transfer_config") and config.kv_transfer_config:
         connector = get_kvconnector(config=config)
         if connector is not None:
-            connector.register_kv_caches(kv_cache_data)
+            connector.register_kv_caches(kv_cache_data, transfer_tensors)
 
     _forward_kv_cache_context.kv_cache_data = kv_cache_data

@@ -1423,8 +1423,8 @@ class ModelRunner:
             f"layer_{i}": kv_cache_tensor
             for i, kv_cache_tensor in enumerate(kv_cache_tensors)
         }
-        # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
-        set_kv_cache_data(kv_cache_data, config)
+        transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
+        set_kv_cache_data(kv_cache_data, config, transfer_tensors)
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
