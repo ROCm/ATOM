@@ -372,16 +372,14 @@ class EagleProposer:
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
-                model_output = self.model(
+                ret_hidden_states = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     hidden_states=hidden_states,
                 )
 
-                sample_hidden_states = (
-                    torch.index_select(model_output, 0, last_token_indices)
-                    if i == 0
-                    else model_output
+                sample_hidden_states = torch.index_select(
+                    ret_hidden_states, 0, last_token_indices
                 )
                 logits = self.model.compute_logits(sample_hidden_states)
                 new_draft_ids = logits.argmax(dim=-1)
