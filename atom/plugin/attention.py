@@ -5,8 +5,9 @@ from dataclasses import dataclass
 
 import torch
 
-from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
+from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
+from aiter.jit.utils.chip_info import get_gfx
 from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
 from atom.plugin.attention_mla import (
     disabled_mla_persistent_metadata,
@@ -687,6 +688,15 @@ class AiterMLADecodeMetadataForPluginMode(AiterMLACommonDecodeMetadataForPluginM
     attn_out_dtype: torch.dtype = torch.bfloat16
     # The max query output length: int
     max_qo_len: int | None = None
+    # The fold factor for handling mqa_ratio=64 in non-persistent mode
+    fold_factor: int | None = None
+    # Fold buffers for 64-head MLA workaround. These are populated at the
+    # fwd of the first MLA layer so they stay inside the cudagraph capture
+    # region, and then reused by subsequent layers
+    fold_kv_indptr: torch.Tensor | None = None
+    fold_kv_indices: torch.Tensor | None = None
+    fold_qo_indptr: torch.Tensor | None = None
+    fold_kv_last_page_len: torch.Tensor | None = None
 
 
 @dataclass
@@ -890,9 +900,12 @@ class vllmMLAAttentionMetadataBuilderMethods:
 
         # Disable persistent MLA in DP mode: pre-computed metadata buffers
         # are invalid when request counts vary across DP ranks each step.
-        if get_dp_group().world_size <= 1:
+        dp_enabled = get_dp_group().world_size > 1
+        if not dp_enabled:
             ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
             self.mla_persistent_metadata.update(ctx_mla_ps)
+
+        fold_factor = self._mla_fold_factor if self._mla_fold_enabled and dp_enabled and max_qo_len == 1 else None
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(
             block_table=block_table_tensor,
@@ -904,6 +917,7 @@ class vllmMLAAttentionMetadataBuilderMethods:
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
             max_qo_len=max_qo_len,
             attn_out_dtype=self.decode_attn_out_dtype,
+            fold_factor=fold_factor,
         )
 
         return attn_metadata
@@ -1312,6 +1326,20 @@ def create_mla_attn_metadata_builder_init_method(base_class):
                 device=self.device,
             ),
         }
+
+        # Workaround for the missing MLA fp8/fp8 nhead=64 qseqlen=1
+        # non-persistent kernel on gfx950. Leverage the pre-existing
+        # 16-head non-persistent kernels, folding the q/o tensors to
+        # 16 heads
+        self._mla_fold_enabled = (
+            self.padded_num_attention_heads in [64, 32]
+            and self.dtype_q == dtypes.fp8
+            and self.dtype_kv == dtypes.fp8
+            and get_gfx() == "gfx950"
+        )
+        self._mla_fold_factor = (
+            self.padded_num_attention_heads // 16 if self._mla_fold_enabled else 1
+        )
 
     return init_method_under_plugin_mode
 
