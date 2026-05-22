@@ -378,8 +378,10 @@ class EagleProposer:
                     hidden_states=hidden_states,
                 )
 
-                sample_hidden_states = torch.index_select(
-                    ret_hidden_states, 0, last_token_indices
+                sample_hidden_states = (
+                    torch.index_select(ret_hidden_states, 0, last_token_indices)
+                    if i == 0
+                    else ret_hidden_states
                 )
                 logits = self.model.compute_logits(sample_hidden_states)
                 new_draft_ids = logits.argmax(dim=-1)
