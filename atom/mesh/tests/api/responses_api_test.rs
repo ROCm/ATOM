@@ -10,7 +10,7 @@ use mesh::{
             ResponsesRequest, ServiceTier, Truncation,
         },
     },
-    routers::{conversations, RouterFactory},
+    routers::{comm::conversations, RouterFactory},
 };
 
 #[tokio::test]

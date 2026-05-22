@@ -1,27 +1,22 @@
-//! Pipeline orchestrator for gRPC router request processing
-//!
-//! This module defines the RequestPipeline orchestrator that coordinates
-//! the execution of pipeline stages from request preparation to response delivery.
+//! Transport-neutral 4-step gRPC pipeline: prepare → plan → engine.dispatch → render.
 
 use std::{sync::Arc, time::Instant};
 
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
+use http::HeaderMap;
 use tracing::error;
 
-use super::{
-    common::stages::*,
-    context::*,
-    regular::{processor, stages::*, streaming},
-    utils::error_type_from_status,
-};
+use super::engine::{Dispatcher, GrpcEngine};
 use crate::{
+    app_context::AppContext,
     core::{
         placement::{
             planner::DefaultPlanner,
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
             traits::PdPlanner,
+            types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor},
         },
-        WorkerRegistry, UNKNOWN_MODEL_ID,
+        AttachedBody, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
@@ -29,384 +24,309 @@ use crate::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         generate::GenerateRequest,
     },
-    reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::error,
-    tool_parser::ParserFactory as ToolParserFactory,
+    routers::{
+        prepare::{self, generation_payload::GenerationPayload, response_context::ResponseContext},
+        render,
+        comm::{
+            error,
+            metrics_utils::error_type_from_status,
+            placement_response::placement_err_to_response,
+        },
+        token_handle::engine_error::EngineError,
+    },
 };
 
-/// Generic request pipeline for all request types
-///
-/// Orchestrates all stages from request preparation to response delivery.
-/// Configured differently for regular vs PD mode.
 #[derive(Clone)]
-pub(crate) struct RequestPipeline {
-    stages: Arc<Vec<Box<dyn PipelineStage>>>,
-    /// Backend type for metrics labeling
-    backend_type: &'static str,
+pub(crate) struct Pipeline {
+    planner: Arc<dyn PdPlanner>,
+    engine: Arc<dyn Dispatcher>,
+    backend_label: &'static str,
 }
 
-impl RequestPipeline {
-    /// Create a regular (single-worker) pipeline
+#[cfg(test)]
+impl Pipeline {
+    pub(crate) fn with_injected(
+        planner: Arc<dyn PdPlanner>,
+        engine: Arc<dyn Dispatcher>,
+        backend_label: &'static str,
+    ) -> Self {
+        Self {
+            planner,
+            engine,
+            backend_label,
+        }
+    }
+}
+
+impl Pipeline {
     pub fn new_regular(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        tool_parser_factory: ToolParserFactory,
-        reasoning_parser_factory: ReasoningParserFactory,
-        configured_tool_parser: Option<String>,
-        configured_reasoning_parser: Option<String>,
     ) -> Self {
-        let processor = processor::ResponseProcessor::new(
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            configured_tool_parser.clone(),
-            configured_reasoning_parser.clone(),
-        );
-
-        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
-            tool_parser_factory,
-            reasoning_parser_factory,
-            configured_tool_parser,
-            configured_reasoning_parser,
+        Self::with_label(
+            worker_registry,
+            policy_registry,
             metrics_labels::BACKEND_REGULAR,
-        ));
-
-        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
-            Arc::new(WorkerRegistryAdapter::new(worker_registry)),
-            Arc::new(PolicyRegistryAdapter::new(policy_registry)),
-        ));
-
-        let stages: Vec<Box<dyn PipelineStage>> = vec![
-            Box::new(PreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(planner)),
-            Box::new(ClientAcquisitionStage),
-            Box::new(RequestBuildingStage::new(false)), // No PD metadata
-            Box::new(DispatchMetadataStage),
-            Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
-            Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
-        ];
-
-        Self {
-            stages: Arc::new(stages),
-            backend_type: metrics_labels::BACKEND_REGULAR,
-        }
+        )
     }
 
-    /// Create a PD (prefill-decode) pipeline
     pub fn new_pd(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        tool_parser_factory: ToolParserFactory,
-        reasoning_parser_factory: ReasoningParserFactory,
-        configured_tool_parser: Option<String>,
-        configured_reasoning_parser: Option<String>,
     ) -> Self {
-        let processor = processor::ResponseProcessor::new(
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            configured_tool_parser.clone(),
-            configured_reasoning_parser.clone(),
-        );
+        Self::with_label(worker_registry, policy_registry, metrics_labels::BACKEND_PD)
+    }
 
-        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
-            tool_parser_factory,
-            reasoning_parser_factory,
-            configured_tool_parser,
-            configured_reasoning_parser,
-            metrics_labels::BACKEND_PD,
-        ));
-
+    fn with_label(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+        backend_label: &'static str,
+    ) -> Self {
         let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
             Arc::new(WorkerRegistryAdapter::new(worker_registry)),
             Arc::new(PolicyRegistryAdapter::new(policy_registry)),
         ));
-
-        let stages: Vec<Box<dyn PipelineStage>> = vec![
-            Box::new(PreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(planner)),
-            Box::new(ClientAcquisitionStage),
-            Box::new(RequestBuildingStage::new(true)), // Inject PD metadata
-            Box::new(DispatchMetadataStage),
-            Box::new(RequestExecutionStage::new(ExecutionMode::DualDispatch)),
-            Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
-        ];
-
         Self {
-            stages: Arc::new(stages),
-            backend_type: metrics_labels::BACKEND_PD,
+            planner,
+            engine: Arc::new(GrpcEngine::new()),
+            backend_label,
         }
     }
 
-    /// Execute the complete pipeline for a chat request
     pub async fn execute_chat(
         &self,
-        request: Arc<ChatCompletionRequest>,
-        headers: Option<http::HeaderMap>,
+        req: Arc<ChatCompletionRequest>,
+        headers: Option<HeaderMap>,
         model_id: Option<String>,
-        components: Arc<SharedComponents>,
+        components: Arc<AppContext>,
     ) -> Response {
         let start = Instant::now();
-        // Clone Arc for metrics (cheap atomic increment) to avoid borrow issues
-        let request_for_metrics = Arc::clone(&request);
-        let streaming = request.stream;
-
-        // Record request start
+        let model = req.model.clone();
+        let streaming = req.stream;
         Metrics::record_router_request(
             metrics_labels::ROUTER_GRPC,
-            self.backend_type,
+            self.backend_label,
             metrics_labels::CONNECTION_GRPC,
-            &request_for_metrics.model,
+            &model,
             metrics_labels::ENDPOINT_CHAT,
             bool_to_static_str(streaming),
         );
 
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+        let (mut payload, resp_ctx) = match prepare::prepare_chat(req, headers, model_id, &components) {
+            Ok(t) => t,
+            Err(e) => return self.record_chat_err(&model, start, e),
+        };
+        let placement = match self.plan_for(&payload, &resp_ctx).await {
+            Ok(p) => p,
+            Err(e) => return self.record_chat_err(&model, start, e),
+        };
+        let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
+        let stream = match self.engine.dispatch(&placement, &mut payload).await {
+            Ok(s) => s,
+            Err(e) => return self.record_chat_err(&model, start, engine_err_to_response(e)),
+        };
 
-        for stage in self.stages.iter() {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    // Stage completed with streaming response - record success and return
-                    Metrics::record_router_duration(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &request_for_metrics.model,
-                        metrics_labels::ENDPOINT_CHAT,
-                        start.elapsed(),
-                    );
-                    return response;
-                }
-                Ok(None) => continue,
-                Err(response) => {
-                    Metrics::record_router_error(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &request_for_metrics.model,
-                        metrics_labels::ENDPOINT_CHAT,
-                        error_type_from_status(response.status()),
-                    );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
-                    return response;
-                }
-            }
-        }
+        let is_stream = resp_ctx.original.is_streaming();
+        let response = if is_stream {
+            render::chat_streaming::process(stream, resp_ctx, self.backend_label)
+        } else {
+            render::chat_aggregator::process(stream, resp_ctx).await
+        };
+        let response = AttachedBody::wrap_response(response, guards);
 
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => {
-                Metrics::record_router_duration(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &request_for_metrics.model,
-                    metrics_labels::ENDPOINT_CHAT,
-                    start.elapsed(),
-                );
-                axum::Json(response).into_response()
-            }
-            Some(FinalResponse::Generate(_)) => {
-                error!(
-                    function = "execute_chat",
-                    "Wrong response type: expected Chat, got Generate"
-                );
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &request_for_metrics.model,
-                    metrics_labels::ENDPOINT_CHAT,
-                    metrics_labels::ERROR_INTERNAL,
-                );
-                error::internal_error("wrong_response_type", "Internal error: wrong response type")
-            }
-            None => {
-                error!(
-                    function = "execute_chat",
-                    "No response produced by pipeline"
-                );
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &request_for_metrics.model,
-                    metrics_labels::ENDPOINT_CHAT,
-                    metrics_labels::ERROR_INTERNAL,
-                );
-                error::internal_error("no_response_produced", "No response produced")
-            }
-        }
+        Metrics::record_router_duration(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_label,
+            metrics_labels::CONNECTION_GRPC,
+            &model,
+            metrics_labels::ENDPOINT_CHAT,
+            start.elapsed(),
+        );
+        response
     }
 
-    /// Execute the complete pipeline for a generate request
     pub async fn execute_generate(
         &self,
-        request: Arc<GenerateRequest>,
-        headers: Option<http::HeaderMap>,
+        req: Arc<GenerateRequest>,
+        headers: Option<HeaderMap>,
         model_id: Option<String>,
-        components: Arc<SharedComponents>,
+        components: Arc<AppContext>,
     ) -> Response {
         let start = Instant::now();
-        let streaming = request.stream;
-
-        // Record request start
+        let model_for_metric = model_id
+            .clone()
+            .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
+        let streaming = req.stream;
         Metrics::record_router_request(
             metrics_labels::ROUTER_GRPC,
-            self.backend_type,
+            self.backend_label,
             metrics_labels::CONNECTION_GRPC,
-            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+            &model_for_metric,
             metrics_labels::ENDPOINT_GENERATE,
             bool_to_static_str(streaming),
         );
 
-        let mut ctx = RequestContext::for_generate(request, headers, model_id.clone(), components);
+        let (mut payload, resp_ctx) =
+            match prepare::prepare_generate(req, headers, model_id, &components) {
+                Ok(t) => t,
+                Err(e) => return self.record_generate_err(&model_for_metric, start, e),
+            };
+        let placement = match self.plan_for(&payload, &resp_ctx).await {
+            Ok(p) => p,
+            Err(e) => return self.record_generate_err(&model_for_metric, start, e),
+        };
+        let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
+        let stream = match self.engine.dispatch(&placement, &mut payload).await {
+            Ok(s) => s,
+            Err(e) => {
+                return self.record_generate_err(
+                    &model_for_metric,
+                    start,
+                    engine_err_to_response(e),
+                )
+            }
+        };
 
-        for stage in self.stages.iter() {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    Metrics::record_router_duration(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
-                        metrics_labels::ENDPOINT_GENERATE,
-                        start.elapsed(),
-                    );
-                    return response;
-                }
-                Ok(None) => continue,
-                Err(response) => {
-                    Metrics::record_router_error(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
-                        metrics_labels::ENDPOINT_GENERATE,
-                        error_type_from_status(response.status()),
-                    );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
-                    return response;
-                }
-            }
-        }
+        let is_stream = resp_ctx.original.is_streaming();
+        let response = if is_stream {
+            render::generate_streaming::process(stream, resp_ctx, self.backend_label)
+        } else {
+            render::generate_aggregator::process(stream, resp_ctx).await
+        };
+        let response = AttachedBody::wrap_response(response, guards);
 
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Generate(response)) => {
-                Metrics::record_router_duration(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
-                    metrics_labels::ENDPOINT_GENERATE,
-                    start.elapsed(),
-                );
-                axum::Json(response).into_response()
-            }
-            Some(FinalResponse::Chat(_)) => {
-                error!(
-                    function = "execute_generate",
-                    "Wrong response type: expected Generate, got Chat"
-                );
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
-                    metrics_labels::ENDPOINT_GENERATE,
-                    metrics_labels::ERROR_INTERNAL,
-                );
-                error::internal_error("wrong_response_type", "Internal error: wrong response type")
-            }
-            None => {
-                error!(
-                    function = "execute_generate",
-                    "No response produced by pipeline"
-                );
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
-                    metrics_labels::ENDPOINT_GENERATE,
-                    metrics_labels::ERROR_INTERNAL,
-                );
-                error::internal_error("no_response_produced", "No response produced")
-            }
-        }
+        Metrics::record_router_duration(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_label,
+            metrics_labels::CONNECTION_GRPC,
+            &model_for_metric,
+            metrics_labels::ENDPOINT_GENERATE,
+            start.elapsed(),
+        );
+        response
     }
 
-    /// Execute chat pipeline for responses endpoint
-    ///
-    /// Used by ALL non-streaming /v1/responses requests.
-    /// Uses the same 7 pipeline stages as execute_chat(), with two differences:
-    /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
-    /// 2. Disallows streaming (responses endpoint uses different SSE format)
     pub async fn execute_chat_for_responses(
         &self,
-        request: Arc<ChatCompletionRequest>,
-        headers: Option<http::HeaderMap>,
+        req: Arc<ChatCompletionRequest>,
+        headers: Option<HeaderMap>,
         model_id: Option<String>,
-        components: Arc<SharedComponents>,
+        components: Arc<AppContext>,
     ) -> Result<ChatCompletionResponse, Response> {
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
-
-        for (idx, stage) in self.stages.iter().enumerate() {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(_response)) => {
-                    // Streaming not supported for responses sync mode
-                    error!(
-                        function = "execute_chat_for_responses",
-                        "Streaming attempted in responses context"
-                    );
-                    return Err(error::bad_request(
-                        "streaming_not_supported",
-                        "Streaming is not supported in this context".to_string(),
-                    ));
-                }
-                Ok(None) => {
-                    continue;
-                }
-                Err(response) => {
-                    // Error occurred - return the response as-is to preserve HTTP status codes
-                    error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
-                        stage.name(),
-                        response.status()
-                    );
-                    return Err(response);
-                }
-            }
+        if req.stream {
+            return Err(error::bad_request(
+                "streaming_not_supported",
+                "Streaming is not supported in this context".to_string(),
+            ));
         }
 
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => Ok(response),
-            Some(FinalResponse::Generate(_)) => {
-                error!(
-                    function = "execute_chat_for_responses",
-                    "Wrong response type: expected Chat, got Generate"
-                );
-                Err(error::internal_error(
-                    "wrong_response_type",
-                    "Internal error: wrong response type",
-                ))
-            }
-            None => {
-                error!(
-                    function = "execute_chat_for_responses",
-                    "No response produced by pipeline"
-                );
-                Err(error::internal_error(
-                    "no_response_produced",
-                    "No response produced",
-                ))
-            }
+        let (mut payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
+        let placement = self.plan_for(&payload, &resp_ctx).await?;
+        let _guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
+        let stream = self
+            .engine
+            .dispatch(&placement, &mut payload)
+            .await
+            .map_err(engine_err_to_response)?;
+
+        render::chat_aggregator::process_typed(stream, resp_ctx).await
+    }
+
+    async fn plan_for(
+        &self,
+        payload: &GenerationPayload,
+        resp_ctx: &ResponseContext,
+    ) -> Result<PlacementPlan, Response> {
+        let tokens = if payload.token_ids.is_empty() {
+            None
+        } else {
+            Some(payload.token_ids.as_slice())
+        };
+        let descriptor = RequestDescriptor {
+            model_id: resp_ctx.model_id.as_deref(),
+            protocol: Some(Protocol::Grpc),
+            text: resp_ctx.original_text.as_deref(),
+            tokens,
+            headers: resp_ctx.headers.as_ref(),
+            stream: resp_ctx.original.is_streaming(),
+        };
+        self.planner
+            .plan(&descriptor)
+            .await
+            .map_err(|e| placement_err_to_response_log(e, resp_ctx.model_id.as_deref()))
+    }
+
+    fn record_chat_err(&self, model: &str, _start: Instant, resp: Response) -> Response {
+        Metrics::record_router_error(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_label,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            metrics_labels::ENDPOINT_CHAT,
+            error_type_from_status(resp.status()),
+        );
+        resp
+    }
+
+    fn record_generate_err(&self, model: &str, _start: Instant, resp: Response) -> Response {
+        Metrics::record_router_error(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_label,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            metrics_labels::ENDPOINT_GENERATE,
+            error_type_from_status(resp.status()),
+        );
+        resp
+    }
+}
+
+fn make_load_guards(plan: &PlacementPlan, headers: Option<&HeaderMap>) -> Vec<WorkerLoadGuard> {
+    match plan {
+        PlacementPlan::Single { worker, .. } => {
+            vec![WorkerLoadGuard::new(worker.clone(), headers)]
         }
+        PlacementPlan::Pair {
+            prefill, decode, ..
+        } => vec![
+            WorkerLoadGuard::new(prefill.clone(), headers),
+            WorkerLoadGuard::new(decode.clone(), headers),
+        ],
+    }
+}
+
+fn placement_err_to_response_log(err: PlacementError, model_id: Option<&str>) -> Response {
+    error!(
+        function = "Pipeline::plan_for",
+        model_id = %model_id.unwrap_or(UNKNOWN_MODEL_ID),
+        error = %err,
+        "Placement planner returned error"
+    );
+    placement_err_to_response(err, model_id)
+}
+
+fn engine_err_to_response(err: EngineError) -> Response {
+    match err {
+        EngineError::Transport(s) => {
+            error::service_unavailable("engine_transport_error", format!("transport error: {}", s))
+        }
+        EngineError::Prefill(m) => {
+            error::internal_error("engine_prefill_error", format!("prefill error: {}", m))
+        }
+        EngineError::DecodeError(m) => {
+            error::internal_error("engine_decode_error", format!("decode error: {}", m))
+        }
+        EngineError::PrefillEarlyClose => error::internal_error(
+            "engine_prefill_early_close",
+            "prefill stream closed without Complete",
+        ),
+        EngineError::DecodeIncomplete => error::internal_error(
+            "engine_decode_incomplete",
+            "decode stream closed without Complete",
+        ),
+        EngineError::ConnectionAcquireFailed(r) => {
+            error::service_unavailable("engine_connection_failed", r)
+        }
+        EngineError::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
     }
 }

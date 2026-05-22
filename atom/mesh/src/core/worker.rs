@@ -16,7 +16,7 @@ use super::{CircuitBreaker, WorkerError, WorkerResult, UNKNOWN_MODEL_ID};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerInfo,
-    routers::grpc::client::GrpcClient,
+    routers::grpc::engine::worker_client_cache::GrpcClient,
 };
 
 /// Default worker priority (mid-range on 0-100 scale)

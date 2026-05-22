@@ -1,3 +1,5 @@
+//! gRPC router for prefill/decode (PD) dual-dispatch chat/generate paths.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,8 +11,7 @@ use super::{
         completion_to_generate, wrap_generate_response_as_completion,
         wrap_streaming_generate_as_completion,
     },
-    context::SharedComponents,
-    pipeline::RequestPipeline,
+    pipeline::Pipeline,
 };
 use crate::{
     app_context::AppContext,
@@ -23,65 +24,37 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     },
-    routers::{error, RouterTrait},
+    routers::{comm::error, RouterTrait},
 };
 
-/// gRPC PD (Prefill-Decode) router implementation for SGLang
 #[derive(Clone)]
 pub struct GrpcPDRouter {
     worker_registry: Arc<WorkerRegistry>,
-    pipeline: RequestPipeline,
-    shared_components: Arc<SharedComponents>,
+    pipeline: Pipeline,
+    app_context: Arc<AppContext>,
     retry_config: RetryConfig,
 }
 
 impl GrpcPDRouter {
-    /// Create a new gRPC PD router
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
-        // Get registries from context
+        if ctx.reasoning_parser_factory.is_none() {
+            return Err("gRPC PD router requires reasoning parser factory".to_string());
+        }
+        if ctx.tool_parser_factory.is_none() {
+            return Err("gRPC PD router requires tool parser factory".to_string());
+        }
+
         let worker_registry = ctx.worker_registry.clone();
-        let policy_registry = ctx.policy_registry.clone();
-
-        // Get tokenizer registry (no longer requires pre-loaded tokenizer)
-        let tokenizer_registry = ctx.tokenizer_registry.clone();
-
-        let reasoning_parser_factory = ctx
-            .reasoning_parser_factory
-            .as_ref()
-            .ok_or_else(|| "gRPC PD router requires reasoning parser factory".to_string())?
-            .clone();
-        let tool_parser_factory = ctx
-            .tool_parser_factory
-            .as_ref()
-            .ok_or_else(|| "gRPC PD router requires tool parser factory".to_string())?
-            .clone();
-
-        // Create shared components for pipeline
-        let shared_components = Arc::new(SharedComponents {
-            tokenizer_registry: tokenizer_registry.clone(),
-            tool_parser_factory: tool_parser_factory.clone(),
-            reasoning_parser_factory: reasoning_parser_factory.clone(),
-        });
-
-        // Create PD pipeline
-        let pipeline = RequestPipeline::new_pd(
-            worker_registry.clone(),
-            policy_registry.clone(),
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            ctx.configured_tool_parser.clone(),
-            ctx.configured_reasoning_parser.clone(),
-        );
+        let pipeline = Pipeline::new_pd(worker_registry.clone(), ctx.policy_registry.clone());
 
         Ok(GrpcPDRouter {
             worker_registry,
             pipeline,
-            shared_components,
+            app_context: ctx.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
         })
     }
 
-    /// Main route_generate implementation with PD dual dispatch
     async fn route_generate_impl(
         &self,
         headers: Option<&HeaderMap>,
@@ -93,11 +66,10 @@ impl GrpcPDRouter {
             model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
 
-        // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
-        let components = self.shared_components.clone();
+        let components = self.app_context.clone();
         let pipeline = &self.pipeline;
 
         RetryExecutor::execute_response_with_retry(
@@ -139,7 +111,6 @@ impl GrpcPDRouter {
         .await
     }
 
-    /// Main route_chat implementation with PD dual dispatch
     async fn route_chat_impl(
         &self,
         headers: Option<&HeaderMap>,
@@ -151,11 +122,10 @@ impl GrpcPDRouter {
             model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
 
-        // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
-        let components = self.shared_components.clone();
+        let components = self.app_context.clone();
         let pipeline = &self.pipeline;
 
         RetryExecutor::execute_response_with_retry(

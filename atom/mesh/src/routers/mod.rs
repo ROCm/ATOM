@@ -17,18 +17,18 @@ use crate::protocols::{
     responses::{ResponsesGetParams, ResponsesRequest},
 };
 
-pub mod conversations;
-pub mod error;
 pub mod factory;
 pub mod grpc;
-pub mod header_utils;
 pub mod http_pd_router;
 pub mod http_router;
-pub mod parse;
-pub mod persistence_utils;
+pub mod openai;
+pub mod prepare;
+pub mod render;
 pub mod router_manager;
-pub mod shared;
-pub mod tokenize;
+pub mod comm;
+#[cfg(test)]
+pub(crate) mod test_mocks;
+pub mod token_handle;
 
 pub use factory::RouterFactory;
 
