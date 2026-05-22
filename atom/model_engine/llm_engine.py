@@ -266,7 +266,7 @@ class InputOutputProcessor:
                 f"max_model_len={max_model_len}. Shorten the prompt or "
                 "restart the server with a larger --max-model-len."
             )
-        raw_max_tokens = getattr(sampling_params, "max_tokens", 0)
+        raw_max_tokens = sampling_params.max_tokens
         if raw_max_tokens is None:
             max_tokens = 0
         elif isinstance(raw_max_tokens, bool) or not isinstance(raw_max_tokens, int):

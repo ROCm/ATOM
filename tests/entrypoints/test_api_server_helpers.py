@@ -144,6 +144,7 @@ class TestStreamDecodeDelta:
         api_server._request_start_times.clear()
         api_server._seq_id_to_request_id.clear()
         api_server._seq_id_to_sibling_index.clear()
+        api_server._request_active_seq_ids.clear()
 
     def teardown_method(self):
         api_server._stream_decode_states.clear()
@@ -152,6 +153,7 @@ class TestStreamDecodeDelta:
         api_server._request_start_times.clear()
         api_server._seq_id_to_request_id.clear()
         api_server._seq_id_to_sibling_index.clear()
+        api_server._request_active_seq_ids.clear()
 
     def test_withholds_replacement_char_until_sequence_resolves(self, monkeypatch):
         class FakeTokenizer:
@@ -291,11 +293,13 @@ class TestStreamDecodeDelta:
         class FakeTokenizer:
             is_fast = False
             all_special_tokens = ["<special>"]
+            get_added_vocab_calls = 0
 
             def __len__(self):
                 return 4
 
             def get_added_vocab(self):
+                self.get_added_vocab_calls += 1
                 return {"<tool>": 2}
 
             def convert_ids_to_tokens(self, token_ids, skip_special_tokens=True):
@@ -305,12 +309,14 @@ class TestStreamDecodeDelta:
             def convert_tokens_to_string(self, tokens):
                 return "".join(tokens)
 
-        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+        fake_tokenizer = FakeTokenizer()
+        monkeypatch.setattr(api_server, "tokenizer", fake_tokenizer)
 
         assert api_server._decode_stream_delta(("req", 0), [0]) == "a"
         assert api_server._decode_stream_delta(("req", 0), [2]) == " <tool>"
         assert api_server._decode_stream_delta(("req", 0), [1]) == " b"
         assert api_server._decode_stream_delta(("req", 0), [3]) == ""
+        assert fake_tokenizer.get_added_vocab_calls == 1
 
     def test_cleanup_keeps_request_state_until_last_seq(self, monkeypatch):
         api_server._stream_decode_states["req-a"] = {0: {}, 1: {}}
@@ -322,6 +328,7 @@ class TestStreamDecodeDelta:
         api_server._seq_id_to_request_id[12] = "req-a"
         api_server._seq_id_to_sibling_index[11] = 0
         api_server._seq_id_to_sibling_index[12] = 1
+        api_server._request_active_seq_ids["req-a"] = {11, 12}
         fake_engine = SimpleNamespace(
             io_processor=SimpleNamespace(requests={11: "seq-a", 12: "seq-b"})
         )

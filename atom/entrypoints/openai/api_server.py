@@ -20,7 +20,7 @@ import time
 import uuid
 from asyncio import AbstractEventLoop
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
 
 import uvicorn
 from atom import SamplingParams
@@ -71,10 +71,12 @@ custom_message_encoder: Optional[Any] = None
 _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
 _seq_id_to_sibling_index: Dict[int, int] = {}
+_request_active_seq_ids: Dict[str, Set[int]] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
 _request_start_times: Dict[str, float] = {}
 _stream_decode_states: Dict[str, Dict[int, Dict[str, Any]]] = {}
 _request_logger: Optional[logging.Logger] = None
+# Align with vLLM's slow incremental detokenizer initial prefix offset.
 INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
@@ -173,13 +175,11 @@ def _convert_tokens_to_string_with_added_encoders(
     output_tokens: List[str],
     skip_special_tokens: bool,
     spaces_between_special_tokens: bool,
+    added_vocab_set: Set[str],
+    all_special_tokens: Set[str],
 ) -> str:
     sub_texts: List[str] = []
     current_sub_text: List[str] = []
-    added_vocab_set = set(tokenizer.get_added_vocab())
-    all_special_tokens = (
-        set(tokenizer.all_special_tokens) if skip_special_tokens else set()
-    )
 
     for token in output_tokens:
         if token in all_special_tokens:
@@ -227,6 +227,8 @@ def _detokenize_incrementally(
     read_offset: int,
     skip_special_tokens: bool = False,
     spaces_between_special_tokens: bool = True,
+    added_vocab_set: Optional[Set[str]] = None,
+    all_special_tokens: Optional[Set[str]] = None,
 ) -> Tuple[List[str], str, int, int]:
     if 0 <= new_token_id < len(tokenizer):
         new_tokens = tokenizer.convert_ids_to_tokens(
@@ -239,8 +241,17 @@ def _detokenize_incrementally(
     else:
         new_tokens = [""]
 
+    if added_vocab_set is None:
+        added_vocab_set = set(tokenizer.get_added_vocab())
+    if all_special_tokens is None:
+        all_special_tokens = (
+            set(tokenizer.all_special_tokens)
+            if skip_special_tokens and added_vocab_set
+            else set()
+        )
+
     output_tokens = prev_tokens + new_tokens
-    if tokenizer.is_fast or not tokenizer.get_added_vocab():
+    if tokenizer.is_fast or not added_vocab_set:
         prefix_text = tokenizer.convert_tokens_to_string(
             output_tokens[prefix_offset:read_offset]
         )
@@ -251,12 +262,16 @@ def _detokenize_incrementally(
             output_tokens[prefix_offset:read_offset],
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
+            added_vocab_set=added_vocab_set,
+            all_special_tokens=all_special_tokens,
         )
         new_text = _convert_tokens_to_string_with_added_encoders(
             tokenizer,
             output_tokens[prefix_offset:],
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
+            added_vocab_set=added_vocab_set,
+            all_special_tokens=all_special_tokens,
         )
 
     if len(new_text) <= len(prefix_text) or new_text.endswith("\ufffd"):
@@ -287,11 +302,16 @@ def _init_stream_decode_state(
     tokens, prefix_offset, read_offset = _convert_prompt_ids_to_tokens(
         tokenizer, prompt_token_ids, skip_special_tokens=True
     )
+    added_vocab_set = set(tokenizer.get_added_vocab())
     states_for_request = _stream_decode_states.setdefault(request_id, {})
     states_for_request[sibling_index] = {
         "tokens": tokens,
         "prefix_offset": prefix_offset,
         "read_offset": read_offset,
+        "added_vocab_set": added_vocab_set,
+        "all_special_tokens": (
+            set(tokenizer.all_special_tokens) if added_vocab_set else set()
+        ),
     }
 
 
@@ -324,6 +344,8 @@ def _decode_stream_delta(
                 prefix_offset=state["prefix_offset"],
                 read_offset=state["read_offset"],
                 skip_special_tokens=True,
+                added_vocab_set=state["added_vocab_set"],
+                all_special_tokens=state["all_special_tokens"],
             )
         )
         state["tokens"].extend(new_tokens)
@@ -648,6 +670,7 @@ async def setup_streaming_request(
 ) -> Tuple[int, asyncio.Queue]:
     """Set up a streaming request with the engine."""
     global engine, _stream_queues, _seq_id_to_request_id, _seq_id_to_sibling_index
+    global _request_active_seq_ids
     global _stream_loops, _request_start_times
 
     stream_queue: asyncio.Queue = asyncio.Queue()
@@ -670,6 +693,7 @@ async def setup_streaming_request(
         )
         _seq_id_to_request_id[seq.id] = request_id
         _seq_id_to_sibling_index[seq.id] = 0
+        _request_active_seq_ids[request_id] = {seq.id}
         return seq
 
     seq = await executor_loop.run_in_executor(None, do_preprocess)
@@ -690,19 +714,24 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     retained until the last active sibling is removed.
     """
     global engine, _stream_queues, _seq_id_to_request_id, _seq_id_to_sibling_index
+    global _request_active_seq_ids
     global _stream_loops, _request_start_times, _stream_decode_states
 
     _seq_id_to_request_id.pop(seq_id, None)
     sibling_index = _seq_id_to_sibling_index.pop(seq_id, None)
+    active_seq_ids = _request_active_seq_ids.get(request_id)
+    if active_seq_ids is not None:
+        active_seq_ids.discard(seq_id)
     if sibling_index is not None:
         states_for_request = _stream_decode_states.get(request_id)
         if states_for_request is not None:
             states_for_request.pop(sibling_index, None)
     engine.io_processor.requests.pop(seq_id, None)
 
-    if request_id in _seq_id_to_request_id.values():
+    if active_seq_ids:
         return
 
+    _request_active_seq_ids.pop(request_id, None)
     _stream_queues.pop(request_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
@@ -722,6 +751,7 @@ async def setup_streaming_request_fanout(
     the merge-stream consumer can rewrite ``choices[0].index`` correctly.
     """
     global engine, _stream_queues, _seq_id_to_request_id, _seq_id_to_sibling_index
+    global _request_active_seq_ids
     global _stream_loops, _request_start_times
 
     n = int(sampling_params.n)
@@ -756,6 +786,7 @@ async def setup_streaming_request_fanout(
         for idx, seq in enumerate(seqs):
             _seq_id_to_request_id[seq.id] = request_id
             _seq_id_to_sibling_index[seq.id] = idx
+        _request_active_seq_ids[request_id] = {seq.id for seq in seqs}
         return seqs
 
     seqs = await executor_loop.run_in_executor(None, do_preprocess)
