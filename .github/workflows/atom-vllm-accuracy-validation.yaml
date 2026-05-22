@@ -810,7 +810,6 @@ jobs:
               "gpt-oss-120b TP1",
               "MiniMax-M2.5 TP2",
               "DeepSeek-V3.2-FP8 TP4",
-              "DeepSeek-V3.2-FP8 TP8",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1",
               "GLM-4.7-FP8 TP8",
               "GLM-4.7-FP8 MTP TP4",
@@ -822,6 +821,7 @@ jobs:
               "Kimi-K2-Thinking-MXFP4 TP4",
               "Kimi-K2-Thinking-MXFP4 TP8",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
+              "DeepSeek-V3.2-FP8 TP8",
               "DeepSeek-R1-FP8 TP8",
               "DeepSeek-R1-0528-MXFP4 TP8",
               "gpt-oss-120b TP2",
@@ -899,7 +899,7 @@ jobs:
           else:
               run_date = ""
 
-          order = ("P1", "P2", "P0")
+          order = ("P1", "P0", "P2")
           if event != "schedule" or beijing_now.weekday() < 5:
               order = ("P0", "P1", "P2")
 
@@ -1083,6 +1083,20 @@ jobs:
           echo "- should_run=$(sed -n 's/^should_run=//p' "$GITHUB_OUTPUT")"
           echo "- reason=$(sed -n 's/^reason=//p' "$GITHUB_OUTPUT")"
 
+      - name: Detect container engine
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
+        run: |
+          if docker info > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
+            echo "Container engine: docker"
+          elif command -v podman > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
+            echo "Container engine: podman"
+          else
+            echo "ERROR: Neither docker nor podman is available on this runner."
+            exit 1
+          fi
+
       - name: Checkout ATOM repo
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         uses: actions/checkout@v6
@@ -1090,7 +1104,12 @@ jobs:
       - name: Docker Login
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+          REG="${OOT_IMAGE_TAG%%/*}"
+          if [[ "$REG" != *.* && "$REG" != localhost* && "$REG" != *:* ]]; then
+            REG="docker.io"
+          fi
+          echo "Logging in to registry: ${REG}"
+          echo "${{ secrets.DOCKER_PASSWORD }}" | $CONTAINER_ENGINE login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
       - name: Set HF_TOKEN
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
@@ -1099,19 +1118,41 @@ jobs:
       - name: Pull OOT image
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          docker pull "${OOT_IMAGE_TAG}"
+          set -euo pipefail
+          IMG="${OOT_IMAGE_TAG}"
+          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+            if [[ "${IMG}" != */* ]]; then
+              IMG="docker.io/library/${IMG}"
+            else
+              reg="${IMG%%/*}"
+              if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
+                IMG="docker.io/${IMG}"
+              fi
+            fi
+          fi
+          echo "OOT_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+          echo "Pulling OOT image: ${IMG} (workflow tag: ${OOT_IMAGE_TAG})"
+          $CONTAINER_ENGINE pull "${IMG}"
 
       - name: Prepare model cache mount
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-
-          if [ -d "/models" ]; then
+          if [ -d "/shared/data/amd_int/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared/data/amd_int/models:/models"
+            MODEL_CACHE_DESC="/shared/data/amd_int/models (shared host path)"
+          elif [ -d "/it-share/models" ]; then
+            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
+            MODEL_CACHE_DESC="/it-share/models (shared host path)"
+          elif [ -d "/models" ]; then
             MODEL_CACHE_MOUNT="-v /models:/models"
-            MODEL_CACHE_DESC="/models (host mount)"
+            MODEL_CACHE_DESC="/models (shared host path)"
+          elif [ -d "/data/models" ]; then
+            MODEL_CACHE_MOUNT="-v /data/models:/models"
+            MODEL_CACHE_DESC="/data/models (shared host path)"
           else
-            echo "Warning: /models directory not found on runner; using container-local /models."
+            echo "No shared host model cache found; using container-local /models."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -1121,11 +1162,11 @@ jobs:
       - name: Clean up old containers
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          containers=$(docker ps -q)
+          containers=$($CONTAINER_ENGINE ps -q)
           if [ -n "$containers" ]; then
-            docker kill $containers || true
+            $CONTAINER_ENGINE kill $containers || true
           fi
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
       - name: Start validation container
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
@@ -1147,12 +1188,11 @@ jobs:
               "AITER_LOG_MORE=0"
           } | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//' > /tmp/oot_env_file.txt
 
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
             --ipc=host --group-add video \
-            --shm-size=16G \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
@@ -1161,23 +1201,162 @@ jobs:
             --env-file /tmp/oot_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${OOT_IMAGE_TAG}"
+            "${OOT_IMAGE_REF:-${OOT_IMAGE_TAG}}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Collect GPU info (inside container)
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         id: gpu-info
-        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.runner }}"
+
+      - name: Resolve local model path
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MODEL_CACHE_MOUNT}" ]; then
+            echo "OOT_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
+            echo "No shared model cache mount; local model resolution skipped."
+            exit 0
+          fi
+
+          if $CONTAINER_ENGINE exec \
+            -e MODEL_PATH="${{ matrix.model_path }}" \
+            "$CONTAINER_NAME" \
+            bash -lc '
+              set -euo pipefail
+              python3 - <<'"'"'PY'"'"'
+          import os
+          from pathlib import Path
+
+          model_path = os.environ["MODEL_PATH"].strip().strip("/")
+          normalized = model_path.rstrip("/")
+          basename = Path(normalized).name
+
+          alias_map = {
+              "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8": [
+                  "/models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
+                  "/models/Qwen3-235B-A22B-Instruct-2507-FP8",
+              ],
+              "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8": [
+                  "/models/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+                  "/models/Qwen3-Next-80B-A3B-Instruct-FP8",
+              ],
+              "Qwen/Qwen3.5-397B-A17B-FP8": [
+                  "/models/Qwen/Qwen3.5-397B-A17B-FP8",
+                  "/models/Qwen3.5-397B-A17B-FP8",
+              ],
+              "Qwen/Qwen3.5-397B-A17B": [
+                  "/models/Qwen/Qwen3.5-397B-A17B",
+                  "/models/Qwen3.5-397B-A17B",
+              ],
+              "amd/Qwen3.5-397B-A17B-MXFP4": [
+                  "/models/amd/Qwen3.5-397B-A17B-MXFP4",
+                  "/models/Qwen/Qwen3.5-397B-A17B-MXFP4",
+                  "/models/Qwen3.5-397B-A17B-MXFP4",
+              ],
+              "Meta-Llama-3.1-405B-Instruct-FP8": [
+                  "/models/Meta-Llama-3.1-405B-Instruct-FP8",
+                  "/models/facebook/Meta-Llama-3.1-405B-Instruct-FP8",
+              ],
+              "meta-llama/Llama-3.1-8B-Instruct": [
+                  "/models/meta-llama/Llama-3.1-8B-Instruct",
+                  "/models/Llama-3.1-8B-Instruct",
+              ],
+              "amd/Kimi-K2-Thinking-MXFP4-AttnFP8": [
+                  "/models/amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
+                  "/models/kimi/Kimi-K2-Thinking-MXFP4-AttnFP8",
+                  "/models/Kimi-K2-Thinking-MXFP4-AttnFP8",
+              ],
+              "amd/Kimi-K2.5-MXFP4-AttnFP8": [
+                  "/models/amd/Kimi-K2.5-MXFP4-AttnFP8",
+                  "/models/kimi/Kimi-K2.5-MXFP4-AttnFP8",
+                  "/models/Kimi-K2.5-MXFP4-AttnFP8",
+              ],
+              "deepseek-ai/DeepSeek-R1-0528": [
+                  "/models/deepseek-ai/DeepSeek-R1-0528",
+                  "/models/DeepSeek-R1-0528",
+              ],
+              "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4": [
+                  "/models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+                  "/models/deepseek-ai/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+                  "/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+              ],
+              "deepseek-ai/DeepSeek-V3.2": [
+                  "/models/deepseek-ai/DeepSeek-V3.2",
+                  "/models/DeepSeek-V3.2",
+              ],
+              "openai/gpt-oss-120b": [
+                  "/models/openai/gpt-oss-120b",
+                  "/models/gpt-oss-120b",
+              ],
+              "MiniMaxAI/MiniMax-M2.5": [
+                  "/models/MiniMaxAI/MiniMax-M2.5",
+                  "/models/MiniMax-M2.5",
+              ],
+              "zai-org/GLM-4.7-FP8": [
+                  "/models/zai-org/GLM-4.7-FP8",
+                  "/models/GLM/GLM-4.7-FP8",
+                  "/models/GLM-4.7-FP8",
+              ],
+              "zai-org/GLM-5.1-FP8": [
+                  "/models/zai-org/GLM-5.1-FP8",
+                  "/models/GLM/GLM-5.1-FP8",
+                  "/models/GLM-5.1-FP8",
+              ],
+          }
+
+          candidates = []
+          if normalized:
+              candidates.append(f"/models/{normalized}")
+          if basename:
+              candidates.append(f"/models/{basename}")
+          candidates.extend(alias_map.get(normalized, []))
+
+          seen = set()
+          for candidate in candidates:
+              if candidate in seen:
+                  continue
+              seen.add(candidate)
+              path = Path(candidate)
+              if (path / "config.json").is_file():
+                  print(f"FOUND_LOCAL_MODEL={candidate}")
+                  raise SystemExit(0)
+
+          print("LOCAL_MODEL_NOT_FOUND")
+          print("Checked candidates:")
+          for candidate in seen:
+              print(f" - {candidate}")
+          raise SystemExit(1)
+          PY
+            ' > /tmp/local_model_resolution.txt; then
+            resolved_model_path="$(sed -n 's/^FOUND_LOCAL_MODEL=//p' /tmp/local_model_resolution.txt | tail -n 1)"
+            if [ -z "${resolved_model_path}" ]; then
+              echo "ERROR: local model resolver succeeded but did not emit a model path."
+              cat /tmp/local_model_resolution.txt
+              exit 1
+            fi
+            echo "Resolved local model path: ${resolved_model_path}"
+            echo "OOT_MODEL_AVAILABLE_LOCALLY=true" >> "$GITHUB_ENV"
+            echo "OOT_RESOLVED_MODEL_PATH=${resolved_model_path}" >> "$GITHUB_ENV"
+          else
+            echo "Local model path not found for ${{ matrix.model_path }}."
+            cat /tmp/local_model_resolution.txt || true
+            echo "OOT_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Download model if needed
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
           set -euo pipefail
           model_dir="/models/${{ matrix.model_path }}"
+          if [ "${OOT_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
+            echo "Using local model path ${OOT_RESOLVED_MODEL_PATH}; skip download."
+            exit 0
+          fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
-            if ! docker exec \
+            if ! $CONTAINER_ENGINE exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
               -e MODEL_PATH="${{ matrix.model_path }}" \
               -e MODEL_DIR="$model_dir" \
@@ -1238,6 +1417,10 @@ jobs:
       - name: Resolve OOT model path
         if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
         run: |
+          if [ "${OOT_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
+            echo "Using previously resolved local model path: ${OOT_RESOLVED_MODEL_PATH}"
+            exit 0
+          fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: /models/${{ matrix.model_path }}"
@@ -1258,7 +1441,7 @@ jobs:
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
-          docker exec \
+          $CONTAINER_ENGINE exec \
             -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
@@ -1278,7 +1461,7 @@ jobs:
       - name: Check OOT accuracy test results
         if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
           result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
             echo "ERROR: No results JSON file found in oot_accuracy_results/"
@@ -1303,14 +1486,14 @@ jobs:
         if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
         run: |
           echo "OOT gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Collect artifacts
         if: ${{ always() && steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
 
       - name: Upload model artifacts
         if: ${{ always() && steps.validation-window.outputs.should_run == 'true' }}
@@ -1333,10 +1516,10 @@ jobs:
       - name: Cleanup
         if: ${{ always() && steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
-          docker stop "$CONTAINER_NAME" || true
-          docker rm "$CONTAINER_NAME" || true
-          docker rmi "${OOT_IMAGE_TAG}" || true
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
+          $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
+          $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
+          $CONTAINER_ENGINE rmi "${OOT_IMAGE_REF:-${OOT_IMAGE_TAG}}" || true
 
   oot-model-accuracy-priority-2:
     name: Model Accuracy ${{ matrix.priority }} (${{ matrix.model_name }})
