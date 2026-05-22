@@ -82,11 +82,7 @@ impl BackendAdapter for VllmAdapter {
         }))
     }
 
-    fn inject_prefill_fields(
-        &self,
-        body: &mut Value,
-        ctx: &PairCtx,
-    ) -> Result<(), AdapterError> {
+    fn inject_prefill_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
         let ctx = downcast(ctx)?;
         let obj = body.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
         obj.insert(
@@ -106,11 +102,7 @@ impl BackendAdapter for VllmAdapter {
         Ok(())
     }
 
-    fn inject_decode_fields(
-        &self,
-        body: &mut Value,
-        ctx: &PairCtx,
-    ) -> Result<(), AdapterError> {
+    fn inject_decode_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
         let ctx = downcast(ctx)?;
         let obj = body.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
         obj.insert(
