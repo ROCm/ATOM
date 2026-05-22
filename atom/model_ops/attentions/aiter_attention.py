@@ -9,10 +9,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils import CpuGpuBuffer
-from atom.utils.block_convert import (
-    block_table_convert_triton,
-    kv_indices_generate_triton,
-)
+from atom.utils.block_convert import kv_indices_generate_triton
 import atom.model_ops as ops
 from atom.model_ops.paged_attention import PagedAttention
 from atom.model_ops.attention_mha import PagedAttentionImpl
@@ -184,12 +181,6 @@ class AiterAttentionMetadataBuilder:
                 self.max_num_blocks_per_seq // self.block_ratio,
                 **i32_kwargs,
             )
-            if self.block_ratio > 1:
-                var[f"{p}block_tables_converted"] = CpuGpuBuffer(
-                    ub_max_bs,
-                    self.max_num_blocks_per_seq,
-                    **i32_kwargs,
-                )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
                 torch.arange(
@@ -651,14 +642,6 @@ class AiterAttentionMetadataBuilder:
             self.block_ratio,
             max_seqlen_k,
         )
-        if self.block_ratio > 1 and "block_tables" in ctx:
-            block_table_convert_triton(
-                var["block_tables"].gpu[:bs],
-                var["block_tables_converted"].gpu[:bs],
-                var["context_lens"].gpu[:bs],
-                self.block_ratio,
-            )
-            ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
@@ -820,11 +803,6 @@ class AiterAttentionMetadataBuilder:
             cu_seqlens_q=var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
             kv_indptr=var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
             kv_indices=var[f"{p}kv_indices"].gpu,
-            block_tables_converted=(
-                var[f"{p}block_tables_converted"].gpu[:padded_bs]
-                if f"{p}block_tables_converted" in var
-                else None
-            ),
             work_meta_data=var[f"{p}work_meta_data"],
             work_info_set=var[f"{p}work_info_set"],
             work_indptr=var[f"{p}work_indptr"],
@@ -849,11 +827,6 @@ class AiterAttentionMetadataBuilder:
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu,
             max_seqlen_k=self.model_runner.config.max_model_len,
-            block_tables_converted=(
-                var["block_tables_converted"].gpu[:bs]
-                if "block_tables_converted" in var
-                else None
-            ),
             **ctx_pa_ps,
         )
 
