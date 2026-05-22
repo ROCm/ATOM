@@ -127,7 +127,12 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     `[0:num_write]` = real (last `win` tokens per seq); trailing entries
     `[num_write:W]` = -1 sentinel (only present on decode/MTP CG paths
     where `W = padded_bs * (1 + max_spec_steps)`; prefill is eager and
-    uses `W = num_write` exactly, no padding). `None` for warmup / empty fwd."""
+    uses `W = num_write` exactly, no padding). `None` for warmup / empty fwd.
+
+    NOTE: kept only for the aiter `fused_qk_norm_rope_swa_write` path
+    (num_tokens <= 64). Standalone `swa_write` (num_tokens > 64) now derives
+    `src_id` from `cu_seqlens_q` + `token_num_per_seq` directly inside the
+    kernel — eliminates the DMA-tear race on this shared GPU buffer."""
     compress_plans: Optional[Dict[int, Any]] = None
     """dict[ratio:int -> CompressPlan] — packed plan tensors per
     compress_ratio (4=CSA, 128=HCA)."""
@@ -1333,8 +1338,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ub_attn.batch_id_per_token = ub_attn.batch_id_per_token.clone()
         if ub_attn.n_committed_csa_per_seq is not None:
             ub_attn.n_committed_csa_per_seq = ub_attn.n_committed_csa_per_seq.clone()
-        if ub_attn.swa_write_indices is not None:
-            ub_attn.swa_write_indices = ub_attn.swa_write_indices.clone()
         if ub_attn.indexer_meta is not None:
             im = ub_attn.indexer_meta
             if im.get("cu_committed_gpu") is not None:
@@ -1365,17 +1368,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         them once per fwd saves ~64 redundant constructions for V4-Pro.
 
         Sets:
-          - `attn_metadata.swa_write_indices`: [W] int64 row ids into
-            per-token KV. Real entries are the last `win` tokens per seq.
-            For decode/MTP (CG-captured): `W = padded_bs * (1 + max_spec_steps)`,
-            trailing entries `[num_write:W]` get -1 sentinel so the fixed
-            grid is CUDAGraph-safe. For prefill (eager, no CG):
-            `W = num_write` exactly — no padding, no wasted grid programs
-            (long-prefill chunks would otherwise launch up to ~64× more
-            programs that all bail on `src_id < 0`).
           - `attn_metadata.batch_id_per_token`: [padded_T] int32 batch id
-            per token (single per-token mapping; consumed by `swa_write`,
-            Phase B/C/E paged-decode kernels, and the indexer).
+            per token (single per-token mapping; consumed by the Phase B/C/E
+            paged-decode kernels and the indexer). `swa_write` no longer
+            depends on this — it derives `src_id` from `cu_seqlens_q` inline.
           - `attn_metadata.n_committed_csa_per_seq`: [bs] int32 per-seq
             `ctx_len // 4` (shared by csa_translate_pack + indexer; kernels
             do their own `min(., index_topk)` clamp via mask).
@@ -1401,17 +1397,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # construction time (single source of truth — prepare_decode /
         # prepare_prefill / build_for_cudagraph_capture each know their
         # own semantics). Consumed for: padded_total_tokens (CG bucket vs
-        # eager-tight), arange shortcut (write_indices), SWA grid bucketing,
-        # and by `_attach_v4_paged_decode_meta` for the index-buffer skip.
+        # eager-tight) and by `_attach_v4_paged_decode_meta` for the
+        # index-buffer skip.
         is_pure_decode = attn_metadata.is_pure_decode
 
         # padded_total_tokens: CG-captured decode/MTP pads to the fixed
-        # bucket `padded_bs * (1+max_spec_steps)` so per-token buffers
-        # (batch_id_per_token, swa_write_indices) have a stable shape across
-        # captures. Non-pure-decode (prefill / mixed / fresh-prefill) is
-        # eager and uses `total_tokens` exactly — no wasted padding (a long
-        # prefill chunk doesn't need to be padded up to a bucket that
-        # doesn't exist for it).
+        # bucket `padded_bs * (1+max_spec_steps)` so the per-token
+        # `batch_id_per_token` buffer has a stable shape across captures.
+        # Non-pure-decode (prefill / mixed / fresh-prefill) is eager and
+        # uses `total_tokens` exactly — no wasted padding (a long prefill
+        # chunk doesn't need to be padded up to a bucket that doesn't
+        # exist for it).
         if is_pure_decode:
             assert padded_bs is not None and max_q_len is not None, (
                 "is_pure_decode requires padded_bs + max_q_len from caller "
@@ -1439,33 +1435,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         n_committed_hca_per_seq_np = ctx_per_seq_np // 128
         attn_metadata.n_committed_csa_per_seq_cpu = n_committed_csa_per_seq_np
         attn_metadata.n_committed_hca_per_seq_cpu = n_committed_hca_per_seq_np
-
-        # Build write_indices for the SWA-write kernel.
-        # is_pure_decode ⇒ source is `self._swa_iota` (static GPU tensor) +
-        #   GPU fill_(-1) tail. No CPU numpy needed; `num_write = total_tokens`,
-        #   `swa_write_grid = padded_total_tokens` (CG bucket).
-        # else ⇒ per-seq concat tail (filter `last win tokens per seq`).
-        #   Built as a fresh local numpy (NOT into the shared pinned
-        #   `wi_buf.np`, which would race with the next fwd's rewrite during
-        #   in-flight DMA). `swa_write_grid = num_write` (tight, no padding —
-        #   prefill is eager).
-        if is_pure_decode:
-            write_indices_np = None
-            num_write = total_tokens
-            swa_write_grid = padded_total_tokens
-        else:
-            write_starts = cu_seqlens_q_arr[:scheduled_bs] + np.maximum(
-                0, token_num_per_seq - win
-            )
-            write_ends = cu_seqlens_q_arr[1:]
-            write_indices_np = np.concatenate(
-                [
-                    np.arange(s, e, dtype=np.int64)
-                    for s, e in zip(write_starts, write_ends)
-                ]
-            )
-            num_write = int(write_indices_np.shape[0])
-            swa_write_grid = num_write
 
         # ---- Stage all buffers to GPU ----
         # window_topk used to be CPU-built here ([T, win] of ring indices with
@@ -1496,29 +1465,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.n_committed_csa_per_seq = n_csa_buf.copy_to_gpu(padded_bs)
         else:
             attn_metadata.n_committed_csa_per_seq = n_csa_buf.copy_to_gpu(scheduled_bs)
-        # Race-free write into the shared `v4_meta_swa_write_indices` GPU
-        # buffer (stable pointer → CG-capture-safe). Bypasses `_stage`
-        # because `_stage`'s `buf.np[:n] = arr; copy_to_gpu(non_blocking=True)`
-        # pattern uses the shared pinned alias as the H2D source — the next
-        # fwd's CPU rewrite of `buf.np` can land mid-DMA and tear the GPU
-        # contents, producing torn `src_id` values that exceed `kv.shape[0]`
-        # and MEMORY_VIOLATION the `tl.load(kv_ptr + src_id * ...)` in
-        # `_swa_write_kernel`.
-        wi_gpu = var["v4_meta_swa_write_indices"].gpu
-        assert swa_write_grid <= wi_gpu.shape[0], (
-            f"v4_meta_swa_write_indices too small: need {swa_write_grid}, "
-            f"have {wi_gpu.shape[0]}"
-        )
-        if is_pure_decode:
-            if num_write > 0:
-                wi_gpu[:num_write].copy_(self._swa_iota[:num_write])
-            if num_write < swa_write_grid:
-                wi_gpu[num_write:swa_write_grid].fill_(-1)
-        elif num_write > 0:
-            wi_buf = var["v4_meta_swa_write_indices"]
-            wi_buf.np[:num_write] = write_indices_np
-            wi_gpu[:num_write].copy_(wi_buf.cpu[:num_write], non_blocking=True)
-        attn_metadata.swa_write_indices = wi_gpu[:swa_write_grid]
 
         self._attach_v4_paged_decode_meta(
             attn_metadata=attn_metadata,
@@ -2250,18 +2196,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # exposes that GPU view to all downstream consumers (no second
         # H2D-staged copy).
         bufs["v4_meta_state_slot_groups"] = CpuGpuBuffer(bs, **i32)
-        # swa_write_indices: tight bound = `max_bs * window_size`. Universal
-        # worst-case across paths — prefill compact write is `sum(min(num_i,
-        # win)) ≤ bs * win`; decode/MTP CG is `bs * (1+max_spec_steps) ≤
-        # bs * win` (since `1+max_spec_steps ≪ win`). Legacy `mnbt` sizing
-        # was over-padded to the prefill total-token worst case.
-        bufs["v4_meta_swa_write_indices"] = CpuGpuBuffer(bs * win, **i64)
-        # Static GPU iota used by `_attach_v4_per_fwd_meta` for the
-        # is_pure_decode arange shortcut. Pre-allocated once so the per-fwd
-        # write into `v4_meta_swa_write_indices` is a pure GPU-to-GPU copy
-        # (no CPU intermediate → no pinned-buffer H2D race) and the source
-        # pointer stays stable for CUDAGraph capture.
-        self._swa_iota = torch.arange(bs * win, dtype=torch.int64, device=self.device)
 
         # Phase B: paged-decode index buffers (consumed by Phase C/E).
         # Sized to worst-case decode shape `T = max_bs * (1 + max_spec_steps)`

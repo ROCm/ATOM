@@ -476,6 +476,8 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}

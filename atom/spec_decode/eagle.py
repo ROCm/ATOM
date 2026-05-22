@@ -456,9 +456,6 @@ class EagleProposer:
                         attn_metadata.__dict__[k] = v
                     if has_flat_kv:
                         # MLA/MHA path: slot derived from flat kv_indices.
-                        # V4 doesn't expose flat kv_indices and its kernels
-                        # don't read attn_metadata.slot_mapping (state-ring +
-                        # swa_write_indices instead), so the update is skipped.
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids

@@ -360,6 +360,8 @@ jobs:
           MODEL_SLOT_7: ${{ inputs.model_slot_7 || 'none' }}
           MODEL_SLOT_8: ${{ inputs.model_slot_8 || 'none' }}
           GITHUB_TOKEN: ${{ github.token }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
         run: |
           set -euo pipefail

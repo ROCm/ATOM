@@ -154,18 +154,28 @@ class tokenIDProcessor:
         #   prev acc decode have 0 rej, 1 bonus
         #   prev rej decode have 1 rej, 0 bonus
         # It is clear that only rejected number is not sufficient for all status tracking, bonus number is also needed.
-        self.send_to_cpu_async(num_rejected, self.rejected_tokens_cpu, data_ready)
-        self.send_to_cpu_async(num_bonus, self.bonus_tokens_cpu, data_ready)
+        # Single Event for both copies (vs. per-tensor send_to_cpu_async) so the
+        # consumer pops one queue entry and synchronizes once instead of twice.
+        copy_done = torch.cuda.Event()
+        with torch.cuda.stream(self.async_copy_stream):
+            data_ready.wait(stream=self.async_copy_stream)
+            cpu_num_rejected = num_rejected.to("cpu", non_blocking=True)
+            cpu_num_bonus = num_bonus.to("cpu", non_blocking=True)
+            copy_done.record(self.async_copy_stream)
+        self.pending_mtp_status_copies.append(
+            (cpu_num_rejected, cpu_num_bonus, copy_done)
+        )
 
     def recv_mtp_status_async(
         self,
     ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        if not self.rejected_tokens_cpu:
+        if not self.pending_mtp_status_copies:
             return None, None
-        return (
-            self.recv_async_output(self.rejected_tokens_cpu).numpy(),
-            self.recv_async_output(self.bonus_tokens_cpu).numpy(),
+        cpu_num_rejected, cpu_num_bonus, copy_done = self.pending_mtp_status_copies.pop(
+            0
         )
+        copy_done.synchronize()
+        return cpu_num_rejected.numpy(), cpu_num_bonus.numpy()
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -176,8 +186,12 @@ class tokenIDProcessor:
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: Optional[torch.Tensor] = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
-        self.rejected_tokens_cpu: list[torch.Tensor] = []
-        self.bonus_tokens_cpu: list[torch.Tensor] = []
+        # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event) — async
+        # D2H copies fired by send_mtp_status_to_cpu_async, drained by
+        # recv_mtp_status_async after the event syncs.
+        self.pending_mtp_status_copies: list[
+            tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
+        ] = []
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )

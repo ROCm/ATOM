@@ -104,6 +104,8 @@ jobs:
       - name: Resolve image source and model matrix
         id: meta
         env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           RUN_DSR1_FP8_TP4: ${{ inputs.run_dsr1_fp8_tp4 }}
           RUN_QWEN35_35B_A3B_FP8_TP2: ${{ inputs.run_qwen35_35b_a3b_fp8_tp2 }}
           RUN_QWEN35_35B_A3B_TP2: ${{ inputs.run_qwen35_35b_a3b_tp2 }}

@@ -15,7 +15,9 @@ digest is known, it returns a digest-pinned floating reference instead.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -118,9 +120,21 @@ def get_registry_token(repository: str) -> str:
             "scope": f"repository:{repository}:pull",
         }
     )
+    # Use Docker Hub credentials when available to raise the unauthenticated
+    # rate limit (100 pulls / 6h per IP) to the authenticated quota (200 / 6h
+    # per account, billed against the user instead of the shared runner IP).
+    # Falls back to anonymous when secrets are absent (e.g. fork PR runs).
+    headers = {"User-Agent": USER_AGENT}
+    docker_user = os.environ.get("DOCKER_USERNAME")
+    docker_pass = os.environ.get("DOCKER_PASSWORD")
+    if docker_user and docker_pass:
+        creds = base64.b64encode(
+            f"{docker_user}:{docker_pass}".encode("utf-8")
+        ).decode("ascii")
+        headers["Authorization"] = f"Basic {creds}"
     body, _ = http_request(
         f"{AUTH_URL}?{query}",
-        headers={"User-Agent": USER_AGENT},
+        headers=headers,
     )
     payload = json.loads(body.decode("utf-8"))
     token = payload.get("token")
