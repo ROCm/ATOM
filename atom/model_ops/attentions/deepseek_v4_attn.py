@@ -39,6 +39,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Type, cast
 
+
 import numpy as np
 import torch
 from aiter import dtypes
@@ -52,6 +53,7 @@ from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import (
     AttentionMetaData,
+    AttnState,
     Context,
     get_forward_context,
 )
@@ -137,10 +139,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """dict[ratio:int -> CompressPlan] — packed plan tensors per
     compress_ratio (4=CSA, 128=HCA)."""
 
-    # ----- Phase B paged-decode metadata (set when is_pure_decode == True) -----
-    is_pure_decode: bool = False
-    """uniform tokens-per-seq AND no fresh prefill (doc §7.4) — gates the
-    paged-decode dispatch in V4Attention.forward."""
+    # ----- Phase B paged-decode metadata (set when state is DECODE) -----
+    # `state` lives on the base AttentionMetaData; every V4 `prepare_*` path
+    # overrides it. Below buffers are populated only when state is DECODE
+    # (built by `_attach_v4_paged_decode_meta`).
     kv_indices_swa: Optional[torch.Tensor] = None
     """[T*win] int32 GPU — flat paged offsets into `unified_kv` for SWA path."""
     kv_indices_csa: Optional[torch.Tensor] = None
@@ -314,6 +316,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.index_head_dim = getattr(hf, "index_head_dim", 128)
         self.window_size = getattr(hf, "sliding_window", 128)
         self.index_topk = getattr(hf, "index_topk", 1024)
+        # MTP-portion of compress_ratios. `prepare_mtp_decode`'s direct-kernel
+        # fast path only handles SWA (ratio=0) draft layers; non-zero ratios
+        # would also need n_committed_{csa,hca} + HCA compress tail rebuilt.
+        # V4-Pro currently ships all-zero MTP ratios; assert keeps future
+        # configs honest.
+        n_main = int(getattr(hf, "num_hidden_layers", len(ratios)))
+        self._n_main_layers = n_main
+        self._mtp_layers_are_swa_only = all(r == 0 for r in ratios[n_main:])
         # `deepgemm_fp8_paged_mqa_logits` decode-path output column count
         # = max compressed K positions per seq. CSA ratio=4 is the
         # max-density ratio (1 indexer slot per 4 source tokens).
@@ -947,83 +957,116 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bs: int,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        positions: torch.Tensor,  # [bs] int — eagle's current draft-step positions
         only_update: bool = False,
-        num_reject_tokens: torch.Tensor = None,
+        num_reject_tokens: Optional[torch.Tensor] = None,
     ):
         """Per-draft-step V4 region metadata rebuild for 1-token-per-seq shape.
 
-        Called by EagleProposer.propose at mid-step iters (i < mtp_k - 1).
-        Eagle has already bumped attn_metadata.context_lens GPU by +1 and
-        max_seqlen_k by +1 before calling us. We mirror the +1 on CPU (zero
-        D2H: structural invariant of eagle's loop) and rebuild
-        v4_kv_indices_{swa,csa,hca}, batch_id_per_token, n_committed_csa_per_seq,
-        indexer meta, and compress_plans.
+        Called by EagleProposer.propose at mid-step iters. Eagle has already
+        updated GPU state before this call:
+          - ``attn_metadata.context_lens`` (GPU view of
+            ``var["context_lens"].gpu``): rolled-back by ``prepare_decode``
+            and bumped by eagle (`eagle.py:443`). Already the correct
+            per-seq KV length for this draft step — DO NOT subtract
+            num_reject_tokens (would double-rollback).
+          - ``var["cu_seqlens_q"].gpu[:bs+1]``: set to ``arange(bs+1)``
+            (`eagle.py:430`) for the 1-tok-per-seq shape.
+        Eagle does NOT update the CPU mirrors (``var["..."].np``), so the
+        CPU-numpy path of ``_attach_v4_per_fwd_meta`` /
+        ``_attach_v4_paged_decode_meta`` would see stale values from verify.
+        This routine bypasses both helpers and rebuilds the only buffers
+        an SWA-only MTP layer actually consumes by calling
+        ``write_v4_paged_decode_indices`` directly with GPU-computed
+        indptrs. No D2H, no CPU mirror touch.
 
-        ``only_update`` / ``num_reject_tokens`` are MLA-specific (no V4
-        analog — V4 has no incremental-update kernel and the ctx rollback
-        is already applied at the top of prepare_decode for the verify
-        shape). Ignored.
+        Restricted to SWA-only MTP layers (compress_ratio == 0); asserted at
+        builder init via ``self._mtp_layers_are_swa_only``. ``only_update``
+        / ``num_reject_tokens`` are MLA-specific knobs and are ignored — V4
+        handles rollback once in ``prepare_decode``.
         """
-        # `max_per_req_cache_slots` is set inside `model_runner.get_num_blocks`,
-        # which runs AFTER `warmup_model`. The full per-fwd meta rebuild below
-        # eventually reads it via `_attach_v4_paged_decode_meta`, so during
-        # warmup (attr unset) we no-op — warmup discards draft output anyway,
-        # and the verify-shape attn_metadata from the main forward stays valid
-        # for the rest of eagle.propose.
+        # `max_per_req_cache_slots` is set inside `model_runner.get_num_blocks`
+        # AFTER `warmup_model`. During warmup we no-op — warmup discards
+        # draft output anyway, and the verify-shape attn_metadata stays valid.
         if not getattr(self.model_runner, "max_per_req_cache_slots", 0):
             return {}
+        assert self._mtp_layers_are_swa_only, (
+            "prepare_mtp_decode fast path only supports SWA-only MTP layers "
+            f"(compress_ratio==0); got compress_ratios[mtp]="
+            f"{self.compress_ratios[self._n_main_layers:]}"
+        )
 
         var = self.model_runner.forward_vars
-        attn_metadata = get_forward_context().attn_metadata
-
-        # 1. CPU mirror of eagle's GPU `context_lens[:bs] += 1` bump. Zero
-        #    D2H: we know the offset by construction (+1 per call).
-        var["context_lens"].np[:bs] += 1
-        context_lens_np = var["context_lens"].np[:bs]
-
-        # 2. 1-token-per-seq shape: positions = ctx-1, cu_seqlens_q = arange.
-        positions_np = (context_lens_np - 1).astype(np.int32)
-        cu_seqlens_q_np = np.arange(bs + 1, dtype=np.int32)
-        var["positions"].np[:bs] = positions_np
-        var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q_np
-
-        # 3. H2D staging. context_lens already on GPU (eagle bumped it);
-        # CPU is now mirrored.
-        positions_gpu = var["positions"].copy_to_gpu(bs)
-        var["cu_seqlens_q"].copy_to_gpu(bs + 1)
-
-        # 4. CPU numpy: extend_lens (=1 per seq).
-        extend_lens_np = np.ones(bs, dtype=np.int32)
-
-        # 5. Rebuild V4 region metadata via existing helpers (numpy + H2D,
-        #    no D2H — `_build_compress_plans` only triggers `.cpu()` when
-        #    given torch tensors; we pass numpy below).
-        self._attach_v4_per_fwd_meta(
-            attn_metadata,
-            cu_seqlens_q_np,
-            extend_lens_np,  # = np.ones(bs) — MTP draft step is 1 token per seq
-            state_slot_mapping_cpu=attn_metadata.state_slot_mapping_cpu,
-            scheduled_bs=bs,
-            total_tokens=bs,
-            padded_bs=bs,
-            max_q_len=1,
+        attn_metadata = cast(
+            AttentionMetaData_DSV4, get_forward_context().attn_metadata
         )
-        self._attach_v4_indexer_meta(
-            attn_metadata,
-            scheduled_bs=bs,
-            total_tokens=bs,
-            positions_gpu=positions_gpu,
+        # Pre-populated by the verify-forward `prepare_decode` and kept alive
+        # across eagle.propose; assert for the static checker.
+        assert attn_metadata.context_lens is not None
+        assert attn_metadata.state_slot_mapping is not None
+        win = self.window_size  # SWA prefix max per token
+        cs = self.win_with_spec  # SWA ring stride = win + max_spec_steps
+
+        # ----- GPU-side SWA indptr math (no CPU numpy, no D2H) -----
+        # ctx_gpu is already correct (rolled-back by prepare_decode + bumped
+        # by eagle). int32 in the source buffer; keep dtype throughout.
+        # Only SWA is computed; CSA/HCA indices are unused by SWA-only MTP
+        # (asserted above) and will be fully rebuilt by the next verify-fwd's
+        # `prepare_decode`.
+        actual_swa = torch.clamp(positions + 1, max=win)
+
+        swa_indptr = var["v4_kv_indptr_swa"].gpu[: bs + 1]
+        # positions/actual_swa are int64 (eagle's positions buffer); cast to
+        # int32 inside cumsum to match swa_indptr's int32 storage.
+        torch.cumsum(actual_swa, dim=0, dtype=torch.int32, out=swa_indptr[1:])
+
+        # batch_id_per_token: 1-tok-per-seq → arange(bs). Eagle already
+        # populated cu_seqlens_q as arange(bs+1) (eagle.py:430), so its
+        # [:bs] slice IS [0,1,...,bs-1] — exactly the per-token batch id.
+        # No extra alloc / arange kernel.
+        assert attn_metadata.cu_seqlens_q is not None
+        batch_id_per_token = attn_metadata.cu_seqlens_q[:bs]
+
+        # ----- Kernel: write SWA prefix paged offsets -----
+        # `write_v4_paged_decode_indices` writes to swa/csa/hca indices in
+        # one pass. For SWA-only MTP we alias csa/hca slots to swa so the
+        # kernel writes the same value three times to swa_indices_buf —
+        # redundant ~bs*win stores (~8 KB at V4-Pro bs=64, win=128), saves
+        # building two extra unused indptr buffers.
+        swa_indices_buf = var["v4_kv_indices_swa"].gpu
+        write_v4_paged_decode_indices(
+            state_slot_per_seq=attn_metadata.state_slot_mapping,
+            batch_id_per_token=batch_id_per_token,
+            positions=positions,
+            swa_indptr=swa_indptr,
+            csa_indptr=swa_indptr,
+            hca_indptr=swa_indptr,
+            swa_indices=swa_indices_buf,
+            csa_indices=swa_indices_buf,
+            hca_indices=swa_indices_buf,
+            T=bs,
+            win=win,
+            cs=cs,
         )
 
-        # 6. Compress plans for state-ring write of each new draft token.
-        attn_metadata.compress_plans = self._build_compress_plans(
-            extend_lens_np,
-            context_lens_np,
-            for_decode_cg=True,
-        )
+        # ----- Publish on attn_metadata for V4Attention.forward -----
+        # MTP layer is ratio=0 → reads kv_indices_swa + kv_indptr_swa only.
+        # kv_indices_{csa,hca} / kv_indptr_{csa,hca} are left at whatever
+        # prepare_decode populated for the verify shape; downstream V4
+        # decode kernel only touches them when ratio != 0.
+        attn_metadata.state = AttnState.DECODE
+        attn_metadata.max_seqlen_q = 1
+        attn_metadata.kv_indices_swa = swa_indices_buf
+        attn_metadata.kv_indptr_swa = swa_indptr
+        attn_metadata.batch_id_per_token = batch_id_per_token
 
-        # All updates done in-place on attn_metadata; eagle's
-        # `for k, v in workinfos.items(): __dict__[k] = v` loop is a no-op.
+        # NOT rebuilt (unused by SWA-only MTP layer; would block a future
+        # CSA/HCA MTP layer — assert at top guards):
+        #   - n_committed_{csa,hca}_per_seq{,_cpu} (compressor/HCA tail math)
+        #   - skip_prefix_len_csa (csa_translate_pack per-layer write)
+        #   - compress_plans (Compressor — only present when ratio != 0)
+        #   - HCA compress tail in kv_indices_hca
+        #   - v4 indexer meta (Indexer — only present when ratio == 4)
         return {}
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
@@ -1114,7 +1157,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             num_cached_tokens=None,
             block_tables=block_tables_gpu,
             context_lens=context_lens_gpu,
-            is_pure_decode=True,
+            state=AttnState.DECODE,
         )
         attn_metadata.state_slot_mapping = state_slot_gpu
         attn_metadata.state_slot_mapping_cpu = state_slot_np
@@ -1156,11 +1199,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # fields with defaults; the parent dataclass is non-slotted.
         base_md.__class__ = AttentionMetaData_DSV4
         attn_metadata = cast(AttentionMetaData_DSV4, base_md)
-        # Prefill is by definition not pure decode (fresh-prefill seqs have
-        # start_pos == 0). Class-promotion via __class__ doesn't run the
-        # dataclass __init__, so V4-specific defaults aren't applied — set
-        # explicitly.
-        attn_metadata.is_pure_decode = False
+        # state defaults to PREFILL_NATIVE (set by `backends.build()` after
+        # this returns); `_build_paged_prefill_meta` upgrades to
+        # PREFILL_PREFIX if any seq has chunk_start > 0 (chunked prefill).
         scheduled_bs = batch.total_seqs_num_prefill
         if attn_metadata.block_tables is None:
             attn_metadata.block_tables = self._populate_block_tables(
@@ -1393,24 +1434,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         cu_seqlens_q_arr = np.asarray(
             cu_seqlens_q_np[: scheduled_bs + 1], dtype=np.int32
         )
-        # is_pure_decode is set by the caller at AttentionMetaData_DSV4
-        # construction time (single source of truth — prepare_decode /
-        # prepare_prefill / build_for_cudagraph_capture each know their
-        # own semantics). Consumed for: padded_total_tokens (CG bucket vs
-        # eager-tight) and by `_attach_v4_paged_decode_meta` for the
-        # index-buffer skip.
-        is_pure_decode = attn_metadata.is_pure_decode
+        # state is set by the caller at AttentionMetaData_DSV4 construction
+        # time (single source of truth — prepare_decode / prepare_prefill /
+        # prepare_mtp_decode / build_for_cudagraph_capture each set it).
+        # Consumed here for padded_total_tokens sizing.
+        is_pure_decode = attn_metadata.state is AttnState.DECODE
 
         # padded_total_tokens: CG-captured decode/MTP pads to the fixed
         # bucket `padded_bs * (1+max_spec_steps)` so the per-token
         # `batch_id_per_token` buffer has a stable shape across captures.
-        # Non-pure-decode (prefill / mixed / fresh-prefill) is eager and
-        # uses `total_tokens` exactly — no wasted padding (a long prefill
+        # Prefill states (PREFILL_NATIVE / PREFILL_PREFIX) are eager and
+        # use `total_tokens` exactly — no wasted padding (a long prefill
         # chunk doesn't need to be padded up to a bucket that doesn't
         # exist for it).
         if is_pure_decode:
             assert padded_bs is not None and max_q_len is not None, (
-                "is_pure_decode requires padded_bs + max_q_len from caller "
+                "DECODE state requires padded_bs + max_q_len from caller "
                 "(CG bucket size — fixed at capture)"
             )
             padded_total_tokens = int(padded_bs) * int(max_q_len)
@@ -1514,23 +1553,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                                the caller; consumed by the index-write kernel
                                + CPU-side actual_swa_count cumsum here)
 
-        Skipped when not is_pure_decode (prefill, mixed, fresh-prefill). The
-        Phase-B fields (kv_indices_*, kv_indptr_*, swa_pages) stay at their
-        dataclass defaults (None / 0) for non-decode batches; downstream
-        consumers gate on `is_pure_decode`.
+        Skipped when state is not DECODE. The Phase-B fields
+        (kv_indices_*, kv_indptr_*, swa_pages) stay at their dataclass
+        defaults for prefill batches; downstream V4Attention.forward branches
+        on state and reads prefill-mode buffers (kv_indices_prefix_*) instead.
         """
         if scheduled_bs == 0 or total_tokens == 0:
             return  # fields stay at dataclass defaults
 
-        if not attn_metadata.is_pure_decode:
-            return  # caller already marked non-decode; nothing to build
+        if attn_metadata.state is not AttnState.DECODE:
+            return  # prefill: only kv_indices_prefix_* are built downstream
 
         if len(state_slot_mapping_cpu) < scheduled_bs:
-            # Warmup / dummy_run carve-out: caller asserted pure_decode but
-            # state_slot_mapping is incomplete. Flip the flag so downstream
-            # consumers (V4Attention.forward) take the non-decode codepath
-            # instead of dereferencing the unbuilt kv_indices_* buffers.
-            attn_metadata.is_pure_decode = False
+            # Defensive carve-out: caller asserted DECODE but
+            # state_slot_mapping is incomplete. Flip state to PREFILL_NATIVE.
+            attn_metadata.state = AttnState.PREFILL_NATIVE
             return
 
         var = self.model_runner.forward_vars
@@ -2117,7 +2154,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             num_cached_tokens=None,
             block_tables=block_tables_gpu,
             context_lens=context_lens_gpu,
-            is_pure_decode=True,
+            state=AttnState.DECODE,
         )
         attn_metadata.state_slot_mapping = state_slot_gpu
         attn_metadata.state_slot_mapping_cpu = state_slot_np

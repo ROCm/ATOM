@@ -441,6 +441,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         bs: int,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        positions: torch.Tensor,  # [total_tokens] int32
         only_update: bool = False,
         num_reject_tokens: torch.Tensor = None,
     ):

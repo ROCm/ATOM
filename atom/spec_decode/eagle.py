@@ -441,6 +441,7 @@ class EagleProposer:
                     # Update context_lens for each draft step (needed by both
                     # MHA attention and MLA+sparse indexer)
                     attn_metadata.context_lens[:bs] += 1
+                    positions += 1
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
                         (
@@ -449,6 +450,7 @@ class EagleProposer:
                             else i0_max_seqlen_q
                         ),
                         attn_metadata.max_seqlen_k,
+                        positions,
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,
                     )
@@ -459,7 +461,6 @@ class EagleProposer:
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
-                    positions += 1
                     if ret_hidden_prenorm is not None:
                         hidden_states = (
                             torch.index_select(

@@ -96,7 +96,7 @@ from atom.model_ops.v4_kernels import (
     swa_write,
     update_compressor_states,
 )
-from atom.utils.forward_context import get_forward_context
+from atom.utils.forward_context import AttnState, get_forward_context
 from atom.utils.decorators import support_torch_compile
 
 # ---------------------------------------------------------------------------
@@ -1688,7 +1688,8 @@ class DeepseekV4Attention(nn.Module):
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
         qr, qr_scale = self.q_norm(q_lora)
         q = self.wq_b(qr, x_scale=qr_scale)
-        if attn_md.is_pure_decode and self.use_fuse_qk_norm_rope_swa_write:
+        is_decode = attn_md.state is AttnState.DECODE
+        if is_decode and self.use_fuse_qk_norm_rope_swa_write:
             # Fused: wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw
             # + RoPE on q tail + RoPE on kv tail (+ SWA write) in one triton
             # kernel. KV RMSNorm stays out (kernel doesn't apply weighted norm
@@ -1768,7 +1769,7 @@ class DeepseekV4Attention(nn.Module):
         #   Pure prefill (chunk_start==0) has prefix_swa_count==0 so no prior
         #   ring read; swa_write order is irrelevant in that subcase.
         q_sa = q.contiguous()
-        if attn_md.is_pure_decode:
+        if is_decode:
             if not self.use_fuse_qk_norm_rope_swa_write:
                 swa_write(
                     kv,
@@ -1806,9 +1807,11 @@ class DeepseekV4Attention(nn.Module):
             elif ratio == 4:
                 kv_indices_prefix = attn_md.kv_indices_prefix_csa
                 kv_indptr_prefix = attn_md.kv_indptr_prefix_csa
-            else:  # ratio == 128
+            elif ratio == 128:
                 kv_indices_prefix = attn_md.kv_indices_prefix_hca
                 kv_indptr_prefix = attn_md.kv_indptr_prefix_hca
+            else:
+                raise ValueError(f"Unsupported compress_ratio {ratio}")
             o = sparse_attn_v4_paged_prefill(
                 q_sa,
                 self.unified_kv,
@@ -1884,7 +1887,7 @@ class DeepseekV4Attention(nn.Module):
         # warmup batches). Equivalent post-bind: `compressor.kv_cache.size(1)`.
         csa_block_capacity = _V4_BLOCK_SIZE // 4
 
-        if attn_md.is_pure_decode:
+        if attn_md.state is AttnState.DECODE:
             kv_indptr = attn_md.kv_indptr_csa
             kv_indices = attn_md.kv_indices_csa
         else:
