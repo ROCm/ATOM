@@ -35,7 +35,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
     },
     policies::PolicyRegistry,
     protocols::{
@@ -439,13 +439,13 @@ impl PDRouter {
             };
 
         let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        Metrics::record_worker_selection(
+        MeshMetrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
             metrics_labels::CONNECTION_HTTP,
             model,
             prefill_policy,
         );
-        Metrics::record_worker_selection(
+        MeshMetrics::record_worker_selection(
             metrics_labels::WORKER_DECODE,
             metrics_labels::CONNECTION_HTTP,
             model,
@@ -473,7 +473,7 @@ impl PDRouter {
         let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
-        Metrics::record_router_request(
+        MeshMetrics::record_router_request(
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_PD,
             metrics_labels::CONNECTION_HTTP,
@@ -538,20 +538,20 @@ impl PDRouter {
             },
             |res, _attempt| is_retryable_status(res.status()),
             |delay, attempt| {
-                Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
-                Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
-                Metrics::record_worker_retry_backoff(attempt, delay);
+                MeshMetrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
+                MeshMetrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
+                MeshMetrics::record_worker_retry_backoff(attempt, delay);
             },
             || {
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
+                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
+                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
             },
         )
         .await;
 
         let duration = start_time.elapsed();
         if response.status().is_success() {
-            Metrics::record_router_duration(
+            MeshMetrics::record_router_duration(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
                 metrics_labels::CONNECTION_HTTP,
@@ -560,7 +560,7 @@ impl PDRouter {
                 duration,
             );
         } else if !is_retryable_status(response.status()) {
-            Metrics::record_router_error(
+            MeshMetrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
                 metrics_labels::CONNECTION_HTTP,
@@ -679,7 +679,7 @@ impl PDRouter {
                 decode.url(),
                 status
             );
-            Metrics::record_worker_error(
+            MeshMetrics::record_worker_error(
                 metrics_labels::WORKER_DECODE,
                 metrics_labels::CONNECTION_HTTP,
                 error_type_from_status(status),
@@ -1066,7 +1066,7 @@ impl PDRouter {
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
-        Metrics::record_router_request(
+        MeshMetrics::record_router_request(
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_PD,
             metrics_labels::CONNECTION_HTTP,
@@ -1132,12 +1132,12 @@ impl PDRouter {
                         // Record worker errors for server errors (5xx)
                         if status.is_server_error() {
                             let error_type = error_type_from_status(status);
-                            Metrics::record_worker_error(
+                            MeshMetrics::record_worker_error(
                                 metrics_labels::WORKER_PREFILL,
                                 metrics_labels::CONNECTION_HTTP,
                                 error_type,
                             );
-                            Metrics::record_worker_error(
+                            MeshMetrics::record_worker_error(
                                 metrics_labels::WORKER_DECODE,
                                 metrics_labels::CONNECTION_HTTP,
                                 error_type,
@@ -1151,13 +1151,13 @@ impl PDRouter {
             |res, _attempt| is_retryable_status(res.status()),
             |delay, attempt| {
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
-                Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
-                Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
-                Metrics::record_worker_retry_backoff(attempt, delay);
+                MeshMetrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
+                MeshMetrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
+                MeshMetrics::record_worker_retry_backoff(attempt, delay);
             },
             || {
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
+                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
+                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
             },
         )
         .await;
@@ -1165,7 +1165,7 @@ impl PDRouter {
         // Record Layer 2 metrics
         let duration = start_time.elapsed();
         if response.status().is_success() {
-            Metrics::record_router_duration(
+            MeshMetrics::record_router_duration(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
                 metrics_labels::CONNECTION_HTTP,
@@ -1174,7 +1174,7 @@ impl PDRouter {
                 duration,
             );
         } else if !is_retryable_status(response.status()) {
-            Metrics::record_router_error(
+            MeshMetrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
                 metrics_labels::CONNECTION_HTTP,

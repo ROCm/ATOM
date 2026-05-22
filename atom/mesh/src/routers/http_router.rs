@@ -26,7 +26,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
     },
     protocols::{
         chat::ChatCompletionRequest,
@@ -145,7 +145,7 @@ impl Router {
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
-        Metrics::record_router_request(
+        MeshMetrics::record_router_request(
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_REGULAR,
             metrics_labels::CONNECTION_HTTP,
@@ -163,7 +163,7 @@ impl Router {
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                Metrics::record_router_upstream_response(
+                MeshMetrics::record_router_upstream_response(
                     metrics_labels::ROUTER_HTTP,
                     res.status().as_u16(),
                     extract_error_code_from_response(&res),
@@ -176,19 +176,19 @@ impl Router {
             // on_backoff hook
             |delay, attempt| {
                 // Layer 3 worker metrics
-                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
-                Metrics::record_worker_retry_backoff(attempt, delay);
+                MeshMetrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                MeshMetrics::record_worker_retry_backoff(attempt, delay);
             },
             // on_exhausted hook
             || {
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
             },
         )
         .await;
 
         if response.status().is_success() {
             let duration = start.elapsed();
-            Metrics::record_router_duration(
+            MeshMetrics::record_router_duration(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_REGULAR,
                 metrics_labels::CONNECTION_HTTP,
@@ -197,7 +197,7 @@ impl Router {
                 duration,
             );
         } else if !is_retryable_status(response.status()) {
-            Metrics::record_router_error(
+            MeshMetrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_REGULAR,
                 metrics_labels::CONNECTION_HTTP,
@@ -249,7 +249,7 @@ impl Router {
             }
         };
 
-        Metrics::record_worker_selection(
+        MeshMetrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
             metrics_labels::CONNECTION_HTTP,
             model_id.unwrap_or(UNKNOWN_MODEL_ID),
@@ -281,7 +281,7 @@ impl Router {
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
-            Metrics::record_worker_error(
+            MeshMetrics::record_worker_error(
                 metrics_labels::WORKER_REGULAR,
                 metrics_labels::CONNECTION_HTTP,
                 error_type_from_status(status),

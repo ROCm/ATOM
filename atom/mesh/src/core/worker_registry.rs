@@ -22,7 +22,7 @@ use crate::{
         worker::{HealthChecker, RuntimeType, WorkerType},
         ConnectionMode, Worker,
     },
-    observability::metrics::Metrics,
+    observability::metrics::MeshMetrics,
 };
 
 /// Number of virtual nodes per physical worker for even distribution.
@@ -325,7 +325,7 @@ impl WorkerRegistry {
             }
 
             worker.set_healthy(false);
-            Metrics::remove_worker_metrics(worker.url());
+            MeshMetrics::remove_worker_metrics(worker.url());
 
             Some(worker)
         } else {
