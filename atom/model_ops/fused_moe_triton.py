@@ -92,6 +92,22 @@ def _amd_smem_safe_tile():
         reset_opt_flags_constraints()
 
 
+def _gu_concat_to_row_interleave(t):
+    """Convert N-axis from CONCAT [g|u] to row-level INTERLEAVED [g0,u0,g1,u1,...].
+    Required by triton_kernels.swiglu._swiglu_fn, so the triton path must
+    do this conversion on weight/bias/scale before _swizzle_mxfp4.
+
+    t shape: [E, N, ...] where N axis is CONCAT [g_half | u_half] and N is even.
+    Returns a new tensor with the same shape, N axis row-interleaved.
+    Returns None if t is None.
+    """
+    if t is None:
+        return None
+    assert t.shape[1] % 2 == 0, f"N must be even, got shape {tuple(t.shape)}"
+    E, N, *rest = t.shape
+    return t.view(E, 2, N // 2, *rest).transpose(1, 2).contiguous().view(E, N, *rest)
+
+
 def _swizzle_mxfp4(quant_tensor, scale):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     assert has_triton_kernels()

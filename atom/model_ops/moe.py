@@ -831,13 +831,36 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_triton:
-            from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
+            from atom.model_ops.fused_moe_triton import (
+                _swizzle_mxfp4,
+                _gu_concat_to_row_interleave,
+            )
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+
+            # SwiGLU MoE only (e.g. gpt-oss): triton_kernels.swiglu._swiglu_fn
+            # assumes row-level INTERLEAVED [g0,u0,...]. Module layer produces
+            # CONCAT [g|u], so convert w13 weight/bias/scale in-place before
+            # _swizzle_mxfp4. SiLU MoE (e.g. DeepSeek MXFP4)
+            # uses fused_clamp_act_mul which expects CONCAT, so it must skip
+            # this conversion.
+            if layer.activation == ActivationType.Swiglu:
+                w13_weight_dtype = layer.w13_weight.dtype
+                layer.w13_weight.data = _gu_concat_to_row_interleave(
+                    layer.w13_weight.view(torch.uint8)
+                ).view(w13_weight_dtype)
+                layer.w13_weight_scale.data = _gu_concat_to_row_interleave(
+                    layer.w13_weight_scale.data
+                )
+                if layer.w13_bias is not None:
+                    layer.w13_bias.data = _gu_concat_to_row_interleave(
+                        layer.w13_bias.data
+                    )
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
                 layer.w13_weight_scale,
             )
+
             w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
                 layer.w2_weight.view(torch.uint8),
                 layer.w2_weight_scale,
