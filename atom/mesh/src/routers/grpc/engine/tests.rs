@@ -827,7 +827,7 @@ mod e_engine_dispatch {
             worker: mock_http_only_worker("http://unreachable:8000"),
             policy_name: "rr",
         };
-        match Dispatcher::dispatch(&e, &plan, &basic_payload()).await {
+        match Dispatcher::dispatch(&e, &plan, &mut basic_payload()).await {
             Ok(_) => panic!("expected ConnectionAcquireFailed"),
             Err(err) => assert!(matches!(err, EngineError::ConnectionAcquireFailed(_))),
         }
@@ -842,7 +842,7 @@ mod e_engine_dispatch {
             prefill_policy: "rr",
             decode_policy: "rr",
         };
-        match Dispatcher::dispatch(&e, &plan, &basic_payload()).await {
+        match Dispatcher::dispatch(&e, &plan, &mut basic_payload()).await {
             Ok(_) => panic!("expected ConnectionAcquireFailed"),
             Err(err) => assert!(matches!(err, EngineError::ConnectionAcquireFailed(_))),
         }
@@ -856,7 +856,7 @@ mod e_engine_dispatch {
             worker: mock_grpc_worker("http://w:8000", WorkerType::Regular),
             policy_name: "rr",
         };
-        let _s = mock.dispatch(&plan, &basic_payload()).await.unwrap();
+        let _s = mock.dispatch(&plan, &mut basic_payload()).await.unwrap();
         let calls = mock.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].placement_kind, "single");
@@ -878,7 +878,7 @@ mod e_engine_dispatch {
             prefill_policy: "rr",
             decode_policy: "rr",
         };
-        let _s = mock.dispatch(&plan, &basic_payload()).await.unwrap();
+        let _s = mock.dispatch(&plan, &mut basic_payload()).await.unwrap();
         let calls = mock.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].placement_kind, "pair");
@@ -892,7 +892,7 @@ mod e_engine_dispatch {
             worker: mock_grpc_worker("http://w:8000", WorkerType::Regular),
             policy_name: "rr",
         };
-        match mock.dispatch(&plan, &basic_payload()).await {
+        match mock.dispatch(&plan, &mut basic_payload()).await {
             Ok(_) => panic!("expected RequestBuildFailed"),
             Err(err) => assert!(matches!(err, EngineError::RequestBuildFailed(_))),
         }

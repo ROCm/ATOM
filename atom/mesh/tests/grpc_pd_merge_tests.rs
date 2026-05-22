@@ -7,12 +7,12 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use mesh::routers::grpc::engine::merge_pd_streams;
-use mesh::routers::worker_stream::engine_error::EngineError;
-use mesh::routers::worker_stream::test_support::{
+use mesh::routers::token_handle::engine_error::EngineError;
+use mesh::routers::token_handle::test_support::{
     pending_forever_stream, scripted_stream_with_drop_observer, scripted_stream_with_poll_counter,
     ScriptedItem,
 };
-use mesh::routers::worker_stream::token_chunk::{
+use mesh::routers::token_handle::token_chunk::{
     FinishReason, InputLogprobs, TokenChunk, TokenLogprob, Usage, WorkerMeta,
 };
 

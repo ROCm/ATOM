@@ -21,8 +21,8 @@ use mesh::protocols::chat::ChatCompletionRequest;
 use mesh::protocols::generate::GenerateRequest;
 use mesh::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
 use mesh::routers::render::{chat_streaming, generate_streaming};
-use mesh::routers::worker_stream::test_support::synthetic_single_stream;
-use mesh::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+use mesh::routers::token_handle::test_support::synthetic_single_stream;
+use mesh::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 use mesh::tokenizer::stop::StopSequenceDecoderBuilder;
 use mesh::tokenizer::{traits::Tokenizer, MockTokenizer, StopSequenceDecoder};
 
@@ -100,7 +100,7 @@ fn meta() -> WorkerMeta {
 /// sequence + usage so the render layer emits a final delta plus the usage
 /// chunk.
 fn scripted_chunks(
-) -> Vec<Result<TokenChunk, mesh::routers::worker_stream::engine_error::EngineError>> {
+) -> Vec<Result<TokenChunk, mesh::routers::token_handle::engine_error::EngineError>> {
     vec![
         Ok(TokenChunk::Partial {
             token_ids: vec![1],

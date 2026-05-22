@@ -6,9 +6,9 @@
 use tokio::sync::mpsc;
 
 use mesh::routers::grpc::engine::merge_pd_streams;
-use mesh::routers::worker_stream::engine_error::EngineError;
-use mesh::routers::worker_stream::test_support::single_from_receiver;
-use mesh::routers::worker_stream::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+use mesh::routers::token_handle::engine_error::EngineError;
+use mesh::routers::token_handle::test_support::single_from_receiver;
+use mesh::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
 fn complete_chunk() -> TokenChunk {
     TokenChunk::Complete {

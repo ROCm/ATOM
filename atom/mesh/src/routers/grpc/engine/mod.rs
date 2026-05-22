@@ -20,7 +20,7 @@ use crate::routers::grpc::engine::proto_stream_wrapper::{
     ProtoGenerateRequest, ProtoResponseVariant, ProtoStream,
 };
 use crate::routers::grpc::engine::worker_client_cache::{get_grpc_client_from_worker, GrpcClient};
-use crate::routers::prepare::generation_payload::GenerationPayload;
+use crate::routers::prepare::generation_payload::{GenerationPayload, PdMetadata};
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::TokenChunk;
 use crate::routers::token_handle::token_handle::{TokenSource, TokenHandle};
@@ -32,7 +32,7 @@ pub(crate) trait Dispatcher: Send + Sync {
     async fn dispatch(
         &self,
         placement: &PlacementPlan,
-        payload: &GenerationPayload,
+        payload: &mut GenerationPayload,
     ) -> Result<TokenHandle, EngineError>;
 }
 
@@ -41,7 +41,7 @@ impl Dispatcher for GrpcEngine {
     async fn dispatch(
         &self,
         placement: &PlacementPlan,
-        payload: &GenerationPayload,
+        payload: &mut GenerationPayload,
     ) -> Result<TokenHandle, EngineError> {
         GrpcEngine::dispatch(self, placement, payload).await
     }
@@ -58,7 +58,7 @@ impl GrpcEngine {
     pub async fn dispatch(
         &self,
         placement: &PlacementPlan,
-        payload: &GenerationPayload,
+        payload: &mut GenerationPayload,
     ) -> Result<TokenHandle, EngineError> {
         match placement {
             PlacementPlan::Single { worker, .. } => {
@@ -68,12 +68,21 @@ impl GrpcEngine {
             PlacementPlan::Pair {
                 prefill, decode, ..
             } => {
-                let prefill_stream = self
-                    .dispatch_one(prefill, payload, ProtoErrorRole::Prefill)
-                    .await?;
-                let decode_stream = self
-                    .dispatch_one(decode, payload, ProtoErrorRole::Decode)
-                    .await?;
+                payload.pd_metadata = Some(PdMetadata {
+                    bootstrap_host: prefill.bootstrap_host().to_string(),
+                    bootstrap_port: prefill
+                        .bootstrap_port()
+                        .map(|p| p as i32)
+                        .unwrap_or(0),
+                    bootstrap_room: (rand::random::<u32>() & (i32::MAX as u32)) as i32,
+                });
+                let payload_ref: &GenerationPayload = payload;
+                let (prefill_result, decode_result) = tokio::join!(
+                    self.dispatch_one(prefill, payload_ref, ProtoErrorRole::Prefill),
+                    self.dispatch_one(decode, payload_ref, ProtoErrorRole::Decode),
+                );
+                let prefill_stream = prefill_result?;
+                let decode_stream = decode_result?;
                 Ok(merge_pd_streams(
                     prefill_stream,
                     decode_stream,

@@ -25,11 +25,12 @@ use crate::{
         generate::GenerateRequest,
     },
     routers::{
-        comm::error,
         prepare::{self, generation_payload::GenerationPayload, response_context::ResponseContext},
         render,
         comm::{
-            metrics_utils::error_type_from_status, placement_response::placement_err_to_response,
+            error,
+            metrics_utils::error_type_from_status,
+            placement_response::placement_err_to_response,
         },
         token_handle::engine_error::EngineError,
     },
@@ -111,7 +112,7 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (payload, resp_ctx) = match prepare::prepare_chat(req, headers, model_id, &components) {
+        let (mut payload, resp_ctx) = match prepare::prepare_chat(req, headers, model_id, &components) {
             Ok(t) => t,
             Err(e) => return self.record_chat_err(&model, start, e),
         };
@@ -120,7 +121,7 @@ impl Pipeline {
             Err(e) => return self.record_chat_err(&model, start, e),
         };
         let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
-        let stream = match self.engine.dispatch(&placement, &payload).await {
+        let stream = match self.engine.dispatch(&placement, &mut payload).await {
             Ok(s) => s,
             Err(e) => return self.record_chat_err(&model, start, engine_err_to_response(e)),
         };
@@ -165,7 +166,7 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (payload, resp_ctx) =
+        let (mut payload, resp_ctx) =
             match prepare::prepare_generate(req, headers, model_id, &components) {
                 Ok(t) => t,
                 Err(e) => return self.record_generate_err(&model_for_metric, start, e),
@@ -175,7 +176,7 @@ impl Pipeline {
             Err(e) => return self.record_generate_err(&model_for_metric, start, e),
         };
         let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
-        let stream = match self.engine.dispatch(&placement, &payload).await {
+        let stream = match self.engine.dispatch(&placement, &mut payload).await {
             Ok(s) => s,
             Err(e) => {
                 return self.record_generate_err(
@@ -219,12 +220,12 @@ impl Pipeline {
             ));
         }
 
-        let (payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
+        let (mut payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
         let placement = self.plan_for(&payload, &resp_ctx).await?;
         let _guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = self
             .engine
-            .dispatch(&placement, &payload)
+            .dispatch(&placement, &mut payload)
             .await
             .map_err(engine_err_to_response)?;
 

@@ -56,7 +56,7 @@ impl Dispatcher for MockDispatcher {
     async fn dispatch(
         &self,
         placement: &PlacementPlan,
-        _payload: &GenerationPayload,
+        _payload: &mut GenerationPayload,
     ) -> Result<TokenHandle, EngineError> {
         let (placement_kind, worker_url) = match placement {
             PlacementPlan::Single { worker, .. } => ("single", worker.url().to_string()),
