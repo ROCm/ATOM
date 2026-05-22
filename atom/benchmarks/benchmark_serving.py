@@ -28,6 +28,7 @@ On the client side, run:
 import argparse
 import asyncio
 import contextlib
+import functools
 import gc
 import json
 import os
@@ -37,11 +38,16 @@ import warnings
 from argparse import ArgumentParser as FlexibleArgumentParser
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
+
+from atom.entrypoints.openai.chat_encoders import (
+    apply_chat_template,
+    load_custom_message_encoder,
+)
 
 from .backend_request_func import (
     ASYNC_REQUEST_FUNCS,
@@ -92,16 +98,15 @@ def sample_random_requests(
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     use_chat_template: bool = False,
+    apply_chat_template_fn: Callable = lambda x: x,
 ) -> List[Tuple[str, int, int]]:
     prefix_token_ids = np.random.randint(
         0, tokenizer.vocab_size, size=prefix_len
     ).tolist()
 
     if use_chat_template:
-        chat_template_dummy = tokenizer.apply_chat_template(
+        chat_template_dummy = apply_chat_template_fn(
             [{"role": "user", "content": "a"}],
-            add_generation_prompt=True,
-            tokenize=False,
         )
         tokenized_chat_template_dummy = tokenizer.encode(
             chat_template_dummy, add_special_tokens=False
@@ -143,10 +148,8 @@ def sample_random_requests(
             prompt = tokenizer.decode(prompt_token_ids)
 
         if use_chat_template:
-            prompt = tokenizer.apply_chat_template(
+            prompt = apply_chat_template_fn(
                 [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=False,
             )
 
         prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
@@ -705,6 +708,10 @@ def main(args: argparse.Namespace):
         tokenizer_mode=tokenizer_mode,
         trust_remote_code=args.trust_remote_code,
     )
+    custom_encoder = load_custom_message_encoder(model_id)
+    apply_chat_template_fn = functools.partial(
+        apply_chat_template, tokenizer, custom_encoder
+    )
 
     if args.dataset_name == "random":
         input_requests = sample_random_requests(
@@ -714,6 +721,7 @@ def main(args: argparse.Namespace):
             num_prompts=args.num_prompts,
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
+            apply_chat_template_fn=apply_chat_template_fn,
             use_chat_template=args.use_chat_template,
         )
 

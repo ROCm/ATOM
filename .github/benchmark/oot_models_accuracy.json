@@ -185,6 +185,17 @@
     "accuracy_baseline_model": "openai/gpt-oss-120b"
   },
   {
+    "model_name": "GLM-4.7-FP8 TP8",
+    "model_path": "zai-org/GLM-4.7-FP8",
+    "extraArgs": "--tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+    "runner": "linux-atom-mi35x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.92,
+    "accuracy_baseline": 0.9386,
+    "accuracy_baseline_model": "zai-org/GLM-4.7-FP8"
+  },
+  {
     "model_name": "GLM-5.1-FP8 TP8",
     "model_path": "zai-org/GLM-5.1-FP8",
     "extraArgs": "--tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",

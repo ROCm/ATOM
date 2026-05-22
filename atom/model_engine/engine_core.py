@@ -192,12 +192,31 @@ class EngineCore:
 
     def _process_engine_step(self):
         result = self.scheduler.schedule()
+
+        # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
+        # the scheduler) through the same finished-seq path as normal seqs.
+        # Without this, `llm.generate()` blocks forever waiting for an output
+        # the rejected seq will never produce.
+        rejected = self.scheduler.take_rejected()
+        if rejected:
+            self.output_queue.put_nowait(rejected)
+
         if result is None:
+            if self.kv_transfer_enabled:
+                kvoutput = self.runner_mgr.call_func_with_aggregation(
+                    "async_proc_aggregation"
+                )
+                self.scheduler._update_from_kv_xfer_finished(kvoutput)
             return False
         scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
+            if self.kv_transfer_enabled:
+                kvoutput = self.runner_mgr.call_func_with_aggregation(
+                    "async_proc_aggregation"
+                )
+                self.scheduler._update_from_kv_xfer_finished(kvoutput)
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)

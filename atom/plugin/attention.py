@@ -22,6 +22,17 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 
 
+def _get_aiter_kv_cache_dtype(config) -> torch.dtype:
+    kv_cache_dtype = config.cache_config.cache_dtype
+    if kv_cache_dtype == "auto":
+        kv_cache_dtype = "bf16"
+    elif kv_cache_dtype == "bfloat16":
+        kv_cache_dtype = "bf16"
+    elif kv_cache_dtype == "float16":
+        kv_cache_dtype = "fp16"
+    return dtypes.d_dtypes[kv_cache_dtype]
+
+
 @dataclass
 class AiterFlashAttentionPhaseMetadata:
     max_query_len: int
@@ -375,6 +386,9 @@ class vllmAttentionMetadataBuilderMethods:
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
+        # The spec-decode draft path invalidates it between proposal steps when
+        # num_speculative_tokens > 1.
+        # Fall back to seq_lens - query_lens computed on already-CPU tensors.
         num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
         # In async spec-decode mode (auto-enabled for MTP/EAGLE), vLLM sets
         # _num_computed_tokens_cpu to None because the GPU seq_lens is the
@@ -1296,7 +1310,7 @@ def create_mla_attn_metadata_builder_init_method(base_class):
             1,
             self.padded_num_attention_heads,
             torch.bfloat16,
-            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            _get_aiter_kv_cache_dtype(config),
             is_sparse=False,  # TODO: support sparse
             fast_mode=True,
         )
@@ -2380,7 +2394,7 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
             1,
             self.padded_num_heads,
             torch.bfloat16,
-            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            _get_aiter_kv_cache_dtype(config),
             is_sparse=True,
             fast_mode=True,
         )
@@ -2477,7 +2491,14 @@ def unified_attention_with_output_base_for_plugin_mode(
         # ATOM needs to handle all of the buffer here
         # Positions for compiled unified_attention are provided via vLLM ForwardContext
         # (atom_positions) in ATOMModelBase.forward, not via this Python arg.
-        if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        #
+        # RoPE single-source-of-truth in plugin mode: when ATOM's
+        # PagedAttentionImpl is active, it applies RoPE inside
+        # rope_cache_plugin_mode. Applying RoPE here too would double apply
+        # it for any model hitting the "else" branch in rope_cache_plugin_mode when
+        # ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION is not set.
+        # if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        if current_atom_config.plugin_config.vllm_use_atom_attention:
             output = self.attn(q, k, v)
         else:
             # calculate the q and k with rotary embedding

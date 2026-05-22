@@ -103,8 +103,11 @@ def _fused_compress_attn_kernel(
     HALF_ROPE: tl.constexpr,  # = rope_head_dim // 2
     OVERLAP: tl.constexpr,
     RATIO: tl.constexpr,
-    STATE_SIZE: tl.constexpr,  # = 2*RATIO if OVERLAP else RATIO
-    K: tl.constexpr,  # = STATE_SIZE (softmax-pool reduce dim)
+    STATE_SIZE: tl.constexpr,  # ring buffer modulo = kv_state.shape[1] (≥ K_pool;
+    #   for spec decode is K_pool + max_spec_steps + 1 to avoid R+1 re-commit
+    #   borrow-reads of prior round's reject K/V; for non-spec decode is K_pool)
+    K: tl.constexpr,  # pool-window reduce dim (= 2*RATIO if OVERLAP else RATIO);
+    #   ≤ STATE_SIZE; used for `s = position - K + 1 + k_static` loop bound
     HAS_BLOCK_TABLE: tl.constexpr,
     QUANT: tl.constexpr,  # 0 = raw BF16 (CSA/HCA Main), 1 = FP8 e4m3 + ue8m0 scale (Indexer)
     USE_UE8M0: tl.constexpr,  # round scale to power-of-2 (only when QUANT == 1)
@@ -409,12 +412,17 @@ def fused_compress_attn(
 
     # Validate shapes
     dim_full = (2 if overlap else 1) * head_dim
-    state_size = (2 if overlap else 1) * ratio
+    K_pool = (2 if overlap else 1) * ratio  # pool window size (algorithm-defined)
+    state_size = kv_state.shape[
+        1
+    ]  # ring buffer modulo (≥ K_pool; spec path enlarges to K_pool + max_spec_steps + 1)
     assert (
         kv_in.dim() == 2 and kv_in.shape[1] == dim_full
     ), f"kv_in {kv_in.shape}, expected [*, {dim_full}]"
     assert score_in.shape == kv_in.shape
-    assert kv_state.shape[1] == state_size and kv_state.shape[2] == dim_full
+    assert (
+        state_size >= K_pool and kv_state.shape[2] == dim_full
+    ), f"kv_state {kv_state.shape}, expected [*, ≥{K_pool}, {dim_full}]"
     assert score_state.shape == kv_state.shape
     assert ape.shape == (ratio, dim_full)
     assert rms_weight.shape == (head_dim,)
@@ -470,7 +478,7 @@ def fused_compress_attn(
 
     BLOCK_D = triton.next_power_of_2(head_dim)
     HALF_ROPE = rope_head_dim // 2
-    K = state_size
+    K = K_pool  # pool window reduce-dim (constexpr; not equal to ring modulo)
 
     # Cache-scale args (only consumed by the quant path; pass placeholders
     # otherwise so the constexpr branch is never taken).
@@ -559,8 +567,8 @@ def fused_compress_attn_reference(
     if plan.num_compress == 0:
         return None
     device = kv_in.device
-    K = (2 if overlap else 1) * ratio
-    state_size = K
+    K = (2 if overlap else 1) * ratio  # pool window
+    state_size = kv_state.shape[1]  # ring buffer modulo (≥ K)
     plan_cpu = plan.compress_plan_gpu.detach().cpu()
     slot_map_cpu = state_slot_mapping.detach().cpu()
     if block_tables is not None:

@@ -232,7 +232,7 @@ class MiniMaxM2Attention(nn.Module):
             # TP-aware RMSNorm: all-reduce variance across TP ranks so
             # normalization uses the global variance (over 6144/1024 dims)
             # rather than per-rank variance (768/128 dims).
-            if qkv.shape[0] <= 64 and self.tp_size > 1:
+            if qkv.shape[0] <= 256 and self.tp_size > 1:
                 q, k, v = tensor_model_parallel_fused_qknorm_allreduce(
                     qkv, self.q_norm.weight, self.k_norm.weight, self.rms_norm_eps
                 )
