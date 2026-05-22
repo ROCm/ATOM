@@ -88,8 +88,7 @@ class LLMEngine:
             # otherwise check num elements first
             if len(prompt_or_tokens_list) != len(sampling_params_list):
                 raise ValueError(
-                    "number of elements in prompt_or_tokens_list and "
-                    "sampling_params_list is different: "
+                    f"number of elements in prompt_or_tokens_list and sampling_params_list is different: "
                     f"{len(prompt_or_tokens_list)=} vs {len(sampling_params_list)=}"
                 )
             sampling_params_iter = sampling_params_list
@@ -100,8 +99,7 @@ class LLMEngine:
         elif isinstance(stream_callback, list):
             if len(stream_callback) != len(prompt_or_tokens_list):
                 raise ValueError(
-                    "number of elements in prompt_or_tokens_list and "
-                    "stream_callback is different: "
+                    f"number of elements in prompt_or_tokens_list and stream_callback is different: "
                     f"{len(prompt_or_tokens_list)=} vs {len(stream_callback)=}"
                 )
             stream_callback_iter = stream_callback
@@ -361,10 +359,9 @@ class InputOutputProcessor:
 
             logger.info(
                 f"Request {req.id} finished with reason {req.leave_reason}. "
-                f"Input tokens: {req.num_prompt_tokens}, output tokens: "
-                f"{req.num_completion_tokens}, latency: "
-                f"{req.leave_time - req.arrive_time:.2f}s, TTFT: {ttft:.3f}s, "
-                f"TPOT: {tpot:.3f}s"
+                f"Input tokens: {req.num_prompt_tokens}, output tokens: {req.num_completion_tokens}, "
+                f"latency: {req.leave_time - req.arrive_time:.2f}s, "
+                f"TTFT: {ttft:.3f}s, TPOT: {tpot:.3f}s"
                 # f"{req.completion_token_ids}"
             )
             outputs[req.id] = {
