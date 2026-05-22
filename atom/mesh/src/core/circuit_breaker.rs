@@ -5,7 +5,7 @@ use std::{
 
 use tracing::info;
 
-use crate::observability::metrics::Metrics;
+use crate::observability::metrics::MeshMetrics;
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone)]
@@ -124,7 +124,7 @@ impl CircuitBreaker {
     /// Create a new circuit breaker with custom configuration and metric label
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
         let init_state = CircuitState::Closed;
-        Metrics::set_worker_cb_state(&metric_label, init_state.to_int());
+        MeshMetrics::set_worker_cb_state(&metric_label, init_state.to_int());
         Self {
             state: AtomicU8::new(STATE_CLOSED),
             consecutive_failures: AtomicU32::new(0),
@@ -188,8 +188,8 @@ impl CircuitBreaker {
                     self.consecutive_successes.store(0, Ordering::Release);
 
                     info!("Circuit breaker state transition: open -> half_open");
-                    Metrics::record_worker_cb_transition(&self.metric_label, "open", "half_open");
-                    Metrics::set_worker_cb_state(&self.metric_label, STATE_HALF_OPEN);
+                    MeshMetrics::record_worker_cb_transition(&self.metric_label, "open", "half_open");
+                    MeshMetrics::set_worker_cb_state(&self.metric_label, STATE_HALF_OPEN);
                     self.publish_gauge_metrics();
                     return CircuitState::HalfOpen;
                 }
@@ -209,7 +209,7 @@ impl CircuitBreaker {
         }
 
         let outcome_str = if success { "success" } else { "failure" };
-        Metrics::record_worker_cb_outcome(&self.metric_label, outcome_str);
+        MeshMetrics::record_worker_cb_outcome(&self.metric_label, outcome_str);
         self.publish_gauge_metrics();
     }
 
@@ -284,8 +284,8 @@ impl CircuitBreaker {
             let from = old_state.as_str();
             let to = new_state.as_str();
             info!("Circuit breaker state transition: {} -> {}", from, to);
-            Metrics::record_worker_cb_transition(&self.metric_label, from, to);
-            Metrics::set_worker_cb_state(&self.metric_label, new_state.to_int());
+            MeshMetrics::record_worker_cb_transition(&self.metric_label, from, to);
+            MeshMetrics::set_worker_cb_state(&self.metric_label, new_state.to_int());
             self.publish_gauge_metrics();
         }
     }
@@ -374,11 +374,11 @@ impl CircuitBreaker {
     }
 
     fn publish_gauge_metrics(&self) {
-        Metrics::set_worker_cb_consecutive_failures(
+        MeshMetrics::set_worker_cb_consecutive_failures(
             &self.metric_label,
             self.consecutive_failures(),
         );
-        Metrics::set_worker_cb_consecutive_successes(
+        MeshMetrics::set_worker_cb_consecutive_successes(
             &self.metric_label,
             self.consecutive_successes(),
         );

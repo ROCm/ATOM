@@ -27,7 +27,7 @@ pub use crate::core::token_bucket::TokenBucket;
 use crate::{
     observability::{
         inflight_tracker::InFlightRequestTracker,
-        metrics::{method_to_static_str, metrics_labels, Metrics},
+        metrics::{method_to_static_str, metrics_labels, MeshMetrics},
     },
     routers::comm::error::extract_error_code_from_response,
     server::AppState,
@@ -247,7 +247,7 @@ impl<B> OnRequest<B> for RequestLogger {
 
         let method = method_to_static_str(request.method().as_str());
         let path = normalize_path_for_metrics(request.uri().path());
-        Metrics::record_http_request(method, &path);
+        MeshMetrics::record_http_request(method, &path);
 
         // Log the request start
         info!(
@@ -269,7 +269,7 @@ impl<B> OnResponse<B> for ResponseLogger {
         let error_code = extract_error_code_from_response(response);
 
         // Layer 1: HTTP metrics
-        Metrics::record_http_response(status_code, error_code);
+        MeshMetrics::record_http_response(status_code, error_code);
 
         // Record these in the span for structured logging/observability tools
         span.record("status_code", status_code);
@@ -430,7 +430,7 @@ pub async fn concurrency_limit_middleware(
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
-        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+        MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
         let response = next.run(request).await;
 
         // Wrap the response body with TokenGuardBody to return token when stream ends
@@ -459,7 +459,7 @@ pub async fn concurrency_limit_middleware(
                     match permit_rx.await {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+                            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
 
                             let response = next.run(request).await;
 
@@ -470,25 +470,25 @@ pub async fn concurrency_limit_middleware(
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                             status.into_response()
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
                     }
                 }
                 Err(_) => {
                     warn!("Request queue is full, returning 429");
-                    Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                    MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                     StatusCode::TOO_MANY_REQUESTS.into_response()
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
-            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
     }
@@ -557,7 +557,7 @@ where
         Box::pin(async move {
             // Increment inside async block - ensures no leak if future is dropped before polling
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
-            Metrics::set_http_connections_active(active as usize);
+            MeshMetrics::set_http_connections_active(active as usize);
 
             let guard = in_flight_request_tracker.track();
 
@@ -568,12 +568,12 @@ where
 
             // Always decrement, regardless of success or failure
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            Metrics::set_http_connections_active(active as usize);
+            MeshMetrics::set_http_connections_active(active as usize);
 
             let response = result?;
 
             let duration = start.elapsed();
-            Metrics::record_http_duration(method, &path, duration);
+            MeshMetrics::record_http_duration(method, &path, duration);
 
             Ok(response)
         })
