@@ -96,21 +96,17 @@ def _log_request_event(event_type: str, request_id: str, data: Any) -> None:
 
 
 async def _logged_stream(
-    gen: AsyncGenerator[str, None], request_id: str, seq_ids: List[int]
+    gen: AsyncGenerator[str, None], request_id: str
 ) -> AsyncGenerator[str, None]:
-    """Log a stream and clean request state on completion or disconnect."""
-    try:
-        async for chunk in gen:
-            if _request_logger is not None and chunk.startswith("data: "):
-                payload = chunk[6:].strip()
-                if payload != "[DONE]":
-                    _log_request_event("stream_chunk", request_id, json.loads(payload))
-                else:
-                    _log_request_event("stream_done", request_id, None)
-            yield chunk
-    finally:
-        for seq_id in seq_ids:
-            cleanup_streaming_request(request_id, seq_id)
+    """Log streaming response chunks."""
+    async for chunk in gen:
+        if _request_logger is not None and chunk.startswith("data: "):
+            payload = chunk[6:].strip()
+            if payload != "[DONE]":
+                _log_request_event("stream_chunk", request_id, json.loads(payload))
+            else:
+                _log_request_event("stream_done", request_id, None)
+        yield chunk
 
 
 # ============================================================================
@@ -864,7 +860,6 @@ async def chat_completions(request: ChatCompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
-                cleanup_seq_ids = seq_ids
             else:
                 seq_id, stream_queue = await setup_streaming_request(
                     prompt, sampling_params, request_id
@@ -878,9 +873,8 @@ async def chat_completions(request: ChatCompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
-                cleanup_seq_ids = [seq_id]
             return StreamingResponse(
-                _logged_stream(gen, request_id, cleanup_seq_ids),
+                _logged_stream(gen, request_id),
                 media_type="text/event-stream",
             )
 
@@ -951,7 +945,6 @@ async def completions(request: CompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
-                cleanup_seq_ids = seq_ids
             else:
                 seq_id, stream_queue = await setup_streaming_request(
                     request.prompt,
@@ -968,9 +961,8 @@ async def completions(request: CompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
-                cleanup_seq_ids = [seq_id]
             return StreamingResponse(
-                _logged_stream(gen, request_id, cleanup_seq_ids),
+                _logged_stream(gen, request_id),
                 media_type="text/event-stream",
             )
 
