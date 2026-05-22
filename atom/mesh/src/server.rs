@@ -44,7 +44,7 @@ use crate::{
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
-    routers::{conversations, parse, router_manager::RouterManager, tokenize, RouterTrait},
+    routers::{comm::{conversations, parse, tokenize}, router_manager::RouterManager, RouterTrait},
     tokenizer::TokenizerRegistry,
 };
 #[derive(Clone)]

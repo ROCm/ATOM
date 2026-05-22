@@ -1,3 +1,5 @@
+//! gRPC router for regular (single-worker) chat/generate/completion paths.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -5,17 +7,11 @@ use axum::{http::HeaderMap, response::Response};
 use tracing::debug;
 
 use super::{
-    common::responses::{
-        handlers::{cancel_response_impl, get_response_impl},
-        ResponsesContext,
-    },
     completion_adapter::{
         completion_to_generate, wrap_generate_response_as_completion,
         wrap_streaming_generate_as_completion,
     },
-    context::SharedComponents,
-    pipeline::RequestPipeline,
-    regular::responses,
+    pipeline::Pipeline,
 };
 use crate::{
     app_context::AppContext,
@@ -28,60 +24,42 @@ use crate::{
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{error, RouterTrait},
+    routers::{
+        comm::error,
+        openai::responses::{
+            context::ResponsesContext,
+            handlers as responses_handlers,
+            retrieve::{cancel_response_impl, get_response_impl},
+        },
+        RouterTrait,
+    },
 };
 
-/// gRPC router implementation for SGLang
 #[derive(Clone)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
-    pipeline: RequestPipeline,
-    shared_components: Arc<SharedComponents>,
+    pipeline: Pipeline,
+    app_context: Arc<AppContext>,
     responses_context: ResponsesContext,
     retry_config: RetryConfig,
 }
 
 impl GrpcRouter {
-    /// Create a new gRPC router
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
-        // Get tokenizer registry (no longer requires pre-loaded tokenizer)
-        let tokenizer_registry = ctx.tokenizer_registry.clone();
-
-        let reasoning_parser_factory = ctx
-            .reasoning_parser_factory
-            .as_ref()
-            .ok_or_else(|| "gRPC router requires reasoning parser factory".to_string())?
-            .clone();
-        let tool_parser_factory = ctx
-            .tool_parser_factory
-            .as_ref()
-            .ok_or_else(|| "gRPC router requires tool parser factory".to_string())?
-            .clone();
+        if ctx.reasoning_parser_factory.is_none() {
+            return Err("gRPC router requires reasoning parser factory".to_string());
+        }
+        if ctx.tool_parser_factory.is_none() {
+            return Err("gRPC router requires tool parser factory".to_string());
+        }
 
         let worker_registry = ctx.worker_registry.clone();
-        let _policy_registry = ctx.policy_registry.clone();
+        let pipeline = Pipeline::new_regular(worker_registry.clone(), ctx.policy_registry.clone());
+        let app_context = ctx.clone();
 
-        // Create shared components for pipeline
-        let shared_components = Arc::new(SharedComponents {
-            tokenizer_registry: tokenizer_registry.clone(),
-            tool_parser_factory: tool_parser_factory.clone(),
-            reasoning_parser_factory: reasoning_parser_factory.clone(),
-        });
-
-        // Create regular pipeline
-        let pipeline = RequestPipeline::new_regular(
-            worker_registry.clone(),
-            _policy_registry.clone(),
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            ctx.configured_tool_parser.clone(),
-            ctx.configured_reasoning_parser.clone(),
-        );
-
-        // Create responses context
         let responses_context = ResponsesContext::new(
             Arc::new(pipeline.clone()),
-            shared_components.clone(),
+            app_context.clone(),
             ctx.response_storage.clone(),
             ctx.conversation_storage.clone(),
             ctx.conversation_item_storage.clone(),
@@ -90,13 +68,12 @@ impl GrpcRouter {
         Ok(GrpcRouter {
             worker_registry,
             pipeline,
-            shared_components,
+            app_context,
             responses_context,
             retry_config: ctx.router_config.effective_retry_config(),
         })
     }
 
-    /// Main route_chat implementation
     async fn route_chat_impl(
         &self,
         headers: Option<&HeaderMap>,
@@ -110,15 +87,13 @@ impl GrpcRouter {
 
         let pipeline = &self.pipeline;
 
-        // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
-        let components = self.shared_components.clone();
+        let components = self.app_context.clone();
 
         RetryExecutor::execute_response_with_retry(
             &self.retry_config,
-            // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
                 let request = Arc::clone(&request);
                 let headers = headers_cloned.clone();
@@ -130,9 +105,7 @@ impl GrpcRouter {
                         .await
                 }
             },
-            // Should retry: check if status is retryable
             |res, _attempt| is_retryable_status(res.status()),
-            // On backoff: record retry metrics
             |delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::WORKER_REGULAR,
@@ -140,7 +113,6 @@ impl GrpcRouter {
                 );
                 Metrics::record_worker_retry_backoff(attempt, delay);
             },
-            // On exhausted: record exhaustion
             || {
                 Metrics::record_worker_retries_exhausted(
                     metrics_labels::WORKER_REGULAR,
@@ -151,7 +123,6 @@ impl GrpcRouter {
         .await
     }
 
-    /// Main route_generate implementation
     async fn route_generate_impl(
         &self,
         headers: Option<&HeaderMap>,
@@ -163,16 +134,14 @@ impl GrpcRouter {
             model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
 
-        // Clone values needed for retry closure
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(|s| s.to_string());
-        let components = self.shared_components.clone();
+        let components = self.app_context.clone();
         let pipeline = &self.pipeline;
 
         RetryExecutor::execute_response_with_retry(
             &self.retry_config,
-            // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
                 let request = Arc::clone(&request);
                 let headers = headers_cloned.clone();
@@ -184,9 +153,7 @@ impl GrpcRouter {
                         .await
                 }
             },
-            // Should retry: check if status is retryable
             |res, _attempt| is_retryable_status(res.status()),
-            // On backoff: record retry metrics
             |delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::WORKER_REGULAR,
@@ -194,7 +161,6 @@ impl GrpcRouter {
                 );
                 Metrics::record_worker_retry_backoff(attempt, delay);
             },
-            // On exhausted: record exhaustion
             || {
                 Metrics::record_worker_retries_exhausted(
                     metrics_labels::WORKER_REGULAR,
@@ -205,14 +171,13 @@ impl GrpcRouter {
         .await
     }
 
-    /// Main route_responses implementation
     async fn route_responses_impl(
         &self,
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        responses::route_responses(
+        responses_handlers::route_responses(
             &self.responses_context,
             Arc::new(body.clone()),
             headers.cloned(),

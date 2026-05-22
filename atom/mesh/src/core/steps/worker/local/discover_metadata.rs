@@ -14,7 +14,7 @@ use super::strip_protocol;
 use crate::{
     config::BackendType,
     core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
-    routers::grpc::client::GrpcClient,
+    routers::grpc::engine::worker_client_cache::GrpcClient,
 };
 
 // HTTP client for metadata fetching

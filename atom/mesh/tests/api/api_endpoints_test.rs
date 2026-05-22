@@ -663,7 +663,7 @@ mod responses_endpoint_tests {
 
         let payload = json!({
             "input": "Hello Responses API",
-            "model": "mock-model",
+            "model": "test-model",
             "stream": false
         });
 
@@ -702,7 +702,7 @@ mod responses_endpoint_tests {
 
         let payload = json!({
             "input": "Hello Responses API",
-            "model": "mock-model",
+            "model": "test-model",
             "stream": true
         });
 
@@ -745,7 +745,7 @@ mod responses_endpoint_tests {
         let resp_id = "test-get-resp-id-123";
         let payload = json!({
             "input": "Hello Responses API",
-            "model": "mock-model",
+            "model": "test-model",
             "stream": false,
             "store": true,
             "background": true,
@@ -794,7 +794,7 @@ mod responses_endpoint_tests {
         let resp_id = "test-cancel-resp-id-456";
         let payload = json!({
             "input": "Hello Responses API",
-            "model": "mock-model",
+            "model": "test-model",
             "stream": false,
             "store": true,
             "background": true,
@@ -880,7 +880,7 @@ mod responses_endpoint_tests {
         let rid = format!("resp_{}", 18960); // arbitrary unique id
         let payload = json!({
             "input": "Hello Responses API",
-            "model": "mock-model",
+            "model": "test-model",
             "background": true,
             "store": true,
             "request_id": rid,
@@ -1104,8 +1104,12 @@ mod error_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        // Mock worker accepts any model, but real implementation might return 400
-        assert!(resp.status().is_success() || resp.status() == StatusCode::BAD_REQUEST);
+        // Real implementation may accept (mock), 400, or 503 (model_not_found from planner).
+        assert!(
+            resp.status().is_success()
+                || resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+        );
 
         ctx.shutdown().await;
     }

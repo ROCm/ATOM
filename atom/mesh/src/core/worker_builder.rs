@@ -7,7 +7,9 @@ use super::{
         WorkerRoutingKeyLoad, WorkerType,
     },
 };
-use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
+use crate::{
+    observability::metrics::Metrics, routers::grpc::engine::worker_client_cache::GrpcClient,
+};
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {

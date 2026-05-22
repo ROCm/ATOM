@@ -229,6 +229,7 @@ async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
 
     Json(json!({
         "model_path": "mock-model-path",
+        "served_model_name": "test-model",
         "tokenizer_path": "mock-tokenizer-path",
         "port": config.port,
         "host": "127.0.0.1",

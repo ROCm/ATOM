@@ -17,17 +17,9 @@ pub trait BackendAdapter: Send + Sync {
         decode: &dyn Worker,
     ) -> Result<PairCtx, AdapterError>;
 
-    fn inject_prefill_fields(
-        &self,
-        body: &mut Value,
-        ctx: &PairCtx,
-    ) -> Result<(), AdapterError>;
+    fn inject_prefill_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError>;
 
-    fn inject_decode_fields(
-        &self,
-        body: &mut Value,
-        ctx: &PairCtx,
-    ) -> Result<(), AdapterError>;
+    fn inject_decode_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError>;
 
     fn inject_batch_prefill_fields(
         &self,
