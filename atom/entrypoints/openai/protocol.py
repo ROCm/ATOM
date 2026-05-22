@@ -52,8 +52,10 @@ class ChatMessage(BaseModel):
     @staticmethod
     def _normalize_tool_calls(tool_calls: Any) -> Any:
         """Decode OpenAI JSON-string tool arguments for chat templates."""
-        if not isinstance(tool_calls, list):
+        if tool_calls is None:
             return tool_calls
+        if not isinstance(tool_calls, list):
+            raise ValueError(f"tool_calls must be a list, got {type(tool_calls)!r}")
 
         normalized = []
         for item in tool_calls:

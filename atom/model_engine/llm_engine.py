@@ -271,8 +271,10 @@ class InputOutputProcessor:
             max_tokens = 0
         elif isinstance(raw_max_tokens, bool) or not isinstance(raw_max_tokens, int):
             raise ValueError("max_tokens must be an integer or None")
+        elif raw_max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative")
         else:
-            max_tokens = max(0, raw_max_tokens)
+            max_tokens = raw_max_tokens
         if max_model_len is not None and prompt_len + max_tokens > max_model_len:
             raise ValueError(
                 f"Requested context length is {prompt_len + max_tokens} "

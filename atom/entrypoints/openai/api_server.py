@@ -70,6 +70,7 @@ default_chat_template_kwargs: Dict[str, Any] = {}
 custom_message_encoder: Optional[Any] = None
 _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
+_seq_id_to_sibling_index: Dict[int, int] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
 _request_start_times: Dict[str, float] = {}
 _stream_decode_states: Dict[str, Dict[int, Dict[str, Any]]] = {}
@@ -391,6 +392,8 @@ def _enqueue_decoded_stream_chunk_tagged(
     """Decode and enqueue one fan-out stream chunk on the event loop thread."""
     if _stream_queues.get(request_id) is not stream_queue:
         return
+    if sibling_index not in _stream_decode_states.get(request_id, {}):
+        return
     new_text = _decode_stream_delta(
         (request_id, sibling_index),
         output_tokens,
@@ -644,7 +647,7 @@ async def setup_streaming_request(
     kv_transfer_params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, asyncio.Queue]:
     """Set up a streaming request with the engine."""
-    global engine, _stream_queues, _seq_id_to_request_id
+    global engine, _stream_queues, _seq_id_to_request_id, _seq_id_to_sibling_index
     global _stream_loops, _request_start_times
 
     stream_queue: asyncio.Queue = asyncio.Queue()
@@ -666,6 +669,7 @@ async def setup_streaming_request(
             kv_transfer_params=kv_transfer_params,
         )
         _seq_id_to_request_id[seq.id] = request_id
+        _seq_id_to_sibling_index[seq.id] = 0
         return seq
 
     seq = await executor_loop.run_in_executor(None, do_preprocess)
@@ -682,18 +686,27 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     """Clean up resources for a streaming request.
 
     Safe to call multiple times for the same ``request_id`` with different
-    ``seq_id`` values (as happens in fan-out cleanup): the per-request
-    dicts use ``dict.pop(..., None)`` so repeated removal is a no-op.
+    ``seq_id`` values (as happens in fan-out cleanup): request-scoped state is
+    retained until the last active sibling is removed.
     """
-    global engine, _stream_queues, _seq_id_to_request_id
+    global engine, _stream_queues, _seq_id_to_request_id, _seq_id_to_sibling_index
     global _stream_loops, _request_start_times, _stream_decode_states
 
-    _stream_queues.pop(request_id, None)
     _seq_id_to_request_id.pop(seq_id, None)
+    sibling_index = _seq_id_to_sibling_index.pop(seq_id, None)
+    if sibling_index is not None:
+        states_for_request = _stream_decode_states.get(request_id)
+        if states_for_request is not None:
+            states_for_request.pop(sibling_index, None)
+    engine.io_processor.requests.pop(seq_id, None)
+
+    if request_id in _seq_id_to_request_id.values():
+        return
+
+    _stream_queues.pop(request_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
     _stream_decode_states.pop(request_id, None)
-    engine.io_processor.requests.pop(seq_id, None)
 
 
 async def setup_streaming_request_fanout(
@@ -708,7 +721,7 @@ async def setup_streaming_request_fanout(
     queue. Every callback pushes ``(sibling_index, chunk_data)`` tuples so
     the merge-stream consumer can rewrite ``choices[0].index`` correctly.
     """
-    global engine, _stream_queues, _seq_id_to_request_id
+    global engine, _stream_queues, _seq_id_to_request_id, _seq_id_to_sibling_index
     global _stream_loops, _request_start_times
 
     n = int(sampling_params.n)
@@ -740,8 +753,9 @@ async def setup_streaming_request_fanout(
             kv_transfer_params=kv_transfer_params,
             parent_request_id=request_id,
         )
-        for seq in seqs:
+        for idx, seq in enumerate(seqs):
             _seq_id_to_request_id[seq.id] = request_id
+            _seq_id_to_sibling_index[seq.id] = idx
         return seqs
 
     seqs = await executor_loop.run_in_executor(None, do_preprocess)

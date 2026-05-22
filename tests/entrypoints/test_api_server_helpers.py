@@ -140,10 +140,18 @@ class TestStreamDecodeDelta:
     def setup_method(self):
         api_server._stream_decode_states.clear()
         api_server._stream_queues.clear()
+        api_server._stream_loops.clear()
+        api_server._request_start_times.clear()
+        api_server._seq_id_to_request_id.clear()
+        api_server._seq_id_to_sibling_index.clear()
 
     def teardown_method(self):
         api_server._stream_decode_states.clear()
         api_server._stream_queues.clear()
+        api_server._stream_loops.clear()
+        api_server._request_start_times.clear()
+        api_server._seq_id_to_request_id.clear()
+        api_server._seq_id_to_sibling_index.clear()
 
     def test_withholds_replacement_char_until_sequence_resolves(self, monkeypatch):
         class FakeTokenizer:
@@ -279,9 +287,41 @@ class TestStreamDecodeDelta:
         assert "token_ids" not in state
         assert "output_text" not in state
 
-    def test_cleanup_removes_request_decode_bucket(self, monkeypatch):
+    def test_slow_tokenizer_added_vocab_path(self, monkeypatch):
+        class FakeTokenizer:
+            is_fast = False
+            all_special_tokens = ["<special>"]
+
+            def __len__(self):
+                return 4
+
+            def get_added_vocab(self):
+                return {"<tool>": 2}
+
+            def convert_ids_to_tokens(self, token_ids, skip_special_tokens=True):
+                vocab = {0: "a", 1: "b", 2: "<tool>", 3: "<special>"}
+                return [vocab[token_id] for token_id in token_ids]
+
+            def convert_tokens_to_string(self, tokens):
+                return "".join(tokens)
+
+        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+
+        assert api_server._decode_stream_delta(("req", 0), [0]) == "a"
+        assert api_server._decode_stream_delta(("req", 0), [2]) == " <tool>"
+        assert api_server._decode_stream_delta(("req", 0), [1]) == " b"
+        assert api_server._decode_stream_delta(("req", 0), [3]) == ""
+
+    def test_cleanup_keeps_request_state_until_last_seq(self, monkeypatch):
         api_server._stream_decode_states["req-a"] = {0: {}, 1: {}}
         api_server._stream_decode_states["req-b"] = {0: {}}
+        api_server._stream_queues["req-a"] = asyncio.Queue()
+        api_server._stream_loops["req-a"] = object()
+        api_server._request_start_times["req-a"] = 1.0
+        api_server._seq_id_to_request_id[11] = "req-a"
+        api_server._seq_id_to_request_id[12] = "req-a"
+        api_server._seq_id_to_sibling_index[11] = 0
+        api_server._seq_id_to_sibling_index[12] = 1
         fake_engine = SimpleNamespace(
             io_processor=SimpleNamespace(requests={11: "seq-a", 12: "seq-b"})
         )
@@ -289,10 +329,21 @@ class TestStreamDecodeDelta:
 
         api_server.cleanup_streaming_request("req-a", 11)
 
-        assert "req-a" not in api_server._stream_decode_states
-        assert "req-b" in api_server._stream_decode_states
         assert 11 not in fake_engine.io_processor.requests
         assert 12 in fake_engine.io_processor.requests
+        assert api_server._stream_decode_states["req-a"] == {1: {}}
+        assert "req-a" in api_server._stream_queues
+        assert "req-a" in api_server._stream_loops
+        assert "req-a" in api_server._request_start_times
+
+        api_server.cleanup_streaming_request("req-a", 12)
+
+        assert "req-a" not in api_server._stream_decode_states
+        assert "req-a" not in api_server._stream_queues
+        assert "req-a" not in api_server._stream_loops
+        assert "req-a" not in api_server._request_start_times
+        assert "req-b" in api_server._stream_decode_states
+        assert 12 not in fake_engine.io_processor.requests
 
     def test_send_stream_chunk_direct_decodes_on_event_loop(self, monkeypatch):
         class FakeTokenizer:
@@ -374,6 +425,28 @@ class TestStreamDecodeDelta:
         )
 
         assert "req" not in api_server._stream_decode_states
+        assert stream_queue.empty()
+
+    def test_tagged_enqueue_skips_cleaned_sibling(self, monkeypatch):
+        class FakeTokenizer:
+            is_fast = True
+
+            def __len__(self):
+                return 1
+
+            def get_added_vocab(self):
+                return {}
+
+        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+        stream_queue = asyncio.Queue()
+        api_server._stream_queues["req"] = stream_queue
+        api_server._stream_decode_states["req"] = {1: {}}
+
+        api_server._enqueue_decoded_stream_chunk_tagged(
+            "req", 0, [0], False, None, None, stream_queue
+        )
+
+        assert api_server._stream_decode_states["req"] == {1: {}}
         assert stream_queue.empty()
 
 

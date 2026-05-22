@@ -149,6 +149,29 @@ class TestChatMessage:
         with pytest.raises(ValueError, match="tool_calls entries must be dicts"):
             msg.to_template_dict()
 
+    def test_to_template_dict_rejects_non_list_tool_calls(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": {"id": "call_0"},
+            }
+        )
+
+        with pytest.raises(ValueError, match="tool_calls must be a list"):
+            msg.to_template_dict()
+
+    def test_to_template_dict_preserves_none_tool_calls(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": None,
+            }
+        )
+
+        assert msg.to_template_dict()["tool_calls"] is None
+
     def test_to_template_dict_rejects_falsy_non_dict_function_value(self):
         msg = ChatMessage.model_validate(
             {

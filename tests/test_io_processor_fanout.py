@@ -180,3 +180,10 @@ class TestPreprocessFanout:
 
         with pytest.raises(ValueError, match="max_tokens must be an integer"):
             proc.preprocess_fanout("hello", SamplingParams(n=1, max_tokens=max_tokens))
+
+    def test_fanout_rejects_negative_max_tokens(self):
+        proc = _make_processor()
+        proc.config.max_model_len = 8
+
+        with pytest.raises(ValueError, match="max_tokens must be non-negative"):
+            proc.preprocess_fanout("hello", SamplingParams(n=1, max_tokens=-1))
