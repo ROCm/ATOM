@@ -119,6 +119,24 @@ class TestChatMessage:
         assert d["content"] == ""
         assert d["tool_calls"][0]["function"]["arguments"] == {}
 
+    def test_to_template_dict_with_whitespace_only_tool_call_arguments(self):
+        """Whitespace-only OpenAI tool arguments are empty arguments."""
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "noop", "arguments": " \n\t"},
+                    }
+                ],
+            }
+        )
+        d = msg.to_template_dict()
+        assert d["tool_calls"][0]["function"]["arguments"] == {}
+
     def test_to_template_dict_with_decoded_tool_call_arguments(self):
         """Already-decoded tool arguments should pass through unchanged."""
         msg = ChatMessage.model_validate(

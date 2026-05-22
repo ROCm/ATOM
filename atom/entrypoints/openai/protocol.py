@@ -75,7 +75,9 @@ class ChatMessage(BaseModel):
 
             function = dict(function_value)
             arguments = function.get("arguments")
-            if arguments is None or arguments == "":
+            if arguments is None or (
+                isinstance(arguments, str) and not arguments.strip()
+            ):
                 function["arguments"] = {}
             elif isinstance(arguments, str):
                 try:

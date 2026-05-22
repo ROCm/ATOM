@@ -173,7 +173,6 @@ def _replace_none_with_empty(tokens: List[Optional[str]]) -> None:
 def _convert_tokens_to_string_with_added_encoders(
     tokenizer: AutoTokenizer,
     output_tokens: List[str],
-    skip_special_tokens: bool,
     spaces_between_special_tokens: bool,
     added_vocab_set: Set[str],
     all_special_tokens: Set[str],
@@ -260,7 +259,6 @@ def _detokenize_incrementally(
         prefix_text = _convert_tokens_to_string_with_added_encoders(
             tokenizer,
             output_tokens[prefix_offset:read_offset],
-            skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
             added_vocab_set=added_vocab_set,
             all_special_tokens=all_special_tokens,
@@ -268,7 +266,6 @@ def _detokenize_incrementally(
         new_text = _convert_tokens_to_string_with_added_encoders(
             tokenizer,
             output_tokens[prefix_offset:],
-            skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
             added_vocab_set=added_vocab_set,
             all_special_tokens=all_special_tokens,

@@ -107,6 +107,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _clear_streaming_globals():
+    api_server._stream_decode_states.clear()
+    api_server._stream_queues.clear()
+    api_server._stream_loops.clear()
+    api_server._request_start_times.clear()
+    api_server._seq_id_to_request_id.clear()
+    api_server._seq_id_to_sibling_index.clear()
+    api_server._request_active_seq_ids.clear()
+
+
 class TestCoerceN:
     """``_coerce_n`` normalizes the request ``n`` before engine fan-out."""
 
@@ -138,22 +148,10 @@ class TestCoerceN:
 
 class TestStreamDecodeDelta:
     def setup_method(self):
-        api_server._stream_decode_states.clear()
-        api_server._stream_queues.clear()
-        api_server._stream_loops.clear()
-        api_server._request_start_times.clear()
-        api_server._seq_id_to_request_id.clear()
-        api_server._seq_id_to_sibling_index.clear()
-        api_server._request_active_seq_ids.clear()
+        _clear_streaming_globals()
 
     def teardown_method(self):
-        api_server._stream_decode_states.clear()
-        api_server._stream_queues.clear()
-        api_server._stream_loops.clear()
-        api_server._request_start_times.clear()
-        api_server._seq_id_to_request_id.clear()
-        api_server._seq_id_to_sibling_index.clear()
-        api_server._request_active_seq_ids.clear()
+        _clear_streaming_globals()
 
     def test_withholds_replacement_char_until_sequence_resolves(self, monkeypatch):
         class FakeTokenizer:
