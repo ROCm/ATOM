@@ -7,7 +7,7 @@ import json
 import time
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field
 
 # ============================================================================
 # Constants
@@ -124,7 +124,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = DEFAULT_TEMPERATURE
     top_k: Optional[int] = DEFAULT_TOP_K
     top_p: Optional[float] = DEFAULT_TOP_P
-    max_tokens: Optional[StrictInt] = DEFAULT_MAX_TOKENS
+    max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     stop: Optional[List[str]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
@@ -160,7 +160,7 @@ class CompletionRequest(BaseModel):
     temperature: Optional[float] = DEFAULT_TEMPERATURE
     top_k: Optional[int] = DEFAULT_TOP_K
     top_p: Optional[float] = DEFAULT_TOP_P
-    max_tokens: Optional[StrictInt] = DEFAULT_MAX_TOKENS
+    max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     stop: Optional[List[str]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
