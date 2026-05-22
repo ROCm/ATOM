@@ -10,7 +10,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use super::strip_protocol;
 use crate::{
     core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
-    routers::grpc::client::GrpcClient,
+    routers::grpc::engine::worker_client_cache::GrpcClient,
 };
 
 /// Try HTTP health check.
