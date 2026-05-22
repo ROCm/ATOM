@@ -5,327 +5,26 @@ use std::{
     time::Duration,
 };
 
-use dashmap::DashMap;
-use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
+use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use once_cell::sync::Lazy;
 
-// =============================================================================
-// STRING INTERNING
-// =============================================================================
-//
-// Dynamic strings (model_id, worker URLs, paths) are interned to avoid repeated
-// heap allocations. The interner uses Arc<str> which is cheap to clone and
-// allows the metrics crate to store references without repeated allocations.
-//
-// Performance characteristics:
-// - First occurrence: One allocation + DashMap insert
-// - Subsequent occurrences: DashMap lookup + Arc::clone (very cheap)
-// - Memory: Strings are never freed (acceptable for bounded label cardinality)
+use super::{config::default_duration_buckets, schema};
 
-/// Global string interner for metric labels.
-/// Uses DashMap for lock-free concurrent access.
-static STRING_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
-
-/// Intern a string, returning a cheaply-cloneable Arc<str>.
-///
-/// This function is designed for high-throughput scenarios where the same
-/// strings (model IDs, worker URLs) appear repeatedly. The first call allocates,
-/// subsequent calls just clone the Arc (very cheap - just a ref count increment).
-pub(crate) fn intern_string(s: &str) -> Arc<str> {
-    // Fast path: check if already interned
-    if let Some(entry) = STRING_INTERNER.get(s) {
-        return Arc::clone(entry.value());
-    }
-
-    // Slow path: intern the string
-    // Use entry API to avoid TOCTOU race
-    STRING_INTERNER
-        .entry(s.to_string())
-        .or_insert_with(|| Arc::from(s))
-        .clone()
-}
-
-#[allow(dead_code)]
-pub(crate) fn interner_size() -> usize {
-    STRING_INTERNER.len()
-}
-
-// =============================================================================
-// STATIC STRING CONSTANTS
-// =============================================================================
-
-/// Static string constants for boolean labels to avoid allocations.
-pub const STREAMING_TRUE: &str = "true";
-pub const STREAMING_FALSE: &str = "false";
-
-pub const fn bool_to_static_str(b: bool) -> &'static str {
-    if b {
-        STREAMING_TRUE
-    } else {
-        STREAMING_FALSE
-    }
-}
-
-/// Static lookup table for common HTTP status codes to avoid allocations.
-/// Returns a static string for known codes, or None for unknown codes.
-#[inline]
-pub fn status_code_to_static_str(code: u16) -> Option<&'static str> {
-    // Using a match with explicit arms is faster than a lookup table for this size
-    match code {
-        200 => Some("200"),
-        201 => Some("201"),
-        204 => Some("204"),
-        400 => Some("400"),
-        401 => Some("401"),
-        403 => Some("403"),
-        404 => Some("404"),
-        408 => Some("408"),
-        422 => Some("422"),
-        429 => Some("429"),
-        500 => Some("500"),
-        502 => Some("502"),
-        503 => Some("503"),
-        504 => Some("504"),
-        _ => None,
-    }
-}
-
-/// Static HTTP method strings to avoid allocations on every request.
-pub(crate) mod http_methods {
-    pub const GET: &str = "GET";
-    pub const POST: &str = "POST";
-    pub const PUT: &str = "PUT";
-    pub const DELETE: &str = "DELETE";
-    pub const PATCH: &str = "PATCH";
-    pub const HEAD: &str = "HEAD";
-    pub const OPTIONS: &str = "OPTIONS";
-}
-
-/// Convert HTTP method to static string. Returns the method as-is for unknown methods.
-#[inline]
-pub fn method_to_static_str(method: &str) -> &'static str {
-    match method {
-        "GET" => http_methods::GET,
-        "POST" => http_methods::POST,
-        "PUT" => http_methods::PUT,
-        "DELETE" => http_methods::DELETE,
-        "PATCH" => http_methods::PATCH,
-        "HEAD" => http_methods::HEAD,
-        "OPTIONS" => http_methods::OPTIONS,
-        // For unknown methods, we return a static "OTHER" to avoid allocation
-        // This is acceptable since unknown methods are rare in practice
-        _ => "OTHER",
-    }
-}
-
-/// Get status code as Cow - static for common codes, allocated for rare ones.
-#[inline]
-pub fn status_code_to_cow(code: u16) -> Cow<'static, str> {
-    match status_code_to_static_str(code) {
-        Some(s) => Cow::Borrowed(s),
-        None => Cow::Owned(code.to_string()),
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PrometheusConfig {
-    pub port: u16,
-    pub host: String,
-    pub duration_buckets: Option<Vec<f64>>,
-}
-
-impl Default for PrometheusConfig {
-    fn default() -> Self {
-        Self {
-            port: 29000,
-            host: "0.0.0.0".to_string(),
-            duration_buckets: None,
-        }
-    }
-}
+pub use super::config::PrometheusConfig;
+pub(crate) use super::schema::intern_string;
+pub use super::schema::{labels as metrics_labels, status_code_to_cow};
 
 pub(crate) fn init_metrics() {
-    // Layer 1: HTTP metrics
-    describe_counter!(
-        "mesh_http_requests_total",
-        "Total HTTP requests by method and path"
-    );
-    describe_histogram!(
-        "mesh_http_request_duration_seconds",
-        "HTTP request duration by method and path"
-    );
-    describe_gauge!(
-        "mesh_http_inflight_request_age_count",
-        "In-flight HTTP requests per age bucket (gt < age <= le, non-cumulative)"
-    );
-    describe_counter!(
-        "mesh_http_responses_total",
-        "Total HTTP responses by status_code and error_code"
-    );
-    describe_gauge!(
-        "mesh_http_connections_active",
-        "Currently active HTTP connections"
-    );
-    describe_counter!(
-        "mesh_http_rate_limit_total",
-        "Rate limiting decisions by result (allowed/rejected)"
-    );
-
-    // Layer 2: Router metrics
-    describe_counter!(
-        "mesh_router_requests_total",
-        "Total routed requests by router_type, backend_type, connection_mode, model, endpoint, streaming"
-    );
-    describe_histogram!(
-        "mesh_router_request_duration_seconds",
-        "Router request duration by router_type, backend_type, connection_mode, model, endpoint"
-    );
-    describe_counter!(
-        "mesh_router_request_errors_total",
-        "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type"
-    );
-    describe_histogram!(
-        "mesh_router_stage_duration_seconds",
-        "Pipeline stage duration by router_type and stage (gRPC only)"
-    );
-    describe_counter!(
-        "mesh_router_upstream_responses_total",
-        "Upstream backend HTTP responses by router_type, status_code, error_code"
-    );
-
-    // Layer 2: Router inference metrics (gRPC only)
-    describe_histogram!(
-        "mesh_router_ttft_seconds",
-        "Time to first token by router_type, backend_type, model, endpoint (gRPC only)"
-    );
-    describe_histogram!(
-        "mesh_router_tpot_seconds",
-        "Time per output token by router_type, backend_type, model, endpoint (gRPC only)"
-    );
-    describe_counter!(
-        "mesh_router_tokens_total",
-        "Total tokens processed by router_type, backend_type, model, endpoint, token_type (gRPC only)"
-    );
-    describe_histogram!(
-        "mesh_router_generation_duration_seconds",
-        "Total generation time by router_type, backend_type, model, endpoint (gRPC only)"
-    );
-
-    // Layer 3: Worker metrics
-    describe_gauge!(
-        "mesh_worker_pool_size",
-        "Current worker pool size by worker_type, connection_mode, model"
-    );
-    describe_gauge!(
-        "mesh_worker_connections_active",
-        "Active connections to workers by worker_type, connection_mode"
-    );
-    describe_gauge!(
-        "mesh_worker_requests_active",
-        "Currently running requests per worker"
-    );
-    describe_gauge!(
-        "mesh_worker_health",
-        "Worker health status (1=healthy, 0=unhealthy)"
-    );
-    describe_counter!(
-        "mesh_worker_health_checks_total",
-        "Health check results by worker_type and result"
-    );
-    describe_counter!(
-        "mesh_worker_selection_total",
-        "Worker selection events by worker_type, connection_mode, model, policy"
-    );
-    describe_counter!(
-        "mesh_worker_errors_total",
-        "Worker-level errors by worker_type, connection_mode, error_type"
-    );
-    describe_gauge!(
-        "mesh_manual_policy_cache_entries",
-        "Number of routing entries in manual policy cache"
-    );
-
-    // Layer 3: Worker resilience metrics (circuit breaker)
-    describe_gauge!(
-        "mesh_worker_cb_state",
-        "Circuit breaker state per worker (0=closed, 1=open, 2=half_open)"
-    );
-    describe_counter!(
-        "mesh_worker_cb_transitions_total",
-        "Circuit breaker state transitions by worker, from, to"
-    );
-    describe_counter!(
-        "mesh_worker_cb_outcomes_total",
-        "Circuit breaker outcomes by worker and outcome (success/failure)"
-    );
-    describe_gauge!(
-        "mesh_worker_cb_consecutive_failures",
-        "Current consecutive failure count per worker"
-    );
-    describe_gauge!(
-        "mesh_worker_cb_consecutive_successes",
-        "Current consecutive success count per worker"
-    );
-
-    // Layer 3: Worker resilience metrics (retry)
-    describe_counter!(
-        "mesh_worker_retries_total",
-        "Total retry attempts by worker_type and endpoint"
-    );
-    describe_counter!(
-        "mesh_worker_retries_exhausted_total",
-        "Requests that exhausted all retries by worker_type and endpoint"
-    );
-    describe_histogram!(
-        "mesh_worker_retry_backoff_seconds",
-        "Retry backoff duration by attempt number"
-    );
-
-    // Layer 4: Discovery metrics
-    describe_counter!(
-        "mesh_discovery_registrations_total",
-        "Worker registration attempts by source and result"
-    );
-    describe_counter!(
-        "mesh_discovery_deregistrations_total",
-        "Worker deregistration events by source and reason"
-    );
-    describe_histogram!(
-        "mesh_discovery_sync_duration_seconds",
-        "Discovery sync duration by source"
-    );
-    describe_gauge!(
-        "mesh_discovery_workers_discovered",
-        "Workers known via discovery by source"
-    );
-
-    // Layer 5: Database metrics
-    describe_counter!(
-        "mesh_db_operations_total",
-        "Total database operations by storage_type, operation, result"
-    );
-    describe_histogram!(
-        "mesh_db_operation_duration_seconds",
-        "Database operation duration by storage_type, operation"
-    );
-    describe_gauge!(
-        "mesh_db_connections_active",
-        "Active database connections by storage_type"
-    );
-    describe_counter!("mesh_db_items_stored", "Total items stored by storage_type");
+    schema::describe_all_metrics();
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
     init_metrics();
 
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
-    let duration_bucket: Vec<f64> = config.duration_buckets.unwrap_or_else(|| {
-        vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
-            60.0, 90.0, 120.0, 180.0, 240.0,
-        ]
-    });
+    let duration_bucket: Vec<f64> = config
+        .duration_buckets
+        .unwrap_or_else(default_duration_buckets);
 
     let ip_addr: IpAddr = config
         .host
@@ -340,58 +39,6 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
-}
-
-/// Label constants for consistent metric labeling
-pub mod metrics_labels {
-    // Router types
-    pub const ROUTER_HTTP: &str = "http";
-    pub const ROUTER_GRPC: &str = "grpc";
-
-    // Backend types
-    pub const BACKEND_REGULAR: &str = "regular";
-    pub const BACKEND_PD: &str = "pd";
-    // Connection modes
-    pub const CONNECTION_HTTP: &str = "http";
-    pub const CONNECTION_GRPC: &str = "grpc";
-
-    // Endpoints
-    pub const ENDPOINT_CHAT: &str = "chat";
-    pub const ENDPOINT_GENERATE: &str = "generate";
-    pub const ENDPOINT_RESPONSES: &str = "responses";
-    pub const ENDPOINT_COMPLETIONS: &str = "completions";
-
-    // Worker types
-    pub const WORKER_REGULAR: &str = "regular";
-    pub const WORKER_PREFILL: &str = "prefill";
-    pub const WORKER_DECODE: &str = "decode";
-    pub const WORKER_HTTP: &str = "http";
-    pub const WORKER_GRPC: &str = "grpc";
-
-    // Token types
-    pub const TOKEN_INPUT: &str = "input";
-    pub const TOKEN_OUTPUT: &str = "output";
-
-    // Result types
-    pub const RESULT_SUCCESS: &str = "success";
-    pub const RESULT_ERROR: &str = "error";
-    pub const RESULT_TIMEOUT: &str = "timeout";
-    pub const RESULT_NOT_FOUND: &str = "not_found";
-
-    // Rate limit results
-    pub const RATE_LIMIT_ALLOWED: &str = "allowed";
-    pub const RATE_LIMIT_REJECTED: &str = "rejected";
-
-    // Circuit breaker outcomes
-    pub const CB_SUCCESS: &str = "success";
-    pub const CB_FAILURE: &str = "failure";
-
-    // Router error types
-    pub const ERROR_NO_WORKERS: &str = "no_workers";
-    pub const ERROR_TIMEOUT: &str = "timeout";
-    pub const ERROR_BACKEND: &str = "backend_error";
-    pub const ERROR_VALIDATION: &str = "validation_error";
-    pub const ERROR_INTERNAL: &str = "internal_error";
 }
 
 /// Mesh Metrics helper struct for the new layered metrics architecture.
@@ -1091,6 +738,9 @@ impl Metrics {
 mod tests {
     use std::net::TcpListener;
 
+    use super::super::schema::{
+        bool_to_static_str, interner_size, method_to_static_str, status_code_to_static_str,
+    };
     use super::*;
 
     #[test]
