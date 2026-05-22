@@ -1007,6 +1007,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_moe_forward,
                 triton_kernel_fused_experts,
+                routing_from_topk
             )
 
             # Check if the model needs custom routing that triton routing()
@@ -1038,17 +1039,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_act = topk_weights.shape[1]
 
                 # Convert to triton routing data structures
-                if expert_map is not None:
-                    # local_num_experts already includes fused shared experts
-                    # (added at FusedMoE.__init__ line ~2056).
-                    n_expts_tot = layer.local_num_experts
-                else:
-                    n_expts_tot = router_logits.shape[-1]
-                    if global_num_experts > 0:
-                        n_expts_tot = global_num_experts
-                    n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
+                n_expts_tot = router_logits.shape[-1]
+                if global_num_experts > 0:
+                    n_expts_tot = global_num_experts
+                logger.warning("num fused shared experts")
+                logger.warning(layer.num_fused_shared_experts)
+                n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
-                routing_data, gather_idx, scatter_idx = routing_from_topk_triton(
+                routing_data, gather_idx, scatter_idx = routing_from_topk(
                     topk_weights, topk_ids, n_expts_tot
                 )
                 x_q_dtype = self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None

@@ -33,6 +33,8 @@ from atom.model_ops.moe_utils import (
 )
 from atom.utils import envs
 
+from triton import next_power_of_2
+
 
 logger = logging.getLogger("atom")
 
@@ -43,7 +45,33 @@ if envs.ATOM_USE_TRITON_GEMM:
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
+        get_kernel_config,
     )
+    
+    
+    from aiter.ops.triton.moe import moe_op_gemm_a16w4 as _aiter_a16w4
+    import logging
+    logging.getLogger("atom").warning(get_gfx())
+    if get_gfx() == "gfx950":
+        _orig_get_kernel_config = _aiter_a16w4.get_kernel_config
+        _MAX_BLOCK_N = envs.ATOM_TRITON_MOE_MAX_BLOCK_N
+        def _amd_smem_safe_tile(m, n, k, routing_data):
+            cfg = _orig_get_kernel_config(m, n, k, routing_data)
+            # Cap block_n on CDNA4: BLOCK_M=128 * BLOCK_N=512 * 4B FP32 acc = 256 KiB,
+            # which exceeds MI355X's 160 KiB LDS when triton spills the accumulator.
+            # Pinning block_n <= 256 keeps acc <= 128 KiB.
+            # previous safe_mem function to prevent LDS overflow
+            if cfg["block_m"] >= 64 and cfg["block_n"] > _MAX_BLOCK_N:
+                cfg["block_n"] = _MAX_BLOCK_N
+            return cfg
+        _aiter_a16w4.get_kernel_config = _amd_smem_safe_tile
+
+
+        logging.getLogger("atom").warning(
+            "[atom] aiter moe_op_gemm_a16w4.get_kernel_config patched -> %s (max_block_n=%d)",
+            _aiter_a16w4.get_kernel_config.__name__, _MAX_BLOCK_N,
+        )
+    
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 
 
@@ -179,7 +207,7 @@ def routing_from_topk(
         RoutingData,
     )
 
-    from moe_utils import compute_expt_data
+    from atom.model_ops.moe_utils import compute_expt_data
 
     n_tokens, n_expts_act = topk_weights.shape
     n_gates_pad = n_tokens * n_expts_act
@@ -201,7 +229,7 @@ def routing_from_topk(
     # Sort by expert_id globally so experts are contiguous for the matmul
     topk_indx = torch.argsort(expt_indx, stable=True).int()
     gate_indx = torch.argsort(topk_indx, stable=True).int()
-    gate_scal = expt_scal[topk_indx.long()]
+    gate_scal = expt_scal[topk_indx.long()].to(torch.bfloat16)
 
     # Histogram of tokens over experts
     hist = torch.histc(expt_indx.float(), bins=n_expts_tot, max=n_expts_tot - 1).int()
@@ -209,7 +237,7 @@ def routing_from_topk(
     # Build routing data structures using triton-accelerated compute_expt_data
     m = n_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
-    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    block_m = max(16, min(next_power_of_2(tokens_per_expt), 128))
     expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad, block_m)
 
     routing_data = RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
@@ -322,7 +350,8 @@ def triton_kernel_fused_experts(
     # assert hidden_states.shape[-1] == w1.shape[-2] * 2 
     # assert w2.shape[-1] == w1.shape[-2]  * 2
 
-    batch_dim = 1
+    # unecessary since aiter kernels expect 2d inputs/outputs
+    # batch_dim = 1
     M, K = hidden_states.shape[-2:] # 
     E, _, N = w1.shape 
 
@@ -331,15 +360,27 @@ def triton_kernel_fused_experts(
 
     half_N = N // 2
 
-    output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
+    # if intermediate_cache is None:
+    #     intermediate_cache = torch.empty(
+    #         (M * topk, half_N),
+    #         device=hidden_states.device,
+    #         dtype=hidden_states.dtype,
+    #     )
+    
+    # # Add batch_dim to output buffer because matmul_ogs expects 3D output
+    # intermediate_cache = _resize_cache(
+    #     intermediate_cache, (M * topk, half_N)
+    # )
+
+    output_tensor = _resize_cache(output_tensor, (M, K))
 
     gammas = routing_data.gate_scal if routing_data else None
 
-    raw_intermediate = torch.empty(
-        (batch_dim, M * topk, N),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    # raw_intermediate = torch.empty(
+    #     (M * topk, N),
+    #     device=hidden_states.device,
+    #     dtype=hidden_states.dtype,
+    # )
 
     if activation == ActivationType.Swiglu:
         # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
@@ -422,38 +463,41 @@ def triton_kernel_fused_experts(
     else:
         # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation
         raw_intermediate = moe_gemm_a16w4(
-                hidden_states,
-                w1,
-                None,
-                w13_scale,
-                None,
-                None,
-                w1_bias,
-                routing_data,
-                gather_indx=gather_indx,
-                gammas=gammas if apply_router_weight_on_input else None,
-                swizzle_mx_scale=w13_swizzle_layout,
-                apply_swiglu=False,
-            )
-            # raw_intermediate = matmul_ogs(
-        #     hidden_states,
-        #     w1,
-        #     w1_bias,
-        #     routing_data,
-        #     gather_indx=gather_indx,
-        #     precision_config=w13_precision_config,
-        #     gammas=gammas if apply_router_weight_on_input else None,
-        # )
-        raw_2d = raw_intermediate.view(M * topk, N)
-        intermediate_cache = intermediate_cache.view(M * topk, half_N)
-        fused_clamp_act_mul(
+            hidden_states,
+            w1,
+            None,
+            w13_scale,
+            None,
+            None,
+            w1_bias,
+            routing_data,
+            gather_indx=gather_indx,
+            gammas=gammas if apply_router_weight_on_input else None,
+            swizzle_mx_scale=w13_swizzle_layout,
+            apply_swiglu=False,
+        )
+        
+        raw_2d = raw_intermediate #.view(M * topk, N)
+        # intermediate_cache = intermediate_cache.view(M * topk, half_N)
+        intermediate_cache = fused_clamp_act_mul(
             raw_2d,
-            out=intermediate_cache,
             swiglu_limit=swiglu_limit,
             activation="silu",
             dtype_quant=None,
         )
-        intermediate_cache = intermediate_cache.view(batch_dim, M * topk, half_N)
+
+        # logger.warning("intermediate cache")
+        # logger.warning(intermediate_cache.view(M * topk, half_N))
+        # logger.warning(intermediate_cache.shape)
+
+        # logger.warning("swizzle layouts")
+        # logger.warning(w13_swizzle_layout)
+        # logger.warning(w2_swizzle_layout)
+
+        # logger.warning("numerics")
+        # logger.warning(M * topk)
+        # logger.warning(half_N)
+        # logger.warning(N)
 
         output_tensor = moe_gemm_a16w4(
             intermediate_cache,
@@ -468,17 +512,9 @@ def triton_kernel_fused_experts(
             gammas=None if apply_router_weight_on_input else gammas,
             swizzle_mx_scale=w2_swizzle_layout,
         )
-        
-        # matmul_ogs(
-        #     intermediate_cache.view(M * topk, half_N),
-        #     w2,
-        #     w2_bias,
-        #     routing_data,
-        #     scatter_indx=scatter_indx,
-        #     precision_config=w2_precision_config,
-        #     gammas=None if apply_router_weight_on_input else gammas,
-        #     y=output_tensor,
-        # )
+        logger.warning("out")
+        logger.warning("output")
+        return output_tensor
 
     output_tensor = output_tensor.view(M, K) 
     return output_tensor
