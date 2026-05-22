@@ -146,6 +146,8 @@ def _can_fuse_indexer_wk_weights_proj(
     quant_config: Optional[QuantizationConfig],
     indexer_prefixes: list[str],
 ) -> bool:
+    if not ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION:
+        return False
     if not _supports_fused_indexer_kernel_config(config):
         return False
     if quant_config is None:
@@ -1051,8 +1053,6 @@ def sparse_attn_indexer(
         weights = weights_out
     else:
         q_fp8 = q_input
-        k = k.contiguous()
-        weights = weights.contiguous()
         indexer_k_quant_and_cache(
             k,
             kv_cache,
@@ -1347,7 +1347,18 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        self.use_wk_weights_proj_fusion = use_wk_weights_proj_fusion
+        self.scale_fmt = "ue8m0"
+        self.quant_func = get_hip_quant(QuantType.per_1x128)
+        self.quant_block_size = 128  # TODO: get from config
+        self.use_qk_rope_cache_fusion = (
+            ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
+            and _supports_fused_indexer_kernel_config(config)
+            and self.head_dim == self.quant_block_size
+            and self.rope_dim == self.head_dim // 2
+        )
+        self.use_wk_weights_proj_fusion = (
+            use_wk_weights_proj_fusion and self.use_qk_rope_cache_fusion
+        )
         if self.use_wk_weights_proj_fusion:
             self.wk_weights_proj = IndexerWkWeightsProjLinear(
                 hidden_size,
@@ -1373,15 +1384,6 @@ class Indexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
 
-        self.scale_fmt = "ue8m0"
-        self.quant_func = get_hip_quant(QuantType.per_1x128)
-        self.quant_block_size = 128  # TODO: get from config
-        self.use_qk_rope_cache_fusion = (
-            ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
-            and _supports_fused_indexer_kernel_config(config)
-            and self.head_dim == self.quant_block_size
-            and self.rope_dim == self.head_dim // 2
-        )
         self.topk_indices_buffer = topk_indices_buffer
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)
@@ -1420,8 +1422,6 @@ class Indexer(nn.Module):
             weights = self.weights_proj(hidden_states)
 
         if not self.use_qk_rope_cache_fusion:
-            k = k.contiguous()
-            weights = weights.contiguous()
             q_pe, _ = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
