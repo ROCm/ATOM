@@ -354,15 +354,14 @@ class EagleProposer:
         # Eaale3 only support mha currently
         draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
 
-        # Eagle3 MLA: re-slice slot_mapping to len(input_ids).
-        # Target's MLA prepare_decode sized it
-        # to bs*max_q_len; after rejection len(input_ids) may be smaller,
-        # and the MHA cache-write kernel asserts slot_mapping <= q.
-        # Other fields (block_tables, context_lens, slot_mapping values
-        # themselves) are already in a draft-compatible format because
-        # MLA's prepare_decode uses the same runner.block_size as the draft.
+        # Eagle3 MHA reuses target metadata, but the target may be MLA.  Keep
+        # write slots sized to this draft pass, and when prefix cache is active
+        # restore logical block ids: MLA prefill expands block_tables by
+        # block_ratio for its physical block_size=1 pool, while the draft MHA
+        # cache is indexed by runner.block_size blocks.
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
+            attn_metadata.block_tables = var["block_tables"].gpu[:bs]
 
         # Backends that expose flat per-seq kv_indices/kv_indptr (MLA, MHA)
         # wire them through eagle's mid-step block; V4 has block_tables +
@@ -378,19 +377,11 @@ class EagleProposer:
                     positions=positions,
                     hidden_states=hidden_states,
                 )
-                # Eagle3 draft (the only draft_uses_mha case under narrow
-                # semantics) returns (post_norm, pre_norm); MTP drafts return
-                # a single hidden tensor.
-                if draft_uses_mha:
-                    ret_hidden_states, ret_hidden_prenorm = model_output
-                else:
-                    ret_hidden_states = model_output
-                    ret_hidden_prenorm = None
 
                 sample_hidden_states = (
-                    torch.index_select(ret_hidden_states, 0, last_token_indices)
+                    torch.index_select(model_output, 0, last_token_indices)
                     if i == 0
-                    else ret_hidden_states
+                    else model_output
                 )
                 logits = self.model.compute_logits(sample_hidden_states)
                 new_draft_ids = logits.argmax(dim=-1)
@@ -463,16 +454,7 @@ class EagleProposer:
 
                     input_ids = new_draft_ids
                     positions += 1
-                    if ret_hidden_prenorm is not None:
-                        hidden_states = (
-                            torch.index_select(
-                                ret_hidden_prenorm, 0, last_token_indices
-                            )
-                            if i == 0
-                            else ret_hidden_prenorm
-                        )
-                    else:
-                        hidden_states = sample_hidden_states
+                    hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]
