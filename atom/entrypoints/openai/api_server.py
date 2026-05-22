@@ -96,25 +96,17 @@ def _log_request_event(event_type: str, request_id: str, data: Any) -> None:
 
 
 async def _logged_stream(
-    gen: AsyncGenerator[str, None], request_id: str
-) -> AsyncGenerator[str, None]:
-    """Wrap a streaming generator to log each SSE chunk."""
-    async for chunk in gen:
-        if _request_logger is not None and chunk.startswith("data: "):
-            payload = chunk[6:].strip()
-            if payload != "[DONE]":
-                _log_request_event("stream_chunk", request_id, json.loads(payload))
-            else:
-                _log_request_event("stream_done", request_id, None)
-        yield chunk
-
-
-async def _logged_stream_with_cleanup(
     gen: AsyncGenerator[str, None], request_id: str, seq_ids: List[int]
 ) -> AsyncGenerator[str, None]:
     """Log a stream and clean request state on completion or disconnect."""
     try:
-        async for chunk in _logged_stream(gen, request_id):
+        async for chunk in gen:
+            if _request_logger is not None and chunk.startswith("data: "):
+                payload = chunk[6:].strip()
+                if payload != "[DONE]":
+                    _log_request_event("stream_chunk", request_id, json.loads(payload))
+                else:
+                    _log_request_event("stream_done", request_id, None)
             yield chunk
     finally:
         for seq_id in seq_ids:
@@ -888,7 +880,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 )
                 cleanup_seq_ids = [seq_id]
             return StreamingResponse(
-                _logged_stream_with_cleanup(gen, request_id, cleanup_seq_ids),
+                _logged_stream(gen, request_id, cleanup_seq_ids),
                 media_type="text/event-stream",
             )
 
@@ -978,7 +970,7 @@ async def completions(request: CompletionRequest):
                 )
                 cleanup_seq_ids = [seq_id]
             return StreamingResponse(
-                _logged_stream_with_cleanup(gen, request_id, cleanup_seq_ids),
+                _logged_stream(gen, request_id, cleanup_seq_ids),
                 media_type="text/event-stream",
             )
 
