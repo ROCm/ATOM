@@ -222,13 +222,20 @@ def try_mrope_qk_fused(
     mrope_section = getattr(rotary_emb, "mrope_section", None)
     if (
         positions.ndim != 2
+        or positions.shape[0] != 3
+        or positions.stride(1) != 1
         or mrope_section is None
+        or len(mrope_section) < 3
         or not getattr(rotary_emb, "mrope_interleaved", False)
         or head_size != 256
         or getattr(rotary_emb, "rotary_dim", None) != 64
         or not getattr(rotary_emb, "is_neox_style", False)
         or q.ndim != 2
         or k.ndim != 2
+        or q.shape[0] != positions.shape[1]
+        or k.shape[0] != positions.shape[1]
+        or q.stride(1) != 1
+        or k.stride(1) != 1
         or q.shape[1] != num_q_heads * head_size
         or k.shape[1] != num_k_heads * head_size
     ):

@@ -429,7 +429,6 @@ class Qwen3NextAttention(nn.Module):
             )
         else:
             q, k = self.qk_norm(q, k)
-            # q, k = self.rotary_emb(positions, q, k)
             fused_qk = try_mrope_qk_fused(
                 self.rotary_emb,
                 positions,
