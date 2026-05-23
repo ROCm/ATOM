@@ -360,7 +360,12 @@ def gdn_decode_update_lossy_fast(
     beta: float = 1.0,
     threshold: float = 20.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Approximate decode fast path that fuses gating and recurrent update."""
+    """Approximate decode fast path that fuses gating and recurrent update.
+
+    This path updates ``initial_state`` in place and returns the same tensor as
+    the final state. The kernel expects a contiguous state cache with layout
+    ``[slot, value_head, key_dim, value_dim]``.
+    """
     if beta != 1.0 or threshold != 20.0:
         raise ValueError("gdn_decode_update_lossy_fast supports beta=1.0 and threshold=20.0")
     if not use_qk_l2norm_in_kernel:
@@ -384,6 +389,15 @@ def gdn_decode_update_lossy_fast(
     assert B == 1, "decode fast path expects B == 1"
     assert a.shape == (T, HV), "decode fast path expects a shaped [T, HV]"
     assert b.shape == (T, HV), "decode fast path expects b shaped [T, HV]"
+    if HV < H or HV % H != 0:
+        raise ValueError("decode fast path expects value heads to be a multiple of heads")
+    if initial_state.ndim != 4 or initial_state.shape[1:] != (HV, K, V):
+        raise ValueError(
+            "decode fast path expects initial_state shaped "
+            f"[num_slots, {HV}, {K}, {V}]"
+        )
+    if not initial_state.is_contiguous():
+        raise ValueError("decode fast path expects contiguous initial_state")
 
     BK = triton.next_power_of_2(K)
     BV = 64
