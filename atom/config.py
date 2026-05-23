@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Optional, Union
 
@@ -263,7 +264,11 @@ class QuantizationConfig:
     - ``quant_type``, ``quant_dtype``, ``is_dynamic`` convenience properties
     """
 
-    def __init__(self, config: PretrainedConfig = None):
+    def __init__(
+        self,
+        config: PretrainedConfig = None,
+        online_quant_config: Optional[dict] = None,
+    ):
         if config is None:
             self.torch_dtype = torch.bfloat16
             self.hf_quant_config = None
@@ -271,6 +276,11 @@ class QuantizationConfig:
             self.layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
             self.exclude_layers: list[str] = []
             self.quant_method = ""
+            self.online_quant = False
+            self.online_quant_config_raw = None
+            self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
+            self.online_layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
+            self.online_exclude_layers: list[str] = []
             return
 
         # Some HF configs set torch_dtype=None; normalize to bf16 default.
@@ -284,10 +294,31 @@ class QuantizationConfig:
             self.layer_pattern_specs = []
             self.exclude_layers = []
             self.quant_method = ""
+        else:
+            self.quant_method = self.hf_quant_config.get("quant_method", "")
+
+        # Online quantization: re-quantize float / FP8 / MXFP4 models at load time
+        self.online_quant = False
+        self.online_quant_config_raw = online_quant_config
+        self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
+        self.online_layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
+        self.online_exclude_layers: list[str] = []
+        if online_quant_config and self.quant_method in [
+            "",
+            "fp8",
+            "mxfp4",
+        ]:
+            self.online_quant = True
+            online_parser = get_quant_parser("online_quant")
+            online_parsed_quant_config = online_parser.parse(online_quant_config)
+            self.online_global_spec = online_parsed_quant_config.global_spec
+            self.online_layer_pattern_specs = (
+                online_parsed_quant_config.layer_pattern_specs
+            )
+            self.online_exclude_layers = list(online_parsed_quant_config.exclude_layers)
+
+        if self.quant_method == "":
             return
-
-        self.quant_method = self.hf_quant_config.get("quant_method", "")
-
         # Use the parser registry to build a structured ParsedQuantConfig
         parser = get_quant_parser(self.quant_method)
         parsed_quant_config = parser.parse(self.hf_quant_config)
@@ -303,7 +334,11 @@ class QuantizationConfig:
         return self.global_spec
 
     def get_layer_quant_config(
-        self, layer_name: str, *, check_children: bool = False
+        self,
+        layer_name: str,
+        use_online_quant: bool = False,
+        *,
+        check_children: bool = False,
     ) -> LayerQuantConfig:
         """Return the :class:`LayerQuantConfig` for *layer_name*.
 
@@ -312,12 +347,21 @@ class QuantizationConfig:
         2. fnmatch-style pattern match in ``layer_pattern_specs``.
         3. Fall back to ``global_spec``.
         """
+        if use_online_quant:
+            layer_pattern_specs = self.online_layer_pattern_specs
+            global_spec = self.online_global_spec
+            exclude_layers = self.online_exclude_layers
+        else:
+            layer_pattern_specs = self.layer_pattern_specs
+            global_spec = self.global_spec
+            exclude_layers = self.exclude_layers
+
         # 1. Exclude list
-        if self._is_excluded(layer_name, check_children=check_children):
+        if self._is_excluded(layer_name, exclude_layers, check_children=check_children):
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
-        for pattern, spec in self.layer_pattern_specs:
+        for pattern, spec in layer_pattern_specs:
             if "*" not in pattern:
                 if layer_name in pattern:
                     return spec
@@ -325,7 +369,7 @@ class QuantizationConfig:
                 return spec
 
         # 3. Global default
-        return self.global_spec
+        return global_spec
 
     # -- convenience properties (delegate to global_spec) ---------------------
 
@@ -359,6 +403,10 @@ class QuantizationConfig:
         factors.append(self.global_spec)
         factors.append(self.layer_pattern_specs)
         factors.append(self.exclude_layers)
+        if self.online_quant:
+            factors.append(self.online_layer_pattern_specs)
+            factors.append(self.online_global_spec)
+            factors.append(self.online_exclude_layers)
         hash_value = hashlib.sha256(str(factors).encode()).hexdigest()
         return hash_value
 
@@ -368,11 +416,19 @@ class QuantizationConfig:
 
     # -- internal helpers ---------------------------------------------------
 
-    def _is_excluded(self, layer_name: str, *, check_children: bool = False) -> bool:
-        if layer_name is None or not self.exclude_layers:
+    def _is_excluded(
+        self,
+        layer_name: str,
+        exclude_layers: Optional[list[str]] = None,
+        *,
+        check_children: bool = False,
+    ) -> bool:
+        if exclude_layers is None:
+            exclude_layers = self.exclude_layers
+        if layer_name is None or not exclude_layers:
             return False
         prefix = layer_name + "."
-        for ignore_str in self.exclude_layers:
+        for ignore_str in exclude_layers:
             if self._matches_exclude(layer_name, ignore_str):
                 return True
             # When check_children is True, also match if any exclude entry
@@ -489,6 +545,17 @@ class QuantizationConfig:
         for name in self.exclude_layers:
             new_exclude.extend(_remap_layer_name(name))
         self.exclude_layers = list(dict.fromkeys(new_exclude))
+        if self.online_quant:
+            new_online_pattern_specs = []
+            for pattern, spec in self.online_layer_pattern_specs:
+                for remapped in _remap_layer_name(pattern):
+                    new_online_pattern_specs.append((remapped, spec))
+            self.online_layer_pattern_specs = new_online_pattern_specs
+
+            new_online_exclude = []
+            for name in self.online_exclude_layers:
+                new_online_exclude.extend(_remap_layer_name(name))
+            self.online_exclude_layers = list(dict.fromkeys(new_online_exclude))
 
         # Apply model-declared HF-name to ATOM-path translations for exclude entries.
         # Models that have a mismatch between their HF quant config names and ATOM
@@ -731,6 +798,7 @@ class SpeculativeConfig:
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
         "deepseek_v3": "deepseek_mtp",
         "deepseek_v32": "deepseek_mtp",
+        "deepseek_v4": "deepseek_v4_mtp",
         "glm_moe_dsa": "deepseek_mtp",
         "qwen3_next": "qwen3_next_mtp",
         "qwen3_5": "qwen3_5_mtp",
@@ -743,6 +811,7 @@ class SpeculativeConfig:
     # mtp_model_type → (n_predict_attr, architecture)
     _MTP_CONFIG: ClassVar[dict[str, tuple[str, str]]] = {
         "deepseek_mtp": ("num_nextn_predict_layers", "DeepSeekMTPModel"),
+        "deepseek_v4_mtp": ("num_nextn_predict_layers", "DeepseekV4MTPModel"),
         "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
         "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
     }
@@ -903,6 +972,8 @@ class Config:
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
+    # only for quark_online_quantization
+    online_quant_config: Optional[dict] = None
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -947,7 +1018,10 @@ class Config:
                 eos_ids := getattr(self.generation_config, "eos_token_id", None)
             ) is not None:
                 self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
-        self.quant_config = QuantizationConfig(self.hf_config)
+        self.quant_config = QuantizationConfig(
+            self.hf_config,
+            self.online_quant_config,
+        )
         # In plugin mode, supplement exclude_layers with vLLM's ignored_layers when
         # the HF quant config didn't produce any exclusions (non-quark quant methods).
         if (
@@ -1018,7 +1092,13 @@ class Config:
         # tokens. ATOM's BlockManager + slot_mapping math assume one global
         # block_size, so we override `kv_cache_block_size` here when V4 is
         # detected; the V4 attention builder enforces the same value.
-        if getattr(self.hf_config, "model_type", None) == "deepseek_v4":
+        #
+        # NOTE: cannot use `hf_config.model_type` for detection — `_CONFIG_REGISTRY`
+        # maps "deepseek_v4" → "deepseek_v3" so model_type reads as "deepseek_v3".
+        # Use the preserved `architectures` field (re-injected by get_hf_config,
+        # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
+        arches = getattr(self.hf_config, "architectures", None) or []
+        if any("DeepseekV4" in str(a) for a in arches):
             v4_block_size = 128
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
@@ -1103,3 +1183,16 @@ def get_current_atom_config() -> Config:
             return forward_atom_config
     assert _current_atom_config is not None, "Current atom config is not set"
     return _current_atom_config
+
+
+@contextmanager
+def use_custom_atom_config(custom_atom_config: Config):
+    # Temporarily masquerade the custom atom_config as the current atom_config
+    # for the current context and restore upon exit
+    global _current_atom_config
+    prev = _current_atom_config
+    _current_atom_config = custom_atom_config
+    try:
+        yield custom_atom_config
+    finally:
+        _current_atom_config = prev

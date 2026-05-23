@@ -2,9 +2,11 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import concurrent.futures
+import json
 import os
 import logging
 import re
+import time
 from glob import glob
 from typing import Generator, Tuple
 from collections.abc import Iterable, Mapping
@@ -245,6 +247,35 @@ def load_model_in_plugin_mode(
     return loaded_weights_record
 
 
+def _save_online_quant_info(
+    oq_layers: list[dict],
+    model_name_or_path: str,
+    elapsed_seconds: float,
+    online_quant_config: dict,
+):
+    """Save online quantization info to a JSON file (rank 0 only)."""
+    if get_tp_group().rank_in_group != 0:
+        return
+    output_dir = envs.ATOM_TORCH_PROFILER_DIR or os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp_ns = time.time_ns() % 1_000_000_000
+    filepath = os.path.join(
+        output_dir, f"online_quant_info_{timestamp}_{timestamp_ns:09d}.json"
+    )
+
+    payload = {
+        "model": model_name_or_path,
+        "online_quant_config": online_quant_config,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "num_layers": len(oq_layers),
+        "layers": oq_layers,
+    }
+    with open(filepath, "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    logger.info("Online quantization info saved to %s", filepath)
+
+
 def load_model(
     model: nn.Module,
     model_name_or_path: str,
@@ -296,6 +327,12 @@ def load_model(
     if weights_mapper is None:
         weights_mapper = getattr(model, "weights_mapper", None)
     params_dict = dict(model.named_parameters())
+    # Load `mtp.*` ckpt entries only when this is a spec-decode draft model
+    # AND it actually carries `mtp.*` params. The two-condition gate handles
+    # both directions: target loads (spec_decode=False) skip mtp regardless,
+    # and spec drafts that don't use the standard `mtp.*` param naming
+    # (e.g. Eagle3 with its own arch) also skip cleanly.
+    need_load_mtp: bool = spec_decode and any("mtp" in n for n in params_dict)
 
     # Pre-index expert_mapping by weight_name_part for O(1) lookup.
     # Original code does O(N) scan of expert_mapping (768 entries) per tensor,
@@ -353,7 +390,7 @@ def load_model(
                 name = mapped_name
             if load_dummy:
                 continue
-            if "mtp" in name and not spec_decode:
+            if "mtp" in name and not need_load_mtp:
                 continue
             if name.endswith("kv_scale") or "inv_freq" in name:
                 continue
@@ -485,7 +522,7 @@ def load_model(
                         ) and name not in params_dict:
                             matched = True
                             break
-                        if "mtp" in name and not spec_decode:
+                        if "mtp" in name and not need_load_mtp:
                             matched = True
                             break
                         try:
@@ -508,7 +545,7 @@ def load_model(
                         matched = True
                         break
                     if not matched:
-                        if "mtp" in name and not spec_decode:
+                        if "mtp" in name and not need_load_mtp:
                             continue
                         if merged_target := extract_expert_target_and_id(name):
                             fused_name, expert_id = merged_target
@@ -633,6 +670,17 @@ def load_model(
 
     # Avoid holding stale Parameter refs that prevent storage release.
     del params_dict
+    has_online_quant = any(
+        getattr(m, "online_quant", False)
+        or (
+            getattr(m, "quant_config", None) is not None
+            and getattr(m.quant_config, "online_quant", False)
+        )
+        for _, m in model.named_modules()
+    )
+    if has_online_quant:
+        logger.info("Weight post-processing started (includes online quantization)")
+    pp_start = time.perf_counter()
 
     for _, module in model.named_modules():
         if hasattr(module, "process_weights_after_loading"):
@@ -645,5 +693,29 @@ def load_model(
             quant_method.process_weights_after_loading(module)
         if isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)
+
+    if has_online_quant:
+        pp_elapsed = time.perf_counter() - pp_start
+        oq_layers = []
+        raw_online_quant_config = None
+        for _, module in model.named_modules():
+            info = getattr(module, "_online_quant_info", None)
+            if info is not None:
+                oq_layers.append(info)
+            if raw_online_quant_config is None:
+                qc = getattr(module, "quant_config", None)
+                if qc is not None and hasattr(qc, "online_quant_config_raw"):
+                    raw_online_quant_config = qc.online_quant_config_raw
+        logger.info(
+            "Weight post-processing done: %.2f seconds, " "%d layers online-quantized",
+            pp_elapsed,
+            len(oq_layers),
+        )
+        _save_online_quant_info(
+            oq_layers,
+            model_name_or_path,
+            pp_elapsed,
+            raw_online_quant_config or {},
+        )
 
     return loaded_weights_record

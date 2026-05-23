@@ -737,9 +737,18 @@ class ModelRunner:
         return False
 
     def is_deepseek_v4(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        return self.hf_text_config.model_type == "deepseek_v4"
+        # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
+        # `_CONFIG_REGISTRY` maps deepseek_v4 → deepseek_v3 (V4 reuses V3 schema).
+        # Use `architectures` (preserved by get_hf_config:567) instead. Covers
+        # both target (DeepseekV4ForCausalLM[NextN]) and draft (whose model_type
+        # SpeculativeConfig stamps as deepseek_v4_mtp).
+        arches = getattr(self.hf_text_config, "architectures", None) or []
+        if any("DeepseekV4" in str(a) for a in arches):
+            return True
+        return getattr(self.hf_text_config, "model_type", None) in (
+            "deepseek_v4",
+            "deepseek_v4_mtp",
+        )
 
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -1084,8 +1093,15 @@ class ModelRunner:
             "top_ks": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "top_ps": CpuGpuBuffer(self.max_bs, **f32_kwargs),
             # Keep enough space for MTP decode (max_q_len > 1).
+            # `extra_output_dims` lets a model insert dims between N and dim
+            # (e.g. DeepSeek-V4 returns the un-reduced mHC residual
+            # [N, hc_mult, dim] from forward, with hc_head + LM head deferred
+            # to compute_logits). Default `()` keeps the standard 2D layout.
             "outputs": torch.empty(
-                self.max_num_batched_tokens, hidden_size, dtype=hidden_type
+                self.max_num_batched_tokens,
+                *getattr(self.model, "extra_output_dims", ()),
+                hidden_size,
+                dtype=hidden_type,
             ),
         }
         if hasattr(self, "drafter"):
@@ -1409,8 +1425,8 @@ class ModelRunner:
             f"layer_{i}": kv_cache_tensor
             for i, kv_cache_tensor in enumerate(kv_cache_tensors)
         }
-        # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
-        set_kv_cache_data(kv_cache_data, config)
+        transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
+        set_kv_cache_data(kv_cache_data, config, transfer_tensors)
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -2019,6 +2035,7 @@ class ModelRunner:
                     num_tokens=num_tokens,
                     num_tokens_across_dp=num_tokens_across_dp,
                     ubatch_slices=ubatch_slices,
+                    in_hipgraph=True,
                 )
 
                 # Warmup
