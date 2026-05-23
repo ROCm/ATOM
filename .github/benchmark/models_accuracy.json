@@ -30,7 +30,7 @@
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
-    "accuracy_threshold": 0.92,
+    "accuracy_threshold": 0.94,
     "accuracy_baseline": 0.96,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "Local 4-run average GSM8K-100 3-shot flexible-extract = 0.96 (runs: 0.96/0.98/0.96/0.94, stderr ~0.024). ATOM_USE_TRITON_MOE=1 is required — without it accuracy drops to ~0.6. Threshold set 4pp below local baseline to absorb full-eval (1319 samples) noise; refresh after first CI measurement."
@@ -42,7 +42,7 @@
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
-    "accuracy_threshold": 0.92,
+    "accuracy_threshold": 0.94,
     "accuracy_baseline": 0.96,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "Same base model as DeepSeek-V4-Pro FP8 (MTP-3: 3 speculative tokens). Local full-eval (1319 samples, 3-shot) flexible-extract = 0.9560 ± 0.0056."

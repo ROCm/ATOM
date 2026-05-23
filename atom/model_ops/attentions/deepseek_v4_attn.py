@@ -336,20 +336,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         # Compressor state shape: [ring_size, coff * head_dim], fp32.
-        # ring_size = K_pool + (max_spec_steps + 1), where K_pool = coff * ratio.
-        # The extra (max_spec_steps + 1) slots prevent reject K/V written to the
-        # ring in round R from being borrow-read by the round-R+1 re-commit of
-        # the same boundary (slot index = pos % ring_size). With ring_size =
-        # K_pool the slot of pos P+K_pool aliases the slot of pos P, so a
-        # rejected K_{P+K_pool} written in R overwrites the K_P that R+1's
-        # commit pool window [P..P+K_pool-1] still needs. Bumping by one
-        # verify window's worth of positions decouples the two.
-        # CSA: ratio=4, overlap=True  → K_pool=8;  spec ring_size=8 + (mtp_k+1)
-        # HCA: ratio=128, overlap=False → K_pool=128; spec ring_size=128+(mtp_k+1)
-        # Non-spec (max_spec_steps=0) → ring_size = K_pool + 1 (effectively
-        # equivalent to old K_pool layout for correctness; one extra slot is
-        # the algebraic minimum and trivial in memory).
-        ring_extra = self.max_spec_steps + 1
+        # ring_size = K_pool + max_spec_steps, where K_pool = coff * ratio.
+        #
+        # Per spec round we write up to (1 + max_spec_steps) consecutive token
+        # positions; if some draft tokens are rejected, round R+1 re-commits
+        # those slots starting from a later offset. The aliasing concern is:
+        # at round R+1, while we read the K_pool committed entries that R+1's
+        # attention needs, can a position R already wrote (and we'd be about
+        # to overwrite) collide with one of those reads?
+        #
+        # Slot index = (compressed_K_id) % ring_size, where
+        # compressed_K_id = pos // ratio. Round R+1 reads
+        # `K_pool` consecutive ids ending at its own commit head; round R's
+        # rejected writes sit `<= max_spec_steps` ids beyond that head. With
+        # `ring_size = K_pool + max_spec_steps`, R's stale ids are guaranteed
+        # to fall outside R+1's K_pool-wide read window — no collision.
+        # Adding a further +1 (the old layout) was unnecessary slack.
+        # CSA: ratio=4, overlap=True  → K_pool=8;  ring_size=8 + mtp_k
+        # HCA: ratio=128, overlap=False → K_pool=128; ring_size=128 + mtp_k
+        # Non-spec (max_spec_steps=0) → ring_size = K_pool: no rejections ever
+        # happen, so the bare commit pool is sufficient (causal writes mean
+        # the alias slot is never read before being overwritten).
+        ring_extra = self.max_spec_steps
         self.csa_main_state_shape = (2 * 4 + ring_extra, 2 * self.head_dim)
         self.csa_idx_state_shape = (2 * 4 + ring_extra, 2 * self.index_head_dim)
         self.hca_main_state_shape = (128 + ring_extra, self.head_dim)
