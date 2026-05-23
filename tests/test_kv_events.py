@@ -158,18 +158,17 @@ class TestBlockManagerHooks:
         bm = _bm_with_events()
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1)
-        bm.take_events()  # drain
+        first = bm.take_events()
+        first_stored = [e for e in first if isinstance(e, BlockStored)]
+        assert len(first_stored) == 1
+        first_hashes = first_stored[0].block_hashes
 
-        # Re-submit identical prompt: the first full block should hit cache.
-        # ATOM forces the last full block to recompute for sampler liveness,
-        # so we expect at most ONE store event (for the forced-recompute block)
-        # and zero or one removal.
         s2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s2)
         events = bm.take_events()
         stored = [e for e in events if isinstance(e, BlockStored)]
-        # 0 stores when both blocks hit, 1 when last block is forced-recompute
-        assert len(stored) <= 1
+        assert len(stored) == 1
+        assert stored[0].parent_block_hash == first_hashes[0]
 
     def test_eviction_emits_block_removed(self, seq_factory):
         # Pool with a single block so the free FIFO has no choice but to

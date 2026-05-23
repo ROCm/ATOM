@@ -1025,26 +1025,25 @@ class Scheduler:
         self.finished_recving_kv_req_ids.remove(seq.id)
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
 
-        # Consumer-side P/D: blocks were pre-allocated via the normal allocate()
-        # path (so their hashes are set), and remote KV data has now landed in
-        # them. Emit BlockStored(medium=REMOTE) so external consumers (LMCache,
-        # downstream KV-aware schedulers) can track which blocks are now
-        # remote-sourced. Doesn't alter GPU-side bookkeeping.
         if self.block_manager.kv_events_enabled:
-            # Consumer-side: producer owned the chain, so parent is None.
             remote_hashes: list[int] = []
             remote_tokens: list[int] = []
+            parent_block_hash: int | None = None
+            prev_hash: int | None = None
             for block_id in seq.block_table:
                 blk = self.block_manager.blocks[block_id]
                 if blk.hash == -1:
                     continue
+                if not remote_hashes:
+                    parent_block_hash = prev_hash
                 remote_hashes.append(blk.hash)
                 remote_tokens.extend(blk.token_ids)
+                prev_hash = blk.hash
             if remote_hashes:
                 self.block_manager.record_remote_store(
                     block_hashes=remote_hashes,
                     token_ids=remote_tokens,
-                    parent_block_hash=None,
+                    parent_block_hash=parent_block_hash,
                 )
         return True
 

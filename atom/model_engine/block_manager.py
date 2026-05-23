@@ -307,13 +307,10 @@ class BlockManager:
     # ---------------- KV event API ---------------- #
 
     def take_events(self) -> list[KVCacheEvent]:
-        """Drain and return events accumulated since the last call. Returns
-        empty list when events are disabled. The caller (Scheduler) hands the
-        returned list to the EventPublisher."""
+        """Drain and return events accumulated since the last call."""
         if self._event_log is None or not self._event_log:
             return []
-        events = self._event_log
-        self._event_log = []
+        self._event_log, events = [], self._event_log
         return events
 
     def clear_cache(self) -> None:

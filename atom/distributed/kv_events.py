@@ -222,7 +222,7 @@ class ZmqEventPublisher(EventPublisher):
                     pass
         self._sender.join(timeout=2.0)
         try:
-            self._socket.close(linger=0)
+            self._socket.close(linger=1000)
         except Exception:  # pragma: no cover
             pass
 
