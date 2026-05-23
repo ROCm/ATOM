@@ -1885,22 +1885,31 @@ class DeepseekV4Attention(nn.Module):
         if attn_md.state is AttnState.DECODE:
             kv_indptr = attn_md.kv_indptr_csa
             kv_indices = attn_md.kv_indices_csa
+            # Decode: skip = `actual_swa_count[t]` = min(pos+1, win) — derived
+            # inline by the kernel, so the per-token buffer + its CPU build +
+            # H2D in `_attach_v4_paged_decode_meta` are skipped.
+            skip_buf = None
+            window_size = self.window_size
         else:
             kv_indptr = attn_md.kv_indptr_prefix_csa
             kv_indices = attn_md.kv_indices_prefix_csa
+            # Prefill: skip = `prefix_swa_count[t]` (chunked-prefill: depends
+            # on `chunk_start[bid]`, not derivable from `positions[t]` alone)
+            # — kernel loads from the per-token buffer.
+            skip_buf = attn_md.skip_prefix_len_csa
+            window_size = 0
 
         csa_translate_pack(
             topk_local_raw,
             attn_md.block_tables,
-            attn_md.n_committed_csa_per_seq,
             positions,
             kv_indptr,
             attn_md.batch_id_per_token,
-            attn_md.skip_prefix_len_csa,
+            skip_buf,
             kv_indices,
             swa_pages=attn_md.swa_pages,
             csa_block_capacity=csa_block_capacity,
-            ratio=4,
+            window_size=window_size,
         )
 
 

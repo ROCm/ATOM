@@ -1281,6 +1281,39 @@ class ModelRunner:
                 f"pool_blocks={num_kvcache_blocks}"
             )
 
+        # Concurrent-capacity table: at each context-length percentage of
+        # max_model_len, how many requests can simultaneously hold their
+        # KV in the pool. Per-req block usage = ceil(ctx_len/block_size);
+        # per-req state cache is in its own pre-allocated tensor (already
+        # excluded from `num_kvcache_blocks` at sizing time), so it adds
+        # no per-block cost. Concurrency is also capped by
+        # max_per_req_cache_slots (state buffer slot count).
+        max_model_len = config.max_model_len
+        cap = (
+            max_per_req_cache_slots if per_req_cache_bytes > 0 else config.max_num_seqs
+        )
+        pct_lines = []
+        for pct in (10, 30, 50, 70, 90, 100):
+            ctx = max(1, max_model_len * pct // 100)
+            blocks_per_req = math.ceil(ctx / self.block_size)
+            block_bound = (
+                num_kvcache_blocks // blocks_per_req if blocks_per_req > 0 else 0
+            )
+            max_conc = min(cap, block_bound) if cap > 0 else block_bound
+            bound_label = (
+                "slots" if cap > 0 and max_conc == cap < block_bound else "blocks"
+            )
+            pct_lines.append(
+                f"  {pct:>3}% ({ctx:>7} tok): {blocks_per_req:>6} blk/req "
+                f"→ max_concurrent={max_conc:<5} (bound by {bound_label})"
+            )
+        logger.info(
+            f"Concurrent capacity vs context length "
+            f"(max_model_len={max_model_len}, block_size={self.block_size}, "
+            f"max_slots={cap}, pool_blocks={num_kvcache_blocks}):\n"
+            + "\n".join(pct_lines)
+        )
+
         assert num_kvcache_blocks > 0, (
             f"Not enough memory for KV cache with block size({self.block_size}). "
             f"At least 1 block ({block_bytes / (1 << 20):.2f}MB) is required, "
@@ -1717,7 +1750,7 @@ class ModelRunner:
 
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             # prefill[bs=1 tok=115 ctx=115]
-            label = f"prefill[bs={bs}"
+            label = f"prefill[bs={bs}" if is_prefill else f"eager_decode[bs={bs}"
             if batch is not None:
                 ctx = batch.context_lens
                 if len(ctx) == 1:

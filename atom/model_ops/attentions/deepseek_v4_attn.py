@@ -128,6 +128,12 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     read int64 fine. Padded tail [T:padded_T] = -1 sentinel; consumer
     kernels skip on `bid < 0`. All other per-token quantities resolved as
     `per_seq_data[batch_id_per_token[t]]` — no [T] aliases of seq data."""
+    batch_id_per_token_cpu: Optional[Any] = None
+    """[T] int64 — CPU mirror of the unpadded batch_id slice. Built once in
+    `_attach_v4_per_fwd_meta` (host-side `np.repeat`); reused by
+    `_attach_v4_paged_decode_meta` for indptr fancy-index math. Avoids a
+    duplicate `np.repeat` per fwd. None for prefill paths that don't go
+    through paged_decode_meta (it's only consumed there)."""
     swa_write_indices: Optional[torch.Tensor] = None
     """[W] int64 GPU — src row id into per-fwd KV for swa_write.
     `[0:num_write]` = real (last `win` tokens per seq); trailing entries
@@ -843,6 +849,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
           - `attn_metadata.batch_id_per_token`        [padded_T] int64
           - `attn_metadata.n_committed_csa_per_seq`   [bs] int32
 
+        DECODE fast path: returns a minimal dict with only
+        `n_committed_per_seq_gpu` (the single field `_score_topk_decode`
+        reads). The cumsum + H2D + per-token GPU derivations below are all
+        prefill-only — `deepgemm_fp8_paged_mqa_logits` + `top_k_per_row_decode`
+        operate directly on paged KV via `n_committed_per_seq_gpu`, never on
+        the packed-cumsum / per-token `cu_starts/cu_ends` layout.
+
         The FP8 indexer K-cache write happens inside `fused_compress_attn`
         (the unified Indexer-inner Compressor path) via the same block_tables
         that CSA Main uses; no separate slot_mapping is built here.
@@ -852,6 +865,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # invariants as `_attach_v4_per_fwd_meta` — guaranteed by every
         # prepare_*/CG-capture path).
         bs = scheduled_bs
+
+        # DECODE short-circuit: the only field `_score_topk_decode` consumes is
+        # `n_committed_per_seq_gpu`, which is the same tensor as
+        # `attn_metadata.n_committed_csa_per_seq` (already staged by
+        # `_attach_v4_per_fwd_meta`). The prefill-only derivations below
+        # (CPU cumsum + H2D for `cu_committed_gpu`; 7 GPU launches for
+        # `seq_base`/`visible_end`/`cu_ends`) feed `_score_topk_prefill` only
+        # (cp_gather + fp8_mqa_logits + per-row prefill top-k), so they are
+        # dead work on the decode hot path. ~50μs / fwd saved at bs=1024.
+        if attn_metadata.state is AttnState.DECODE:
+            return {
+                "n_committed_per_seq_gpu": attn_metadata.n_committed_csa_per_seq,
+            }
+
         ratio = 4  # CSA — also referenced by `visible_end_gpu` below
         n_committed_per_seq = attn_metadata.n_committed_csa_per_seq_cpu[:bs]
         cu_committed_cpu = np.concatenate(
@@ -1138,7 +1165,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         padded_bs = int(bs)
         self._attach_v4_per_fwd_meta(
             attn_metadata,
-            cu_seqlens_q_np,
             extend_lens_np,  # = np.full(scheduled_bs, max_seqlen_q) for decode
             state_slot_np,
             scheduled_bs,
@@ -1218,7 +1244,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # reuse the shared GPU tensors (batch_id_per_token, n_committed_csa).
         self._attach_v4_per_fwd_meta(
             attn_metadata,
-            cu_seqlens_q_np,
             extend_lens_np,  # = cu_seqlens_q[1:] - cu_seqlens_q[:bs]
             attn_metadata.state_slot_mapping_cpu,
             scheduled_bs,
@@ -1313,7 +1338,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
             self._attach_v4_per_fwd_meta(
                 ub_attn,
-                ub_cu,
                 extend_lens_np,  # ubatch's per-seq token counts
                 ub_attn.state_slot_mapping_cpu,
                 ub_num_reqs,
@@ -1365,7 +1389,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def _attach_v4_per_fwd_meta(
         self,
         attn_metadata: AttentionMetaData_DSV4,
-        cu_seqlens_q_np,
         token_num_per_seq,
         state_slot_mapping_cpu,
         scheduled_bs: int,
@@ -1397,15 +1420,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         (model_runner.warmup_model:1003-1011, _populate_state_slot_mapping
         zeros-fill); CG capture uses graph_bs >= 1 too.
         """
-        win = self.window_size
-
-        # cu_seqlens_q_arr still needed for write_starts/write_ends below;
-        # token_num_per_seq is now passed in by caller (== batch.num_scheduled_tokens
-        # for prepare_decode/prefill, np.ones for MTP draft, etc.) — no longer
-        # re-derived from cu_seqlens_q here.
-        cu_seqlens_q_arr = np.asarray(
-            cu_seqlens_q_np[: scheduled_bs + 1], dtype=np.int32
-        )
         # state is set by the caller at AttentionMetaData_DSV4 construction
         # time (single source of truth — prepare_decode / prepare_prefill /
         # prepare_mtp_decode / build_for_cudagraph_capture each set it).
@@ -1431,10 +1445,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
 
         # ---- CPU numpy work (all on main thread) ----
-        batch_id_per_token_np = np.full(padded_total_tokens, -1, dtype=np.int64)
-        batch_id_per_token_np[:total_tokens] = np.repeat(
+        # Build the unpadded mapping once; the padded GPU staging buffer wraps
+        # it (head = real, tail = -1 sentinel). Stash the unpadded slice on
+        # attn_metadata so `_attach_v4_paged_decode_meta` reuses it instead of
+        # re-running `np.repeat(arange, token_num_per_seq)` (saves ~10μs/fwd
+        # at bs=1024 + one allocation).
+        batch_id_unpadded_np = np.repeat(
             np.arange(scheduled_bs, dtype=np.int64), token_num_per_seq
         )
+        batch_id_per_token_np = np.full(padded_total_tokens, -1, dtype=np.int64)
+        batch_id_per_token_np[:total_tokens] = batch_id_unpadded_np
+        attn_metadata.batch_id_per_token_cpu = batch_id_unpadded_np
 
         # context_lens is int32 on the buffer; keep dtype through divide so
         # n_committed_{csa,hca} stay int32 (max value ~max_model_len // 4 ≪ 2^31).
@@ -1553,11 +1574,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         # ----- Per-seq scalars (CPU numpy) -----
         # The single per-token mapping. Built once in `_attach_v4_per_fwd_meta`
-        # (so swa_write / indexer can also consume it). Pull the GPU view from
-        # attn_metadata; recompute the np copy here only for cumsum math below.
-        batch_id_per_token_np = np.repeat(
-            np.arange(scheduled_bs, dtype=np.int32), token_num_per_seq
-        )  # [T] int32 — host copy for indptr cumsums
+        # — both the GPU staging tensor and the unpadded CPU mirror — so we
+        # just borrow both here. int64 (numpy fancy-index source dtype is
+        # irrelevant; consumers below produce int32 outputs).
+        batch_id_per_token_np = attn_metadata.batch_id_per_token_cpu  # [T] int64
         batch_id_per_token_gpu = attn_metadata.batch_id_per_token
 
         # Read pre-computed `ctx // {4,128}` from attn_metadata — populated by
@@ -1684,15 +1704,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cs=cs,
         )
 
-        # ----- skip_prefix_len_csa: per-token actual SWA-prefix length -----
-        # csa_translate_pack consumes this as the offset within each token's
-        # `kv_indices_csa` region where the CSA topk section starts (after
-        # the SWA prefix segment). Decode + prefill now share this semantics
-        # (was `win` in decode, `prefix_swa_count[t]` in prefill).
-        skip_csa_buf = var["v4_skip_prefix_len_csa"]
-        skip_csa_buf.np[:T] = actual_swa_count_np
-        skip_csa_buf.np[T:T_pad].fill(0)
-        skip_csa_gpu = skip_csa_buf.copy_to_gpu(T_pad)
+        # `skip_prefix_len_csa` is no longer materialized on the decode path —
+        # `csa_translate_pack` is invoked with `window_size = self.window_size`
+        # so the kernel derives `skip = min(positions[t]+1, win)` inline,
+        # which is identical to the value we used to write here
+        # (`actual_swa_count_np`). Saves a CPU write + H2D per fwd. The
+        # `v4_skip_prefix_len_csa` forward_var is retained for the (unrelated)
+        # prefill path where skip depends on `chunk_start` and cannot be
+        # derived from positions alone.
 
         # ----- Stash on attn_metadata for V4Attention.forward consumption -----
         # batch_id_per_token + n_committed_csa_per_seq already set in
@@ -1707,7 +1726,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indptr_swa = swa_indptr_gpu
         attn_metadata.kv_indptr_csa = csa_indptr_gpu
         attn_metadata.kv_indptr_hca = hca_indptr_gpu
-        attn_metadata.skip_prefix_len_csa = skip_csa_gpu
         attn_metadata.swa_pages = swa_pages
 
     def _build_paged_prefill_meta(
@@ -2101,7 +2119,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # builder can reuse the shared per-fwd GPU tensors.
         self._attach_v4_per_fwd_meta(
             attn_metadata,
-            cu_seqlens_q_np,
             extend_lens_np,  # = np.full(bs, max_q_len) — synthetic uniform decode batch
             attn_metadata.state_slot_mapping_cpu,
             bs,
