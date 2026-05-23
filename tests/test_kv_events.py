@@ -187,6 +187,19 @@ class TestBlockManagerHooks:
         assert removed, f"expected BlockRemoved on eviction, got: {events}"
         assert removed[0].medium == MEDIUM_GPU
 
+    def test_cache_hit_reuse_does_not_emit_block_removed(self, seq_factory):
+        bm = _bm_with_events(num_kvcache_blocks=8, kv_cache_block_size=4)
+        s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        bm.allocate(s1)
+        bm.deallocate(s1)
+        bm.take_events()
+
+        s2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        bm.allocate(s2)
+        events = bm.take_events()
+        removed = [e for e in events if isinstance(e, BlockRemoved)]
+        assert removed == [], f"cache hit must not emit BlockRemoved, got: {events}"
+
     def test_clear_cache_emits_all_cleared(self, seq_factory):
         bm = _bm_with_events()
         s1 = seq_factory([1, 2, 3, 4])

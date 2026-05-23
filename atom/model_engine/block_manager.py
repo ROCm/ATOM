@@ -219,7 +219,11 @@ class BlockManager:
                     block = self.blocks[block_id]
                     block.ref_count += 1
                 else:
-                    block = self._allocate_block(block_id)
+                    block = self.blocks[block_id]
+                    assert block.ref_count == 0
+                    block.ref_count = 1
+                    self.free_block_ids_set.discard(block_id)
+                    self.used_block_ids.add(block_id)
             if h != -1:
                 # cache_miss && full block + real hash = a freshly stored block.
                 # cache_miss is sticky once a block is missing, so this is the
