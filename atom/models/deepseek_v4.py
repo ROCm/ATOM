@@ -50,7 +50,11 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import (
 from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
 )
+from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_copy_x import (
+    fused_gemm_a16w16_copy_x,
+)
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.tuned_gemm import tgemm
 from atom.config import (
     Config,
     LayerQuantConfig,
@@ -238,6 +242,48 @@ def fused_qk_norm_rope_swa_write(
                 win,
             )
     return q_out
+
+
+def _fused_router_gate_a16w16_quant_fake(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_tokens, dim = x.shape
+    n_routed_experts = gate_weight.shape[0]
+    router_logits = torch.empty(
+        (num_tokens, n_routed_experts), dtype=torch.bfloat16, device=x.device
+    )
+    # Match the runtime branch: fused path emits FP8 copy of x, fallback
+    # path returns x itself (BF16) so the downstream fused_moe re-triggers
+    # its own `.to(dtypes.fp8)` cast.
+    if num_tokens <= 64:
+        x_out = torch.empty((num_tokens, dim), dtype=dtypes.fp8, device=x.device)
+    else:
+        x_out = torch.empty_like(x)
+    return router_logits, x_out
+
+
+@torch_compile_guard(gen_fake=_fused_router_gate_a16w16_quant_fake, mutates_args=[])
+def fused_router_gate_a16w16_quant(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """A16W16 router-gate GEMM, optionally fused with a BF16->FP8 downcast
+    copy of x.
+
+    For decode-shaped batches (num_tokens <= 64) the GEMM and the activation
+    downcast run in a single triton kernel; the FP8 copy is consumed by the
+    downstream fused_moe kernel, replacing its internal
+    `hidden_states.to(dtypes.fp8)` cast with a copy done inline with the
+    gate GEMM's A-loads. For larger batches the fusion's per-element copy
+    overhead is not worth the savings, so we fall back to tgemm.mm and let
+    aiter re-trigger the `.to(fp8)` cast on its side.
+    """
+    num_tokens = x.shape[0]
+    if num_tokens <= 64:
+        return fused_gemm_a16w16_copy_x(x, gate_weight)
+    router_logits = tgemm.mm(x, gate_weight, None, otype=torch.bfloat16)
+    return router_logits, x
 
 
 def _make_weightless_rmsnorm(dim: int, eps: float) -> RMSNorm:
@@ -2203,8 +2249,17 @@ class MoE(nn.Module):
         `forward_context.context.input_ids` before each forward, and
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
-        router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
-        return self.experts(hidden_states=x, router_logits=router_logits)
+        # router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
+        # return self.experts(hidden_states=x, router_logits=router_logits)
+        # num_tokens<=64 branch returns x already in FP8 (fused with the gate
+        # GEMM); larger batches return x in BF16 and aiter fused_moe handles
+        # the `.to(dtypes.fp8)` cast on its side. Either way, passing the
+        # returned tensor as `hidden_states` is correct: when it's already
+        # FP8, fused_moe's `.to(dtypes.fp8)` is a no-op.
+        router_logits, x_for_experts = fused_router_gate_a16w16_quant(
+            x, self.gate.weight
+        )
+        return self.experts(hidden_states=x_for_experts, router_logits=router_logits)
 
     def combine_outputs(
         self,
