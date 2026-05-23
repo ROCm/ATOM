@@ -47,7 +47,8 @@ import triton.language as tl
 def _csa_translate_pack_kernel(
     topk_local_ptr,  # [T, index_topk] int32 — indexer raw output
     block_tables_ptr,  # [bs, mnbps] int32 — page table
-    n_committed_csa_per_seq_ptr,  # [bs] int32 — per-seq valid count
+    n_committed_csa_per_seq_ptr,  # [bs] int32 — RAW per-seq committed count
+    positions_ptr,  # [T] int — global token positions
     kv_indptr_csa_ptr,  # [T+1] int32 — packed cumsum (per-token)
     batch_id_per_token_ptr,  # [T] int32 — token → seq, sentinel -1
     skip_prefix_len_per_token_ptr,  # [T] int32 — per-token write offset
@@ -56,6 +57,7 @@ def _csa_translate_pack_kernel(
     mnbps,  # i32 — max blocks per seq, runtime int
     index_topk: tl.constexpr,
     csa_block_capacity: tl.constexpr,
+    ratio: tl.constexpr,  # = 4 for CSA (compress ratio used for visibility)
     BLOCK_K: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
@@ -67,10 +69,19 @@ def _csa_translate_pack_kernel(
     if bid < 0:
         return
 
-    valid_k = tl.load(n_committed_csa_per_seq_ptr + bid)
+    # Per-token valid_k = Indexer's per-row visibility = the count of
+    # valid (>=0) topk_local cells per row. Matches the formula in
+    # `_attach_v4_indexer_meta`. The n_csa_seq clamp is defensive — V4
+    # prepare_* paths enforce `pos < ctx_total` so it usually matches
+    # `(pos+1)//ratio`, but keeping the explicit clamp tracks Indexer's
+    # `visible_end` exactly and protects against edge cases in CG-warmup /
+    # MTP-verify rollback paths where positions and ctx may drift slightly.
+    pos = tl.load(positions_ptr + pid_t)
+    n_csa_seq = tl.load(n_committed_csa_per_seq_ptr + bid)
+    valid_k = tl.minimum(tl.minimum((pos + 1) // ratio, n_csa_seq), index_topk)
 
     k_offs = pid_kb * BLOCK_K + tl.arange(0, BLOCK_K)
-    in_range = (k_offs < valid_k) & (k_offs < index_topk)
+    in_range = k_offs < valid_k
 
     topk = tl.load(
         topk_local_ptr + pid_t * index_topk + k_offs,
@@ -109,6 +120,7 @@ def csa_translate_pack(
     topk_local: torch.Tensor,
     block_tables: torch.Tensor,
     n_committed_csa_per_seq: torch.Tensor,
+    positions: torch.Tensor,
     kv_indptr_csa: torch.Tensor,
     batch_id_per_token: torch.Tensor,
     skip_prefix_len_per_token: torch.Tensor,
@@ -116,23 +128,30 @@ def csa_translate_pack(
     *,
     swa_pages: int,
     csa_block_capacity: int,
+    ratio: int = 4,
 ) -> None:
     """Fused topk translate + packed write into `kv_indices_csa` (in-place).
 
+    The kernel computes per-token CSA `valid_k` inline as
+    ``min((positions[t]+1)//ratio, n_committed_csa[bid], index_topk)``,
+    matching Indexer's per-row visibility (cu_ends - cu_starts in
+    ``_attach_v4_indexer_meta``). Caller's CSA indptr MUST reserve exactly
+    this many cells per token — then csa_translate_pack writes every
+    reserved cell and no `-1` sentinel pre-fill is needed.
+
     Args:
       topk_local:                  [T, index_topk] int32 — indexer's seq-local
-                                   row indices; tails may carry -1 sentinels
-                                   (kernel-native; we skip writes on those).
+                                   row indices. Leading `valid_k[t]` cells are
+                                   always >= 0 (Indexer filled them); trailing
+                                   cells are -1 but never read because
+                                   `k_offs < valid_k` filters them out.
       block_tables:                [bs, mnbps] int32 — logical block → physical.
       n_committed_csa_per_seq:     [bs] int32 — RAW per-seq committed count
-                                   (`ctx_len // 4`). The kernel clamps
-                                   internally via
-                                   `(k < valid_k) & (k < index_topk)` mask;
-                                   callers MUST pass the raw value (NOT
-                                   pre-clamped to index_topk), since the
-                                   indexer also reads this same buffer and
-                                   needs the raw count. Indexed by
-                                   `batch_id_per_token[t]`.
+                                   (`ctx_len // ratio`); clamps per-token
+                                   `valid_k` to seq-level (defensive).
+      positions:                   [T] int — global token positions; combined
+                                   with `n_committed_csa_per_seq` and
+                                   `index_topk` to derive per-token valid_k.
       kv_indptr_csa:               [T+1] int32 — per-token packed cumsum
                                    (CG-padded: tail repeats last value
                                    → kv_len=0).
@@ -140,19 +159,22 @@ def csa_translate_pack(
                                    CG-padded slots.
       skip_prefix_len_per_token:   [T] int32 — per-token write offset within
                                    `kv_indices_csa[indptr[t] : indptr[t+1]]`
-                                   the CSA section starts at. Decode passes
+                                   where the CSA section starts. Decode passes
                                    `[window_size, ...]` (full SWA prefix);
                                    pure prefill passes 0; chunked prefill
                                    passes `prior_swa_count_per_token`.
       kv_indices_csa:              [total_indices] int32 — destination buffer;
                                    this kernel writes the CSA section
                                    `[indptr[t]+skip[t],
-                                     indptr[t]+skip[t]+min(valid_k, index_topk))`.
+                                     indptr[t]+skip[t]+valid_k[t])`.
       swa_pages:                   SWA region size — `num_slots * window_size`,
                                    fixed at CG capture time. Keyword-only.
       csa_block_capacity:          `block_size // ratio = 128 // 4 = 32`
                                    (constexpr; triton can strength-reduce
                                    // and %). Keyword-only.
+      ratio:                       Compression ratio (= 4 for CSA). Used in
+                                   the per-token visibility formula
+                                   `(positions[t]+1)//ratio`. Keyword-only.
     """
     T, index_topk = topk_local.shape
     if T == 0:
@@ -169,6 +191,8 @@ def csa_translate_pack(
             "skip_prefix_len_per_token.numel()="
             f"{skip_prefix_len_per_token.numel()} < T={T}"
         )
+    if positions.numel() < T:
+        raise ValueError(f"positions.numel()={positions.numel()} < T={T}")
     mnbps = block_tables.size(1)
 
     BLOCK_K = min(64, triton.next_power_of_2(index_topk))
@@ -177,6 +201,7 @@ def csa_translate_pack(
         topk_local,
         block_tables,
         n_committed_csa_per_seq,
+        positions,
         kv_indptr_csa,
         batch_id_per_token,
         skip_prefix_len_per_token,
@@ -185,6 +210,7 @@ def csa_translate_pack(
         mnbps,
         index_topk=index_topk,
         csa_block_capacity=csa_block_capacity,
+        ratio=ratio,
         BLOCK_K=BLOCK_K,
     )
 
@@ -193,6 +219,7 @@ def csa_translate_pack_reference(
     topk_local: torch.Tensor,
     block_tables: torch.Tensor,
     n_committed_csa_per_seq: torch.Tensor,
+    positions: torch.Tensor,
     kv_indptr_csa: torch.Tensor,
     batch_id_per_token: torch.Tensor,
     skip_prefix_len_per_token: torch.Tensor,
@@ -200,18 +227,15 @@ def csa_translate_pack_reference(
     *,
     swa_pages: int,
     csa_block_capacity: int,
+    ratio: int = 4,
 ) -> None:
-    """Pure-torch reference. Mirrors the original PyTorch chain + packed write.
-
-    Same contract as `csa_translate_pack`: `n_committed_csa_per_seq` is the
-    raw per-seq count; this reference also clamps via `min(n, index_topk)`
-    to match the kernel's mask behavior. Negative `topk_local` entries
-    (kernel-native -1 sentinels) are skipped to mirror the kernel's
-    `topk >= 0` write mask.
+    """Pure-torch reference. Mirrors the kernel — derives per-token valid_k
+    inline from positions + n_committed_csa_per_seq + index_topk.
     """
     T, index_topk = topk_local.shape
     indptr = kv_indptr_csa.to(torch.int64)
     counts = n_committed_csa_per_seq.to(torch.int64)
+    poses = positions.to(torch.int64)
     bids = batch_id_per_token.to(torch.int64)
     skips = skip_prefix_len_per_token.to(torch.int64)
     mnbps = block_tables.size(1)
@@ -219,19 +243,18 @@ def csa_translate_pack_reference(
         bid = int(bids[t].item())
         if bid < 0:
             continue
-        # Mirror kernel's `(k < valid_k) & (k < index_topk)` clamp.
-        n = min(int(counts[bid].item()), index_topk)
-        if n == 0:
+        pos = int(poses[t].item())
+        n_csa_seq = int(counts[bid].item())
+        n = min((pos + 1) // ratio, n_csa_seq, index_topk)
+        if n <= 0:
             continue
         topk = topk_local[t, :n].to(torch.int64)
-        valid = topk >= 0  # mirror kernel's per-cell `topk >= 0` write mask
+        valid = topk >= 0  # defensive; with per-token valid_k all should be >= 0
         blk_idx = (topk // csa_block_capacity).clamp(0, mnbps - 1)
         slot = topk % csa_block_capacity
         phys = block_tables[bid, blk_idx].to(torch.int64)
         paged = swa_pages + phys * csa_block_capacity + slot
         base = int(indptr[t].item()) + int(skips[t].item())
-        # Scatter only at cells where valid; cells with topk<0 keep their
-        # prior value (matches the kernel's masked tl.store).
         for k in range(n):
             if bool(valid[k].item()):
                 kv_indices_csa[base + k] = int(paged[k].item())

@@ -1723,6 +1723,16 @@ class DeepseekV4Attention(nn.Module):
             # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
             # to (1, num_tokens, ...) for aiter's per-position rope kernel.
             self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
+            if is_decode:
+                swa_write(
+                    kv,
+                    positions,
+                    attn_md.cu_seqlens_q,
+                    state_slot_mapping,
+                    self.swa_kv,
+                    cache_size,
+                    min(attn_md.max_seqlen_q, cache_size),
+                )
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
@@ -1743,43 +1753,22 @@ class DeepseekV4Attention(nn.Module):
             )
             # Translate seq-local topk → physical paged offsets and write into
             # the CSA section of either:
-            #   - decode buffer `kv_indices_csa` (is_pure_decode)
+            #   - decode buffer `kv_indices_csa` (state is DECODE)
             #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
-            # `_fill_csa_paged_compress` dispatches internally on is_pure_decode.
-            self._fill_csa_paged_compress(attn_md, indexer_topk_batched, num_tokens)
+            # `_fill_csa_paged_compress` dispatches internally on state.
+            self._fill_csa_paged_compress(
+                attn_md, indexer_topk_batched, positions, num_tokens
+            )
 
         # ===== Sparse attention dispatch =====
-        # Two paths over the unified KV pool. The order of `swa_write` vs
-        # `sparse_attn` differs because the two kernels read SWA differently:
-        #
-        # decode (is_pure_decode==True):
-        #   `paged_decode` reads SWA from `unified_kv` ring slot
-        #   `pos % cache_size`. The current decode token's K must be present
-        #   in the ring before attn fires, otherwise the token can't see its
-        #   own K. So:
-        #     swa_write → paged_decode
-        #
-        # prefill / mixed (is_pure_decode==False):
-        #   `paged_prefill` reads in-chunk K from per-fwd `kv` tensor (extend
-        #   region) and prior-chunk K from `unified_kv` ring (prefix region).
-        #   `swa_write` writes the LAST `cache_size` tokens of THIS fwd into
-        #   ring slots `pos % cache_size`, which OVERLAP with prior-chunk
-        #   slots that the prefix SWA region wants to read (chunked prefill):
-        #     paged_prefill → swa_write
-        #   Pure prefill (chunk_start==0) has prefix_swa_count==0 so no prior
-        #   ring read; swa_write order is irrelevant in that subcase.
+        # Decode SWA write fires upstream of this dispatch — either inside
+        # `fused_qk_norm_rope_swa_write` (fused path above) or via the
+        # explicit `swa_write` call in the non-fused `else` branch — so
+        # `paged_decode` always sees the current token's K in the ring.
+        # Prefill does NOT call swa_write from this layer (prior-chunk K is
+        # read from `unified_kv` ring via the kv_indices_prefix_swa region).
         q_sa = q.contiguous()
         if is_decode:
-            if not self.use_fuse_qk_norm_rope_swa_write:
-                swa_write(
-                    kv,
-                    positions,
-                    attn_md.cu_seqlens_q,
-                    state_slot_mapping,
-                    self.swa_kv,
-                    cache_size,
-                    min(attn_md.max_seqlen_q, cache_size),
-                )
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
                 kv_indptr = attn_md.kv_indptr_swa
@@ -1850,6 +1839,7 @@ class DeepseekV4Attention(nn.Module):
         self,
         attn_md,
         topk_local_raw: torch.Tensor,
+        positions: torch.Tensor,
         total_tokens: int,
     ) -> None:
         """Per-CSA-layer: translate indexer raw `topk_in_seq` → physical paged
@@ -1857,8 +1847,8 @@ class DeepseekV4Attention(nn.Module):
         active prefix buffer.
 
         Dispatch:
-          - is_pure_decode → write into decode buffer `kv_indices_csa`,
-                             skip = `window_size` (full SWA prefix per token)
+          - state is DECODE → write into decode buffer `kv_indices_csa`,
+                              skip = `window_size` (full SWA prefix per token)
           - prefill / mixed → write into prefill buffer `kv_indices_prefix_csa`,
                               skip = per-token `prefix_swa_count[t]`
 
@@ -1871,14 +1861,19 @@ class DeepseekV4Attention(nn.Module):
 
         Fully fused into one triton kernel — no [T, index_topk] intermediates,
         no PyTorch fancy index. CG sentinel (batch_id=-1) and OOB clamp are
-        handled in-kernel; downstream paged_decode/paged_prefill kernels
-        strict-slice via `kv_indptr*`, so tail cols beyond `valid_k` are never
-        read and need no `-1` fill (CSA section was -1 pre-filled by builder).
+        handled in-kernel. The kernel derives per-token `valid_k` inline from
+        `(positions[t]+1)//ratio` clamped by `n_committed_csa[bid]` and
+        `index_topk`, matching Indexer's per-row visibility — so every
+        reserved CSA cell gets written and no `-1` sentinel pre-fill is needed.
 
         Args:
           topk_local_raw: [total_tokens, index_topk] int32 — RAW seq-local
-            output of `Indexer.forward_batched` (negative tails are sentinels;
-            csa_translate_pack skips them via `topk >= 0` write mask).
+            output of `Indexer.forward_batched`. The leading `valid_k[t]`
+            cells are always >= 0; trailing cells are -1 sentinels never
+            read by csa_translate_pack (filtered by `k_offs < valid_k`).
+          positions: [total_tokens] int — global token positions; forwarded
+            to csa_translate_pack so the kernel can compute per-token
+            `valid_k` inline.
         """
         # csa_block_capacity = block_size // ratio = 128 // 4 = 32.
         # Derived from constants (not `compressor.kv_cache.size(1)`) because
@@ -1898,12 +1893,14 @@ class DeepseekV4Attention(nn.Module):
             topk_local_raw,
             attn_md.block_tables,
             attn_md.n_committed_csa_per_seq,
+            positions,
             kv_indptr,
             attn_md.batch_id_per_token,
             attn_md.skip_prefix_len_csa,
             kv_indices,
             swa_pages=attn_md.swa_pages,
             csa_block_capacity=csa_block_capacity,
+            ratio=4,
         )
 
 
