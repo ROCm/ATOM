@@ -1828,7 +1828,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "build (got scheduled_bs={scheduled_bs}, total_tokens={total_tokens})"
         )
 
-        device = self.device
         win = self.window_size  # per-token topk count
         cs = self.win_with_spec  # SWA region per-slot stride (W + mtp_k)
         index_topk = self.index_topk

@@ -721,6 +721,7 @@ class AiterMlaSparseIndexerMetadataBuilderMethodsForVllm:
         )
         return indexer_metadata
 
+
 # vLLM metadata builders
 class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
     """vLLM-only MHA metadata builder."""
@@ -1649,6 +1650,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         attn_metadata.persistent_metadata = persistent_metadata
         return attn_metadata
 
+
 class AiterMLASparseMetadataBuilder(
     AiterMlaSparseMetadataBuilderMethodsForVllm, AttentionMetadataBuilder
 ):
@@ -1750,6 +1752,7 @@ class AiterMLASparseMetadataBuilder(
             dtype=reduce_partial_map_type,
             device=device,
         )
+
 
 class AiterMLASparseIndexerMetadataBuilder(
     AiterMlaSparseIndexerMetadataBuilderMethodsForVllm, AttentionMetadataBuilder
