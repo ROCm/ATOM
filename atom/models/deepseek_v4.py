@@ -819,11 +819,13 @@ class Compressor(nn.Module):
         # valid tensor; afterwards `DeepseekV4AttentionMetadataBuilder.
         # build_kv_cache_tensor` setattr-replaces these attributes with
         # views of the per-request cache pool whose second dim is the real
-        # ring_size = coff*ratio + max_spec_steps + 1 (spec) or coff*ratio
-        # (non-spec). The 1-slot init buffers (≈9 MB total across all layers)
-        # are GC'd once replaced before any real kernel call, so the
-        # placeholder's smaller second dim never actually flows through the
-        # kernel's `state_size >= K_pool` assertion.
+        # ring_size = K_pool + max_spec_steps where K_pool = coff * ratio
+        # (non-spec collapses to K_pool since max_spec_steps == 0; causal
+        # writes guarantee no read-before-overwrite alias). The 1-slot init
+        # buffers (≈9 MB total across all layers) are GC'd once replaced
+        # before any real kernel call, so the placeholder's smaller second
+        # dim never actually flows through the kernel's
+        # `state_size >= K_pool` assertion.
         self.register_buffer(
             "kv_state",
             torch.zeros(

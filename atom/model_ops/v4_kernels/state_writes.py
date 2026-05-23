@@ -250,7 +250,9 @@ def _update_compressor_states_kernel(
     score_state_slot_stride,
     score_state_pos_stride,
     dim,
-    STATE_SIZE: tl.constexpr,  # = 2*RATIO if OVERLAP else RATIO
+    STATE_SIZE: tl.constexpr,  # ring buffer modulo = kv_state.shape[1] (≥ K_pool;
+    #   V4-Pro spec decode: K_pool + max_spec_steps to keep R's rejected writes
+    #   out of R+1's read window; non-spec or pre-spec models: exactly K_pool)
     OVERLAP: tl.constexpr,
     RATIO: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -320,20 +322,25 @@ def update_compressor_states(
     overlap: bool,
 ) -> None:
     """In-place update of Compressor's per-request `kv_state`/`score_state`
-    ring buffer (size `2*ratio` for overlap CSA, `ratio` for HCA), driven by
-    a SGLang-style packed `write_plan`.
+    ring buffer (size ≥ `K_pool = (1+overlap)*ratio`; V4-Pro widens to
+    `K_pool + max_spec_steps` for spec decode, keeps `K_pool` for non-spec),
+    driven by a SGLang-style packed `write_plan`.
 
     The plan is pre-filtered on the host to include only tokens whose
-    `position` falls in the per-seq "last STATE_SIZE absolute positions"
-    window — the kernel writes unconditionally, no in-kernel mask.
+    `position` falls in the per-seq "last K_pool absolute positions" window
+    (`write_starts = max(0, context_lens - K_pool)` in `make_compress_plans`)
+    — the kernel writes unconditionally, no in-kernel mask. Note that the
+    write window is K_pool, NOT STATE_SIZE; the extra STATE_SIZE - K_pool
+    slots exist purely as aliasing slack for spec rollback (see
+    `csa_main_state_shape` comment in `deepseek_v4_attn.py`).
 
     Args:
       kv:           [N, dim] flat batched KV (typically fp32 or bf16, cast inside).
       score:        [N, dim] flat batched score (NOT pre-added with ape;
                     kernel fuses ape addition).
       ape:          [ratio, dim] absolute position embedding.
-      kv_state:     [num_slots, S, dim] in-place ring buffer.
-                    S = 2*ratio if overlap else ratio.
+      kv_state:     [num_slots, S, dim] in-place ring buffer. S ≥ K_pool;
+                    V4-Pro: S = K_pool + max_spec_steps.
       score_state:  same shape as kv_state.
       write_plan:   [num_write, 4] int32 — packed (ragged_id, batch_id,
                     position, _); each row = one token to write.

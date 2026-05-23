@@ -1875,14 +1875,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the kernel was designed/tested against int32 (downstream paged
         # offsets stored in int32 buffers; int32 throughout avoids mixed-
         # dtype Triton arithmetic that can silently truncate).
-        positions_gpu = var["positions"].gpu[:T].to(torch.int32)
+        positions_gpu = var["positions"].gpu[:T]
         cu_q_per_seq_gpu = var["cu_seqlens_q"].gpu[:scheduled_bs]
         state_slot_per_seq_gpu = attn_metadata.state_slot_mapping[:scheduled_bs]
         block_tables_gpu = var["block_tables"].gpu[:scheduled_bs]
         # batch_id_per_token is int64 in storage (PyTorch fancy-index
         # compatibility upstream); kernel uses tl.load which is dtype-agnostic
         # but cast for safety + consistency.
-        bid_per_token_gpu = attn_metadata.batch_id_per_token[:T].to(torch.int32)
+        bid_per_token_gpu = attn_metadata.batch_id_per_token[:T]
 
         # ----- Allocate output buffers (exact sizes known from CPU totals) -----
         ext_indices = torch.empty(max(ext_total, 1), dtype=torch.int32, device=device)
@@ -2262,8 +2262,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._decode_compress_cap: dict[int, int] = {}
         for ratio, is_overlap in self._unique_compress_ratios_overlap:
             # NOTE: this is the pool-window size (algorithm constant), NOT the
-            # state ring buffer size. The ring buffer is now K_pool + max_spec_steps + 1
-            # to avoid R+1 re-commit borrow-reads (see csa_main_state_shape comment),
+            # state ring buffer size. The ring buffer is K_pool + max_spec_steps
+            # (see csa_main_state_shape comment for the slot-aliasing argument),
             # but write_plan still emits ≤ K_pool rows per seq per fwd because
             # `write_starts = max(0, context_lens - K_pool)` in make_compress_plans.
             K_pool = (2 if is_overlap else 1) * ratio
