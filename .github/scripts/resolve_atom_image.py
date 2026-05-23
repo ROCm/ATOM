@@ -128,9 +128,9 @@ def get_registry_token(repository: str) -> str:
     docker_user = os.environ.get("DOCKER_USERNAME")
     docker_pass = os.environ.get("DOCKER_PASSWORD")
     if docker_user and docker_pass:
-        creds = base64.b64encode(
-            f"{docker_user}:{docker_pass}".encode("utf-8")
-        ).decode("ascii")
+        creds = base64.b64encode(f"{docker_user}:{docker_pass}".encode("utf-8")).decode(
+            "ascii"
+        )
         headers["Authorization"] = f"Basic {creds}"
     body, _ = http_request(
         f"{AUTH_URL}?{query}",

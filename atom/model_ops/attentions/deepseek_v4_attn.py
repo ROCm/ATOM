@@ -134,17 +134,6 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     `_attach_v4_paged_decode_meta` for indptr fancy-index math. Avoids a
     duplicate `np.repeat` per fwd. None for prefill paths that don't go
     through paged_decode_meta (it's only consumed there)."""
-    swa_write_indices: Optional[torch.Tensor] = None
-    """[W] int64 GPU — src row id into per-fwd KV for swa_write.
-    `[0:num_write]` = real (last `win` tokens per seq); trailing entries
-    `[num_write:W]` = -1 sentinel (only present on decode/MTP CG paths
-    where `W = padded_bs * (1 + max_spec_steps)`; prefill is eager and
-    uses `W = num_write` exactly, no padding). `None` for warmup / empty fwd.
-
-    NOTE: kept only for the aiter `fused_qk_norm_rope_swa_write` path
-    (num_tokens <= 64). Standalone `swa_write` (num_tokens > 64) now derives
-    `src_id` from `cu_seqlens_q` + `token_num_per_seq` directly inside the
-    kernel — eliminates the DMA-tear race on this shared GPU buffer."""
     compress_plans: Optional[Dict[int, Any]] = None
     """dict[ratio:int -> CompressPlan] — packed plan tensors per
     compress_ratio (4=CSA, 128=HCA)."""

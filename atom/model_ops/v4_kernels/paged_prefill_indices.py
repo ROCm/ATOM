@@ -40,7 +40,6 @@ used by `swa_write` and `_attach_v4_paged_decode_meta`):
   paged[t,k] = state_slot[bid] * cs + ((swa_low[t] + k) % cs)
 """
 
-
 import torch
 import triton
 import triton.language as tl

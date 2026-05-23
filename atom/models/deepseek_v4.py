@@ -147,7 +147,6 @@ def _fused_qk_norm_rope_swa_write_fake(
     kv_weight: torch.Tensor,
     eps: float,
     win: int,
-    swa_write_indices: Optional[torch.Tensor] = None,
     batch_id_per_token: Optional[torch.Tensor] = None,
     state_slot_mapping: Optional[torch.Tensor] = None,
     swa_kv: Optional[torch.Tensor] = None,
@@ -173,18 +172,16 @@ def fused_qk_norm_rope_swa_write(
     kv_weight: torch.Tensor,
     eps: float,
     win: int,
-    swa_write_indices: Optional[torch.Tensor] = None,
     batch_id_per_token: Optional[torch.Tensor] = None,
     state_slot_mapping: Optional[torch.Tensor] = None,
     swa_kv: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw + RoPE on
-    q/kv tail (+ SWA write) in a single triton kernel.
+    q/kv tail in a single triton kernel.
 
     `kv` must already be kv_norm-applied; the kernel does not weight-norm kv.
-    `kv` is RoPE-mutated in place. When all SWA tensors are provided, the
-    kernel also writes the windowed kv into `swa_kv`; the caller must then
-    skip the standalone `swa_write` for those rows.
+    `kv` is RoPE-mutated in place. SWA write is not performed here — callers
+    that need it must invoke the standalone `swa_write` after this call.
     """
     num_tokens = q.shape[0]
     if num_tokens <= 64:
@@ -207,7 +204,7 @@ def fused_qk_norm_rope_swa_write(
             q_out=q_out,
             is_neox=False,
             dtype=torch.bfloat16,
-            write_indices=swa_write_indices,
+            write_indices=None,
             batch_id_per_token=batch_id_per_token,
             state_slot_mapping=state_slot_mapping,
             swa_kv=swa_kv,
@@ -227,16 +224,6 @@ def fused_qk_norm_rope_swa_write(
             reuse_freqs_front_part=True,
             nope_first=False,
         )
-        if swa_write_indices is not None:
-            swa_write(
-                kv,
-                swa_write_indices,
-                positions,
-                batch_id_per_token,
-                state_slot_mapping,
-                swa_kv,
-                win,
-            )
     return q_out
 
 
@@ -1661,7 +1648,7 @@ class DeepseekV4Attention(nn.Module):
         # always populates these; warmup goes through the same path
         # (`_populate_state_slot_mapping` falls back to slot 0).
         # Cast to V4 typed metadata so V4-specific attribute access (v4_*,
-        # compress_plans, swa_write_indices, ...) is well-typed for pyright.
+        # compress_plans, ...) is well-typed for pyright.
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         compress_plans = attn_md.compress_plans
         v4_batch_id_per_token = attn_md.batch_id_per_token
@@ -1710,7 +1697,6 @@ class DeepseekV4Attention(nn.Module):
                 self.kv_norm.weight,
                 self.eps,
                 cache_size,
-                swa_write_indices=swa_write_indices,
                 batch_id_per_token=v4_batch_id_per_token,
                 state_slot_mapping=state_slot_mapping,
                 swa_kv=self.swa_kv,
