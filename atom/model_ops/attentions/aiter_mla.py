@@ -66,6 +66,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
 
+        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
+        if self.dcp_world_size > 1:
+            from aiter.dist.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
+        else:
+            self.dcp_rank = 0
+
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
             (work_meta_data_size, work_meta_data_type),
@@ -740,12 +748,30 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     for pos in range(seq_len - max_seqlen_q, seq_len)
                 ]
             else:
-                slot_mapping = [
-                    block_table[-1] * self.model_runner.block_size + last_block_num - 1
-                    for block_table, last_block_num in zip(
-                        block_tables, batch.last_block_num_tokens
-                    )
-                ]
+                if self.dcp_world_size > 1:
+                    slot_mapping = []
+                    block_size = self.model_runner.block_size
+                    virtual_block_size = block_size * self.dcp_world_size
+                    for block_table, seq_len in zip(block_tables, context_lens):
+                        pos = seq_len - 1
+                        if pos % self.dcp_world_size == self.dcp_rank:
+                            blk_idx = pos // virtual_block_size
+                            vb_offset = pos % virtual_block_size
+                            local_offset = vb_offset // self.dcp_world_size
+                            slot_mapping.append(
+                                block_table[blk_idx] * block_size + local_offset
+                            )
+                        else:
+                            slot_mapping.append(-1)
+                else:
+                    slot_mapping = [
+                        block_table[-1] * self.model_runner.block_size
+                        + last_block_num
+                        - 1
+                        for block_table, last_block_num in zip(
+                            block_tables, batch.last_block_num_tokens
+                        )
+                    ]
         positions = np.tile(
             np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
         ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
@@ -759,7 +785,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:bs] = 0
 
-        if any(batch.is_first_decode_without_local_prefill):
+        if self.dcp_world_size > 1:
+            from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+
+            local_context_lens = get_dcp_local_seq_lens(
+                context_lens, self.dcp_world_size, self.dcp_rank
+            )
+            num_blocks_per_seq = cdiv(local_context_lens, self.block_size)
+        elif any(batch.is_first_decode_without_local_prefill):
             num_blocks_per_seq = [
                 (
                     len(batch.block_tables[i])
@@ -781,9 +814,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.prepare_block_tables(batch)
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
         var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
-        var["kv_last_page_lens"].np[:scheduled_bs] = (
-            batch.last_block_num_tokens if self.block_size != 1 else 1
-        )
+        if self.dcp_world_size > 1 and self.block_size != 1:
+            local_last = local_context_lens % self.block_size
+            var["kv_last_page_lens"].np[:scheduled_bs] = np.where(
+                local_last == 0,
+                np.where(local_context_lens > 0, self.block_size, 0),
+                local_last,
+            )
+        else:
+            var["kv_last_page_lens"].np[:scheduled_bs] = (
+                batch.last_block_num_tokens if self.block_size != 1 else 1
+            )
         var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
         vars_used = [
             ("slot_mapping", bs * max_seqlen_q),

@@ -696,6 +696,9 @@ class ParallelConfig:
     data_parallel_rank_local: Optional[int] = None
     """Local rank of the data parallel group,
     set only in SPMD mode."""
+    decode_context_parallel_size: int = 1
+    """DCP group size. tp_size must be divisible by dcp_size.
+    DCP does not increase world_size; it reuses TP GPUs."""
     world_size: int = field(init=False)
     """world_size is TPxPP, it affects the number of workers we create."""
     data_parallel_master_port: int = 29500
@@ -937,6 +940,7 @@ class Config:
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    decode_context_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)
     generation_config: GenerationConfig = field(init=False)
@@ -990,6 +994,17 @@ class Config:
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8
+        if self.decode_context_parallel_size > 1:
+            assert self.tensor_parallel_size % self.decode_context_parallel_size == 0, (
+                f"tp_size ({self.tensor_parallel_size}) must be divisible by "
+                f"dcp_size ({self.decode_context_parallel_size})"
+            )
+            if self.enable_prefix_caching:
+                logger.warning(
+                    "DCP does not support prefix caching yet; "
+                    "disabling enable_prefix_caching."
+                )
+                self.enable_prefix_caching = False
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )

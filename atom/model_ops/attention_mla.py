@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
 from dataclasses import dataclass
@@ -166,6 +166,22 @@ class MLAAttention(nn.Module):
             else None
         )
         self.layer_num = layer_num
+
+        from atom.config import get_current_atom_config
+
+        config = get_current_atom_config()
+        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
+        if self.dcp_world_size > 1:
+            from aiter.dist.parallel_state import get_dcp_group
+            from atom.model_ops.dcp_ops import CPTritonContext
+
+            self.dcp_group = get_dcp_group()
+            self.dcp_rank = self.dcp_group.rank_in_group
+            self._cp_triton_ctx = CPTritonContext()
+        else:
+            self.dcp_group = None
+            self.dcp_rank = 0
+            self._cp_triton_ctx = None
 
     def process_weights_after_loading(self):
         if is_rocm_aiter_fp4bmm_enabled():
@@ -531,21 +547,26 @@ class MLAAttention(nn.Module):
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        return_lse: bool = False,
     ) -> torch.Tensor:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata is not None
         B = q.shape[0]
+        num_heads_q = q.shape[1]
 
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
 
+        padded_heads = max(num_heads_q * self.head_repeat_factor, _MLA_MIN_HEADS)
         o = torch.empty(
             B,
-            self.padded_num_heads,
+            padded_heads,
             self.kv_lora_rank,
             dtype=self.dtype,
             device=q.device,
         )
+
+        final_lse = None
 
         if hasattr(attn_metadata, "triton_block_table"):
             from aiter.ops.triton.attention.mla_decode import decode_attention_fwd
@@ -614,7 +635,7 @@ class MLAAttention(nn.Module):
                     )
 
             dp_size = get_dp_group().world_size
-            use_persistent_mode = not (dp_size > 1)
+            use_persistent_mode = not (dp_size > 1) and not return_lse
 
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
@@ -645,7 +666,12 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
-            mla_decode_fwd(
+            if self.dcp_world_size > 1:
+                num_kv_splits = max(1, 16 // self.dcp_world_size)
+            else:
+                num_kv_splits = 16
+
+            _, final_lse = mla_decode_fwd(
                 q,
                 kv_buffer.view(-1, 1, 1, q.shape[-1]),
                 o,
@@ -654,7 +680,7 @@ class MLAAttention(nn.Module):
                 paged_kv_indices,
                 paged_kv_last_page_lens,
                 max_q_len,
-                num_kv_splits=16,
+                num_kv_splits=num_kv_splits,
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,
                 work_indptr=work_indptr,
@@ -664,10 +690,16 @@ class MLAAttention(nn.Module):
                 reduce_partial_map=reduce_partial_map,
                 q_scale=self._q_scale,
                 kv_scale=self._k_scale,
+                return_lse=return_lse,
             )
 
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :].contiguous()
+            if final_lse is not None:
+                final_lse = final_lse[:, :: self.head_repeat_factor].contiguous()
+
+        if return_lse:
+            return o, final_lse
 
         return self._v_up_proj_and_o_proj(o)
 
@@ -781,30 +813,60 @@ class MLAAttention(nn.Module):
                 device=q_nope.device,
             )
             if kv_cache.numel() > 0:
-                fused_qk_rope_concat_and_cache_mla(
-                    q_nope,
-                    q_rope,
-                    k_nope,
-                    k_rope,
-                    kv_cache.view(
-                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                    ),
-                    q_out,
-                    attn_metadata.slot_mapping,
-                    self._k_scale,
-                    self._q_scale,
-                    positions,
-                    self.rotary_emb.cos_cache,
-                    self.rotary_emb.sin_cache,
-                    is_neox=self.rotary_emb.is_neox_style,
-                    is_nope_first=True,
-                )
+                if self.dcp_world_size > 1:
+                    # DCP workaround: the fused kernel returns early (skipping
+                    # Q RoPE) when slot_mapping=-1, leaving q_out uninitialised
+                    # for non-local tokens. Split into separate ops so Q RoPE is
+                    # always computed for every token.
+                    self.rotary_emb(positions, q_rope, k_rope)
+                    q_out = torch.cat([q_nope, q_rope], dim=-1)
+                    concat_and_cache_mla(
+                        k_nope,
+                        k_rope.squeeze(1),
+                        kv_cache,
+                        attn_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=self._k_scale,
+                    )
+                else:
+                    fused_qk_rope_concat_and_cache_mla(
+                        q_nope,
+                        q_rope,
+                        k_nope,
+                        k_rope,
+                        kv_cache.view(
+                            kv_cache.shape[0],
+                            -1,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        q_out,
+                        attn_metadata.slot_mapping,
+                        self._k_scale,
+                        self._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        is_nope_first=True,
+                    )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
             else:
-                output = self._forward_decode(q_out, kv_cache, attn_metadata)
+                if self.dcp_world_size > 1:
+                    q_out = self.dcp_group.all_gather(q_out, dim=1)
+                    o, lse = self._forward_decode(
+                        q_out, kv_cache, attn_metadata, return_lse=True
+                    )
+                    from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
+
+                    o = cp_lse_ag_out_rs(
+                        o, lse, self.dcp_group, ctx=self._cp_triton_ctx
+                    )
+                    output = self._v_up_proj_and_o_proj(o)
+                else:
+                    output = self._forward_decode(q_out, kv_cache, attn_metadata)
 
         return output
 
@@ -941,7 +1003,7 @@ def triton_convert_req_index_to_global_index(
     # Strides in elements
     ti_stride0, ti_stride1 = token_indices_c.stride()
 
-    # Exact 2D grid: tokens × column tiles
+    # Exact 2D grid: tokens x column tiles
     grid = (num_batch, tiles_per_row)
 
     _convert_req_index_to_global_index_kernel[grid](

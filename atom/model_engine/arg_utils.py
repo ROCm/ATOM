@@ -30,6 +30,7 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    decode_context_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
@@ -81,6 +82,13 @@ class EngineArgs:
             type=int,
             default=1,
             help="Data parallel size.",
+        )
+        parser.add_argument(
+            "--decode-context-parallel-size",
+            "-dcp",
+            type=int,
+            default=1,
+            help="Decode context parallel size. Must divide tensor_parallel_size.",
         )
         parser.add_argument(
             "--enforce-eager",
