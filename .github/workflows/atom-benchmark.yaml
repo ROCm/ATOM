@@ -890,7 +890,7 @@ jobs:
             const { execSync } = require('child_process');
             const artifactName = 'pd-proxy-ip-${{ matrix.entry.prefix }}';
             core.info(`Polling for proxy IP artifact (${artifactName})...`);
-            for (let i = 0; i < 60; i++) {
+            for (let i = 0; i < 180; i++) {
               try {
                 const { data } = await github.rest.actions.listWorkflowRunArtifacts({
                   owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
@@ -910,8 +910,8 @@ jobs:
                   return;
                 }
               } catch (e) { core.debug(`Attempt ${i+1} error: ${e.message}`); }
-              if (i === 59) { core.setFailed('Timed out waiting for proxy IP'); return; }
-              core.info(`  Artifact not ready (${i+1}/60), retrying in 10s...`);
+              if (i === 179) { core.setFailed('Timed out waiting for proxy IP'); return; }
+              core.info(`  Artifact not ready (${i+1}/180), retrying in 10s...`);
               await new Promise(r => setTimeout(r, 10000));
             }
 
