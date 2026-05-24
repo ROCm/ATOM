@@ -47,9 +47,6 @@ from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
-from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
-    fused_reduce_qk_norm_rope_swa_write,
-)
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
     Config,
@@ -60,7 +57,7 @@ from atom.config import (
 )
 from atom.model_loader.loader import WeightsMapper
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import DualRMSNorm, RMSNorm, rmsnorm2d_fwd_
+from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -90,6 +87,7 @@ from atom.model_ops.v4_kernels import (
     csa_translate_pack,
     fused_compress_attn,
     inverse_rope_inplace,
+    qk_norm_rope_maybe_quant,
     scale_indexer_weights,
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
@@ -133,114 +131,6 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
-
-
-def _fused_qk_norm_rope_swa_write_fake(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    positions: torch.Tensor,
-    n_local_heads: int,
-    head_dim: int,
-    rope_head_dim: int,
-    kv_weight: torch.Tensor,
-    eps: float,
-    win: int,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    swa_kv: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    M = q.shape[0]
-    return torch.empty(
-        (M, n_local_heads, head_dim),
-        dtype=torch.bfloat16,
-        device=q.device,
-    )
-
-
-@torch_compile_guard(gen_fake=_fused_qk_norm_rope_swa_write_fake)
-def fused_qk_norm_rope_swa_write(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    positions: torch.Tensor,
-    n_local_heads: int,
-    head_dim: int,
-    rope_head_dim: int,
-    kv_weight: torch.Tensor,
-    eps: float,
-    win: int,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    swa_kv: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Fused wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw + RoPE on
-    q/kv tail in a single triton kernel.
-
-    `kv` must already be kv_norm-applied; the kernel does not weight-norm kv.
-    `kv` is RoPE-mutated in place. SWA write is not performed here — callers
-    that need it must invoke the standalone `swa_write` after this call.
-    """
-    num_tokens = q.shape[0]
-    if num_tokens <= 64:
-        q_out = torch.empty(
-            (num_tokens, n_local_heads, head_dim),
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
-        fused_reduce_qk_norm_rope_swa_write(
-            q,
-            kv,
-            None,
-            kv_weight,
-            eps,
-            eps,
-            rope_head_dim,
-            cos_cache,
-            sin_cache,
-            positions,
-            q_out=q_out,
-            is_neox=False,
-            dtype=torch.bfloat16,
-            write_indices=None,
-            batch_id_per_token=batch_id_per_token,
-            state_slot_mapping=state_slot_mapping,
-            swa_kv=swa_kv,
-            win=win,
-        )
-    else:
-        q = q.view(num_tokens, n_local_heads, head_dim)
-        q_out = _rmsnorm_nw(q, eps, head_dim)
-        kv = rmsnorm2d_fwd_(kv, kv_weight, eps, kv.shape[-1])
-        aiter.rope_cached_positions_2c_fwd_inplace(
-            q_out[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
-            kv[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
-            cos_cache,
-            sin_cache,
-            positions.view(1, num_tokens),
-            1,
-            reuse_freqs_front_part=True,
-            nope_first=False,
-        )
-    return q_out
-
-
-def _make_weightless_rmsnorm(dim: int, eps: float) -> RMSNorm:
-    """Build an `RMSNorm(dim, eps)` whose `.weight` is `None`.
-
-    Drops the learnable Parameter so `state_dict()` is empty for this
-    submodule and `load_model` doesn't expect a weight from disk (no
-    "unloaded parameter" warning).  `DualRMSNorm` recognizes the
-    sentinel `weight is None` and instructs the fused kernel to skip
-    both the q_weight load and the multiply (Q_HAS_WEIGHT=False),
-    matching the prior `_rmsnorm_nw(x, eps, dim)` behavior.
-    """
-    norm = RMSNorm(dim, eps)
-    del norm.weight  # remove Parameter from `_parameters`
-    norm.weight = None  # sentinel for downstream consumers
-    return norm
 
 
 def _hc_head_reduce_fake(
@@ -1375,12 +1265,6 @@ class DeepseekV4Attention(nn.Module):
             quant_config=qc,
             prefix=f"{p}.q_norm",
         )
-        # q_norm2: per-head Q normalization. The checkpoint has no
-        # `q_norm2.weight` entry, so the module is constructed with
-        # `weight=None` (no learnable Parameter) — `DualRMSNorm` reads the
-        # sentinel and tells the kernel to skip the q_weight load entirely.
-        # Behavior is identical to the prior `_rmsnorm_nw(q, eps, head_dim)`.
-        self.q_norm2 = _make_weightless_rmsnorm(self.head_dim, self.eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1389,19 +1273,6 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{p}.wq_b",
         )
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        # Fused per-head Q RMSNorm (identity weight) + KV RMSNorm — both have
-        # feature dim = head_dim, single Triton kernel via DualRMSNorm.
-        # `q_norm2.weight is None` tells the kernel's Q_HAS_WEIGHT=False
-        # path to skip the q_weight load (Q side has no learnable weight;
-        # equivalent to the prior `_rmsnorm_nw` helper).
-        self.qk_norm = DualRMSNorm(
-            self.q_norm2,
-            self.kv_norm,
-            num_q_heads=self.n_local_heads,
-            num_kv_heads=1,
-            head_dim=self.head_dim,
-            prefix=f"{p}.qk_norm",
-        )
         # wo_a: grouped LoRA — V4QuantConfig forces this BF16 even though disk is FP8.
         # The grouped einsum (`bsgd,grd->bsgr`) needs BF16 weights; aiter has no FP8 einsum.
         self.wo_a = ColumnParallelLinear(
@@ -1495,8 +1366,6 @@ class DeepseekV4Attention(nn.Module):
         self._use_async_compress = (
             self.alt_stream is not None and self.compressor is not None
         )
-
-        self.use_fuse_qk_norm_rope_swa_write = _V4_USE_TRITON_FUSION
 
         self.layer_name = prefix
         atom_config = get_current_atom_config()
@@ -1678,49 +1547,39 @@ class DeepseekV4Attention(nn.Module):
         qr, qr_scale = self.q_norm(q_lora)
         q = self.wq_b(qr, x_scale=qr_scale)
         is_decode = attn_md.state is AttnState.DECODE
-        if is_decode and self.use_fuse_qk_norm_rope_swa_write:
-            # Fused: wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw
-            # + RoPE on q tail + RoPE on kv tail (+ SWA write) in one triton
-            # kernel. KV RMSNorm stays out (kernel doesn't apply weighted norm
-            # to kv); the standalone swa_write below is gated off when this
-            # path runs since the kernel already wrote the window slots.
-            cos_cache, sin_cache = self.rotary_emb.cos_cache, self.rotary_emb.sin_cache
-            q = fused_qk_norm_rope_swa_write(
-                q,
-                kv_pre,
-                cos_cache,
-                sin_cache,
+        # Single kernel fuses per-head Q RMSNorm (weightless) + KV RMSNorm
+        # (weighted) + GPT-J interleaved RoPE on the tail rd dims. Dispatches
+        # to flydsl when the shape matches (V4-Pro is always V4-Pro shape →
+        # always flydsl). Microbench shows flydsl wins at every measured T
+        # from 4 (1.12×) to 32k (1.04×); used for both decode and prefill.
+        # Optional FP8 quant outputs left off — downstream sparse_attn /
+        # swa_write are still bf16.
+        q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
+            q,
+            kv_pre,
+            self.kv_norm.weight,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            positions,
+            self.n_local_heads,
+            self.head_dim,
+            rd,
+            self.eps,
+            quant_q=False,
+            quant_k=False,
+        )
+        if is_decode:
+            # SWA write per-token in decode (prefill writes after sparse_attn
+            # below so the in-chunk SWA tail is captured post-attention).
+            swa_write(
+                kv,
                 positions,
-                self.n_local_heads,
-                self.head_dim,
-                rd,
-                self.kv_norm.weight,
-                self.eps,
+                attn_md.cu_seqlens_q,
+                state_slot_mapping,
+                self.swa_kv,
                 cache_size,
-                batch_id_per_token=v4_batch_id_per_token,
-                state_slot_mapping=state_slot_mapping,
-                swa_kv=self.swa_kv,
+                min(attn_md.max_seqlen_q, cache_size),
             )
-        else:
-            # Flat q_flat is [num_tokens, n_local_heads * head_dim]; DualRMSNorm
-            # views internally to per-head shape and returns flat. Single Triton
-            # launch fuses per-head Q RMSNorm (weightless) + KV RMSNorm (both
-            # head_dim=128), replacing the prior `_rmsnorm_nw + kv_norm` pair.
-            q_flat, kv = self.qk_norm(q, kv_pre)
-            q = q_flat.view(num_tokens, self.n_local_heads, self.head_dim)
-            # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
-            # to (1, num_tokens, ...) for aiter's per-position rope kernel.
-            self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
-            if is_decode:
-                swa_write(
-                    kv,
-                    positions,
-                    attn_md.cu_seqlens_q,
-                    state_slot_mapping,
-                    self.swa_kv,
-                    cache_size,
-                    min(attn_md.max_seqlen_q, cache_size),
-                )
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
@@ -1749,13 +1608,11 @@ class DeepseekV4Attention(nn.Module):
             )
 
         # ===== Sparse attention dispatch =====
-        # Decode SWA write fires upstream of this dispatch — either inside
-        # `fused_qk_norm_rope_swa_write` (fused path above) or via the
-        # explicit `swa_write` call in the non-fused `else` branch — so
-        # `paged_decode` always sees the current token's K in the ring.
-        # Prefill does NOT call swa_write from this layer (prior-chunk K is
-        # read from `unified_kv` ring via the kv_indices_prefix_swa region).
-        q_sa = q.contiguous()
+        # Decode SWA write fires upstream of this dispatch via the
+        # ``swa_write`` call in the decode branch — so ``paged_decode``
+        # always sees the current token's K in the ring. Prefill does NOT
+        # call swa_write from this layer (prior-chunk K is read from
+        # ``unified_kv`` ring via the kv_indices_prefix_swa region).
         if is_decode:
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
