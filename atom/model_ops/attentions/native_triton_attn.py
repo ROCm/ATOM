@@ -65,20 +65,38 @@ from atom.utils.forward_context import (
 logger = logging.getLogger("atom")
 
 
-def _is_gfx1201() -> bool:
+# Arches that aiter's prebuilt HIP modules in rocm/atom-dev:latest ship
+# matching code objects for. On any other arch the HIP attention ops fail
+# (e.g. gfx1201/RDNA4 reports "No compatible code objects found"), so we
+# fall back to the in-tree triton backend in this file. Update this set
+# when aiter's prebuilt distribution changes.
+_AITER_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
+
+
+def _hip_attention_supported_on_current_device() -> bool:
+    """Capability check: does the running device match aiter's prebuilt
+    HIP attention support? Returns True only when the device's arch is in
+    the prebuilt-HIP allowlist above; False otherwise (including no CUDA).
+    No arch-name pattern matching - a positive allowlist makes the
+    coverage extension point explicit."""
     if not torch.cuda.is_available():
         return False
-    name = torch.cuda.get_device_properties(0).gcnArchName or ""
-    return name.startswith("gfx1201")
+    arch = (torch.cuda.get_device_properties(0).gcnArchName or "").split(":")[0]
+    return arch in _AITER_HIP_PREBUILT_ARCHES
 
 
 def use_native_triton_attn() -> bool:
+    """True when we must route paged attention through the in-tree triton
+    backend (this file) instead of the aiter HIP-prebuilt path. The HIP
+    path is selected only when the running device is in aiter's prebuilt
+    allowlist; otherwise (e.g. gfx1201) the JIT-compiled triton path is
+    used. Override with ATOM_NATIVE_TRITON_ATTN=1/0 for testing."""
     val = os.environ.get("ATOM_NATIVE_TRITON_ATTN", "").lower()
     if val in ("1", "true"):
         return True
     if val in ("0", "false"):
         return False
-    return _is_gfx1201()
+    return not _hip_attention_supported_on_current_device()
 
 
 # ---------------------------------------------------------------------------

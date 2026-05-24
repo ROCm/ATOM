@@ -63,10 +63,11 @@ def get_attn_backend_cls(
                 "atom.plugin.sglang.attention_backend.attention_gdn.GDNAttentionBackend"
             )
         return "atom.model_ops.attentions.gdn_attn.GDNAttentionBackend"
-    # gfx1201 (RDNA4) lacks gfx-specific code objects in the AITER prebuilt
-    # .so files shipped with rocm/atom-dev:latest, so fall back to the in-tree
-    # native triton attention backend that does not load those modules.
-    # Also opt-in via ATOM_NATIVE_TRITON_ATTN=1 on any device for testing.
+    # Capability fallback: when aiter's prebuilt HIP modules don't expose
+    # the unified_attention op on the running device (e.g. gfx1201, where
+    # rocm/atom-dev:latest ships no matching code objects), route through
+    # the in-tree triton backend which JIT-compiles for any arch. Forced
+    # on/off via ATOM_NATIVE_TRITON_ATTN=1/0 for testing.
     try:
         from atom.model_ops.attentions.native_triton_attn import use_native_triton_attn
 
