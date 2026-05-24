@@ -2,15 +2,16 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+from typing import Optional
+from torch import nn
 import torch.nn.functional as F
+from atom.config import QuantizationConfig
+from atom.quant_spec import LayerQuantConfig
+from aiter.jit.utils.torch_guard import torch_compile_guard
+
 from aiter import (
     QuantType,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
-from atom.config import QuantizationConfig
-from atom.quant_spec import LayerQuantConfig
-from torch import nn
-from typing import Optional
 
 
 def mxfp4_act_mul_quant_fuse_fake(
