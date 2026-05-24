@@ -70,7 +70,7 @@ export HIP_VISIBLE_DEVICES=1   # GPU 1 by convention on this host
 python3 -m atom.entrypoints.openai_server \
   --model /mnt/sda1/carhuang/models/Qwen3-8B-FP8 \
   --level 0 --kv_cache_dtype bf16 \
-  --max-model-len 4096 \
+  --max-model-len 16384 \
   --server-port 30000
 ```
 

@@ -114,7 +114,7 @@ disable cudagraph entirely.
 python3 -m atom.examples.simple_inference \
   --model /path/to/Ministral-3-8B-Instruct-2512 \
   --level 0 -tp 1 --kv_cache_dtype bf16 \
-  --max-model-len 4096 --max-tokens 32 \
+  --max-model-len 16384 --max-tokens 32 \
   --gpu-memory-utilization 0.85
 ```
 
@@ -124,7 +124,7 @@ python3 -m atom.examples.simple_inference \
 python3 -m atom.entrypoints.openai_server \
   --model /path/to/Ministral-3-8B-Instruct-2512 \
   --level 0 --kv_cache_dtype bf16 \
-  --max-model-len 4096 \
+  --max-model-len 16384 \
   --server-port 30000
 ```
 
