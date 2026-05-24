@@ -197,6 +197,12 @@ class EngineCore:
             self.scheduler.shutdown_kv_events()
 
     def _process_engine_step(self):
+        try:
+            return self._process_engine_step_inner()
+        finally:
+            self.scheduler.publish_kv_events()
+
+    def _process_engine_step_inner(self):
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -270,7 +276,6 @@ class EngineCore:
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
 
-        self.scheduler.publish_kv_events()
         return True
 
     def pull_and_process_input_queue(self):

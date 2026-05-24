@@ -169,6 +169,7 @@ class TestBlockManagerHooks:
         stored = [e for e in events if isinstance(e, BlockStored)]
         assert len(stored) == 1
         assert stored[0].parent_block_hash == first_hashes[0]
+        assert stored[0].block_hashes == [first_hashes[1]]
 
     def test_eviction_emits_block_removed(self, seq_factory):
         # Pool with a single block so the free FIFO has no choice but to

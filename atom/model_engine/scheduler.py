@@ -1036,13 +1036,18 @@ class Scheduler:
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
 
         if self.block_manager.kv_events_enabled:
+            bm = self.block_manager
+            num_cached_blocks = seq.num_cached_tokens // bm.block_size
             remote_hashes: list[int] = []
             remote_tokens: list[int] = []
             parent_block_hash: int | None = None
             prev_hash: int | None = None
-            for block_id in seq.block_table:
-                blk = self.block_manager.blocks[block_id]
+            for i, block_id in enumerate(seq.block_table):
+                blk = bm.blocks[block_id]
                 if blk.hash == -1:
+                    continue
+                if i < num_cached_blocks:
+                    prev_hash = blk.hash
                     continue
                 if not remote_hashes:
                     parent_block_hash = prev_hash

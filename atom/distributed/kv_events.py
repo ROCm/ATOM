@@ -221,8 +221,9 @@ class ZmqEventPublisher(EventPublisher):
                 except queue.Empty:
                     pass
         self._sender.join(timeout=2.0)
+        linger = 0 if self._sender.is_alive() else 1000
         try:
-            self._socket.close(linger=1000)
+            self._socket.close(linger=linger)
         except Exception:  # pragma: no cover
             pass
 
