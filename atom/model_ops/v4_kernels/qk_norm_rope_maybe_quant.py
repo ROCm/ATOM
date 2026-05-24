@@ -35,8 +35,6 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.utils import envs
-
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
 # is unavailable; the dispatch in ``qk_norm_rope_maybe_quant`` will fall
 # back to the Triton kernel.
@@ -129,7 +127,6 @@ def _qk_norm_rope_maybe_quant_kernel(
 
     d_offs = tl.arange(0, D)
     nope_d_mask = d_offs < NOPE
-    rope_d_mask = d_offs >= NOPE
 
     rd_offs = tl.arange(0, RD).to(tl.int64)
     cos_d_offs = rd_offs // 2  # GPT-J + REUSE_FREQS_FRONT_PART: lane duplicate
