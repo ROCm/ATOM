@@ -55,6 +55,13 @@ on:
           - "ds-fp4-non-mtp (tp8 + tp4 + dpa4-ep4 + dpa8-ep8)"
           - "ds-fp4-mtp (tp8-mtp + tp4-mtp + dpa4-ep4-mtp + dpa8-ep8-mtp)"
         default: "ds-fp4-all (all Mesh configs: 62 cases)"
+      mesh_server_mode:
+        description: "SGLang-Mesh server launch mode. Use sglang-mori only with lmsysorg/sglang-rocm images."
+        type: choice
+        options:
+          - sglang-atom
+          - sglang-mori
+        default: sglang-atom
       docker_image:
         description: "Optional Docker image override. Use this for mori+sglang benchmark images."
         type: string
@@ -140,7 +147,7 @@ jobs:
           WORKLOAD_LABEL="${INPUT_WORKLOAD_LABEL:-SGLang-OOB}"
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             case "${SCHEDULE_CRON}" in
-              "0 15 * * 6,0") WORKLOAD_LABEL="SGLang-Mesh" ;;
+              "0 15 * * 6") WORKLOAD_LABEL="SGLang-Mesh" ;;
               *) WORKLOAD_LABEL="SGLang-OOB" ;;
             esac
           fi
@@ -413,7 +420,7 @@ jobs:
               elif schedule_cron == "0 15 * * 5":
                   selected_group = "C-ALL"
                   selected = [m for m in models if matches_workload(m)]
-              elif schedule_cron == "0 15 * * 6,0":
+              elif schedule_cron == "0 15 * * 6":
                   selected_group = "WEEKEND-MESH"
                   selected = [
                       m
@@ -675,7 +682,7 @@ jobs:
       MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
       SGLANG_EXTRA_ARGS: ${{ matrix.model.extra_args }}
       BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
-      BENCHMARK_RUNNER: ${{ matrix.model.benchmark_runner || 'sglang_atom' }}
+      MESH_SERVER_MODE: ${{ inputs.mesh_server_mode || 'sglang-atom' }}
       MESH_SPEC_MODE: ${{ matrix.model.mesh_spec_mode || 'none' }}
       MESH_TP_SIZE: ${{ matrix.model.tp_size || '' }}
       MESH_DP_SIZE: ${{ matrix.model.dp_size || '' }}
@@ -901,7 +908,18 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
-          if [[ "${BENCHMARK_RUNNER}" == "mori_sglang_mesh" ]]; then
+          EFFECTIVE_BENCHMARK_RUNNER="sglang_atom"
+          EFFECTIVE_SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}"
+          if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && "${MESH_SERVER_MODE}" == "sglang-mori" ]]; then
+            case "${SGLANG_IMAGE_TAG}" in
+              lmsysorg/sglang-rocm*|docker.io/lmsysorg/sglang-rocm*) ;;
+              *)
+                echo "ERROR: mesh_server_mode=sglang-mori requires docker_image to start with lmsysorg/sglang-rocm."
+                echo "Current image: ${SGLANG_IMAGE_TAG}"
+                exit 1
+                ;;
+            esac
+            EFFECTIVE_BENCHMARK_RUNNER="mori_sglang_mesh"
             $CONTAINER_ENGINE exec \
               -e MODEL="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
               -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
@@ -925,10 +943,13 @@ jobs:
                 bash .github/scripts/atom_sglang_mesh_benchmark.sh
               "
           else
+            if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && -n "${MESH_TP_SIZE}" ]]; then
+              EFFECTIVE_SGLANG_EXTRA_ARGS="--tensor-parallel-size ${MESH_TP_SIZE} ${SGLANG_EXTRA_ARGS}"
+            fi
             $CONTAINER_ENGINE exec \
               -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
               -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
-              -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
+              -e SGLANG_EXTRA_ARGS="${EFFECTIVE_SGLANG_EXTRA_ARGS}" \
               -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
               -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
               -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
@@ -938,7 +959,7 @@ jobs:
               "
 
             TRUST_REMOTE_CODE_ARG=""
-            if [[ "${SGLANG_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
+            if [[ "${EFFECTIVE_SGLANG_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
               TRUST_REMOTE_CODE_ARG="--trust-remote-code"
             fi
 
@@ -979,7 +1000,7 @@ jobs:
             -e RESULT_PATH="${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" \
             -e ISL="${ISL}" \
             -e OSL="${OSL}" \
-            -e EXTRA_ARGS_TEXT="${SGLANG_EXTRA_ARGS}" \
+            -e EXTRA_ARGS_TEXT="${EFFECTIVE_SGLANG_EXTRA_ARGS}" \
             -e DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
             -e ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
             -e ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
@@ -991,7 +1012,8 @@ jobs:
             -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
             -e UPLOAD_TO_CUSTOM_DASHBOARD="${UPLOAD_TO_CUSTOM_DASHBOARD}" \
             -e WORKLOAD_LABEL="${WORKLOAD_LABEL}" \
-            -e BENCHMARK_RUNNER="${BENCHMARK_RUNNER}" \
+            -e BENCHMARK_RUNNER="${EFFECTIVE_BENCHMARK_RUNNER}" \
+            -e MESH_SERVER_MODE="${MESH_SERVER_MODE}" \
             -e MESH_SPEC_MODE="${MESH_SPEC_MODE}" \
             -e MESH_TP_SIZE="${MESH_TP_SIZE}" \
             -e MESH_DP_SIZE="${MESH_DP_SIZE}" \
@@ -1039,6 +1061,7 @@ jobs:
               data["expert_parallel_size"] = int(os.environ["MESH_EP_SIZE"])
           data["enable_dp_attention"] = "--enable-dp-attention" in extra_args_text
           data["benchmark_runner"] = os.environ.get("BENCHMARK_RUNNER", "")
+          data["mesh_server_mode"] = os.environ.get("MESH_SERVER_MODE", "")
           data["spec_mode"] = os.environ.get("MESH_SPEC_MODE", "")
 
           data["atom_source_repository"] = os.environ.get("ATOM_SOURCE_REPOSITORY", "")
