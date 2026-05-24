@@ -472,15 +472,13 @@ class Scheduler:
                 f"or shorten the prompt."
             )
         bm = self.block_manager
-        per_req_cost = bm.per_req_cache_equiv_blocks if seq.has_per_req_cache else 0
         total_blocks = len(bm.blocks)
-        if seq.num_blocks + per_req_cost > total_blocks:
+        if seq.num_blocks > total_blocks:
             return (
-                f"needs {seq.num_blocks + per_req_cost} KV blocks "
-                f"({seq.num_blocks} for {num_tokens} input tokens + "
-                f"{per_req_cost} for per-req cache) > total pool blocks="
-                f"{total_blocks}. Reduce prompt length, lower --max-num-seqs, "
-                f"or raise --gpu-memory-utilization."
+                f"needs {seq.num_blocks} KV blocks for {num_tokens} input tokens "
+                f"> total pool blocks={total_blocks}. Reduce prompt length or "
+                f"raise --gpu-memory-utilization. (Per-req state cache lives in "
+                f"its own pre-allocated tensor and does not consume pool blocks.)"
             )
         return None
 
@@ -499,16 +497,23 @@ class Scheduler:
             logger.warning("Request %s will never be scheduled: %s", seq.id, reason)
             return
         bm = self.block_manager
-        if (
-            seq.has_per_req_cache
-            and not bm.free_per_req_cache_groups
-            and not bm.per_req_cache_accounting
-        ):
-            logger.warning(
-                "Request %s will never be scheduled: needs per-req cache slot "
-                "but no slots were allocated (max_num_seqs=0 for this model type).",
-                seq.id,
-            )
+        # No slots ever allocated (max_num_seqs=0 effectively) AND no slots
+        # currently in use → seq with has_per_req_cache=True can never enter.
+        # We check the slot list length below; without the accounting dict we
+        # infer "no slots ever existed" from `num_per_req_cache_groups == 0`,
+        # exposed via the free list at init time (slot ids 0..N-1).
+        if seq.has_per_req_cache and len(bm.free_per_req_cache_groups) == 0:
+            # All slots are currently in-use OR no slots were ever created.
+            # The schedule loop handles "currently full" by waiting; only
+            # warn for the permanent "never created" case, identified by
+            # `num_per_req_cache_groups` being 0 in the config.
+            if getattr(self.config, "num_per_req_cache_groups", 0) == 0:
+                logger.warning(
+                    "Request %s will never be scheduled: needs per-req cache "
+                    "slot but no slots were allocated (max_num_seqs=0 for "
+                    "this model type).",
+                    seq.id,
+                )
 
     def take_rejected(self) -> list[Sequence]:
         """Pop and return any seqs the prefill scheduler dropped because
@@ -784,8 +789,13 @@ class Scheduler:
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
             if is_deferred_out or self.use_spec:
-                num_rejected = fwd_output.num_rejected[idx]
-                num_bonus = fwd_output.num_bonus[idx]
+                # int() casts strip the np.int32 wrapper coming out of
+                # fwd_output's np.ndarray indexing. Without these, the values
+                # propagate into seq.num_rejected / seq.num_bonus_tokens, then
+                # into seq.num_tokens via `preempt()`'s `-= mtp_k + num_rejected`,
+                # contaminating downstream logs and arithmetic with np.int32.
+                num_rejected = int(fwd_output.num_rejected[idx])
+                num_bonus = int(fwd_output.num_bonus[idx])
                 offset = 0 if (num_new_token + num_rejected) == 1 else self.mtp_k
                 # Align stats with vLLM: only count steps that actually ran
                 # speculation (drafts proposed and validated). Skip the

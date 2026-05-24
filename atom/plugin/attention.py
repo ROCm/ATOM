@@ -1873,6 +1873,8 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=True,
+            dtype_q=_get_aiter_kv_cache_dtype(self.vllm_config),
+            dtype_kv=_get_aiter_kv_cache_dtype(self.vllm_config),
         )
 
         attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
@@ -2393,7 +2395,7 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
             max_num_batched_tokens,
             1,
             self.padded_num_heads,
-            torch.bfloat16,
+            _get_aiter_kv_cache_dtype(config),
             _get_aiter_kv_cache_dtype(config),
             is_sparse=True,
             fast_mode=True,

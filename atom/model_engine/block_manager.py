@@ -41,22 +41,17 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
 
-        # Per-request cache: per-request slot pool + equiv-block accounting.
-        # Used by attention types that maintain stateful per-request buffers
-        # outside the paged KV pool — currently GDN recurrent state, future
-        # DeepseekV4 ring buffer + compressor state. See
-        # AttentionMetadataBuilder.compute_per_req_cache_bytes() for details.
+        # Per-request cache slot pool. Used by attention types with a
+        # stateful per-request buffer (GDN recurrent state, V4 compressor
+        # state). The backing tensor is pre-allocated by ModelRunner sized
+        # to max_num_seqs and excluded from `num_kvcache_blocks` at sizing
+        # time, so admission only needs a free slot index from this list.
         # Each slot group contains slots_per_req() contiguous tensor indices
         # (1 for stateless / + num_spec for spec-decoding-aware variants).
-        self.per_req_cache_equiv_blocks: int = getattr(
-            config, "per_req_cache_equiv_blocks", 0
-        )
         num_per_req_cache_groups: int = getattr(config, "num_per_req_cache_groups", 0)
         self.free_per_req_cache_groups: list[int] = list(
             range(num_per_req_cache_groups)
         )
-        # seq_id → list of accounting block_ids (memory bookkeeping only)
-        self.per_req_cache_accounting: dict[int, list[int]] = {}
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -93,16 +88,15 @@ class BlockManager:
         self.free_block_ids_set.add(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
-        per_req_cache_cost = (
-            self.per_req_cache_equiv_blocks if seq.has_per_req_cache else 0
-        )
+        # State cache (mamba / V4 compressor ring) has its own pre-allocated
+        # tensor; admission only needs a free slot index, not extra paged
+        # blocks. See `allocate()` for the budget reasoning.
         per_req_cache_slot_ok = (not seq.has_per_req_cache) or len(
             self.free_per_req_cache_groups
         ) > 0
         if not self.enable_prefix_caching:
             return (
-                len(self.free_block_ids_set) >= seq.num_blocks + per_req_cache_cost
-                and per_req_cache_slot_ok
+                len(self.free_block_ids_set) >= seq.num_blocks and per_req_cache_slot_ok
             )
         # Dry-run: count how many blocks would be cache hits
         h = -1
@@ -129,10 +123,7 @@ class BlockManager:
                 cache_miss = True
             if cache_miss:
                 needed_free += 1
-        return (
-            len(self.free_block_ids_set) >= needed_free + per_req_cache_cost
-            and per_req_cache_slot_ok
-        )
+        return len(self.free_block_ids_set) >= needed_free and per_req_cache_slot_ok
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
@@ -176,16 +167,15 @@ class BlockManager:
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
 
-        # Per-request cache: allocate equiv blocks (memory accounting) +
-        # one slot index from the per-req cache pool. Slot indexes into
-        # ModelRunner's per-req cache tensors (e.g. mamba_k_cache for GDN).
+        # Per-request cache: claim one slot index from the pre-allocated
+        # state tensor (e.g. GDN mamba_k_cache, V4 compressor state + SWA
+        # ring). The state tensor's memory was already excluded from
+        # `num_kvcache_blocks` in ModelRunner._compute_kv_budget() — see
+        # `available_for_pool = available_for_kv - per_req_cache_tensor_bytes`
+        # — so admitting a seq adds no further paged-block cost. The slot
+        # cap (`free_per_req_cache_groups` size = `max_num_seqs`) is the
+        # sole admission bound for state cache.
         if seq.has_per_req_cache:
-            accounting_blocks = []
-            for _ in range(self.per_req_cache_equiv_blocks):
-                block_id = self._pop_free_block()
-                self._allocate_block(block_id)
-                accounting_blocks.append(block_id)
-            self.per_req_cache_accounting[seq.id] = accounting_blocks
             seq.per_req_cache_group = self.free_per_req_cache_groups.pop()
 
     def deallocate(self, seq: Sequence):
@@ -197,10 +187,6 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
-            for block_id in self.per_req_cache_accounting.pop(seq.id, []):
-                block = self.blocks[block_id]
-                block.ref_count = 0  # accounting blocks bypass ref-counting
-                self._deallocate_block(block_id)
             self.free_per_req_cache_groups.append(seq.per_req_cache_group)
             seq.per_req_cache_group = -1
 

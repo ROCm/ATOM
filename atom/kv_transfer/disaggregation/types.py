@@ -12,7 +12,7 @@ KV output aggregator.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -25,6 +25,27 @@ TransferId = int
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class KVTransferRegion:
+    """One RDMA-registerable tensor region."""
+
+    base_addr: int
+    total_bytes: int
+    unit_bytes: int  # bytes per block (block-indexed) or per slot (slot-indexed)
+
+
+@dataclass
+class KVTransferTensors:
+    block_regions: list[KVTransferRegion]
+    slot_regions: list[KVTransferRegion]
+    num_blocks: int
+    num_slots: int = 0
+    staging_region: KVTransferRegion | None = None
+    staging_pool_size: int = 0
+    gather_slot: Callable[[int, int], None] | None = None
+    scatter_slot: Callable[[int, int], None] | None = None
 
 
 @dataclass
@@ -75,6 +96,7 @@ class ReqMeta:
     remote_dp_size: int
     remote_dp_rank: int = 0
     transfer_id: int = 0
+    local_slot_index: int = -1
 
 
 @dataclass
@@ -135,6 +157,7 @@ class ConnectorMetadata:
                 else kv_transfer_params.get("remote_tp_size", 1)
             ),
             transfer_id=kv_transfer_params.get("transfer_id", 0),
+            local_slot_index=kv_transfer_params.get("local_slot_index", -1),
         )
 
     def add_new_req_to_save(

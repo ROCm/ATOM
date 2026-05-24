@@ -149,6 +149,76 @@ python -m atom.entrypoints.openai_server \
   2>&1 | tee consumer.log
 ```
 
+## DeepSeek V4-Pro
+
+V4-Pro requires additional env vars for its hash-routed MoE to work correctly in PD mode.
+
+### Step 1: Start Proxy
+
+```bash
+python -m atom.kv_transfer.disaggregation.proxy --port 10001
+```
+
+### Step 2: Start Producer (prefill node)
+
+```bash
+export LOCAL_IP=<this-node-ip>
+
+AITER_BF16_FP8_MOE_BOUND=0 \
+ATOM_MOE_GU_ITLV=1 \
+ATOM_DISABLE_MMAP=true \
+NCCL_SOCKET_IFNAME=lo \
+AITER_LOG_LEVEL=WARNING \
+python -m atom.entrypoints.openai_server \
+  --model /data/models/DeepSeek-V4-Pro/ \
+  --kv_cache_dtype fp8 \
+  -tp 8 \
+  --server-port 8003 \
+  --kv-transfer-config '{
+    "kv_role": "kv_producer",
+    "kv_connector": "mooncake",
+    "proxy_ip": "'"${LOCAL_IP}"'",
+    "proxy_ping_port": 36367,
+    "http_port": 8003
+  }' \
+  2>&1 | tee producer.log
+```
+
+### Step 3: Start Consumer (decode node)
+
+```bash
+export PRODUCER_IP=<producer-node-ip>
+
+AITER_BF16_FP8_MOE_BOUND=0 \
+ATOM_MOE_GU_ITLV=1 \
+ATOM_DISABLE_MMAP=true \
+NCCL_SOCKET_IFNAME=eno0 \
+AITER_LOG_LEVEL=WARNING \
+python -m atom.entrypoints.openai_server \
+  --model /data/models/DeepSeek-V4-Pro/ \
+  --kv_cache_dtype fp8 \
+  -tp 8 \
+  --server-port 8004 \
+  --kv-transfer-config '{
+    "kv_role": "kv_consumer",
+    "kv_connector": "mooncake",
+    "proxy_ip": "'"${PRODUCER_IP}"'",
+    "proxy_ping_port": 36367,
+    "http_port": 8004
+  }' \
+  2>&1 | tee consumer.log
+```
+
+V4-specific env vars:
+- `AITER_BF16_FP8_MOE_BOUND=0` — disables the BF16↔FP8 MoE boundary optimization (required for PD correctness)
+- `ATOM_MOE_GU_ITLV=1` — enables MoE gate-up interleaving for V4's hash-routed expert selection
+
+---
+
+## Accuracy Validation
+
+### DeepSeek-R1
+
 ### Step 4: Validate Accuracy
 
 Run GSM8K evaluation against the consumer endpoint:

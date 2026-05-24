@@ -14,7 +14,7 @@ docker pull rocm/atom-dev:vllm-latest
 
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
-The following matches the internal benchmark entry (`--kv_cache_dtype fp8 -tp 2 --trust-remote-code` in `.github/benchmark/models.json`). On multi-GPU hosts, use tensor parallel size 2 or adjust to your topology.
+The following matches the internal benchmark entry (`--kv_cache_dtype fp8 -tp 2 --trust-remote-code` in `.github/benchmark/models.json`). On multi-GPU hosts, use tensor parallel size 2 or 4; TP8 is not supported for this model.
 
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
