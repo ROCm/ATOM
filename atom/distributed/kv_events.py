@@ -43,7 +43,7 @@ class BlockStored(KVCacheEvent):
     medium: str | None = MEDIUM_GPU
     lora_name: str | None = None
     extra_keys: list[tuple[Any, ...] | None] | None = None
-    group_idx: int | None = 0
+    group_idx: int | None = None
     # Reserved wire slots; emitted as None until hybrid-cache wiring lands.
     kv_cache_spec_kind: str | None = None
     kv_cache_spec_sliding_window: int | None = None
@@ -54,7 +54,7 @@ class BlockRemoved(KVCacheEvent):
 
     block_hashes: list[int]
     medium: str | None = MEDIUM_GPU
-    group_idx: int | None = 0
+    group_idx: int | None = None
 
 
 class AllBlocksCleared(KVCacheEvent):
@@ -73,7 +73,7 @@ class BlockTransferred(KVCacheEvent):
     block_hashes: list[int]
     from_medium: str
     to_medium: str
-    group_idx: int | None = 0
+    group_idx: int | None = None
 
 
 # Union of all events. Subscribers that only know the vLLM-compatible subset
