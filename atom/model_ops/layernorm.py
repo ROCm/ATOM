@@ -62,16 +62,30 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
     return torch._C._nn.silu(input)
 
 
-def _detect_gfx1201() -> bool:
+# Arches that aiter's prebuilt HIP rmsnorm modules in rocm/atom-dev:latest
+# ship matching code objects for. On any other arch the HIP rmsnorm
+# entrypoints (rmsnorm2d_fwd, rmsnorm2d_fwd_with_add) SIGSEGV at first
+# call (verified on gfx1201/RDNA4), so we route to aiter's triton rmsnorm
+# implementation instead. Update this set when aiter's prebuilt
+# distribution changes. Same set as
+# atom/model_ops/attentions/native_triton_attn.py:_AITER_HIP_PREBUILT_ARCHES.
+_AITER_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
+
+
+def _hip_rmsnorm_supported_on_current_device() -> bool:
+    """Capability check: does the running device match aiter's prebuilt
+    HIP rmsnorm support? Returns True only when the device's arch is in
+    the prebuilt-HIP allowlist above; False otherwise (e.g. gfx1201)."""
     try:
-        return (torch.cuda.get_device_properties(0).gcnArchName or "").startswith(
-            "gfx1201"
-        )
+        if not torch.cuda.is_available():
+            return False
+        arch = (torch.cuda.get_device_properties(0).gcnArchName or "").split(":")[0]
+        return arch in _AITER_HIP_PREBUILT_ARCHES
     except Exception:
         return False
 
 
-_IS_GFX1201: bool = _detect_gfx1201()
+_USE_AITER_TRITON_RMSNORM: bool = not _hip_rmsnorm_supported_on_current_device()
 
 
 @torch_compile_guard()
@@ -80,7 +94,7 @@ def rmsnorm2d_fwd_(
 ) -> torch.Tensor:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    if _IS_GFX1201:
+    if _USE_AITER_TRITON_RMSNORM:
         return _aiter_triton_rms_norm(x, weight, eps).view(ori_shape)
     return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
 
@@ -91,7 +105,7 @@ def rmsnorm2d_fwd_with_add_(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    if _IS_GFX1201:
+    if _USE_AITER_TRITON_RMSNORM:
         res_in = residual.reshape(-1, dim)
         out = torch.empty_like(x)
         res_out = torch.empty_like(res_in)
