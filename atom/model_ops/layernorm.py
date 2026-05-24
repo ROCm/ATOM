@@ -17,17 +17,6 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
-from aiter.ops.triton.normalization.rmsnorm import (
-    # rmsnorm_forward_inference: lean variant that skips the autograd Function
-    # wrapper used by rms_norm(). Saves ~125 us/call which is significant for
-    # Qwen3 q_norm/k_norm (dim=128) called per layer per token.
-    rmsnorm_forward_inference as _aiter_triton_rms_norm,
-    # _rmsnorm_forward_with_add is the lean variant matching
-    # rmsnorm2d_fwd_with_add but without the autograd Function wrapper.
-    # Underscore-prefixed but exposed at the module level alongside the public
-    # API; we use it for the same Python-overhead reason as above.
-    _rmsnorm_forward_with_add as _aiter_triton_rmsnorm_with_add,
-)
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
@@ -62,40 +51,12 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
     return torch._C._nn.silu(input)
 
 
-# Arches that aiter's prebuilt HIP rmsnorm modules in rocm/atom-dev:latest
-# ship matching code objects for. On any other arch the HIP rmsnorm
-# entrypoints (rmsnorm2d_fwd, rmsnorm2d_fwd_with_add) SIGSEGV at first
-# call (verified on gfx1201/RDNA4), so we route to aiter's triton rmsnorm
-# implementation instead. Update this set when aiter's prebuilt
-# distribution changes. Same set as
-# atom/model_ops/attentions/native_triton_attn.py:_AITER_HIP_PREBUILT_ARCHES.
-_AITER_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
-
-
-def _hip_rmsnorm_supported_on_current_device() -> bool:
-    """Capability check: does the running device match aiter's prebuilt
-    HIP rmsnorm support? Returns True only when the device's arch is in
-    the prebuilt-HIP allowlist above; False otherwise (e.g. gfx1201)."""
-    try:
-        if not torch.cuda.is_available():
-            return False
-        arch = (torch.cuda.get_device_properties(0).gcnArchName or "").split(":")[0]
-        return arch in _AITER_HIP_PREBUILT_ARCHES
-    except Exception:
-        return False
-
-
-_USE_AITER_TRITON_RMSNORM: bool = not _hip_rmsnorm_supported_on_current_device()
-
-
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
 ) -> torch.Tensor:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    if _USE_AITER_TRITON_RMSNORM:
-        return _aiter_triton_rms_norm(x, weight, eps).view(ori_shape)
     return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
 
 
@@ -105,14 +66,6 @@ def rmsnorm2d_fwd_with_add_(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    if _USE_AITER_TRITON_RMSNORM:
-        res_in = residual.reshape(-1, dim)
-        out = torch.empty_like(x)
-        res_out = torch.empty_like(res_in)
-        # rsigma is required by the kernel API but unused in inference
-        rsigma = torch.empty(x.shape[0], dtype=torch.float32, device=x.device)
-        _aiter_triton_rmsnorm_with_add(out, x, res_in, res_out, weight, rsigma, eps)
-        return out.view(ori_shape), res_out.view(ori_shape)
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
     rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
