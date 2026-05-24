@@ -208,11 +208,21 @@ class EngineCore:
             self.output_queue.put_nowait(rejected)
 
         if result is None:
+            if self.kv_transfer_enabled:
+                kvoutput = self.runner_mgr.call_func_with_aggregation(
+                    "async_proc_aggregation"
+                )
+                self.scheduler._update_from_kv_xfer_finished(kvoutput)
             return False
         scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
+            if self.kv_transfer_enabled:
+                kvoutput = self.runner_mgr.call_func_with_aggregation(
+                    "async_proc_aggregation"
+                )
+                self.scheduler._update_from_kv_xfer_finished(kvoutput)
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)

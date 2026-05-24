@@ -12,18 +12,20 @@ docker pull rocm/atom-dev:vllm-latest
 
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
-### Qwen3-Next-80B-A3B-Instruct-FP8 (TP=1, MI355X)
+### Qwen3-Next-80B-A3B-Instruct-FP8 (TP=1/TP=4, MI355X)
 
 ```bash
+TP=1
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
-export ATOM_USE_FLYDSL_GDR=0
+export ATOM_USE_FLYDSL_GDR=1
 export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
+if [ "${TP}" != "1" ]; then export AITER_QUICK_REDUCE_QUANTIZATION=INT4; fi
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size 1 \
+    --tensor-parallel-size "${TP}" \
     --kv-cache-dtype fp8 \
     --async-scheduling \
     --load-format fastsafetensors \
@@ -39,7 +41,7 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
 TP=1
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
-export ATOM_USE_FLYDSL_GDR=0
+export ATOM_USE_FLYDSL_GDR=1
 export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
 if [ "${TP}" != "1" ]; then export AITER_QUICK_REDUCE_QUANTIZATION=INT4; fi
 

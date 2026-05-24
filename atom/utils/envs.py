@@ -83,6 +83,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
     "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
+    # Force the Triton path for V4 sparse-paged-prefill attention; default backend
+    # is aiter's OPUS kernel (gfx950 fast path). Set to 1 to fall back to Triton
+    # (e.g. for debugging or on non-gfx950 builds).
+    "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"

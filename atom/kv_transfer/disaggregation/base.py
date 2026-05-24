@@ -30,7 +30,9 @@ class KVConnectorBase(ABC):
     is_producer: bool
 
     @abstractmethod
-    def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+    def register_kv_caches(
+        self, kv_caches: dict[str, Any], transfer_tensors: Any = None
+    ) -> None:
         """Register local KV cache tensors for remote access.
 
         Called once after model loading and KV cache allocation.

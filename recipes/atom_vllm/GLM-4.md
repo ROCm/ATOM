@@ -31,7 +31,7 @@ vllm serve zai-org/GLM-4.7-FP8 \
     --no-enable-prefix-caching
 ```
 
-### GLM-4.7-FP8 MTP (TP=4/TP=8, MI355X)
+### GLM-4.7-FP8 MTP (TP=4, MI355X)
 
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4

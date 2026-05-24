@@ -20,12 +20,12 @@
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
   },
   {
-    "display": "DeepSeek-V4-Pro MTP1",
+    "display": "DeepSeek-V4-Pro MTP3",
     "path": "deepseek-ai/DeepSeek-V4-Pro",
     "prefix": "deepseek-v4-pro",
-    "args": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 1",
+    "args": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3",
     "bench_args": "--use-chat-template",
-    "suffix": "-mtp1",
+    "suffix": "-mtp3",
     "runner": "atom-mi355-8gpu.predownload",
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
   },
@@ -83,7 +83,7 @@
     "display": "gpt-oss-120b",
     "path": "openai/gpt-oss-120b",
     "prefix": "gpt-oss-120b",
-    "args": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5",
+    "args": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.9",
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
