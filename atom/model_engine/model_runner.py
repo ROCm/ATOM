@@ -269,7 +269,9 @@ class tokenIDProcessor:
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
         self.send_to_cpu_async(
-            sampled_token_ids, self.token_ids_cpu, sync_event,
+            sampled_token_ids,
+            self.token_ids_cpu,
+            sync_event,
             gpu_logprobs=sampled_logprobs,
         )
         token_id_dict = {}
@@ -2004,7 +2006,9 @@ class ModelRunner:
         sampled_logprobs = None
         if need_logprobs:
             logits_fp32 = logits.float()
-            safe_temps = torch.where(temperatures <= 0, torch.ones_like(temperatures), temperatures)
+            safe_temps = torch.where(
+                temperatures <= 0, torch.ones_like(temperatures), temperatures
+            )
             scaled_logits = logits_fp32 / safe_temps.view(-1, 1)
             log_probs = torch.log_softmax(scaled_logits, dim=-1)
             sampled_logprobs = log_probs.gather(

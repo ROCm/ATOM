@@ -219,8 +219,25 @@ class LLMEngine:
         if level >= 2:
             self.core_mgr.broadcast_utility_command("release_memory", tags=["weights"])
 
-    def load_weights(self, weights, bucket_size_mb: int = 2048):
-        load_weights_via_shm(self.core_mgr, weights, bucket_size_mb)
+    def load_weights(
+        self,
+        weights,
+        bucket_size_mb: int = 2048,
+        num_gpus: int = 1,
+        mode: str = "shm",
+    ):
+        import torch
+
+        if mode == "auto":
+            mode = "ipc" if torch.cuda.is_available() else "shm"
+        if mode == "ipc":
+            from atom.rollout.weight_sync import load_weights_via_ipc
+
+            load_weights_via_ipc(
+                self.core_mgr, weights, bucket_size_mb, num_gpus=num_gpus
+            )
+        else:
+            load_weights_via_shm(self.core_mgr, weights, bucket_size_mb)
 
 
 class InputOutputProcessor:

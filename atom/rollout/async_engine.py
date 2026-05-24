@@ -67,20 +67,32 @@ class AsyncLLMEngine(LLMEngine):
         self.core_mgr.broadcast_utility_command_sync("resume_memory", tags=tags)
         logger.info("AsyncLLMEngine wake_up: completed")
 
-    def load_weights(self, weights, bucket_size_mb: int = 2048):
-        """Load weights via POSIX shared memory."""
-        load_weights_via_shm(self.core_mgr, weights, bucket_size_mb)
-
-    def load_weights_ipc(self, weights, bucket_size_mb: int = 2048, num_gpus: int = 1):
-        """Load weights via CUDA IPC (zero-copy GPU-to-GPU).
+    def load_weights(
+        self,
+        weights,
+        bucket_size_mb: int = 2048,
+        num_gpus: int = 1,
+        mode: str = "auto",
+    ):
+        """Load weights into the engine.
 
         Args:
             weights: Iterator of (name, tensor) tuples.
             bucket_size_mb: Max bucket size in MiB.
-            num_gpus: Total GPUs (TP * DP). When > 1, uses per-GPU IPC
-                buffers to avoid cross-GPU hipIpcOpenMemHandle on ROCm.
+            num_gpus: Total GPUs (TP * DP). Only used in IPC mode.
+            mode: "ipc" for CUDA IPC, "shm" for shared memory,
+                  "auto" to pick IPC when CUDA is available.
         """
-        load_weights_via_ipc(self.core_mgr, weights, bucket_size_mb, num_gpus=num_gpus)
+        import torch
+
+        if mode == "auto":
+            mode = "ipc" if torch.cuda.is_available() else "shm"
+        if mode == "ipc":
+            load_weights_via_ipc(
+                self.core_mgr, weights, bucket_size_mb, num_gpus=num_gpus
+            )
+        else:
+            load_weights_via_shm(self.core_mgr, weights, bucket_size_mb)
 
     def shutdown(self):
         """Shutdown engine and release all resources."""
