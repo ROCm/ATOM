@@ -2,10 +2,8 @@
 
 This recipe describes running `mistralai/Ministral-3-8B-Instruct-2512`
 (natively FP8 trained) on a single RDNA4 GPU using ATOM's
-aiter triton attention backend (selected by default for non-MLA models).
-The backend is arch-portable: it routes through aiter's triton paged
-attention kernels, which JIT-compile for any supported arch including
-gfx1201.
+`NATIVE_TRITON_ATTENTION` backend. The backend is selected automatically
+when ATOM detects gfx1201; on other archs it does nothing.
 
 ## Why not the default AITER path?
 
