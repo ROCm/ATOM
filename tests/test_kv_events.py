@@ -274,18 +274,13 @@ class TestPublisher:
         try:
             sub.setsockopt(zmq.SUBSCRIBE, b"")
             sub.connect(endpoint)
-            # zmq PUB/SUB slow-joiner: send some warmup batches until the
-            # subscriber is wired in.
             decoder = msgspec.msgpack.Decoder(EventBatch)
             payload: bytes | None = None
-            deadline = time.time() + 3.0
-            while time.time() < deadline:
+            for _ in range(10):
                 pub.publish([BlockRemoved(block_hashes=[7])])
-                try:
-                    payload = sub.recv(flags=zmq.NOBLOCK)
+                if sub.poll(timeout=200):
+                    payload = sub.recv()
                     break
-                except zmq.Again:
-                    time.sleep(0.05)
             assert payload is not None, "SUB did not receive any batch"
             batch = decoder.decode(payload)
             assert len(batch.events) == 1
