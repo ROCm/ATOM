@@ -30,13 +30,11 @@ KV cache layout (matches aiter's pa_decode triton kernel expectations)
 
 Forward
 -------
-* Prefill: in-tree triton kv-cache write, then aiter triton
+* Prefill: aiter reshape_and_cache (KV write), then aiter triton
   context_attention_fwd (handles GQA internally).
-* Decode: same triton kv-cache write, then a thin v1/v2 dispatcher
-  around aiter's paged_attn_decode_v1 / paged_attn_decode_v2 that
-  takes Python-float scales (the higher-level paged_attention_decode
-  wrapper does .item() on every call -- a GPU->CPU sync that breaks
-  CUDAGraph capture).
+* Decode: aiter reshape_and_cache, then aiter paged_attention_decode
+  (called with Python-float scales so the wrapper skips .item() and
+  the path is safe inside a CUDAGraph capture).
 """
 
 from __future__ import annotations
@@ -47,7 +45,6 @@ from typing import Optional, Type
 
 import numpy as np
 import torch
-import triton
 import triton.language as tl
 from torch import nn
 
@@ -85,11 +82,14 @@ def use_native_triton_attn() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Cached triton paged-attention decode kernel
+# Cached lazy-imports of aiter triton kernels
 # ---------------------------------------------------------------------------
 _TRITON_PA_DECODE = None
 _TRITON_TL_BF16 = None
 _TRITON_PREFILL = None
+_TRITON_RESHAPE_AND_CACHE = None
+_TRITON_ROPE = None
+_TRITON_ROPE_NEOX_STYLE = None
 
 
 def _get_triton_prefill():
@@ -107,84 +107,22 @@ def _get_triton_prefill():
     return _TRITON_PREFILL if _TRITON_PREFILL is not False else None
 
 
-_PA_SEQ_PARTITION_SIZE = 1024  # mirrors aiter's wrapper constant
-
-
 def _get_triton_pa_decode():
-    """Return (pa_decode_dispatch, tl.bfloat16) or (None, None).
+    """Return (paged_attention_decode, tl.bfloat16) or (None, None).
 
-    pa_decode_dispatch mirrors aiter's ``paged_attention_decode`` v1/v2
-    selection but takes Python float scales instead of 0-dim tensors --
-    avoids the ``k_scale.item()`` / ``v_scale.item()`` sync that breaks
-    CUDAGraph capture. BF16 KV path only (k_scale=v_scale=1.0).
+    Uses aiter's public wrapper directly; pass Python-float scales so the
+    wrapper's Tensor->.item() branch is skipped (CUDAGraph-safe path that
+    landed in aiter via the Union[float, Tensor] signature relaxation).
     """
     global _TRITON_PA_DECODE, _TRITON_TL_BF16
     if _TRITON_PA_DECODE is None:
         try:
-            from aiter.ops.triton.attention.pa_decode import (
-                paged_attn_decode_v1,
-                paged_attn_decode_v2,
-            )
-            import triton.language as tl
+            from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 
-            def _dispatch(
-                out,
-                q,
-                k_cache,
-                v_cache,
-                block_tables,
-                seq_lens,
-                max_seq_len,
-                compute_type,
-                num_kv_heads,
-                scale,
-            ):
-                num_seqs = q.shape[0]
-                num_q_heads = q.shape[1]
-                max_num_partitions = (
-                    max_seq_len + _PA_SEQ_PARTITION_SIZE - 1
-                ) // _PA_SEQ_PARTITION_SIZE
-                use_v1 = max_seq_len <= 8192 and (
-                    max_num_partitions == 1 or num_seqs * num_q_heads > 512
-                )
-                if use_v1:
-                    paged_attn_decode_v1(
-                        out,
-                        q,
-                        k_cache,
-                        v_cache,
-                        block_tables,
-                        seq_lens,
-                        max_seq_len,
-                        compute_type,
-                        num_kv_heads,
-                        scale,
-                        None,
-                        1.0,
-                        1.0,
-                    )
-                else:
-                    paged_attn_decode_v2(
-                        out,
-                        q,
-                        k_cache,
-                        v_cache,
-                        block_tables,
-                        seq_lens,
-                        max_seq_len,
-                        compute_type,
-                        num_kv_heads,
-                        scale,
-                        None,
-                        1.0,
-                        1.0,
-                        max_num_partitions,
-                    )
-
-            _TRITON_PA_DECODE = _dispatch
+            _TRITON_PA_DECODE = paged_attention_decode
             _TRITON_TL_BF16 = tl.bfloat16
         except Exception as e:
-            logger.warning("triton paged_attn_decode unavailable: %s", e)
+            logger.warning("triton paged_attention_decode unavailable: %s", e)
             _TRITON_PA_DECODE = False
     return (
         (_TRITON_PA_DECODE, _TRITON_TL_BF16)
@@ -193,197 +131,39 @@ def _get_triton_pa_decode():
     )
 
 
-# ---------------------------------------------------------------------------
-# Backend
-# ---------------------------------------------------------------------------
+def _get_triton_reshape_and_cache():
+    global _TRITON_RESHAPE_AND_CACHE
+    if _TRITON_RESHAPE_AND_CACHE is None:
+        try:
+            from aiter.ops.triton.kv_cache import reshape_and_cache
+
+            _TRITON_RESHAPE_AND_CACHE = reshape_and_cache
+        except Exception as e:
+            logger.warning("triton reshape_and_cache unavailable: %s", e)
+            _TRITON_RESHAPE_AND_CACHE = False
+    return _TRITON_RESHAPE_AND_CACHE if _TRITON_RESHAPE_AND_CACHE is not False else None
 
 
-# ---------------------------------------------------------------------------
-# Triton KV-cache write kernel (skips -1 sentinels in-kernel; no Python sync)
-# ---------------------------------------------------------------------------
+def _get_triton_rope():
+    """Return (rope_cached_thd_positions_2c_fwd, RotateStyle.NEOX) or (None, None)."""
+    global _TRITON_ROPE, _TRITON_ROPE_NEOX_STYLE
+    if _TRITON_ROPE is None:
+        try:
+            from aiter.ops.triton.rope.rope import (
+                RotateStyle,
+                rope_cached_thd_positions_2c_fwd,
+            )
 
-
-@triton.jit
-def _kv_cache_write_kernel(
-    K_NEW_PTR,
-    V_NEW_PTR,  # [N, H, D] BF16 (or compatible)
-    SLOT_PTR,  # [N] int64
-    K_CACHE_PTR,
-    V_CACHE_PTR,  # [B, H, S, D] BF16
-    new_stride_token,
-    new_stride_head,
-    cache_stride_block,
-    cache_stride_head,
-    cache_stride_within,
-    N: tl.constexpr,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    S: tl.constexpr,
-):
-    """One program per token; copies the token's full (H, D) K/V slab into
-    cache[block_id, :, within, :]. Slot < 0 sentinels are skipped."""
-    token_idx = tl.program_id(0)
-    if token_idx >= N:
-        return
-    slot = tl.load(SLOT_PTR + token_idx)
-    if slot < 0:
-        return
-    block_id = slot // S
-    within = slot % S
-
-    head_offs = tl.arange(0, H)
-    d_offs = tl.arange(0, D)
-
-    new_off = (
-        token_idx * new_stride_token
-        + head_offs[:, None] * new_stride_head
-        + d_offs[None, :]
+            _TRITON_ROPE = rope_cached_thd_positions_2c_fwd
+            _TRITON_ROPE_NEOX_STYLE = int(RotateStyle.NEOX)
+        except Exception as e:
+            logger.warning("triton rope_cached_thd_positions_2c_fwd unavailable: %s", e)
+            _TRITON_ROPE = False
+    return (
+        (_TRITON_ROPE, _TRITON_ROPE_NEOX_STYLE)
+        if _TRITON_ROPE is not False
+        else (None, None)
     )
-    cache_off = (
-        block_id * cache_stride_block
-        + head_offs[:, None] * cache_stride_head
-        + within * cache_stride_within
-        + d_offs[None, :]
-    )
-
-    k_vals = tl.load(K_NEW_PTR + new_off)
-    v_vals = tl.load(V_NEW_PTR + new_off)
-    tl.store(K_CACHE_PTR + cache_off, k_vals)
-    tl.store(V_CACHE_PTR + cache_off, v_vals)
-
-
-def _kv_cache_write_triton(
-    k_cache: torch.Tensor,  # [B, H, S, D]
-    v_cache: torch.Tensor,  # [B, H, S, D]
-    slot_mapping: torch.Tensor,  # [N]
-    k_new: torch.Tensor,  # [N, H, D]
-    v_new: torch.Tensor,  # [N, H, D]
-):
-    N = slot_mapping.shape[0]
-    if N == 0:
-        return
-    B, H, S, D = k_cache.shape
-    # Triton requires power-of-two block sizes; H, D should be already.
-    # k_new strides assume contiguous [N, H, D].
-    k_new_c = k_new.contiguous() if not k_new.is_contiguous() else k_new
-    v_new_c = v_new.contiguous() if not v_new.is_contiguous() else v_new
-    slot_i64 = (
-        slot_mapping.to(torch.int64)
-        if slot_mapping.dtype != torch.int64
-        else slot_mapping
-    )
-
-    new_stride = k_new_c.stride()
-    cache_stride = k_cache.stride()
-    grid = (N,)
-    _kv_cache_write_kernel[grid](
-        k_new_c,
-        v_new_c,
-        slot_i64,
-        k_cache,
-        v_cache,
-        new_stride[0],
-        new_stride[1],
-        cache_stride[0],
-        cache_stride[1],
-        cache_stride[2],
-        N=N,
-        H=H,
-        D=D,
-        S=S,
-    )
-
-
-@triton.jit
-def _rope_neox_kernel(
-    Q_PTR,
-    K_PTR,
-    Q_OUT_PTR,
-    K_OUT_PTR,
-    POS_PTR,
-    COS_PTR,
-    SIN_PTR,
-    q_stride_t,
-    q_stride_h,
-    k_stride_t,
-    k_stride_h,
-    cos_stride_pos,
-    T: tl.constexpr,
-    NUM_Q_HEADS: tl.constexpr,
-    NUM_K_HEADS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    ROTARY_DIM: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    total_heads = NUM_Q_HEADS + NUM_K_HEADS
-    token_id = pid // total_heads
-    head_id = pid % total_heads
-
-    d = tl.arange(0, BLOCK_D)
-    half = ROTARY_DIM // 2
-    is_first_half = d < half
-    rot_mask = d < ROTARY_DIM
-    pair_d = tl.where(is_first_half, d + half, d - half)
-    cos_d = tl.where(is_first_half, d, d - half)
-    sign = tl.where(is_first_half, -1.0, 1.0)
-
-    pos = tl.load(POS_PTR + token_id)
-    cos = tl.load(COS_PTR + pos * cos_stride_pos + cos_d, mask=rot_mask, other=1.0)
-    sin = tl.load(SIN_PTR + pos * cos_stride_pos + cos_d, mask=rot_mask, other=0.0)
-
-    if head_id < NUM_Q_HEADS:
-        base = token_id * q_stride_t + head_id * q_stride_h
-        x = tl.load(Q_PTR + base + d).to(tl.float32)
-        x_pair = tl.load(Q_PTR + base + pair_d, mask=rot_mask, other=0.0).to(tl.float32)
-        y = tl.where(rot_mask, x * cos + sign * x_pair * sin, x)
-        out_base = token_id * (NUM_Q_HEADS * HEAD_DIM) + head_id * HEAD_DIM
-        tl.store(Q_OUT_PTR + out_base + d, y.to(Q_OUT_PTR.dtype.element_ty))
-    else:
-        kv_head = head_id - NUM_Q_HEADS
-        base = token_id * k_stride_t + kv_head * k_stride_h
-        x = tl.load(K_PTR + base + d).to(tl.float32)
-        x_pair = tl.load(K_PTR + base + pair_d, mask=rot_mask, other=0.0).to(tl.float32)
-        y = tl.where(rot_mask, x * cos + sign * x_pair * sin, x)
-        out_base = token_id * (NUM_K_HEADS * HEAD_DIM) + kv_head * HEAD_DIM
-        tl.store(K_OUT_PTR + out_base + d, y.to(K_OUT_PTR.dtype.element_ty))
-
-
-def _rope_neox_triton(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    positions: torch.Tensor,
-    rotary_emb,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply Neox RoPE to Q/K without torch split/mul/cat kernels."""
-    if not getattr(rotary_emb, "is_neox_style", True):
-        raise RuntimeError("native triton RoPE currently supports Neox style only")
-    T, num_q_heads, head_dim = q.shape
-    _, num_k_heads, _ = k.shape
-    rotary_dim = min(int(rotary_emb.cos_cache.shape[-1]) * 2, head_dim)
-    q_out = torch.empty((T, num_q_heads, head_dim), dtype=q.dtype, device=q.device)
-    k_out = torch.empty((T, num_k_heads, head_dim), dtype=k.dtype, device=k.device)
-    _rope_neox_kernel[(T * (num_q_heads + num_k_heads),)](
-        q,
-        k,
-        q_out,
-        k_out,
-        positions,
-        rotary_emb.cos_cache,
-        rotary_emb.sin_cache,
-        q.stride(0),
-        q.stride(1),
-        k.stride(0),
-        k.stride(1),
-        rotary_emb.cos_cache.stride(0),
-        T=T,
-        NUM_Q_HEADS=num_q_heads,
-        NUM_K_HEADS=num_k_heads,
-        HEAD_DIM=head_dim,
-        ROTARY_DIM=rotary_dim,
-        BLOCK_D=triton.next_power_of_2(head_dim),
-    )
-    return q_out, k_out
 
 
 class NativeTritonBackend(AttentionBackend):
@@ -751,12 +531,6 @@ class NativeTritonAttentionImpl(AttentionImpl):
         # Set by build_kv_cache_tensor after engine_core.allocate_kv_cache.
         self.k_cache = torch.tensor([])
         self.v_cache = torch.tensor([])
-        # Reusable scale tensors for the triton paged-attention kernel
-        # (BF16 KV path -> identity scales). Pre-created here so that
-        # CUDAGraph capture does not see a torch.tensor() allocation on the
-        # first decode call.
-        self._pa_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
-        self._pa_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
         if kv_cache_dtype != "bf16":
             logger.warning(
                 f"NativeTritonAttentionImpl: kv_cache_dtype={kv_cache_dtype} "
@@ -775,17 +549,22 @@ class NativeTritonAttentionImpl(AttentionImpl):
         k_new: torch.Tensor,
         v_new: torch.Tensor,
     ) -> None:
-        """Triton-launched scatter into the paged KV pool. Slot == -1 entries
-        are skipped inside the kernel, so this path has no Python-side
-        conditional and is CUDAGraph-capturable."""
+        """Triton-launched scatter into the paged KV pool via aiter's
+        reshape_and_cache. Slot < 0 entries are skipped inside the kernel,
+        so this path has no Python-side conditional and is CUDAGraph-safe."""
         if slot_mapping.numel() == 0:
             return
-        # Cast K/V to cache dtype if needed (cheap pointwise; otherwise no-op).
         if k_new.dtype != k_cache.dtype:
             k_new = k_new.to(k_cache.dtype)
         if v_new.dtype != v_cache.dtype:
             v_new = v_new.to(v_cache.dtype)
-        _kv_cache_write_triton(k_cache, v_cache, slot_mapping, k_new, v_new)
+        reshape_and_cache = _get_triton_reshape_and_cache()
+        if reshape_and_cache is None:
+            raise RuntimeError(
+                "aiter triton reshape_and_cache unavailable -- required for "
+                "KV-cache write on gfx1201 (no torch fallback in this build)."
+            )
+        reshape_and_cache(k_new, v_new, k_cache, v_cache, slot_mapping)
 
     # ------------------------------------------------------------------ #
     # Forward                                                            #
@@ -822,7 +601,36 @@ class NativeTritonAttentionImpl(AttentionImpl):
         v = value.view(total_tokens, self.num_kv_heads, self.head_dim)
 
         if self.rotary_emb is not None and positions is not None:
-            q, k = _rope_neox_triton(q, k, positions, self.rotary_emb)
+            rope, neox_style = _get_triton_rope()
+            if rope is None:
+                raise RuntimeError(
+                    "aiter triton rope_cached_thd_positions_2c_fwd unavailable "
+                    "-- required for RoPE on gfx1201 (no torch fallback in this build)."
+                )
+            if not getattr(self.rotary_emb, "is_neox_style", True):
+                raise RuntimeError(
+                    "NativeTritonAttentionImpl: aiter rope path currently used "
+                    "with Neox style only."
+                )
+            # cos_cache/sin_cache hold only the front half of the rotary dim
+            # (reuse_freqs_front_part=True) -- the same shape the in-tree
+            # kernel previously inferred via shape[-1]*2 == rotary_dim.
+            # ATOM rotary caches are [max_pos, 1, 1, rotary_dim/2] (4D)
+            # because rotary_embedding.forward unsqueezes for broadcast over
+            # head dims; aiter rope_cached_thd_positions_2c_fwd expects
+            # 2D cos/sin tables [max_pos, rotary_dim/2 or rotary_dim].
+            cos2d = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+            sin2d = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+            q, k = rope(
+                q.contiguous(),
+                k.contiguous(),
+                cos2d,
+                sin2d,
+                positions,
+                rotate_style=neox_style,
+                reuse_freqs_front_part=True,
+                nope_first=False,
+            )
 
         slot_mapping = attn_md.slot_mapping
         if (
@@ -906,16 +714,20 @@ class NativeTritonAttentionImpl(AttentionImpl):
         out = torch.empty_like(q)
         block_tables = attn_md.block_tables[:bs]
         seq_lens = attn_md.context_lens[:bs]
+        # aiter paged_attention_decode (positional + kw mix to match wrapper).
+        # k_scale=v_scale=1.0 (Python float) -> wrapper skips .item() and the
+        # call is CUDAGraph-capture-safe (no GPU->CPU sync at the boundary).
         pa_decode(
             out,
             q,
             self.k_cache,
             self.v_cache,
-            block_tables,
             seq_lens,
+            block_tables,
+            float(self.scale),
             int(attn_md.max_seqlen_k),
             tl_bf16,
-            self.num_kv_heads,
-            float(self.scale),
+            k_scale=1.0,
+            v_scale=1.0,
         )
         return out.reshape(bs, self.num_heads * self.head_dim)
