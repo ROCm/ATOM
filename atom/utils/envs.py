@@ -157,7 +157,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KV_EVENTS_ENABLE": lambda: os.getenv("ATOM_KV_EVENTS_ENABLE", "0") == "1",
     "ATOM_KV_EVENTS_PUBLISHER": lambda: os.getenv("ATOM_KV_EVENTS_PUBLISHER", "zmq"),
     "ATOM_KV_EVENTS_ENDPOINT": lambda: os.getenv(
-        "ATOM_KV_EVENTS_ENDPOINT", "tcp://0.0.0.0:5557"
+        "ATOM_KV_EVENTS_ENDPOINT", "tcp://127.0.0.1:5557"
     ),
     "ATOM_KV_EVENTS_TOPIC": lambda: os.getenv("ATOM_KV_EVENTS_TOPIC", ""),
     "ATOM_KV_EVENTS_HWM": lambda: int(os.getenv("ATOM_KV_EVENTS_HWM", "0") or "0"),

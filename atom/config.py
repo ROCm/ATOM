@@ -933,7 +933,7 @@ class KVEventsConfig:
 
     enable: bool = False
     publisher: str = "zmq"  # "null" | "zmq"
-    endpoint: str = "tcp://0.0.0.0:5557"
+    endpoint: str = "tcp://127.0.0.1:5557"
     topic: str = ""
     # ZMQ high-water-mark on the PUB socket (0 = unlimited).
     hwm: int = 0
