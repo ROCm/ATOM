@@ -31,18 +31,6 @@ _NATIVE_SAMPLING_WARNING_ISSUED = False
 SAMPLER_EPS = 1e-10
 
 
-def _detect_gfx1201() -> bool:
-    try:
-        return (torch.cuda.get_device_properties(0).gcnArchName or "").startswith(
-            "gfx1201"
-        )
-    except Exception:
-        return False
-
-
-_IS_GFX1201: bool = _detect_gfx1201()
-
-
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     """Returns a tensor of shape (1, vocab_size) filled with exponential random values.
     This is key to deterministic inference, as it ensures that the same random values are used for each token across different runs.
@@ -138,15 +126,6 @@ class Sampler(nn.Module):
             exponential = get_per_token_exponential(vocab_size, logits.device).expand(
                 num_tokens, vocab_size
             )
-        if _IS_GFX1201:
-            # Torch fallback: Gumbel-max sampling. exponential is Exp(1) noise,
-            # so log(exponential) is Gumbel-distributed (up to sign). Greedy
-            # (T->0) collapses to argmax.
-            scaled = logits / temperatures.clamp(min=self.eps).unsqueeze(-1)
-            # Use Gumbel = -log(exponential); add to scaled logits and argmax.
-            gumbel = -torch.log(exponential.clamp(min=1e-20))
-            sampled_tokens.copy_((scaled + gumbel).argmax(dim=-1).to(torch.int))
-            return sampled_tokens
         mixed_sample_outer_exponential(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
