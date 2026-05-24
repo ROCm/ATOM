@@ -239,6 +239,7 @@ class BlockManager:
                 )
             )
 
+
         # Per-request cache: claim one slot index from the pre-allocated
         # state tensor (e.g. GDN mamba_k_cache, V4 compressor state + SWA
         # ring). The state tensor's memory was already excluded from

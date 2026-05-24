@@ -1139,8 +1139,10 @@ jobs:
           fi
 
       - name: Persist benchmark matrix payload
+        env:
+          BENCHMARK_MATRIX: ${{ steps.build.outputs.benchmark_matrix }}
         run: |
-          printf '%s' '${{ steps.build.outputs.benchmark_matrix }}' > benchmark_matrix.json
+          printf '%s' "${BENCHMARK_MATRIX}" > benchmark_matrix.json
 
       - name: Upload benchmark matrix payload
         uses: actions/upload-artifact@v7
