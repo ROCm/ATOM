@@ -42,6 +42,8 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
 
 
@@ -238,8 +240,22 @@ def sparse_attn_v4_paged_decode(
     attn_sink: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """V4 decode sparse attention over a unified KV pool with paged indices."""
+    """V4 decode sparse attention over a unified KV pool with paged indices.
+
+    ``_sparse_attn_v4_paged_decode_triton`` now internally dispatches between
+    the 2D kernel and the 3D split-K variant via ``use_3D(T, H)``.
+    """
     if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
+        # if the number of workgroups schedule is below 1024, always use pa_decode_sparse, which is a split + reduce paged attention
+        if q.shape[0] * triton.cdiv(q.shape[1], 16) < 1024:
+            return pa_decode_sparse(
+                q,
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                softmax_scale,
+            )
         return _sparse_attn_v4_paged_decode_triton(
             q,
             unified_kv,
