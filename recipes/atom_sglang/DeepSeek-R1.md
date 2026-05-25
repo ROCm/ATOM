@@ -51,6 +51,7 @@ python3 -m sglang.launch_server \
     --port 8000 \
     --trust-remote-code \
     --tensor-parallel-size 4 \
+    --attention-backend aiter \
     --kv-cache-dtype fp8_e4m3 \
     --mem-fraction-static 0.8 \
     --page-size 1 \
