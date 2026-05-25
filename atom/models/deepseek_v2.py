@@ -92,7 +92,6 @@ from atom.utils.forward_context import get_forward_context
 from atom.plugin.attention_mla_sparse import (
     IndexerDecoratorForPluginMode,
     DeepseekV32IndexerCacheDecoratorForPluginMode,
-    get_sparse_mla_plugin_paged_kv_indices,
 )
 from torch import nn
 from transformers import PretrainedConfig
@@ -1481,7 +1480,7 @@ class Indexer(nn.Module):
         else:
             q_input = q
 
-        args = [
+        return self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
@@ -1494,23 +1493,16 @@ class Indexer(nn.Module):
             self.head_dim,
             self.max_model_len,
             self.max_total_seq_len,
-        ]
-        if getattr(self, "_atom_vllm_sparse_indexer", False):
-            args.append(get_sparse_mla_plugin_paged_kv_indices(self.k_cache.prefix))
-        args.extend(
-            [
-                self.k_norm.weight,
-                self.k_norm.bias,
-                self.k_norm.eps,
-                positions,
-                rotary_emb.cos_cache.squeeze(-2).squeeze(-2),
-                rotary_emb.sin_cache.squeeze(-2).squeeze(-2),
-                self._weights_scale,
-                rotary_emb.is_neox_style,
-                self.use_qk_rope_cache_fusion,
-            ]
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.eps,
+            positions,
+            rotary_emb.cos_cache.squeeze(-2).squeeze(-2),
+            rotary_emb.sin_cache.squeeze(-2).squeeze(-2),
+            self._weights_scale,
+            rotary_emb.is_neox_style,
+            self.use_qk_rope_cache_fusion,
         )
-        return self.sparse_attn_indexer_impl(*args)
 
 
 class DeepseekV2MLAAttention(nn.Module):
