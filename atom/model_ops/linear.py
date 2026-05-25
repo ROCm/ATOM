@@ -6,7 +6,6 @@ from functools import partial as functools_partial
 from typing import Callable, Optional
 
 import torch
-import functools
 from aiter import (
     QuantType,
     dtypes,
@@ -220,28 +219,6 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
-
-
-@functools.lru_cache(maxsize=4)
-def _get_triton_a16w8_blockscale():
-    """Lazy import of aiter's triton a16w8 blockscale GEMM.
-
-    Signature: (x_bf16, w_fp8, w_scale, dtype=bf16) -> y_bf16
-      x: (M, K) BF16
-      w: (N, K) FP8 (must be viewed as torch.float8_e4m3fn, not uint8 — the
-         kernel does `b.to(bf16)` which only works numerically on a real FP8
-         dtype pointer)
-      w_scale: (N/128, K/128) FP32
-
-    Used on gfx1201 because Triton on this build doesn't support
-    tl.dot(fp8, fp8). a16w8 path casts FP8 weights to BF16 inside the kernel,
-    so the dot is bf16xbf16 — fully supported.
-    """
-    from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
-        gemm_a16w8_blockscale,
-    )
-
-    return gemm_a16w8_blockscale
 
 
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
@@ -781,34 +758,57 @@ class LinearBase(nn.Module):
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
                 if _is_gfx1201_linear():
-                    # gfx1201: Triton on this build doesn't support
-                    # tl.dot(fp8, fp8), so we use aiter's a16w8 blockscale GEMM
-                    # which casts FP8 weight -> BF16 inside the kernel and runs
-                    # tl.dot(bf16, bf16). x stays BF16, no activation quant
-                    # needed, weight stays FP8 in memory (no extra bandwidth).
-                    a16w8 = _get_triton_a16w8_blockscale()
-                    # Weight is stored as torch.uint8 (aiter's d_dtypes['fp8']
-                    # convention). View as float8_e4m3fn so the kernel's
-                    # b.to(bf16) cast decodes FP8 numerics correctly.
-                    w = self.weight
-                    if w.dtype in (torch.uint8, torch.int8):
-                        w = w.view(torch.float8_e4m3fn)
-                    # Override the autotuned config: shipped gfx1201 config
-                    # picks BLOCK_N=256 which overflows the 64 KiB shared mem.
-                    # M=32, N=64, K=128, num_stages=2 keeps shared mem ~57 KiB.
-                    a16w8_config = {
-                        "BLOCK_SIZE_M": 32,
-                        "BLOCK_SIZE_N": 64,
-                        "BLOCK_SIZE_K": 128,
-                        "GROUP_SIZE_M": 8,
-                        "num_warps": 4,
-                        "num_stages": 2,
-                        "waves_per_eu": 2,
-                        "matrix_instr_nonkdim": 16,
-                        "cache_modifier": None,
-                        "NUM_KSPLIT": 1,
-                    }
-                    y = a16w8(x, w, self.weight_scale, dtype=otype, config=a16w8_config)
+                    # gfx1201: aiter's HIP gemm_a8w8_blockscale has no
+                    # gfx1201 code object (the rocm/atom-dev:latest image
+                    # ships prebuilt .so files for gfx94x/95x only) -- both
+                    # the plain and bpreshuffle HIP variants either SIGSEGV
+                    # or return "GEMM is not supported" on this arch. Route
+                    # to aiter's triton non-preshuffle gemm_a8w8_blockscale
+                    # instead; it JIT-compiles for gfx1201 and matches
+                    # F.linear(bf16) at the FP8 quant-noise floor.
+                    #
+                    # The shared pre-quant block above honors
+                    # ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE (defaults True),
+                    # which produces column-major x_scale for the HIP
+                    # preshuffle kernel. The non-preshuffle triton kernel
+                    # expects row-major x_scale -- so on gfx1201 the shared
+                    # pre-quant is skipped (x stays BF16) and we run quant
+                    # inline here with transpose_scale=False.
+                    #
+                    # weight is stored as torch.uint8 (aiter d_dtypes['fp8']
+                    # convention) on aiter builds without #3332; .view to
+                    # float8_e4m3fn so triton's tl.dot accepts it. With
+                    # #3332 the weight is already float8_e4m3fn and the
+                    # view is a no-op. need_shuffle=False at init keeps
+                    # the weight in plain (N, K) layout.
+                    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+                        gemm_a8w8_blockscale as gemm_a8w8_blockscale_triton,
+                    )
+
+                    # x is BF16 here (the shared pre-quant block above leaves
+                    # gfx1201 per_1x128 alone). Quantize inline with the row-major
+                    # x_scale layout the triton non-preshuffle kernel expects.
+                    x_inline, x_scale_inline = self.quant_func(
+                        x,
+                        quant_dtype=self.params_dtype,
+                        scale=getattr(self, "input_scale", None),
+                        transpose_scale=False,
+                    )
+                    xf = (
+                        x_inline
+                        if x_inline.dtype == torch.float8_e4m3fn
+                        else x_inline.view(torch.float8_e4m3fn)
+                    )
+                    wf = self.weight
+                    if wf.dtype in (torch.uint8, torch.int8):
+                        wf = wf.view(torch.float8_e4m3fn)
+                    y = gemm_a8w8_blockscale_triton(
+                        xf,
+                        wf,
+                        x_scale_inline,
+                        self.weight_scale,
+                        dtype=otype,
+                    )
                     if self.bias is not None:
                         y += self.bias
                 elif envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
