@@ -348,7 +348,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     BackendType::Sglang => {
                         discover_http_sglang(&config.url, config.api_key.as_deref()).await
                     }
-                    BackendType::Vllm => {
+                    BackendType::Vllm | BackendType::Atom => {
                         discover_http_openai(&config.url, config.api_key.as_deref()).await
                     }
                 };

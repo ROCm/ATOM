@@ -109,6 +109,8 @@ pub enum Backend {
     Sglang,
     #[value(name = "vllm")]
     Vllm,
+    #[value(name = "atom")]
+    Atom,
 }
 
 impl std::fmt::Display for Backend {
@@ -116,6 +118,7 @@ impl std::fmt::Display for Backend {
         match self {
             Backend::Sglang => write!(f, "sglang"),
             Backend::Vllm => write!(f, "vllm"),
+            Backend::Atom => write!(f, "atom"),
         }
     }
 }
@@ -125,6 +128,7 @@ impl From<Backend> for BackendType {
         match b {
             Backend::Sglang => BackendType::Sglang,
             Backend::Vllm => BackendType::Vllm,
+            Backend::Atom => BackendType::Atom,
         }
     }
 }
@@ -136,6 +140,7 @@ impl std::str::FromStr for Backend {
         match value {
             "sglang" => Ok(Self::Sglang),
             "vllm" => Ok(Self::Vllm),
+            "atom" => Ok(Self::Atom),
             other => Err(format!("unsupported backend: {other}")),
         }
     }
