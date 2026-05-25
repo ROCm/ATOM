@@ -160,10 +160,9 @@ class MLAAttention(nn.Module):
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
-        self.topk_indices_buffer = (
-            mla_modules.indexer.topk_indices_buffer
-            if mla_modules.indexer is not None
-            else None
+        self.is_sparse_mla = mla_modules.indexer is not None
+        self.topk_tokens = (
+            mla_modules.indexer.topk_tokens if mla_modules.indexer is not None else None
         )
         self.layer_num = layer_num
 
@@ -475,20 +474,10 @@ class MLAAttention(nn.Module):
         paged_kv_indices = attn_metadata.kv_indices
         kv_last_page_lens = attn_metadata.kv_last_page_lens
         max_q_len = attn_metadata.max_seqlen_q
-        if self.topk_indices_buffer is not None:
-            sparse_kv_indices = triton_convert_req_index_to_global_index_dsa_prefill(
-                attn_metadata.sparse_cu_seqlens_q,
-                attn_metadata.sparse_kv_indptr,
-                attn_metadata.token_to_seq_idxs,
-                self.topk_indices_buffer[:B],
-                attn_metadata.block_tables,
-                attn_metadata.cu_seqlens_k,
-                NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
-                PAGE_SIZE=get_current_atom_config().kv_cache_block_size,
-            )
+        if self.is_sparse_mla:
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
-            paged_kv_indices = sparse_kv_indices
+            paged_kv_indices = attn_metadata.sparse_kv_indices
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
@@ -583,35 +572,18 @@ class MLAAttention(nn.Module):
             paged_kv_indices = attn_metadata.kv_indices
             paged_kv_last_page_lens = attn_metadata.kv_last_page_lens
             max_q_len = attn_metadata.max_seqlen_q
-            if self.topk_indices_buffer is not None:
+            if self.is_sparse_mla:
                 if attn_metadata.max_seqlen_q > 1:
                     # MTP verify: per-token layout with max_q_len=1.
                     # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).
                     paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-                    # Gather physical page indices from kv_indices using topk positions.
-                    # block_tables contains large-block IDs (block_ratio > 1) that
-                    # need expansion; kv_indices already has per-token page indices.
-                    paged_kv_indices = triton_gather_kv_indices_sparse(
-                        paged_kv_indptr,
-                        attn_metadata.token_to_seq_idxs,
-                        self.topk_indices_buffer[:B],
-                        attn_metadata.kv_indices,
-                        attn_metadata.kv_indptr,
-                        NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
-                    )
+                    paged_kv_indices = attn_metadata.sparse_kv_indices
                     max_q_len = 1
                 else:
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
-                    paged_kv_indices = triton_convert_req_index_to_global_index(
-                        attn_metadata.cu_seqlens_q,
-                        attn_metadata.kv_indptr,
-                        paged_kv_indptr,
-                        attn_metadata.kv_indices,
-                        self.topk_indices_buffer[:B],
-                        NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
-                    )
+                    paged_kv_indices = attn_metadata.sparse_kv_indices
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = not (dp_size > 1)
@@ -620,7 +592,7 @@ class MLAAttention(nn.Module):
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
             # (max_seqlen_qo=2).
             is_sparse_mtp = (
-                self.topk_indices_buffer is not None and attn_metadata.max_seqlen_q > 1
+                self.is_sparse_mla and attn_metadata.max_seqlen_q > 1
             )
 
             if not use_persistent_mode:
@@ -684,8 +656,8 @@ class MLAAttention(nn.Module):
         attn_metadata = forward_context.attn_metadata
         context = forward_context.context
         use_prefill_mla = (
-            self.topk_indices_buffer is not None
-            and attn_metadata.max_seqlen_k > self.topk_indices_buffer.shape[1]
+            self.is_sparse_mla
+            and attn_metadata.max_seqlen_k > self.topk_tokens
         )
         if forward_context.context.is_dummy_run:
             output_shape = list(q.shape)

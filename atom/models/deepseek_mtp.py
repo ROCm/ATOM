@@ -46,7 +46,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         atom_config: Config,
         prefix: str,
         layer_idx: int,
-        topk_indices_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
 
@@ -63,20 +62,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             prefix=maybe_prefix(prefix, "eh_proj"),
         )
 
-        if hasattr(config, "index_topk"):
-            max_num_batched_tokens = getattr(
-                atom_config, "max_num_batched_tokens", atom_config.max_num_seqs
-            )
-            buffer_device = getattr(atom_config, "device", "cuda")
-            topk_indices_buffer = torch.empty(
-                max_num_batched_tokens,
-                config.index_topk,
-                dtype=torch.int32,
-                device=buffer_device,
-            )
-        else:
-            topk_indices_buffer = None
-
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=atom_config.quant_config
         )
@@ -90,7 +75,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             layer_num=layer_idx,
             is_mtp_block=True,
-            topk_indices_buffer=topk_indices_buffer,
         )
 
     def forward(
@@ -125,7 +109,6 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         *,
         atom_config: Config,
         prefix: str = "",
-        topk_indices_buffer: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         config = atom_config.hf_config
@@ -138,7 +121,6 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                     atom_config,
                     f"{prefix}.layers.{idx}",
                     layer_idx=idx,
-                    topk_indices_buffer=topk_indices_buffer,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -215,7 +197,6 @@ class DeepSeekMTP(nn.Module):
                 "up_proj": ("gate_up_proj", 1),
             }
 
-        topk_indices_buffer = None
         model_prefix = maybe_prefix(prefix, "model")
         if hasattr(self.config, "index_topk"):
             indexer_prefixes = [
@@ -237,17 +218,10 @@ class DeepSeekMTP(nn.Module):
                         "indexer.weights_proj": ("indexer.wk_weights_proj", 1),
                     }
                 )
-            topk_indices_buffer = torch.empty(
-                atom_config.max_num_batched_tokens,
-                self.config.index_topk,
-                dtype=torch.int32,
-                device="cuda",
-            )
 
         self.model = DeepSeekMultiTokenPredictor(
             atom_config=atom_config,
             prefix=model_prefix,
-            topk_indices_buffer=topk_indices_buffer,
         )
 
     def remap_mtp_weight_name(self, name: str) -> str | None:

@@ -62,7 +62,6 @@ class KimiK25Model(DeepseekV2Model):
             lambda prefix, layer_num=None: DeepseekV2DecoderLayer(
                 config,
                 prefix,
-                topk_indices_buffer=None,
                 cache_config=cache_config,
                 quant_config=quant_config,
                 layer_num=layer_num,
