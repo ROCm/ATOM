@@ -1,11 +1,13 @@
 from abc import ABC, abstractmethod
 
+import os
 from dataclasses import dataclass
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
 from atom.utils.tbo.ubatching import tbo_overlap_enabled
 from atom.utils.forward_context import get_forward_context
 import torch
+import torch.nn.functional as F
 from typing import Callable, Optional, final
 from enum import Enum
 from aiter import ActivationType, QuantType
@@ -56,6 +58,212 @@ PrepareResultType = tuple[
 ]
 
 ReceiverType = Callable[[], PrepareResultType]
+
+
+_E2M1_TO_FLOAT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+def _inverse_shuffle_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Undo aiter.ops.shuffle.shuffle_weight(..., layout=(16, 16))."""
+    n = weight.shape[-2]
+    packed_k = weight.shape[-1]
+    bn = 16
+    bk = 32
+    k_lane = 16
+    if n % bn != 0 or packed_k % bk != 0:
+        raise ValueError(f"cannot unshuffle weight with shape {tuple(weight.shape)}")
+
+    return (
+        weight.reshape(-1, n // bn, packed_k // bk, bk // k_lane, bn, k_lane)
+        .permute(0, 1, 4, 2, 3, 5)
+        .contiguous()
+        .reshape_as(weight)
+    )
+
+
+def _inverse_shuffle_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Undo aiter.utility.fp4_utils.e8m0_shuffle for 2D scale tensors."""
+    if scale.ndim != 2:
+        raise ValueError(f"scale must be 2D, got shape {tuple(scale.shape)}")
+
+    rows, groups = scale.shape
+    if rows % 32 != 0 or groups % 8 != 0:
+        raise ValueError(f"cannot unshuffle scale with shape {tuple(scale.shape)}")
+
+    return (
+        scale.reshape(rows // 32, groups // 8, 4, 16, 2, 2)
+        .permute(0, 5, 3, 1, 4, 2)
+        .contiguous()
+        .reshape_as(scale)
+    )
+
+
+def _decode_fp4_e2m1fn_x2(packed: torch.Tensor) -> torch.Tensor:
+    if packed.dtype != torch.uint8:
+        packed = packed.contiguous().view(torch.uint8)
+    lut = _E2M1_TO_FLOAT.to(device=packed.device)
+
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    codes = torch.stack((low, high), dim=-1).flatten(start_dim=-2)
+
+    signs = (codes & 0x08).to(torch.bool)
+    magnitudes = (codes & 0x07).to(torch.long)
+    values = lut[magnitudes]
+    return torch.where(signs, -values, values)
+
+
+def _decode_e8m0fnu(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype != torch.uint8:
+        scale = scale.contiguous().view(torch.uint8)
+    exponent = scale.to(torch.int32).clamp(max=254)
+    values = torch.exp2(exponent.to(torch.float32) - 127.0)
+    return torch.where(exponent == 0, torch.zeros_like(values), values)
+
+
+def _dequant_mxfp4_weight(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    unshuffle: bool,
+) -> torch.Tensor:
+    weight = weight.contiguous().view(torch.uint8)
+    scale = scale.contiguous().view(torch.uint8)
+    if unshuffle:
+        weight = _inverse_shuffle_weight(weight)
+        scale = _inverse_shuffle_scale(scale)
+
+    dequant = _decode_fp4_e2m1fn_x2(weight)
+    out_features, in_features = dequant.shape
+    if scale.shape != (out_features, in_features // 32):
+        raise ValueError(
+            f"scale shape {tuple(scale.shape)} does not match weight shape "
+            f"{tuple(weight.shape)} after FP4 unpack"
+        )
+
+    scale_f32 = _decode_e8m0fnu(scale)
+    return (
+        dequant.reshape(out_features, in_features // 32, 32) * scale_f32[:, :, None]
+    ).reshape(out_features, in_features)
+
+
+def _local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
+    expert_mask = expert_mask.to(torch.int32)
+    hashed = expert_mask.cumsum(0, dtype=torch.int32) - 1
+    hashed[expert_mask == 0] = -1
+    return hashed
+
+
+@torch.no_grad()
+def _torch_native_mxfp4_fused_moe(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: torch.Tensor | None,
+    num_local_tokens: torch.Tensor | None,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    activation: ActivationType,
+) -> torch.Tensor:
+    if activation != ActivationType.Silu:
+        raise NotImplementedError(
+            f"torch native MXFP4 MoE only supports Silu, got {activation}"
+        )
+    if w1_scale is None or w2_scale is None:
+        raise ValueError("torch native MXFP4 MoE requires w1_scale and w2_scale")
+
+    num_experts, w1_out_features, _ = w1.shape
+    _, w2_out_features, _ = w2.shape
+    w1_scale = w1_scale.contiguous().view(torch.uint8).reshape(
+        num_experts, w1_out_features, -1
+    )
+    w2_scale = w2_scale.contiguous().view(torch.uint8).reshape(
+        num_experts, w2_out_features, -1
+    )
+
+    if expert_mask is not None:
+        hashed = _local_expert_hash(expert_mask)
+        valid = (topk_ids >= 0) & (topk_ids < hashed.numel())
+        mapped_ids = torch.full_like(topk_ids, -1)
+        mapped_ids[valid] = hashed[topk_ids[valid]]
+    else:
+        mapped_ids = topk_ids
+
+    if num_local_tokens is not None:
+        num_rows = min(hidden_states.shape[0], int(num_local_tokens.sum().item()))
+    else:
+        num_rows = hidden_states.shape[0]
+
+    output = torch.zeros(
+        hidden_states.shape,
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    if num_rows <= 0:
+        return output.to(hidden_states.dtype)
+
+    mapped_ids = mapped_ids[:num_rows]
+    topk_weights = topk_weights[:num_rows]
+    hidden_rows = hidden_states[:num_rows]
+
+    unshuffle = os.getenv("ATOM_MOE_TORCH_NATIVE_UNSHUFFLE", "1") != "0"
+    local_experts = torch.unique(mapped_ids[mapped_ids >= 0]).sort().values.tolist()
+    for local_expert in local_experts:
+        token_idx, topk_idx = (mapped_ids == local_expert).nonzero(as_tuple=True)
+        if token_idx.numel() == 0:
+            continue
+
+        w13_f32 = _dequant_mxfp4_weight(
+            w1[local_expert],
+            w1_scale[local_expert],
+            unshuffle=unshuffle,
+        )
+        w2_f32 = _dequant_mxfp4_weight(
+            w2[local_expert],
+            w2_scale[local_expert],
+            unshuffle=unshuffle,
+        )
+
+        x = hidden_rows[token_idx].to(torch.float32)
+        gate_up = x @ w13_f32.T
+        gate, up = gate_up.chunk(2, dim=-1)
+        intermediate = F.silu(gate) * up
+        expert_out = intermediate @ w2_f32.T
+        expert_out = expert_out * topk_weights[token_idx, topk_idx].to(torch.float32)[
+            :, None
+        ]
+        output[:num_rows].index_add_(0, token_idx, expert_out)
+
+        del w13_f32, w2_f32, gate_up, intermediate, expert_out
+
+    return output.to(hidden_states.dtype)
+
+
+def _report_native_diff(
+    name: str, native_out: torch.Tensor, fused_out: torch.Tensor
+) -> None:
+    native_f32 = native_out.float()
+    fused_f32 = fused_out.float()
+    diff = native_f32 - fused_f32
+    native_absmax = float(native_f32.abs().max().item()) if native_f32.numel() else 0.0
+    fused_absmax = float(fused_f32.abs().max().item()) if fused_f32.numel() else 0.0
+    diff_absmax = float(diff.abs().max().item()) if diff.numel() else 0.0
+    rmse = float(torch.sqrt(torch.mean(diff * diff)).item()) if diff.numel() else 0.0
+    denom = max(fused_absmax, 1e-12)
+    print(
+        f"[ATOM_MOE_TORCH_NATIVE] {name}: "
+        f"native_absmax={native_absmax} fused_absmax={fused_absmax} "
+        f"diff_absmax={diff_absmax} rmse={rmse} rel_absmax={diff_absmax / denom}"
+    )
 
 
 class FusedMoEPrepareAndFinalize(ABC):
@@ -344,27 +552,66 @@ class FusedMoEModularKernel(torch.nn.Module):
             if dispatch_scale is not None:
                 dispatch_scale = dispatch_scale[:total_valid_tokens]
 
-        fused_out = fused_moe(
-            dispatch_a1,
-            w1,
-            w2,
-            dispatch_weights,
-            dispatch_ids,
-            expert_map,
-            activation,
-            quant_type=quant_type,
-            num_local_tokens=expert_tokens_meta.expert_num_tokens,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,
-            a2_scale=a2_scale,
-            doweight_stage1=apply_router_weight_on_input,
-            hidden_pad=hidden_pad,
-            intermediate_pad=intermediate_pad,
-            bias1=bias1,
-            bias2=bias2,
-            dtype=hidden_states.dtype,
-        )
+        use_native_mxfp4 = _env_flag("ATOM_MOE_USE_TORCH_NATIVE_MXFP4")
+        compare_native_mxfp4 = _env_flag("ATOM_MOE_COMPARE_TORCH_NATIVE_MXFP4")
+        native_out = None
+        if use_native_mxfp4 or compare_native_mxfp4:
+            if quant_type != QuantType.per_1x32:
+                raise NotImplementedError(
+                    "ATOM_MOE_USE_TORCH_NATIVE_MXFP4 only supports QuantType.per_1x32"
+                )
+            if dispatch_scale is not None or a1_scale is not None or a2_scale is not None:
+                raise NotImplementedError(
+                    "ATOM_MOE_USE_TORCH_NATIVE_MXFP4 does not support activation scales"
+                )
+            if bias1 is not None or bias2 is not None:
+                raise NotImplementedError(
+                    "ATOM_MOE_USE_TORCH_NATIVE_MXFP4 does not support MoE bias"
+                )
+            if apply_router_weight_on_input:
+                raise NotImplementedError(
+                    "ATOM_MOE_USE_TORCH_NATIVE_MXFP4 expects router weights on output"
+                )
+
+            native_out = _torch_native_mxfp4_fused_moe(
+                dispatch_a1,
+                w1,
+                w2,
+                dispatch_weights,
+                dispatch_ids,
+                expert_map,
+                expert_tokens_meta.expert_num_tokens,
+                w1_scale,
+                w2_scale,
+                activation=ActivationType(activation),
+            )
+
+        if use_native_mxfp4:
+            fused_out = native_out
+        else:
+            fused_out = fused_moe(
+                dispatch_a1,
+                w1,
+                w2,
+                dispatch_weights,
+                dispatch_ids,
+                expert_map,
+                activation,
+                quant_type=quant_type,
+                num_local_tokens=expert_tokens_meta.expert_num_tokens,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,
+                a2_scale=a2_scale,
+                doweight_stage1=apply_router_weight_on_input,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                dtype=hidden_states.dtype,
+            )
+            if compare_native_mxfp4:
+                _report_native_diff("dispatch fused_out", native_out, fused_out)
         return self._finalize(
             output,
             fused_out,

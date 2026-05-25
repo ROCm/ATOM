@@ -64,7 +64,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
     use_triton_gemm,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, _moe_dump_gate_debug
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
 from atom.models.utils import (
@@ -884,6 +884,12 @@ class DeepseekV2MoE(nn.Module):
 
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits = self.gate(hidden_states)
+        _moe_dump_gate_debug(
+            self.experts,
+            hidden_states,
+            self.gate.weight,
+            router_logits,
+        )
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )

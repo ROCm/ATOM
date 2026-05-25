@@ -23,6 +23,7 @@ from aiter import dtypes
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size, get_tp_group
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mla import (
+    concat_and_cache_mla,
     dynamic_per_batched_tensor_quant,
     fused_qk_rope_concat_and_cache_mla,
 )
@@ -57,6 +58,10 @@ from sglang.srt.utils import bind_or_assign, get_bool_env_var
 
 if TYPE_CHECKING:
     from atom.models.deepseek_v2 import DeepseekV2MLAAttention
+
+
+_CONCAT_AND_CACHE_MLA_ROPE_FUSED_OP: Optional[Any] = None
+_CONCAT_AND_CACHE_MLA_ROPE_FUSED_CHECKED = False
 
 
 # bmm_fp8 custom-op wrapper (adapted from sglang forward_mla.py)
@@ -156,16 +161,23 @@ def _fuse_qk_rmsnorm(
     k_nope: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse q/k RMSNorm without quantizing q."""
-    from atom.models.deepseek_v2 import _fused_qk_rmsnorm
-
-    return _fused_qk_rmsnorm(
+    (q_normed, _), _, k_nope_normed, _ = _fuse_rmsnorm_quant(
         q,
         attn.q_a_layernorm.weight,
         attn.q_a_layernorm.eps,
         k_nope,
         attn.kv_a_layernorm.weight,
         attn.kv_a_layernorm.eps,
+        None,
+        dtype_quant=torch.bfloat16,
+        shuffle=False,
+        scale_shuffle_padding=False,
+        group_size=128,
+        quant_type=None,
+        output_unquantized_inp1=False,
+        transpose_scale=False,
     )
+    return q_normed, k_nope_normed
 
 
 def _prepare_weight_for_bmm(
@@ -618,7 +630,47 @@ def _get_sglang_radix_attn(attn_module):
     return attn_module.attn if hasattr(attn_module, "attn") else attn_module
 
 
-def _set_mla_kv_buffer_for_mha(
+def _get_concat_and_cache_mla_rope_fused_op():
+    global _CONCAT_AND_CACHE_MLA_ROPE_FUSED_OP
+    global _CONCAT_AND_CACHE_MLA_ROPE_FUSED_CHECKED
+
+    if _CONCAT_AND_CACHE_MLA_ROPE_FUSED_CHECKED:
+        return _CONCAT_AND_CACHE_MLA_ROPE_FUSED_OP
+
+    _CONCAT_AND_CACHE_MLA_ROPE_FUSED_CHECKED = True
+    try:
+        from vllm import _custom_ops as ops
+    except Exception:
+        _CONCAT_AND_CACHE_MLA_ROPE_FUSED_OP = None
+    else:
+        _CONCAT_AND_CACHE_MLA_ROPE_FUSED_OP = getattr(
+            ops, "concat_and_cache_mla_rope_fused", None
+        )
+    return _CONCAT_AND_CACHE_MLA_ROPE_FUSED_OP
+
+
+def _get_rotary_emb_cos_sin_cache(attn: DeepseekV2MLAAttention) -> torch.Tensor:
+    rotary_emb = attn.rotary_emb
+    cache = getattr(attn, "rotary_emb_cos_sin_cache", None)
+    cos_cache = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+    sin_cache = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+    expected_shape = (*cos_cache.shape[:-1], cos_cache.shape[-1] + sin_cache.shape[-1])
+    if (
+        cache is None
+        or cache.shape != expected_shape
+        or cache.device != cos_cache.device
+        or cache.dtype != cos_cache.dtype
+    ):
+        cache = torch.cat([cos_cache, sin_cache], dim=-1)
+        attn.rotary_emb_cos_sin_cache = cache
+    return cache
+
+
+def _aiter_mla_cache_dtype(kv_cache_dtype: str) -> str:
+    return "fp8" if str(kv_cache_dtype).startswith("fp8") else "auto"
+
+
+def _set_mla_kv_buffer_for_mha_legacy(
     attn: DeepseekV2MLAAttention,
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
@@ -632,6 +684,65 @@ def _set_mla_kv_buffer_for_mha(
         cache_k,
         cache_k,
     )
+
+
+def _set_mla_kv_buffer_for_mha(
+    attn: DeepseekV2MLAAttention,
+    kv_a: torch.Tensor,
+    k_pe: torch.Tensor,
+    forward_batch,
+) -> None:
+    attn_mha = _get_sglang_radix_attn(attn.attn_mha)
+    if getattr(attn_mha, "k_scale", None) is None:
+        _set_mla_kv_buffer_for_mha_legacy(attn, kv_a, k_pe, forward_batch)
+        return
+
+    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(attn_mha.layer_id)
+    concat_and_cache_mla(
+        kv_a,
+        k_pe.squeeze(1),
+        kv_cache,
+        forward_batch.out_cache_loc.flatten(),
+        kv_cache_dtype=_aiter_mla_cache_dtype(attn.kv_cache_dtype),
+        scale=attn_mha.k_scale,
+    )
+
+
+def _try_fused_rope_and_set_mla_kv_buffer_for_mha(
+    attn: DeepseekV2MLAAttention,
+    q: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_a: torch.Tensor,
+    k_pe: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch,
+) -> bool:
+    if attn.rotary_emb is None:
+        return False
+
+    fused_op = _get_concat_and_cache_mla_rope_fused_op()
+    if fused_op is None:
+        return False
+
+    attn_mha = _get_sglang_radix_attn(attn.attn_mha)
+    if getattr(attn_mha, "k_scale", None) is None:
+        return False
+
+    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(attn_mha.layer_id)
+    fused_op(
+        positions,
+        q_pe,
+        k_pe.squeeze(1),
+        kv_a,
+        _get_rotary_emb_cos_sin_cache(attn),
+        attn.rotary_emb.is_neox_style,
+        forward_batch.out_cache_loc,
+        kv_cache,
+        _aiter_mla_cache_dtype(attn.kv_cache_dtype),
+        attn_mha.k_scale,
+    )
+    q[..., attn.qk_nope_head_dim :] = q_pe
+    return True
 
 
 def _can_run_sgl_mha_now(attn: DeepseekV2MLAAttention, forward_batch) -> bool:
@@ -751,11 +862,19 @@ def forward_sgl_mha_prepare(
         kv_a = attn.kv_a_layernorm(kv_a)
 
     k_pe = latent_cache[:, :, attn.kv_lora_rank :]
-    if attn.rotary_emb is not None:
-        q_pe, k_pe = attn.rotary_emb(positions, q_pe, k_pe)
-    q[..., attn.qk_nope_head_dim :] = q_pe
-
-    _set_mla_kv_buffer_for_mha(attn, kv_a, k_pe, forward_batch)
+    if not _try_fused_rope_and_set_mla_kv_buffer_for_mha(
+        attn,
+        q,
+        q_pe,
+        kv_a,
+        k_pe,
+        positions,
+        forward_batch,
+    ):
+        if attn.rotary_emb is not None:
+            q_pe, k_pe = attn.rotary_emb(positions, q_pe, k_pe)
+        q[..., attn.qk_nope_head_dim :] = q_pe
+        _set_mla_kv_buffer_for_mha(attn, kv_a, k_pe, forward_batch)
 
     if kv_a_quanted is not None:
         kv = _unwrap_linear_output(attn.kv_b_proj(kv_a_quanted, kv_a_quanted_scale))

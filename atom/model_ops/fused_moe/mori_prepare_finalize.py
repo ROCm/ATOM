@@ -26,6 +26,63 @@ logger = logging.getLogger("atom")
 _NUM_TBO_UBATCHES = 2
 
 
+def _mori_dump_tensor(owner: Any, name: str, value: Any) -> None:
+    dump_ctx = getattr(owner, "_atom_moe_dump_ctx", None)
+    if dump_ctx is None or value is None:
+        return
+
+    rank_dir = dump_ctx["rank_dir"]
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    path = rank_dir / f"{name}.pt"
+
+    if torch.is_tensor(value):
+        payload = {
+            "tensor": value.detach().cpu(),
+            "shape": tuple(value.shape),
+            "dtype": str(value.dtype),
+        }
+    else:
+        payload = {"value": value}
+
+    payload.update(
+        {
+            "name": name,
+            "layer_name": dump_ctx["layer_name"],
+            "step": dump_ctx["step"],
+            "dp_rank": dump_ctx["dp_rank"],
+            "tp_rank": dump_ctx["tp_rank"],
+            "ep_rank": dump_ctx["ep_rank"],
+            "dp_size": dump_ctx["dp_size"],
+            "tp_size": dump_ctx["tp_size"],
+            "ep_size": dump_ctx["ep_size"],
+        }
+    )
+    torch.save(payload, path)
+
+
+def _mori_debug_info(owner: "MoriPrepareAndFinalize", **extra: Any) -> dict[str, Any]:
+    context = get_forward_context().context
+    return {
+        "rank": getattr(owner._sync_mori_op, "rank", None),
+        "num_dispatchers": owner.num_dispatchers_,
+        "max_tokens_per_rank": owner.max_tokens_per_rank,
+        "use_fp8_dispatch": owner.use_fp8_dispatch,
+        "is_async": owner._is_async,
+        "low_latency": owner._low_latency,
+        "forward_context": {
+            "is_prefill": getattr(context, "is_prefill", None),
+            "is_dummy_run": getattr(context, "is_dummy_run", None),
+            "batch_size": getattr(context, "batch_size", None),
+            "graph_bs": getattr(context, "graph_bs", None),
+        },
+        **extra,
+    }
+
+
+def _shape_or_none(value: Any) -> tuple[int, ...] | None:
+    return tuple(value.shape) if torch.is_tensor(value) else None
+
+
 @lru_cache(maxsize=8)
 def init_mori_op(
     rank: int,
@@ -194,6 +251,20 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
 
         block_num, warp_per_block = self._get_dispatch_config()
+        _mori_dump_tensor(
+            self,
+            "mori_prepare_debug_info_before",
+            _mori_debug_info(
+                self,
+                input_shape=tuple(a1.shape),
+                topk_ids_shape=tuple(topk_ids.shape),
+                topk_weights_shape=tuple(topk_weights.shape),
+                block_num=block_num,
+                warp_per_block=warp_per_block,
+            ),
+        )
+        _mori_dump_tensor(self, "mori_topk_ids_before_dispatch", topk_ids)
+        _mori_dump_tensor(self, "mori_topk_weights_before_dispatch", topk_weights)
 
         (
             dispatch_a1,
@@ -203,6 +274,21 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_recv_token_num,
         ) = self._sync_mori_op.dispatch(
             a1, topk_weights, scale, topk_ids, block_num, warp_per_block
+        )
+        _mori_dump_tensor(self, "mori_dispatch_a1", dispatch_a1)
+        _mori_dump_tensor(self, "mori_dispatch_ids", dispatch_ids)
+        _mori_dump_tensor(self, "mori_dispatch_weights", dispatch_weights)
+        _mori_dump_tensor(self, "mori_dispatch_recv_token_num", dispatch_recv_token_num)
+        _mori_dump_tensor(
+            self,
+            "mori_prepare_debug_info_after",
+            _mori_debug_info(
+                self,
+                dispatch_a1_shape=tuple(dispatch_a1.shape),
+                dispatch_ids_shape=tuple(dispatch_ids.shape),
+                dispatch_weights_shape=tuple(dispatch_weights.shape),
+                dispatch_recv_token_num=dispatch_recv_token_num.detach().cpu().tolist(),
+            ),
         )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
@@ -228,6 +314,20 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_token = topk_ids.shape[0]
 
         block_num, warp_per_block = self._get_dispatch_config()
+        _mori_dump_tensor(
+            self,
+            "mori_finalize_debug_info_before",
+            _mori_debug_info(
+                self,
+                output_shape=_shape_or_none(output),
+                fused_expert_output_shape=_shape_or_none(fused_expert_output),
+                topk_ids_shape=_shape_or_none(topk_ids),
+                block_num=block_num,
+                warp_per_block=warp_per_block,
+            ),
+        )
+        _mori_dump_tensor(self, "mori_finalize_topk_ids", topk_ids)
+        _mori_dump_tensor(self, "mori_fused_expert_output_before_combine", fused_expert_output)
 
         result = self._sync_mori_op.combine(
             fused_expert_output,
@@ -236,6 +336,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             block_num,
             warp_per_block,
         )[0]
+        _mori_dump_tensor(self, "mori_combine_result", result)
         return result[:num_token]
 
     # 1. IntraNode (default TBO): dispatch()/combine() on comm_stream

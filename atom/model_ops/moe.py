@@ -5,7 +5,8 @@ import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -56,6 +57,498 @@ from atom.utils.decorators import mark_trace
 from torch import nn
 from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
+
+
+_MOE_DUMP_CALL_COUNTS: Dict[Tuple[str, int, int, int], int] = {}
+_MOE_GATE_DUMP_CALL_COUNTS: Dict[Tuple[str, int, int, int], int] = {}
+
+
+def _sanitize_moe_dump_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+
+
+def _extract_layer_id_from_name(layer_name: str) -> Optional[str]:
+    marker = ".layers."
+    if marker not in layer_name:
+        return None
+    suffix = layer_name.split(marker, 1)[1]
+    layer_id = suffix.split(".", 1)[0]
+    return layer_id if layer_id.isdigit() else None
+
+
+def _moe_layer_matches(layer_name: str, layers: str) -> bool:
+    layers = layers.strip()
+    if not layers:
+        return True
+
+    layer_id = _extract_layer_id_from_name(layer_name)
+    for item in layers.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item == layer_name or item == layer_id:
+            return True
+    return False
+
+
+def _moe_dump_layer_enabled(layer_name: str) -> bool:
+    return _moe_layer_matches(layer_name, os.getenv("ATOM_MOE_DUMP_LAYERS", ""))
+
+
+def _moe_dump_bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _moe_make_dump_ctx(layer: "FusedMoE", step: int) -> Dict[str, Any]:
+    primary_rank = layer.dp_rank == 0 and layer.tp_rank == 0 and layer.ep_rank == 0
+    dump_dir = os.getenv("ATOM_MOE_DUMP_DIR", "").strip()
+    layer_dir = Path(dump_dir) / _sanitize_moe_dump_name(layer.layer_name)
+    rank_dir = layer_dir / f"step_{step:05d}" / (
+        f"dp{layer.dp_rank}_tp{layer.tp_rank}_ep{layer.ep_rank}"
+    )
+    return {
+        "rank_dir": rank_dir,
+        "layer_name": layer.layer_name,
+        "step": step,
+        "dp_rank": layer.dp_rank,
+        "tp_rank": layer.tp_rank,
+        "ep_rank": layer.ep_rank,
+        "dp_size": layer.dp_size,
+        "tp_size": layer.tp_size,
+        "ep_size": layer.ep_size,
+        "primary_rank": primary_rank,
+        "dump_local": _moe_dump_bool_env("ATOM_MOE_DUMP_LOCAL", False),
+    }
+
+
+def _moe_dump_begin(layer: "FusedMoE") -> Optional[Dict[str, Any]]:
+    dump_dir = os.getenv("ATOM_MOE_DUMP_DIR", "").strip()
+    if not dump_dir or not _moe_dump_layer_enabled(layer.layer_name):
+        return None
+
+    max_steps = int(os.getenv("ATOM_MOE_DUMP_MAX_STEPS", "1"))
+    key = (layer.layer_name, layer.dp_rank, layer.tp_rank, layer.ep_rank)
+    step = _MOE_DUMP_CALL_COUNTS.get(key, 0)
+    if max_steps >= 0 and step >= max_steps:
+        return None
+    _MOE_DUMP_CALL_COUNTS[key] = step + 1
+    return _moe_make_dump_ctx(layer, step)
+
+
+def _moe_gate_dump_begin(layer: "FusedMoE") -> Optional[Dict[str, Any]]:
+    dump_dir = os.getenv("ATOM_MOE_DUMP_DIR", "").strip()
+    if not dump_dir or not _moe_dump_layer_enabled(layer.layer_name):
+        return None
+
+    max_steps = int(os.getenv("ATOM_MOE_DUMP_MAX_STEPS", "1"))
+    key = (layer.layer_name, layer.dp_rank, layer.tp_rank, layer.ep_rank)
+    step = _MOE_GATE_DUMP_CALL_COUNTS.get(key, 0)
+    if max_steps >= 0 and step >= max_steps:
+        return None
+    _MOE_GATE_DUMP_CALL_COUNTS[key] = step + 1
+    return _moe_make_dump_ctx(layer, step)
+
+
+def _tensor_layout_info(tensor: torch.Tensor) -> Dict[str, Any]:
+    return {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "stride": tuple(tensor.stride()),
+        "is_contiguous": tensor.is_contiguous(),
+        "storage_offset": tensor.storage_offset(),
+        "device": str(tensor.device),
+    }
+
+
+def _moe_dump_gate_debug(
+    layer: "FusedMoE",
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    router_logits: torch.Tensor,
+) -> None:
+    dump_ctx = _moe_gate_dump_begin(layer)
+    _moe_dump_tensor(dump_ctx, "gate_input", hidden_states)
+    _moe_dump_tensor(dump_ctx, "gate_weight", gate_weight)
+    _moe_dump_tensor(dump_ctx, "gate_router_logits", router_logits)
+    _moe_dump_tensor(
+        dump_ctx,
+        "gate_layout_info",
+        {
+            "hidden_states": _tensor_layout_info(hidden_states),
+            "gate_weight": _tensor_layout_info(gate_weight),
+            "router_logits": _tensor_layout_info(router_logits),
+        },
+    )
+
+
+def _moe_dump_tensor(
+    dump_ctx: Optional[Dict[str, Any]],
+    name: str,
+    value: Any,
+    *,
+    primary_only: bool = False,
+    all_ranks: bool = False,
+) -> None:
+    if dump_ctx is None or value is None:
+        return
+    if primary_only and not dump_ctx["primary_rank"]:
+        return
+    if (
+        not primary_only
+        and not all_ranks
+        and not dump_ctx["dump_local"]
+        and not dump_ctx["primary_rank"]
+    ):
+        return
+
+    rank_dir: Path = dump_ctx["rank_dir"]
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    path = rank_dir / f"{name}.pt"
+
+    if torch.is_tensor(value):
+        payload = {
+            "tensor": value.detach().cpu(),
+            "shape": tuple(value.shape),
+            "dtype": str(value.dtype),
+        }
+    else:
+        payload = {"value": value}
+
+    payload.update(
+        {
+            "name": name,
+            "layer_name": dump_ctx["layer_name"],
+            "step": dump_ctx["step"],
+            "dp_rank": dump_ctx["dp_rank"],
+            "tp_rank": dump_ctx["tp_rank"],
+            "ep_rank": dump_ctx["ep_rank"],
+            "dp_size": dump_ctx["dp_size"],
+            "tp_size": dump_ctx["tp_size"],
+            "ep_size": dump_ctx["ep_size"],
+        }
+    )
+    torch.save(payload, path)
+
+
+def _moe_dump_topk_debug(
+    layer: "FusedMoE",
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> None:
+    dump_ctx = getattr(layer, "_moe_dump_ctx", None)
+    _moe_dump_tensor(dump_ctx, "topk_weights", topk_weights)
+    _moe_dump_tensor(dump_ctx, "topk_ids", topk_ids)
+
+
+def _moe_bind_prepare_finalize_dump_ctx(
+    layer: "FusedMoE", fused_experts: Optional[FusedMoEModularKernel]
+) -> None:
+    if fused_experts is None:
+        return
+    prepare_finalize = getattr(fused_experts, "prepare_finalize", None)
+    if prepare_finalize is not None:
+        prepare_finalize._atom_moe_dump_ctx = getattr(layer, "_moe_dump_ctx", None)
+
+
+def _moe_context_debug_info(layer: "FusedMoE", hidden_states: torch.Tensor) -> Dict[str, Any]:
+    ctx = get_forward_context()
+    context = getattr(ctx, "context", None)
+    dp_metadata = getattr(ctx, "dp_metadata", None)
+    dp_group = get_dp_group()
+
+    return {
+        "layer_parallel": {
+            "dp_size": layer.dp_size,
+            "dp_rank": layer.dp_rank,
+            "tp_size": layer.tp_size,
+            "tp_rank": layer.tp_rank,
+            "ep_size": layer.ep_size,
+            "ep_rank": layer.ep_rank,
+            "use_ep": layer.use_ep,
+        },
+        "dp_group": {
+            "world_size": dp_group.world_size,
+            "rank_in_group": dp_group.rank_in_group,
+        },
+        "forward_context": {
+            "is_prefill": getattr(context, "is_prefill", None),
+            "is_dummy_run": getattr(context, "is_dummy_run", None),
+            "batch_size": getattr(context, "batch_size", None),
+            "graph_bs": getattr(context, "graph_bs", None),
+        },
+        "dp_metadata": None
+        if dp_metadata is None
+        else {
+            "max_tokens_across_dp_cpu": int(dp_metadata.max_tokens_across_dp_cpu),
+            "cu_tokens_across_dp_cpu": dp_metadata.cu_tokens_across_dp_cpu.tolist(),
+            "max_tokens_across_dp": dp_metadata.max_tokens_across_dp,
+        },
+        "local_input_shape": tuple(hidden_states.shape),
+    }
+
+
+def _maybe_slice_expert_tensor(
+    tensor: Optional[torch.Tensor], local_expert_ids: torch.Tensor
+) -> Optional[torch.Tensor]:
+    if tensor is None or local_expert_ids.numel() == 0:
+        return None
+    index = local_expert_ids.to(device=tensor.device, dtype=torch.long)
+    try:
+        return tensor.index_select(0, index)
+    except NotImplementedError:
+        # Packed FP4 tensors do not implement index_select_cuda. Keep the exact
+        # underlying bytes so offline tests can reconstruct/compare the weight.
+        return tensor.view(torch.uint8).index_select(0, index)
+
+
+def _moe_dump_repro_bundle(
+    layer: "FusedMoE",
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    expert_map_arg: Optional[torch.Tensor],
+    activation: ActivationType,
+    apply_router_weight_on_input: bool,
+    global_num_experts: int,
+) -> None:
+    dump_ctx = getattr(layer, "_moe_dump_ctx", None)
+    if dump_ctx is None:
+        return
+
+    topk_ids_cpu = topk_ids.detach().cpu().to(torch.long)
+    unique_global_experts = torch.unique(topk_ids_cpu).sort().values
+
+    layer_expert_map = getattr(layer, "expert_map", None)
+    if layer_expert_map is not None:
+        expert_map_cpu = layer_expert_map.detach().cpu().to(torch.long)
+        valid_global = unique_global_experts[
+            (unique_global_experts >= 0) & (unique_global_experts < expert_map_cpu.numel())
+        ]
+        mapped_local = torch.full_like(unique_global_experts, -1)
+        if valid_global.numel() > 0:
+            valid_positions = torch.nonzero(
+                (unique_global_experts >= 0)
+                & (unique_global_experts < expert_map_cpu.numel()),
+                as_tuple=False,
+            ).flatten()
+            mapped_local[valid_positions] = expert_map_cpu[valid_global]
+
+        local_topk_ids = torch.full_like(topk_ids_cpu, -1)
+        valid_topk = (topk_ids_cpu >= 0) & (topk_ids_cpu < expert_map_cpu.numel())
+        local_topk_ids[valid_topk] = expert_map_cpu[topk_ids_cpu[valid_topk]]
+    else:
+        expert_map_cpu = None
+        mapped_local = unique_global_experts.clone()
+        local_topk_ids = topk_ids_cpu.clone()
+
+    selected_local_experts = torch.unique(local_topk_ids[local_topk_ids >= 0]).sort().values
+    selected_local_experts = selected_local_experts.to(torch.long)
+
+    local_to_global: Dict[int, int] = {}
+    if expert_map_cpu is not None:
+        for global_expert, local_expert in zip(
+            unique_global_experts.tolist(), mapped_local.tolist()
+        ):
+            if local_expert >= 0:
+                local_to_global[int(local_expert)] = int(global_expert)
+    else:
+        local_to_global = {
+            int(local_expert): int(local_expert)
+            for local_expert in selected_local_experts.tolist()
+        }
+
+    _moe_dump_tensor(
+        dump_ctx,
+        "moe_repro_metadata",
+        {
+            "layer_name": layer.layer_name,
+            "quant_method": type(layer.quant_method).__name__,
+            "moe_parallel_config": {
+                "dp_size": layer.dp_size,
+                "dp_rank": layer.dp_rank,
+                "tp_size": layer.tp_size,
+                "tp_rank": layer.tp_rank,
+                "ep_size": layer.ep_size,
+                "ep_rank": layer.ep_rank,
+                "use_ep": layer.use_ep,
+                "local_ep_size": layer.moe_parallel_config.local_ep_size,
+            },
+            "global_num_experts": layer.global_num_experts,
+            "local_num_experts": layer.local_num_experts,
+            "num_fused_shared_experts": layer.num_fused_shared_experts,
+            "top_k": layer.top_k,
+            "hidden_size": layer.hidden_size,
+            "intermediate_size_per_partition": layer.intermediate_size_per_partition,
+            "routed_scaling_factor": layer.routed_scaling_factor,
+            "activation": getattr(activation, "name", str(activation)),
+            "apply_router_weight_on_input": apply_router_weight_on_input,
+            "apply_global_num_experts": global_num_experts,
+            "selected_global_experts": unique_global_experts.tolist(),
+            "selected_local_experts": selected_local_experts.tolist(),
+            "local_to_global": local_to_global,
+            "selected_weight_dump_note": (
+                "FP4 packed weights are dumped as raw uint8 when CUDA index_select "
+                "is unavailable for the FP4 dtype."
+            ),
+            "input": _tensor_layout_info(x),
+            "router_logits": _tensor_layout_info(router_logits),
+            "topk_ids": _tensor_layout_info(topk_ids),
+            "topk_weights": _tensor_layout_info(topk_weights),
+            "w13_weight": _tensor_layout_info(layer.w13_weight),
+            "w2_weight": _tensor_layout_info(layer.w2_weight),
+            "w13_weight_scale": (
+                _tensor_layout_info(layer.w13_weight_scale)
+                if layer.w13_weight_scale is not None
+                else None
+            ),
+            "w2_weight_scale": (
+                _tensor_layout_info(layer.w2_weight_scale)
+                if layer.w2_weight_scale is not None
+                else None
+            ),
+        },
+    )
+    _moe_dump_tensor(dump_ctx, "expert_map", expert_map_cpu)
+    _moe_dump_tensor(
+        dump_ctx,
+        "expert_mask",
+        getattr(layer, "expert_mask", None),
+    )
+    _moe_dump_tensor(dump_ctx, "local_topk_ids", local_topk_ids)
+    _moe_dump_tensor(
+        dump_ctx, "selected_global_experts", unique_global_experts
+    )
+    _moe_dump_tensor(
+        dump_ctx, "selected_local_experts", selected_local_experts
+    )
+
+    selected_local_on_device = selected_local_experts.to(device=layer.w13_weight.device)
+    _moe_dump_tensor(
+        dump_ctx,
+        "selected_w13_weight",
+        _maybe_slice_expert_tensor(layer.w13_weight, selected_local_on_device),
+    )
+    _moe_dump_tensor(
+        dump_ctx,
+        "selected_w2_weight",
+        _maybe_slice_expert_tensor(layer.w2_weight, selected_local_on_device),
+    )
+    _moe_dump_tensor(
+        dump_ctx,
+        "selected_w13_weight_scale",
+        _maybe_slice_expert_tensor(layer.w13_weight_scale, selected_local_on_device),
+    )
+    _moe_dump_tensor(
+        dump_ctx,
+        "selected_w2_weight_scale",
+        _maybe_slice_expert_tensor(layer.w2_weight_scale, selected_local_on_device),
+    )
+    if os.getenv("SGLANG_MOE_DUMP_FULL_LOCAL_WEIGHTS", "0") == "1":
+        # Optional heavyweight dump for standalone fused_moe repros.  The
+        # selected weights above are enough for equality checks, but replaying
+        # the exact tp4/tp8 kernel configs needs the full local expert table.
+        _moe_dump_tensor(
+            dump_ctx,
+            "local_w13_weight",
+            layer.w13_weight.view(torch.uint8),
+        )
+        _moe_dump_tensor(
+            dump_ctx,
+            "local_w2_weight",
+            layer.w2_weight.view(torch.uint8),
+        )
+        _moe_dump_tensor(
+            dump_ctx,
+            "local_w13_weight_scale",
+            layer.w13_weight_scale.view(torch.uint8),
+        )
+        _moe_dump_tensor(
+            dump_ctx,
+            "local_w2_weight_scale",
+            layer.w2_weight_scale.view(torch.uint8),
+        )
+    _moe_dump_tensor(
+        dump_ctx,
+        "selected_w13_input_scale",
+        _maybe_slice_expert_tensor(
+            getattr(layer, "w13_input_scale", None), selected_local_on_device
+        ),
+    )
+    _moe_dump_tensor(
+        dump_ctx,
+        "selected_w2_input_scale",
+        _maybe_slice_expert_tensor(
+            getattr(layer, "w2_input_scale", None), selected_local_on_device
+        ),
+    )
+
+
+_MOE_INJECT_WARNED: set[str] = set()
+
+
+def _moe_inject_warn_once(message: str) -> None:
+    if message in _MOE_INJECT_WARNED:
+        return
+    _MOE_INJECT_WARNED.add(message)
+    print(f"[ATOM_MOE_INJECT] {message}", flush=True)
+
+
+def _load_moe_inject_tensor(path: str, like: torch.Tensor) -> Optional[torch.Tensor]:
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except Exception as exc:
+        _moe_inject_warn_once(f"failed to load {path}: {exc!r}")
+        return None
+
+    tensor = payload.get("tensor") if isinstance(payload, dict) else payload
+    if not torch.is_tensor(tensor):
+        _moe_inject_warn_once(f"{path} does not contain a tensor payload")
+        return None
+
+    if tuple(tensor.shape) != tuple(like.shape):
+        _moe_inject_warn_once(
+            f"skip {path}: shape mismatch dump={tuple(tensor.shape)} current={tuple(like.shape)}"
+        )
+        return None
+
+    return tensor.to(device=like.device, dtype=like.dtype)
+
+
+def _moe_maybe_inject_router_logits(
+    layer: "FusedMoE",
+    router_logits: torch.Tensor,
+) -> torch.Tensor:
+    inject_file = os.getenv("ATOM_MOE_INJECT_ROUTER_LOGITS_FILE", "").strip()
+    if not inject_file:
+        return router_logits
+
+    inject_layers = os.getenv("ATOM_MOE_INJECT_ROUTER_LOGITS_LAYERS", "").strip()
+    if not inject_layers:
+        _moe_inject_warn_once(
+            "ATOM_MOE_INJECT_ROUTER_LOGITS_LAYERS is required when router injection is enabled"
+        )
+        return router_logits
+    if not _moe_layer_matches(layer.layer_name, inject_layers):
+        return router_logits
+
+    inject_all_ranks = _moe_dump_bool_env("ATOM_MOE_INJECT_ROUTER_LOGITS_ALL_RANKS")
+    is_primary_rank = layer.dp_rank == 0 and layer.tp_rank == 0 and layer.ep_rank == 0
+    if not inject_all_ranks and not is_primary_rank:
+        return router_logits
+
+    tensor = _load_moe_inject_tensor(inject_file, router_logits)
+    if tensor is None:
+        return router_logits
+
+    _moe_inject_warn_once(
+        f"inject router_logits for {layer.layer_name} from {inject_file}"
+    )
+    return tensor
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -531,6 +1024,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             routed_scaling_factor=layer.routed_scaling_factor,
         )
         if self.fused_experts:
+            _moe_bind_prepare_finalize_dump_ctx(layer, self.fused_experts)
             return self.fused_experts(
                 hidden_states=x,
                 w1=layer.w13_weight,
@@ -950,6 +1444,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_fused_shared_experts=layer.num_fused_shared_experts,
                     routed_scaling_factor=layer.routed_scaling_factor,
                 )
+                _moe_dump_topk_debug(layer, topk_weights, topk_ids)
+                _moe_dump_repro_bundle(
+                    layer,
+                    x,
+                    router_logits,
+                    topk_weights,
+                    topk_ids,
+                    expert_map_arg=expert_map,
+                    activation=activation,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    global_num_experts=global_num_experts,
+                )
                 n_expts_act = topk_weights.shape[1]
 
                 # Convert to triton routing data structures
@@ -1021,6 +1527,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        _moe_dump_topk_debug(layer, topk_weights, topk_ids)
+        _moe_dump_repro_bundle(
+            layer,
+            x,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            expert_map_arg=expert_map,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
+        )
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         if self.fused_experts is None:
@@ -1049,6 +1567,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     else GateMode.SEPARATED.value
                 ),
             )
+        _moe_bind_prepare_finalize_dump_ctx(layer, self.fused_experts)
         return self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -1430,6 +1949,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         # Use modular kernel if available (for EP/DP setups)
         # Otherwise fall back to direct kernel call
         if self.fused_experts is not None:
+            _moe_bind_prepare_finalize_dump_ctx(layer, self.fused_experts)
             return self.fused_experts(
                 hidden_states=x,
                 w1=layer.w13_weight,
@@ -1794,6 +2314,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a2_scale=layer.w2_input_scale,
                 doweight_stage1=apply_router_weight_on_input,
             )
+        _moe_bind_prepare_finalize_dump_ctx(layer, self.fused_experts)
         return self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -2668,6 +3189,11 @@ class FusedMoE(torch.nn.Module):
     def forward_impl_graph(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
+        dump_ctx = _moe_dump_begin(self)
+        self._moe_dump_ctx = dump_ctx
+        _moe_dump_tensor(dump_ctx, "moe_input_local", hidden_states)
+        _moe_dump_tensor(dump_ctx, "router_logits_local", router_logits)
+
         # There are three mode
         # 1. Pure DP mode: only DP is used
         # 2. DP attention + EP mori Moe
@@ -2678,6 +3204,16 @@ class FusedMoE(torch.nn.Module):
             self.dp_size > 1
             and not self.moe_parallel_config.use_all2all_kernels
             and get_current_atom_config().enable_dp_attention
+        )
+        _moe_dump_tensor(
+            dump_ctx,
+            "dp_gather_debug_info_before",
+            {
+                **_moe_context_debug_info(self, hidden_states),
+                "use_dp_gather_scatter": use_dp_gather_scatter,
+                "use_all2all_kernels": self.moe_parallel_config.use_all2all_kernels,
+            },
+            all_ranks=True,
         )
         if use_dp_gather_scatter:
             from atom.utils.tbo.ubatching import tbo_active
@@ -2691,10 +3227,73 @@ class FusedMoE(torch.nn.Module):
                 )
 
                 tbo_yield_and_switch_from_compute_to_comm()
+            _moe_dump_tensor(
+                dump_ctx,
+                "moe_input_before_dp_gather",
+                hidden_states,
+                all_ranks=True,
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "router_logits_before_dp_gather",
+                router_logits,
+                all_ranks=True,
+            )
             hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
             router_logits, _ = all_gather_with_padding(router_logits)
+            _moe_dump_tensor(
+                dump_ctx,
+                "moe_input_after_dp_gather",
+                hidden_states,
+                all_ranks=True,
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "router_logits_after_dp_gather",
+                router_logits,
+                all_ranks=True,
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "moe_input_full_after_dp_gather",
+                hidden_states,
+                primary_only=True,
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "router_logits_full_after_dp_gather",
+                router_logits,
+                primary_only=True,
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "original_hidden_size_before_dp_gather",
+                original_hidden_size,
+                all_ranks=True,
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "dp_gather_debug_info_after",
+                _moe_context_debug_info(self, hidden_states),
+                all_ranks=True,
+            )
             if _tbo:
                 tbo_switch_to_compute_sync()
+        else:
+            _moe_dump_tensor(
+                dump_ctx, "moe_input_full", hidden_states, primary_only=True
+            )
+            _moe_dump_tensor(
+                dump_ctx, "router_logits_full", router_logits, primary_only=True
+            )
+
+        router_logits = _moe_maybe_inject_router_logits(self, router_logits)
+        _moe_dump_tensor(
+            dump_ctx,
+            "router_logits_after_inject",
+            router_logits,
+            primary_only=True,
+        )
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -2715,13 +3314,35 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
+        _moe_dump_tensor(
+            dump_ctx,
+            "moe_output_local_contrib_before_dp_reduce",
+            final_hidden_states,
+        )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
         if use_dp_gather_scatter:
+            # reduce_scatter only returns the current rank's slice. For debugging,
+            # materialize the fully reduced MoE output once before scattering.
+            if dump_ctx is not None:
+                full_output_for_dump = get_dp_group().all_reduce(
+                    final_hidden_states.detach().clone()
+                )
+                _moe_dump_tensor(
+                    dump_ctx,
+                    "moe_output_full_after_dp_reduce_before_scatter",
+                    full_output_for_dump,
+                    primary_only=True,
+                )
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
             final_hidden_states = reduce_scatter_with_unpadding(
                 final_hidden_states, original_hidden_size
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "moe_output_local_after_reduce_scatter",
+                final_hidden_states,
             )
             if _tbo:
                 tbo_yield_and_switch_from_comm_to_compute()
@@ -2730,6 +3351,11 @@ class FusedMoE(torch.nn.Module):
             # Default set to False. (May have to add shared expert outputs.)
             final_hidden_states = get_tp_group().all_reduce(
                 final_hidden_states, ca_fp8_quant=False
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "moe_output_after_tp_all_reduce",
+                final_hidden_states,
             )
 
         return final_hidden_states
@@ -2741,14 +3367,74 @@ class FusedMoE(torch.nn.Module):
             return self.forward_impl_graph(hidden_states, router_logits)
             # return self.forward_impl_chunked(hidden_states, router_logits)
 
+        dump_ctx = _moe_dump_begin(self)
+        self._moe_dump_ctx = dump_ctx
+        _moe_dump_tensor(dump_ctx, "moe_input_local", hidden_states)
+        _moe_dump_tensor(dump_ctx, "router_logits_local", router_logits)
+
         dp_group = get_dp_group()
+        _moe_dump_tensor(
+            dump_ctx,
+            "dp_multicast_debug_info_before",
+            _moe_context_debug_info(self, hidden_states),
+            all_ranks=True,
+        )
         if dp_group.world_size > 1:
             cu_tokens_across_dp_cpu = (
                 get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
             )
 
+            _moe_dump_tensor(
+                dump_ctx,
+                "moe_input_before_dp_multicast",
+                hidden_states,
+                all_ranks=True,
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "router_logits_before_dp_multicast",
+                router_logits,
+                all_ranks=True,
+            )
             hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
             router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
+            _moe_dump_tensor(
+                dump_ctx,
+                "moe_input_after_dp_multicast",
+                hidden_states,
+                all_ranks=True,
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "router_logits_after_dp_multicast",
+                router_logits,
+                all_ranks=True,
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "cu_tokens_across_dp_cpu",
+                cu_tokens_across_dp_cpu,
+                all_ranks=True,
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "dp_multicast_debug_info_after",
+                _moe_context_debug_info(self, hidden_states),
+                all_ranks=True,
+            )
+
+        _moe_dump_tensor(dump_ctx, "moe_input_full", hidden_states, primary_only=True)
+        _moe_dump_tensor(
+            dump_ctx, "router_logits_full", router_logits, primary_only=True
+        )
+
+        router_logits = _moe_maybe_inject_router_logits(self, router_logits)
+        _moe_dump_tensor(
+            dump_ctx,
+            "router_logits_after_inject",
+            router_logits,
+            primary_only=True,
+        )
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -2769,6 +3455,11 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
+        _moe_dump_tensor(
+            dump_ctx,
+            "moe_output_local_contrib_before_dp_reduce",
+            final_hidden_states,
+        )
 
         dp_group = get_dp_group()
         if dp_group.world_size > 1:
@@ -2777,12 +3468,28 @@ class FusedMoE(torch.nn.Module):
             end = cu_tokens_across_dp_cpu[dp_rank]
 
             all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
+            _moe_dump_tensor(
+                dump_ctx,
+                "moe_output_full_after_dp_reduce_before_slice",
+                all_hidden_states,
+                primary_only=True,
+            )
             final_hidden_states = all_hidden_states[start:end, :]
+            _moe_dump_tensor(
+                dump_ctx,
+                "moe_output_local_after_dp_slice",
+                final_hidden_states,
+            )
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
             final_hidden_states = get_tp_group().all_reduce(
                 final_hidden_states, ca_fp8_quant=False
+            )
+            _moe_dump_tensor(
+                dump_ctx,
+                "moe_output_after_tp_all_reduce",
+                final_hidden_states,
             )
 
         return final_hidden_states
