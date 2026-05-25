@@ -139,6 +139,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn atom_standalone(mut self, enable: bool) -> Self {
+        self.config.atom_standalone = enable;
+        self
+    }
+
     pub fn host<S: Into<String>>(mut self, host: S) -> Self {
         self.config.host = host.into();
         self
