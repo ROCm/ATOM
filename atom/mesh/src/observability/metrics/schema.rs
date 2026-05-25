@@ -114,10 +114,10 @@ pub fn status_code_to_cow(code: u16) -> Cow<'static, str> {
 
 /// Normalize HTTP paths for metrics without changing the current label contract.
 ///
-/// This preserves the behavior of `middleware::normalize_path_for_metrics`:
+/// This preserves the pre-refactor behavior of middleware path normalization:
 /// common stable paths pass through unchanged, and dynamic path segments after
 /// the second segment are replaced with `{id}`.
-pub fn normalize_path(path: &str) -> Cow<'_, str> {
+pub fn normalize_path_for_metrics(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut segment_start = 0;
     let mut segment_idx = 0;
@@ -149,7 +149,7 @@ pub fn normalize_path(path: &str) -> Cow<'_, str> {
         }
     }
 
-    result.map(Cow::Owned).unwrap_or(Cow::Borrowed(path))
+    result.unwrap_or_else(|| path.to_owned())
 }
 
 /// Check if segment looks like a dynamic ID (prefixed ID, UUID, or numeric).
@@ -434,19 +434,19 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::MANUAL_POLICY_BRANCH_TOTAL,
         kind: MetricKind::Counter,
         help: "Manual policy execution branches by branch",
-        status: MetricStatus::MissingDescribe,
+        status: MetricStatus::Planned,
     },
     MetricSpec {
         name: names::PREFIX_HASH_POLICY_BRANCH_TOTAL,
         kind: MetricKind::Counter,
         help: "Prefix hash policy execution branches by branch",
-        status: MetricStatus::MissingDescribe,
+        status: MetricStatus::Active,
     },
     MetricSpec {
         name: names::WORKER_ROUTING_KEYS_ACTIVE,
         kind: MetricKind::Gauge,
         help: "Active routing keys per worker",
-        status: MetricStatus::MissingDescribe,
+        status: MetricStatus::Active,
     },
     MetricSpec {
         name: names::WORKER_CB_STATE,
@@ -546,6 +546,11 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     },
 ];
 
+/// Register HELP/TYPE metadata for every metric with a complete schema entry.
+///
+/// Planned metrics remain in the inventory so recorder APIs and future wiring
+/// have a single source of truth, but they are still described here. Only
+/// `MissingDescribe` is skipped, and tests assert that no such entries remain.
 pub(crate) fn describe_all_metrics() {
     for metric in METRIC_INVENTORY {
         if metric.status == MetricStatus::MissingDescribe {
@@ -579,6 +584,21 @@ mod tests {
     }
 
     #[test]
+    fn metric_inventory_has_no_missing_describe_entries() {
+        let missing_describe: Vec<_> = METRIC_INVENTORY
+            .iter()
+            .filter(|metric| metric.status == MetricStatus::MissingDescribe)
+            .map(|metric| metric.name)
+            .collect();
+
+        assert!(
+            missing_describe.is_empty(),
+            "metrics still missing describe entries: {:?}",
+            missing_describe
+        );
+    }
+
+    #[test]
     fn test_bool_to_static_str() {
         assert_eq!(bool_to_static_str(true), "true");
         assert_eq!(bool_to_static_str(false), "false");
@@ -600,10 +620,10 @@ mod tests {
 
     #[test]
     fn test_normalize_path_preserves_stable_paths() {
-        assert_eq!(normalize_path("/health"), "/health");
-        assert_eq!(normalize_path("/v1/models"), "/v1/models");
+        assert_eq!(normalize_path_for_metrics("/health"), "/health");
+        assert_eq!(normalize_path_for_metrics("/v1/models"), "/v1/models");
         assert_eq!(
-            normalize_path("/v1/chat/completions"),
+            normalize_path_for_metrics("/v1/chat/completions"),
             "/v1/chat/completions"
         );
     }
@@ -611,14 +631,17 @@ mod tests {
     #[test]
     fn test_normalize_path_replaces_dynamic_ids() {
         assert_eq!(
-            normalize_path("/v1/responses/resp_abc123def456"),
+            normalize_path_for_metrics("/v1/responses/resp_abc123def456"),
             "/v1/responses/{id}"
         );
         assert_eq!(
-            normalize_path("/v1/responses/550e8400-e29b-41d4-a716-446655440000"),
+            normalize_path_for_metrics("/v1/responses/550e8400-e29b-41d4-a716-446655440000"),
             "/v1/responses/{id}"
         );
-        assert_eq!(normalize_path("/v1/workers/12345"), "/v1/workers/{id}");
+        assert_eq!(
+            normalize_path_for_metrics("/v1/workers/12345"),
+            "/v1/workers/{id}"
+        );
     }
 
     #[test]

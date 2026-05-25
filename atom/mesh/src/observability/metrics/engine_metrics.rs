@@ -1,3 +1,11 @@
+//! Worker engine metrics aggregation.
+//!
+//! This module backs the router `/engine_metrics` endpoint. It scrapes each
+//! registered worker's own `/metrics` endpoint, injects Mesh-side worker labels,
+//! and merges the Prometheus text without changing the downstream metric names.
+//! Mesh self metrics are recorded by `recorder.rs` and exposed by
+//! `mesh_metrics.rs`; this module only handles worker engine metrics.
+
 use std::{sync::Arc, time::Duration};
 
 use anyhow::ensure;
@@ -86,6 +94,9 @@ pub async fn collect_engine_metrics(
         if let Ok(r) = resp.result {
             if r.status().is_success() {
                 if let Ok(text) = r.text().await {
+                    // Keep the existing /engine_metrics contract: successful
+                    // worker scrapes are annotated by worker address, while
+                    // failed scrapes are omitted unless every worker fails.
                     metric_packs.push(MetricPack {
                         labels: vec![("worker_addr".into(), resp.url)],
                         metrics_text: text,
@@ -109,6 +120,10 @@ type PrometheusExposition = MetricsExposition<PrometheusType, PrometheusValue>;
 type PrometheusFamily = MetricFamily<PrometheusType, PrometheusValue>;
 
 /// Aggregate Prometheus metrics scraped from multiple sources into a unified one.
+///
+/// Invalid Prometheus payloads are skipped to preserve partial-failure behavior.
+/// If valid families with the same metric name disagree on label names, merging
+/// returns an error because Prometheus samples in a family must share labels.
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {
     let mut expositions = vec![];
     for metric_pack in metric_packs {

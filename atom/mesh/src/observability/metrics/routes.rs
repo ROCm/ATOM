@@ -1,3 +1,10 @@
+//! Public health and metrics routes owned by the metrics subsystem.
+//!
+//! The factory currently accepts the full `AppState` to preserve route behavior
+//! during the refactor. A future cleanup can replace it with a narrower state
+//! containing only router health, worker registry, router config, and HTTP
+//! client access.
+
 use std::sync::Arc;
 
 use axum::{
