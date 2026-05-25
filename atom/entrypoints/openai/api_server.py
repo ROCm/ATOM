@@ -786,6 +786,19 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/kv_transfer_info")
+async def kv_transfer_info():
+    global engine
+    cfg = engine.config
+    kv_cfg = cfg.kv_transfer_config or {}
+    return {
+        "tp_size": cfg.tensor_parallel_size,
+        "dp_size": cfg.parallel_config.data_parallel_size,
+        "kv_role": kv_cfg.get("kv_role"),
+        "handshake_port": kv_cfg.get("handshake_port", 6301),
+    }
+
+
 @app.post("/start_profile")
 async def start_profile():
     """Start profiling the engine."""

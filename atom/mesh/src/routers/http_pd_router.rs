@@ -21,6 +21,7 @@ use crate::{
         is_retryable_status,
         placement::{
             backend::{
+                atom::{AtomAdapter, AtomPrefillInfo},
                 sglang::SglangAdapter,
                 vllm::{VllmAdapter, VllmPrefillInfo},
                 BackendAdapter, PairCtx,
@@ -70,6 +71,8 @@ pub struct PDRouter {
     pub backend: BackendType,
     pub planner: Arc<dyn PdPlanner>,
     pub adapter: Arc<dyn BackendAdapter>,
+    /// Set when backend == Atom. enrich_decode_kv is ATOM-specific and not on the trait.
+    atom_adapter: Option<Arc<AtomAdapter>>,
 }
 
 impl std::fmt::Debug for PDRouter {
@@ -170,12 +173,20 @@ impl PDRouter {
         let policy_registry = Arc::clone(&ctx.policy_registry);
         let client = ctx.client.clone();
 
+        let mut atom_adapter: Option<Arc<AtomAdapter>> = None;
         let adapter: Arc<dyn BackendAdapter> = match backend {
             BackendType::Sglang => Arc::new(SglangAdapter),
             BackendType::Vllm => {
                 let info =
                     Arc::new(Self::fetch_vllm_prefill_info(&worker_registry, &client).await?);
                 Arc::new(VllmAdapter::new(info))
+            }
+            BackendType::Atom => {
+                let info =
+                    Arc::new(Self::fetch_atom_prefill_info(&worker_registry, &client).await?);
+                let a = Arc::new(AtomAdapter::new(info));
+                atom_adapter = Some(a.clone());
+                a
             }
         };
 
@@ -192,6 +203,7 @@ impl PDRouter {
             backend,
             planner,
             adapter,
+            atom_adapter,
         })
     }
 
@@ -292,6 +304,52 @@ impl PDRouter {
         })
     }
 
+    async fn fetch_atom_prefill_info(
+        worker_registry: &WorkerRegistry,
+        client: &Client,
+    ) -> Result<AtomPrefillInfo, String> {
+        let prefill_workers = worker_registry.get_prefill_workers();
+        if prefill_workers.is_empty() {
+            return Err("ATOM PD mode requires at least one prefill worker".to_string());
+        }
+
+        let mut tp_sizes = HashMap::new();
+        for worker in &prefill_workers {
+            let worker_url = worker.url().to_string();
+            let info_url = format!("{}/kv_transfer_info", worker_url);
+
+            info!("Querying ATOM prefill kv_transfer_info: {}", info_url);
+            let resp = client
+                .get(&info_url)
+                .send()
+                .await
+                .map_err(|e| format!("GET {} failed: {}", info_url, e))?;
+            if !resp.status().is_success() {
+                return Err(format!("{} returned {}", info_url, resp.status()));
+            }
+            let data: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Parse {} response: {}", info_url, e))?;
+
+            let tp = data
+                .get("tp_size")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| format!("Missing tp_size in {} response", info_url))?
+                as usize;
+            let kv_role = data.get("kv_role").and_then(|v| v.as_str());
+            if kv_role != Some("kv_producer") {
+                return Err(format!(
+                    "{} is not a prefill (kv_role={:?}, expected kv_producer)",
+                    worker_url, kv_role
+                ));
+            }
+            info!("ATOM prefill {} tp_size={}", worker_url, tp);
+            tp_sizes.insert(worker_url, tp);
+        }
+        Ok(AtomPrefillInfo { tp_sizes })
+    }
+
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
         error::internal_error("serialization_failed", "Failed to serialize request")
@@ -340,6 +398,10 @@ impl PDRouter {
             }
             BackendType::Vllm => {
                 self.execute_vllm_mooncake(headers, original_request, context)
+                    .await
+            }
+            BackendType::Atom => {
+                self.execute_atom_relay(headers, original_request, context)
                     .await
             }
         }
@@ -650,6 +712,341 @@ impl PDRouter {
                 }
                 Err(e) => {
                     error!("Failed to read vLLM decode response: {}", e);
+                    error::internal_error("read_response_failed", "Failed to read response")
+                }
+            }
+        }
+    }
+
+    /// ATOM Mooncake mode: P must run first and return kv_transfer_params; mesh
+    /// enriches them with remote_dp_size/remote_tp_size, then forwards to D.
+    /// Decode's response is streamed (or buffered) back to the client.
+    async fn execute_atom_relay<T: Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        original_request: &T,
+        context: PDRequestContext<'_>,
+    ) -> Response {
+        let start_time = Instant::now();
+
+        let route = context.route;
+        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        let endpoint = route_to_endpoint(route);
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_PD,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            bool_to_static_str(context.is_stream),
+        );
+
+        let shared_request = Arc::new(original_request.clone());
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            {
+                move |attempt: u32| {
+                    let shared_request = Arc::clone(&shared_request);
+                    let context = context.clone();
+                    async move {
+                        let (prefill, decode, ctx) = match self.plan_pd_pair(&context).await {
+                            Ok(t) => t,
+                            Err(resp) => return resp,
+                        };
+
+                        debug!(
+                            "ATOM PD retry attempt {} prefill={} decode={}",
+                            attempt,
+                            prefill.url(),
+                            decode.url()
+                        );
+
+                        let mut prefill_request_json =
+                            match serde_json::to_value(shared_request.as_ref()) {
+                                Ok(v) => v,
+                                Err(e) => return Self::handle_serialization_error(e),
+                            };
+                        let mut decode_request_json = prefill_request_json.clone();
+                        if let Err(e) = self
+                            .adapter
+                            .inject_prefill_fields(&mut prefill_request_json, &ctx)
+                        {
+                            return Self::handle_serialization_error(e);
+                        }
+                        if let Err(e) = self
+                            .adapter
+                            .inject_decode_fields(&mut decode_request_json, &ctx)
+                        {
+                            return Self::handle_serialization_error(e);
+                        }
+                        let correlation_id = self.adapter.correlation_id(&ctx);
+
+                        self.dispatch_atom_relay_internal(
+                            headers,
+                            prefill_request_json,
+                            decode_request_json,
+                            context,
+                            Arc::clone(&prefill),
+                            Arc::clone(&decode),
+                            ctx,
+                            start_time,
+                            correlation_id,
+                        )
+                        .await
+                    }
+                }
+            },
+            |res, _attempt| is_retryable_status(res.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
+                Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
+            },
+        )
+        .await;
+
+        let duration = start_time.elapsed();
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_PD,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
+        } else if !is_retryable_status(response.status()) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_PD,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+
+        response
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_atom_relay_internal(
+        &self,
+        headers: Option<&HeaderMap>,
+        prefill_request_json: Value,
+        mut decode_request_json: Value,
+        context: PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        ctx: PairCtx,
+        _start_time: Instant,
+        correlation_id: Option<String>,
+    ) -> Response {
+        let _prefill_guard =
+            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+        let _decode_guard =
+            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
+        }
+        .emit();
+
+        let prefill_post = self.build_post_with_headers(
+            &self.client,
+            prefill.url(),
+            context.route,
+            &prefill_request_json,
+            headers,
+            false,
+        );
+        let correlation_for_log = correlation_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let prefill_result = prefill_post.send().await;
+        let prefill_resp = match prefill_result {
+            Ok(r) => r,
+            Err(e) => {
+                error!(
+                    "ATOM prefill {} request_id={} failed: {}",
+                    prefill.url(),
+                    correlation_for_log,
+                    e
+                );
+                prefill.record_outcome(false);
+                return error::bad_gateway(
+                    "prefill_server_error",
+                    format!("Prefill server error: {}", e),
+                );
+            }
+        };
+
+        let prefill_status = prefill_resp.status();
+        prefill.record_outcome(prefill_status.is_success());
+        if !prefill_status.is_success() {
+            let body_text = prefill_resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            error!(
+                "ATOM prefill {} request_id={} status={} body={}",
+                prefill.url(),
+                correlation_for_log,
+                prefill_status,
+                body_text
+            );
+            let code = StatusCode::from_u16(prefill_status.as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return error::create_error(
+                code,
+                "prefill_error",
+                format!("Prefill server error ({}): {}", prefill_status, body_text),
+            );
+        }
+
+        let prefill_body: Value = match prefill_resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!(
+                    "ATOM prefill {} request_id={} response parse failed: {}",
+                    prefill.url(),
+                    correlation_for_log,
+                    e
+                );
+                return error::bad_gateway(
+                    "prefill_parse_error",
+                    format!("Prefill response parse error: {}", e),
+                );
+            }
+        };
+
+        let mut kv_params = match prefill_body.get("kv_transfer_params").cloned() {
+            Some(v) => v,
+            None => {
+                error!(
+                    "ATOM prefill {} request_id={} response missing kv_transfer_params",
+                    prefill.url(),
+                    correlation_for_log
+                );
+                return error::bad_gateway(
+                    "prefill_missing_kv_transfer_params",
+                    "Prefill response missing kv_transfer_params",
+                );
+            }
+        };
+
+        let atom_adapter = match self.atom_adapter.as_ref() {
+            Some(a) => a,
+            None => {
+                error!("atom_adapter is None but backend == Atom — programming error");
+                return error::internal_error(
+                    "atom_adapter_missing",
+                    "Internal: ATOM adapter not initialized",
+                );
+            }
+        };
+        if let Err(e) = atom_adapter.enrich_decode_kv(&mut kv_params, &ctx) {
+            error!(
+                "ATOM enrich_decode_kv failed for prefill {} request_id={}: {}",
+                prefill.url(),
+                correlation_for_log,
+                e
+            );
+            return error::internal_error(
+                "enrich_decode_kv_failed",
+                format!("Failed to enrich decode kv: {}", e),
+            );
+        }
+
+        let decode_obj = match decode_request_json.as_object_mut() {
+            Some(o) => o,
+            None => {
+                return error::internal_error(
+                    "decode_body_not_object",
+                    "Decode request body must be a JSON object",
+                );
+            }
+        };
+        decode_obj.insert("kv_transfer_params".to_string(), kv_params);
+
+        let decode_post = self.build_post_with_headers(
+            &self.client,
+            decode.url(),
+            context.route,
+            &decode_request_json,
+            headers,
+            false,
+        );
+        let decode_result = decode_post.send().await;
+        events::RequestReceivedEvent {}.emit();
+
+        let res = match decode_result {
+            Ok(r) => r,
+            Err(e) => {
+                error!(
+                    decode_url = %decode.url(),
+                    error = %e,
+                    "ATOM decode request failed"
+                );
+                decode.record_outcome(false);
+                return error::bad_gateway(
+                    "decode_server_error",
+                    format!("Decode server error: {}", e),
+                );
+            }
+        };
+
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let not_error = status.is_success() || status.is_client_error();
+        decode.record_outcome(not_error);
+
+        if !status.is_success() {
+            error!(
+                "ATOM decode {} returned error status={}",
+                decode.url(),
+                status
+            );
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_DECODE,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
+            return self
+                .handle_decode_error_response(res, &context, prefill, decode)
+                .await;
+        }
+
+        if context.is_stream {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            self.create_streaming_response(
+                res.bytes_stream(),
+                status,
+                None,
+                false,
+                None,
+                Some(response_headers),
+                prefill,
+                decode,
+            )
+        } else {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            match res.bytes().await {
+                Ok(decode_body) => {
+                    let mut response = Response::new(Body::from(decode_body));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                }
+                Err(e) => {
+                    error!("Failed to read ATOM decode response: {}", e);
                     error::internal_error("read_response_failed", "Failed to read response")
                 }
             }
@@ -1569,6 +1966,7 @@ mod tests {
             backend: BackendType::Sglang,
             planner,
             adapter,
+            atom_adapter: None,
         }
     }
 
