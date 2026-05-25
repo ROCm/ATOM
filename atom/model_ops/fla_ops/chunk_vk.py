@@ -257,7 +257,6 @@ def chunk_gated_delta_rule_vk(
     # directly to aiter's flydsl_gdr_prefill via its `o=` parameter
     # (which threads into chunk_fwd_o_opt_vk via the same mechanism).
 
-
     o, final_state = ChunkGatedDeltaRuleFunctionVk.apply(
         q,
         k,
