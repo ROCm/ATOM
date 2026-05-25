@@ -1,3 +1,4 @@
+pub mod atom;
 pub mod sglang;
 pub mod vllm;
 

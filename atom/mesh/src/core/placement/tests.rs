@@ -1342,6 +1342,196 @@ mod e_adapter {
     }
 }
 
+mod f_atom_adapter {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+
+    use super::super::backend::atom::{AtomAdapter, AtomPairCtx, AtomPrefillInfo};
+    use super::super::backend::BackendAdapter;
+    use super::super::test_support::*;
+    use super::super::types::AdapterError;
+
+    fn atom_info_with(prefill_url: &str, tp_size: usize) -> Arc<AtomPrefillInfo> {
+        let mut tp_sizes = HashMap::new();
+        tp_sizes.insert(prefill_url.to_string(), tp_size);
+        Arc::new(AtomPrefillInfo { tp_sizes })
+    }
+
+    fn atom_pair_for(
+        prefill_url: &str,
+        tp_size: usize,
+    ) -> (AtomAdapter, super::super::backend::PairCtx) {
+        let prefill = make_prefill_http(prefill_url, "m", None);
+        let decode = make_decode_http("http://decode:8000", "m");
+        let adapter = AtomAdapter::new(atom_info_with(prefill_url, tp_size));
+        let ctx = adapter
+            .prepare_pair(prefill.as_ref(), decode.as_ref())
+            .expect("prepare_pair");
+        (adapter, ctx)
+    }
+
+    #[test]
+    fn test_atom_inject_prefill_writes_kv_and_force_prefill() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut body = json!({
+            "prompt": "hi",
+            "stream": true,
+            "max_tokens": 256,
+            "max_completion_tokens": 100,
+        });
+        adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
+        let obj = body.as_object().unwrap();
+        let kv = &obj["kv_transfer_params"];
+        assert_eq!(kv["do_remote_decode"], json!(true));
+        assert_eq!(kv["do_remote_prefill"], json!(false));
+        assert_eq!(obj["stream"], json!(false));
+        assert_eq!(obj["max_tokens"], json!(1));
+        assert_eq!(obj["max_completion_tokens"], json!(1));
+    }
+
+    #[test]
+    fn test_atom_inject_prefill_removes_stream_options() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut body = json!({
+            "prompt": "hi",
+            "stream_options": {"include_usage": true},
+        });
+        adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
+        assert!(!body.as_object().unwrap().contains_key("stream_options"));
+    }
+
+    #[test]
+    fn test_atom_inject_prefill_does_not_add_max_completion_tokens() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut body = json!({"prompt": "hi"});
+        adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
+        let obj = body.as_object().unwrap();
+        assert!(!obj.contains_key("max_completion_tokens"));
+        assert_eq!(obj["max_tokens"], json!(1));
+    }
+
+    #[test]
+    fn test_atom_inject_decode_is_noop() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut body = json!({"prompt": "hi", "kv_transfer_params": {"x": 1}});
+        let before = body.clone();
+        adapter.inject_decode_fields(&mut body, &ctx).unwrap();
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn test_atom_inject_prefill_on_non_object_returns_body_not_object() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut body = json!([1, 2, 3]);
+        let before = body.clone();
+        let err = adapter.inject_prefill_fields(&mut body, &ctx).unwrap_err();
+        assert_eq!(err, AdapterError::BodyNotObject);
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn test_atom_inject_batch_equals_single_for_batch_one() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut a = json!({"prompt": "hi"});
+        let mut b = json!({"prompt": "hi"});
+        adapter.inject_prefill_fields(&mut a, &ctx).unwrap();
+        adapter
+            .inject_batch_prefill_fields(&mut b, &ctx, 1)
+            .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_atom_correlation_id_matches_ctx_transfer_id() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let cid = adapter.correlation_id(&ctx).unwrap();
+        let downcast = ctx
+            .downcast_ref::<AtomPairCtx>()
+            .expect("downcast atom ctx");
+        assert!(cid.starts_with("xfer-"));
+        assert_eq!(cid, downcast.transfer_id);
+    }
+
+    #[test]
+    fn test_atom_prepare_pair_captures_default_dp_size_one() {
+        let (_adapter, ctx) = atom_pair_for("http://p:8000", 4);
+        let c = ctx.downcast_ref::<AtomPairCtx>().unwrap();
+        assert_eq!(c.prefill_url, "http://p:8000");
+        assert_eq!(c.prefill_dp_size, 1);
+    }
+
+    #[test]
+    fn test_atom_enrich_decode_kv_single_dp() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut kv = json!({
+            "do_remote_prefill": true,
+            "do_remote_decode": false,
+            "remote_block_ids": [0, 1, 2],
+            "remote_engine_id": "10.24.112.168:6301",
+            "transfer_id": 42,
+        });
+        adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
+        assert_eq!(kv["remote_dp_size"], json!(1));
+        assert_eq!(kv["remote_tp_size"], json!(8));
+        assert_eq!(kv["transfer_id"], json!(42));
+    }
+
+    #[test]
+    fn test_atom_enrich_decode_kv_multi_dp() {
+        let info = atom_info_with("http://p:8000", 8);
+        let adapter = AtomAdapter::new(info);
+        let ctx: super::super::backend::PairCtx = Box::new(AtomPairCtx {
+            transfer_id: "xfer-test".to_string(),
+            prefill_url: "http://p:8000".to_string(),
+            prefill_dp_size: 4,
+        });
+        let mut kv = json!({});
+        adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
+        assert_eq!(kv["remote_dp_size"], json!(4));
+        assert_eq!(kv["remote_tp_size"], json!(8));
+    }
+
+    #[test]
+    fn test_atom_enrich_decode_kv_missing_tp_size_errors() {
+        let info = atom_info_with("http://other:8000", 8);
+        let adapter = AtomAdapter::new(info);
+        let ctx: super::super::backend::PairCtx = Box::new(AtomPairCtx {
+            transfer_id: "x".to_string(),
+            prefill_url: "http://unknown:8000".to_string(),
+            prefill_dp_size: 1,
+        });
+        let mut kv = json!({});
+        let err = adapter.enrich_decode_kv(&mut kv, &ctx).unwrap_err();
+        assert_eq!(
+            err,
+            AdapterError::TpSizeMissing {
+                prefill_url: "http://unknown:8000".to_string()
+            }
+        );
+        assert_eq!(kv, json!({}));
+    }
+
+    #[test]
+    fn test_atom_enrich_decode_kv_non_object_errors() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut kv = json!("not-an-object");
+        let err = adapter.enrich_decode_kv(&mut kv, &ctx).unwrap_err();
+        assert_eq!(err, AdapterError::BodyNotObject);
+    }
+
+    #[test]
+    fn test_atom_enrich_decode_kv_wrong_ctx_errors() {
+        let info = atom_info_with("http://p:8000", 8);
+        let adapter = AtomAdapter::new(info);
+        let wrong: super::super::backend::PairCtx = Box::new(42u32);
+        let mut kv = json!({});
+        let err = adapter.enrich_decode_kv(&mut kv, &wrong).unwrap_err();
+        assert_eq!(err, AdapterError::CtxTypeMismatch);
+    }
+}
+
 mod g_error {
     use std::sync::Arc;
 
