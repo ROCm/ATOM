@@ -5,7 +5,7 @@
 
 Covers:
   * Event schema + msgspec round-trip
-  * BlockManager emits BlockStored on first store / suppresses on cache hit
+  * BlockManager emits BlockStored only for newly finalized blocks (cache-hit reuse skips)
   * BlockManager emits BlockRemoved on lazy eviction
   * `take_events()` drain semantics
   * `clear_cache()` emits AllBlocksCleared
@@ -160,7 +160,7 @@ class TestBlockManagerHooks:
         assert first
         assert second == []
 
-    def test_cache_hit_emits_no_new_store(self, seq_factory):
+    def test_cache_hit_emits_only_new_blocks(self, seq_factory):
         bm = _bm_with_events()
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         _admit(bm, s1)
