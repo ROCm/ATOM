@@ -1122,9 +1122,7 @@ def triton_gather_kv_indices_sparse(
     if out is not None:
         out_buf = out[:total_out]
     else:
-        out_buf = torch.empty(
-            total_out, dtype=torch.int32, device=topk_indices.device
-        )
+        out_buf = torch.empty(total_out, dtype=torch.int32, device=topk_indices.device)
 
     ti_stride0, ti_stride1 = topk_indices.stride()
     grid = (num_tokens, tiles_per_row)
