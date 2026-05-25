@@ -754,12 +754,18 @@ jobs:
       - name: Container Engine Login
         if: steps.check.outputs.enabled == 'true'
         run: |
-          # Podman requires an explicit registry when registries.conf has no search list;
-          # Docker Hub short names (e.g. rocm/foo) must use docker.io here.
-          REG="${SGLANG_IMAGE_TAG%%/*}"
-          if [[ "$REG" != *.* && "$REG" != localhost* && "$REG" != *:* ]]; then
-            REG="docker.io"
+          set -euo pipefail
+          IMG="${SGLANG_IMAGE_TAG}"
+          if [[ "${IMG}" != */* ]]; then
+            IMG="docker.io/library/${IMG}"
+          else
+            reg="${IMG%%/*}"
+            if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
+              IMG="docker.io/${IMG}"
+            fi
           fi
+          echo "SGLANG_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+          REG="${IMG%%/*}"
           echo "Logging in to registry: ${REG}"
           echo "${{ secrets.DOCKER_PASSWORD }}" | $CONTAINER_ENGINE login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
@@ -771,20 +777,33 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         run: |
           set -euo pipefail
-          IMG="${SGLANG_IMAGE_TAG}"
-          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
-            if [[ "${IMG}" != */* ]]; then
-              IMG="docker.io/library/${IMG}"
-            else
-              reg="${IMG%%/*}"
-              if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
-                IMG="docker.io/${IMG}"
-              fi
+          IMG="${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
+          if [[ -z "${IMG}" ]]; then
+            echo "ERROR: SGLang image reference is empty."
+            exit 1
+          fi
+          echo "Pulling SGLang benchmark image: ${IMG} (workflow tag: ${SGLANG_IMAGE_TAG})"
+          pull_ok=false
+          for attempt in 1 2 3; do
+            echo "Pull attempt ${attempt}/3: ${IMG}"
+            if $CONTAINER_ENGINE pull "${IMG}"; then
+              pull_ok=true
+              break
+            fi
+            sleep $((attempt * 10))
+          done
+
+          if [[ "${pull_ok}" != "true" && "${CONTAINER_ENGINE}" == "podman" ]]; then
+            echo "Plain podman pull failed; retrying with docker transport."
+            if $CONTAINER_ENGINE pull "docker://${IMG}"; then
+              pull_ok=true
             fi
           fi
-          echo "SGLANG_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
-          echo "Pulling SGLang benchmark image: ${IMG} (workflow tag: ${SGLANG_IMAGE_TAG})"
-          $CONTAINER_ENGINE pull "${IMG}"
+
+          if [[ "${pull_ok}" != "true" ]]; then
+            echo "ERROR: Failed to pull SGLang benchmark image: ${IMG}"
+            exit 1
+          fi
 
       - name: Prepare model cache mount
         if: steps.check.outputs.enabled == 'true'
@@ -1032,6 +1051,7 @@ jobs:
           workload_label = os.environ.get("WORKLOAD_LABEL") or "SGLang-OOB"
           data["workload_label"] = workload_label
           data["benchmark_backend"] = workload_label
+          data["dashboard_backend"] = "ATOM-SGLang"
 
           display_name = os.environ.get("DASHBOARD_MODEL_NAME", "")
           if display_name:

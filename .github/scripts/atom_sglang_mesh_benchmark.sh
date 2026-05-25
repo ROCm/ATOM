@@ -125,6 +125,7 @@ export SGLANG_USE_AITER="${SGLANG_USE_AITER:-1}"
 export SGLANG_AITER_MLA_PERSIST="${SGLANG_AITER_MLA_PERSIST:-1}"
 export ROCM_QUICK_REDUCE_QUANTIZATION="${ROCM_QUICK_REDUCE_QUANTIZATION:-INT4}"
 export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT4}"
+export IBDEVICES="${IBDEVICES:-rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7}"
 
 prefill_size=196608
 if [[ "${ISL}" == "8192" && "${OSL}" == "1024" && "${CONC}" -gt "32" ]]; then
@@ -147,11 +148,11 @@ if [[ "${SPEC_MODE}" == "mtp" ]]; then
     )
   fi
   if [[ "${SERVER_EXTRA_ARGS}" != *"--max-running-requests"* ]]; then
-    server_args+=(--max-running-requests 128)
+    server_args+=(--max-running-requests 256)
   fi
   if [[ "${SERVER_EXTRA_ARGS}" != *"--cuda-graph-bs"* ]]; then
     server_args+=(--cuda-graph-bs)
-    for bs in $(seq 1 128); do
+    for bs in $(seq 1 128) 160 192 224 256; do
       server_args+=("${bs}")
     done
   fi
@@ -178,7 +179,7 @@ python3 -m sglang.launch_server \
   --disable-radix-cache \
   --num-continuous-decode-steps=4 \
   --max-prefill-tokens="${prefill_size}" \
-  --cuda-graph-max-bs=128 \
+  --cuda-graph-max-bs=256 \
   --attention-backend aiter \
   --kv-cache-dtype fp8_e4m3 \
   "${server_args[@]}" \

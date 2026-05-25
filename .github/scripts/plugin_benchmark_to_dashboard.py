@@ -82,7 +82,11 @@ def build_entries(
             continue
 
         model = derive_model_name(result_path, payload)
-        backend = str(payload.get("benchmark_backend") or default_backend)
+        backend = str(
+            payload.get("dashboard_backend")
+            or payload.get("benchmark_backend")
+            or default_backend
+        )
         isl = int(payload.get("random_input_len", 0))
         osl = int(payload.get("random_output_len", 0))
         conc = int(payload.get("max_concurrency", 0))
