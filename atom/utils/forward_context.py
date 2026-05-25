@@ -156,6 +156,10 @@ class SpecDecodeMetadata:
     cu_num_draft_tokens: torch.Tensor
     target_logits_indices: torch.Tensor
     bonus_logits_indices: torch.Tensor
+    completion_token_counts: Optional[torch.Tensor] = None
+    blind_accept_no_argmax: bool = False
+    partial_blind_accept_no_argmax: bool = False
+    partial_blind_strict_row_mask: Optional[torch.Tensor] = None
 
 
 @dataclass

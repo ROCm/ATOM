@@ -16,6 +16,8 @@ from aiter import (
     flash_attn_varlen_func,
     fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
+    mla_decode_stage1_asm_fwd,
+    mla_reduce_v1,
 )
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
@@ -55,6 +57,44 @@ mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=F
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+_MLA_DIRECT_SCRATCH_CACHE = {}
+_MLA_DIRECT_SCRATCH_LOGGED = False
+
+
+def _device_index(device: torch.device) -> int:
+    if device.type == "cpu":
+        return -1
+    if device.index is None:
+        return torch.cuda.current_device() if torch.cuda.is_available() else -1
+    return int(device.index)
+
+
+def _mla_direct_stage1_reduce_scratch(
+    *,
+    partial_tiles: int,
+    max_seqlen_q: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _MLA_DIRECT_SCRATCH_LOGGED
+    device_key = _device_index(device)
+    logits_shape = (partial_tiles * max_seqlen_q, 1, num_heads, kv_lora_rank)
+    attn_lse_shape = (partial_tiles * max_seqlen_q, 1, num_heads, 1)
+    logits_key = (device_key, "logits", logits_shape, torch.float32)
+    attn_lse_key = (device_key, "attn_lse", attn_lse_shape, torch.float32)
+    logits = _MLA_DIRECT_SCRATCH_CACHE.get(logits_key)
+    if logits is None:
+        logits = torch.empty(logits_shape, dtype=torch.float32, device=device)
+        _MLA_DIRECT_SCRATCH_CACHE[logits_key] = logits
+    attn_lse = _MLA_DIRECT_SCRATCH_CACHE.get(attn_lse_key)
+    if attn_lse is None:
+        attn_lse = torch.empty(attn_lse_shape, dtype=torch.float32, device=device)
+        _MLA_DIRECT_SCRATCH_CACHE[attn_lse_key] = attn_lse
+    if not _MLA_DIRECT_SCRATCH_LOGGED:
+        _MLA_DIRECT_SCRATCH_LOGGED = True
+        logger.info("ATOM MLA direct stage1+reduce scratch cache enabled")
+    return logits, attn_lse
 
 if use_triton_gemm():
     try:
@@ -645,26 +685,83 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
-            mla_decode_fwd(
-                q,
-                kv_buffer.view(-1, 1, 1, q.shape[-1]),
-                o,
-                paged_cu_seqlens_q,
-                paged_kv_indptr,
-                paged_kv_indices,
-                paged_kv_last_page_lens,
-                max_q_len,
-                num_kv_splits=16,
-                sm_scale=self.scale,
-                work_meta_data=work_meta_data,
-                work_indptr=work_indptr,
-                work_info_set=work_info_set,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                q_scale=self._q_scale,
-                kv_scale=self._k_scale,
+            request_batch = int(paged_cu_seqlens_q.numel() - 1)
+            use_direct_stage1_reduce = (
+                envs.ATOM_MLA_DIRECT_STAGE1_REDUCE
+                and self.kv_cache_dtype.startswith("fp8")
+                and use_persistent_mode
+                and work_meta_data is not None
+                and work_indptr is not None
+                and work_info_set is not None
+                and reduce_indptr is not None
+                and reduce_final_map is not None
+                and reduce_partial_map is not None
+                and max_q_len == 4
+                and self.padded_num_heads == 32
+                and self.num_kv_heads == 1
+                and request_batch <= envs.ATOM_MLA_DIRECT_STAGE1_REDUCE_MAX_BATCH
             )
+            if use_direct_stage1_reduce:
+                logits, attn_lse = _mla_direct_stage1_reduce_scratch(
+                    partial_tiles=int(reduce_partial_map.numel()),
+                    max_seqlen_q=max_q_len,
+                    num_heads=self.padded_num_heads,
+                    kv_lora_rank=self.kv_lora_rank,
+                    device=q.device,
+                )
+                mla_decode_stage1_asm_fwd(
+                    q,
+                    kv_buffer.view(-1, 1, 1, q.shape[-1]),
+                    paged_cu_seqlens_q,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_lens,
+                    None,
+                    work_meta_data,
+                    work_indptr,
+                    work_info_set,
+                    max_q_len,
+                    1,
+                    1,
+                    self.scale,
+                    logits,
+                    attn_lse,
+                    o,
+                    None,
+                    self._q_scale,
+                    self._k_scale,
+                )
+                mla_reduce_v1(
+                    logits,
+                    attn_lse,
+                    reduce_indptr,
+                    reduce_final_map,
+                    reduce_partial_map,
+                    max_q_len,
+                    o,
+                    None,
+                )
+            else:
+                mla_decode_fwd(
+                    q,
+                    kv_buffer.view(-1, 1, 1, q.shape[-1]),
+                    o,
+                    paged_cu_seqlens_q,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_lens,
+                    max_q_len,
+                    num_kv_splits=envs.ATOM_MLA_MAX_SPLIT_PER_BATCH,
+                    sm_scale=self.scale,
+                    work_meta_data=work_meta_data,
+                    work_indptr=work_indptr,
+                    work_info_set=work_info_set,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    q_scale=self._q_scale,
+                    kv_scale=self._k_scale,
+                )
 
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :].contiguous()

@@ -247,6 +247,9 @@ class ScheduledBatch:
         self.context_lens = np.asarray(
             [seq.num_tokens for seq in seqs.values()], dtype=np.int32
         )
+        self.completion_lens = np.asarray(
+            [seq.num_completion_tokens for seq in seqs.values()], dtype=np.int32
+        )
         self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
         )
@@ -746,11 +749,26 @@ class Scheduler:
         # Real token count = seq.num_tokens - mtp_k - num_rejected
         # (same formula as postprocess line: num_tokens = seq.num_tokens - self.mtp_k - num_rejected)
         if self.mtp_k > 0:
-            strip = self.mtp_k + seq.num_rejected
+            requested_strip = self.mtp_k + seq.num_rejected
+            max_strip = max(
+                0,
+                min(seq.num_tokens, len(seq.token_ids)) - seq.num_prompt_tokens,
+            )
+            strip = min(requested_strip, max_strip)
             if strip > 0:
                 del seq.token_ids[-strip:]
-                del seq.output_tokens[-strip:]
                 seq.num_tokens -= strip
+            if seq.num_tokens > len(seq.token_ids):
+                seq.num_tokens = len(seq.token_ids)
+            if seq.num_tokens < seq.num_prompt_tokens:
+                seq.num_tokens = seq.num_prompt_tokens
+            expected_output_len = max(0, seq.num_tokens - seq.num_prompt_tokens)
+            if len(seq.output_tokens) > expected_output_len:
+                del seq.output_tokens[expected_output_len:]
+            if seq.token_ids:
+                seq.last_token = seq.token_ids[
+                    min(seq.num_tokens, len(seq.token_ids)) - 1
+                ]
         seq.num_rejected = 0
         seq.num_bonus_tokens = 0
         seq.spec_token_ids = np.array([], dtype=np.int32)
