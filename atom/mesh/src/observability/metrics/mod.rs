@@ -1,4 +1,5 @@
 pub mod config;
+pub mod mesh_metrics;
 pub mod recorder;
 pub mod schema;
 
@@ -13,4 +14,4 @@ pub use schema::{
     status_code_to_static_str,
 };
 
-pub(crate) use legacy::start_prometheus;
+pub(crate) use mesh_metrics::start_prometheus;
