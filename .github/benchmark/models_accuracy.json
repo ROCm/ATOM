@@ -3,7 +3,7 @@
     "model_name": "Meta-Llama-3-8B-Instruct",
     "model_path": "meta-llama/Meta-Llama-3-8B-Instruct",
     "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",
-    "env_vars": "",
+    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
     "runner": "linux-atom-mi35x-1",
     "test_level": "pr",
     "accuracy_threshold": 0.73,
