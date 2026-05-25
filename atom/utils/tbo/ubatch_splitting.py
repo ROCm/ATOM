@@ -314,7 +314,6 @@ def split_attn_metadata(
         kv_indices=ub_kv_indices,
         kv_last_page_lens=ub_kv_last_page_lens,
         sparse_kv_indptr=ub_sparse_kv_indptr,
-        sparse_kv_indices=attn_metadata.sparse_kv_indices,
         has_cached=attn_metadata.has_cached,
         total_kv=ub_total_kv,
         num_cached_tokens=ub_num_cached_tokens,

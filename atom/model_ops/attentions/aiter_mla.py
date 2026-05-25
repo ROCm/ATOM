@@ -138,11 +138,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             mla_metadata["sparse_kv_last_page_lens"].np[:] = 1
             mla_metadata["sparse_kv_last_page_lens"].copy_to_gpu()
-            self._sparse_kv_indices_gpu = torch.empty(
-                self.max_num_batched_tokens * self.index_topk,
-                dtype=torch.int32,
-                device=self.device,
-            )
 
         if self.is_sparse and max_seqlen_qo > 1:
             # Allocate a second set of persistent work buffers for sparse MTP
@@ -717,8 +712,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         attn_metadata.dtype_q = self.dtype_q
-        if self.is_sparse:
-            attn_metadata.sparse_kv_indices = self._sparse_kv_indices_gpu
         return attn_metadata, positions
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
@@ -884,7 +877,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            sparse_kv_indices=(self._sparse_kv_indices_gpu if self.is_sparse else None),
             **ctx,
         )
         attn_metadata.dtype_q = self.dtype_q
@@ -1091,7 +1083,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_indices=var["kv_indices"].gpu,
             kv_last_page_lens=var["kv_last_page_lens"].gpu[:bs],
             sparse_kv_indptr=sparse_kv_indptr,
-            sparse_kv_indices=(self._sparse_kv_indices_gpu if self.is_sparse else None),
             **ctx_mla_ps,
         )
         attn_matadata.dtype_q = self.dtype_q
@@ -1145,7 +1136,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if self.is_sparse
                 else None
             ),
-            sparse_kv_indices=(self._sparse_kv_indices_gpu if self.is_sparse else None),
             work_meta_data=var[f"{p}work_meta_data"],
             work_info_set=var[f"{p}work_info_set"],
             work_indptr=var[f"{p}work_indptr"],
