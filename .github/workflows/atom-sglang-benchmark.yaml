@@ -10,6 +10,13 @@ on:
     - cron: '0 15 * * 1-5'
   workflow_dispatch:
     inputs:
+      target_hardware:
+        description: "Benchmark target hardware"
+        type: choice
+        default: mi355
+        options:
+          - mi355
+          - mi308
       deepseek-r1-fp8-tp8:
         description: "DeepSeek-R1-0528 FP8 TP8"
         type: boolean
@@ -48,6 +55,34 @@ on:
         default: false
       qwen3-5-397b-a17b-fp8-tp8:
         description: "Qwen3.5-397B-A17B-FP8 TP8"
+        type: boolean
+        default: false
+      deepseek-r1-fp8-tp8-mi308:
+        description: "MI308 DeepSeek-R1-0528 FP8 TP8"
+        type: boolean
+        default: false
+      deepseek-r1-fp8-tp4-mi308:
+        description: "MI308 DeepSeek-R1-0528 FP8 TP4"
+        type: boolean
+        default: false
+      deepseek-r1-fp4-tp8-mi308:
+        description: "MI308 DeepSeek-R1-0528-MXFP4 FP4 TP8"
+        type: boolean
+        default: false
+      deepseek-r1-fp4-tp4-mi308:
+        description: "MI308 DeepSeek-R1-0528-MXFP4 FP4 TP4"
+        type: boolean
+        default: false
+      deepseek-r1-fp4-tp8-ep8-mi308:
+        description: "MI308 DeepSeek-R1-0528-MXFP4 FP4 TP8 EP8"
+        type: boolean
+        default: false
+      qwen3-5-397b-a17b-fp8-tp4-mi308:
+        description: "MI308 Qwen3.5-397B-A17B-FP8 TP4"
+        type: boolean
+        default: false
+      qwen3-5-397b-a17b-fp8-tp8-mi308:
+        description: "MI308 Qwen3.5-397B-A17B-FP8 TP8"
         type: boolean
         default: false
       sglang_image:
@@ -311,6 +346,14 @@ jobs:
           ENABLE_DEEPSEEK_R1_FP4_TP8_MTP1: ${{ inputs.deepseek-r1-fp4-tp8-mtp1 }}
           ENABLE_QWEN3_5_397B_A17B_FP8_TP4: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}
           ENABLE_QWEN3_5_397B_A17B_FP8_TP8: ${{ inputs.qwen3-5-397b-a17b-fp8-tp8 }}
+          ENABLE_DEEPSEEK_R1_FP8_TP8_MI308: ${{ inputs.deepseek-r1-fp8-tp8-mi308 }}
+          ENABLE_DEEPSEEK_R1_FP8_TP4_MI308: ${{ inputs.deepseek-r1-fp8-tp4-mi308 }}
+          ENABLE_DEEPSEEK_R1_FP4_TP8_MI308: ${{ inputs.deepseek-r1-fp4-tp8-mi308 }}
+          ENABLE_DEEPSEEK_R1_FP4_TP4_MI308: ${{ inputs.deepseek-r1-fp4-tp4-mi308 }}
+          ENABLE_DEEPSEEK_R1_FP4_TP8_EP8_MI308: ${{ inputs.deepseek-r1-fp4-tp8-ep8-mi308 }}
+          ENABLE_QWEN3_5_397B_A17B_FP8_TP4_MI308: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4-mi308 }}
+          ENABLE_QWEN3_5_397B_A17B_FP8_TP8_MI308: ${{ inputs.qwen3-5-397b-a17b-fp8-tp8-mi308 }}
+          TARGET_HARDWARE: ${{ inputs.target_hardware || '' }}
         run: |
           set -euo pipefail
 
@@ -330,6 +373,13 @@ jobs:
           event = os.environ["GITHUB_EVENT_NAME"]
           selected_group = ""
 
+          def model_hardware(model):
+              prefix = str(model.get("prefix", ""))
+              return "mi308" if prefix.endswith("-mi308") else "mi355"
+
+          def filter_hardware(selected, target_hardware):
+              return [m for m in selected if model_hardware(m) == target_hardware]
+
           if event == "schedule":
               weekday = int(os.environ["BEIJING_WEEKDAY"])
               if weekday in (1, 3):
@@ -345,6 +395,7 @@ jobs:
                   selected_group = "SKIP-WEEKEND"
                   selected = []
           else:
+              target_hardware = os.environ.get("TARGET_HARDWARE") or "mi355"
               enabled_by_prefix = {
                   "deepseek-r1-fp8-tp8": os.environ.get("ENABLE_DEEPSEEK_R1_FP8_TP8", ""),
                   "deepseek-r1-fp8-tp4": os.environ.get("ENABLE_DEEPSEEK_R1_FP8_TP4", ""),
@@ -356,12 +407,20 @@ jobs:
                   "deepseek-r1-fp4-tp8-mtp1": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_MTP1", ""),
                   "qwen3-5-397b-a17b-fp8-tp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP4", ""),
                   "qwen3-5-397b-a17b-fp8-tp8": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP8", ""),
+                  "deepseek-r1-fp8-tp8-mi308": os.environ.get("ENABLE_DEEPSEEK_R1_FP8_TP8_MI308", ""),
+                  "deepseek-r1-fp8-tp4-mi308": os.environ.get("ENABLE_DEEPSEEK_R1_FP8_TP4_MI308", ""),
+                  "deepseek-r1-fp4-tp8-mi308": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_MI308", ""),
+                  "deepseek-r1-fp4-tp4-mi308": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP4_MI308", ""),
+                  "deepseek-r1-fp4-tp8-ep8-mi308": os.environ.get("ENABLE_DEEPSEEK_R1_FP4_TP8_EP8_MI308", ""),
+                  "qwen3-5-397b-a17b-fp8-tp4-mi308": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP4_MI308", ""),
+                  "qwen3-5-397b-a17b-fp8-tp8-mi308": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP8_MI308", ""),
               }
               selected = [
                   model
                   for model in models
                   if enabled_by_prefix.get(str(model.get("prefix")), "").lower() == "true"
               ]
+              selected = filter_hardware(selected, target_hardware)
 
           if selected_group:
               print(f"Scheduled SGLang benchmark group: {selected_group}", file=sys.stderr)
@@ -636,6 +695,13 @@ jobs:
             deepseek-r1-fp4-tp8-mtp1) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-mtp1 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-fp8-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-fp8-tp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp8-tp8-mi308) echo "enabled=${{ inputs.deepseek-r1-fp8-tp8-mi308 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp8-tp4-mi308) echo "enabled=${{ inputs.deepseek-r1-fp8-tp4-mi308 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp4-tp8-mi308) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-mi308 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp4-tp4-mi308) echo "enabled=${{ inputs.deepseek-r1-fp4-tp4-mi308 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp4-tp8-ep8-mi308) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-ep8-mi308 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-5-397b-a17b-fp8-tp4-mi308) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp4-mi308 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-5-397b-a17b-fp8-tp8-mi308) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp8-mi308 }}" >> "$GITHUB_OUTPUT" ;;
             *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
           esac
 
