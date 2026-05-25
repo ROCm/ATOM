@@ -591,9 +591,7 @@ class MLAAttention(nn.Module):
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
             # (max_seqlen_qo=2).
-            is_sparse_mtp = (
-                self.is_sparse_mla and attn_metadata.max_seqlen_q > 1
-            )
+            is_sparse_mtp = self.is_sparse_mla and attn_metadata.max_seqlen_q > 1
 
             if not use_persistent_mode:
                 work_meta_data = None
@@ -656,8 +654,7 @@ class MLAAttention(nn.Module):
         attn_metadata = forward_context.attn_metadata
         context = forward_context.context
         use_prefill_mla = (
-            self.is_sparse_mla
-            and attn_metadata.max_seqlen_k > self.topk_tokens
+            self.is_sparse_mla and attn_metadata.max_seqlen_k > self.topk_tokens
         )
         if forward_context.context.is_dummy_run:
             output_shape = list(q.shape)
