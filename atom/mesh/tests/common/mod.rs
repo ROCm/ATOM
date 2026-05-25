@@ -52,10 +52,6 @@ impl WorkerTestContext {
             workers.push(worker);
         }
 
-        if !workers.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        }
-
         Self {
             workers,
             worker_urls,
@@ -144,11 +140,9 @@ impl WorkerTestContext {
     }
 
     pub async fn shutdown(mut self) {
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         for worker in &mut self.workers {
             worker.stop().await;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -190,10 +184,6 @@ impl AppTestContext {
             let url = worker.start().await.unwrap();
             worker_urls.push(url);
             workers.push(worker);
-        }
-
-        if !workers.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
 
         if let RoutingMode::Regular {
