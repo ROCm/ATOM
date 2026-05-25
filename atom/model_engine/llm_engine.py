@@ -36,6 +36,7 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
         config = Config(model, **config_kwargs)
+        self.config = config
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
         )
