@@ -596,7 +596,7 @@ jobs:
                   "toggle_env": "RUN_DSV32_FP8_TP8",
                   "model_name": "DeepSeek-V3.2-FP8 TP8",
                   "model_path": "deepseek-ai/DeepSeek-V3.2",
-                  "extra_args": "--tensor-parallel-size 8 --block-size 1",
+                  "extra_args": "--tensor-parallel-size 8",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
