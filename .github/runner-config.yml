@@ -10,6 +10,10 @@ runners:
     gpu_arch: MI355
     gpu_count: 8
 
+  atom-mi308-8gpu-plugins-benchmark:
+    gpu_arch: MI308
+    gpu_count: 8
+
   linux-atom-mi355-1:
     gpu_arch: MI355
     gpu_count: 1
