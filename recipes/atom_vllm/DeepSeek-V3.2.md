@@ -34,17 +34,12 @@ vllm serve deepseek-ai/DeepSeek-V3.2 \
 ```bash
 TP=4
 MTP=3
-if [ "${TP}" = "4" ]; then
-    KV_CACHE_DTYPE=auto
-else
-    KV_CACHE_DTYPE=fp8
-fi
 
 vllm serve deepseek-ai/DeepSeek-V3.2 \
     --host localhost \
     --port 8000 \
     --tensor-parallel-size "${TP}" \
-    --kv-cache-dtype "${KV_CACHE_DTYPE}" \
+    --kv-cache-dtype fp8 \
     --async-scheduling \
     --load-format fastsafetensors \
     --trust-remote-code \
