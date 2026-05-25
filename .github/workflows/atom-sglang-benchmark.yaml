@@ -111,7 +111,7 @@ jobs:
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-          INPUT_SGLANG_IMAGE: ${{ inputs.sglang_image || '' }}
+          INPUT_DOCKER_IMAGE: ${{ inputs.docker_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
           INPUT_WORKLOAD_LABEL: ${{ inputs.benchmark_suite || 'SGLang-OOB' }}
@@ -134,8 +134,8 @@ jobs:
           RESOLVED_PREBUILT_DIGEST=""
           PREBUILT_RESOLUTION_TYPE=""
           RESOLVED_NIGHTLY_TAG=""
-          if [[ -n "${INPUT_SGLANG_IMAGE}" ]]; then
-            PREBUILT_SGLANG_IMAGE="${INPUT_SGLANG_IMAGE}"
+          if [[ -n "${INPUT_DOCKER_IMAGE}" ]]; then
+            PREBUILT_SGLANG_IMAGE="${INPUT_DOCKER_IMAGE}"
             SGLANG_IMAGE_SOURCE="user-provided"
             USER_PROVIDED_SGLANG_IMAGE=true
           elif [[ "${NORMALIZED_REF}" == "main" ]]; then
@@ -722,13 +722,7 @@ jobs:
             exit 1
           fi
 
-      - name: Check if model is enabled
-        id: check
-        run: |
-          echo "enabled=true" >> "$GITHUB_OUTPUT"
-
       - name: Clean up containers and workspace
-        if: steps.check.outputs.enabled == 'true'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$($CONTAINER_ENGINE ps -q)
@@ -739,7 +733,6 @@ jobs:
           $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged docker.io/rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
 
       - name: Checkout benchmark ATOM source
-        if: steps.check.outputs.enabled == 'true'
         uses: actions/checkout@v6
         with:
           repository: ${{ env.ATOM_SOURCE_REPOSITORY }}
@@ -747,14 +740,12 @@ jobs:
           fetch-depth: 1
 
       - name: Record benchmark source revision
-        if: steps.check.outputs.enabled == 'true'
         run: |
           SOURCE_SHA="$(git rev-parse HEAD)"
           echo "ATOM_SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
           echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${SGLANG_IMAGE_SOURCE} image ${SGLANG_IMAGE_TAG}"
 
       - name: Container Engine Login
-        if: steps.check.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           IMG="${SGLANG_IMAGE_TAG}"
@@ -772,11 +763,9 @@ jobs:
           echo "${{ secrets.DOCKER_PASSWORD }}" | $CONTAINER_ENGINE login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
       - name: Set HF_TOKEN
-        if: steps.check.outputs.enabled == 'true'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Pull SGLang benchmark image
-        if: steps.check.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           IMG="${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
@@ -808,7 +797,6 @@ jobs:
           fi
 
       - name: Prepare model cache mount
-        if: steps.check.outputs.enabled == 'true'
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
@@ -830,7 +818,6 @@ jobs:
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
       - name: Start SGLang benchmark container
-        if: steps.check.outputs.enabled == 'true'
         run: |
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
@@ -861,12 +848,10 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Collect GPU info (inside container)
-        if: steps.check.outputs.enabled == 'true'
         id: gpu-info
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
 
       - name: Download model if needed
-        if: steps.check.outputs.enabled == 'true'
         run: |
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
@@ -889,7 +874,6 @@ jobs:
           fi
 
       - name: Resolve SGLang model path
-        if: steps.check.outputs.enabled == 'true'
         run: |
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
@@ -910,7 +894,6 @@ jobs:
           fi
 
       - name: Prepare SGLang benchmark runner in container
-        if: steps.check.outputs.enabled == 'true'
         run: |
           $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
             set -euo pipefail
@@ -921,7 +904,6 @@ jobs:
           "
 
       - name: Run SGLang benchmark
-        if: steps.check.outputs.enabled == 'true'
         timeout-minutes: 240
         env:
           MAX_WAIT_RETRIES: "120"
@@ -1108,7 +1090,6 @@ jobs:
           $CONTAINER_ENGINE cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json"
 
       - name: Inject GPU metadata into benchmark results
-        if: steps.check.outputs.enabled == 'true'
         run: |
           shopt -s nullglob
           for f in "${RESULT_PREFIX}"-*.json; do
@@ -1130,7 +1111,6 @@ jobs:
           done
 
       - name: Collect benchmark result
-        if: steps.check.outputs.enabled == 'true'
         run: |
           if [ ! -f "${RESULT_FILENAME}.json" ]; then
             echo "ERROR: Benchmark result file ${RESULT_FILENAME}.json was not generated for ${MODEL_NAME}."
@@ -1138,14 +1118,13 @@ jobs:
           fi
 
       - name: Upload benchmark result
-        if: steps.check.outputs.enabled == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: sglang-benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
 
       - name: Clean up SGLang benchmark container
-        if: always() && steps.check.outputs.enabled == 'true'
+        if: always()
         run: |
           $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
           $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true

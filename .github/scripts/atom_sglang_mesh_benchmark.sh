@@ -14,7 +14,7 @@ EP_SIZE=${EP_SIZE:-1}
 CONC=${CONC:-}
 ISL=${ISL:-}
 OSL=${OSL:-}
-RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-0.8}
+RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-1}
 RESULT_FILENAME=${RESULT_FILENAME:-}
 RESULT_DIR=${RESULT_DIR:-/tmp/sglang-benchmark-results}
 BENCH_SERVING_DIR=${BENCH_SERVING_DIR:-/tmp/sglang-benchmark/bench_serving}
@@ -78,7 +78,7 @@ emit_new_logs() {
   fi
   echo ""
   echo "========== SGLang Mesh server log =========="
-  sed -n '1,240p' "${SERVER_LOG}" || true
+  tail -n 240 "${SERVER_LOG}" || true
 }
 
 wait_server_ready() {
