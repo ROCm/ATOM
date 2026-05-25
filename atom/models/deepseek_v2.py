@@ -1004,7 +1004,6 @@ def sparse_attn_indexer(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    sparse_kv_indices_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1140,7 +1139,7 @@ def sparse_attn_indexer(
             attn_metadata.cu_seqlens_k,
             NUM_TOPK_TOKENS=topk_tokens,
             PAGE_SIZE=runner_block_size,
-            out=sparse_kv_indices_buffer,
+            out=attn_metadata.sparse_kv_indices,
         )
     else:
         decode_metadata = attn_metadata
@@ -1190,7 +1189,7 @@ def sparse_attn_indexer(
                 attn_metadata.kv_indices,
                 attn_metadata.kv_indptr,
                 NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
+                out=attn_metadata.sparse_kv_indices,
             )
         else:
             triton_convert_req_index_to_global_index(
@@ -1200,7 +1199,7 @@ def sparse_attn_indexer(
                 attn_metadata.kv_indices,
                 topk_indices,
                 NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
+                out=attn_metadata.sparse_kv_indices,
             )
     return weights
 
@@ -1218,7 +1217,6 @@ def sparse_attn_indexer_fake(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    sparse_kv_indices_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1243,7 +1241,7 @@ def sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer",
     op_func=sparse_attn_indexer,
-    mutates_args=["sparse_kv_indices_buffer"],
+    mutates_args=[],
     fake_impl=sparse_attn_indexer_fake,
 )
 
@@ -1439,11 +1437,6 @@ class Indexer(nn.Module):
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
-        max_buf = atom_config.max_num_batched_tokens * self.topk_tokens
-        self.sparse_kv_indices_buffer = torch.empty(
-            max_buf, dtype=torch.int32, device="cuda"
-        )
-
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
 
     def forward(
@@ -1501,7 +1494,6 @@ class Indexer(nn.Module):
             self.head_dim,
             self.max_model_len,
             self.max_total_seq_len,
-            self.sparse_kv_indices_buffer,
             self.k_norm.weight,
             self.k_norm.bias,
             self.k_norm.eps,

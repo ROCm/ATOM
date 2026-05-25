@@ -219,6 +219,7 @@ class AttentionMetaData:
     cu_seqlen_ks: Optional[torch.Tensor] = None
     cu_seqlen_ke: Optional[torch.Tensor] = None
     sparse_kv_indptr: Optional[torch.Tensor] = None
+    sparse_kv_indices: Optional[torch.Tensor] = None
 
     work_meta_data: Optional[torch.Tensor] = None
     work_indptr: Optional[torch.Tensor] = None
@@ -254,6 +255,7 @@ class AttentionMetaData:
         cu_seqlen_ks: Optional[torch.Tensor] = None,
         cu_seqlen_ke: Optional[torch.Tensor] = None,
         sparse_kv_indptr: Optional[torch.Tensor] = None,
+        sparse_kv_indices: Optional[torch.Tensor] = None,
         work_meta_data: Optional[torch.Tensor] = None,
         work_indptr: Optional[torch.Tensor] = None,
         work_info_set: Optional[torch.Tensor] = None,
@@ -288,6 +290,7 @@ class AttentionMetaData:
         self.cu_seqlen_ks = cu_seqlen_ks
         self.cu_seqlen_ke = cu_seqlen_ke
         self.sparse_kv_indptr = sparse_kv_indptr
+        self.sparse_kv_indices = sparse_kv_indices
         self.work_meta_data = work_meta_data
         self.work_indptr = work_indptr
         self.work_info_set = work_info_set

@@ -308,7 +308,7 @@ class MLASparseAttentionImplPluginModeMethods:
             output,
             sparse_meta.qo_indptr,
             sparse_meta.paged_kv_indptr,
-            self.sparse_kv_indices_buffer,
+            sparse_meta.paged_kv_indices,
             sparse_meta.paged_kv_last_page_len,
             1,
             sm_scale=self.scale,
@@ -559,7 +559,6 @@ def sparse_attn_indexer_plugin_mode(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    sparse_kv_indices_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -781,7 +780,7 @@ def sparse_attn_indexer_plugin_mode(
         sparse_meta.block_table.to(dtype=torch.int32),
         topk_indices[: sparse_meta.num_actual_tokens].to(dtype=torch.int32),
         sparse_meta.paged_kv_indptr,
-        sparse_kv_indices_buffer,
+        sparse_meta.paged_kv_indices,
         BLOCK_SIZE=sparse_meta.block_size,
         NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
     )
@@ -802,7 +801,6 @@ def sparse_attn_indexer_fake(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    sparse_kv_indices_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -827,7 +825,7 @@ def sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer_plugin_mode",
     op_func=sparse_attn_indexer_plugin_mode,
-    mutates_args=["sparse_kv_indices_buffer"],
+    mutates_args=[],
     fake_impl=sparse_attn_indexer_fake,
 )
 

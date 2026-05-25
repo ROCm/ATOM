@@ -164,11 +164,6 @@ class MLAAttention(nn.Module):
         self.topk_tokens = (
             mla_modules.indexer.topk_tokens if mla_modules.indexer is not None else None
         )
-        self.sparse_kv_indices_buffer = (
-            mla_modules.indexer.sparse_kv_indices_buffer
-            if mla_modules.indexer is not None
-            else None
-        )
         self.layer_num = layer_num
 
     def process_weights_after_loading(self):
@@ -482,7 +477,7 @@ class MLAAttention(nn.Module):
         if self.is_sparse_mla:
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
-            paged_kv_indices = self.sparse_kv_indices_buffer
+            paged_kv_indices = attn_metadata.sparse_kv_indices
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
@@ -584,11 +579,11 @@ class MLAAttention(nn.Module):
                     paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-                    paged_kv_indices = self.sparse_kv_indices_buffer
+                    paged_kv_indices = attn_metadata.sparse_kv_indices
                     max_q_len = 1
                 else:
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
-                    paged_kv_indices = self.sparse_kv_indices_buffer
+                    paged_kv_indices = attn_metadata.sparse_kv_indices
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = not (dp_size > 1)
@@ -1122,9 +1117,7 @@ def triton_gather_kv_indices_sparse(
     if out is not None:
         out_buf = out[:total_out]
     else:
-        out_buf = torch.empty(
-            total_out, dtype=torch.int32, device=topk_indices.device
-        )
+        out_buf = torch.empty(total_out, dtype=torch.int32, device=topk_indices.device)
 
     ti_stride0, ti_stride1 = topk_indices.stride()
     grid = (num_tokens, tiles_per_row)
