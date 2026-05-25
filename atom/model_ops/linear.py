@@ -195,35 +195,6 @@ def _fp8_per_tensor_linear_triton(
     )
 
 
-def _fp8_per_tensor_linear_gfx1201(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale,
-    bias,
-    x_scale,
-    otype,
-    output_partition_sizes=None,
-) -> torch.Tensor:
-    """Per-tensor FP8 linear for gfx1201. Triton-only — no torch fallback.
-    Caller is responsible for ensuring aiter triton gemm_a8w8 is available.
-    """
-    triton_gemm = _get_triton_fp8_gemm()
-    if triton_gemm is None:
-        raise RuntimeError(
-            "aiter triton gemm_a8w8 unavailable on gfx1201 — required for "
-            "per-tensor FP8 linear (no torch fallback in this build)."
-        )
-    return _fp8_per_tensor_linear_triton(
-        triton_gemm,
-        x,
-        weight,
-        weight_scale,
-        bias,
-        otype,
-        output_partition_sizes,
-    )
-
-
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
@@ -760,8 +731,12 @@ class LinearBase(nn.Module):
                         transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
-                    if _is_gfx1201_linear():
-                        # skip dynamic FP8 quant on gfx1201; fallback handles BF16 inputs
+                    if (
+                        self.quant_type.value == QuantType.per_1x128.value
+                        and _is_gfx1201_linear()
+                    ):
+                        # gfx1201 per_1x128 routes to aiter triton a16w8 below,
+                        # which takes BF16 x; skip the FP8 pre-quant.
                         x_scale = getattr(self, "input_scale", None)
                     else:
                         x, x_scale = quant_func(
@@ -770,29 +745,20 @@ class LinearBase(nn.Module):
                             scale=getattr(self, "input_scale", None),
                         )
             if self.quant_type.value == QuantType.per_Tensor.value:
-                if _is_gfx1201_linear():
-                    # gfx1201: skip aiter tgemm.mm (no gfx1201 HIP code object),
-                    # dequant FP8 weight + run F.linear in BF16.
-                    y = _fp8_per_tensor_linear_gfx1201(
-                        x,
-                        self.weight,
-                        self.weight_scale,
-                        self.bias,
-                        x_scale,
-                        otype,
-                        output_partition_sizes=getattr(
-                            self, "output_partition_sizes", None
-                        ),
-                    )
-                else:
-                    y = tgemm.mm(
-                        x,
-                        self.weight,
-                        self.bias,
-                        otype=otype,
-                        scale_a=x_scale,
-                        scale_b=self.weight_scale,
-                    )
+                # aiter.tgemm.mm handles per-Tensor FP8 on every supported arch
+                # now that aiter#3332 added gfx1200 / gfx1201 to the FP8 dtype
+                # map. On gfx1201 the HIP libtypes are skipped and torch_gemm's
+                # fallback runs F.linear(float8.to(fp32), ...) * scales --
+                # correct dequantization, was garbage before #3332 when
+                # dtypes.fp8 fell back to uint8.
+                y = tgemm.mm(
+                    x,
+                    self.weight,
+                    self.bias,
+                    otype=otype,
+                    scale_a=x_scale,
+                    scale_b=self.weight_scale,
+                )
             elif self.quant_type.value == QuantType.per_Token.value:
                 if self.params_dtype == dtypes.i8:
                     y = gemm_a8w8(
