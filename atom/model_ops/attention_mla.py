@@ -337,6 +337,202 @@ class MLAAttention(nn.Module):
 
         return result
 
+    def _forward_prefill_cached_single_pass(
+        self,
+        prefill_q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+    ) -> torch.Tensor:
+        """Legacy single-pass path: gather the full cached+new context into
+        k_full / v_full and run one flash_attn. OOMs on long contexts (peak
+        ≈ total_kv × heads × (qk_dim + v_dim) × dtype)."""
+        k_full = torch.empty(
+            (
+                attn_metadata.total_kv,
+                self.num_heads,
+                self.qk_nope_head_dim + self.qk_rope_head_dim,
+            ),
+            device=prefill_q.device,
+            dtype=self.dtype,
+        )
+        v_full = torch.empty(
+            (attn_metadata.total_kv, self.num_heads, self.v_head_dim),
+            device=prefill_q.device,
+            dtype=self.dtype,
+        )
+        gather_kv_b_proj(
+            kv_cache,
+            self._k_scale,
+            attn_metadata.kv_indptr,
+            attn_metadata.kv_indices,
+            attn_metadata.cu_seqlens_k,
+            self.kv_b_proj.weight,
+            self.kv_b_proj.weight_scale,
+            k_full,
+            v_full,
+            weight_preshuffle=getattr(self.kv_b_proj.weight, "is_shuffled", False),
+        )
+        output = flash_attn_varlen_func(
+            q=prefill_q,
+            k=k_full,
+            v=v_full,
+            cu_seqlens_q=attn_metadata.cu_seqlens_q,
+            cu_seqlens_k=attn_metadata.cu_seqlens_k,
+            max_seqlen_q=attn_metadata.max_seqlen_q,
+            max_seqlen_k=attn_metadata.max_seqlen_k,
+            min_seqlen_q=attn_metadata.min_seqlen_q,
+            dropout_p=attn_metadata.dropout_p,
+            softmax_scale=self.scale,
+            causal=True,
+        )
+        return self.o_proj(output.flatten(start_dim=-2))
+
+    def _forward_prefill_cached_chunked(
+        self,
+        prefill_q: torch.Tensor,
+        kv_c_normed_new: torch.Tensor,
+        k_rope_new: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+        chunk_meta,
+    ) -> torch.Tensor:
+        """Chunked prefill for the has_cached branch.
+
+        Pattern (mirrors atom/plugin/attention_mha.py:extend_forward): the
+        cached prefix and the new tokens are attended separately and merged
+        via softmax-LSE recombination. This bounds peak memory to
+        ``CHUNK_TOKENS × heads × (qk_dim + v_dim)``, independent of context
+        length.
+
+        Step 1 — new-tokens self-attention (causal). New k/v come from
+        kv_b_proj on the input latent kv_c_normed; cu_seqlens_k = cu_seqlens_q.
+        Step 2 — per chunk c of the cached prefix: gather_kv_b_proj into the
+        shared workspace, flash_attn(causal=False, return_lse), merge into a
+        running (chunked_out, chunked_lse).
+        Step 3 — final merge of (chunked_out, chunked_lse) with (new_out,
+        new_lse). The cached prefix is the "prefix" side (smaller token
+        positions), new tokens are the "suffix".
+        """
+        from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
+
+        # Trigger counter: log first hit + every 500th to confirm the chunked
+        # path is actually exercised (not silently bypassed when
+        # has_cached=True but cached prefix < CHUNK_TOKENS for every seq).
+        # Counter is class-level so all layers/instances share a single count.
+        n = MLAAttention._chunked_prefill_calls = (
+            getattr(MLAAttention, "_chunked_prefill_calls", 0) + 1
+        )
+        if n == 1 or n % 500 == 0:
+            logger.info(
+                "MLA chunked-prefill #%d: layer=%d num_chunks=%d "
+                "total_kv=%d cu_seqlens_q[-1]=%d",
+                n,
+                self.layer_num,
+                chunk_meta.num_chunks,
+                attn_metadata.total_kv,
+                int(attn_metadata.cu_seqlens_q[-1].item()),
+            )
+
+        weight_preshuffle = getattr(self.kv_b_proj.weight, "is_shuffled", False)
+
+        # Step 1: new-tokens self-attn via kv_b_proj on the latent.
+        if k_rope_new.dim() == 2:
+            k_rope_new = k_rope_new.unsqueeze(1)
+        kv_nope_new = self.kv_b_proj(kv_c_normed_new).view(
+            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        k_nope_new, v_new = kv_nope_new.split(
+            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+        k_new = torch.cat(
+            (k_nope_new, k_rope_new.expand((*k_nope_new.shape[:-1], -1))), dim=-1
+        )
+        new_out, new_lse = flash_attn_varlen_func(
+            q=prefill_q,
+            k=k_new,
+            v=v_new,
+            cu_seqlens_q=attn_metadata.cu_seqlens_q,
+            cu_seqlens_k=attn_metadata.cu_seqlens_q,
+            max_seqlen_q=attn_metadata.max_seqlen_q,
+            max_seqlen_k=attn_metadata.max_seqlen_q,
+            min_seqlen_q=attn_metadata.min_seqlen_q,
+            dropout_p=attn_metadata.dropout_p,
+            softmax_scale=self.scale,
+            causal=True,
+            return_lse=True,
+        )
+
+        # Step 2: chunked cached-prefix attention.
+        k_workspace = chunk_meta.k_workspace
+        v_workspace = chunk_meta.v_workspace
+        chunked_out: Optional[torch.Tensor] = None
+        chunked_lse: Optional[torch.Tensor] = None
+        for c in range(chunk_meta.num_chunks):
+            n_tok = chunk_meta.total_tokens[c]
+            if n_tok == 0:
+                continue
+            k_chunk = k_workspace[:n_tok]
+            v_chunk = v_workspace[:n_tok]
+            gather_kv_b_proj(
+                kv_cache,
+                self._k_scale,
+                chunk_meta.kv_indptr[c],
+                chunk_meta.kv_indices[c],
+                chunk_meta.cu_seqlens_k[c],
+                self.kv_b_proj.weight,
+                self.kv_b_proj.weight_scale,
+                k_chunk,
+                v_chunk,
+                weight_preshuffle=weight_preshuffle,
+            )
+            suf_out, suf_lse = flash_attn_varlen_func(
+                q=prefill_q,
+                k=k_chunk,
+                v=v_chunk,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=chunk_meta.cu_seqlens_k[c],
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=chunk_meta.max_seqlen_k[c],
+                min_seqlen_q=attn_metadata.min_seqlen_q,
+                dropout_p=attn_metadata.dropout_p,
+                softmax_scale=self.scale,
+                causal=False,
+                return_lse=True,
+            )
+            if chunked_out is None:
+                chunked_out = suf_out
+                chunked_lse = suf_lse
+            else:
+                tmp_out = torch.empty_like(new_out)
+                tmp_lse = torch.empty_like(new_lse)
+                merge_attn_states(
+                    output=tmp_out,
+                    output_lse=tmp_lse,
+                    prefix_output=chunked_out,
+                    prefix_lse=chunked_lse,
+                    suffix_output=suf_out,
+                    suffix_lse=suf_lse,
+                )
+                chunked_out = tmp_out
+                chunked_lse = tmp_lse
+
+        # Step 3: merge cached prefix (prefix) with new tokens (suffix).
+        # If every seq happened to have zero cached tokens this iter, fall
+        # back to the new-only output (should not happen since has_cached
+        # implies ≥1 seq has cached_len > 0).
+        if chunked_out is None:
+            output = new_out
+        else:
+            output = torch.empty_like(new_out)
+            merge_attn_states(
+                output=output,
+                prefix_output=chunked_out,
+                prefix_lse=chunked_lse,
+                suffix_output=new_out,
+                suffix_lse=new_lse,
+            )
+        return self.o_proj(output.flatten(start_dim=-2))
+
     def _forward_prefill_mha(
         self,
         q: torch.Tensor,
@@ -715,55 +911,15 @@ class MLAAttention(nn.Module):
                 )
 
             if attn_metadata.has_cached:
-                # k_full/v_full are used for attention compute; gather_kv_b_proj reads
-                # fp8 from cache and dequantizes internally, so output must be model dtype
-                k_full = torch.empty(
-                    (
-                        attn_metadata.total_kv,
-                        self.num_heads,
-                        self.qk_nope_head_dim + self.qk_rope_head_dim,
-                    ),
-                    device=q.device,
-                    dtype=self.dtype,
-                )
-                v_full = torch.empty(
-                    (
-                        attn_metadata.total_kv,
-                        self.num_heads,
-                        self.v_head_dim,
-                    ),
-                    device=q.device,
-                    dtype=self.dtype,
-                )
-
-                gather_kv_b_proj(
-                    kv_cache,
-                    self._k_scale,
-                    attn_metadata.kv_indptr,
-                    attn_metadata.kv_indices,
-                    attn_metadata.cu_seqlens_k,
-                    self.kv_b_proj.weight,
-                    self.kv_b_proj.weight_scale,
-                    k_full,
-                    v_full,
-                    weight_preshuffle=getattr(
-                        self.kv_b_proj.weight, "is_shuffled", False
-                    ),
-                )
-                output = flash_attn_varlen_func(
-                    q=prefill_q,
-                    k=k_full,
-                    v=v_full,
-                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
-                    cu_seqlens_k=attn_metadata.cu_seqlens_k,
-                    max_seqlen_q=attn_metadata.max_seqlen_q,
-                    max_seqlen_k=attn_metadata.max_seqlen_k,
-                    min_seqlen_q=attn_metadata.min_seqlen_q,
-                    dropout_p=attn_metadata.dropout_p,
-                    softmax_scale=self.scale,
-                    causal=True,
-                )
-                output = self.o_proj(output.flatten(start_dim=-2))
+                chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
+                if chunk_meta is not None:
+                    output = self._forward_prefill_cached_chunked(
+                        prefill_q, k_nope, k_rope, kv_cache, attn_metadata, chunk_meta
+                    )
+                else:
+                    output = self._forward_prefill_cached_single_pass(
+                        prefill_q, kv_cache, attn_metadata
+                    )
             else:
                 output = self._forward_prefill_mha(
                     prefill_q, k_nope, k_rope, kv_cache, attn_metadata
