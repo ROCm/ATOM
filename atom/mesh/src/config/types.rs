@@ -12,6 +12,8 @@ pub enum BackendType {
     Sglang,
     #[serde(rename = "vllm")]
     Vllm,
+    #[serde(rename = "atom")]
+    Atom,
 }
 
 /// Main router configuration
