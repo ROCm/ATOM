@@ -20,6 +20,20 @@
 # required regardless of speed.
 import os as _os
 
+# When ATOM_USE_TRITON_MHA_PREFILL=1, force aiter's flash_attn_varlen_func
+# (called by ATOM's prefill path) to route through the Triton MHA kernel
+# (aiter/ops/triton/attention/mha.py) instead of CK's FmhaFwdKernel. aiter
+# reads ENABLE_CK from os.environ exactly once at import time
+# (aiter/jit/core.py:29), so we MUST flip it BEFORE the first `import aiter`
+# below — that's why this block is at the very top of this file.
+#
+# Why the global switch (rather than a per-call backend hook): aiter does not
+# expose a per-call CK/Triton selector for MHA today; the only knob is the
+# import-time ENABLE_CK env. Routing this through ENABLE_CK is the smallest-
+# diff way to unlock the Triton SWA path on gpt-oss.
+if _os.getenv("ATOM_USE_TRITON_MHA_PREFILL", "0") == "1":
+    _os.environ["ENABLE_CK"] = "0"
+
 # When ATOM_USE_TRITON_BF16_DENSE=1, also redirect aiter.tuned_gemm's auto-
 # tuned "torch" libtype fallback to use the Triton gemm_a16w16 path. The
 # auto-tuner picks libtype="torch" for certain small/odd shapes (e.g. the

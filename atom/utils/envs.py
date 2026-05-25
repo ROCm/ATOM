@@ -64,6 +64,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_PA_REDUCE": lambda: (
         os.getenv("ATOM_USE_TRITON_PA_REDUCE", "0") == "1"
     ),
+    # Route the prefill MHA path through aiter's Triton flash_attn_varlen_func
+    # instead of the CK FmhaFwdKernel. Works on gpt-oss SWA layers now that the
+    # Triton wrapper accepts (window_size_right==0 + causal). Implemented by
+    # setting ENABLE_CK=0 in os.environ from atom/__init__.py BEFORE aiter is
+    # imported (aiter reads ENABLE_CK once at import time). Note: this is a
+    # GLOBAL aiter switch -- it routes every CK-vs-Triton dispatch (not just
+    # MHA) to Triton. Safe on gpt-oss-120b 1-GPU where CK is only ~0.07% of
+    # runtime; for other models, audit which other CK kernels would be
+    # affected before enabling.
+    "ATOM_USE_TRITON_MHA_PREFILL": lambda: (
+        os.getenv("ATOM_USE_TRITON_MHA_PREFILL", "0") == "1"
+    ),
     # --- Kernel Fusion Toggles ---
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
