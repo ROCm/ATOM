@@ -14,7 +14,6 @@ from atom.model_ops.utils import atom_parameter
 from atom.model_ops.linear import (
     _fp8_per_tensor_linear_triton,
     _get_triton_fp8_gemm,
-    _is_gfx1201_linear,
 )
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
@@ -209,10 +208,13 @@ class ParallelLMHead(VocabParallelEmbedding):
         self._fp8_lm_head_src_ptr = src_ptr
         return weight_q, weight_scale
 
-    def _use_gfx1201_fp8_lm_head(self, x: torch.Tensor) -> bool:
+    def _use_fp8_lm_head(self, x: torch.Tensor) -> bool:
+        """Whether this forward should route through the aiter triton gemm_a8w8
+        FP8 lm_head path. Pure capability check on the inputs and the env var
+        - no arch detection. The decision to actually quantize is deferred to
+        _get_fp8_lm_head_weight() (lazy + cached)."""
         return (
-            envs.ATOM_GFX1201_LM_HEAD_FP8
-            and _is_gfx1201_linear()
+            envs.ATOM_LM_HEAD_FP8
             and x.is_cuda
             and x.dim() == 2
             and self.weight.dim() == 2
@@ -228,7 +230,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             if context.is_prefill and not context.is_draft:
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
-        if self._use_gfx1201_fp8_lm_head(x):
+        if self._use_fp8_lm_head(x):
             triton_gemm = _get_triton_fp8_gemm()
             if triton_gemm is None:
                 logits = tgemm.mm(x, self.weight, self.bias)

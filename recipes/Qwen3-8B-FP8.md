@@ -35,7 +35,7 @@ Mistral-3 needs it for full perf.
 
 ## Optional perf env: lm_head FP8 (gfx1201)
 
-`ATOM_GFX1201_LM_HEAD_FP8=1` (default on for gfx1201) lazily quantizes the
+`ATOM_LM_HEAD_FP8=1` (default on) lazily quantizes the
 lm_head weight to per-row FP8 on first forward and routes it through the same
 triton FP8 GEMM as qkv/o/gate_up/down. Halves the lm_head weight bandwidth
 (vocab × hidden × 2 → 1 byte/elem). Combined with the per-shape
@@ -48,7 +48,7 @@ triton FP8 GEMM as qkv/o/gate_up/down. Halves the lm_head weight bandwidth
 | Ministral-3-8B | 22.1 → **18.4 ms** | 26.5 → **21.6 ms** | 30.8 → **27.6 ms** | 0.765 → **0.83** |
 | Qwen3-8B-FP8 | 21.7 → **18.5 ms** | 24.0 → **21.6 ms** | 28.8 → **23.4 ms** | 0.925 → **0.90** |
 
-Set `ATOM_GFX1201_LM_HEAD_FP8=0` to opt out (preserves the BF16 hipBLASLt
+Set `ATOM_LM_HEAD_FP8=0` to opt out (preserves the BF16 hipBLASLt
 lm_head path). Skipped automatically when lm_head shares storage with
 embed_tokens (tied-embeddings models).
 
