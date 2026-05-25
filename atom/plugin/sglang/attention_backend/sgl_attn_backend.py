@@ -136,6 +136,17 @@ def reshape_and_cache_shuffle_triton(
     _, num_kv_heads, head_size = key.shape
     num_blocks, block_size, _, _ = key_cache.shape
     x = 16 // key_cache.element_size()
+    if block_size < x:
+        raise ValueError(
+            f"ATOM reshape_and_cache_shuffle_triton requires block_size (page_size) "
+            f">= {x} for kv_cache_dtype={key_cache.dtype}, got block_size={block_size}. "
+            f"The V cache template uses shape [num_blocks, num_kv_heads, "
+            f"block_size // x, head_size, x], which collapses to a 0-sized dimension "
+            f"and crashes view_as() when page_size < x. "
+            f"Fix: launch sglang with `--page-size {x}` (or larger, e.g. 64). "
+            f"This constraint applies to non-MLA models whose head_dim != 256 "
+            f"(MLA models and head_dim==256 models take a different code path)."
+        )
     k_cache_template = torch.empty(
         [num_blocks, num_kv_heads, head_size // x, block_size, x],
         dtype=key_cache.dtype,
@@ -275,10 +286,36 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         self.pa_metadata_buffers = None
 
         k_buffer, _ = model_runner.token_to_kv_pool.get_kv_buffer(first_full_attn_id)
-        num_slots, num_kv_heads, _ = k_buffer.shape
+        num_slots, num_kv_heads, head_dim = k_buffer.shape
         block_size = self.page_size
         num_blocks = num_slots // block_size
         max_total_tokens = num_blocks * block_size
+
+        # ATOM's layout-shuffle KV write path
+        # (set_kv_buffer_with_layout_shuffle -> reshape_and_cache_shuffle_triton)
+        # rewrites the cache into [num_blocks, num_kv_heads, block_size // x,
+        # head_size, x] where x = 16 // element_size (bf16->8, fp8->16).
+        # When page_size < x, block_size // x degenerates to 0 and view_as()
+        # crashes deep inside CUDA graph capture with a confusing shape error.
+        # SGLang's default --page-size on ROCm is 1, so non-MLA models with
+        # head_dim != 256 (e.g. Qwen3-30B-A3B, Llama-3.1-70B) will hit this
+        # the moment a user forgets to pass --page-size. Fail fast here with
+        # an actionable message instead of dying mid graph-capture.
+        if not self.use_mla and head_dim != 256:
+            required_page_size = 16 // k_buffer.element_size()
+            if self.page_size < required_page_size:
+                raise ValueError(
+                    f"ATOM attention backend requires --page-size >= "
+                    f"{required_page_size} for non-MLA models with "
+                    f"head_dim={head_dim} and kv_cache_dtype={k_buffer.dtype} "
+                    f"(current --page-size={self.page_size}). "
+                    f"The internal layout-shuffle kernel computes "
+                    f"block_size // x with x={required_page_size}, which "
+                    f"degenerates to 0 when page_size < x and crashes during "
+                    f"CUDA graph capture. "
+                    f"Fix: launch sglang with `--page-size {required_page_size}` "
+                    f"(or larger, e.g. 64)."
+                )
         self.k_qscale = torch.ones(
             num_kv_heads, max_total_tokens, dtype=torch.float32, device=self.device
         )
