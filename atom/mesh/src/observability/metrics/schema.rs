@@ -50,11 +50,7 @@ pub const STREAMING_TRUE: &str = "true";
 pub const STREAMING_FALSE: &str = "false";
 
 pub const fn bool_to_static_str(b: bool) -> &'static str {
-    if b {
-        STREAMING_TRUE
-    } else {
-        STREAMING_FALSE
-    }
+    if b { STREAMING_TRUE } else { STREAMING_FALSE }
 }
 
 /// Static lookup table for common HTTP status codes to avoid allocations.
