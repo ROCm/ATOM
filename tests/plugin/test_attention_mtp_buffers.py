@@ -11,42 +11,65 @@ import torch
 
 def _install_attention_import_stubs(monkeypatch):
     aiter = types.ModuleType("aiter")
+    aiter.__path__ = []
     aiter.dtypes = SimpleNamespace()
     aiter.get_mla_metadata_info_v1 = lambda *args, **kwargs: None
     aiter.get_mla_metadata_v1 = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "aiter", aiter)
 
     aiter_dist = types.ModuleType("aiter.dist")
+    aiter_dist.__path__ = []
     monkeypatch.setitem(sys.modules, "aiter.dist", aiter_dist)
+    aiter.dist = aiter_dist
 
     parallel_state = types.ModuleType("aiter.dist.parallel_state")
     parallel_state.get_tp_group = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
+    aiter_dist.parallel_state = parallel_state
+
+    atom = types.ModuleType("atom")
+    atom.__path__ = []
+    monkeypatch.setitem(sys.modules, "atom", atom)
 
     atom_config = types.ModuleType("atom.config")
     monkeypatch.setitem(sys.modules, "atom.config", atom_config)
+    atom.config = atom_config
     monkeypatch.setattr(atom_config,
                         "get_current_atom_config",
                         lambda: None,
                         raising=False)
 
+    atom_model_ops = types.ModuleType("atom.model_ops")
+    atom_model_ops.__path__ = []
+    monkeypatch.setitem(sys.modules, "atom.model_ops", atom_model_ops)
+    atom.model_ops = atom_model_ops
+
     attention_mha = types.ModuleType("atom.model_ops.attention_mha")
     attention_mha.PagedAttentionImpl = object
     monkeypatch.setitem(sys.modules, "atom.model_ops.attention_mha", attention_mha)
+    atom_model_ops.attention_mha = attention_mha
 
     attention_mla = types.ModuleType("atom.model_ops.attention_mla")
     attention_mla.MLAAttention = object
     attention_mla._MLA_MIN_HEADS = 1
     monkeypatch.setitem(sys.modules, "atom.model_ops.attention_mla", attention_mla)
+    atom_model_ops.attention_mla = attention_mla
+
+    atom_utils = types.ModuleType("atom.utils")
+    atom_utils.__path__ = []
+    monkeypatch.setitem(sys.modules, "atom.utils", atom_utils)
+    atom.utils = atom_utils
 
     block_convert = types.ModuleType("atom.utils.block_convert")
     block_convert.kv_indices_generate_triton = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "atom.utils.block_convert", block_convert)
+    atom_utils.block_convert = block_convert
 
     forward_context = types.ModuleType("atom.utils.forward_context")
     forward_context.Context = object
     forward_context.AttentionMetaData = object
     monkeypatch.setitem(sys.modules, "atom.utils.forward_context", forward_context)
+    atom_utils.forward_context = forward_context
 
 
 def _install_vllm_init_stubs(monkeypatch):
@@ -72,7 +95,12 @@ def _install_vllm_init_stubs(monkeypatch):
     models_utils = types.ModuleType("atom.models.utils")
 
     def extract_layer_index(layer_name):
-        return int(re.search(r"\d+", layer_name).group(0))
+        match = re.search(r"\d+", layer_name)
+        if match is None:
+            raise ValueError(
+                f"Expected layer_name to contain a numeric layer index, got: {layer_name!r}"
+            )
+        return int(match.group(0))
 
     models_utils.extract_layer_index = extract_layer_index
     monkeypatch.setitem(sys.modules, "atom.models.utils", models_utils)
