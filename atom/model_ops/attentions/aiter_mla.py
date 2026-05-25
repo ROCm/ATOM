@@ -26,6 +26,10 @@ from atom.utils.block_convert import (
 )
 from atom.utils.forward_context import AttentionMetaData, Context
 
+from .backends import AttentionBackend, CommonAttentionBuilder
+
+logger = logging.getLogger("atom")
+
 
 @dataclass
 class MLAChunkContextMetadata:
@@ -57,11 +61,6 @@ class MLAChunkContextMetadata:
     v_workspace: torch.Tensor
 
 
-from .backends import AttentionBackend, CommonAttentionBuilder
-
-logger = logging.getLogger("atom")
-
-
 def cdiv(a, b):
     return (a + b - 1) // b
 
@@ -85,7 +84,6 @@ class AiterMLABackend(AttentionBackend):
     default_base_class=CommonAttentionBuilder
 )
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
-
     def __init__(self, model_runner):
         self.block_size = 1
         CommonAttentionBuilder.__init__(self, model_runner)
