@@ -229,6 +229,26 @@ jobs:
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
             accuracy_test_threshold: 0.76
             runner: linux-atom-mi35x-4
+          - model_name: "MI308 DeepSeek-R1-FP8 TP4"
+            model_path: "deepseek-ai/DeepSeek-R1-0528"
+            extra_args: "--tensor-parallel-size 4"
+            env_vars: |
+              AITER_QUICK_REDUCE_QUANTIZATION=INT4
+              SGLANG_AITER_FP8_PREFILL_ATTN=0
+              SGLANG_USE_AITER=1
+              ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
+            accuracy_test_threshold: 0.91
+            runner: atom-mi308-8gpu-plugins-benchmark
+          - model_name: "MI308 DeepSeek-R1-FP4 TP4"
+            model_path: "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+            extra_args: "--tensor-parallel-size 4"
+            env_vars: |
+              AITER_QUICK_REDUCE_QUANTIZATION=INT4
+              SGLANG_AITER_FP8_PREFILL_ATTN=0
+              SGLANG_USE_AITER=1
+              ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
+            accuracy_test_threshold: 0.91
+            runner: atom-mi308-8gpu-plugins-benchmark
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
@@ -238,7 +258,7 @@ jobs:
 
     steps:
       - name: Clean up containers and workspace
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: contains(fromJSON('["atom-mi355-8gpu.predownload","atom-mi308-8gpu-plugins-benchmark"]'), matrix.runner)
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
