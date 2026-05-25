@@ -13,6 +13,7 @@ use crate::{
     config::{PolicyConfig, RoutingMode},
     core::ConnectionMode,
     policies::PolicyFactory,
+    python::atom_standalone::AtomStandaloneRouter,
 };
 
 /// Factory for creating router instances based on configuration
@@ -21,6 +22,10 @@ pub struct RouterFactory;
 impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        if ctx.router_config.atom_standalone {
+            return Self::create_atom_standalone_router(ctx).await;
+        }
+
         match ctx.router_config.connection_mode {
             ConnectionMode::Grpc { .. } => match &ctx.router_config.mode {
                 RoutingMode::Regular { .. } => Self::create_grpc_router(ctx).await,
@@ -62,6 +67,19 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         let router = Router::new(ctx).await?;
+
+        Ok(Box::new(router))
+    }
+
+    /// Create an ATOM standalone router
+    pub async fn create_atom_standalone_router(
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        let runtime = ctx
+            .atom_standalone_runtime
+            .as_ref()
+            .ok_or_else(|| "ATOM standalone requires a Python-owned runtime".to_string())?;
+        let router = AtomStandaloneRouter::from_runtime(runtime);
 
         Ok(Box::new(router))
     }

@@ -47,6 +47,7 @@ impl RouterId {
 pub mod router_ids {
     use super::RouterId;
 
+    pub const ATOM_STANDALONE: RouterId = RouterId::new("atom-standalone");
     pub const HTTP_REGULAR: RouterId = RouterId::new("http-regular");
     pub const HTTP_PD: RouterId = RouterId::new("http-pd");
     pub const GRPC_REGULAR: RouterId = RouterId::new("grpc-regular");
@@ -82,6 +83,7 @@ impl RouterManager {
 
         let single_router = Arc::from(RouterFactory::create_router(app_context).await?);
         let router_id = Self::determine_router_id(
+            config.router_config.atom_standalone,
             &config.router_config.mode,
             &config.router_config.connection_mode,
         );
@@ -98,9 +100,14 @@ impl RouterManager {
     }
 
     pub fn determine_router_id(
+        is_atom_standalone: bool,
         routing_mode: &RoutingMode,
         connection_mode: &ConnectionMode,
     ) -> RouterId {
+        if is_atom_standalone {
+            return router_ids::ATOM_STANDALONE;
+        }
+
         match (connection_mode, routing_mode) {
             (ConnectionMode::Http, RoutingMode::Regular { .. }) => router_ids::HTTP_REGULAR,
             (ConnectionMode::Http, RoutingMode::PrefillDecode { .. }) => router_ids::HTTP_PD,
@@ -138,6 +145,24 @@ impl RouterManager {
         self.routers.len()
     }
 
+    fn atom_standalone_router(&self) -> Option<Arc<dyn RouterTrait>> {
+        let default_router = self
+            .default_router
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+
+        if matches!(
+            default_router.as_ref(),
+            Some(id) if id == &router_ids::ATOM_STANDALONE
+        ) {
+            self.routers
+                .get(&router_ids::ATOM_STANDALONE)
+                .map(|r| r.clone())
+        } else {
+            None
+        }
+    }
+
     pub fn select_router_for_request(
         &self,
         _headers: Option<&HeaderMap>,
@@ -166,7 +191,19 @@ impl RouterTrait for RouterManager {
         self
     }
 
-    async fn health_generate(&self, _req: Request<Body>) -> Response {
+    async fn shutdown(&self) {
+        let routers = self.routers_snapshot.load_full();
+        info!("Shutting down {} registered router(s)", routers.len());
+        for router in routers.iter() {
+            router.shutdown().await;
+        }
+    }
+
+    async fn health_generate(&self, req: Request<Body>) -> Response {
+        if let Some(router) = self.atom_standalone_router() {
+            return router.health_generate(req).await;
+        }
+
         // Return 200 if at least one router has healthy workers
         let has_healthy_workers = self
             .worker_registry
@@ -185,7 +222,11 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn get_server_info(&self, _req: Request<Body>) -> Response {
+    async fn get_server_info(&self, req: Request<Body>) -> Response {
+        if let Some(router) = self.atom_standalone_router() {
+            return router.get_server_info(req).await;
+        }
+
         // TODO: Aggregate info from all routers with healthy workers
         (
             StatusCode::OK,
@@ -199,7 +240,11 @@ impl RouterTrait for RouterManager {
             .into_response()
     }
 
-    async fn get_models(&self, _req: Request<Body>) -> Response {
+    async fn get_models(&self, req: Request<Body>) -> Response {
+        if let Some(router) = self.atom_standalone_router() {
+            return router.get_models(req).await;
+        }
+
         let model_names = self.worker_registry.get_models();
 
         if model_names.is_empty() {
@@ -361,12 +406,17 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "delete_response not yet implemented",
-        )
-            .into_response()
+    async fn delete_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.delete_response(headers, response_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("No router available to delete response '{}'", response_id),
+            )
+                .into_response()
+        }
     }
 
     async fn list_response_input_items(
