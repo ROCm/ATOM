@@ -17,6 +17,9 @@ metrics       = Prometheus 指标定义、记录、暴露、worker engine 指标
 
 本次重构的核心不是简单把 `metrics.rs` 换目录，而是把“指标记录、指标暴露、engine metrics 聚合、健康检查路由”从 `server.rs` 和 `observability/metrics.rs` 中拆出来，形成独立的 metrics 子系统。
 
+![Atomesh Metrics Architecture Refactor](../assets/atomesh_metrics.svg)
+
+
 ### 核心变化
 
 现状：
@@ -92,6 +95,7 @@ After
 │ - interner / cardinality     │ - engine metrics config           │
 └──────────────────────────────┴───────────────────────────────────┘
 ```
+
 
 ### 代码结构前后对比
 
@@ -226,7 +230,7 @@ pub struct MetricsRouteConfig {
 
 `schema.rs` 只定义 metrics 的统一规范，不负责真正打点。它集中管理指标名、HELP 文案、label 名称、HTTP method/status 转换、endpoint 规范化、动态 label 缓存和 cardinality 规则。`recorder.rs` 在调用 `counter!`、`histogram!`、`gauge!` 时引用这些规范，避免指标名或 label 在不同业务模块里写出多个变体。
 
-第一阶段必须保持现有 `middleware.rs::normalize_path_for_metrics` 的 label 语义，不把未知路径统一改成 `unknown`，也不把已有 `{id}` 占位符改成其他名字。后续如需收敛为更严格的静态 endpoint 枚举，应作为独立 breaking change 迁移，并同步 dashboard/alert。
+第一阶段必须保持迁移前 `middleware.rs::normalize_path_for_metrics` 的 label 语义；迁移后统一由 `schema.rs::normalize_path_for_metrics` 承载，不把未知路径统一改成 `unknown`，也不把已有 `{id}` 占位符改成其他名字。后续如需收敛为更严格的静态 endpoint 枚举，应作为独立 breaking change 迁移，并同步 dashboard/alert。
 
 ```rust
 pub mod names {
@@ -235,8 +239,8 @@ pub mod names {
         "mesh_router_request_duration_seconds";
 }
 
-pub fn normalize_path(path: &str) -> Cow<'_, str> {
-    // Preserve the current normalize_path_for_metrics behavior:
+pub fn normalize_path_for_metrics(path: &str) -> String {
+    // Preserve the pre-refactor normalize_path_for_metrics behavior:
     // known static paths pass through, dynamic segments become {id},
     // and unknown-but-stable paths are not collapsed to "unknown".
     normalize_dynamic_segments(path)
@@ -253,7 +257,7 @@ impl MeshMetrics {
         counter!(
             schema::names::HTTP_REQUESTS_TOTAL,
             "method" => schema::method(method),
-            "path" => schema::normalize_path(path),
+            "path" => schema::normalize_path_for_metrics(path),
         )
         .increment(1);
     }

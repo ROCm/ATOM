@@ -24,6 +24,7 @@ High-performance model routing gateway for **PD (Prefill–Decode) disaggregated
 | `POST /v1/tokenize` / `/v1/detokenize` | Tokenization with batch support |
 | `POST /parse/reasoning` / `/parse/function_call` | Reasoning and tool-call parsing |
 | `GET /health` / `/readiness` / `/liveness` | Health probes |
+| `GET /engine_metrics` | Aggregated worker engine Prometheus metrics |
 | `GET /v1/models` | Model metadata |
 
 ## Installation
@@ -137,6 +138,11 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 ### Prometheus metrics
 
 Default bind: `0.0.0.0:29000` (`--prometheus-host` / `--prometheus-port`)
+
+Mesh self metrics are exposed by the Prometheus exporter above. Worker engine
+metrics remain available through the router's `/engine_metrics` endpoint, which
+scrapes backend workers, injects `worker_addr`, and aggregates their Prometheus
+text without changing worker metric names.
 
 | Layer | Prefix | Description |
 |-------|--------|-------------|
