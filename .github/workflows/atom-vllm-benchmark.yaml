@@ -56,7 +56,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_2:
         description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
@@ -93,7 +92,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_3:
         description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
@@ -130,7 +128,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_4:
         description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
@@ -167,7 +164,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_5:
         description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
@@ -204,7 +200,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_6:
         description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
@@ -241,7 +236,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_7:
         description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
@@ -278,7 +272,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_8:
         description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
@@ -315,7 +308,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -484,6 +476,8 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
@@ -1145,11 +1139,13 @@ jobs:
           fi
 
       - name: Persist benchmark matrix payload
+        env:
+          BENCHMARK_MATRIX: ${{ steps.build.outputs.benchmark_matrix }}
         run: |
-          printf '%s' '${{ steps.build.outputs.benchmark_matrix }}' > benchmark_matrix.json
+          printf '%s' "${BENCHMARK_MATRIX}" > benchmark_matrix.json
 
       - name: Upload benchmark matrix payload
-        uses: actions/upload-artifact@v8
+        uses: actions/upload-artifact@v7
         with:
           name: oot-benchmark-matrix
           path: benchmark_matrix.json

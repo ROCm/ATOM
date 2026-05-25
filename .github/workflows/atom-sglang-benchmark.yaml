@@ -109,7 +109,9 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
-          INPUT_SGLANG_IMAGE: ${{ inputs.docker_image || '' }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          INPUT_SGLANG_IMAGE: ${{ inputs.sglang_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
           INPUT_WORKLOAD_LABEL: ${{ inputs.benchmark_suite || 'SGLang-OOB' }}

@@ -10,15 +10,19 @@ Each plan slot is a 16-byte struct of 4 int32 fields:
   - batch_id:   sequence index (→ state_slot_mapping[batch_id], block_table[batch_id])
   - position:   absolute token position (→ RoPE)
   - window_len: number of leading K-loop iterations that read from state cache
-                instead of the ragged input. K = STATE_SIZE = (1+overlap)*ratio.
+                instead of the ragged input. K = K_pool = (1+overlap)*ratio
+                (pool window size — the algorithm constant; distinct from
+                STATE_SIZE = K_pool + max_spec_steps which is just the ring
+                modulus widened by spec slack).
 
 Two plan tensors are produced per `compress_ratio`:
   - compress_plan: rows for tokens whose `(position+1) % ratio == 0`
                    (= compression boundaries). One row per fused-compress kernel
                    program. Grid = `num_compress`.
   - write_plan:    rows for tokens whose `position` falls in the per-seq
-                   "last STATE_SIZE positions" window. One row per
-                   `update_compressor_states` kernel program. Grid = `num_write`.
+                   "last K_pool positions" window (the only entries the
+                   downstream compressor forward will actually read). One row
+                   per `update_compressor_states` kernel program. Grid = `num_write`.
 
 Caller (per-seq loop) gets `cu_compress_cpu` for slicing the kernel's flat
 output `[num_compress, head_dim]` back to per-seq chunks.
