@@ -66,14 +66,24 @@ def rmsnorm2d_fwd_with_add_(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    out = torch.empty_like(x)
-    residual_out = torch.empty_like(x)
     if envs.ATOM_USE_TRITON_RMSNORM:
+        # Triton _fused_add_rmsnorm_kernel uses input_row_stride for res_in
+        # AND res_out (single stride var). If x.stride(0) doesn't match
+        # residual's last-dim row stride, the kernel reads/writes wrong
+        # addresses. Also assumes last dim contiguous (stride 1). Coerce both
+        # x and residual to contiguous (-1, dim) with matching strides before
+        # the call.
+        x = x.contiguous()
+        residual = residual.reshape(-1, dim).contiguous()
+        out = torch.empty_like(x)
+        residual_out = torch.empty_like(x)
         from aiter.ops.triton.normalization.rmsnorm import (
             rmsnorm2d_fwd_with_add as _triton_rmsnorm_add,
         )
-        _triton_rmsnorm_add(out, x, residual, residual_out, weight, eps)
+        _triton_rmsnorm_add(out, x, residual, residual_out, weight.contiguous(), eps)
     else:
+        out = torch.empty_like(x)
+        residual_out = torch.empty_like(x)
         rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
     return out.view(ori_shape), residual_out.view(ori_shape)
 

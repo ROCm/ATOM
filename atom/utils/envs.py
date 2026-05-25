@@ -55,6 +55,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_SAMPLE": lambda: (
         os.getenv("ATOM_USE_TRITON_SAMPLE", "0") == "1"
     ),
+    # Force aiter's paged_attention_decode_v2 to use the FlyDSL Triton reduce
+    # kernel instead of the C++ HIP `pa_decode_ps_reduce_hip_kernel`. Done via
+    # a monkey-patch of `aiter.ops.triton.gluon.pa_decode_gluon.CXX_PS_REDUCE_AVAILABLE`
+    # at ATOM startup (in atom/__init__.py). Only safe when the model has
+    # attention sinks (gpt-oss does); models without sinks hit a NameError in
+    # the FlyDSL kernel's no-sinks branch.
+    "ATOM_USE_TRITON_PA_REDUCE": lambda: (
+        os.getenv("ATOM_USE_TRITON_PA_REDUCE", "0") == "1"
+    ),
     # --- Kernel Fusion Toggles ---
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
