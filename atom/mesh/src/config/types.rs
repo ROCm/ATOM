@@ -22,6 +22,9 @@ pub struct RouterConfig {
     pub backend: BackendType,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
+    #[serde(default)]
+    pub atom_standalone: bool,
+
     pub policy: PolicyConfig,
     pub host: String,
     pub port: u16,
@@ -351,6 +354,7 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             connection_mode: ConnectionMode::Http,
+            atom_standalone: false,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,
