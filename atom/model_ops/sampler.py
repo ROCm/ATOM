@@ -4,10 +4,21 @@
 import warnings
 
 import torch
-from aiter import mixed_sample_outer_exponential
+from aiter import mixed_sample_outer_exponential as _hip_mixed_sample_outer_exponential
+from aiter.ops.triton.sample.mix_sample import (
+    mixed_sample_outer_exponential as _triton_mixed_sample_outer_exponential,
+)
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
+from atom.utils import envs
 from torch import nn
+
+
+def mixed_sample_outer_exponential(*args, **kwargs):
+    """Dispatch to Triton drop-in when ATOM_USE_TRITON_SAMPLE=1, else HIP."""
+    if envs.ATOM_USE_TRITON_SAMPLE:
+        return _triton_mixed_sample_outer_exponential(*args, **kwargs)
+    return _hip_mixed_sample_outer_exponential(*args, **kwargs)
 
 # Try to import aiter top-k/top-p sampling ops
 try:

@@ -42,6 +42,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_BF16_DENSE": lambda: (
         os.getenv("ATOM_USE_TRITON_BF16_DENSE", "0") == "1"
     ),
+    # Route the unquantized RMSNorm-with-add path through aiter's Triton
+    # rmsnorm2d_fwd_with_add (aiter/ops/triton/normalization/rmsnorm.py) instead
+    # of the aiter HIP add_rmsnorm_quant_kernel that fires from the no-quant
+    # fallback. Drop-in; same signature.
+    "ATOM_USE_TRITON_RMSNORM": lambda: (
+        os.getenv("ATOM_USE_TRITON_RMSNORM", "0") == "1"
+    ),
+    # Route mixed_sample_outer_exponential through aiter's Triton drop-in
+    # (aiter/ops/triton/sample/mix_sample.py) instead of the aiter HIP kernel.
+    # Bit-exact for greedy (temperature==0); same algorithm for stochastic.
+    "ATOM_USE_TRITON_SAMPLE": lambda: (
+        os.getenv("ATOM_USE_TRITON_SAMPLE", "0") == "1"
+    ),
     # --- Kernel Fusion Toggles ---
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.

@@ -68,7 +68,13 @@ def rmsnorm2d_fwd_with_add_(
     x = x.reshape(-1, dim)
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
-    rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
+    if envs.ATOM_USE_TRITON_RMSNORM:
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rmsnorm2d_fwd_with_add as _triton_rmsnorm_add,
+        )
+        _triton_rmsnorm_add(out, x, residual, residual_out, weight, eps)
+    else:
+        rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
     return out.view(ori_shape), residual_out.view(ori_shape)
 
 
