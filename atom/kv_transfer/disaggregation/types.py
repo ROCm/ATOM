@@ -144,11 +144,11 @@ class ConnectorMetadata:
         """Construct a :class:`ReqMeta` from raw transfer parameters."""
         return ReqMeta(
             local_block_ids=local_block_ids,
-            remote_block_ids=kv_transfer_params["remote_block_ids"],
-            remote_engine_id=kv_transfer_params["remote_engine_id"],
-            remote_host=kv_transfer_params["remote_host"],
-            remote_port=kv_transfer_params["remote_port"],
-            remote_handshake_port=kv_transfer_params["remote_handshake_port"],
+            remote_block_ids=kv_transfer_params.get("remote_block_ids"),
+            remote_engine_id=kv_transfer_params.get("remote_engine_id"),
+            remote_host=kv_transfer_params.get("remote_host"),
+            remote_port=kv_transfer_params.get("remote_port"),
+            remote_handshake_port=kv_transfer_params.get("remote_handshake_port"),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
             tp_size=(
