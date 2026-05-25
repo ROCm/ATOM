@@ -19,6 +19,21 @@
 # performance-oriented run; turn it on only when full-Triton coverage is
 # required regardless of speed.
 import os as _os
+
+# When ATOM_USE_TRITON_BF16_DENSE=1, also redirect aiter.tuned_gemm's auto-
+# tuned "torch" libtype fallback to use the Triton gemm_a16w16 path. The
+# auto-tuner picks libtype="torch" for certain small/odd shapes (e.g. the
+# Tensile MT64x16x128 kernels that fire from non-LinearBase callsites), and
+# the torch fallback calls F.linear → aten::mm → rocBLAS. Re-pointing the
+# dispatcher's "torch" slot at `triton_gemm` keeps those shapes on Triton too.
+if _os.getenv("ATOM_USE_TRITON_BF16_DENSE", "0") == "1":
+    try:
+        import aiter.tuned_gemm as _tg
+        if "torch" in _tg.solMap and "triton" in _tg.solMap:
+            _tg.solMap["torch"] = _tg.solMap["triton"]
+    except Exception:
+        pass
+
 if _os.getenv("ATOM_USE_TRITON_PA_REDUCE", "0") == "1":
     try:
         import aiter.ops.triton.gluon.pa_decode_gluon as _pa_decode_mod
