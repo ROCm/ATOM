@@ -1004,6 +1004,7 @@ def sparse_attn_indexer(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
+    sparse_kv_indices_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1130,17 +1131,16 @@ def sparse_attn_indexer(
             stride0=logits.stride(0),
             stride1=logits.stride(1),
         )
-        attn_metadata.sparse_kv_indices = (
-            triton_convert_req_index_to_global_index_dsa_prefill(
-                attn_metadata.sparse_cu_seqlens_q,
-                attn_metadata.sparse_kv_indptr,
-                attn_metadata.token_to_seq_idxs,
-                topk_indices,
-                attn_metadata.block_tables,
-                attn_metadata.cu_seqlens_k,
-                NUM_TOPK_TOKENS=topk_tokens,
-                PAGE_SIZE=runner_block_size,
-            )
+        triton_convert_req_index_to_global_index_dsa_prefill(
+            attn_metadata.sparse_cu_seqlens_q,
+            attn_metadata.sparse_kv_indptr,
+            attn_metadata.token_to_seq_idxs,
+            topk_indices,
+            attn_metadata.block_tables,
+            attn_metadata.cu_seqlens_k,
+            NUM_TOPK_TOKENS=topk_tokens,
+            PAGE_SIZE=runner_block_size,
+            out=sparse_kv_indices_buffer,
         )
     else:
         decode_metadata = attn_metadata
@@ -1183,22 +1183,24 @@ def sparse_attn_indexer(
             logits.stride(1),
         )
         if attn_metadata.max_seqlen_q > 1:
-            attn_metadata.sparse_kv_indices = triton_gather_kv_indices_sparse(
+            triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.token_to_seq_idxs,
                 topk_indices,
                 attn_metadata.kv_indices,
                 attn_metadata.kv_indptr,
                 NUM_TOPK_TOKENS=topk_tokens,
+                out=sparse_kv_indices_buffer,
             )
         else:
-            attn_metadata.sparse_kv_indices = triton_convert_req_index_to_global_index(
+            triton_convert_req_index_to_global_index(
                 attn_metadata.cu_seqlens_q,
                 attn_metadata.kv_indptr,
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.kv_indices,
                 topk_indices,
                 NUM_TOPK_TOKENS=topk_tokens,
+                out=sparse_kv_indices_buffer,
             )
     return weights
 
@@ -1216,6 +1218,7 @@ def sparse_attn_indexer_fake(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
+    sparse_kv_indices_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1240,7 +1243,7 @@ def sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer",
     op_func=sparse_attn_indexer,
-    mutates_args=[],
+    mutates_args=["sparse_kv_indices_buffer"],
     fake_impl=sparse_attn_indexer_fake,
 )
 
@@ -1436,6 +1439,11 @@ class Indexer(nn.Module):
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
+        max_buf = atom_config.max_num_batched_tokens * self.topk_tokens
+        self.sparse_kv_indices_buffer = torch.empty(
+            max_buf, dtype=torch.int32, device="cuda"
+        )
+
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
 
     def forward(
@@ -1493,6 +1501,7 @@ class Indexer(nn.Module):
             self.head_dim,
             self.max_model_len,
             self.max_total_seq_len,
+            self.sparse_kv_indices_buffer,
             self.k_norm.weight,
             self.k_norm.bias,
             self.k_norm.eps,

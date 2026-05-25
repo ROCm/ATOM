@@ -164,6 +164,11 @@ class MLAAttention(nn.Module):
         self.topk_tokens = (
             mla_modules.indexer.topk_tokens if mla_modules.indexer is not None else None
         )
+        self.sparse_kv_indices_buffer = (
+            mla_modules.indexer.sparse_kv_indices_buffer
+            if mla_modules.indexer is not None
+            else None
+        )
         self.layer_num = layer_num
 
     def process_weights_after_loading(self):
@@ -477,7 +482,7 @@ class MLAAttention(nn.Module):
         if self.is_sparse_mla:
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
-            paged_kv_indices = attn_metadata.sparse_kv_indices
+            paged_kv_indices = self.sparse_kv_indices_buffer
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
@@ -579,11 +584,11 @@ class MLAAttention(nn.Module):
                     paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-                    paged_kv_indices = attn_metadata.sparse_kv_indices
+                    paged_kv_indices = self.sparse_kv_indices_buffer
                     max_q_len = 1
                 else:
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
-                    paged_kv_indices = attn_metadata.sparse_kv_indices
+                    paged_kv_indices = self.sparse_kv_indices_buffer
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = not (dp_size > 1)
@@ -876,6 +881,7 @@ def triton_convert_req_index_to_global_index(
     BLOCK_SIZE: int = 1,  # page_block_size = 1 for now
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,  # tile width along columns
+    out: Optional[torch.Tensor] = None,
 ):
     """
     out[token_id, indice_id] =
@@ -905,7 +911,10 @@ def triton_convert_req_index_to_global_index(
     token_indices_c = token_indices.contiguous()
     page_kv_indptr_c = page_kv_indptr.contiguous()
     # NOTE: MTP (max_seqlen_q > 1) uses triton_convert_req_index_to_global_index_dsa_prefill instead
-    new_kv_indices = torch.empty_like(kv_indices)
+    if out is not None:
+        new_kv_indices = out[: kv_indices.shape[0]]
+    else:
+        new_kv_indices = torch.empty_like(kv_indices)
 
     # Strides in elements
     ti_stride0, ti_stride1 = token_indices_c.stride()
@@ -1001,6 +1010,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     PAGE_SIZE: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
+    out: Optional[torch.Tensor] = None,
 ):
 
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
@@ -1012,9 +1022,13 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     num_tokens = dsa_qo_indptr.shape[0] - 1
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
-    new_kv_indices = torch.empty(
-        num_tokens * NUM_TOPK_TOKENS, dtype=torch.int32, device=topk_indices.device
-    )
+    total_out = num_tokens * NUM_TOPK_TOKENS
+    if out is not None:
+        new_kv_indices = out[:total_out]
+    else:
+        new_kv_indices = torch.empty(
+            total_out, dtype=torch.int32, device=topk_indices.device
+        )
 
     # Strides in elements
     ti_stride0, ti_stride1 = topk_indices.stride()
@@ -1096,6 +1110,7 @@ def triton_gather_kv_indices_sparse(
     kv_indptr: torch.Tensor,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,
+    out: Optional[torch.Tensor] = None,
 ):
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0
@@ -1103,9 +1118,13 @@ def triton_gather_kv_indices_sparse(
     num_tokens = token_to_seq_idxs.shape[0]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
-    out = torch.empty(
-        num_tokens * NUM_TOPK_TOKENS, dtype=torch.int32, device=topk_indices.device
-    )
+    total_out = num_tokens * NUM_TOPK_TOKENS
+    if out is not None:
+        out_buf = out[:total_out]
+    else:
+        out_buf = torch.empty(
+            total_out, dtype=torch.int32, device=topk_indices.device
+        )
 
     ti_stride0, ti_stride1 = topk_indices.stride()
     grid = (num_tokens, tiles_per_row)
@@ -1116,10 +1135,10 @@ def triton_gather_kv_indices_sparse(
         topk_indices,
         kv_indices,
         kv_indptr,
-        out,
+        out_buf,
         NUM_TOPK_TOKENS,
         BLOCK_N,
         ti_stride0,
         ti_stride1,
     )
-    return out
+    return out_buf
