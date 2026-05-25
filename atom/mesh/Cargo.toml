@@ -12,7 +12,7 @@ unused_qualifications = "warn"
 
 [lib]
 name = "mesh"
-crate-type = ["rlib"]
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "atom-mesh"
@@ -74,6 +74,7 @@ prost = "0.14.1"
 prost-types = "0.14.1"
 tonic-prost = "0.14.2"
 once_cell = "1.21.3"
+pyo3 = { version = "0.28.2", features = ["auto-initialize"] }
 
 
 [build-dependencies]

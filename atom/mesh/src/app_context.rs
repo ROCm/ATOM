@@ -15,6 +15,7 @@ use crate::{
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
+    python::atom_standalone::AtomStandaloneRuntime,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::router_manager::RouterManager,
     tokenizer::registry::TokenizerRegistry,
@@ -54,6 +55,7 @@ pub struct AppContext {
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
+    pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -80,6 +82,7 @@ pub struct AppContextBuilder {
     load_monitor: Option<Arc<LoadMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
+    atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
 }
 
 impl AppContext {
@@ -118,6 +121,7 @@ impl AppContextBuilder {
             load_monitor: None,
             worker_job_queue: None,
             workflow_engines: None,
+            atom_standalone_runtime: None,
         }
     }
 
@@ -205,6 +209,11 @@ impl AppContextBuilder {
         self
     }
 
+    pub fn atom_standalone_runtime(mut self, runtime: Option<Arc<AtomStandaloneRuntime>>) -> Self {
+        self.atom_standalone_runtime = runtime;
+        self
+    }
+
     pub fn build(self) -> Result<AppContext, AppContextBuildError> {
         let router_config = self
             .router_config
@@ -258,6 +267,7 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError("workflow_engines"))?,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
+            atom_standalone_runtime: self.atom_standalone_runtime,
         })
     }
 
