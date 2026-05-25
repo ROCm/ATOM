@@ -546,6 +546,15 @@ def _get_sparse_mla_plugin_metadata(attn_metadata_dict, k_cache_prefix: str):
     return None
 
 
+def get_sparse_mla_plugin_paged_kv_indices(k_cache_prefix: str) -> torch.Tensor:
+    from vllm.forward_context import get_forward_context as get_vllm_forward_context
+
+    attn_metadata_dict = get_vllm_forward_context().attn_metadata
+    return _get_sparse_mla_plugin_metadata(
+        attn_metadata_dict, k_cache_prefix
+    ).paged_kv_indices
+
+
 def sparse_attn_indexer_plugin_mode(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -559,6 +568,7 @@ def sparse_attn_indexer_plugin_mode(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
+    paged_kv_indices: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -780,7 +790,7 @@ def sparse_attn_indexer_plugin_mode(
         sparse_meta.block_table.to(dtype=torch.int32),
         topk_indices[: sparse_meta.num_actual_tokens].to(dtype=torch.int32),
         sparse_meta.paged_kv_indptr,
-        sparse_meta.paged_kv_indices,
+        paged_kv_indices,
         BLOCK_SIZE=sparse_meta.block_size,
         NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
     )
@@ -801,6 +811,7 @@ def sparse_attn_indexer_fake(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
+    paged_kv_indices: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -825,7 +836,7 @@ def sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer_plugin_mode",
     op_func=sparse_attn_indexer_plugin_mode,
-    mutates_args=[],
+    mutates_args=["paged_kv_indices"],
     fake_impl=sparse_attn_indexer_fake,
 )
 
@@ -842,6 +853,7 @@ def IndexerDecoratorForPluginMode(cls):
             self.sparse_attn_indexer_impl = (
                 torch.ops.aiter.sparse_attn_indexer_plugin_mode
             )
+            self._atom_vllm_sparse_indexer = True
 
     cls.__init__ = new_init
     cls._atom_vllm_indexer_decorated = True
