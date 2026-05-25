@@ -46,26 +46,65 @@ cargo build
 cargo build --release
 ```
 
-Artifacts: `target/release/atom-mesh`, `target/release/mesh`.
+Artifacts: `target/release/atom-mesh`, `target/release/libmesh.so`.
 
 ### Verify
 
 ```bash
-./target/release/mesh --version
+./target/release/atom-mesh --version
 ```
 
 ## Usage
 
+### Startup entrypoints
+
+ATOM Mesh can be started through either the original Rust binary or the Python entrypoint.
+
+Use the Rust binary when routing to external workers:
+
+```bash
+cd atom/mesh
+cargo build --release
+./target/release/atom-mesh launch \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware
+```
+
+Use the Python entrypoint when Python needs to own the ATOM engine and tokenizer. The Python entrypoint loads the Rust PyO3 module from `atom/mesh/target/{debug,release}/libmesh.so`, so build the Rust library first:
+
+```bash
+cd atom/mesh
+cargo build --release
+cd ../..
+
+python atom/mesh/src/python/server.py \
+  --model /path/to/model \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+The Python entrypoint can also run the normal mesh router with the same mesh arguments:
+
+```bash
+python atom/mesh/src/python/server.py launch \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware
+```
+
+For the Python entrypoint, `launch` selects mesh routing. Without `launch`, it defaults to ATOM standalone mode and constructs a Python-owned engine/tokenizer runtime.
+
 ### Regular HTTP routing
 
 ```bash
-mesh launch --worker-urls http://worker1:8000 http://worker2:8000 --policy cache_aware
+./target/release/atom-mesh launch \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware
 ```
 
 ### Prefill / decode disaggregation
 
 ```bash
-mesh launch --pd-disaggregation \
+./target/release/atom-mesh launch --pd-disaggregation \
   --prefill http://prefill1:30001 9001 \
   --prefill http://prefill2:30002 \
   --decode http://decode1:30011 \
@@ -78,7 +117,7 @@ Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cac
 ### gRPC routing
 
 ```bash
-mesh launch \
+./target/release/atom-mesh launch \
   --worker-urls grpc://worker1:31001 grpc://worker2:31002 \
   --tokenizer-path /path/to/tokenizer.json \
   --reasoning-parser deepseek-r1 \
@@ -156,7 +195,7 @@ Structured logging via `tracing`, optional file sink (`--log-dir`), and log leve
 Optional API key protection for router endpoints:
 
 ```bash
-mesh launch --api-key "your-secret-key" \
+./target/release/atom-mesh launch --api-key "your-secret-key" \
   --worker-urls http://worker1:8000 http://worker2:8000
 ```
 
