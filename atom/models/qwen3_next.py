@@ -395,11 +395,8 @@ class Qwen3NextAttention(nn.Module):
             **fusion_kwargs,
         )
 
-        self.use_fused_sigmoid_mul_quant = (
-            ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
-            and self.attn_output_gate
-            and self.o_proj.quant_type == QuantType.per_1x128
-        )
+        # P4: forced False — fused kernel is 414us/layer, std uses 109us with 2 small kernels
+        self.use_fused_sigmoid_mul_quant = False
 
     def forward(
         self,
