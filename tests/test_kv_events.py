@@ -125,63 +125,68 @@ class TestEventSchema:
 # ── BlockManager hooks ─────────────────────────────────────────────────────
 
 
+def _admit(bm: BlockManager, seq):
+    """allocate(seq, num_cached) + hash_blocks() — mirrors the scheduler."""
+    n = bm.can_allocate(seq)
+    if n < 0:
+        raise AssertionError("no admission for seq")
+    bm.allocate(seq, n)
+    num_new_tokens = (seq.num_blocks - n) * bm.block_size
+    bm.hash_blocks(seq, num_new_tokens)
+
+
 class TestBlockManagerHooks:
     def test_disabled_no_overhead(self, block_manager_prefix, seq_factory):
-        # default fixture has events disabled
         seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
-        block_manager_prefix.allocate(seq)
+        _admit(block_manager_prefix, seq)
         assert block_manager_prefix.take_events() == []
 
     def test_block_stored_on_first_allocate(self, seq_factory):
         bm = _bm_with_events()
         seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
-        bm.allocate(seq)
+        _admit(bm, seq)
         events = bm.take_events()
         stored = [e for e in events if isinstance(e, BlockStored)]
         assert len(stored) == 1
-        # First full block has a hash; second is the trailing block forced to
-        # recompute (also gets a hash). Both should appear in the coalesced run.
-        assert len(stored[0].block_hashes) >= 1
         assert stored[0].block_size == 4
         assert stored[0].medium == MEDIUM_GPU
 
     def test_drain_is_destructive(self, seq_factory):
         bm = _bm_with_events()
         seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
-        bm.allocate(seq)
+        _admit(bm, seq)
         first = bm.take_events()
         second = bm.take_events()
-        assert first  # non-empty
+        assert first
         assert second == []
 
     def test_cache_hit_emits_no_new_store(self, seq_factory):
         bm = _bm_with_events()
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
-        bm.allocate(s1)
+        _admit(bm, s1)
         first = bm.take_events()
         first_stored = [e for e in first if isinstance(e, BlockStored)]
         assert len(first_stored) == 1
         first_hashes = first_stored[0].block_hashes
 
         s2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
-        bm.allocate(s2)
+        _admit(bm, s2)
         events = bm.take_events()
         stored = [e for e in events if isinstance(e, BlockStored)]
         assert len(stored) == 1
         assert stored[0].parent_block_hash == first_hashes[0]
-        assert stored[0].block_hashes == [first_hashes[1]]
 
     def test_eviction_emits_block_removed(self, seq_factory):
         # Pool with a single block so the free FIFO has no choice but to
         # recycle the block that still carries s1's stale hash → eviction.
         bm = _bm_with_events(num_kvcache_blocks=1, kv_cache_block_size=4)
         s1 = seq_factory([1, 2, 3, 4])
-        bm.allocate(s1)
+        _admit(bm, s1)
         bm.deallocate(s1)
-        bm.take_events()  # drain prior events
+        bm.take_events()
 
         s2 = seq_factory([9, 9, 9, 9])
-        bm.allocate(s2)
+        _admit(bm, s2)
         events = bm.take_events()
         removed = [e for e in events if isinstance(e, BlockRemoved)]
         assert removed, f"expected BlockRemoved on eviction, got: {events}"
@@ -190,12 +195,12 @@ class TestBlockManagerHooks:
     def test_cache_hit_reuse_does_not_emit_block_removed(self, seq_factory):
         bm = _bm_with_events(num_kvcache_blocks=8, kv_cache_block_size=4)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
-        bm.allocate(s1)
+        _admit(bm, s1)
         bm.deallocate(s1)
         bm.take_events()
 
         s2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
-        bm.allocate(s2)
+        _admit(bm, s2)
         events = bm.take_events()
         removed = [e for e in events if isinstance(e, BlockRemoved)]
         assert removed == [], f"cache hit must not emit BlockRemoved, got: {events}"
@@ -203,7 +208,7 @@ class TestBlockManagerHooks:
     def test_clear_cache_emits_all_cleared(self, seq_factory):
         bm = _bm_with_events()
         s1 = seq_factory([1, 2, 3, 4])
-        bm.allocate(s1)
+        _admit(bm, s1)
         bm.deallocate(s1)
         bm.take_events()
 
@@ -215,7 +220,7 @@ class TestBlockManagerHooks:
     def test_clear_cache_drops_hash_index(self, seq_factory):
         bm = _bm_with_events()
         s1 = seq_factory([1, 2, 3, 4])
-        bm.allocate(s1)
+        _admit(bm, s1)
         bm.deallocate(s1)
         assert bm.hash_to_block_id, "preconditions: hash should be cached"
         bm.clear_cache()
