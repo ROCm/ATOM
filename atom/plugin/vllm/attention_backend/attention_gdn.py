@@ -16,6 +16,7 @@ from vllm.forward_context import get_forward_context
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
 # Two prefill kernel options, selected per-instance via use_vk_layout:
 #
 #   * vk (default for the plugin path): ATOM-vendored verbatim port of
@@ -216,9 +217,7 @@ class GatedDeltaNet(nn.Module):
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
         self.use_vk_layout = use_vk_layout
-        self.chunk_gated_delta_rule = ChunkGatedDeltaRule(
-            use_vk_layout=use_vk_layout
-        )
+        self.chunk_gated_delta_rule = ChunkGatedDeltaRule(use_vk_layout=use_vk_layout)
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:

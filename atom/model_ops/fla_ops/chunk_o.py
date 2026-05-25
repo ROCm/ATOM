@@ -178,8 +178,7 @@ def chunk_fwd_o(
             f"v.shape {tuple(v.shape)}"
         )
         assert o.dtype == v.dtype, (
-            f"chunk_fwd_o: caller-provided o.dtype {o.dtype} != v.dtype "
-            f"{v.dtype}"
+            f"chunk_fwd_o: caller-provided o.dtype {o.dtype} != v.dtype " f"{v.dtype}"
         )
         assert o.is_contiguous(), (
             "chunk_fwd_o: caller-provided o must be contiguous (kernel "

@@ -28,7 +28,6 @@ from .utils import SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
 
 
-
 def chunk_gated_delta_rule_fwd_vk(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -205,9 +204,9 @@ def chunk_gated_delta_rule_vk(
         )
     """
     assert q.dtype == k.dtype == v.dtype
-    assert q.dtype != torch.float32, (
-        "ChunkGatedDeltaRuleFunctionVk does not support float32. Please use bfloat16."
-    )
+    assert (
+        q.dtype != torch.float32
+    ), "ChunkGatedDeltaRuleFunctionVk does not support float32. Please use bfloat16."
     assert len(beta.shape) == 3, "beta must be of shape [B, T, H]."
     if q.shape[1] < q.shape[2]:
         warnings.warn(
@@ -240,12 +239,12 @@ def chunk_gated_delta_rule_vk(
             f"chunk_gated_delta_rule_vk: o.shape {tuple(o.shape)} != v.shape "
             f"{tuple(v.shape)}"
         )
-        assert o.dtype == v.dtype, (
-            f"chunk_gated_delta_rule_vk: o.dtype {o.dtype} != v.dtype {v.dtype}"
-        )
-        assert o.is_contiguous(), (
-            "chunk_gated_delta_rule_vk: caller-provided o must be contiguous"
-        )
+        assert (
+            o.dtype == v.dtype
+        ), f"chunk_gated_delta_rule_vk: o.dtype {o.dtype} != v.dtype {v.dtype}"
+        assert (
+            o.is_contiguous()
+        ), "chunk_gated_delta_rule_vk: caller-provided o must be contiguous"
 
     # Optional: dispatch to aiter's end-to-end flydsl prefill pipeline
     # (K1+K2 fused, K3+K4 fused, K5 flydsl, K6 chunk_fwd_o_opt_vk).
@@ -257,22 +256,7 @@ def chunk_gated_delta_rule_vk(
     # the dispatch through them. The inplace o= contract is forwarded
     # directly to aiter's flydsl_gdr_prefill via its `o=` parameter
     # (which threads into chunk_fwd_o_opt_vk via the same mechanism).
-    from atom.utils import envs
 
-    if False and _HAS_FLYDSL_GDR_PREFILL:
-        return flydsl_gdr_prefill(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            cu_seqlens=cu_seqlens,
-            o=o,
-        )
 
     o, final_state = ChunkGatedDeltaRuleFunctionVk.apply(
         q,

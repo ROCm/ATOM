@@ -257,12 +257,12 @@ def chunk_gated_delta_rule(
             f"chunk_gated_delta_rule: o.shape {tuple(o.shape)} != v.shape "
             f"{tuple(v.shape)}"
         )
-        assert o.dtype == v.dtype, (
-            f"chunk_gated_delta_rule: o.dtype {o.dtype} != v.dtype {v.dtype}"
-        )
-        assert o.is_contiguous(), (
-            "chunk_gated_delta_rule: caller-provided o must be contiguous"
-        )
+        assert (
+            o.dtype == v.dtype
+        ), f"chunk_gated_delta_rule: o.dtype {o.dtype} != v.dtype {v.dtype}"
+        assert (
+            o.is_contiguous()
+        ), "chunk_gated_delta_rule: caller-provided o must be contiguous"
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,

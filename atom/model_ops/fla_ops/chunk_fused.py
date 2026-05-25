@@ -24,6 +24,7 @@ Scope (Phase 1):
 
 Correctness reference: vllm.model_executor.layers.fla.ops.chunk_gated_delta_rule
 """
+
 from __future__ import annotations
 
 import torch
@@ -33,13 +34,11 @@ import triton.language as tl
 
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
-from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .l2norm import l2norm_fwd
 from .op import exp
 from .solve_tril import solve_tril
 from .utils import use_cuda_graph
 from .wy_fast import recompute_w_u_fwd
-
 
 # ---------------------------------------------------------------------------
 # Fused Phase-1 kernel: h-recurrence (vk layout) + per-chunk o-GEMM.
@@ -93,18 +92,18 @@ NUM_WARPS = [2, 4]
 @triton.jit(do_not_specialize=["T"])
 def chunk_fused_fwd_kernel_vk(
     # --- inputs (all needed by the recurrence) ---
-    q,           # [B, T, Hg, K]
-    k,           # [B, T, Hg, K]
-    u,           # [B, T, H,  V]  — the "new v" from recompute_w_u
-    w,           # [B, T, H,  K]  — the "corrected k weight" from recompute_w_u
-    g,           # [B, T, H]      — cumulative log-decay
-    h0,          # [N, H, V, K] fp32 or None
+    q,  # [B, T, Hg, K]
+    k,  # [B, T, Hg, K]
+    u,  # [B, T, H,  V]  — the "new v" from recompute_w_u
+    w,  # [B, T, H,  K]  — the "corrected k weight" from recompute_w_u
+    g,  # [B, T, H]      — cumulative log-decay
+    h0,  # [N, H, V, K] fp32 or None
     # --- outputs ---
-    ht,          # [N, H, V, K] fp32 or None  (final recurrent state)
-    o,           # [B, T, H, V] — the chunk-attention output (same dtype as q)
+    ht,  # [N, H, V, K] fp32 or None  (final recurrent state)
+    o,  # [B, T, H, V] — the chunk-attention output (same dtype as q)
     # --- ragged-batch metadata ---
     cu_seqlens,  # [N+1] int32 or None
-    scale,       # 1/sqrt(K), runtime scalar
+    scale,  # 1/sqrt(K), runtime scalar
     # --- compile-time shapes ---
     T,
     H: tl.constexpr,
@@ -268,9 +267,7 @@ def chunk_fused_fwd_kernel_vk(
         # Apply chunk-relative gating to the inter-chunk attn output and the
         # intra-chunk A. (Identical to chunk_fwd_kernel_o.)
         if USE_G:
-            p_g = tl.make_block_ptr(
-                g_p, (T,), (stride_g,), (i_t * BT,), (BT,), (0,)
-            )
+            p_g = tl.make_block_ptr(g_p, (T,), (stride_g,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
             b_o = b_o * exp(b_g)[:, None]
             b_A = b_A * exp(b_g[:, None] - b_g[None, :])
@@ -375,9 +372,7 @@ def chunk_fused_fwd_kernel_vk(
     # ----- epilogue: write final recurrent state -----
     if STORE_FINAL_STATE:
         ht_p = ht + (i_n * H + i_h) * V * K
-        p_ht1 = tl.make_block_ptr(
-            ht_p, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
-        )
+        p_ht1 = tl.make_block_ptr(ht_p, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         tl.store(p_ht1, b_h1.to(p_ht1.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
             p_ht2 = tl.make_block_ptr(
@@ -428,9 +423,7 @@ def chunk_gated_delta_rule_fused(
         "Use bfloat16 / float16; chunk_gated_delta_rule_fused does not "
         "support fp32 inputs."
     )
-    assert beta.dim() == 3, (
-        f"beta must be [B, T, H]; got shape {tuple(beta.shape)}"
-    )
+    assert beta.dim() == 3, f"beta must be [B, T, H]; got shape {tuple(beta.shape)}"
 
     if cu_seqlens is not None:
         assert q.shape[0] == 1, (
@@ -478,9 +471,9 @@ def chunk_gated_delta_rule_fused(
     H = v.shape[-2]
     V = v.shape[-1]
     BT = 64  # algorithmic chunk size (must match the prologue's chunk_size)
-    assert K <= 256, (
-        f"chunk_fused: K must be <= 256 (got {K}); kernel only has 4 K-tiles."
-    )
+    assert (
+        K <= 256
+    ), f"chunk_fused: K must be <= 256 (got {K}); kernel only has 4 K-tiles."
 
     # N (# sequences) is already computed above based on cu_seqlens vs B.
 
