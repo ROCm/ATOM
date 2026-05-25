@@ -63,7 +63,6 @@ docker run \
   --device=/dev/kfd \
   --device=/dev/dri \
   --group-add video \
-  --group-add keep-groups \
   --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined \
   -v /data:/data \

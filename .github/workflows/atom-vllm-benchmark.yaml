@@ -1412,7 +1412,7 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
+            --ipc=host --group-add video --group-add keep-groups \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \

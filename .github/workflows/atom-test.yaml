@@ -390,7 +390,7 @@ jobs:
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           $MODEL_MOUNT \
           -w /workspace \
-          --ipc=host --group-add video --group-add keep-groups \
+          --ipc=host --group-add video \
           --shm-size=16G \
           --privileged \
           --cap-add=SYS_PTRACE \
