@@ -23,8 +23,12 @@ def _install_attention_import_stubs(monkeypatch):
     parallel_state.get_tp_group = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
 
-    atom_config = sys.modules["atom.config"]
-    atom_config.get_current_atom_config = lambda: None
+    atom_config = types.ModuleType("atom.config")
+    monkeypatch.setitem(sys.modules, "atom.config", atom_config)
+    monkeypatch.setattr(atom_config,
+                        "get_current_atom_config",
+                        lambda: None,
+                        raising=False)
 
     attention_mha = types.ModuleType("atom.model_ops.attention_mha")
     attention_mha.PagedAttentionImpl = object
