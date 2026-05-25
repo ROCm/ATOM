@@ -154,8 +154,8 @@ def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
     match exactly; ``matmul_ogs`` is commutative over per-expert slices
     so the MoE output is unchanged (up to FP non-associativity).
     """
-    if not has_triton_kernels():
-        return routing_from_topk(topk_weights, topk_ids, n_expts_tot)
+    # if not has_triton_kernels():
+    #     return routing_from_topk(topk_weights, topk_ids, n_expts_tot)
 
     n_tokens, n_expts_act = topk_weights.shape
     n_gates_pad = n_tokens * n_expts_act
@@ -174,11 +174,12 @@ def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
         RoutingData,
     )
 
-    from moe_utils import compute_expt_data
+    from atom.model_ops.moe_utils import compute_expt_data
+    from triton import next_power_of_2
 
     m = n_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
-    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    block_m = max(16, min(next_power_of_2(tokens_per_expt), 128))
     expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad, block_m)
 
     routing_data = RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
@@ -504,8 +505,7 @@ def triton_kernel_fused_experts(
             gammas=None if apply_router_weight_on_input else gammas,
             swizzle_mx_scale=w2_swizzle_layout,
         )
-        logger.warning("out")
-        logger.warning("output")
+
         return output_tensor
 
     output_tensor = output_tensor.view(M, K) 
