@@ -555,8 +555,9 @@ class Scheduler:
             `max_model_len // block_size` cols and would crash with a
             broadcast error at prepare-time. (Checked first since it's the
             usual actionable cause.)
-          - prompt longer than `max_num_batched_tokens` → no single prefill
-            forward can ever fit it
+          - prompt longer than `max_num_batched_tokens` AND chunked prefill
+            disabled → no single prefill forward can ever fit it (with chunked
+            prefill enabled, the prompt is split across steps and this is fine)
           - prompt's KV blocks (+ per-req cache reservation) exceed the total
             pool size → never fits even on a fully empty pool
 
@@ -570,11 +571,11 @@ class Scheduler:
                 f"input tokens={num_tokens} > max_model_len={self.max_model_len}. "
                 f"Increase --max-model-len or shorten the prompt."
             )
-        if num_tokens > self.max_num_batched_tokens:
+        if not self.enable_chunked_prefill and num_tokens > self.max_num_batched_tokens:
             return (
                 f"input tokens={num_tokens} > max_num_batched_tokens="
-                f"{self.max_num_batched_tokens}. Increase --max-num-batched-tokens "
-                f"or shorten the prompt."
+                f"{self.max_num_batched_tokens}. Increase --max-num-batched-tokens, "
+                f"enable chunked prefill, or shorten the prompt."
             )
         bm = self.block_manager
         total_blocks = len(bm.blocks)
