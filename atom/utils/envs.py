@@ -35,6 +35,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    # Route unquantized BF16/FP16 dense linears through aiter's Triton
+    # gemm_a16w16 instead of the auto-tuned `tgemm.mm` (which picks aiter's
+    # HIP asm bf16gemm on gfx950). For gpt-oss-120b on 1 GPU this swaps
+    # ~7% of runtime from aiter-hip to Triton with no correctness regression.
+    "ATOM_USE_TRITON_BF16_DENSE": lambda: (
+        os.getenv("ATOM_USE_TRITON_BF16_DENSE", "0") == "1"
+    ),
     # --- Kernel Fusion Toggles ---
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.

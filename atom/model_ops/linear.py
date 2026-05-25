@@ -526,12 +526,32 @@ class LinearBase(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
-            y = tgemm.mm(
-                x,
-                self.weight,
-                self.bias,
-                otype=otype,
-            )
+            if (
+                envs.ATOM_USE_TRITON_BF16_DENSE
+                and x.dtype in (torch.bfloat16, torch.float16)
+                and self.weight.dim() == 2
+                and not getattr(self.weight, "is_shuffled", False)
+            ):
+                from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
+                    gemm_a16w16 as _triton_gemm,
+                )
+
+                out_dtype = otype if otype is not None else x.dtype
+                if x.dim() == 2:
+                    y = _triton_gemm(x, self.weight, bias=self.bias, dtype=out_dtype)
+                else:
+                    flat = x.reshape(-1, x.shape[-1])
+                    tmp = _triton_gemm(
+                        flat, self.weight, bias=self.bias, dtype=out_dtype
+                    )
+                    y = tmp.view(*x.shape[:-1], self.weight.shape[0])
+            else:
+                y = tgemm.mm(
+                    x,
+                    self.weight,
+                    self.bias,
+                    otype=otype,
+                )
         else:
             if x_scale is None:
                 quant_func = self.quant_func
