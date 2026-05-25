@@ -604,14 +604,15 @@ class Scheduler:
                 continue
 
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            num_cached_blocks = self.block_manager.can_allocate(seq)
             if (
                 num_batched_tokens + num_new_tokens > self.max_num_batched_tokens
-                or not self.block_manager.can_allocate(seq)
+                or num_cached_blocks < 0
             ):
                 self.waiting.appendleft(seq)
                 break
 
-            self.block_manager.allocate(seq)
+            self.block_manager.allocate(seq, num_cached_blocks)
 
             if self.kv_connector is not None:
                 self.kv_connector.update_state_after_alloc(seq)
@@ -786,6 +787,17 @@ class Scheduler:
             idx = fwd_output.get_idx(seq.id)
             if idx is None:
                 continue
+            # Register prefix-cache hashes for blocks the prefill step just
+            # finalized. Deferred from BlockManager.allocate() so a hash is
+            # only published after the block's KV has actually been computed
+            # by the forward — keeps the block manager correct under future
+            # chunked-prefill scheduling where one block may span multiple
+            # steps. Must run before any seq state update so num_cached_tokens
+            # and block_table still reflect the pre-step view.
+            if seq.type == SequenceType.PREFILL:
+                self.block_manager.hash_blocks(
+                    seq, seq.num_tokens - seq.num_cached_tokens
+                )
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
             if is_deferred_out or self.use_spec:
