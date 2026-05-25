@@ -34,7 +34,6 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 #     escape hatch (e.g. for A/B layout experiments). Selecting it on the
 #     plugin path will corrupt the prefill→decode ssm_state round-trip.
 from atom.model_ops.fla_ops.chunk_vk import chunk_gated_delta_rule_vk
-from atom.model_ops.fla_ops.chunk import chunk_gated_delta_rule as _chunk_gated_delta_rule_kv
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -65,11 +64,7 @@ class ChunkGatedDeltaRule(nn.Module):
     def __init__(self, use_vk_layout: bool = True) -> None:
         super().__init__()
         self.use_vk_layout = use_vk_layout
-        self._fla_chunk_gated_delta_rule = (
-            chunk_gated_delta_rule_vk
-            if use_vk_layout
-            else _chunk_gated_delta_rule_kv
-        )
+        self._fla_chunk_gated_delta_rule = chunk_gated_delta_rule_vk
 
     def forward(
         self,
