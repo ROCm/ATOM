@@ -308,7 +308,7 @@ class MLASparseAttentionImplPluginModeMethods:
             output,
             sparse_meta.qo_indptr,
             sparse_meta.paged_kv_indptr,
-            sparse_meta.paged_kv_indices,
+            self.sparse_kv_indices_buffer,
             sparse_meta.paged_kv_last_page_len,
             1,
             sm_scale=self.scale,
@@ -781,7 +781,7 @@ def sparse_attn_indexer_plugin_mode(
         sparse_meta.block_table.to(dtype=torch.int32),
         topk_indices[: sparse_meta.num_actual_tokens].to(dtype=torch.int32),
         sparse_meta.paged_kv_indptr,
-        sparse_meta.paged_kv_indices,
+        sparse_kv_indices_buffer,
         BLOCK_SIZE=sparse_meta.block_size,
         NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
     )
