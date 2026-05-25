@@ -165,7 +165,7 @@ jobs:
           echo "Starting container: atom_release_ci (image: atom_release:ci)"
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-            --ipc=host --group-add video \
+            --ipc=host --group-add video --group-add keep-groups \
             --shm-size 16g \
             --cap-add=SYS_PTRACE \
             -e HF_TOKEN="${HF_TOKEN:-}" \

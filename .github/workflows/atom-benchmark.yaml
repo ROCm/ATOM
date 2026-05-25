@@ -212,7 +212,7 @@ jobs:
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
-            -w /workspace --ipc=host --group-add video \
+            -w /workspace --ipc=host --group-add video --group-add keep-groups \
             --shm-size=16G --privileged --cap-add=SYS_PTRACE \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --security-opt seccomp=unconfined \
@@ -587,7 +587,7 @@ jobs:
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
-            -w /workspace --ipc=host --group-add video \
+            -w /workspace --ipc=host --group-add video --group-add keep-groups \
             --shm-size=16G --privileged --cap-add=SYS_PTRACE \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --security-opt seccomp=unconfined \

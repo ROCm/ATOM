@@ -109,6 +109,7 @@ jobs:
             --network=host \
             --device=/dev/kfd $DEVICE_FLAG \
             --group-add video \
+            --group-add keep-groups \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
             $MOUNT_FLAGS \
