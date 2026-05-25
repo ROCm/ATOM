@@ -253,10 +253,11 @@ class tokenIDProcessor:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
-            ret = {
-                seq_id: self._process_token_id(token_id)
-                for seq_id, token_id in zip(req_ids, token_ids)
-            }
+            if token_ids and isinstance(token_ids[0], list):
+                processed = self._batch_process_token_ids(token_ids)
+            else:
+                processed = [(tid,) for tid in token_ids]
+            ret = dict(zip(req_ids, processed))
             ret[-1] = 0  # is_deferred_out flag
             logprobs_map = None
             if sampled_logprobs is not None:
@@ -279,10 +280,14 @@ class tokenIDProcessor:
         self.prev_req_ids = None
         if self.prev_batch is not None:
             self.prev_req_ids = self.prev_batch.req_ids
-            token_id_dict = {
-                seq_id: self._process_token_id(token_id)
-                for seq_id, token_id in zip(self.prev_req_ids, token_ids)
-            }
+            token_ids_list = (
+                token_ids.tolist() if hasattr(token_ids, "tolist") else token_ids
+            )
+            if token_ids_list and isinstance(token_ids_list[0], list):
+                processed = self._batch_process_token_ids(token_ids_list)
+            else:
+                processed = [(tid,) for tid in token_ids_list]
+            token_id_dict = dict(zip(self.prev_req_ids, processed))
             if logprobs is not None:
                 logprobs_map = {
                     seq_id: logprob
