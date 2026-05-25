@@ -834,21 +834,17 @@ class Scheduler:
             num_placeholder += 1
 
         for seq in self.running:
-            # Update the running status
-            idx = fwd_output.get_idx(seq.id)
-            if idx is None:
-                continue
             # Register prefix-cache hashes for blocks the prefill step just
-            # finalized. Deferred from BlockManager.allocate() so a hash is
-            # only published after the block's KV has actually been computed
-            # by the forward — keeps the block manager correct under future
-            # chunked-prefill scheduling where one block may span multiple
-            # steps. Must run before any seq state update so num_cached_tokens
-            # and block_table still reflect the pre-step view.
+            # finalized. Must run before the `idx is None` skip so the hash
+            # is registered on the prefill step (fwd_output's idx mapping
+            # populates from the decode step onward).
             if seq.type == SequenceType.PREFILL:
                 self.block_manager.hash_blocks(
                     seq, seq.num_tokens - seq.num_cached_tokens
                 )
+            idx = fwd_output.get_idx(seq.id)
+            if idx is None:
+                continue
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
             if is_deferred_out or self.use_spec:
