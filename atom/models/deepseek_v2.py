@@ -1021,7 +1021,6 @@ def sparse_attn_indexer(
         dtype=torch.int32,
         device=hidden_states.device,
     )
-    topk_indices[:] = -1
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
     attn_metadata = forward_context.attn_metadata

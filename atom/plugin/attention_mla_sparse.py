@@ -576,7 +576,6 @@ def sparse_attn_indexer_plugin_mode(
         dtype=torch.int32,
         device=hidden_states.device,
     )
-    topk_indices[:] = -1
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
