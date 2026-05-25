@@ -1302,8 +1302,6 @@ mod pd_mode_tests {
         let prefill_url = prefill_worker.start().await.unwrap();
         let decode_url = decode_worker.start().await.unwrap();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
         // Extract port from prefill URL
         let prefill_port = prefill_url
             .split(':')
