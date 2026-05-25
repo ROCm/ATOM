@@ -67,9 +67,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight bandwidth at the cost of ~0.5% accuracy noise; biggest win on
     # bandwidth-constrained devices (e.g. gfx1201/RDNA4). Set to 0 to force
     # the BF16 tgemm path.
-    "ATOM_LM_HEAD_FP8": lambda: (
-        os.getenv("ATOM_LM_HEAD_FP8", "1") == "1"
-    ),
+    "ATOM_LM_HEAD_FP8": lambda: (os.getenv("ATOM_LM_HEAD_FP8", "1") == "1"),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",

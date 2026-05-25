@@ -5,7 +5,6 @@ import torch
 from typing import Optional
 from torch import nn
 import torch.nn.functional as F
-from aiter import silu_and_mul
 from atom.config import QuantizationConfig
 from atom.quant_spec import LayerQuantConfig
 from aiter.jit.utils.torch_guard import torch_compile_guard
