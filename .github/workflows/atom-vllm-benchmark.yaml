@@ -476,6 +476,8 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
@@ -1137,8 +1139,10 @@ jobs:
           fi
 
       - name: Persist benchmark matrix payload
+        env:
+          BENCHMARK_MATRIX: ${{ steps.build.outputs.benchmark_matrix }}
         run: |
-          printf '%s' '${{ steps.build.outputs.benchmark_matrix }}' > benchmark_matrix.json
+          printf '%s' "${BENCHMARK_MATRIX}" > benchmark_matrix.json
 
       - name: Upload benchmark matrix payload
         uses: actions/upload-artifact@v7

@@ -115,24 +115,40 @@ python -m atom.benchmarks.benchmark_serving \
 ```
 
 Performance on 8xMI355X GPUs with the following environment:
-- Date measured: 2026-05-07.
+- Date measured: 2026-05-23.
 - Docker image: rocm/atom:latest.
-- ATOM: main branch (commit 33c54649).
+- ATOM: `feat/v4-swa-write-tok-n-guard-opus-default` branch (commit bf9b133e).
 - `ATOM_USE_TRITON_MOE=1`, `--kv_cache_dtype fp8`.
 
 The numbers below are a snapshot. For the latest data tracked across commits, see [rocm.github.io/ATOM/benchmark-dashboard](https://rocm.github.io/ATOM/benchmark-dashboard/).
 
-### FP8 (TP8, FP8 KV Cache)
+### FP8 (TP8, FP8 KV Cache) — no MTP
 
 | ISL  | OSL  | Concurrency | Num Prompts | Output Throughput (tok/s) | Total Throughput (tok/s) | Mean TPOT (ms) |
 | ---- | ---- | ----------- | ----------- | ------------------------- | ------------------------ | -------------- |
-| 1024 | 1024 | 4           | 40          | 111.03                    | 222.06                   | 35.67          |
-| 1024 | 1024 | 8           | 80          | 196.19                    | 392.39                   | 40.25          |
-| 1024 | 1024 | 16          | 160         | 369.79                    | 739.59                   | 42.36          |
-| 1024 | 1024 | 32          | 320         | 660.31                    | 1320.62                  | 46.85          |
-| 1024 | 1024 | 64          | 640         | 1138.68                   | 2277.37                  | 53.64          |
-| 1024 | 1024 | 128         | 1280        | 1888.45                   | 3776.90                  | 63.41          |
-| 1024 | 1024 | 256         | 2560        | 2926.71                   | 5853.41                  | 79.66          |
+| 1024 | 1024 | 4           | 40          | 195.31                    | 392.53                   | 19.66          |
+| 1024 | 1024 | 8           | 80          | 367.43                    | 732.14                   | 21.09          |
+| 1024 | 1024 | 16          | 160         | 668.02                    | 1343.15                  | 23.19          |
+| 1024 | 1024 | 32          | 320         | 1145.71                   | 2287.81                  | 26.90          |
+| 1024 | 1024 | 64          | 640         | 1808.69                   | 3618.19                  | 33.96          |
+| 1024 | 1024 | 128         | 1280        | 2847.24                   | 5700.73                  | 43.26          |
+| 1024 | 1024 | 256         | 2560        | 4289.93                   | 8575.71                  | 57.55          |
+
+### FP8 (TP8, FP8 KV Cache) — MTP-3
+
+Add `--method mtp --num-speculative-tokens 3` to the server launch. MTP-3
+trades a small amount of memory for ~1.5–2× lower TPOT and ~1.3–1.5×
+higher total throughput at the same concurrency.
+
+| ISL  | OSL  | Concurrency | Num Prompts | Output Throughput (tok/s) | Total Throughput (tok/s) | Mean TPOT (ms) |
+| ---- | ---- | ----------- | ----------- | ------------------------- | ------------------------ | -------------- |
+| 1024 | 1024 | 4           | 40          | 528.46                    | 1061.26                  | 7.25           |
+| 1024 | 1024 | 8           | 80          | 907.09                    | 1806.44                  | 8.17           |
+| 1024 | 1024 | 16          | 160         | 1391.13                   | 2795.02                  | 10.95          |
+| 1024 | 1024 | 32          | 320         | 2159.04                   | 4308.13                  | 14.01          |
+| 1024 | 1024 | 64          | 640         | 3222.33                   | 6441.40                  | 18.75          |
+| 1024 | 1024 | 128         | 1280        | 4376.29                   | 8755.90                  | 27.77          |
+| 1024 | 1024 | 256         | 2560        | 5701.20                   | 11388.96                 | 43.06          |
 
 Here are the steps to reinstall ATOM/AITER in the docker, if you are trying to verify with other specific commits:
 ```bash
@@ -163,7 +179,18 @@ lm_eval \
   --num_fewshot 5
 ```
 
-Reference accuracy on 8xMI355X GPUs (FP8, FP8 KV Cache, `ATOM_USE_TRITON_MOE=1`):
+Reference accuracy on 8xMI355X GPUs (FP8, FP8 KV Cache, `ATOM_USE_TRITON_MOE=1`,
+measured 2026-05-23 at commit bf9b133e):
+
+**no MTP**:
+```
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9553|±  |0.0057|
+|     |       |strict-match    |     5|exact_match|↑  |0.9560|±  |0.0056|
+```
+
+**MTP-3** (`--method mtp --num-speculative-tokens 3`, average acceptance ≈ 64.5%):
 ```
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|

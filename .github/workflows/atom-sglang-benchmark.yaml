@@ -90,6 +90,8 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           INPUT_SGLANG_IMAGE: ${{ inputs.sglang_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
         run: |
