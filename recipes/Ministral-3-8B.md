@@ -44,39 +44,6 @@ syncs, which silently corrupt cudagraph capture on ROCm (HIP graph
 capture does not raise on illegal-during-capture ops the way CUDA
 does — see pytorch#155684).
 
-## One-shot image setup (per fresh container)
-
-Aiter ships per-arch tuned GEMM configs but only for gfx94x/95x/1250.
-Symlink the gfx1250 (sibling RDNA4) configs as gfx1201 placeholders:
-
-```bash
-cd /app/aiter-test/aiter/ops/triton/configs/gemm
-for f in gfx1250-*.json; do
-  ln -s "$f" "gfx1201-${f#gfx1250-}"
-done
-```
-
-This is the only image-side setup. Everything else is in the repo.
-
-## Required setup (run once per fresh container)
-
-aiter ships **zero** gfx1201 GEMM tuned configs. Without aliasing the
-gfx1250 ones to gfx1201, the autotuner falls back to a default that is
-**~50% slower** at 8B-class shapes (Mistral TPOT 22 ms with this step,
-32.5 ms without — verified end-to-end on `rocm/atom-dev:latest` digest
-`sha256:b704d9a8...`). Run once after starting the container:
-
-```bash
-bash scripts/gfx1201/setup_aiter_configs.sh
-```
-
-This creates 24 symlinks from `gfx1201-*.json` to `gfx1250-*.json` in
-`/app/aiter-test/aiter/ops/triton/configs/gemm/`. Idempotent. The Qwen3
-`gemm_a16w8_blockscale` path overrides its config in code (see
-`atom/model_ops/linear.py`) so it works even without this step, but
-Mistral-3 needs it for full perf.
-
-
 ## Optional perf env: lm_head FP8 (gfx1201)
 
 `ATOM_LM_HEAD_FP8=1` (default on) lazily quantizes the

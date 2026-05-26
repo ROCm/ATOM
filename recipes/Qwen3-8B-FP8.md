@@ -29,25 +29,6 @@ for gfx94x/95x, so the kernel launch SIGSEGVs on gfx1201 at first
 forward. `ATOM_USE_UNIFIED_ATTN=1` routes through `TritonMHABackend`
 which uses aiter triton `unified_attention` (JIT-compiled per arch).
 
-### 2. Alias gfx1250 GEMM tuning configs
-
-aiter ships **zero** gfx1201 GEMM tuned configs. Without aliasing the
-gfx1250 ones to gfx1201, the autotuner falls back to a default that is
-**~50% slower** at 8B-class shapes (Mistral TPOT 22 ms with this step,
-32.5 ms without — verified end-to-end on `rocm/atom-dev:latest` digest
-`sha256:b704d9a8...`). Run once after starting the container:
-
-```bash
-bash scripts/gfx1201/setup_aiter_configs.sh
-```
-
-This creates 24 symlinks from `gfx1201-*.json` to `gfx1250-*.json` in
-`/app/aiter-test/aiter/ops/triton/configs/gemm/`. Idempotent. The Qwen3
-`gemm_a16w8_blockscale` path overrides its config in code (see
-`atom/model_ops/linear.py`) so it works even without this step, but
-Mistral-3 needs it for full perf.
-
-
 ## Optional perf env: lm_head FP8 (gfx1201)
 
 `ATOM_LM_HEAD_FP8=1` (default on) lazily quantizes the
@@ -165,8 +146,9 @@ weight in DRAM (no activation quant overhead on the host either).
 
 ### Custom config to fit gfx1201's 64 KiB shared mem
 
-The shipped `gfx1201-GEMM-A16W8_BLOCKSCALE.json` picks `BLOCK_N=256` which needs
-~98 KiB shared mem and JIT-fails. We override at the call site:
+aiter has no gfx1201-tuned `GEMM-A16W8_BLOCKSCALE` config; the autotune
+default picks `BLOCK_N=256` which needs ~98 KiB shared mem and JIT-fails on
+gfx1201 (64 KiB LDS). We override at the call site:
 
 ```python
 {
