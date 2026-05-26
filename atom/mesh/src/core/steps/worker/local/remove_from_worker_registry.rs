@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    core::steps::workflow_data::WorkerRemovalWorkflowData, observability::metrics::Metrics,
+    core::steps::workflow_data::WorkerRemovalWorkflowData, observability::metrics::MeshMetrics,
 };
 
 /// Step to remove workers from the worker registry.
@@ -86,7 +86,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
                 )
                 .len();
 
-            Metrics::set_worker_pool_size(
+            MeshMetrics::set_worker_pool_size(
                 worker_type_label,
                 connection_mode_label,
                 &model_id,

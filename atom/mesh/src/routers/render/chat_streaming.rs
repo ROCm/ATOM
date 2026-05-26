@@ -13,7 +13,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
 use crate::{
-    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    observability::metrics::{metrics_labels, MeshMetrics, StreamingMetricsParams},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
         common::{FunctionCallDelta, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage},
@@ -354,7 +354,7 @@ async fn run_chat_stream(
 
     stream.mark_completed();
 
-    Metrics::record_streaming_metrics(StreamingMetricsParams {
+    MeshMetrics::record_streaming_metrics(StreamingMetricsParams {
         router_type: metrics_labels::ROUTER_GRPC,
         backend_type: cfg.backend_label,
         model_id: model,
