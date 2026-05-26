@@ -1513,6 +1513,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 device=self.device,
             )
             kv_lens = seq_lens + self.num_draft_tokens if self.use_mla else seq_lens
+            target_verify_kv_len_sum = seq_lens_sum + self.num_draft_tokens * bs
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
@@ -1559,7 +1560,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    target_verify_kv_len_sum,
                     None,
                     None,
                     work_metadata=work_metadata,
@@ -1592,7 +1593,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    target_verify_kv_len_sum,
                     None,
                     None,
                     custom_mask=custom_mask,
@@ -1658,7 +1659,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    seq_lens_sum,
                     None,
                     None,
                     work_metadata=work_metadata,
@@ -1743,7 +1744,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    seq_lens_sum,
                     None,
                     None,
                     work_metadata=work_metadata,
