@@ -7,6 +7,7 @@ import torch
 
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
+from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import kv_indices_generate_triton
@@ -1715,6 +1716,29 @@ class AiterMLASparseMetadataBuilder(
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
+        default_sfc = get_current_atom_config().compilation_config.static_forward_context
+        vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
+        for layer_name in layer_names or []:
+            attention_prefix = (
+                layer_name[: -len(".attn")]
+                if layer_name.endswith(".attn")
+                else layer_name
+            )
+            indexer_cache = vllm_sfc.get(f"{attention_prefix}.indexer.k_cache")
+            owner_atom_config = getattr(indexer_cache, "atom_config", None)
+            sfc = (
+                owner_atom_config.compilation_config.static_forward_context
+                if owner_atom_config is not None
+                else default_sfc
+            )
+            indexer = sfc.get(f"{attention_prefix}.indexer")
+            if indexer is not None:
+                indexer.sparse_kv_indices_buffer = self.paged_kv_indices
+            sparse_attn = sfc.get(attention_prefix)
+            if sparse_attn is not None and hasattr(
+                sparse_attn, "sparse_kv_indices_buffer"
+            ):
+                sparse_attn.sparse_kv_indices_buffer = self.paged_kv_indices
 
         (
             (work_meta_data_size, work_meta_data_type),

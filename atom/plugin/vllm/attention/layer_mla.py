@@ -22,9 +22,6 @@ from atom.plugin.vllm.attention.mla_impl import (
     reorg_kvcache,
     use_triton_gemm,
 )
-from atom.plugin.vllm.attention.mla_sparse_impl import (
-    triton_convert_req_index_to_global_index,
-)
 from atom.utils import envs
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -146,7 +143,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
         self._is_sparse_mla = False
 
-        if getattr(self, "topk_indices_buffer", None) is not None:
+        if getattr(self, "is_sparse_mla", False):
             self.supports_quant_query_input = False
             self.dcp_world_size = -1
             self.is_aiter_triton_fp4_bmm_enabled = (
@@ -158,10 +155,6 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
             self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
             self.head_repeat_factor = self.padded_num_heads // self.num_heads
-            assert self.topk_indices_buffer is not None, (
-                "topk_indices_buffer must be set for sparse MLA plugin mode. "
-                "Ensure the model's Indexer is properly initialized."
-            )
             self._is_sparse_mla = True
         self.q_pad_num_heads = getattr(self, "q_pad_num_heads", None)
         _register_vllm_static_forward_context(self)
@@ -1130,21 +1123,6 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         if self.head_repeat_factor > 1:
             q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
 
-        assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
-
-        req_id_i32 = sparse_meta.req_id_per_token.to(dtype=torch.int32)
-        block_table_i32 = sparse_meta.block_table.to(dtype=torch.int32)
-        topk_indices_i32 = topk_indices.to(dtype=torch.int32)
-        triton_convert_req_index_to_global_index(
-            req_id_i32,
-            block_table_i32,
-            topk_indices_i32,
-            sparse_meta.paged_kv_indptr,
-            sparse_meta.paged_kv_indices,
-            BLOCK_SIZE=sparse_meta.block_size,
-            NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
-        )
         if fp8_attention:
             from vllm import _custom_ops as ops
 
