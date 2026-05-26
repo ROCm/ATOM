@@ -444,6 +444,8 @@ RUN git clone $ATOM_REPO /app/ATOM && \
     pip install -e .
 RUN pip show atom || true
 
+RUN pip install --no-cache-dir msgpack msgspec quart
+
 # atom-mesh: build Rust binary, strip, install to /usr/local/bin
 RUN echo "========== Build atom-mesh ==========" && \
     rustup update stable && rustup default stable && \
