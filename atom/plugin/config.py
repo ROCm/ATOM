@@ -1,5 +1,4 @@
 import copy
-import os
 from typing import Any, Optional
 from dataclasses import dataclass
 
@@ -328,7 +327,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         torch_profiler_dir=None,
         compilation_config=sgl_compilation_config,
         asyncio_mode=False,
-        load_dummy=bool(os.environ.get("LOAD_DUMMY", "")),
+        load_dummy=False,
         enable_expert_parallel=bool(server_args.ep_size > 1),
         master_addr=None,
         enable_dp_attention=server_args.enable_dp_attention,
