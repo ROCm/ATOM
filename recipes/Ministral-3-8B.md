@@ -5,6 +5,15 @@ RDNA4 GPU. All-triton path; the default `AiterBackend` SIGSEGVs on
 gfx1201 because the prebuilt aiter HIP `.so` files in
 `rocm/atom-dev:latest` ship code objects only for gfx94x/95x.
 
+## Model
+
+[`mistralai/Ministral-3-8B-Instruct-2512`](https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512) — gated, requires accepting the license on the model page and setting `HF_TOKEN`.
+
+```bash
+hf download mistralai/Ministral-3-8B-Instruct-2512 \
+  --local-dir /mnt/sda1/carhuang/models/Ministral-3-8B-Instruct-2512
+```
+
 ## Required env
 
 ```bash
