@@ -14,7 +14,6 @@ pub use crate::protocols::UNKNOWN_MODEL_ID;
 pub mod circuit_breaker;
 pub mod error;
 pub mod job_queue;
-pub mod metrics_aggregator;
 pub mod placement;
 pub mod retry;
 pub mod steps;

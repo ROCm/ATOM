@@ -32,7 +32,7 @@
 use std::sync::Arc;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
-use crate::{core::Worker, observability::metrics::Metrics};
+use crate::{core::Worker, observability::metrics::MeshMetrics};
 
 /// Configuration for the PrefixHash load balancing policy
 #[derive(Debug, Clone)]
@@ -229,7 +229,7 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
-        Metrics::record_worker_prefix_hash_policy_branch(branch.as_str());
+        MeshMetrics::record_worker_prefix_hash_policy_branch(branch.as_str());
         result
     }
 
