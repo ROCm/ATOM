@@ -58,6 +58,20 @@ from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 
+# FP8 KV cache (1xGROUP_SIZE block-scale quantization).
+#
+# Storage: unified_kv[total_pages, D] in e4m3fnuz + kv_scales[total_pages,
+# D // GROUP_SIZE] in fp32. Per-slot, D is split into NUM_GROUPS chunks of
+# GROUP_SIZE elements; each chunk shares one fp32 scale.
+# Dequant in-kernel: kv_bf16 = kv_fp8.to(fp32) * scale[d // GROUP_SIZE], cast
+# back to q.dtype before the second dot.
+#
+# GROUP_SIZE=64 matches the user's 1x64 quant spec. V4-Pro: D=512 → 8 scales
+# per slot, 4 bytes each → +6.25% storage on top of the fp8 pool (vs the
+# halving from bf16→fp8 = 2× saving — net ~46% read bandwidth reduction).
+_FP8_GROUP_SIZE = 64
+_FP8_DTYPE = torch.float8_e4m3fnuz
+
 
 @functools.lru_cache(maxsize=1)
 def _cu_count() -> int:
@@ -158,7 +172,8 @@ def _kv_splits_heuristic(
 @triton.jit
 def _paged_decode_fused_kernel(
     q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D]
+    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
+    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
     attn_sink_ptr,  # [H]
@@ -168,6 +183,7 @@ def _paged_decode_fused_kernel(
     q_stride_d,
     kv_stride_n,
     kv_stride_d,
+    ks_stride_n,  # row stride of kv_scales (groups are contiguous, stride=1)
     out_stride_t,
     out_stride_h,
     out_stride_d,
@@ -178,6 +194,9 @@ def _paged_decode_fused_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
+    GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
+    NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE (constexpr; D % GROUP_SIZE == 0)
 ):
     """Single-pass online-softmax with sink folded inline — fast path for
     cases where ``kv_splits = 1`` (base grid already saturates the GPU). Skips
@@ -214,6 +233,11 @@ def _paged_decode_fused_kernel(
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
+    if QUANT_KV:
+        # Compile-time per-D-element group index: d_offs // GROUP_SIZE has
+        # NUM_GROUPS distinct values; redundant scale loads at the same
+        # address are coalesced through L1, no per-element scalar issue.
+        g_idx_per_d = d_offs // GROUP_SIZE
     for j in tl.range(0, num_tiles):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
@@ -225,13 +249,28 @@ def _paged_decode_fused_kernel(
         )
         valid = in_range & (slot >= 0)
 
-        kv = tl.load(
+        kv_raw = tl.load(
             unified_kv_ptr
             + slot[:, None] * kv_stride_n
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
+        if QUANT_KV:
+            # 1xGROUP_SIZE block-scale dequant via direct broadcast load —
+            # avoids the explicit reshape + 3D intermediate that pinned
+            # too many bf16 tiles in flight at once. The masked load with
+            # d_offs // GROUP_SIZE as the column index produces a virtual
+            # [BLOCK_K, BLOCK_D] scales tile but in IR is a coalesced
+            # NUM_GROUPS-wide load per row.
+            scales_full = tl.load(
+                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                mask=valid[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(q.dtype)
+            kv = kv_raw.to(q.dtype) * scales_full
+        else:
+            kv = kv_raw
 
         scores = tl.dot(q, tl.trans(kv)) * qk_scale
         scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
@@ -275,7 +314,8 @@ def _paged_decode_fused_kernel(
 @triton.jit
 def _paged_decode_split_kernel(
     q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D]
+    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
+    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
     m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
@@ -286,6 +326,7 @@ def _paged_decode_split_kernel(
     q_stride_d,
     kv_stride_n,
     kv_stride_d,
+    ks_stride_n,  # row stride of kv_scales (groups are contiguous, stride=1)
     mp_stride_t,
     mp_stride_k,
     mp_stride_h,
@@ -303,6 +344,9 @@ def _paged_decode_split_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
+    GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
+    NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE
 ):
     """3D split-K + exp2-softmax sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
 
@@ -352,6 +396,8 @@ def _paged_decode_split_kernel(
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
+    if QUANT_KV:
+        g_idx_per_d = d_offs // GROUP_SIZE
     for j in tl.range(tile_start, tile_end):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
@@ -363,13 +409,22 @@ def _paged_decode_split_kernel(
         )
         valid = in_range & (slot >= 0)
 
-        kv = tl.load(
+        kv_raw = tl.load(
             unified_kv_ptr
             + slot[:, None] * kv_stride_n
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
+        if QUANT_KV:
+            scales_full = tl.load(
+                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                mask=valid[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(q.dtype)
+            kv = kv_raw.to(q.dtype) * scales_full
+        else:
+            kv = kv_raw
 
         scores = tl.dot(q, tl.trans(kv)) * qk_scale
         scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
@@ -524,12 +579,19 @@ def _sparse_attn_v4_paged_decode_triton(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    kv_scales: torch.Tensor | None = None,
     block_h: int | None = None,
     kv_splits: int | None = None,
+    block_k: int | None = None,
 ) -> torch.Tensor:
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
     escape hatches for benchmarks; production callers pass neither.
+
+    When ``kv_scales`` is provided, ``unified_kv`` must be e4m3fnuz and
+    ``kv_scales`` must be ``[total_pages, D // GROUP_SIZE]`` fp32 — 1xGROUP_SIZE
+    block-scale quantization. Dequant happens in-kernel; the dot still runs
+    in q.dtype.
     """
     if not q.is_cuda:
         raise RuntimeError(
@@ -539,10 +601,34 @@ def _sparse_attn_v4_paged_decode_triton(
         raise RuntimeError(
             f"sparse_attn_v4_paged_decode expects fp16/bf16 q, got {q.dtype}"
         )
-    if unified_kv.dtype != q.dtype:
-        raise RuntimeError(
-            f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
-        )
+
+    quant_kv = kv_scales is not None
+    if quant_kv:
+        if unified_kv.dtype != _FP8_DTYPE:
+            raise RuntimeError(
+                f"kv_scales supplied but unified_kv is {unified_kv.dtype}, "
+                f"expected {_FP8_DTYPE}"
+            )
+        if kv_scales.dtype != torch.float32:
+            raise RuntimeError(f"kv_scales must be fp32, got {kv_scales.dtype}")
+        D_check = unified_kv.shape[-1]
+        if D_check % _FP8_GROUP_SIZE != 0:
+            raise RuntimeError(
+                f"D={D_check} must be divisible by GROUP_SIZE={_FP8_GROUP_SIZE}"
+            )
+        expected_g = D_check // _FP8_GROUP_SIZE
+        if kv_scales.shape != (unified_kv.shape[0], expected_g):
+            raise RuntimeError(
+                f"kv_scales shape {tuple(kv_scales.shape)} does not match "
+                f"expected ({unified_kv.shape[0]}, {expected_g})"
+            )
+        if kv_scales.stride(-1) != 1:
+            kv_scales = kv_scales.contiguous()
+    else:
+        if unified_kv.dtype != q.dtype:
+            raise RuntimeError(
+                f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
+            )
 
     T, H, D = q.shape
     out = torch.empty_like(q)
@@ -563,7 +649,27 @@ def _sparse_attn_v4_paged_decode_triton(
         kv_splits = _kv_splits_heuristic(T, H, block_h)
 
     qk_scale = float(softmax_scale) * LOG2E
-    block_k, num_warps, num_stages = _kernel_config(block_h)
+    _bk, num_warps, num_stages = _kernel_config(block_h)
+    if block_k is None:
+        # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
+        # the per-tile dequant cost (scale load + cast + multiply) over more
+        # MFMA work. Empirically BLOCK_K=32 wins ~20% over BLOCK_K=16 on fp8
+        # (bs=512 ctx=4096: 3000µs → 2300µs) without hurting bf16.
+        block_k = 32 if quant_kv else _bk
+
+    # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
+    # dummy 1-element fp32 tensor on the bf16 path so the launch signature
+    # stays uniform (avoids a separate JIT specialization per call).
+    if quant_kv:
+        kv_scales_arg = kv_scales
+        ks_stride_n_arg = kv_scales.stride(0)
+        num_groups_arg = D // _FP8_GROUP_SIZE
+    else:
+        kv_scales_arg = q.new_empty(1, dtype=torch.float32)
+        ks_stride_n_arg = 1
+        # NUM_GROUPS still needs a constexpr value (unused at compile time
+        # because the QUANT_KV=False branch elides the dequant code).
+        num_groups_arg = 1
 
     # Fast path: when the base grid (T * n_head_blocks) already saturates the
     # GPU, kv_splits=1 and a single-pass fused kernel beats split+reduce by
@@ -573,6 +679,7 @@ def _sparse_attn_v4_paged_decode_triton(
         _paged_decode_fused_kernel[grid_fused](
             q,
             unified_kv,
+            kv_scales_arg,
             kv_indices,
             kv_indptr,
             attn_sink,
@@ -582,6 +689,7 @@ def _sparse_attn_v4_paged_decode_triton(
             q.stride(2),
             unified_kv.stride(0),
             unified_kv.stride(1),
+            ks_stride_n_arg,
             out.stride(0),
             out.stride(1),
             out.stride(2),
@@ -592,6 +700,9 @@ def _sparse_attn_v4_paged_decode_triton(
             BLOCK_H=block_h,
             BLOCK_D=block_d,
             BLOCK_K=block_k,
+            QUANT_KV=quant_kv,
+            GROUP_SIZE=_FP8_GROUP_SIZE,
+            NUM_GROUPS=num_groups_arg,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -613,6 +724,7 @@ def _sparse_attn_v4_paged_decode_triton(
     _paged_decode_split_kernel[grid_split](
         q,
         unified_kv,
+        kv_scales_arg,
         kv_indices,
         kv_indptr,
         m_partial,
@@ -623,6 +735,7 @@ def _sparse_attn_v4_paged_decode_triton(
         q.stride(2),
         unified_kv.stride(0),
         unified_kv.stride(1),
+        ks_stride_n_arg,
         m_partial.stride(0),
         m_partial.stride(1),
         m_partial.stride(2),
@@ -640,6 +753,9 @@ def _sparse_attn_v4_paged_decode_triton(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        QUANT_KV=quant_kv,
+        GROUP_SIZE=_FP8_GROUP_SIZE,
+        NUM_GROUPS=num_groups_arg,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -688,13 +804,28 @@ def sparse_attn_v4_paged_decode_reference(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    kv_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pure-torch reference. Materialises per-token KV via gather and reuses
     `_sparse_attn_ragged_torch`. Slow but correct — for unit tests / dump-bisect.
 
     Uses the longest per-token span as the K dimension for the dense
-    `topk_idxs` tensor; shorter spans are tail-padded with `-1`.
+    `topk_idxs` tensor; shorter spans are tail-padded with `-1`. When
+    ``kv_scales`` is given, dequantizes unified_kv (fp8) → q.dtype up front
+    via per-slot 1xGROUP_SIZE block-scale multiply.
     """
+    if kv_scales is not None:
+        # Dequant the whole pool once — only the gather sees a real tensor,
+        # so this is just a reference path; not optimized.
+        total_pages, D = unified_kv.shape
+        num_groups = D // _FP8_GROUP_SIZE
+        kv_fp32 = unified_kv.to(torch.float32)
+        scales_expanded = (
+            kv_scales.view(total_pages, num_groups, 1)
+            .expand(total_pages, num_groups, _FP8_GROUP_SIZE)
+            .reshape(total_pages, D)
+        )
+        unified_kv = (kv_fp32 * scales_expanded).to(q.dtype)
     T = q.size(0)
     indptr = kv_indptr.to(torch.int64)
     spans = (indptr[1:] - indptr[:T]).clamp(min=0)
@@ -717,8 +848,13 @@ def sparse_attn_v4_paged_decode(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    kv_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """V4 decode sparse attention over a unified KV pool with paged indices."""
+    """V4 decode sparse attention over a unified KV pool with paged indices.
+
+    When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
+    will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
+    """
     if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
         return _sparse_attn_v4_paged_decode_triton(
             q,
@@ -727,6 +863,7 @@ def sparse_attn_v4_paged_decode(
             kv_indptr,
             attn_sink,
             softmax_scale,
+            kv_scales=kv_scales,
         )
     return sparse_attn_v4_paged_decode_reference(
         q,
@@ -735,4 +872,5 @@ def sparse_attn_v4_paged_decode(
         kv_indptr,
         attn_sink,
         softmax_scale,
+        kv_scales=kv_scales,
     )
