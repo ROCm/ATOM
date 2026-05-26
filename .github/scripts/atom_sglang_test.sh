@@ -174,7 +174,19 @@ launch_server() {
 
   local -a extra_arg_array=()
   if [[ -n "${MODEL_EXTRA_ARGS}" ]]; then
-    read -r -a extra_arg_array <<< "${MODEL_EXTRA_ARGS}"
+    while IFS= read -r -d '' token; do
+      extra_arg_array+=("${token}")
+    done < <(
+      MODEL_EXTRA_ARGS="${MODEL_EXTRA_ARGS}" python3 - <<'PY'
+import os
+import shlex
+import sys
+
+for token in shlex.split(os.environ["MODEL_EXTRA_ARGS"]):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
   fi
 
   rm -rf /root/.cache

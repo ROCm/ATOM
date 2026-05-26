@@ -432,6 +432,7 @@ class EagleProposer:
                     # Update context_lens for each draft step (needed by both
                     # MHA attention and MLA+sparse indexer)
                     attn_metadata.context_lens[:bs] += 1
+                    positions += 1
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
                         (
@@ -440,6 +441,7 @@ class EagleProposer:
                             else i0_max_seqlen_q
                         ),
                         attn_metadata.max_seqlen_k,
+                        positions,
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,
                     )
@@ -447,13 +449,9 @@ class EagleProposer:
                         attn_metadata.__dict__[k] = v
                     if has_flat_kv:
                         # MLA/MHA path: slot derived from flat kv_indices.
-                        # V4 doesn't expose flat kv_indices and its kernels
-                        # don't read attn_metadata.slot_mapping (state-ring +
-                        # swa_write_indices instead), so the update is skipped.
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
-                    positions += 1
                     hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")

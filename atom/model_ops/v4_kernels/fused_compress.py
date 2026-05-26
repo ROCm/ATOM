@@ -104,8 +104,9 @@ def _fused_compress_attn_kernel(
     OVERLAP: tl.constexpr,
     RATIO: tl.constexpr,
     STATE_SIZE: tl.constexpr,  # ring buffer modulo = kv_state.shape[1] (≥ K_pool;
-    #   for spec decode is K_pool + max_spec_steps + 1 to avoid R+1 re-commit
-    #   borrow-reads of prior round's reject K/V; for non-spec decode is K_pool)
+    #   spec decode: K_pool + max_spec_steps so R's rejected writes fall outside
+    #   R+1's K_pool-wide read window; non-spec decode: K_pool exactly — no
+    #   rejection ever happens and causal writes preclude any read-before-overwrite)
     K: tl.constexpr,  # pool-window reduce dim (= 2*RATIO if OVERLAP else RATIO);
     #   ≤ STATE_SIZE; used for `s = position - K + 1 + k_static` loop bound
     HAS_BLOCK_TABLE: tl.constexpr,
@@ -415,7 +416,7 @@ def fused_compress_attn(
     K_pool = (2 if overlap else 1) * ratio  # pool window size (algorithm-defined)
     state_size = kv_state.shape[
         1
-    ]  # ring buffer modulo (≥ K_pool; spec path enlarges to K_pool + max_spec_steps + 1)
+    ]  # ring buffer modulo (≥ K_pool; V4-Pro: K_pool + max_spec_steps spec / K_pool non-spec)
     assert (
         kv_in.dim() == 2 and kv_in.shape[1] == dim_full
     ), f"kv_in {kv_in.shape}, expected [*, {dim_full}]"

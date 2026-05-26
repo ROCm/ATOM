@@ -14,7 +14,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
 from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
-from atom.utils.forward_context import AttentionMetaData
+from atom.utils.forward_context import AttentionMetaData, AttnState
 from torch import nn
 
 logger = logging.getLogger("atom")
@@ -348,19 +348,22 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         total_kv = total_tokens if has_cached else sum_scheduled_tokens
         attn_metadata = AttentionMetaData(
             cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            min_seqlen_q=min_seqlen_q,
+            # Cast to python int — numpy.int32 leaks in via batch.context_lens
+            # (numpy array) and breaks downstream Triton kernel constexpr
+            # binding (`tl.minimum` rejects numpy scalars).
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            min_seqlen_q=int(min_seqlen_q),
             dropout_p=dropout_p,
             has_cached=has_cached,
-            total_kv=total_kv,
+            total_kv=int(total_kv),
             num_cached_tokens=num_cached_tokens,
+            state=AttnState.PREFILL_PREFIX if has_cached else AttnState.PREFILL_NATIVE,
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
         return attn_metadata, positions
-        # return var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
     def build_ubatch_prefill_metadata(
         self,
