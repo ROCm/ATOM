@@ -11,10 +11,6 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.model_ops.utils import atom_parameter
-from atom.model_ops.linear import (
-    _fp8_per_tensor_linear_triton,
-    _get_triton_fp8_gemm,
-)
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -172,54 +168,6 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
-        self._fp8_lm_head_weight = None
-        self._fp8_lm_head_scale = None
-        self._fp8_lm_head_src_ptr = None
-
-    def _get_fp8_lm_head_weight(self):
-        src_ptr = self.weight.data_ptr()
-        if (
-            self._fp8_lm_head_weight is not None
-            and self._fp8_lm_head_scale is not None
-            and self._fp8_lm_head_src_ptr == src_ptr
-        ):
-            return self._fp8_lm_head_weight, self._fp8_lm_head_scale
-
-        weight = self.weight.detach()
-        num_rows, hidden_size = weight.shape
-        weight_q = torch.empty_like(weight, dtype=torch.uint8)
-        weight_scale = torch.empty(
-            (num_rows, 1), dtype=torch.float32, device=weight.device
-        )
-
-        # Chunking avoids a transient full FP32 copy of the 131k x 4096 lm_head.
-        chunk_rows = 4096
-        for start in range(0, num_rows, chunk_rows):
-            end = min(start + chunk_rows, num_rows)
-            block = weight[start:end].float()
-            scale = block.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / 448.0
-            weight_scale[start:end].copy_(scale)
-            weight_q[start:end].copy_(
-                (block / scale).to(torch.float8_e4m3fn).view(torch.uint8)
-            )
-
-        self._fp8_lm_head_weight = weight_q
-        self._fp8_lm_head_scale = weight_scale
-        self._fp8_lm_head_src_ptr = src_ptr
-        return weight_q, weight_scale
-
-    def _use_fp8_lm_head(self, x: torch.Tensor) -> bool:
-        """Whether this forward should route through the aiter triton gemm_a8w8
-        FP8 lm_head path. Pure capability check on the inputs and the env var
-        - no arch detection. The decision to actually quantize is deferred to
-        _get_fp8_lm_head_weight() (lazy + cached)."""
-        return (
-            envs.ATOM_LM_HEAD_FP8
-            and x.is_cuda
-            and x.dim() == 2
-            and self.weight.dim() == 2
-            and self.weight.dtype == torch.bfloat16
-        )
 
     def forward(self, x: torch.Tensor):
         if not is_plugin_mode():
@@ -230,23 +178,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             if context.is_prefill and not context.is_draft:
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
-        if self._use_fp8_lm_head(x):
-            triton_gemm = _get_triton_fp8_gemm()
-            if triton_gemm is None:
-                logits = tgemm.mm(x, self.weight, self.bias)
-            else:
-                weight_q, weight_scale = self._get_fp8_lm_head_weight()
-                logits = _fp8_per_tensor_linear_triton(
-                    triton_gemm,
-                    x,
-                    weight_q,
-                    weight_scale,
-                    self.bias,
-                    x.dtype,
-                    None,
-                )
-        else:
-            logits = tgemm.mm(x, self.weight, self.bias)
+        logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
             logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)

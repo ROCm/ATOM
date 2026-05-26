@@ -38,141 +38,6 @@ from torch import nn
 logger = logging.getLogger("atom")
 
 
-_TRITON_FP8_GEMM = None
-
-
-def _get_triton_fp8_gemm():
-    """Lazily import aiter triton gemm_a8w8 (JIT-compiled per arch)."""
-    global _TRITON_FP8_GEMM
-    if _TRITON_FP8_GEMM is None:
-        try:
-            from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
-
-            _TRITON_FP8_GEMM = gemm_a8w8
-        except Exception:
-            _TRITON_FP8_GEMM = False
-    return _TRITON_FP8_GEMM if _TRITON_FP8_GEMM is not False else None
-
-
-def _build_w_scale_full(weight_scale, output_partition_sizes, N):
-    """Build the (1, N) per-output-channel weight scale that gemm_a8w8 wants.
-
-    The result depends ONLY on weight_scale + output_partition_sizes — both
-    constant per layer. We cache it on the weight_scale tensor itself so
-    subsequent forwards skip the cat/expand/contiguous chain.
-    """
-    cached = getattr(weight_scale, "_atom_w_scale_full", None)
-    if cached is not None:
-        return cached
-    ws = weight_scale.to(torch.float32)
-    if ws.numel() == 1:
-        full = ws.reshape(1, 1).expand(1, N).contiguous()
-    elif (
-        ws.dim() == 2
-        and ws.shape[1] == 1
-        and output_partition_sizes is not None
-        and ws.shape[0] == len(output_partition_sizes)
-    ):
-        parts = [
-            ws[i].reshape(1, 1).expand(1, p_size)
-            for i, p_size in enumerate(output_partition_sizes)
-        ]
-        full = torch.cat(parts, dim=1).contiguous()
-    else:
-        full = ws.reshape(1, -1).contiguous()
-    weight_scale._atom_w_scale_full = full
-    return full
-
-
-def _get_aiter_dynamic_per_tensor_quant():
-    """Lazy import of aiter's fused dynamic per-tensor FP8 quant kernel."""
-    fn = getattr(_get_aiter_dynamic_per_tensor_quant, "_cached", None)
-    if fn is None:
-        try:
-            from aiter.ops.triton.quant.quant import dynamic_per_tensor_quant_fp8_i8
-
-            fn = dynamic_per_tensor_quant_fp8_i8
-        except Exception:
-            fn = False
-        _get_aiter_dynamic_per_tensor_quant._cached = fn
-    return fn if fn is not False else None
-
-
-def _get_aiter_dynamic_per_token_quant():
-    """Lazy import of aiter's per-token FP8 quant kernel.
-
-    Single triton kernel (vs the 2-kernel pair in dynamic_per_tensor_quant
-    which does atomic_max + apply). Per-token is also slightly more
-    accurate at the same FP8 dtype because each row gets its own scale.
-    gemm_a8w8 already accepts an (M, 1) per-row x_scale so we feed the
-    output directly with no reshape/expand needed.
-    """
-    fn = getattr(_get_aiter_dynamic_per_token_quant, "_cached", None)
-    if fn is None:
-        try:
-            from aiter.ops.triton.quant.quant import dynamic_per_token_quant_fp8_i8
-
-            fn = dynamic_per_token_quant_fp8_i8
-        except Exception:
-            fn = False
-        _get_aiter_dynamic_per_token_quant._cached = fn
-    return fn if fn is not False else None
-
-
-def _fp8_per_tensor_linear_triton(
-    triton_gemm,
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale,
-    bias,
-    otype,
-    output_partition_sizes,
-):
-    """Per-tensor FP8 linear via aiter triton gemm_a8w8 (~360x faster than
-    torch dequant + matmul on gfx1201).
-
-    - x          : [M, K] BF16 (we per-tensor dynamic-quantize to FP8).
-    - weight     : [N, K] uint8 (raw FP8 bytes; reinterpret as float8_e4m3fn).
-    - weight_scale: scalar / (P, 1) per-partition / per-channel scale.
-    - bias       : [N] or None.
-    """
-    fp8_dtype = torch.float8_e4m3fn
-    M, K = x.shape
-    N = weight.shape[0]
-
-    # Dynamic per-token (per-row) FP8 quant of x.
-    # Single-kernel: each program computes its own row's max + applies
-    # the scale in one pass. Replaces the 2-kernel per-tensor variant
-    # (dynamic_per_tensor: atomic_max -> static_quant) — saves ~1.4 ms
-    # per decode step on Mistral-3 (4 linear ops x 34 layers x ~10us
-    # static_quant launch overhead). Also slightly more accurate at the
-    # same FP8 dtype because each row gets its own scale.
-    # gemm_a8w8 accepts (M, 1) per-row x_scale natively, so we feed
-    # x_scale_full directly with no reshape/expand chain.
-    # Reinterpret raw uint8 weight as FP8 (no copy).
-    w_q = weight.view(fp8_dtype)
-
-    # Per-output-channel weight scale — cached on the layer (constant per fwd).
-    w_scale_full = _build_w_scale_full(weight_scale, output_partition_sizes, N)
-
-    fused_quant = _get_aiter_dynamic_per_token_quant()
-    x_q = torch.empty((M, K), dtype=fp8_dtype, device=x.device)
-    x_scale_full = torch.empty((M, 1), dtype=torch.float32, device=x.device)
-    fused_quant(x_q, x, x_scale_full)
-
-    # gemm_a8w8 auto-loads gfx1201 tuning configs from JSON files in
-    # aiter/ops/triton/configs/gemm/ (added in aiter PR #3168). No
-    # per-shape dispatch needed on the atom side.
-    return triton_gemm(
-        x_q,
-        w_q,
-        x_scale_full,
-        w_scale_full,
-        bias=bias,
-        dtype=otype,
-    )
-
-
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
@@ -198,8 +63,6 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
-
-
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 
@@ -663,9 +526,6 @@ class LinearBase(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
-            # aiter.gemm_a16w16 already routes gfx12* to its torch fallback
-            # internally (see aiter/tuned_gemm.py: `_no_asm = gfx.startswith("gfx12")`),
-            # so this is a single call on every arch -- no ATOM-side gating.
             y = tgemm.mm(
                 x,
                 self.weight,
@@ -689,12 +549,6 @@ class LinearBase(nn.Module):
                         scale=getattr(self, "input_scale", None),
                     )
             if self.quant_type.value == QuantType.per_Tensor.value:
-                # aiter.tgemm.mm handles per-Tensor FP8 on every supported arch
-                # now that aiter#3332 added gfx1200 / gfx1201 to the FP8 dtype
-                # map. On gfx1201 the HIP libtypes are skipped and torch_gemm's
-                # fallback runs F.linear(float8.to(fp32), ...) * scales --
-                # correct dequantization, was garbage before #3332 when
-                # dtypes.fp8 fell back to uint8.
                 y = tgemm.mm(
                     x,
                     self.weight,
@@ -733,8 +587,6 @@ class LinearBase(nn.Module):
                         dtype=otype,
                         prefix=self.prefix,
                     )
-                    if self.bias is not None:
-                        y += self.bias
                 else:
                     y = gemm_a8w8_blockscale(
                         x,
@@ -743,8 +595,8 @@ class LinearBase(nn.Module):
                         self.weight_scale,
                         dtype=otype,
                     )
-                    if self.bias is not None:
-                        y += self.bias
+                if self.bias is not None:
+                    y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
                 y = gemm_a4w4_quant(
                     x,
