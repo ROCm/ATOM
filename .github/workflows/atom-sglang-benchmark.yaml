@@ -8,7 +8,7 @@ on:
   schedule:
     # Nightly at 23:00 Beijing time (15:00 UTC).
     - cron: '0 15 * * 1,3'  # Mon/Wed: SGLang-OOB DeepSeek group A, 6 models x 10 params = 60 cases
-    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB group B, 2 DeepSeek MTP + 2 Qwen models, 4 x 10 params = 40 cases
+    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB DeepSeek MTP group B, 2 models x 10 params = 20 cases
     - cron: '0 15 * * 5'    # Fri: SGLang-OOB all, 10 models x 10 params = 100 cases
     - cron: '0 15 * * 6'  # Sat: SGLang-Mesh all, 8 configs = 62 cases
   workflow_dispatch:
@@ -417,8 +417,14 @@ jobs:
                   selected_group = "A-DEEPSEEK"
                   selected = [m for m in models if m.get("nightly_group", "A") == "A" and matches_workload(m)]
               elif schedule_cron == "0 15 * * 2,4":
-                  selected_group = "B-QWEN35"
-                  selected = [m for m in models if m.get("nightly_group") == "B" and matches_workload(m)]
+                  selected_group = "B-DEEPSEEK-MTP"
+                  selected = [
+                      m
+                      for m in models
+                      if m.get("nightly_group") == "B"
+                      and matches_workload(m)
+                      and str(m.get("prefix", "")).startswith("deepseek-")
+                  ]
               elif schedule_cron == "0 15 * * 5":
                   selected_group = "C-ALL"
                   selected = [m for m in models if matches_workload(m)]
