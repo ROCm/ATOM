@@ -42,8 +42,21 @@ import triton.language as tl
 
 from typing import Optional
 import logging
+import os
 
 logger = logging.getLogger("atom")
+_DSV32_MTP_DEBUG_COUNT = 0
+_DSV32_MTP_DEBUG_LIMIT = 40
+
+
+def _debug_dsv32_mtp_sparse(message: str):
+    global _DSV32_MTP_DEBUG_COUNT
+    if os.environ.get("ATOM_DEBUG_DSV32_MTP_SPARSE", "0") != "1":
+        return
+    if _DSV32_MTP_DEBUG_COUNT >= _DSV32_MTP_DEBUG_LIMIT:
+        return
+    _DSV32_MTP_DEBUG_COUNT += 1
+    logger.warning("[DSV32-MTP-SPARSE] %s", message)
 
 
 @triton.jit
@@ -291,6 +304,15 @@ class MLASparseAttentionImplPluginModeMethods:
         layer,
     ) -> torch.Tensor:
         sparse_meta = attn_metadata.plugin_metadata
+        _debug_dsv32_mtp_sparse(
+            "attention "
+            f"q_shape={tuple(q.shape)} "
+            f"num_actual={getattr(sparse_meta, 'num_actual_tokens', None)} "
+            f"max_query_len={getattr(sparse_meta, 'max_query_len', None)} "
+            f"paged_indptr_ptr={sparse_meta.paged_kv_indptr.data_ptr()} "
+            f"meta_indices_ptr={sparse_meta.paged_kv_indices.data_ptr()} "
+            f"impl_indices_ptr={getattr(self, 'sparse_kv_indices_buffer', torch.empty(0)).data_ptr()}"
+        )
 
         num_tokens = q.shape[0]
         output = torch.empty(
@@ -308,7 +330,7 @@ class MLASparseAttentionImplPluginModeMethods:
             output,
             sparse_meta.qo_indptr,
             sparse_meta.paged_kv_indptr,
-            sparse_meta.paged_kv_indices,
+            self.sparse_kv_indices_buffer,
             sparse_meta.paged_kv_last_page_len,
             1,
             sm_scale=self.scale,
@@ -612,6 +634,23 @@ def sparse_attn_indexer_plugin_mode(
     has_decode = indexer_meta.num_decodes > 0
     has_prefill = indexer_meta.num_prefills > 0
     num_decode_tokens = indexer_meta.num_decode_tokens
+    decode_meta = indexer_meta.decode
+    decode_lens = getattr(decode_meta, "decode_lens", None)
+    _debug_dsv32_mtp_sparse(
+        "indexer "
+        f"k_cache_prefix={k_cache_prefix} "
+        f"hidden_shape={tuple(hidden_states.shape)} "
+        f"num_actual={getattr(sparse_meta, 'num_actual_tokens', None)} "
+        f"max_query_len={getattr(sparse_meta, 'max_query_len', None)} "
+        f"num_decodes={getattr(indexer_meta, 'num_decodes', None)} "
+        f"num_decode_tokens={num_decode_tokens} "
+        f"num_prefills={getattr(indexer_meta, 'num_prefills', None)} "
+        f"requires_padding={getattr(decode_meta, 'requires_padding', None)} "
+        f"decode_lens_shape={tuple(decode_lens.shape) if decode_lens is not None else None} "
+        f"paged_indptr_ptr={sparse_meta.paged_kv_indptr.data_ptr()} "
+        f"meta_indices_ptr={sparse_meta.paged_kv_indices.data_ptr()} "
+        f"arg_indices_ptr={sparse_kv_indices_buffer.data_ptr()}"
+    )
     kv_block_size = kv_cache.shape[1]
     preshuffle_cache = kv_block_size != 1
 
