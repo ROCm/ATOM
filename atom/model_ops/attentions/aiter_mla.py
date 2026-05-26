@@ -190,6 +190,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             for module in sfc.values():
                 if hasattr(module, "sparse_kv_indices_buffer"):
                     module.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
+                impl = getattr(module, "impl", None)
+                if impl is not None and hasattr(impl, "sparse_kv_indices_buffer"):
+                    impl.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
             self._token_to_seq_idxs_gpu = torch.zeros(
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
