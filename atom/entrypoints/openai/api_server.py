@@ -37,7 +37,9 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    ResponsesRequest,
 )
+from .serving_responses import build_responses_response, stream_responses_response
 from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
@@ -72,7 +74,9 @@ _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
 _request_start_times: Dict[str, float] = {}
+_stream_decode_states: Dict[str, Dict[int, Dict[str, Any]]] = {}
 _request_logger: Optional[logging.Logger] = None
+STREAM_DECODE_CONTEXT_TOKENS = 16
 
 
 # ============================================================================
@@ -105,6 +109,18 @@ async def _logged_stream(
             else:
                 _log_request_event("stream_done", request_id, None)
         yield chunk
+
+
+async def _logged_stream_with_cleanup(
+    gen: AsyncGenerator[str, None], request_id: str, seq_ids: List[int]
+) -> AsyncGenerator[str, None]:
+    """Log a stream and clean request state if the client disconnects."""
+    try:
+        async for chunk in _logged_stream(gen, request_id):
+            yield chunk
+    finally:
+        for seq_id in seq_ids:
+            cleanup_streaming_request(request_id, seq_id)
 
 
 # ============================================================================
@@ -159,16 +175,83 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
     return n
 
 
+def _common_prefix_len(left: str, right: str) -> int:
+    """Return the character prefix shared by two decoded text snapshots."""
+    limit = min(len(left), len(right))
+    idx = 0
+    while idx < limit and left[idx] == right[idx]:
+        idx += 1
+    return idx
+
+
+def _decode_stream_delta(
+    state_key: Tuple[str, int],
+    new_token_ids: List[int],
+    finished: bool,
+) -> str:
+    """Decode streaming output with request-local token context.
+
+    The scheduler sends only newly generated token ids. Decoding that slice
+    directly can split byte-fallback or multi-token Unicode sequences and
+    emit U+FFFD. Keep per-stream token context and return only the newly
+    decoded suffix, similar to vLLM's incremental detokenizer.
+    """
+    global tokenizer
+
+    request_id, sibling_index = state_key
+    states_for_request = _stream_decode_states.setdefault(request_id, {})
+    state = states_for_request.setdefault(
+        sibling_index,
+        {"token_ids": [], "sent_text": "", "context_start": 0, "context_text": ""},
+    )
+    old_token_count = len(state["token_ids"])
+    state["token_ids"].extend(new_token_ids)
+
+    token_ids = state["token_ids"]
+    new_context_start = max(
+        0,
+        len(token_ids) - len(new_token_ids) - STREAM_DECODE_CONTEXT_TOKENS,
+    )
+    decoded_text = tokenizer.decode(
+        token_ids[new_context_start:], skip_special_tokens=True
+    )
+    if state["context_start"] == new_context_start:
+        sent_context_text = state["context_text"]
+    else:
+        sent_context_text = tokenizer.decode(
+            token_ids[new_context_start:old_token_count],
+            skip_special_tokens=True,
+        )
+
+    if decoded_text.startswith(sent_context_text):
+        delta = decoded_text[len(sent_context_text) :]
+    else:
+        # Tokenizers may normalize text around the rolling context boundary.
+        # Fall back to the changed suffix instead of replaying the full text.
+        prefix_len = _common_prefix_len(decoded_text, sent_context_text)
+        delta = decoded_text[prefix_len:]
+
+    if delta.endswith("\ufffd") and not finished:
+        return ""
+
+    state["sent_text"] += delta
+    state["context_start"] = new_context_start
+    state["context_text"] = decoded_text
+    return delta
+
+
 def _send_stream_chunk_direct(
     request_output: RequestOutput,
     request_id: str,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
 ) -> None:
-    """Send stream chunk directly to the queue."""
-    global tokenizer
-
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
+    """Send a stream chunk decoded with cumulative token context."""
+    new_text = _decode_stream_delta(
+        (request_id, 0),
+        request_output.output_tokens,
+        request_output.finished,
+    )
     started_at = _request_start_times.get(request_id)
     chunk_data = {
         "text": new_text,
@@ -185,6 +268,7 @@ def _send_stream_chunk_direct(
 
 def _send_stream_chunk_tagged(
     request_output: RequestOutput,
+    request_id: str,
     sibling_index: int,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
@@ -195,9 +279,11 @@ def _send_stream_chunk_tagged(
     queue so the merge-stream consumer in :mod:`serving_chat` /
     :mod:`serving_completion` can demultiplex by index.
     """
-    global tokenizer
-
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
+    new_text = _decode_stream_delta(
+        (request_id, sibling_index),
+        request_output.output_tokens,
+        request_output.finished,
+    )
     chunk_data = {
         "text": new_text,
         "token_ids": request_output.output_tokens,
@@ -462,12 +548,13 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     dicts use ``dict.pop(..., None)`` so repeated removal is a no-op.
     """
     global engine, _stream_queues, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
+    global _stream_loops, _request_start_times, _stream_decode_states
 
     _stream_queues.pop(request_id, None)
     _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
+    _stream_decode_states.pop(request_id, None)
     engine.io_processor.requests.pop(seq_id, None)
 
 
@@ -497,7 +584,9 @@ async def setup_streaming_request_fanout(
 
     def make_callback(idx: int):
         def _cb(request_output: RequestOutput) -> None:
-            _send_stream_chunk_tagged(request_output, idx, shared_queue, stream_loop)
+            _send_stream_chunk_tagged(
+                request_output, request_id, idx, shared_queue, stream_loop
+            )
 
         return _cb
 
@@ -631,6 +720,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
+                cleanup_seq_ids = seq_ids
             else:
                 seq_id, stream_queue = await setup_streaming_request(
                     prompt, sampling_params, request_id
@@ -644,8 +734,9 @@ async def chat_completions(request: ChatCompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
+                cleanup_seq_ids = [seq_id]
             return StreamingResponse(
-                _logged_stream(gen, request_id),
+                _logged_stream_with_cleanup(gen, request_id, cleanup_seq_ids),
                 media_type="text/event-stream",
             )
 
@@ -716,6 +807,7 @@ async def completions(request: CompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
+                cleanup_seq_ids = seq_ids
             else:
                 seq_id, stream_queue = await setup_streaming_request(
                     request.prompt,
@@ -732,8 +824,9 @@ async def completions(request: CompletionRequest):
                     tokenizer,
                     cleanup_streaming_request,
                 )
+                cleanup_seq_ids = [seq_id]
             return StreamingResponse(
-                _logged_stream(gen, request_id),
+                _logged_stream_with_cleanup(gen, request_id, cleanup_seq_ids),
                 media_type="text/event-stream",
             )
 
@@ -770,6 +863,83 @@ async def completions(request: CompletionRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in completions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/responses")
+async def responses(request: ResponsesRequest):
+    """Handle Responses API requests.
+
+    Implements a compatibility subset by mapping Responses input to ATOM's
+    existing chat-template generation path and wrapping streaming chunks in
+    Responses API SSE events.
+    """
+    global engine, tokenizer, model_name
+
+    validate_model(request.model)
+
+    try:
+        messages = request.to_chat_messages()
+
+        merged_kwargs = dict(default_chat_template_kwargs)
+        if request.chat_template_kwargs:
+            merged_kwargs.update(request.chat_template_kwargs)
+
+        prompt = apply_chat_template(
+            tokenizer,
+            custom_message_encoder,
+            [msg.to_template_dict() for msg in messages],
+            tools=request.tools,
+            **merged_kwargs,
+        )
+
+        sampling_params = _build_sampling_params(
+            temperature=request.temperature,
+            max_tokens=request.get_max_tokens(),
+            stop_strings=request.stop,
+            ignore_eos=request.ignore_eos,
+            top_k=request.top_k,
+            top_p=request.top_p,
+            n=1,
+        )
+
+        request_id = f"resp-{uuid.uuid4().hex}"
+        _log_request_event("request", request_id, request.model_dump())
+
+        if request.stream:
+            seq_id, stream_queue = await setup_streaming_request(
+                prompt, sampling_params, request_id
+            )
+            gen = stream_responses_response(
+                request_id,
+                model_name,
+                prompt,
+                stream_queue,
+                seq_id,
+                tokenizer,
+                cleanup_streaming_request,
+            )
+            return StreamingResponse(
+                _logged_stream_with_cleanup(gen, request_id, [seq_id]),
+                media_type="text/event-stream",
+            )
+
+        final_output = None
+        async for output in generate_async(prompt, sampling_params, request_id):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError("No output generated")
+        resp = build_responses_response(
+            request_id, model_name, final_output["text"], final_output
+        )
+        _log_request_event("response", request_id, resp.model_dump())
+        return resp
+
+    except ValueError as e:
+        logger.error(f"Validation error in responses: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in responses: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
