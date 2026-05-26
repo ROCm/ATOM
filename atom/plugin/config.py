@@ -337,7 +337,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         master_addr=None,
         enable_dp_attention=server_args.enable_dp_attention,
         enable_tbo=bool(server_args.enable_two_batch_overlap),
-        enable_tbo_decode=False,
+        enable_tbo_decode=bool(server_args.enable_two_batch_overlap),
         plugin_config=plugin_config,
     )
 

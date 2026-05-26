@@ -60,6 +60,10 @@ class SGLangAtomTBORunner:
             return False
         if not getattr(atom_config, "enable_tbo", False):
             return False
+        if getattr(atom_config, "enable_dp_attention", False) and not getattr(
+            atom_config, "enable_expert_parallel", False
+        ):
+            return False
         if not uses_context_only_forward:
             return False
         if pp_proxy_tensors is not None:
@@ -72,7 +76,20 @@ class SGLangAtomTBORunner:
         forward_mode = getattr(forward_batch, "forward_mode", None)
         if forward_mode is None:
             return False
-        if hasattr(forward_mode, "is_extend_without_speculative"):
+        is_decode = hasattr(forward_mode, "is_decode") and forward_mode.is_decode()
+        if is_decode and not getattr(atom_config, "enable_tbo_decode", False):
+            return False
+        if is_decode:
+            if getattr(forward_batch, "next_token_logits_buffer", None) is not None:
+                return False
+            is_capturing = (
+                torch.cuda.is_available()
+                and hasattr(torch.cuda, "is_current_stream_capturing")
+                and torch.cuda.is_current_stream_capturing()
+            )
+            if is_capturing:
+                return False
+        elif hasattr(forward_mode, "is_extend_without_speculative"):
             if not forward_mode.is_extend_without_speculative():
                 return False
         elif not forward_mode.is_prefill():
@@ -272,7 +289,12 @@ class SGLangAtomTBORunner:
             token_ranges = [
                 getattr(child, "tbo_parent_token_range", None) for child in children
             ]
-            logger.info("[SGL+ATOM TBO] completed child forwards: %s", token_ranges)
+            forward_mode = getattr(children[0], "forward_mode", None)
+            logger.info(
+                "[SGL+ATOM TBO] completed %s child forwards: %s",
+                forward_mode,
+                token_ranges,
+            )
         return [value for _, value in sorted(results)]
 
     def _merge_outputs(self, outputs: list[Any], children: list[Any], original_len: int):

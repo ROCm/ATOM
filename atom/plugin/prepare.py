@@ -96,6 +96,9 @@ def prepare_model(config: Any, engine: str):
     from atom.plugin.sglang.graph_capture_patch import apply_graph_capture_patch
 
     apply_graph_capture_patch()
+    from atom.plugin.sglang.tbo.patches import apply_sglang_tbo_patches
+
+    apply_sglang_tbo_patches()
 
     try:
         model = model_cls(atom_config=atom_config)
