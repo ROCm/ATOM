@@ -25,6 +25,7 @@ from aiter.utility import fp4_utils
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.quant_spec import LayerQuantConfig
 from atom.model_ops.utils import (
+    MXFP4_QUANT_BLOCK_SIZE,
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
     requantize_with_max_scale,
@@ -63,7 +64,6 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 
 def divide(numerator, denominator):
@@ -461,6 +461,16 @@ class LinearBase(nn.Module):
             "quant_dtype": str(online_quant_dtype),
         }
 
+    def _maybe_preserve_unshuffled_mxfp4_kv_b_proj(self):
+        if (
+            self.weight.dim() == 2
+            and ".self_attn.kv_b_proj" in self.prefix
+            and self.quant_type == QuantType.per_1x32
+            and self.params_dtype == dtypes.fp4x2
+        ):
+            self._mxfp4_unshuffled_weight = self.weight.detach().clone()
+            self._mxfp4_unshuffled_weight_scale = self.weight_scale.detach().clone()
+
     def process_weights_after_loading(self):
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
@@ -503,6 +513,7 @@ class LinearBase(nn.Module):
             # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
             # quantized models must keep that tensor unshuffled here.
             if self.weight.dim() == 2:
+                self._maybe_preserve_unshuffled_mxfp4_kv_b_proj()
                 shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
@@ -515,6 +526,7 @@ class LinearBase(nn.Module):
                 need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
             if need_shuffle:
                 if self.weight.dim() == 2:
+                    self._maybe_preserve_unshuffled_mxfp4_kv_b_proj()
                     shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm

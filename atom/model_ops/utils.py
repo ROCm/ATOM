@@ -7,7 +7,7 @@ from functools import cache
 from typing import List, Optional, Tuple, Union
 
 import torch
-from aiter import QuantType, per_tensor_quant
+from aiter import QuantType, dtypes, per_tensor_quant
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
@@ -191,8 +191,6 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
         # do w_kc (bf16) first to get the w_kc(uint8) w_s_kc(uint8)
         # and w_vc repeating the same procedure of w_kc to get  w_vc(uint8) w_s_vc(uint8)
         if w.dtype == torch.bfloat16:
-            # w_kc, w_vc = w.split(
-            # [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
@@ -202,7 +200,7 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
             w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
             w_s_kc = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
             w_s_vc = w_s_vc.contiguous().transpose(1, 2)
-        elif w.dtype == torch.uint8:  # static quant for mxfp4
+        elif w.dtype in (torch.uint8, dtypes.fp4x2):  # static quant for mxfp4
             # when dtype is uint8, it means the w has been quantized to mxfp4 format
             # but we must separate it to w_kc and w_vc.
             # The quantized tensor size is only half of original tensor size
@@ -210,8 +208,13 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
             # need to upcast it to fp32 to separate w to w_kc and w_vc
             # to ensure the following transpose behavior is correct
             # and then do mxfp4 quant again
-            w = mxfp4_to_f32(w, True).to(torch.bfloat16)
-            w_scales = self_attn.kv_b_proj.weight_scale.repeat_interleave(32, dim=-1)
+            w = mxfp4_to_f32(w.view(torch.uint8)).to(torch.bfloat16)
+            weight_scale = getattr(
+                self_attn.kv_b_proj,
+                "_mxfp4_unshuffled_weight_scale",
+                self_attn.kv_b_proj.weight_scale,
+            )
+            w_scales = weight_scale.repeat_interleave(32, dim=-1)
             w_scales = e8m0_to_f32(w_scales).to(torch.bfloat16)
             w = w * w_scales
             w_kc, w_vc = w.unflatten(
