@@ -38,7 +38,7 @@ class EngineArgs:
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
-    max_num_scheduled_tokens: int = 16384
+    mla_prefill_chunk_size: int = 16384
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -191,7 +191,7 @@ class EngineArgs:
             help="Maximum number of tokens to batch together in async engine",
         )
         parser.add_argument(
-            "--max-num-scheduled-tokens",
+            "--mla-prefill-chunk-size",
             type=int,
             default=16384,
             help=(

@@ -36,7 +36,7 @@ class MLAChunkContextMetadata:
     """Per-chunk slices of the cached prefix for chunked MLA prefill.
 
     Built host-side in `AiterMLAMetadataBuilder.prepare_prefill` when the
-    cached prefix exceeds `config.max_num_scheduled_tokens`. The forward iterates
+    cached prefix exceeds `config.mla_prefill_chunk_size`. The forward iterates
     these chunks instead of materializing the full `total_kv × heads × dim`
     k/v tensors (which OOM on long contexts).
 
@@ -211,20 +211,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.model_runner.forward_vars.update(mla_metadata)
 
         # Chunked-context workspaces for the prefill has_cached path. Sized
-        # to config.max_num_scheduled_tokens (defaults to max_num_batched_tokens)
+        # to config.mla_prefill_chunk_size (defaults to max_num_batched_tokens)
         # so peak memory is bounded regardless of total context length.
         # Allocated outside any per-step scope so a single buffer is shared
         # across all chunks and layers.
-        self.max_num_scheduled_tokens = config.max_num_scheduled_tokens
+        self.mla_prefill_chunk_size = config.mla_prefill_chunk_size
         self.k_chunk_workspace: Optional[torch.Tensor] = None
         self.v_chunk_workspace: Optional[torch.Tensor] = None
-        if self.max_num_scheduled_tokens > 0:
+        if self.mla_prefill_chunk_size > 0:
             qk_head_dim = hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim
             v_head_dim = hf_config.v_head_dim
             model_dtype = config.torch_dtype
             self.k_chunk_workspace = torch.empty(
                 (
-                    self.max_num_scheduled_tokens,
+                    self.mla_prefill_chunk_size,
                     self.num_attention_heads,
                     qk_head_dim,
                 ),
@@ -233,7 +233,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             self.v_chunk_workspace = torch.empty(
                 (
-                    self.max_num_scheduled_tokens,
+                    self.mla_prefill_chunk_size,
                     self.num_attention_heads,
                     v_head_dim,
                 ),
@@ -790,9 +790,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # forward (self-attention via kv_b_proj), so chunks span only the
             # cached prefix.
             if (
-                self.max_num_scheduled_tokens > 0
+                self.mla_prefill_chunk_size > 0
                 and attn_metadata.has_cached
-                and attn_metadata.total_kv > self.max_num_scheduled_tokens
+                and attn_metadata.total_kv > self.mla_prefill_chunk_size
             ):
                 attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta(batch, bs)
 
@@ -805,7 +805,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """Build per-chunk slices of the cached prefix.
 
         Chunks the cached-prefix tokens along the GLOBAL token axis (not the
-        per-seq axis). Per-chunk total token count ≤ `max_num_scheduled_tokens`,
+        per-seq axis). Per-chunk total token count ≤ `mla_prefill_chunk_size`,
         which is what the k/v workspace is sized for. Each chunk c contains a
         contiguous slice of the concatenated per-seq slot list; per-seq
         contributions to chunk c are the intersection of seq i's slot range
@@ -815,7 +815,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         flash_attn returns lse=-inf which merge_attn_states handles correctly
         (the prefix output for that seq is preserved unchanged).
         """
-        chunk_size = self.max_num_scheduled_tokens
+        chunk_size = self.mla_prefill_chunk_size
         runner_bs = self.model_runner.block_size
 
         cached_lens = np.asarray(batch.num_cached_tokens[:bs], dtype=np.int64)
