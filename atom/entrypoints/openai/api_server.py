@@ -20,7 +20,7 @@ import time
 import uuid
 from asyncio import AbstractEventLoop
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
 
 import uvicorn
 from atom import SamplingParams
@@ -70,9 +70,14 @@ default_chat_template_kwargs: Dict[str, Any] = {}
 custom_message_encoder: Optional[Any] = None
 _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
+_seq_id_to_sibling_index: Dict[int, int] = {}
+_request_active_seq_ids: Dict[str, Set[int]] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
 _request_start_times: Dict[str, float] = {}
+_stream_decode_states: Dict[str, Dict[int, Dict[str, Any]]] = {}
 _request_logger: Optional[logging.Logger] = None
+# Align with vLLM's slow incremental detokenizer initial prefix offset.
+INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
 # ============================================================================
@@ -96,7 +101,7 @@ def _log_request_event(event_type: str, request_id: str, data: Any) -> None:
 async def _logged_stream(
     gen: AsyncGenerator[str, None], request_id: str
 ) -> AsyncGenerator[str, None]:
-    """Wrap a streaming generator to log each SSE chunk."""
+    """Log streaming response chunks."""
     async for chunk in gen:
         if _request_logger is not None and chunk.startswith("data: "):
             payload = chunk[6:].strip()
@@ -159,32 +164,273 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
     return n
 
 
+def _replace_none_with_empty(tokens: List[Optional[str]]) -> None:
+    for idx, token in enumerate(tokens):
+        if token is None:
+            tokens[idx] = ""
+
+
+def _convert_tokens_to_string_with_added_encoders(
+    tokenizer: AutoTokenizer,
+    output_tokens: List[str],
+    spaces_between_special_tokens: bool,
+    added_vocab_set: Set[str],
+    all_special_tokens: Set[str],
+) -> str:
+    sub_texts: List[str] = []
+    current_sub_text: List[str] = []
+
+    for token in output_tokens:
+        if token in all_special_tokens:
+            continue
+        if token in added_vocab_set:
+            if current_sub_text:
+                sub_texts.append(tokenizer.convert_tokens_to_string(current_sub_text))
+                current_sub_text.clear()
+            sub_texts.append(token)
+        else:
+            current_sub_text.append(token)
+
+    if current_sub_text:
+        sub_texts.append(tokenizer.convert_tokens_to_string(current_sub_text))
+
+    if spaces_between_special_tokens:
+        return " ".join(sub_texts)
+    return "".join(sub_texts)
+
+
+def _convert_prompt_ids_to_tokens(
+    tokenizer: AutoTokenizer,
+    prompt_ids: List[int],
+    skip_special_tokens: bool = False,
+) -> Tuple[List[str], int, int]:
+    # Match vLLM's prompt suffix offset, with two extra tokens for special
+    # token boundaries during incremental detokenization.
+    new_tokens = tokenizer.convert_ids_to_tokens(
+        prompt_ids[-INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET - 2 :],
+        skip_special_tokens=skip_special_tokens,
+    )
+    if isinstance(new_tokens, str):
+        new_tokens = [new_tokens]
+    read_offset = len(new_tokens)
+    prefix_offset = max(read_offset - INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET, 0)
+    _replace_none_with_empty(new_tokens)
+    return new_tokens, prefix_offset, read_offset
+
+
+def _detokenize_incrementally(
+    tokenizer: AutoTokenizer,
+    new_token_id: int,
+    prev_tokens: List[str],
+    prefix_offset: int,
+    read_offset: int,
+    skip_special_tokens: bool = False,
+    spaces_between_special_tokens: bool = True,
+    added_vocab_set: Optional[Set[str]] = None,
+    all_special_tokens: Optional[Set[str]] = None,
+) -> Tuple[List[str], str, int, int]:
+    if 0 <= new_token_id < len(tokenizer):
+        new_tokens = tokenizer.convert_ids_to_tokens(
+            [new_token_id], skip_special_tokens=skip_special_tokens
+        )
+        if isinstance(new_tokens, str):
+            new_tokens = [new_tokens]
+        else:
+            _replace_none_with_empty(new_tokens)
+    else:
+        new_tokens = [""]
+
+    if added_vocab_set is None:
+        added_vocab_set = set(tokenizer.get_added_vocab())
+    if all_special_tokens is None:
+        all_special_tokens = (
+            set(tokenizer.all_special_tokens)
+            if skip_special_tokens and added_vocab_set
+            else set()
+        )
+
+    output_tokens = prev_tokens + new_tokens
+    if tokenizer.is_fast or not added_vocab_set:
+        prefix_text = tokenizer.convert_tokens_to_string(
+            output_tokens[prefix_offset:read_offset]
+        )
+        new_text = tokenizer.convert_tokens_to_string(output_tokens[prefix_offset:])
+    else:
+        prefix_text = _convert_tokens_to_string_with_added_encoders(
+            tokenizer,
+            output_tokens[prefix_offset:read_offset],
+            spaces_between_special_tokens=spaces_between_special_tokens,
+            added_vocab_set=added_vocab_set,
+            all_special_tokens=all_special_tokens,
+        )
+        new_text = _convert_tokens_to_string_with_added_encoders(
+            tokenizer,
+            output_tokens[prefix_offset:],
+            spaces_between_special_tokens=spaces_between_special_tokens,
+            added_vocab_set=added_vocab_set,
+            all_special_tokens=all_special_tokens,
+        )
+
+    if len(new_text) <= len(prefix_text) or new_text.endswith("\ufffd"):
+        return new_tokens, "", prefix_offset, read_offset
+
+    new_text = new_text[len(prefix_text) :]
+    return new_tokens, new_text, read_offset, len(output_tokens)
+
+
+def _prune_stream_decode_state(state: Dict[str, Any]) -> None:
+    """Drop token prefixes no longer needed by incremental detokenization."""
+    prefix_offset = state["prefix_offset"]
+    if prefix_offset <= 0:
+        return
+
+    del state["tokens"][:prefix_offset]
+    state["prefix_offset"] -= prefix_offset
+    state["read_offset"] -= prefix_offset
+
+
+def _init_stream_decode_state(
+    request_id: str,
+    sibling_index: int,
+    prompt_token_ids: List[int],
+) -> None:
+    global tokenizer
+
+    tokens, prefix_offset, read_offset = _convert_prompt_ids_to_tokens(
+        tokenizer, prompt_token_ids, skip_special_tokens=True
+    )
+    added_vocab_set = set(tokenizer.get_added_vocab())
+    states_for_request = _stream_decode_states.setdefault(request_id, {})
+    states_for_request[sibling_index] = {
+        "tokens": tokens,
+        "prefix_offset": prefix_offset,
+        "read_offset": read_offset,
+        "added_vocab_set": added_vocab_set,
+        "all_special_tokens": (
+            set(tokenizer.all_special_tokens) if added_vocab_set else set()
+        ),
+    }
+
+
+def _decode_stream_delta(
+    state_key: Tuple[str, int],
+    new_token_ids: List[int],
+) -> str:
+    """Decode streaming output with vLLM-style incremental detokenization.
+
+    The scheduler sends only newly generated token ids. Decoding that slice
+    directly can split byte-fallback or multi-token Unicode sequences and
+    emit U+FFFD. Keep per-stream tokens plus prefix/read offsets and return
+    only the newly decoded text, matching vLLM's slow incremental detokenizer.
+    """
+    global tokenizer
+
+    request_id, sibling_index = state_key
+    states_for_request = _stream_decode_states.setdefault(request_id, {})
+    if sibling_index not in states_for_request:
+        _init_stream_decode_state(request_id, sibling_index, [])
+    state = states_for_request[sibling_index]
+
+    decoded_chunks = []
+    for new_token_id in new_token_ids:
+        new_tokens, decoded_text, prefix_offset, read_offset = (
+            _detokenize_incrementally(
+                tokenizer=tokenizer,
+                new_token_id=new_token_id,
+                prev_tokens=state["tokens"],
+                prefix_offset=state["prefix_offset"],
+                read_offset=state["read_offset"],
+                skip_special_tokens=True,
+                added_vocab_set=state["added_vocab_set"],
+                all_special_tokens=state["all_special_tokens"],
+            )
+        )
+        state["tokens"].extend(new_tokens)
+        state["prefix_offset"] = prefix_offset
+        state["read_offset"] = read_offset
+        _prune_stream_decode_state(state)
+        decoded_chunks.append(decoded_text)
+
+    return "".join(decoded_chunks)
+
+
+def _enqueue_decoded_stream_chunk_direct(
+    request_id: str,
+    output_tokens: List[int],
+    finished: bool,
+    finish_reason: Optional[str],
+    kv_transfer_params_output: Optional[Dict[str, Any]],
+    stream_queue: asyncio.Queue,
+) -> None:
+    """Decode and enqueue one direct stream chunk on the event loop thread."""
+    if _stream_queues.get(request_id) is not stream_queue:
+        return
+    new_text = _decode_stream_delta((request_id, 0), output_tokens)
+    started_at = _request_start_times.get(request_id)
+    chunk_data = {
+        "text": new_text,
+        "token_ids": output_tokens,
+        "finished": finished,
+        "finish_reason": finish_reason,
+        "finished_at": time.time(),
+        "started_at": started_at,
+    }
+    if kv_transfer_params_output:
+        chunk_data["kv_transfer_params"] = kv_transfer_params_output
+    stream_queue.put_nowait(chunk_data)
+
+
 def _send_stream_chunk_direct(
     request_output: RequestOutput,
     request_id: str,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
 ) -> None:
-    """Send stream chunk directly to the queue."""
-    global tokenizer
+    """Send a stream chunk decoded with cumulative token context."""
+    output_tokens = list(request_output.output_tokens or [])
+    loop.call_soon_threadsafe(
+        _enqueue_decoded_stream_chunk_direct,
+        request_id,
+        output_tokens,
+        request_output.finished,
+        request_output.finish_reason,
+        getattr(request_output, "kv_transfer_params_output", None),
+        stream_queue,
+    )
 
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
-    started_at = _request_start_times.get(request_id)
+
+def _enqueue_decoded_stream_chunk_tagged(
+    request_id: str,
+    sibling_index: int,
+    output_tokens: List[int],
+    finished: bool,
+    finish_reason: Optional[str],
+    kv_transfer_params_output: Optional[Dict[str, Any]],
+    stream_queue: asyncio.Queue,
+) -> None:
+    """Decode and enqueue one fan-out stream chunk on the event loop thread."""
+    if _stream_queues.get(request_id) is not stream_queue:
+        return
+    if sibling_index not in _stream_decode_states.get(request_id, {}):
+        return
+    new_text = _decode_stream_delta(
+        (request_id, sibling_index),
+        output_tokens,
+    )
     chunk_data = {
         "text": new_text,
-        "token_ids": request_output.output_tokens,
-        "finished": request_output.finished,
-        "finish_reason": request_output.finish_reason,
-        "finished_at": time.time(),
-        "started_at": started_at,
+        "token_ids": output_tokens,
+        "finished": finished,
+        "finish_reason": finish_reason,
     }
-    if getattr(request_output, "kv_transfer_params_output", None):
-        chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-    loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
+    if kv_transfer_params_output:
+        chunk_data["kv_transfer_params"] = kv_transfer_params_output
+    stream_queue.put_nowait((sibling_index, chunk_data))
 
 
 def _send_stream_chunk_tagged(
     request_output: RequestOutput,
+    request_id: str,
     sibling_index: int,
     stream_queue: asyncio.Queue,
     loop: AbstractEventLoop,
@@ -195,18 +441,17 @@ def _send_stream_chunk_tagged(
     queue so the merge-stream consumer in :mod:`serving_chat` /
     :mod:`serving_completion` can demultiplex by index.
     """
-    global tokenizer
-
-    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
-    chunk_data = {
-        "text": new_text,
-        "token_ids": request_output.output_tokens,
-        "finished": request_output.finished,
-        "finish_reason": request_output.finish_reason,
-    }
-    if getattr(request_output, "kv_transfer_params_output", None):
-        chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
-    loop.call_soon_threadsafe(stream_queue.put_nowait, (sibling_index, chunk_data))
+    output_tokens = list(request_output.output_tokens or [])
+    loop.call_soon_threadsafe(
+        _enqueue_decoded_stream_chunk_tagged,
+        request_id,
+        sibling_index,
+        output_tokens,
+        request_output.finished,
+        request_output.finish_reason,
+        getattr(request_output, "kv_transfer_params_output", None),
+        stream_queue,
+    )
 
 
 async def generate_async(
@@ -421,7 +666,8 @@ async def setup_streaming_request(
     kv_transfer_params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, asyncio.Queue]:
     """Set up a streaming request with the engine."""
-    global engine, _stream_queues, _seq_id_to_request_id
+    global engine, _stream_queues, _seq_id_to_request_id, _seq_id_to_sibling_index
+    global _request_active_seq_ids
     global _stream_loops, _request_start_times
 
     stream_queue: asyncio.Queue = asyncio.Queue()
@@ -443,10 +689,13 @@ async def setup_streaming_request(
             kv_transfer_params=kv_transfer_params,
         )
         _seq_id_to_request_id[seq.id] = request_id
+        _seq_id_to_sibling_index[seq.id] = 0
+        _request_active_seq_ids[request_id] = {seq.id}
         return seq
 
     seq = await executor_loop.run_in_executor(None, do_preprocess)
     seq_id = seq.id
+    _init_stream_decode_state(request_id, 0, seq.prompt_token_ids)
 
     logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}")
     engine.core_mgr.add_request([seq])
@@ -458,17 +707,32 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     """Clean up resources for a streaming request.
 
     Safe to call multiple times for the same ``request_id`` with different
-    ``seq_id`` values (as happens in fan-out cleanup): the per-request
-    dicts use ``dict.pop(..., None)`` so repeated removal is a no-op.
+    ``seq_id`` values (as happens in fan-out cleanup): request-scoped state is
+    retained until the last active sibling is removed.
     """
-    global engine, _stream_queues, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
+    global engine, _stream_queues, _seq_id_to_request_id, _seq_id_to_sibling_index
+    global _request_active_seq_ids
+    global _stream_loops, _request_start_times, _stream_decode_states
 
-    _stream_queues.pop(request_id, None)
     _seq_id_to_request_id.pop(seq_id, None)
+    sibling_index = _seq_id_to_sibling_index.pop(seq_id, None)
+    active_seq_ids = _request_active_seq_ids.get(request_id)
+    if active_seq_ids is not None:
+        active_seq_ids.discard(seq_id)
+    if sibling_index is not None:
+        states_for_request = _stream_decode_states.get(request_id)
+        if states_for_request is not None:
+            states_for_request.pop(sibling_index, None)
+    engine.io_processor.requests.pop(seq_id, None)
+
+    if active_seq_ids:
+        return
+
+    _request_active_seq_ids.pop(request_id, None)
+    _stream_queues.pop(request_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
-    engine.io_processor.requests.pop(seq_id, None)
+    _stream_decode_states.pop(request_id, None)
 
 
 async def setup_streaming_request_fanout(
@@ -483,7 +747,8 @@ async def setup_streaming_request_fanout(
     queue. Every callback pushes ``(sibling_index, chunk_data)`` tuples so
     the merge-stream consumer can rewrite ``choices[0].index`` correctly.
     """
-    global engine, _stream_queues, _seq_id_to_request_id
+    global engine, _stream_queues, _seq_id_to_request_id, _seq_id_to_sibling_index
+    global _request_active_seq_ids
     global _stream_loops, _request_start_times
 
     n = int(sampling_params.n)
@@ -497,7 +762,9 @@ async def setup_streaming_request_fanout(
 
     def make_callback(idx: int):
         def _cb(request_output: RequestOutput) -> None:
-            _send_stream_chunk_tagged(request_output, idx, shared_queue, stream_loop)
+            _send_stream_chunk_tagged(
+                request_output, request_id, idx, shared_queue, stream_loop
+            )
 
         return _cb
 
@@ -513,12 +780,16 @@ async def setup_streaming_request_fanout(
             kv_transfer_params=kv_transfer_params,
             parent_request_id=request_id,
         )
-        for seq in seqs:
+        for idx, seq in enumerate(seqs):
             _seq_id_to_request_id[seq.id] = request_id
+            _seq_id_to_sibling_index[seq.id] = idx
+        _request_active_seq_ids[request_id] = {seq.id for seq in seqs}
         return seqs
 
     seqs = await executor_loop.run_in_executor(None, do_preprocess)
     seq_ids = [seq.id for seq in seqs]
+    for idx, seq in enumerate(seqs):
+        _init_stream_decode_state(request_id, idx, seq.prompt_token_ids)
     logger.info(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )

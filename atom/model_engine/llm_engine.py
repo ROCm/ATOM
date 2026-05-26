@@ -4,7 +4,7 @@
 import itertools
 import logging
 import time
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import List, Optional, Union
 
 from atom.config import Config
@@ -258,6 +258,32 @@ class InputOutputProcessor:
             if isinstance(prompt_or_tokens, str)
             else prompt_or_tokens
         )
+        prompt_len = len(tokens)
+        max_model_len = self.config.max_model_len
+        if max_model_len is not None and prompt_len > max_model_len:
+            raise ValueError(
+                f"Input has {prompt_len} tokens, which exceeds "
+                f"max_model_len={max_model_len}. Shorten the prompt or "
+                "restart the server with a larger --max-model-len."
+            )
+        raw_max_tokens = sampling_params.max_tokens
+        if raw_max_tokens is None:
+            max_tokens = 0
+        elif isinstance(raw_max_tokens, bool) or not isinstance(raw_max_tokens, int):
+            raise ValueError("max_tokens must be an integer or None")
+        elif raw_max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative")
+        else:
+            max_tokens = raw_max_tokens
+        if max_model_len is not None and prompt_len + max_tokens > max_model_len:
+            raise ValueError(
+                f"Requested context length is {prompt_len + max_tokens} "
+                f"tokens ({prompt_len} input + {max_tokens} max output), "
+                f"which exceeds max_model_len={max_model_len}. Shorten the "
+                "prompt, lower max_tokens, or restart the server with a "
+                "larger --max-model-len."
+            )
+        sequence_sampling_params = replace(sampling_params, max_tokens=max_tokens)
 
         stop_token_sequences = []
         if sampling_params.stop_strings:
@@ -284,7 +310,7 @@ class InputOutputProcessor:
             seq = Sequence(
                 tokens,
                 self.block_size,
-                sampling_params,
+                sequence_sampling_params,
                 stop_token_sequences,
                 stream_callback=cb,
                 num_draft_tokens=self.num_speculative_tokens,

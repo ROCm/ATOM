@@ -48,6 +48,7 @@ def _reset_sequence_counter():
 def _make_processor() -> InputOutputProcessor:
     proc = InputOutputProcessor.__new__(InputOutputProcessor)
     proc.config = MagicMock()
+    proc.config.max_model_len = None
     tokenizer = MagicMock()
     tokenizer.encode = MagicMock(side_effect=lambda s, **_: list(range(len(s))))
     proc.tokenizer = tokenizer
@@ -140,3 +141,49 @@ class TestPreprocessFanout:
             stream_callback=cb,
         )
         assert all(s.stream_callback is cb for s in seqs)
+
+    def test_fanout_rejects_prompt_longer_than_max_model_len(self):
+        proc = _make_processor()
+        proc.config.max_model_len = 4
+
+        with pytest.raises(ValueError, match="exceeds max_model_len=4"):
+            proc.preprocess_fanout("hello", SamplingParams(n=1, max_tokens=0))
+
+    def test_fanout_rejects_prompt_plus_generation_past_max_model_len(self):
+        proc = _make_processor()
+        proc.config.max_model_len = 8
+
+        with pytest.raises(ValueError, match="which exceeds max_model_len=8"):
+            proc.preprocess_fanout("hello", SamplingParams(n=1, max_tokens=4))
+
+    def test_fanout_coerces_none_max_tokens_before_context_check(self):
+        proc = _make_processor()
+        proc.config.max_model_len = 5
+
+        seqs = proc.preprocess_fanout("hello", SamplingParams(n=1, max_tokens=None))
+
+        assert seqs[0].max_tokens == 0
+
+    def test_fanout_does_not_mutate_sampling_params_max_tokens(self):
+        proc = _make_processor()
+        sp = SamplingParams(n=1, max_tokens=None)
+
+        seqs = proc.preprocess_fanout("hello", sp)
+
+        assert sp.max_tokens is None
+        assert seqs[0].max_tokens == 0
+
+    @pytest.mark.parametrize("max_tokens", ["bad", 3.7, True])
+    def test_fanout_rejects_non_integer_max_tokens(self, max_tokens):
+        proc = _make_processor()
+        proc.config.max_model_len = 8
+
+        with pytest.raises(ValueError, match="max_tokens must be an integer"):
+            proc.preprocess_fanout("hello", SamplingParams(n=1, max_tokens=max_tokens))
+
+    def test_fanout_rejects_negative_max_tokens(self):
+        proc = _make_processor()
+        proc.config.max_model_len = 8
+
+        with pytest.raises(ValueError, match="max_tokens must be non-negative"):
+            proc.preprocess_fanout("hello", SamplingParams(n=1, max_tokens=-1))

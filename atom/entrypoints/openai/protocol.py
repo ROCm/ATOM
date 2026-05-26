@@ -3,6 +3,7 @@
 
 """Pydantic request/response models for the OpenAI-compatible API."""
 
+import json
 import time
 from typing import Any, Dict, List, Optional, Union
 
@@ -48,6 +49,56 @@ class ChatMessage(BaseModel):
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
 
+    @staticmethod
+    def _normalize_tool_calls(tool_calls: Any) -> Any:
+        """Decode OpenAI JSON-string tool arguments for chat templates."""
+        if tool_calls is None:
+            return tool_calls
+        if not isinstance(tool_calls, list):
+            raise ValueError(f"tool_calls must be a list, got {type(tool_calls)!r}")
+
+        normalized = []
+        for item in tool_calls:
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"tool_calls entries must be dicts, got {type(item)!r}"
+                )
+
+            call = dict(item)
+            function_value = call.get("function")
+            if function_value is None:
+                function_value = {}
+            elif not isinstance(function_value, dict):
+                raise ValueError(
+                    f"tool_calls function must be a dict, got {type(function_value)!r}"
+                )
+
+            function = dict(function_value)
+            arguments = function.get("arguments")
+            if arguments is None or (
+                isinstance(arguments, str) and not arguments.strip()
+            ):
+                function["arguments"] = {}
+            elif isinstance(arguments, str):
+                try:
+                    decoded_arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "tool_calls function.arguments must be a valid JSON object"
+                    ) from exc
+                if not isinstance(decoded_arguments, dict):
+                    raise ValueError(
+                        "tool_calls function.arguments must decode to a JSON object"
+                    )
+                function["arguments"] = decoded_arguments
+            elif not isinstance(arguments, dict):
+                raise ValueError(
+                    "tool_calls function.arguments must be a dict or JSON object string"
+                )
+            call["function"] = function
+            normalized.append(call)
+        return normalized
+
     def to_template_dict(self) -> Dict[str, Any]:
         """Convert to dict for chat template, preserving tool-related fields.
 
@@ -59,7 +110,10 @@ class ChatMessage(BaseModel):
         extras = self.model_extra or {}
         for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
             if key in extras:
-                d[key] = extras[key]
+                value = extras[key]
+                if key == "tool_calls":
+                    value = self._normalize_tool_calls(value)
+                d[key] = value
         return d
 
 

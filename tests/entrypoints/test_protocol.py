@@ -98,6 +98,151 @@ class TestChatMessage:
         assert d["content"] == "I'll run that."
         assert len(d["tool_calls"]) == 1
         assert d["tool_calls"][0]["function"]["name"] == "exec"
+        assert d["tool_calls"][0]["function"]["arguments"] == {"cmd": "ls"}
+
+    def test_to_template_dict_with_empty_tool_call_arguments(self):
+        """Empty OpenAI tool arguments should be normalized to an object."""
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "noop", "arguments": ""},
+                    }
+                ],
+            }
+        )
+        d = msg.to_template_dict()
+        assert d["content"] == ""
+        assert d["tool_calls"][0]["function"]["arguments"] == {}
+
+    def test_to_template_dict_with_whitespace_only_tool_call_arguments(self):
+        """Whitespace-only OpenAI tool arguments are empty arguments."""
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "noop", "arguments": " \n\t"},
+                    }
+                ],
+            }
+        )
+        d = msg.to_template_dict()
+        assert d["tool_calls"][0]["function"]["arguments"] == {}
+
+    def test_to_template_dict_with_decoded_tool_call_arguments(self):
+        """Already-decoded tool arguments should pass through unchanged."""
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": {"cmd": "pwd"}},
+                    }
+                ],
+            }
+        )
+        d = msg.to_template_dict()
+        assert d["tool_calls"][0]["function"]["arguments"] == {"cmd": "pwd"}
+
+    def test_to_template_dict_rejects_non_dict_tool_call_entry(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": ["not-a-dict"],
+            }
+        )
+
+        with pytest.raises(ValueError, match="tool_calls entries must be dicts"):
+            msg.to_template_dict()
+
+    def test_to_template_dict_rejects_non_list_tool_calls(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": {"id": "call_0"},
+            }
+        )
+
+        with pytest.raises(ValueError, match="tool_calls must be a list"):
+            msg.to_template_dict()
+
+    def test_to_template_dict_preserves_none_tool_calls(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": None,
+            }
+        )
+
+        assert msg.to_template_dict()["tool_calls"] is None
+
+    def test_to_template_dict_rejects_falsy_non_dict_function_value(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": "",
+                    }
+                ],
+            }
+        )
+
+        with pytest.raises(ValueError, match="tool_calls function must be a dict"):
+            msg.to_template_dict()
+
+    def test_to_template_dict_rejects_non_object_tool_arguments(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "bad", "arguments": "[1, 2]"},
+                    }
+                ],
+            }
+        )
+
+        with pytest.raises(ValueError, match="must decode to a JSON object"):
+            msg.to_template_dict()
+
+    def test_to_template_dict_rejects_decoded_non_object_tool_arguments(self):
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "bad", "arguments": ["x"]},
+                    }
+                ],
+            }
+        )
+
+        with pytest.raises(ValueError, match="must be a dict or JSON object string"):
+            msg.to_template_dict()
 
     def test_to_template_dict_tool_message(self):
         """Tool result message should preserve tool_call_id."""
