@@ -22,9 +22,14 @@ def _reset_framework_state():
 
 
 def test_prepare_model_rtpllm_happy_path():
+    fake_quant_config = _Obj(
+        exclude_layers=[],
+        remap_layer_name=MagicMock(),
+    )
     fake_atom_config = _Obj(
         hf_config=_Obj(architectures=["Qwen3_5MoeForConditionalGeneration"]),
         plugin_config=_Obj(is_plugin_mode=True),
+        quant_config=fake_quant_config,
     )
     fake_model = MagicMock(name="FakeQwen35Moe")
     fake_model_cls = MagicMock(return_value=fake_model)
@@ -57,5 +62,6 @@ def test_prepare_model_rtpllm_happy_path():
     fake_register.register_ops_to_sglang.assert_not_called()
     fake_register.set_attn_cls.assert_called_once()
     fake_register.init_aiter_dist.assert_called_once_with(config=fake_atom_config)
+    fake_quant_config.remap_layer_name.assert_called_once()
     fake_model_cls.assert_called_once_with(atom_config=fake_atom_config)
     assert result is fake_model
