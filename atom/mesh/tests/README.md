@@ -140,3 +140,15 @@ cargo test -p atom-mesh test_list_workers
 # Run with output
 cargo test -p atom-mesh -- --nocapture
 ```
+
+### Standardized Harness Script
+
+`run_atomesh_harness_test.sh` runs the focused checks used for Atomesh harness and metrics validation:
+
+- Metrics subsystem unit tests: `cargo test -p atom-mesh --lib observability::metrics`
+- Worker `/engine_metrics` aggregation tests: `cargo test -p atom-mesh --test metrics_aggregator_test -- --nocapture`
+- Atomesh harness smoke tests: `cargo test -p atom-mesh --test api_tests test_atomesh_harness -- --nocapture --test-threads=1`
+
+```bash
+bash tests/run_atomesh_harness_test.sh
+```
