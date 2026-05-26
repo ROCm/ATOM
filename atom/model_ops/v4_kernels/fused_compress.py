@@ -58,6 +58,28 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.v4_kernels.compress_plan import CompressPlan
+from atom.utils import envs
+
+# Optional flydsl path (aiter ROCm kernels). Falls back to Triton when
+# unavailable. HCA = compress + norm_rope_scatter 2-kernel split for
+# D=512 ratio=128 overlap=False.
+try:
+    from aiter.ops.flydsl.kernels.fused_compress_attn import flydsl_fused_compress_attn
+    from aiter.ops.flydsl.kernels.fused_compress_attn_hca import (
+        flydsl_hca_compress_attn,
+    )
+except Exception:
+    flydsl_fused_compress_attn = None
+    flydsl_hca_compress_attn = None
+
+# Supported (head_dim, rope_head_dim, ratio, overlap) tuples for the flydsl
+# kernel — matches V4-Pro Main (D=512) and Indexer-inner (D=128) compressors.
+# Extend as more configs are validated.
+_FLYDSL_SUPPORTED = {
+    (512, 64, 4, True),  # V4-Pro CSA Main BF16   (ratio=4, OVERLAP)
+    (128, 64, 4, True),  # V4-Pro CSA Indexer FP8 (ratio=4, OVERLAP)
+    (512, 64, 128, False),  # V4-Pro HCA Main BF16  (ratio=128, no overlap)
+}
 
 
 @triton.jit
@@ -410,6 +432,82 @@ def fused_compress_attn(
     num_compress = plan.num_compress
     if plan_capacity == 0:
         return  # nothing to do — no plan rows ever populated.
+
+    # ------------------------------------------------------------------
+    # flydsl dispatch. Pure-GPU time on V4-Pro beats Triton 0.9x→2.9x
+    # across the relevant N_compress range; the small-N gap is bridged
+    # by the kernel doing both BF16 and FP8 paths through a single
+    # launcher (less per-call Python overhead at the boundary).
+    # ------------------------------------------------------------------
+    _flydsl_mode = envs.ATOM_FUSED_COMPRESS_USE_FLYDSL
+    _shape_key = (head_dim, rope_head_dim, ratio, overlap)
+    _flydsl_shape_ok = _shape_key in _FLYDSL_SUPPORTED
+    _flydsl_use = (
+        flydsl_fused_compress_attn is not None
+        and _flydsl_mode in ("auto", "always")
+        and _flydsl_shape_ok
+    )
+    if _flydsl_mode == "always" and not _flydsl_shape_ok:
+        raise RuntimeError(
+            f"ATOM_FUSED_COMPRESS_USE_FLYDSL=always but shape "
+            f"{_shape_key} is not in supported set {_FLYDSL_SUPPORTED}"
+        )
+    # HCA 2-kernel-split: BF16-only on V4-Pro HCA Main shape
+    # (D=512 ratio=128 overlap=False). HCA wins single-kernel at all N
+    # (1.06-3.7×) post slice_size + VEC=8 refactor.
+    _hca_use = (
+        _flydsl_use
+        and flydsl_hca_compress_attn is not None
+        and not quant
+        and _shape_key == (512, 64, 128, False)
+    )
+    if _hca_use:
+        flydsl_hca_compress_attn(
+            kv_in=kv_in,
+            score_in=score_in,
+            kv_state=kv_state,
+            score_state=score_state,
+            state_slot_mapping=state_slot_mapping,
+            plan_gpu=plan.compress_plan_gpu,
+            ape=ape,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            k_per_block=k_per_block,
+            ratio=ratio,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+        )
+        return
+    if _flydsl_use:
+        flydsl_fused_compress_attn(
+            kv_in=kv_in,
+            score_in=score_in,
+            kv_state=kv_state,
+            score_state=score_state,
+            plan_gpu=plan.compress_plan_gpu,
+            state_slot_mapping=state_slot_mapping,
+            ape=ape,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            k_per_block=k_per_block,
+            overlap=overlap,
+            ratio=ratio,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            quant=quant,
+            cache_scale=cache_scale,
+            use_ue8m0=use_ue8m0,
+            preshuffle=preshuffle,
+        )
+        return
 
     # Validate shapes
     dim_full = (2 if overlap else 1) * head_dim
