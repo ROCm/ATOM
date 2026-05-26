@@ -1,6 +1,6 @@
 # Online Quantization Guide
 
-ATOM can re-quantize model weights while loading them by passing
+ATOM can quantize or re-quantize model weights while loading them by passing
 `--online_quant_config` to the engine. The source checkpoint stays on disk
 unchanged; quantization happens in memory inside `process_weights_after_loading`
 right after the loader finishes copying tensors.
@@ -26,8 +26,8 @@ Use online quantization when one of the following holds:
 
 Prefer an offline pre-quantized checkpoint (e.g. `amd/DeepSeek-R1-0528-MXFP4`)
 when one already exists for your target format — it has lower load time,
-deterministic per-layer assignment, and no re-quantization overhead on every
-restart.
+deterministic per-layer assignment, and no online quantization overhead on
+every restart.
 
 ### Supported source-checkpoint formats
 
@@ -71,19 +71,12 @@ Resolution order for a given layer name:
 
 Only two target formats are currently supported. Any other string (for example
 `ptpc_i8`, `mxi4`, `mxfp8`) will either be rejected by the JSON parser or
-trigger an assertion in the loader when the layer's weight is re-quantized.
+trigger an assertion in the loader when the layer's weight is quantized.
 
 | Format string | Underlying `QuantType` | Weight dtype |
 |---|---|---|
 | `ptpc_fp8` | `QuantType.per_Token` | `torch.float8_e4m3fn` |
 | `mxfp4` | `QuantType.per_1x32` | packed FP4 (`torch.float4_e2m1fn_x2`, group size 32) |
-
-Format strings are parsed by
-[`atom/quant_spec.py::QuarkOnlineParser`](../atom/quant_spec.py); the loader-side
-dtype gate is enforced in
-[`atom/model_ops/linear.py::online_quantize_weight`](../atom/model_ops/linear.py)
-and
-[`atom/model_ops/moe.py::_online_quant`](../atom/model_ops/moe.py).
 
 ### 2.2 Picking the right pattern
 
