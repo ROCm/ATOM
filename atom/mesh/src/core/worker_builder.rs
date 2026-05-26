@@ -8,7 +8,7 @@ use super::{
     },
 };
 use crate::{
-    observability::metrics::Metrics, routers::grpc::engine::worker_client_cache::GrpcClient,
+    observability::metrics::MeshMetrics, routers::grpc::engine::worker_client_cache::GrpcClient,
 };
 
 /// Builder for creating BasicWorker instances with fluent API
@@ -220,7 +220,7 @@ impl BasicWorkerBuilder {
         });
 
         let healthy = true;
-        Metrics::set_worker_health(&self.url, healthy);
+        MeshMetrics::set_worker_health(&self.url, healthy);
 
         BasicWorker {
             metadata,

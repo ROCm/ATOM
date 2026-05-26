@@ -1,4 +1,4 @@
-use mesh::core::metrics_aggregator::{aggregate_metrics, MetricPack};
+use mesh::observability::metrics::engine_metrics::{aggregate_metrics, MetricPack};
 
 #[test]
 fn test_aggregate_simple() {

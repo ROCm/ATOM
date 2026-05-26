@@ -17,7 +17,7 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{is_retryable_status, RetryExecutor, WorkerRegistry, UNKNOWN_MODEL_ID},
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::{metrics_labels, MeshMetrics},
     protocols::{
         chat::ChatCompletionRequest,
         completion::CompletionRequest,
@@ -107,14 +107,14 @@ impl GrpcRouter {
             },
             |res, _attempt| is_retryable_status(res.status()),
             |delay, attempt| {
-                Metrics::record_worker_retry(
+                MeshMetrics::record_worker_retry(
                     metrics_labels::WORKER_REGULAR,
                     metrics_labels::ENDPOINT_CHAT,
                 );
-                Metrics::record_worker_retry_backoff(attempt, delay);
+                MeshMetrics::record_worker_retry_backoff(attempt, delay);
             },
             || {
-                Metrics::record_worker_retries_exhausted(
+                MeshMetrics::record_worker_retries_exhausted(
                     metrics_labels::WORKER_REGULAR,
                     metrics_labels::ENDPOINT_CHAT,
                 );
@@ -155,14 +155,14 @@ impl GrpcRouter {
             },
             |res, _attempt| is_retryable_status(res.status()),
             |delay, attempt| {
-                Metrics::record_worker_retry(
+                MeshMetrics::record_worker_retry(
                     metrics_labels::WORKER_REGULAR,
                     metrics_labels::ENDPOINT_GENERATE,
                 );
-                Metrics::record_worker_retry_backoff(attempt, delay);
+                MeshMetrics::record_worker_retry_backoff(attempt, delay);
             },
             || {
-                Metrics::record_worker_retries_exhausted(
+                MeshMetrics::record_worker_retries_exhausted(
                     metrics_labels::WORKER_REGULAR,
                     metrics_labels::ENDPOINT_GENERATE,
                 );

@@ -14,7 +14,7 @@ use tokio::{sync::OnceCell, time};
 
 use super::{CircuitBreaker, WorkerError, WorkerResult, UNKNOWN_MODEL_ID};
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::{metrics_labels, MeshMetrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::engine::worker_client_cache::GrpcClient,
 };
@@ -91,7 +91,7 @@ impl WorkerRoutingKeyLoad {
     }
 
     fn update_metrics(&self) {
-        Metrics::set_worker_routing_keys_active(&self.url, self.value());
+        MeshMetrics::set_worker_routing_keys_active(&self.url, self.value());
     }
 }
 
@@ -532,7 +532,7 @@ impl BasicWorker {
 
     fn update_running_requests_metrics(&self) {
         let load = self.load();
-        Metrics::set_worker_requests_active(self.url(), load);
+        MeshMetrics::set_worker_requests_active(self.url(), load);
     }
 }
 
@@ -560,7 +560,7 @@ impl Worker for BasicWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
-        Metrics::set_worker_health(self.url(), healthy);
+        MeshMetrics::set_worker_health(self.url(), healthy);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -584,7 +584,7 @@ impl Worker for BasicWorker {
             let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
 
             // Record health check success metric
-            Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_SUCCESS);
+            MeshMetrics::record_worker_health_check(worker_type_str, metrics_labels::CB_SUCCESS);
 
             if !self.is_healthy()
                 && successes >= self.metadata.health_config.success_threshold as usize
@@ -598,7 +598,7 @@ impl Worker for BasicWorker {
             let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
 
             // Record health check failure metric
-            Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_FAILURE);
+            MeshMetrics::record_worker_health_check(worker_type_str, metrics_labels::CB_FAILURE);
 
             if self.is_healthy()
                 && failures >= self.metadata.health_config.failure_threshold as usize
