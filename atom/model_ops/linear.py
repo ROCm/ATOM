@@ -585,12 +585,12 @@ class LinearBase(nn.Module):
                 self, "_mxfp8_active", False
             )
             if _use_mxfp8:
-                from aiter.ops.triton.quant.quant_mxfp8 import (
-                    per_1x32_mxfp8_quant_triton,
+                from aiter.ops.triton.quant.quant import (
+                    dynamic_mxfp8_quant,
                 )
 
                 if x_scale is None:
-                    x, x_scale = per_1x32_mxfp8_quant_triton(x)
+                    x, x_scale = dynamic_mxfp8_quant(x)
                 elif x_scale.dtype == torch.uint8:
                     pass  # caller already emitted MXFP8 1x32
                 else:
@@ -603,7 +603,7 @@ class LinearBase(nn.Module):
                         torch.float32
                     ).view(sM, sCols, 1)
                     x_bf16 = x_dq.view(Mx, Kx).to(torch.bfloat16)
-                    x, x_scale = per_1x32_mxfp8_quant_triton(x_bf16)
+                    x, x_scale = dynamic_mxfp8_quant(x_bf16)
             elif x_scale is None:
                 quant_func = self.quant_func
                 if self.quant_type.value == QuantType.per_1x128.value:

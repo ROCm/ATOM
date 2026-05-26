@@ -53,7 +53,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_quant_x import (
 from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
 )
-from aiter.ops.triton.quant.quant_mxfp8 import fused_flatten_mxfp8_quant
+from aiter.ops.triton.quant.fused_mxfp8_quant import fused_flatten_mxfp8_quant
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.tuned_gemm import tgemm
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -133,7 +133,7 @@ _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 # MXFP8 a8w8 GEMM path (Task #77). When on, q_norm RMSNorm emits FP8 e4m3fn +
-# uint8 e8m0 1x32 scales directly (via the Triton rmsnorm_mxfp8_quant path in
+# uint8 e8m0 1x32 scales directly (via the Triton fused_rms_mxfp8_quant path in
 # atom/model_ops/layernorm.py) so wq_b's MXFP8 GEMM consumes them with no
 # transcode. The helper below is reserved for call sites that need to fuse
 # the Q-side MXFP8 quant with the K-side bf16 RMSNorm in a single launch.
@@ -158,14 +158,14 @@ def _fuse_rmsnorm_mxfp8_quant(
     K: RMSNorm only, bf16 output, consumed by the downstream RoPE / SWA-write
        fused kernel which expects bf16 K.
 
-    Both halves run in a single Triton launch (dual_rmsnorm_mxfp8_quant) to
+    Both halves run in a single Triton launch (fused_dual_rmsnorm_mxfp8_quant) to
     avoid the +6us/layer per-launch overhead of two separate kernels.
 
     Returns (qr_fp8, qr_scale_e8m0, kv_bf16).
     """
-    from aiter.ops.triton.quant.quant_mxfp8 import dual_rmsnorm_mxfp8_quant
+    from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
 
-    qr, qr_scale, kv = dual_rmsnorm_mxfp8_quant(
+    qr, qr_scale, kv = fused_dual_rmsnorm_mxfp8_quant(
         q_lora,
         kv_pre,
         q_norm_weight,

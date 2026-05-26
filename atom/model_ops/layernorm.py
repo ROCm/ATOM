@@ -18,7 +18,7 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
-from aiter.ops.triton.quant.quant_mxfp8 import rmsnorm_mxfp8_quant
+from aiter.ops.triton.quant.fused_mxfp8_quant import fused_rms_mxfp8_quant
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
@@ -335,7 +335,7 @@ class RMSNorm(nn.Module):
                         x2 = x.reshape(-1, x.shape[-1])
                     else:
                         x2 = x
-                    y, s = rmsnorm_mxfp8_quant(x2, self.weight, self.eps)
+                    y, s = fused_rms_mxfp8_quant(x2, self.weight, self.eps)
                     if x.dim() != 2:
                         y = y.view(*x.shape[:-1], x.shape[-1])
                         s = s.view(*x.shape[:-1], s.shape[-1])
