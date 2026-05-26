@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import torch
 
@@ -87,42 +86,42 @@ def apply_attention_gdn_rtpllm_patch() -> None:
         )
         if gdn_metadata.num_prefills > 0:
             mixed_qkv_non_spec_T = mixed_qkv.transpose(0, 1)
-            query_non_spec, key_non_spec, value_non_spec = attention_gdn.causal_conv1d_fn(
-                mixed_qkv_non_spec_T,
-                conv_weights,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_state,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                k_dim_size=self.num_k_heads * self.head_k_dim // self.tp_size,
-                v_dim_size=self.num_v_heads * self.head_v_dim // self.tp_size,
-                metadata=gdn_metadata,
+            query_non_spec, key_non_spec, value_non_spec = (
+                attention_gdn.causal_conv1d_fn(
+                    mixed_qkv_non_spec_T,
+                    conv_weights,
+                    self.conv1d.bias,
+                    activation=self.activation,
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=non_spec_state_indices_tensor,
+                    query_start_loc=non_spec_query_start_loc,
+                    k_dim_size=self.num_k_heads * self.head_k_dim // self.tp_size,
+                    v_dim_size=self.num_v_heads * self.head_v_dim // self.tp_size,
+                    metadata=gdn_metadata,
+                )
             )
         elif gdn_metadata.num_decodes > 0:
-            query_non_spec, key_non_spec, value_non_spec = attention_gdn.causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
-                conv_weights,
-                self.num_k_heads * self.head_k_dim // self.tp_size,
-                self.num_v_heads * self.head_v_dim // self.tp_size,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=non_spec_state_indices_tensor,
-                validate_data=True,
+            query_non_spec, key_non_spec, value_non_spec = (
+                attention_gdn.causal_conv1d_update(
+                    mixed_qkv,
+                    conv_state,
+                    conv_weights,
+                    self.num_k_heads * self.head_k_dim // self.tp_size,
+                    self.num_v_heads * self.head_v_dim // self.tp_size,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor,
+                    validate_data=True,
+                )
             )
         else:
             return core_attn_out
 
         num_tokens_nonspec = query_non_spec.shape[0]
-        query_non_spec = query_non_spec.view(
-            1, num_tokens_nonspec, -1, self.head_k_dim
-        )
+        query_non_spec = query_non_spec.view(1, num_tokens_nonspec, -1, self.head_k_dim)
         key_non_spec = key_non_spec.view(1, num_tokens_nonspec, -1, self.head_k_dim)
-        value_non_spec = value_non_spec.view(
-            1, num_tokens_nonspec, -1, self.head_v_dim
-        )
+        value_non_spec = value_non_spec.view(1, num_tokens_nonspec, -1, self.head_v_dim)
 
         g, beta = attention_gdn.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
         if gdn_metadata.num_prefills > 0:

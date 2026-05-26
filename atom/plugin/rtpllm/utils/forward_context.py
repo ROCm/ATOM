@@ -70,11 +70,13 @@ class RTPForwardContext:
             # In cuda-graph capture the .item() host-sync would abort capture
             # (see rtp+atom_graph.md §2.4); under capture we always fall through
             # to the input_lengths-based path below.
-            if (
-                not torch.cuda.is_current_stream_capturing()
-                and bool((cu_seqlens[-1] > 0).item())
+            if not torch.cuda.is_current_stream_capturing() and bool(
+                (cu_seqlens[-1] > 0).item()
             ):
-                if input_lengths is not None and cu_seqlens.numel() >= input_lengths.numel() + 1:
+                if (
+                    input_lengths is not None
+                    and cu_seqlens.numel() >= input_lengths.numel() + 1
+                ):
                     return cu_seqlens[: input_lengths.numel() + 1]
                 return cu_seqlens
 
@@ -113,7 +115,9 @@ class RTPForwardContext:
                 "RTP decode requires sequence_lengths(+1) or input_lengths "
                 "to build GDN query_start_loc."
             )
-        q_lens = torch.ones_like(input_lengths, dtype=torch.int32, device=input_lengths.device)
+        q_lens = torch.ones_like(
+            input_lengths, dtype=torch.int32, device=input_lengths.device
+        )
         prefix = torch.zeros((1,), dtype=torch.int32, device=input_lengths.device)
         return torch.cat([prefix, q_lens.cumsum(dim=0)], dim=0)
 
@@ -136,7 +140,9 @@ class RTPForwardContext:
             )
         if block_table.dim() == 1:
             block_table = block_table.unsqueeze(0)
-        base = block_table.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
+        base = block_table.to(
+            device=device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
         if base.dim() != 2:
             raise ValueError(
                 "RTP plugin produced invalid GDN state indices shape "
@@ -255,7 +261,9 @@ class RTPForwardContext:
         attn_inputs: Any,
         group_id: int | None = None,
     ) -> torch.Tensor | None:
-        by_group = getattr(attn_inputs, "kv_cache_kernel_block_id_device_by_group", None)
+        by_group = getattr(
+            attn_inputs, "kv_cache_kernel_block_id_device_by_group", None
+        )
         if by_group is not None and len(by_group):
             gid = int(group_id) if group_id is not None else 0
             if gid < 0 or gid >= len(by_group):
@@ -290,7 +298,9 @@ class RTPForwardContext:
         layer_num: int | None,
         layer_group_map: Dict[int, int] | None = None,
     ) -> int:
-        by_group = getattr(attn_inputs, "kv_cache_kernel_block_id_device_by_group", None)
+        by_group = getattr(
+            attn_inputs, "kv_cache_kernel_block_id_device_by_group", None
+        )
         if by_group is None or not len(by_group):
             return 0
         if layer_num is None:
@@ -374,8 +384,8 @@ class RTPForwardContext:
                     "RTP prefill requires attention_inputs.prefix_lengths for GDN metadata."
                 )
             has_initial_state = prefix_lengths > 0
-            nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
-                query_start_loc
+            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(query_start_loc)
             )
             return GDNAttentionMetadata(
                 num_prefills=int(prefix_lengths.numel()),
@@ -531,7 +541,9 @@ class RTPForwardContext:
         cg_bufs: dict | None = None,
     ) -> torch.Tensor:
         if positions is None or positions.numel() == 0:
-            raise ValueError("RTP plugin requires non-empty positions for slot_mapping.")
+            raise ValueError(
+                "RTP plugin requires non-empty positions for slot_mapping."
+            )
         if query_start_loc is None or query_start_loc.numel() < 2:
             raise ValueError(
                 "RTP plugin requires valid query_start_loc for slot_mapping."
@@ -583,9 +595,15 @@ class RTPForwardContext:
             qsl = query_start_loc
             bt = block_table
         else:
-            pos_i32 = positions.to(device=device, dtype=dtype, non_blocking=True).contiguous()
-            qsl = query_start_loc.to(device=device, dtype=dtype, non_blocking=True).contiguous()
-            bt = block_table.to(device=device, dtype=dtype, non_blocking=True).contiguous()
+            pos_i32 = positions.to(
+                device=device, dtype=dtype, non_blocking=True
+            ).contiguous()
+            qsl = query_start_loc.to(
+                device=device, dtype=dtype, non_blocking=True
+            ).contiguous()
+            bt = block_table.to(
+                device=device, dtype=dtype, non_blocking=True
+            ).contiguous()
 
         batch_size = int(qsl.numel()) - 1
         num_tokens = int(pos_i32.numel())
@@ -614,7 +632,12 @@ class RTPForwardContext:
             # For decode (1 token/seq): seq_id[i] == i, pre-computed as arange.
             seq_id = cg_bufs["seq_id"][:num_tokens]
             block_col_buf = cg_bufs["block_col"][:num_tokens]
-            torch.div(pos_i32, int(seq_size_per_block), rounding_mode="floor", out=block_col_buf)
+            torch.div(
+                pos_i32,
+                int(seq_size_per_block),
+                rounding_mode="floor",
+                out=block_col_buf,
+            )
             block_col_i64_buf = cg_bufs["block_col_i64"][:num_tokens]
             block_col_i64_buf.copy_(block_col_buf)
             slot_base_buf = cg_bufs["slot_base"][:num_tokens]
@@ -677,7 +700,9 @@ class RTPForwardContext:
     ) -> torch.Tensor:
         batch_size = int(seq_lens.numel())
         if batch_size <= 0:
-            raise ValueError("RTP plugin cannot build query_start_loc with empty seq_lens.")
+            raise ValueError(
+                "RTP plugin cannot build query_start_loc with empty seq_lens."
+            )
 
         in_capture = torch.cuda.is_current_stream_capturing()
 
@@ -699,7 +724,9 @@ class RTPForwardContext:
         qsl = RTPForwardContext._query_start_loc(attn_inputs, device=device)
         if qsl is not None and qsl.numel() == batch_size + 1:
             lengths = qsl[1:] - qsl[:-1]
-            qsl_stats = torch.stack([qsl[-1], torch.min(lengths)], dim=0).to(device="cpu")
+            qsl_stats = torch.stack([qsl[-1], torch.min(lengths)], dim=0).to(
+                device="cpu"
+            )
             qsl_total_tokens, qsl_min_len = [int(v) for v in qsl_stats.tolist()]
             if qsl_total_tokens == int(num_tokens) and qsl_min_len > 0:
                 return qsl.contiguous()
@@ -716,12 +743,12 @@ class RTPForwardContext:
             min_input_len, total_input_len = [int(v) for v in input_stats.tolist()]
             if min_input_len > 0 and total_input_len == int(num_tokens):
                 prefix = torch.zeros((1,), dtype=torch.int32, device=device)
-                return torch.cat([prefix, input_lengths.cumsum(dim=0)], dim=0).contiguous()
+                return torch.cat(
+                    [prefix, input_lengths.cumsum(dim=0)], dim=0
+                ).contiguous()
 
         if int(num_tokens) == batch_size:
-            prefix = torch.arange(
-                0, batch_size + 1, dtype=torch.int32, device=device
-            )
+            prefix = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device)
             return prefix.contiguous()
         if batch_size == 1:
             return torch.tensor([0, int(num_tokens)], dtype=torch.int32, device=device)
@@ -767,7 +794,9 @@ class RTPForwardContext:
             seq_lens_view.copy_(seq_lens, non_blocking=True)
             seq_lens = seq_lens_view
         else:
-            seq_lens = seq_lens.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
+            seq_lens = seq_lens.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
         batch_size = int(seq_lens.numel())
 
         # During RTP CUDA graph capture, positions is the full preallocated
@@ -974,7 +1003,9 @@ class RTPForwardContext:
             conv_kernel = int(gdn_layer.conv1d.weight.size(2))
             qkv_size = int(gdn_layer.conv1d.weight.size(0))
             local_num_v_heads = int(gdn_layer.dt_bias.numel())
-            ssm_state_size = int(local_num_v_heads * gdn_layer.head_v_dim * gdn_layer.head_k_dim)
+            ssm_state_size = int(
+                local_num_v_heads * gdn_layer.head_v_dim * gdn_layer.head_k_dim
+            )
             conv_state_size = int((conv_kernel - 1) * qkv_size)
             total_needed = ssm_state_size + conv_state_size
             if cache_base.shape[1] < total_needed:
@@ -1056,7 +1087,9 @@ class RTPForwardContext:
             return ("no_kv_cache",)
         gdn_layer_map, full_attn_layer_map = layer_maps
         signature: list[Any] = [id(runtime.kv_cache)]
-        all_layer_nums = sorted(set(gdn_layer_map.keys()) | set(full_attn_layer_map.keys()))
+        all_layer_nums = sorted(
+            set(gdn_layer_map.keys()) | set(full_attn_layer_map.keys())
+        )
         for layer_num in all_layer_nums:
             layer_cache = runtime.kv_cache.get_layer_cache(layer_num)
             kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
@@ -1085,10 +1118,14 @@ class RTPForwardContext:
     ) -> "RTPForwardContext":
         attn_inputs = getattr(inputs, "attention_inputs", None)
         if attn_inputs is None:
-            raise ValueError("RTP plugin requires inputs.attention_inputs for forward context.")
+            raise ValueError(
+                "RTP plugin requires inputs.attention_inputs for forward context."
+            )
 
         if runtime.kv_cache is None:
-            raise ValueError("RTP plugin requires initialized kv_cache for forward context.")
+            raise ValueError(
+                "RTP plugin requires initialized kv_cache for forward context."
+            )
         seq_size_per_block = int(getattr(runtime.kv_cache, "seq_size_per_block", 0))
         kernel_seq_size_per_block = int(
             getattr(runtime.kv_cache, "kernel_seq_size_per_block", 0)

@@ -46,4 +46,6 @@ def test_rtpllm_wrapper_registers_qwen35_moe_override():
             ]
             == "qwen35_moe"
         )
-        register_model_mock.assert_called_with("atom_qwen35_moe", _FakeATOMQwen35Moe, [])
+        register_model_mock.assert_called_with(
+            "atom_qwen35_moe", _FakeATOMQwen35Moe, []
+        )

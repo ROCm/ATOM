@@ -73,6 +73,7 @@ class _ATOMAttnPyObj:
         self._rtp_full_attn_layers: list = []
         try:
             from atom.plugin.rtpllm.attention_backend import RTPAttention as _RTPAttn
+
             self._rtp_attention_cls = _RTPAttn
         except (ImportError, ModuleNotFoundError):
             self._rtp_attention_cls = None
@@ -118,7 +119,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         self.model = atom_model
         first_param = next(self.model.parameters(), None)
         if first_param is None:
-            raise RuntimeError("ATOM model has no parameters; cannot determine device/dtype.")
+            raise RuntimeError(
+                "ATOM model has no parameters; cannot determine device/dtype."
+            )
         self._model_device = first_param.device
         self._model_dtype = first_param.dtype
         # Cache module layer maps once to avoid per-forward model.modules() traversal.
@@ -158,7 +161,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
     def _get_model_dtype(self) -> torch.dtype:
         return self._model_dtype
 
-    def _get_token_num(self, inputs: PyModelInputs, input_ids: torch.Tensor | None) -> int:
+    def _get_token_num(
+        self, inputs: PyModelInputs, input_ids: torch.Tensor | None
+    ) -> int:
         if input_ids is not None and input_ids.numel() > 0:
             return int(input_ids.numel())
         if inputs.input_hiddens is not None and inputs.input_hiddens.numel() > 0:
@@ -181,7 +186,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             )
             - 1
         )
-        token_ordinal = token_ordinal - torch.repeat_interleave(per_seq_base, input_lengths)
+        token_ordinal = token_ordinal - torch.repeat_interleave(
+            per_seq_base, input_lengths
+        )
         return (token_starts + token_ordinal).to(dtype=torch.int32).contiguous()
 
     def _build_positions_from_attention_inputs(
@@ -219,7 +226,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         if int(sequence_lengths_i32.numel()) < int(input_lengths_i32.numel()):
             return None
         starts = (
-            sequence_lengths_i32[: int(input_lengths_i32.numel())] - input_lengths_i32 + 1
+            sequence_lengths_i32[: int(input_lengths_i32.numel())]
+            - input_lengths_i32
+            + 1
         )
         return self._build_token_positions(input_lengths_i32, starts)
 
@@ -248,7 +257,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         # first use attention_inputs.position_ids, then fallback to combo_position_ids.
         positions = getattr(attn_inputs, "position_ids", None)
         if positions is None or positions.numel() == 0:
-            positions = self._extract_combo_positions(inputs=inputs, model_device=model_device)
+            positions = self._extract_combo_positions(
+                inputs=inputs, model_device=model_device
+            )
         if positions is None or positions.numel() == 0:
             positions = self._build_positions_from_attention_inputs(
                 attn_inputs=attn_inputs,
@@ -268,7 +279,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         # capture-time max_num_token). See rtp+atom_graph.md §4.3.
         if not torch.cuda.is_current_stream_capturing():
             pos_tokens = (
-                int(positions.shape[-1]) if positions.dim() > 0 else int(positions.numel())
+                int(positions.shape[-1])
+                if positions.dim() > 0
+                else int(positions.numel())
             )
             if token_num > 0 and pos_tokens != token_num:
                 rebuilt_positions = self._build_positions_from_attention_inputs(
@@ -278,7 +291,11 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                 rebuilt_tokens = (
                     int(rebuilt_positions.shape[-1])
                     if rebuilt_positions is not None and rebuilt_positions.dim() > 0
-                    else (int(rebuilt_positions.numel()) if rebuilt_positions is not None else -1)
+                    else (
+                        int(rebuilt_positions.numel())
+                        if rebuilt_positions is not None
+                        else -1
+                    )
                 )
                 if rebuilt_positions is not None and rebuilt_tokens == token_num:
                     positions = rebuilt_positions.to(
@@ -365,7 +382,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             or int(getattr(kv_cache, "seq_size_per_block", 0))
             or 1
         )
-        max_blocks = (int(max_seq_len) + kernel_seq_size_per_block - 1) // kernel_seq_size_per_block + 1
+        max_blocks = (
+            int(max_seq_len) + kernel_seq_size_per_block - 1
+        ) // kernel_seq_size_per_block + 1
         # query_start_loc for decode: always [0, 1, 2, ..., bs], i.e. arange(bs+1).
         # seq_id for decode slot_mapping: seq_id[i] == i, i.e. arange(bs).
         self._cg_meta_bufs: dict = {
@@ -406,7 +425,11 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         input_ids = inputs.input_ids
         inputs_embeds = None
 
-        if input_ids is not None and input_ids.numel() > 0 and input_ids.device != model_device:
+        if (
+            input_ids is not None
+            and input_ids.numel() > 0
+            and input_ids.device != model_device
+        ):
             input_ids = input_ids.to(device=model_device, non_blocking=True)
         token_num = self._get_token_num(inputs=inputs, input_ids=input_ids)
         positions = self._extract_positions(
@@ -508,9 +531,11 @@ class ATOMQwen35Moe(BaseModel):
         attention_step = config_json["full_attention_interval"]
         config.hybrid_attention_config.enable_hybrid_attention = True
         config.hybrid_attention_config.hybrid_attention_types = [
-            HybridAttentionType.NONE
-            if (idx + 1) % attention_step == 0
-            else HybridAttentionType.LINEAR
+            (
+                HybridAttentionType.NONE
+                if (idx + 1) % attention_step == 0
+                else HybridAttentionType.LINEAR
+            )
             for idx in range(config.num_layers)
         ]
 
@@ -538,9 +563,7 @@ class ATOMQwen35Moe(BaseModel):
         Default: enabled (missing/other values behave as enabled).
         """
         if os.getenv("ENABLE_CUDA_GRAPH", "1") == "0":
-            logger.info(
-                "ENABLE_CUDA_GRAPH=0 — ATOMQwen35Moe forces eager forward."
-            )
+            logger.info("ENABLE_CUDA_GRAPH=0 — ATOMQwen35Moe forces eager forward.")
             return False
         return True
 
@@ -613,7 +636,9 @@ class ATOMQwen35Moe(BaseModel):
         import atom
         from atom.model_loader.loader import load_model_in_plugin_mode
 
-        target_device = torch.device(self.device if getattr(self, "device", None) else "cuda")
+        target_device = torch.device(
+            self.device if getattr(self, "device", None) else "cuda"
+        )
         target_dtype = self.model_config.compute_dtype
         old_default_dtype = torch.get_default_dtype()
         try:
@@ -641,28 +666,45 @@ class ATOMQwen35Moe(BaseModel):
             return None
 
         def _inject_rtp_projection_weights(atom_model_obj: Any) -> None:
-            lm_head_w = _get_first_param_tensor(atom_model_obj, "language_model.lm_head.weight")
+            lm_head_w = _get_first_param_tensor(
+                atom_model_obj, "language_model.lm_head.weight"
+            )
             if lm_head_w is None:
                 lm_head_w = _get_first_param_tensor(atom_model_obj, "lm_head.weight")
             if lm_head_w is not None:
                 self.weight.set_global_weight(W.lm_head, lm_head_w.detach())
-                logger.info("Injected runtime lm_head weight for RTP: %s", tuple(lm_head_w.shape))
+                logger.info(
+                    "Injected runtime lm_head weight for RTP: %s",
+                    tuple(lm_head_w.shape),
+                )
             else:
-                logger.warning("Failed to find ATOM lm_head.weight for RTP runtime projection.")
+                logger.warning(
+                    "Failed to find ATOM lm_head.weight for RTP runtime projection."
+                )
 
-            emb_w = _get_first_param_tensor(atom_model_obj, "language_model.model.embed_tokens.weight")
+            emb_w = _get_first_param_tensor(
+                atom_model_obj, "language_model.model.embed_tokens.weight"
+            )
             if emb_w is None:
-                emb_w = _get_first_param_tensor(atom_model_obj, "model.embed_tokens.weight")
+                emb_w = _get_first_param_tensor(
+                    atom_model_obj, "model.embed_tokens.weight"
+                )
             if emb_w is not None:
                 self.weight.set_global_weight(W.embedding, emb_w.detach())
-                logger.info("Injected runtime embedding weight for RTP: %s", tuple(emb_w.shape))
+                logger.info(
+                    "Injected runtime embedding weight for RTP: %s", tuple(emb_w.shape)
+                )
 
-            final_ln = _get_first_param_tensor(atom_model_obj, "language_model.model.norm.weight")
+            final_ln = _get_first_param_tensor(
+                atom_model_obj, "language_model.model.norm.weight"
+            )
             if final_ln is None:
                 final_ln = _get_first_param_tensor(atom_model_obj, "model.norm.weight")
             if final_ln is not None:
                 self.weight.set_global_weight(W.final_ln_gamma, final_ln.detach())
-                logger.info("Injected runtime final_ln_gamma for RTP: %s", tuple(final_ln.shape))
+                logger.info(
+                    "Injected runtime final_ln_gamma for RTP: %s", tuple(final_ln.shape)
+                )
 
         def _assert_norm_weights_loaded(atom_model_obj: Any) -> None:
             # Guard against silently using default-initialized GemmaRMSNorm weights.

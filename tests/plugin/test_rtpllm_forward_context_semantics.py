@@ -49,7 +49,7 @@ def _install_forward_context_stubs():
 
 _install_forward_context_stubs()
 
-from atom.plugin.rtpllm.utils.forward_context import RTPForwardContext
+from atom.plugin.rtpllm.utils.forward_context import RTPForwardContext  # noqa: E402
 
 
 def _make_attn_inputs(
@@ -110,7 +110,9 @@ def test_rtpllm_forward_context_decode_metadata_state_indices_shape():
     attn_inputs = _make_attn_inputs(
         input_lengths=torch.tensor([1], dtype=torch.int32),
         sequence_lengths=torch.tensor([35], dtype=torch.int32),
-        kv_cache_kernel_block_id_device=torch.tensor([[123, 124, 125]], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.tensor(
+            [[123, 124, 125]], dtype=torch.int32
+        ),
         is_prefill=False,
     )
 

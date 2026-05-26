@@ -8,4 +8,3 @@ __all__ = [
     "apply_attention_gdn_rtpllm_patch",
     "apply_attention_mha_rtpllm_patch",
 ]
-

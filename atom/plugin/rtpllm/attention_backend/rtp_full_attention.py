@@ -4,13 +4,16 @@ import math
 from typing import Optional
 
 import torch
+
 try:
     import aiter
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - runtime fallback
     aiter = None
 
 try:
-    from rtp_llm.models_py.modules.factory.attention.common import reshape_paged_kv_cache
+    from rtp_llm.models_py.modules.factory.attention.common import (
+        reshape_paged_kv_cache,
+    )
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - runtime fallback
     reshape_paged_kv_cache = None
 
@@ -723,12 +726,17 @@ class RTPFullAttention(BaseAttention):
                 value_cache_aiter = value_cache_aiter.view(
                     kv_sizes[0], kv_sizes[1], kv_sizes[2] // x, kv_sizes[3], x
                 )
-                kv_indptr = torch.zeros(num_seqs + 1, dtype=torch.int32, device=q.device)
+                kv_indptr = torch.zeros(
+                    num_seqs + 1, dtype=torch.int32, device=q.device
+                )
                 kv_page_indices = torch.zeros(1, dtype=torch.int32, device=q.device)
                 q_descale = None
                 k_descale = None
                 v_descale = None
-                if key_cache_aiter.dtype in (torch.float8_e4m3fnuz, torch.float8_e4m3fn):
+                if key_cache_aiter.dtype in (
+                    torch.float8_e4m3fnuz,
+                    torch.float8_e4m3fn,
+                ):
                     q_descale = torch.ones(1, dtype=torch.float32, device=q.device)
                     k_descale = torch.ones(1, dtype=torch.float32, device=q.device)
                     v_descale = torch.ones(1, dtype=torch.float32, device=q.device)
@@ -767,8 +775,10 @@ class RTPFullAttention(BaseAttention):
         # tensors keep stable addresses across replays.
         static_bufs = (
             self._cg_static_bufs
-            if (self._cg_static_bufs is not None
-                and torch.cuda.is_current_stream_capturing())
+            if (
+                self._cg_static_bufs is not None
+                and torch.cuda.is_current_stream_capturing()
+            )
             else None
         )
         output = _run_nonasm_paged_attention(
@@ -794,7 +804,9 @@ class RTPFullAttention(BaseAttention):
     ) -> torch.Tensor:
         del q_scale
         if not is_plugin_mode() or not is_rtpllm():
-            raise NotImplementedError("RTPFullAttention is only supported in rtpllm plugin mode.")
+            raise NotImplementedError(
+                "RTPFullAttention is only supported in rtpllm plugin mode."
+            )
         return self._forward_impl_plugin_mode(
             query=query,
             key=key,

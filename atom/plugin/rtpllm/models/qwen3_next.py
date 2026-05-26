@@ -17,6 +17,7 @@ def apply_qwen3_next_rtpllm_patch() -> None:
         return
 
     import atom.models.qwen3_next as qwen3_next
+
     def _split_router_logits(self, router_logits: torch.Tensor):
         n_shared = int(getattr(self, "n_shared_experts", 0) or 0)
         if n_shared <= 0:
@@ -116,7 +117,6 @@ def apply_qwen3_next_rtpllm_patch() -> None:
         else:
             raise ValueError("Invalid layer_type")
 
-
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
@@ -159,12 +159,14 @@ def apply_qwen3_next_rtpllm_patch() -> None:
             projected_states_ba = projected_states_qkvzba[..., -ba_dim:]
             k_heads_after_tp = self.num_k_heads // self.tp_size
             v_heads_after_tp = self.num_v_heads // self.tp_size
-            mixed_qkv, z, b, a, core_attn_out = qwen3_next.fused_split_chunk_qwen_next_qkvzba(
-                projected_states_qkvzba,
-                k_heads_after_tp,
-                v_heads_after_tp,
-                self.head_k_dim,
-                self.head_v_dim,
+            mixed_qkv, z, b, a, core_attn_out = (
+                qwen3_next.fused_split_chunk_qwen_next_qkvzba(
+                    projected_states_qkvzba,
+                    k_heads_after_tp,
+                    v_heads_after_tp,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
             )
         else:
             if x_fp8 is not None:
@@ -174,13 +176,15 @@ def apply_qwen3_next_rtpllm_patch() -> None:
             projected_states_ba = self.in_proj_ba(hidden_states)
             num_k_heads_tp = self.num_k_heads // self.tp_size
             num_v_heads_tp = self.num_v_heads // self.tp_size
-            mixed_qkv, z, b, a, core_attn_out = qwen3_next.fused_split_chunk_qwen_next_qkvz_ba(
-                projected_states_qkvz,
-                projected_states_ba,
-                num_k_heads_tp,
-                num_v_heads_tp,
-                self.head_k_dim,
-                self.head_v_dim,
+            mixed_qkv, z, b, a, core_attn_out = (
+                qwen3_next.fused_split_chunk_qwen_next_qkvz_ba(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    num_k_heads_tp,
+                    num_v_heads_tp,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
             )
         core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
         core_attn_out, maybe_scale = self.norm(core_attn_out, z)
@@ -201,4 +205,3 @@ def apply_qwen3_next_rtpllm_patch() -> None:
     logger.info(
         "Applied RTP patch for atom.models.qwen3_next sparse_moe and decoder forward"
     )
-
