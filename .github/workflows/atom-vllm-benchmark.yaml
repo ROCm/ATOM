@@ -1300,6 +1300,24 @@ jobs:
       UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
       BENCHMARK_CLIENT: ${{ contains(matrix.model.prefix, '-aw-') && 'vLLM bench' || needs.resolve-atom-source.outputs.benchmark_client }}
     steps:
+      - name: Print runner user
+        run: |
+          echo "=== Container engine diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "docker path: $(command -v docker || true)"
+          echo "podman path: $(command -v podman || true)"
+          echo "docker version:"
+          docker version || true
+          echo "docker info:"
+          docker info || true
+          echo "podman version:"
+          podman version || true
+          echo "podman info:"
+          podman info || true
+          echo "=== End container engine diagnostics ==="
+
       - name: Detect container engine
         run: |
           if docker info > /dev/null 2>&1; then
