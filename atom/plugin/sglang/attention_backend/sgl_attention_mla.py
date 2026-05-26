@@ -978,7 +978,21 @@ def _read_kv_b_proj_weight(attn: DeepseekV2MLAAttention) -> torch.Tensor:
             attn.kv_b_proj.qzeros,
         ).T
     else:
-        w = attn.kv_b_proj.weight
+        layer_quant_config = getattr(attn.kv_b_proj, "layer_quant_config", None)
+        is_quark_static_mxfp4 = (
+            layer_quant_config is not None
+            and layer_quant_config.quant_method == "quark"
+            and layer_quant_config.quant_dtype == dtypes.fp4x2
+            and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
+        )
+        if is_quark_static_mxfp4:
+            w = getattr(
+                attn.kv_b_proj,
+                "_mxfp4_unshuffled_weight",
+                attn.kv_b_proj.weight,
+            )
+        else:
+            w = attn.kv_b_proj.weight
 
     # On ROCm, ATOM creates parameters with fnuz dtype but loads fn bytes.
     # View-cast back to fn so the normalize path works correctly.
@@ -1140,21 +1154,28 @@ def _split_and_assign_kc_vc(
         [attn.qk_nope_head_dim, attn.v_head_dim], dim=1
     )
 
-    # quark fp4 special path
+    # Quark MXFP4 LinearBase modules store quantization on layer_quant_config;
+    # there is no kv_b_proj.quant_method object to inspect in this path.
+    layer_quant_config = getattr(attn.kv_b_proj, "layer_quant_config", None)
     quant_method = getattr(attn.kv_b_proj, "quant_method", None)
     quant_config = getattr(quant_method, "quant_config", None)
-    if (
-        _use_aiter_gfx95
-        and quant_config is not None
-        and quant_config.get_name() == "quark"
-    ):
+    is_quark_quant_method = (
+        quant_config is not None and quant_config.get_name() == "quark"
+    )
+    is_quark_mxfp4_linear = (
+        layer_quant_config is not None
+        and layer_quant_config.quant_method == "quark"
+        and layer_quant_config.quant_dtype == dtypes.fp4x2
+        and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
+    )
+    if _use_aiter_gfx95 and (is_quark_quant_method or is_quark_mxfp4_linear):
         w_kc, attn.w_scale_k, w_vc, attn.w_scale_v = quark_post_load_weights(
             attn, w, "mxfp4"
         )
 
     if not use_deep_gemm_bmm:
         use_vllm_weight_layout = _is_hip and not (
-            quant_config is not None and quant_config.get_name() == "quark"
+            is_quark_quant_method or is_quark_mxfp4_linear
         )
 
         if use_vllm_weight_layout:
