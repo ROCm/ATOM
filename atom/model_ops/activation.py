@@ -5,6 +5,7 @@ import torch
 from typing import Optional
 from torch import nn
 import torch.nn.functional as F
+from aiter import silu_and_mul
 from atom.config import QuantizationConfig
 from atom.quant_spec import LayerQuantConfig
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -103,11 +104,9 @@ class SiluAndMul(nn.Module):
             and self.quant_type.value == QuantType.per_1x32.value
         ):
             return mxfp4_act_mul_quant_fuse(x, shuffle=True)
-        # aiter triton fused_silu_mul (portable, works on all archs)
-        elif x.is_contiguous() and x.size(-1) % 2 == 0:
-            from aiter.ops.triton.activation import fused_silu_mul
-
-            return fused_silu_mul(x)
-        # torch fallback
         else:
-            return self.forward_native(x)
+            out = torch.empty(
+                [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
+            )
+            silu_and_mul(out, x)
+            return out
