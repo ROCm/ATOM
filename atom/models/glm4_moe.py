@@ -22,6 +22,7 @@ from atom.model_ops.topK import (
     is_rocm_aiter_fuse_routed_scaling_factor,
     is_rocm_aiter_fusion_shared_expert_enabled,
 )
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers.models.glm4_moe import Glm4MoeConfig
@@ -33,6 +34,10 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+)
+
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
+    envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
 
 
@@ -227,6 +232,9 @@ class Glm4MoeAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
         self.use_qk_norm = use_qk_norm
+        self.enable_qk_norm_rope_cache_quant_fusion = (
+            self.use_qk_norm and ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -256,6 +264,18 @@ class Glm4MoeAttention(nn.Module):
             # rope_parameters=config.rope_parameters,
             partial_rotary_factor=partial_rotary_factor,
         )
+        if self.enable_qk_norm_rope_cache_quant_fusion:
+            cos = self.rotary_emb.cos_cache
+            sin = self.rotary_emb.sin_cache
+            joint_cache = torch.cat((cos, sin), dim=-1).view(cos.size(0), -1)
+            self.rotary_emb.register_buffer(
+                "cos_sin_cache", joint_cache.contiguous(), persistent=False
+            )
+        self.q_norm = None
+        self.k_norm = None
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.attn = Attention(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
@@ -267,11 +287,9 @@ class Glm4MoeAttention(nn.Module):
             layer_num=layer_num,
             use_mla=False,
             rotary_emb=self.rotary_emb,
+            q_norm=self.q_norm if self.enable_qk_norm_rope_cache_quant_fusion else None,
+            k_norm=self.k_norm if self.enable_qk_norm_rope_cache_quant_fusion else None,
         )
-
-        if self.use_qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -281,16 +299,22 @@ class Glm4MoeAttention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.use_qk_norm:
-            q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(
-                q.shape
+        if self.enable_qk_norm_rope_cache_quant_fusion:
+            attn_output = self.attn(
+                query=q, key=k, value=v, positions=positions, qkv=qkv
             )
-            k = self.k_norm(k.reshape(-1, self.num_kv_heads, self.head_dim)).reshape(
-                k.shape
-            )
+        else:
+            if self.use_qk_norm:
+                assert self.q_norm is not None and self.k_norm is not None
+                q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(
+                    q.shape
+                )
+                k = self.k_norm(k.reshape(-1, self.num_kv_heads, self.head_dim)).reshape(
+                    k.shape
+                )
 
-        # q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, positions, **model_kwargs)
+            # q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v, positions, **model_kwargs)
         output = self.o_proj(attn_output)
         return output
 
