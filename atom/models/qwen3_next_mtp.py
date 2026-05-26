@@ -43,6 +43,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             self.config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.fc",
         )
 
         self.layers = torch.nn.ModuleList(
@@ -107,6 +108,8 @@ class Qwen3NextMTP(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
     }
     weights_mapping = {"mtp.": "model."}
 
@@ -128,8 +131,6 @@ class Qwen3NextMTP(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         config = atom_config.hf_config
-        if atom_config.enable_prefix_caching:
-            raise ValueError("Qwen3NextMTP currently does not support prefix caching")
         self.config = config
         self.model = Qwen3NextMultiTokenPredictor(
             atom_config=atom_config, prefix=maybe_prefix(prefix, "mtp")
@@ -168,9 +169,19 @@ class Qwen3NextMTP(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        # Mirror target's get_expert_mapping: when shared-expert fusion is on,
+        # the loader rewrites `mlp.shared_expert.*` to `mlp.experts.{N}.*`
+        # (where N == n_routed_experts), so the expert_mapping must include
+        # an extra slot for that fused shared-expert. Without this, MTP's
+        # shared_expert weights get silently dropped during loading.
+        from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+
+        n_routed = getattr(self.config, "n_routed_experts", self.config.num_experts)
+        n_shared = getattr(self.config, "n_shared_experts", 1)
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=n_routed
+            + (n_shared if is_rocm_aiter_fusion_shared_expert_enabled() else 0),
         )

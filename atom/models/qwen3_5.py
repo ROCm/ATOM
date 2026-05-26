@@ -40,10 +40,6 @@ from atom.models.utils import (
     maybe_prefix,
     extract_layer_index,
 )
-from atom.model_ops.split_chunk import (
-    fused_split_chunk_zeros,
-    fused_split_chunk_zeros_qwen3_5_qkvzba,
-)
 
 if is_vllm():
     from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -243,7 +239,6 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
         x_fp8=None,
         x_scale=None,
     ):
@@ -251,35 +246,36 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         Forward pass with three parts:
         1. Input projection
         2. Core attention (custom op)
-        3. Output projection
         """
         num_tokens = hidden_states.size(0)
 
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
+        v_heads_tp = self.num_v_heads // self.tp_size
+        qkv_size = self.conv_dim // self.tp_size
+        z_size = v_heads_tp * self.head_v_dim
+        b_size = v_heads_tp
+        a_size = v_heads_tp
+
         if hasattr(self, "in_proj_qkvzba"):
             qkvzba = self.in_proj_qkvzba(hidden_states)
-            k_heads_after_tp = self.num_k_heads // self.tp_size
-            v_heads_after_tp = self.num_v_heads // self.tp_size
-            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_zeros_qwen3_5_qkvzba(
-                qkvzba,
-                k_heads_after_tp,
-                v_heads_after_tp,
-                self.head_k_dim,
-                self.head_v_dim,
+            # Qwen3.5 layout is already contiguous [q|k|v|z|b|a]
+            mixed_qkv, z_flat, b, a = torch.split(
+                qkvzba, [qkv_size, z_size, b_size, a_size], dim=-1
             )
         else:
-            mixed_qkvz = self.in_proj_qkvz(hidden_states)
-            ba = self.in_proj_ba(hidden_states)
+            if x_fp8 is not None:
+                mixed_qkvz = self.in_proj_qkvz(x_fp8, x_scale=x_scale)
+            else:
+                mixed_qkvz = self.in_proj_qkvz(hidden_states)
+            projected_ba = self.in_proj_ba(hidden_states)
+            # Qwen3.5 layout is already contiguous [q|k|v|z] and [b|a]
+            mixed_qkv, z_flat = torch.split(mixed_qkvz, [qkv_size, z_size], dim=-1)
+            b, a = torch.split(projected_ba, [b_size, a_size], dim=-1)
 
-            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-            z_size = self.value_dim // self.tp_size
-            num_v_heads_tp = self.num_v_heads // self.tp_size
-
-            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_zeros(
-                mixed_qkvz, ba, qkv_size, z_size, self.head_v_dim, num_v_heads_tp
-            )
+        z = z_flat.view(num_tokens, v_heads_tp, self.head_v_dim)
+        core_attn_out = torch.empty_like(z)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -290,7 +286,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # Part 3: Output Projection
         # ============================================================
         core_attn_out, maybe_scale = self.norm(core_attn_out, z)
-        output[:num_tokens] = self.out_proj(core_attn_out, x_scale=maybe_scale)
+        output = self.out_proj(core_attn_out, x_scale=maybe_scale)
+        return output
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
@@ -493,6 +490,25 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
         )
 
 
+_BF16_IN_PROJ_MAPPING = {
+    "in_proj_qkv": ("in_proj_qkvzba", (0, 1, 2)),
+    "in_proj_z": ("in_proj_qkvzba", 3),
+    "in_proj_b": ("in_proj_qkvzba", 4),
+    "in_proj_a": ("in_proj_qkvzba", 5),
+}
+
+
+def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Config) -> dict:
+    if atom_config.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
+        return mapping
+
+    mapping.pop("in_proj_qkvz", None)
+    mapping.pop("in_proj_ba", None)
+    mapping["in_proj_qkvzba"] = ("in_proj_qkvzba", None)
+    mapping.update(_BF16_IN_PROJ_MAPPING)
+    return mapping
+
+
 class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
@@ -520,6 +536,9 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         self.config = atom_config.hf_config
+        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+            dict(self.packed_modules_mapping), atom_config
+        )
         self.visual = PPMissingLayer()
         self.language_model = Qwen3_5ForCausalLM(atom_config=atom_config, prefix="")
         self.make_empty_intermediate_tensors = (
@@ -557,6 +576,9 @@ class Qwen3_5MoeForConditionalGenerationTextOnly(
     def __init__(self, atom_config: Config, prefix: str = ""):
         nn.Module.__init__(self)
         self.config = atom_config.hf_config
+        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+            dict(self.packed_modules_mapping), atom_config
+        )
         self.visual = PPMissingLayer()
         self.language_model = Qwen3_5MoeForCausalLM(atom_config=atom_config, prefix="")
         self.make_empty_intermediate_tensors = (

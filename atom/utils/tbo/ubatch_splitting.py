@@ -224,6 +224,31 @@ def split_attn_metadata(
             )
             ub_kv_last_page_lens = torch.cat([ub_kv_last_page_lens, pad])
 
+    # Prefix-cache prefill needs these fields to gather cached KV before
+    # varlen attention. Dropping them makes cu_seqlens_k describe cached+new
+    # tokens while K/V only contain new tokens, which can OOB in flash-attn.
+    ub_num_cached_tokens = None
+    if attn_metadata.num_cached_tokens is not None:
+        ub_num_cached_tokens = attn_metadata.num_cached_tokens[rs]
+        if padded_bs > ub_num_reqs:
+            pad = torch.zeros(
+                padded_bs - ub_num_reqs,
+                dtype=attn_metadata.num_cached_tokens.dtype,
+                device=attn_metadata.num_cached_tokens.device,
+            )
+            ub_num_cached_tokens = torch.cat([ub_num_cached_tokens, pad])
+
+    ub_seq_starts = None
+    if attn_metadata.seq_starts is not None:
+        ub_seq_starts = attn_metadata.seq_starts[rs]
+        if padded_bs > ub_num_reqs:
+            pad = torch.zeros(
+                padded_bs - ub_num_reqs,
+                dtype=attn_metadata.seq_starts.dtype,
+                device=attn_metadata.seq_starts.device,
+            )
+            ub_seq_starts = torch.cat([ub_seq_starts, pad])
+
     # sparse_kv_indptr: slice and re-base if present (per-request dimension).
     # NOTE: In MLA prefill sparse mode, sparse_kv_indptr is per-token — that
     # case is handled by the MLA builder's build_ubatch_prefill_metadata override.
@@ -262,6 +287,15 @@ def split_attn_metadata(
         per_req_q = ub_cu_seqlens_q[1 : ub_num_reqs + 1] - ub_cu_seqlens_q[:ub_num_reqs]
         ub_max_seqlen_q = int(per_req_q.max().item())
 
+    ub_total_kv = None
+    if attn_metadata.has_cached:
+        if ub_cu_seqlens_k is not None and ub_num_reqs > 0:
+            ub_total_kv = int(ub_cu_seqlens_k[ub_num_reqs].item())
+        elif ub_context_lens is not None and ub_num_reqs > 0:
+            ub_total_kv = int(ub_context_lens[:ub_num_reqs].sum().item())
+        else:
+            ub_total_kv = 0
+
     # MLA work buffers are set to None here — they will be recomputed
     # by decode_update_mla_metadata_v1 in UBatchWrapper before each micro-batch run.
     # Backend-specific fields (e.g. MLA sparse prefill) are handled by
@@ -280,6 +314,10 @@ def split_attn_metadata(
         kv_indices=ub_kv_indices,
         kv_last_page_lens=ub_kv_last_page_lens,
         sparse_kv_indptr=ub_sparse_kv_indptr,
+        has_cached=attn_metadata.has_cached,
+        total_kv=ub_total_kv,
+        num_cached_tokens=ub_num_cached_tokens,
+        seq_starts=ub_seq_starts,
         work_meta_data=None,
         work_indptr=None,
         work_info_set=None,

@@ -12,6 +12,7 @@ from aiter import dtypes, fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from typing import TYPE_CHECKING, Optional
+from atom.config import get_current_atom_config
 from atom.utils import envs
 from atom.model_ops.base_attention import cp_mha_gather_cache
 
@@ -93,6 +94,7 @@ class PagedAttentionImplPluginModeMethods:
         attn_metadata = attention_metadata
 
         use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
+        # use_triton_attn = True
         self.use_triton_attn = use_triton_attn
 
         if (
@@ -108,16 +110,16 @@ class PagedAttentionImplPluginModeMethods:
                     triton_fused_norm_rope_cache,
                 )
 
-                # qkv is a packed [q, k, v] tensor — split
                 q_size = self.num_heads * self.head_dim
                 kv_size = self.num_kv_heads * self.head_dim
-                q_raw, k_raw, v_raw = torch.split(
-                    qkv, [q_size, kv_size, kv_size], dim=-1
-                )
+                q = q.view(-1, q_size)
+                k = k.view(-1, kv_size)
+                v = v.view(-1, kv_size)
+
                 q, k = triton_fused_norm_rope_cache(
-                    q_raw,
-                    k_raw,
-                    v_raw,
+                    q,
+                    k,
+                    v,
                     position,
                     q_norm=self.q_norm,
                     k_norm=self.k_norm,
@@ -135,11 +137,13 @@ class PagedAttentionImplPluginModeMethods:
                 # Reshape q, k for attention: [T, num_heads, head_dim]
                 q = q.view(-1, self.num_heads, self.head_dim)
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
-                v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
+                v = v.view(-1, self.num_kv_heads, self.head_dim)
             else:
                 # Standard RMSNorm — use existing aiter kernel
                 fused_qk_norm_rope_cache_quant_shuffle(
-                    qkv,
+                    q=q,
+                    k=k,
+                    v=v,
                     num_heads_q=self.num_heads,
                     num_heads_k=self.num_kv_heads,
                     num_heads_v=self.num_kv_heads,
@@ -159,18 +163,9 @@ class PagedAttentionImplPluginModeMethods:
                     k_scale=k_scale,
                     v_scale=v_scale,
                 )
-
-                qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
-                q, k, v = qkv.split(
-                    [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
-                )
         elif use_triton_attn and self.rotary_emb is not None:
             k_scale = v_scale = self.per_tensor_scale
             self.per_token_quant = False
-            qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
-            q, k, v = qkv.split(
-                [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
-            )
             q, k, _k_cache, _v_cache = fused_qk_rope_reshape_and_cache(
                 q,
                 k,
@@ -192,10 +187,20 @@ class PagedAttentionImplPluginModeMethods:
                 output_zeros=False,
             )
         else:
+            # for asm paged attention
+            asm_layout = True
+            if use_triton_attn:
+                asm_layout = False
+            if self.rotary_emb is not None:
+                assert position is not None
+                q, k = self.rotary_emb(position, q, k)
             if self.q_norm is not None:
                 q = self.q_norm(q)
             if self.k_norm is not None:
                 k = self.k_norm(k)
+            new_value_cache = new_value_cache.view(
+                num_blocks, num_kv_heads, head_size, block_size
+            )
             if self.kv_cache_dtype == "fp8":
                 aiter.reshape_and_cache_with_pertoken_quant(
                     k,
@@ -205,7 +210,7 @@ class PagedAttentionImplPluginModeMethods:
                     k_scale,
                     v_scale,
                     attn_metadata.slot_mapping,
-                    asm_layout=True,
+                    asm_layout=asm_layout,
                 )
             else:
                 aiter.reshape_and_cache(
@@ -229,22 +234,37 @@ class PagedAttentionImplPluginModeMethods:
         v_cache: torch.Tensor,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
+        num_decodes: int,
         out: torch.Tensor,
         attn_metadata: "AttentionMetaData",
         ps: bool = True,
     ):
-        o = out
-        num_seqs, num_q_heads_total, head_size = q.shape
+        # q.shape[0] == num_decodes * max_query_len for MTP (one row per decode
+        # token, query_len > 1). For non-MTP it equals num_decodes (query_len = 1).
+        # pa_decode_gluon handles multi-token causal masking internally when
+        # `query_length > 1` is passed; intermediate buffers must be sized
+        # `num_decodes` (not q.shape[0]) and `query_group_size` must include
+        # the max_qlen multiplier — mirroring server-mode `paged_attention_triton`.
+        _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-        query_group_size = num_q_heads_total // num_kv_heads
+        decode_metadata = attn_metadata.plugin_metadata.decode_metadata
+        max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
         assert num_q_heads_total % num_kv_heads == 0
+
+        seq_lens = attn_metadata.plugin_metadata.seq_lens[:num_decodes]
+        block_tables = attn_metadata.plugin_metadata.block_table[:num_decodes]
+
+        query_group_size = max_qlen * (num_q_heads_total // num_kv_heads)
         context_partition_size = 256
 
-        use_ps = self.adopt_persistent_kernel(
-            head_size, num_kv_heads, num_q_heads_total
-        )
+        # use_ps = self.adopt_persistent_kernel(
+        #     head_size, num_kv_heads, num_q_heads_total
+        # )
+        use_ps = True
         if use_ps:
-            max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+            max_context_partition_num = get_recommended_splits(
+                num_decodes, num_kv_heads
+            )
         else:
             max_context_partition_num = _NO_PS_FIXED_SPLITS
 
@@ -252,9 +272,8 @@ class PagedAttentionImplPluginModeMethods:
             max_context_partition_num = 1
             context_partition_size = 128
 
-        # Output buffers (same as Triton)
         intermediate_shape = (
-            num_seqs,
+            num_decodes,
             num_kv_heads,
             max_context_partition_num,
             query_group_size,
@@ -277,21 +296,19 @@ class PagedAttentionImplPluginModeMethods:
             k_scale = k_scale.unsqueeze(-1)
             v_scale = v_scale.unsqueeze(-1)
 
-        num_decode_seqs = q.shape[0]
-        seq_lens_decode = attn_metadata.plugin_metadata.seq_lens[:num_decode_seqs]
-        block_tables_decode = attn_metadata.plugin_metadata.block_table[
-            :num_decode_seqs
-        ]
-
+        # Kernel takes natural q layout [batch * query_length, num_q_heads, head_size].
+        # Internally it derives batch_size = q.shape[0] // query_length and reshapes
+        # to [batch, query_length, num_kv_heads, group, head_size]. See
+        # aiter/aiter/ops/triton/gluon/pa_decode_gluon.py:5371-5377 and 5542-5544.
         torch.ops.aiter.pa_decode_gluon(
-            o,
+            out,
             q,
             k_cache,
             v_cache,
-            seq_lens_decode,
-            block_tables_decode,
+            seq_lens,
+            block_tables,
             self.scale,
-            1,  # query_lenth
+            max_qlen,  # query_length — handles multi-token causal mask internally
             max_context_partition_num,
             context_partition_size,
             compute_type,
@@ -306,8 +323,7 @@ class PagedAttentionImplPluginModeMethods:
             sliding_window=self.sliding_window,
             ps=use_ps,
         )
-
-        return o
+        return out
 
     def paged_attention_asm_plugin_mode(
         self,
@@ -321,6 +337,11 @@ class PagedAttentionImplPluginModeMethods:
         attn_metadata: "AttentionMetaData",
         out: torch.Tensor,
     ):
+        decode_metadata = attn_metadata.plugin_metadata.decode_metadata
+        max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
+        qo_indptr = (
+            decode_metadata.query_start_loc if decode_metadata is not None else None
+        )
         aiter.pa_fwd_asm(
             Q=q,
             K=k_cache,
@@ -330,9 +351,11 @@ class PagedAttentionImplPluginModeMethods:
             block_tables_stride0=attn_metadata.plugin_metadata.block_table[
                 :num_decodes
             ].stride(0),
+            max_qlen=max_qlen,
             K_QScale=k_scale,
             V_QScale=v_scale,
             out_=out[:num_decode_tokens],
+            qo_indptr=qo_indptr,
             high_precision=0,
         )
 
@@ -566,19 +589,22 @@ class PagedAttentionImplPluginModeMethods:
         if attn_metadata is None:
             return output.fill_(0)
 
-        # When using the fusion path (ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION),
-        # positions and qkv tuple are smuggled through k, v args.
-        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            assert (
-                position is None
-            ), "position should be None because it is passed through k"
+        # vLLM's compiled unified_attention custom op does not pass positions into
+        # impl.forward. ATOMModelBase stashes them on vLLM ForwardContext as
+        # additional_kwargs["atom_positions"] (see atom/plugin/vllm/model_wrapper.py).
+        if position is None:
+            from vllm.forward_context import (
+                get_forward_context as get_vllm_forward_context,
+                is_forward_context_available,
+            )
 
-            position = key
-            qkv = value  # packed [q, k, v] tensor
-            q_size = self.num_heads * self.head_dim
-            kv_size = self.num_kv_heads * self.head_dim
-            query, key, value = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
-
+            if is_forward_context_available():
+                position = get_vllm_forward_context().additional_kwargs.get(
+                    "atom_positions"
+                )
+        if position is None:
+            sfc = get_current_atom_config().compilation_config.static_forward_context
+            position = sfc.get("positions")
         query = query.view(-1, self.num_heads, self.head_dim)
         key = key.view(-1, self.num_kv_heads, self.head_dim)
         value = value.view(-1, self.num_kv_heads, self.head_dim)
@@ -627,7 +653,6 @@ class PagedAttentionImplPluginModeMethods:
         if value is not None:
             value = value[:num_actual_tokens]
         output_actual_tokens = output[:num_actual_tokens]
-
         # rope and cache flush fusion. ATOM always use shuffle layout for kv cache
         result = self.rope_cache_plugin_mode(
             q=query,
@@ -698,12 +723,13 @@ class PagedAttentionImplPluginModeMethods:
             extend_tokens_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_extend_tokens
             )
+            extend_reqs_slice = slice(num_decodes, num_decodes + num_extends)
             extend_querys = query[extend_tokens_slice]
             extend_keys = key[extend_tokens_slice]
             extend_values = value[extend_tokens_slice]
             extend_outputs = output[extend_tokens_slice]
             extend_block_table = attn_metadata.plugin_metadata.block_table[
-                extend_tokens_slice
+                extend_reqs_slice
             ]
             extend_slot_mapping = attn_metadata.plugin_metadata.slot_mapping[
                 extend_tokens_slice
@@ -737,6 +763,7 @@ class PagedAttentionImplPluginModeMethods:
                     v_cache=new_value_cache,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    num_decodes=num_decodes,
                     out=output_actual_tokens[:num_decode_tokens],
                     attn_metadata=attn_metadata,
                 )
@@ -749,6 +776,7 @@ class PagedAttentionImplPluginModeMethods:
                         v_cache=new_value_cache,
                         k_scale=k_scale,
                         v_scale=v_scale,
+                        num_decodes=num_decodes,
                         out=output_actual_tokens[:num_decode_tokens],
                         attn_metadata=attn_metadata,
                     )

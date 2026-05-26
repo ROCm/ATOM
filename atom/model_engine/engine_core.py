@@ -89,8 +89,12 @@ class EngineCore:
             )
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
             num_blocks = block_info["num_kvcache_blocks"]
-            config.mamba_equiv_per_req = block_info.get("mamba_equiv_per_req", 0)
-            config.num_mamba_groups = block_info.get("num_mamba_groups", 0)
+            config.per_req_cache_equiv_blocks = block_info.get(
+                "per_req_cache_equiv_blocks", 0
+            )
+            config.num_per_req_cache_groups = block_info.get(
+                "num_per_req_cache_groups", 0
+            )
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -188,12 +192,31 @@ class EngineCore:
 
     def _process_engine_step(self):
         result = self.scheduler.schedule()
+
+        # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
+        # the scheduler) through the same finished-seq path as normal seqs.
+        # Without this, `llm.generate()` blocks forever waiting for an output
+        # the rejected seq will never produce.
+        rejected = self.scheduler.take_rejected()
+        if rejected:
+            self.output_queue.put_nowait(rejected)
+
         if result is None:
+            if self.kv_transfer_enabled:
+                kvoutput = self.runner_mgr.call_func_with_aggregation(
+                    "async_proc_aggregation"
+                )
+                self.scheduler._update_from_kv_xfer_finished(kvoutput)
             return False
         scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
+            if self.kv_transfer_enabled:
+                kvoutput = self.runner_mgr.call_func_with_aggregation(
+                    "async_proc_aggregation"
+                )
+                self.scheduler._update_from_kv_xfer_finished(kvoutput)
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)

@@ -8,6 +8,7 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.models.utils import IntermediateTensors
@@ -16,7 +17,7 @@ from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
 from .deepseek_v2 import DeepseekV2DecoderLayer
-from .utils import maybe_prefix
+from .utils import ckpt_has_tensor_suffix, maybe_prefix
 
 
 class SharedHead(nn.Module):
@@ -40,7 +41,13 @@ class SharedHead(nn.Module):
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
-    def __init__(self, atom_config: Config, prefix: str, layer_idx: int) -> None:
+    def __init__(
+        self,
+        atom_config: Config,
+        prefix: str,
+        layer_idx: int,
+        topk_indices_buffer: Optional[torch.Tensor] = None,
+    ) -> None:
         super().__init__()
 
         config = atom_config.hf_config
@@ -48,7 +55,27 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.eh_proj = ReplicatedLinear(
+            config.hidden_size * 2,
+            config.hidden_size,
+            bias=False,
+            quant_config=atom_config.quant_config,
+            prefix=maybe_prefix(prefix, "eh_proj"),
+        )
+
+        if hasattr(config, "index_topk"):
+            max_num_batched_tokens = getattr(
+                atom_config, "max_num_batched_tokens", atom_config.max_num_seqs
+            )
+            buffer_device = getattr(atom_config, "device", "cuda")
+            topk_indices_buffer = torch.empty(
+                max_num_batched_tokens,
+                config.index_topk,
+                dtype=torch.int32,
+                device=buffer_device,
+            )
+        else:
+            topk_indices_buffer = None
 
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=atom_config.quant_config
@@ -63,6 +90,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             layer_num=layer_idx,
             is_mtp_block=True,
+            topk_indices_buffer=topk_indices_buffer,
         )
 
     def forward(
@@ -74,9 +102,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        # masked_inputs_embeds = torch.where(
-        #     positions.unsqueeze(-1) == 0, 0, inputs_embeds
-        # )
         masked_inputs_embeds = inputs_embeds
         inputs_embeds = self.enorm(masked_inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
@@ -95,7 +120,13 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
 
 class DeepSeekMultiTokenPredictor(nn.Module):
-    def __init__(self, *, atom_config: Config, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        atom_config: Config,
+        prefix: str = "",
+        topk_indices_buffer: Optional[torch.Tensor] = None,
+    ):
         super().__init__()
         config = atom_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
@@ -104,7 +135,10 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         self.layers = torch.nn.ModuleDict(
             {
                 str(idx): DeepSeekMultiTokenPredictorLayer(
-                    atom_config, f"{prefix}.layers.{idx}", layer_idx=idx
+                    atom_config,
+                    f"{prefix}.layers.{idx}",
+                    layer_idx=idx,
+                    topk_indices_buffer=topk_indices_buffer,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -154,6 +188,20 @@ class DeepSeekMTP(nn.Module):
         super().__init__()
         self.config = atom_config.hf_config
 
+        # Several MTP checkpoints (DeepSeek R1/V3/V3.2 FP8 + the Quark mixed
+        # MXFP4/FP8 variants) store eh_proj as BF16 with no weight_scale even
+        # though their HF quantization_config does not list eh_proj in the
+        # exclude set. Without this guard ReplicatedLinear is built with the
+        # global FP8/MXFP4 spec, the BF16 weight is cast into the FP8 slot
+        # against an uninitialized weight_scale, and MTP accept rate collapses.
+        # GLM-FP8 ckpts already list eh_proj explicitly (this becomes a no-op);
+        # GLM-5.1-MXFP4 truly quantizes eh_proj and ships weight_scale on disk
+        # so the check below leaves the global spec in effect.
+        if atom_config.quant_config is not None and not ckpt_has_tensor_suffix(
+            atom_config.model, "eh_proj.weight_scale"
+        ):
+            atom_config.quant_config.apply_default_exclude_layers(["*.eh_proj"])
+
         if hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None:
             self.packed_modules_mapping = {
                 "q_a_proj": ("fused_qkv_a_proj", 0),
@@ -167,8 +215,20 @@ class DeepSeekMTP(nn.Module):
                 "up_proj": ("gate_up_proj", 1),
             }
 
+        if hasattr(self.config, "index_topk"):
+            topk_indices_buffer = torch.empty(
+                atom_config.max_num_batched_tokens,
+                self.config.index_topk,
+                dtype=torch.int32,
+                device="cuda",
+            )
+        else:
+            topk_indices_buffer = None
+
         self.model = DeepSeekMultiTokenPredictor(
-            atom_config=atom_config, prefix=maybe_prefix(prefix, "model")
+            atom_config=atom_config,
+            prefix=maybe_prefix(prefix, "model"),
+            topk_indices_buffer=topk_indices_buffer,
         )
 
     def remap_mtp_weight_name(self, name: str) -> str | None:

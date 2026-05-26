@@ -88,9 +88,17 @@ class RadixAttention(BaseAttention):
                 self.attn.k_scale = atom_parameter(
                     torch.tensor([1.0], dtype=torch.float32, device="cuda")
                 )
+            elif not self.attn.k_scale.is_cuda:
+                self.attn.k_scale = atom_parameter(
+                    self.attn.k_scale.detach().to(device="cuda")
+                )
             if self.attn.v_scale is None:
                 self.attn.v_scale = atom_parameter(
                     torch.tensor([1.0], dtype=torch.float32, device="cuda")
+                )
+            elif not self.attn.v_scale.is_cuda:
+                self.attn.v_scale = atom_parameter(
+                    self.attn.v_scale.detach().to(device="cuda")
                 )
             # Some SGLang attention backends consume the host-side float scales
             # directly. Keep them in sync with the device-side defaults so the
@@ -120,6 +128,12 @@ class RadixAttention(BaseAttention):
         if is_sglang():
             # for sglang, forward_batch is required
             forward_batch = kwargs.get("forward_batch", None)
+            if forward_batch is None:
+                from atom.plugin.sglang.models.base_model_wrapper import (
+                    get_current_forward_batch,
+                )
+
+                forward_batch = get_current_forward_batch()
             # save_kv_cache is explicitly set by the caller:
             # - True (default): the attention backend writes KV to cache
             # - False: when fused rope+qknorm kernel already wrote KV to cache,

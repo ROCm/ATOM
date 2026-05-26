@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Optional, Union
 
@@ -263,7 +264,11 @@ class QuantizationConfig:
     - ``quant_type``, ``quant_dtype``, ``is_dynamic`` convenience properties
     """
 
-    def __init__(self, config: PretrainedConfig = None):
+    def __init__(
+        self,
+        config: PretrainedConfig = None,
+        online_quant_config: Optional[dict] = None,
+    ):
         if config is None:
             self.torch_dtype = torch.bfloat16
             self.hf_quant_config = None
@@ -271,6 +276,11 @@ class QuantizationConfig:
             self.layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
             self.exclude_layers: list[str] = []
             self.quant_method = ""
+            self.online_quant = False
+            self.online_quant_config_raw = None
+            self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
+            self.online_layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
+            self.online_exclude_layers: list[str] = []
             return
 
         # Some HF configs set torch_dtype=None; normalize to bf16 default.
@@ -284,10 +294,31 @@ class QuantizationConfig:
             self.layer_pattern_specs = []
             self.exclude_layers = []
             self.quant_method = ""
+        else:
+            self.quant_method = self.hf_quant_config.get("quant_method", "")
+
+        # Online quantization: re-quantize float / FP8 / MXFP4 models at load time
+        self.online_quant = False
+        self.online_quant_config_raw = online_quant_config
+        self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
+        self.online_layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
+        self.online_exclude_layers: list[str] = []
+        if online_quant_config and self.quant_method in [
+            "",
+            "fp8",
+            "mxfp4",
+        ]:
+            self.online_quant = True
+            online_parser = get_quant_parser("online_quant")
+            online_parsed_quant_config = online_parser.parse(online_quant_config)
+            self.online_global_spec = online_parsed_quant_config.global_spec
+            self.online_layer_pattern_specs = (
+                online_parsed_quant_config.layer_pattern_specs
+            )
+            self.online_exclude_layers = list(online_parsed_quant_config.exclude_layers)
+
+        if self.quant_method == "":
             return
-
-        self.quant_method = self.hf_quant_config.get("quant_method", "")
-
         # Use the parser registry to build a structured ParsedQuantConfig
         parser = get_quant_parser(self.quant_method)
         parsed_quant_config = parser.parse(self.hf_quant_config)
@@ -303,7 +334,11 @@ class QuantizationConfig:
         return self.global_spec
 
     def get_layer_quant_config(
-        self, layer_name: str, *, check_children: bool = False
+        self,
+        layer_name: str,
+        use_online_quant: bool = False,
+        *,
+        check_children: bool = False,
     ) -> LayerQuantConfig:
         """Return the :class:`LayerQuantConfig` for *layer_name*.
 
@@ -312,12 +347,21 @@ class QuantizationConfig:
         2. fnmatch-style pattern match in ``layer_pattern_specs``.
         3. Fall back to ``global_spec``.
         """
+        if use_online_quant:
+            layer_pattern_specs = self.online_layer_pattern_specs
+            global_spec = self.online_global_spec
+            exclude_layers = self.online_exclude_layers
+        else:
+            layer_pattern_specs = self.layer_pattern_specs
+            global_spec = self.global_spec
+            exclude_layers = self.exclude_layers
+
         # 1. Exclude list
-        if self._is_excluded(layer_name, check_children=check_children):
+        if self._is_excluded(layer_name, exclude_layers, check_children=check_children):
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
-        for pattern, spec in self.layer_pattern_specs:
+        for pattern, spec in layer_pattern_specs:
             if "*" not in pattern:
                 if layer_name in pattern:
                     return spec
@@ -325,7 +369,7 @@ class QuantizationConfig:
                 return spec
 
         # 3. Global default
-        return self.global_spec
+        return global_spec
 
     # -- convenience properties (delegate to global_spec) ---------------------
 
@@ -359,6 +403,10 @@ class QuantizationConfig:
         factors.append(self.global_spec)
         factors.append(self.layer_pattern_specs)
         factors.append(self.exclude_layers)
+        if self.online_quant:
+            factors.append(self.online_layer_pattern_specs)
+            factors.append(self.online_global_spec)
+            factors.append(self.online_exclude_layers)
         hash_value = hashlib.sha256(str(factors).encode()).hexdigest()
         return hash_value
 
@@ -368,11 +416,19 @@ class QuantizationConfig:
 
     # -- internal helpers ---------------------------------------------------
 
-    def _is_excluded(self, layer_name: str, *, check_children: bool = False) -> bool:
-        if layer_name is None or not self.exclude_layers:
+    def _is_excluded(
+        self,
+        layer_name: str,
+        exclude_layers: Optional[list[str]] = None,
+        *,
+        check_children: bool = False,
+    ) -> bool:
+        if exclude_layers is None:
+            exclude_layers = self.exclude_layers
+        if layer_name is None or not exclude_layers:
             return False
         prefix = layer_name + "."
-        for ignore_str in self.exclude_layers:
+        for ignore_str in exclude_layers:
             if self._matches_exclude(layer_name, ignore_str):
                 return True
             # When check_children is True, also match if any exclude entry
@@ -420,6 +476,13 @@ class QuantizationConfig:
                 name = name.replace(old, new)
             new_excludes.append(name)
         self.exclude_layers = list(dict.fromkeys(new_excludes))
+
+    def apply_default_exclude_layers(self, excludes: list[str]):
+        if not excludes:
+            return
+        for exclude in excludes:
+            if exclude not in self.exclude_layers:
+                self.exclude_layers.append(exclude)
 
     def remap_layer_name(
         self,
@@ -482,6 +545,17 @@ class QuantizationConfig:
         for name in self.exclude_layers:
             new_exclude.extend(_remap_layer_name(name))
         self.exclude_layers = list(dict.fromkeys(new_exclude))
+        if self.online_quant:
+            new_online_pattern_specs = []
+            for pattern, spec in self.online_layer_pattern_specs:
+                for remapped in _remap_layer_name(pattern):
+                    new_online_pattern_specs.append((remapped, spec))
+            self.online_layer_pattern_specs = new_online_pattern_specs
+
+            new_online_exclude = []
+            for name in self.online_exclude_layers:
+                new_online_exclude.extend(_remap_layer_name(name))
+            self.online_exclude_layers = list(dict.fromkeys(new_online_exclude))
 
         # Apply model-declared HF-name to ATOM-path translations for exclude entries.
         # Models that have a mismatch between their HF quant config names and ATOM
@@ -492,6 +566,9 @@ class QuantizationConfig:
 
 _CONFIG_REGISTRY: dict[str, str] = {
     "deepseek_v32": "deepseek_v3",
+    "deepseek_v4": "deepseek_v3",  # V4 reuses V3 schema; V4-specific fields
+    # (compress_ratios, num_hash_layers, hc_mult, swiglu_limit, ...) flow
+    # through as extra config attrs and are read in DeepseekV4Args.from_hf_config.
     "glm_moe_dsa": "deepseek_v3",  # GLM 5.0 MoE, structure similar to DeepSeek v3.2
     "kimi_k2": "deepseek_v3",
 }
@@ -563,13 +640,22 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
 
     if model_type in _CONFIG_REGISTRY:
         config_class = AutoConfig.for_model(_CONFIG_REGISTRY[model_type])
-        return config_class.from_pretrained(
+        hf_config = config_class.from_pretrained(
             model,
             # revision=revision,
             # code_revision=code_revision,
             token=_get_hf_token(),
             trust_remote_code=trust_remote_code,
         )
+        # transformers' from_pretrained strips fields that aren't in the target
+        # config schema. For mapped types (e.g. deepseek_v4 → deepseek_v3) the
+        # source-specific fields would be dropped. Re-inject them so V4-only
+        # attrs (compress_ratios, num_hash_layers, hc_mult, swiglu_limit, ...)
+        # remain accessible via getattr(hf_config, field) downstream.
+        for field, value in config_dict.items():
+            if not hasattr(hf_config, field):
+                setattr(hf_config, field, value)
+        return hf_config
     try:
         hf_config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code
@@ -704,10 +790,14 @@ class SpeculativeConfig:
     model: Optional[str] = None
     num_speculative_tokens: Optional[int] = None
     draft_model_hf_config: Optional[PretrainedConfig] = None
+    use_aux_hidden_state: bool = False
+    eagle3_aux_layer_ids: list[int] = field(default_factory=list)
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
         "deepseek_v3": "deepseek_mtp",
+        "deepseek_v32": "deepseek_mtp",
+        "deepseek_v4": "deepseek_v4_mtp",
         "glm_moe_dsa": "deepseek_mtp",
         "qwen3_next": "qwen3_next_mtp",
         "qwen3_5": "qwen3_5_mtp",
@@ -721,22 +811,51 @@ class SpeculativeConfig:
     # mtp_model_type → (n_predict_attr, architecture)
     _MTP_CONFIG: ClassVar[dict[str, tuple[str, str]]] = {
         "deepseek_mtp": ("num_nextn_predict_layers", "DeepSeekMTPModel"),
+        "deepseek_v4_mtp": ("num_nextn_predict_layers", "DeepseekV4MTPModel"),
         "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
         "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
     }
 
     def __post_init__(self):
         if self.draft_model_hf_config is None:
-            self.draft_model_hf_config = AutoConfig.from_pretrained(
+            self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
             )
         # For multimodal models, extract text_config
         if hasattr(self.draft_model_hf_config, "text_config"):
             self.draft_model_hf_config = self.draft_model_hf_config.text_config
-        self.hf_config_override(self.draft_model_hf_config)
+        self.hf_config_override(self.draft_model_hf_config, self.model)
+
+        if self.method == "eagle3":
+            if getattr(self.draft_model_hf_config, "kv_lora_rank", None):
+                raise NotImplementedError(
+                    "Eagle3 draft model with MLA attention is not supported"
+                )
+            # Aux hidden state layers: prefer the draft checkpoint's
+            # eagle_config; if absent or the list is empty, ModelRunner
+            # falls back to model.get_eagle3_aux_hidden_state_layers(),
+            # which defaults to 3 layers — early / middle / late
+            # (see DeepseekV2ForCausalLM.get_eagle3_aux_hidden_state_layers,
+            # returns `(2, num_layers // 2, num_layers - 3)`, aligned with vLLM).
+            eagle_cfg = getattr(self.draft_model_hf_config, "eagle_config", None)
+            if eagle_cfg:
+                self.use_aux_hidden_state = eagle_cfg.get("use_aux_hidden_state", False)
+                if self.use_aux_hidden_state and not self.eagle3_aux_layer_ids:
+                    self.eagle3_aux_layer_ids = eagle_cfg.get(
+                        "eagle_aux_hidden_state_layer_ids", []
+                    )
+            else:
+                self.use_aux_hidden_state = True
 
     @staticmethod
-    def hf_config_override(hf_config: PretrainedConfig) -> None:
+    def hf_config_override(
+        hf_config: PretrainedConfig, model_path: Optional[str] = None
+    ) -> None:
+        # Eagle3 architecture mapping (architecture-level, not model_type)
+        arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        if arch == "LlamaForCausalLMEagle3":
+            hf_config.architectures = ["Eagle3LlamaModel"]
+
         # Step 1: resolve model_type → mtp model_type
         mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)
         if mtp_type is not None:
@@ -759,10 +878,33 @@ class SpeculativeConfig:
                 "num_nextn_predict_layers": n_predict,
                 "architectures": [arch],
             }
-            # Qwen3.5 MTP needs expert counts for MoE layer construction
-            if hf_config.model_type == "qwen3_5_mtp":
-                updates["n_shared_experts"] = 1
-                updates["n_routed_experts"] = getattr(hf_config, "num_experts", 0)
+            # Naming differs across families:
+            #   DeepSeek / GLM       → already have `n_routed_experts`
+            #   Qwen3.5 / Qwen3-Next → only carry `num_experts`
+            #   non-MoE / unknown    → leave unset (no MoE = no field)
+            n_routed = getattr(
+                hf_config,
+                "n_routed_experts",
+                getattr(hf_config, "num_experts", None),
+            )
+            if n_routed is not None:
+                updates["n_routed_experts"] = n_routed
+            # n_shared_experts: prefer the field's own value if it exists
+            # (DeepSeek / GLM ship it natively); else scan the checkpoint
+            # for `shared_expert` weights and use the parsed count (1 for
+            # the flat-block layout every released model uses). Leaving
+            # the field unset for ckpts without shared experts avoids
+            # fabricating a phantom shared block (e.g. R1 MTP eh_proj
+            # would otherwise pull a stale BF16 weight_scale).
+            existing_n_shared = getattr(hf_config, "n_shared_experts", None)
+            if existing_n_shared is not None:
+                updates["n_shared_experts"] = existing_n_shared
+            else:
+                from atom.models.utils import ckpt_shared_expert_count
+
+                n_shared = ckpt_shared_expert_count(model_path)
+                if n_shared > 0:
+                    updates["n_shared_experts"] = n_shared
 
             hf_config.update(updates)
 
@@ -806,7 +948,7 @@ class Config:
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool = True
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -830,6 +972,8 @@ class Config:
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
+    # only for quark_online_quantization
+    online_quant_config: Optional[dict] = None
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -874,7 +1018,10 @@ class Config:
                 eos_ids := getattr(self.generation_config, "eos_token_id", None)
             ) is not None:
                 self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
-        self.quant_config = QuantizationConfig(self.hf_config)
+        self.quant_config = QuantizationConfig(
+            self.hf_config,
+            self.online_quant_config,
+        )
         # In plugin mode, supplement exclude_layers with vLLM's ignored_layers when
         # the HF quant config didn't produce any exclusions (non-quark quant methods).
         if (
@@ -940,6 +1087,32 @@ class Config:
                     f"num_speculative_tokens must be between 1 and 4, got {num_spec}."
                 )
 
+        # DeepSeek V4: paper §3.6.1 mandates classical KV cache block_size =
+        # lcm(m, m'). For V4-Pro / V4-Flash this is lcm(4, 128) = 128 original
+        # tokens. ATOM's BlockManager + slot_mapping math assume one global
+        # block_size, so we override `kv_cache_block_size` here when V4 is
+        # detected; the V4 attention builder enforces the same value.
+        #
+        # NOTE: cannot use `hf_config.model_type` for detection — `_CONFIG_REGISTRY`
+        # maps "deepseek_v4" → "deepseek_v3" so model_type reads as "deepseek_v3".
+        # Use the preserved `architectures` field (re-injected by get_hf_config,
+        # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
+        arches = getattr(self.hf_config, "architectures", None) or []
+        if any("DeepseekV4" in str(a) for a in arches):
+            v4_block_size = 128
+            if self.kv_cache_block_size != v4_block_size:
+                self.kv_cache_block_size = v4_block_size
+            # TODO: V4's per-request SWA buffer cannot be restored from the classical
+            # KV pool on prefix cache hit, so disable prefix caching silently.
+            if self.enable_prefix_caching:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "DeepSeek-V4 does not support prefix caching "
+                    "(SWA buffer is not cacheable); disabling automatically."
+                )
+                self.enable_prefix_caching = False
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -983,6 +1156,43 @@ def set_current_atom_config(atom_config: Config):
     _current_atom_config = atom_config
 
 
+def _get_current_atom_config_from_vllm_forward_context() -> Optional[Config]:
+    # In vLLM plugin mode (especially speculative decode), main/draft models
+    # can coexist in one process. Resolve per-forward config first to avoid
+    # reading a stale global singleton.
+    try:
+        from vllm.forward_context import (
+            get_forward_context as get_vllm_forward_context,
+            is_forward_context_available,
+        )
+    except Exception:
+        return None
+    if not is_forward_context_available():
+        return None
+    try:
+        return get_vllm_forward_context().additional_kwargs.get("atom_config")
+    except Exception:
+        return None
+
+
 def get_current_atom_config() -> Config:
+    # Try to get the atom config from forward context first in vLLM plugin mode.
+    if is_vllm():
+        forward_atom_config = _get_current_atom_config_from_vllm_forward_context()
+        if forward_atom_config is not None:
+            return forward_atom_config
     assert _current_atom_config is not None, "Current atom config is not set"
     return _current_atom_config
+
+
+@contextmanager
+def use_custom_atom_config(custom_atom_config: Config):
+    # Temporarily masquerade the custom atom_config as the current atom_config
+    # for the current context and restore upon exit
+    global _current_atom_config
+    prev = _current_atom_config
+    _current_atom_config = custom_atom_config
+    try:
+        yield custom_atom_config
+    finally:
+        _current_atom_config = prev

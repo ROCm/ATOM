@@ -55,7 +55,10 @@ def cp_mha_gather_cache_kernel(
 ):
     token_id = tl.program_id(0)
     head_id = tl.program_id(1)
+    # BLOCK_SIZE is rounded up to next pow2 at the call site (tl.arange requires
+    # pow2); col_mask guards stores/loads when head_size is non-pow2 (e.g. MiMo SWA=192).
     col_offsets = tl.arange(0, BLOCK_SIZE)
+    col_mask = col_offsets < head_size
 
     key_ptr_offset = key_ptr + token_id * head_size * num_heads + head_id * head_size
     value_ptr_offset = (
@@ -87,8 +90,8 @@ def cp_mha_gather_cache_kernel(
             + slot_id * num_heads * head_size
             + head_id * head_size
         )
-        k_reg = tl.load(key_cache_ptr_offset + col_offsets)
-        v_reg = tl.load(value_cache_ptr_offset + col_offsets)
+        k_reg = tl.load(key_cache_ptr_offset + col_offsets, mask=col_mask)
+        v_reg = tl.load(value_cache_ptr_offset + col_offsets, mask=col_mask)
         if DEQUANT:
             if PER_TOKEN_QUANT:
                 scale_offset = (
@@ -100,12 +103,10 @@ def cp_mha_gather_cache_kernel(
                 # per-tensor: one scale per ptr, no offset
                 k_scale = tl.load(k_scale_ptr)
                 v_scale = tl.load(v_scale_ptr)
-            k_dtype = k_reg.dtype
-            v_dtype = v_reg.dtype
-            k_reg = (k_reg.to(tl.float32) * k_scale).to(k_dtype)
-            v_reg = (v_reg.to(tl.float32) * v_scale).to(v_dtype)
-        tl.store(key_ptr_offset + col_offsets, k_reg)
-        tl.store(value_ptr_offset + col_offsets, v_reg)
+            k_reg = k_reg.to(tl.float32) * k_scale
+            v_reg = v_reg.to(tl.float32) * v_scale
+        tl.store(key_ptr_offset + col_offsets, k_reg, mask=col_mask)
+        tl.store(value_ptr_offset + col_offsets, v_reg, mask=col_mask)
 
     elif CACHE_FORMAT == "SHUFFLE":
         # for kv cache layout as
@@ -126,8 +127,8 @@ def cp_mha_gather_cache_kernel(
         )
         k_reg_offset = col_offsets // x * PAGE_SIZE * x + col_offsets % x
         v_reg_offset = col_offsets * x
-        k_reg = tl.load(key_cache_ptr_offset + k_reg_offset)
-        v_reg = tl.load(value_cache_ptr_offset + v_reg_offset)
+        k_reg = tl.load(key_cache_ptr_offset + k_reg_offset, mask=col_mask)
+        v_reg = tl.load(value_cache_ptr_offset + v_reg_offset, mask=col_mask)
         if DEQUANT:
             if PER_TOKEN_QUANT:
                 scale_offset = (
@@ -141,8 +142,8 @@ def cp_mha_gather_cache_kernel(
                 v_scale = tl.load(v_scale_ptr)
             k_reg = k_reg.to(tl.float32) * k_scale
             v_reg = v_reg.to(tl.float32) * v_scale
-        tl.store(key_ptr_offset + col_offsets, k_reg)
-        tl.store(value_ptr_offset + col_offsets, v_reg)
+        tl.store(key_ptr_offset + col_offsets, k_reg, mask=col_mask)
+        tl.store(value_ptr_offset + col_offsets, v_reg, mask=col_mask)
 
 
 def cp_mha_gather_cache(
@@ -167,6 +168,12 @@ def cp_mha_gather_cache(
     ], "kv_cache_layout only support NHD, SHUFFLE"
     if dequant:
         assert k_scales is not None and v_scales is not None
+        if k_scales.numel() == 1 and v_scales.numel() == 1:
+            per_token_quant = False
+        else:
+            assert (
+                k_scales.numel() > 1 and v_scales.numel() > 1
+            ), "k_scales and v_scales must both be scalar or per-token"
 
     head_dim = key.shape[2]
     x = 16 // key_cache.element_size()
@@ -207,7 +214,7 @@ def cp_mha_gather_cache(
         PER_TOKEN_QUANT=per_token_quant,
         PAGE_SIZE=page_size,
         CACHE_FORMAT=kv_cache_layout,
-        BLOCK_SIZE=head_dim,
+        BLOCK_SIZE=triton.next_power_of_2(head_dim),
     )
 
 

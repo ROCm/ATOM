@@ -11,7 +11,6 @@ from atom.plugin.prepare import is_vllm, is_sglang
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.config import get_current_atom_config
-
 from atom.utils.forward_context import Context, AttentionMetaData
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
@@ -21,6 +20,17 @@ logger = logging.getLogger("atom")
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
+
+
+def _get_aiter_kv_cache_dtype(config) -> torch.dtype:
+    kv_cache_dtype = config.cache_config.cache_dtype
+    if kv_cache_dtype == "auto":
+        kv_cache_dtype = "bf16"
+    elif kv_cache_dtype == "bfloat16":
+        kv_cache_dtype = "bf16"
+    elif kv_cache_dtype == "float16":
+        kv_cache_dtype = "fp16"
+    return dtypes.d_dtypes[kv_cache_dtype]
 
 
 @dataclass
@@ -284,6 +294,28 @@ def create_attn_metadata_builder_init_method(base_class):
         i64_kwargs = {"dtype": torch.int64, "device": device}
         self.positions = CpuGpuBuffer(max_num_batched_tokens, **i64_kwargs)
 
+        # Bump reorder_batch_threshold so multi-token spec-decode requests
+        # (MTP / EAGLE) are routed through the decode path. Mirrors vLLM's
+        # AttentionMetadataBuilder._init_reorder_batch_threshold(supports_spec_as_decode=True).
+        speculative_config = getattr(config, "speculative_config", None)
+        if (
+            getattr(self, "reorder_batch_threshold", None) is not None
+            and speculative_config is not None
+            and getattr(speculative_config, "num_speculative_tokens", None) is not None
+        ):
+            parallel_drafting = getattr(speculative_config, "parallel_drafting", False)
+            max_num_queries_for_spec = 1 + (2 if parallel_drafting else 1) * (
+                speculative_config.num_speculative_tokens
+            )
+            self.reorder_batch_threshold = max(
+                self.reorder_batch_threshold, max_num_queries_for_spec
+            )
+            logger.info(
+                "Spec decode: bumped reorder_batch_threshold to %d (num_spec_tokens=%d)",
+                self.reorder_batch_threshold,
+                speculative_config.num_speculative_tokens,
+            )
+
     return init_method_under_plugin_mode
 
 
@@ -301,7 +333,7 @@ def setup_attn_metadata_builder_base_class_and_attributes(class_dict: dict):
     needs_generic = True
 
     # align with vllm rocm aiter fa
-    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_BATCH
     class_dict["reorder_batch_threshold"] = 1
 
     return base_class, generic_base, needs_generic, class_dict
@@ -325,9 +357,12 @@ class vllmAttentionMetadataBuilderMethods:
 
         from vllm.v1.attention.backends.utils import split_decodes_prefills_and_extends
 
-        # here assume the decode num token is 1 per request
+        # decode_threshold tracks reorder_batch_threshold so MTP/EAGLE
+        # multi-token verification (query_len > 1) routes through decode.
+        decode_threshold = getattr(self, "reorder_batch_threshold", 1) or 1
         split_ret = split_decodes_prefills_and_extends(
-            common_attn_metadata=common_attn_metadata, decode_threshold=1
+            common_attn_metadata=common_attn_metadata,
+            decode_threshold=decode_threshold,
         )
 
         (
@@ -351,7 +386,15 @@ class vllmAttentionMetadataBuilderMethods:
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
+        # The spec-decode draft path invalidates it between proposal steps when
+        # num_speculative_tokens > 1.
+        # Fall back to seq_lens - query_lens computed on already-CPU tensors.
         num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
+        # In async spec-decode mode (auto-enabled for MTP/EAGLE), vLLM sets
+        # _num_computed_tokens_cpu to None because the GPU seq_lens is the
+        # authoritative source. Reconstruct from CPU tensors we already have.
+        if num_computed_tokens_cpu is None:
+            num_computed_tokens_cpu = seq_lens - query_lens_cpu
 
         prefill_max_query_len = decode_max_query_len = (
             common_attn_metadata.max_query_len
@@ -629,8 +672,15 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
                     if callable(method):
                         class_dict[method_name] = method
         elif is_sglang_mode:
-            raise NotImplementedError(
-                "AttentionMetadataBuilder for sglang is not implemented yet"
+            # SGLang uses ATOM's ScheduledBatch + CommonAttentionBuilder pipeline (same as
+            # native ATOM server). Do not swap in vLLM's AttentionMetadataBuilder or
+            # vllmAttentionMetadataBuilderMethods(build(common_attn_metadata=...)).
+            base_class = default_base_class
+            generic_base = default_base_class
+            needs_generic = True
+            logger.info(
+                "AiterAttentionMetadataBuilder: SGLang plugin mode keeps %s + original methods",
+                getattr(default_base_class, "__name__", default_base_class),
             )
 
         # create the new class
@@ -644,8 +694,10 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
         )
         if needs_generic and is_generic_builder_base:
             new_class.__orig_bases__ = (generic_base[AttentionMetaData],)
-        else:
+        elif generic_base is not None:
             new_class.__orig_bases__ = (generic_base,)
+        else:
+            new_class.__orig_bases__ = (base_class,)
 
         return new_class
 
@@ -832,12 +884,8 @@ class vllmMLAAttentionMetadataBuilderMethods:
         )
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
 
-        max_qo_len = (
-            (query_start_loc_cpu[-1] - query_start_loc_cpu[-2]).item()
-            if query_start_loc_cpu.numel() > 1
-            else 1
-        )
-
+        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_qo_len = qo_len.max().item()
         kv_indices_generate_triton(
             block_table_tensor,
             self.paged_kv_indices,
@@ -874,7 +922,9 @@ class vllmMLAAttentionMetadataBuilderMethods:
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
+        ctx_mla_ps = self._set_mla_persistent_worker_buffers(
+            num_reqs, qo_indptr, max_qo_len
+        )
         self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(
@@ -928,7 +978,6 @@ class vllmMLAAttentionMetadataBuilderMethods:
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
-
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
@@ -1261,7 +1310,7 @@ def create_mla_attn_metadata_builder_init_method(base_class):
             1,
             self.padded_num_attention_heads,
             torch.bfloat16,
-            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            _get_aiter_kv_cache_dtype(config),
             is_sparse=False,  # TODO: support sparse
             fast_mode=True,
         )
@@ -1357,8 +1406,12 @@ def AiterMLAAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
                     if callable(method):
                         class_dict[method_name] = method
         elif is_sglang_mode:
-            raise NotImplementedError(
-                "AttentionMetadataBuilder for sglang is not implemented yet"
+            base_class = default_base_class
+            generic_base = default_base_class
+            needs_generic = True
+            logger.info(
+                "AiterMLAMetadataBuilder: SGLang plugin mode keeps %s + original methods",
+                getattr(default_base_class, "__name__", default_base_class),
             )
 
         # create the new class
@@ -1441,6 +1494,7 @@ def AiterBackendDecoratorForPluginMode(cls):
     """
     is_vllm_mode = is_vllm()
     if is_vllm_mode:
+        is_sparse_mla = False
         if not issubclass(cls.get_impl_cls(), MLAAttention):
             methods_cls = vllmAiterAttentionBackendMethods
         else:
@@ -1452,7 +1506,16 @@ def AiterBackendDecoratorForPluginMode(cls):
         for name in dir(methods_cls):
             if name.startswith("_"):
                 continue
-            setattr(cls, name, getattr(methods_cls, name))
+            raw = methods_cls.__dict__.get(name)
+            if is_sparse_mla and isinstance(raw, classmethod):
+                # Re-wrap so cls binds to the target class, not methods_cls.
+                # For backends like sparse MLA where more than one attention
+                # backends are registered through this decorator exist, the
+                # different backends need to return distinct identities
+                # through full_cls_name().
+                setattr(cls, name, classmethod(raw.__func__))
+            else:
+                setattr(cls, name, getattr(methods_cls, name))
     return cls
 
 
@@ -1725,13 +1788,19 @@ class AiterMLASparseMetadataForPluginMode:
     paged_kv_last_page_len: torch.Tensor
     paged_kv_indices: torch.Tensor
     paged_kv_indptr: torch.Tensor
-    paged_kv_indptr_rest: torch.Tensor
+    attn_out_dtype: torch.dtype
 
     block_size: int = 1
     topk_tokens: int = 2048
 
-    # Flag to run ragged layout conversion only once per forward (shared across MLA layers)
-    ragged_layout_built: bool = False
+    # Persistent MLA metadata (only populated when persistent mode is enabled,
+    # i.e. when the aiter sparse decode kernel supports work-stealing splits).
+    work_meta_data: torch.Tensor | None = None
+    work_indptr: torch.Tensor | None = None
+    work_info_set: torch.Tensor | None = None
+    reduce_indptr: torch.Tensor | None = None
+    reduce_final_map: torch.Tensor | None = None
+    reduce_partial_map: torch.Tensor | None = None
 
 
 class vllmMLASparseAttentionMetadataBuilderMethods:
@@ -1750,18 +1819,63 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         )
         # Zero-fill for cudagraphs
         self.req_id_per_token_buffer.fill_(0)
+        self.paged_kv_indices.fill_(0)
+        self.paged_kv_indptr.fill_(0)
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
             req_id_per_token, non_blocking=True
         )
-        self.paged_kv_indices.fill_(0)
-        self.paged_kv_indptr.fill_(0)
+        query_lens = (
+            common_attn_metadata.query_start_loc[1:]
+            - common_attn_metadata.query_start_loc[:-1]
+        )
+        seq_lens = common_attn_metadata.seq_lens
+
+        from atom.plugin.attention_mla_sparse import generate_sparse_seqlen_triton
+
+        sparse_seqlen = generate_sparse_seqlen_triton(
+            query_lens,
+            seq_lens,
+            common_attn_metadata.query_start_loc,
+            self.topk_tokens,
+            num_tokens,
+            common_attn_metadata.max_query_len,
+        )
+
+        torch.cumsum(sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1])
+        self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
         qo_indptr = self.qo_indptr[: num_tokens + 1]
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
         paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
-        paged_kv_indptr_rest = self.paged_kv_indptr[num_tokens + 1 :]
+
+        # ----- Compute persistent MLA metadata -----
+        # The aiter sparse decode kernel uses qseqlen=1 (each query token is
+        # treated as its own batch entry), so persistent metadata can always
+        # be precomputed here. The kernel switches to the persistent
+        # work-stealing path automatically when work_meta_data is non-None.
+        get_mla_metadata_v1(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_last_page_len,
+            self.padded_num_heads,
+            1,
+            True,
+            self._mla_work_meta_data,
+            self._mla_work_info_set,
+            self._mla_work_indptr,
+            self._mla_reduce_indptr,
+            self._mla_reduce_final_map,
+            self._mla_reduce_partial_map,
+            page_size=1,
+            kv_granularity=16,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+            dtype_q=_get_aiter_kv_cache_dtype(self.vllm_config),
+            dtype_kv=_get_aiter_kv_cache_dtype(self.vllm_config),
+        )
 
         attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
             num_reqs=common_attn_metadata.num_reqs,
@@ -1774,12 +1888,18 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
+            attn_out_dtype=self.model_dtype,
             topk_tokens=self.topk_tokens,
             qo_indptr=qo_indptr,
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indptr_rest=paged_kv_indptr_rest,
+            work_meta_data=self._mla_work_meta_data,
+            work_indptr=self._mla_work_indptr,
+            work_info_set=self._mla_work_info_set,
+            reduce_indptr=self._mla_reduce_indptr,
+            reduce_final_map=self._mla_reduce_final_map,
+            reduce_partial_map=self._mla_reduce_partial_map,
         )
 
         attn_metadata = AttentionMetaData(
@@ -2047,14 +2167,12 @@ class vllmAiterMLASparseBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        return [1]
+        return [1, 64]
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
-        # ATOM's sparse MLA plugin path assumes kernel/page block size == 1
-        # throughout metadata construction and KV-cache indexing, so force that
-        # value when vLLM 0.19 negotiates the backend-specific cache block size.
-        return 1
+        # Prefer block_size == 64 so the indexer's preshuffled path is taken
+        return 64
 
     @staticmethod
     def get_kv_cache_shape(
@@ -2117,6 +2235,7 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
             from vllm.utils.platform_utils import num_compute_units
         except ImportError:
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
+        from atom.models.utils import extract_layer_index
         from vllm.v1.worker.cp_utils import get_total_cp_world_size
         from vllm.utils.math_utils import cdiv
 
@@ -2127,16 +2246,30 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(
             self.model_config.max_model_len
         )
-        self.num_speculative_tokens = (
-            self.vllm_config.speculative_config.num_speculative_tokens
-            if self.vllm_config.speculative_config
-            else 0
-        )
-        self.reorder_batch_threshold += self.num_speculative_tokens
+        # Determine if this builder is for draft model layers (MTP).
+        # Draft model layers have layer indices >= num_hidden_layers.
+        # The draft model itself does not do speculative decoding, so
+        # num_speculative_tokens should be 0 for its builders.
+        _is_draft_layer = False
+        if layer_names:
+            num_hidden_layers = config.model_config.hf_config.num_hidden_layers
+            layer_indices = [
+                extract_layer_index(layer_name) for layer_name in layer_names
+            ]
+            _is_draft_layer = all(idx >= num_hidden_layers for idx in layer_indices)
+        if _is_draft_layer:
+            self.num_speculative_tokens = 0
+        else:
+            self.num_speculative_tokens = (
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config
+                else 0
+            )
 
         sm_count = num_compute_units(self.device.index)
         self.num_sms = sm_count
@@ -2200,18 +2333,17 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
 
         self.vllm_config = config
         self.model_config = config.model_config
+        self.model_dtype = self.model_config.dtype
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         parallel_config = config.parallel_config
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = config.model_config.hf_config.index_topk
-        self.topk_tokens_tensor = torch.tensor(
-            [self.topk_tokens], device=device, dtype=torch.int32
-        )
         self.max_model_len_tensor = torch.tensor(
             [self.model_config.max_model_len], device=device, dtype=torch.int32
         )
@@ -2243,6 +2375,52 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
 
+        # ----- Persistent MLA metadata buffers -----
+        # The aiter sparse decode kernel supports a "persistent" path that
+        # uses precomputed work-splitting metadata for better load balancing
+        # across CUs. Mirrors the approach used in rocm_aiter_mla.py.
+        #
+        # In the sparse case each query token is its own "batch" entry in the
+        # qo_indptr (qo_indptr = [0, 1, 2, ..., num_tokens]) and max_qo_len=1.
+        # We pad get_mla_metadata_info_v1's batch_size to max_num_batched_tokens
+        # so the buffers are large enough for any decode shape we might see.
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = get_mla_metadata_info_v1(
+            max_num_batched_tokens,
+            1,
+            self.padded_num_heads,
+            _get_aiter_kv_cache_dtype(config),
+            _get_aiter_kv_cache_dtype(config),
+            is_sparse=True,
+            fast_mode=True,
+        )
+        self._mla_work_meta_data = torch.empty(
+            work_meta_data_size, dtype=work_meta_data_type, device=device
+        )
+        self._mla_work_indptr = torch.empty(
+            work_indptr_size, dtype=work_indptr_type, device=device
+        )
+        self._mla_work_info_set = torch.empty(
+            work_info_set_size, dtype=work_info_set_type, device=device
+        )
+        self._mla_reduce_indptr = torch.empty(
+            reduce_indptr_size, dtype=reduce_indptr_type, device=device
+        )
+        self._mla_reduce_final_map = torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type, device=device
+        )
+        self._mla_reduce_partial_map = torch.empty(
+            reduce_partial_map_size,
+            dtype=reduce_partial_map_type,
+            device=device,
+        )
+
     return init_method_under_plugin_mode
 
 
@@ -2256,8 +2434,9 @@ def setup_mla_sparse_attn_metadata_builder_base_class_and_attributes(class_dict:
     generic_base = AttentionMetadataBuilder
     needs_generic = True
 
-    # align with vllm ROCMAiterMLASparseMetadataBuilder
-    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # The plugin sparse MLA path builds per-token ragged metadata, so uniform
+    # spec-decode batches from the main model can use full decode cudagraphs.
+    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_BATCH
     # For indexer metadata, not present in vllm sparse MLA
     class_dict["reorder_batch_threshold"] = 1
 
@@ -2278,12 +2457,16 @@ def unified_attention_with_output_base_for_plugin_mode(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    atom_config = get_current_atom_config()
+    current_atom_config = get_current_atom_config()
+    static_forward_context = (
+        current_atom_config.compilation_config.static_forward_context
+    )
+
     if use_mla:
         # raise NotImplementedError("MLA is not supported for plugin mode for now")
         kv_c_normed = k
         k_pe = v
-        self = atom_config.compilation_config.static_forward_context[layer_name]
+        self = static_forward_context[layer_name]
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
@@ -2302,14 +2485,23 @@ def unified_attention_with_output_base_for_plugin_mode(
         )
         return self.o_proj(output)
     else:
-        self = atom_config.compilation_config.static_forward_context[layer_name]
+        self = static_forward_context[layer_name]
         # here is the standard vllm attention impl interface
         # when using fusion, we need to pass the qkv and positions through the q,k,v
         # [watch out] accept_output_buffer must be False for plugin mode
         # because we don't want vllm to manipulate the q k v and output buffer
         # ATOM needs to handle all of the buffer here
-        if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            output = self.attn(q, positions, qkv)
+        # Positions for compiled unified_attention are provided via vLLM ForwardContext
+        # (atom_positions) in ATOMModelBase.forward, not via this Python arg.
+        #
+        # RoPE single-source-of-truth in plugin mode: when ATOM's
+        # PagedAttentionImpl is active, it applies RoPE inside
+        # rope_cache_plugin_mode. Applying RoPE here too would double apply
+        # it for any model hitting the "else" branch in rope_cache_plugin_mode when
+        # ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION is not set.
+        # if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        if current_atom_config.plugin_config.vllm_use_atom_attention:
+            output = self.attn(q, k, v)
         else:
             # calculate the q and k with rotary embedding
             if self.rotary_emb is not None:

@@ -16,12 +16,29 @@ from vllm.forward_context import get_forward_context
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.model_executor.layers.fla.ops import (
-    chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
-)
+
+# Two prefill kernel options, selected per-instance via use_vk_layout:
+#
+#   * vk (default for the plugin path): ATOM-vendored verbatim port of
+#     vllm.model_executor.layers.fla.ops.chunk. Writes ssm_state as
+#     `[N, H, V, K]` per slot — matches the layout vLLM allocates via
+#     MambaStateShapeCalculator.gated_delta_net_state_shape and the layout
+#     that this file's decode kernels (fused_sigmoid_gating_delta_rule_update,
+#     flydsl_gdr_decode) read. Bit-exact agreement with vLLM upstream
+#     verified by tests/test_chunk_gated_delta_rule_vk.py.
+#
+#   * kv: ATOM's original chunk_gated_delta_rule in chunk.py. Writes
+#     ssm_state as `[N, H, K, V]` per slot. Used by the non-plugin
+#     ATOM-native GDN backend, which pairs it with its kv-layout decode
+#     kernel `fused_recurrent_gated_delta_rule`. NOT compatible with the
+#     plugin path's decode kernels — included here as a developer-only
+#     escape hatch (e.g. for A/B layout experiments). Selecting it on the
+#     plugin path will corrupt the prefill→decode ssm_state round-trip.
+from atom.model_ops.fla_ops.chunk_vk import chunk_gated_delta_rule_vk
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
+
 from atom.utils import envs
 
 from torch import nn
@@ -37,8 +54,18 @@ except ImportError:
 
 
 class ChunkGatedDeltaRule(nn.Module):
-    def __init__(self) -> None:
+    """Prefill kernel wrapper.
+
+    The choice between vk- and kv-layout chunk kernels is resolved at
+    construction time so .forward stays branch-free. See the module-level
+    import comment for the layout semantics and the constraint that the
+    plugin path's decode kernels are vk-only.
+    """
+
+    def __init__(self, use_vk_layout: bool = True) -> None:
         super().__init__()
+        self.use_vk_layout = use_vk_layout
+        self._fla_chunk_gated_delta_rule = chunk_gated_delta_rule_vk
 
     def forward(
         self,
@@ -51,8 +78,9 @@ class ChunkGatedDeltaRule(nn.Module):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
+        o: torch.Tensor | None = None,
     ):
-        return fla_chunk_gated_delta_rule(
+        return self._fla_chunk_gated_delta_rule(
             q=q,
             k=k,
             v=v,
@@ -62,6 +90,7 @@ class ChunkGatedDeltaRule(nn.Module):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            o=o,
         )
 
 
@@ -75,17 +104,19 @@ def fused_gdn_gating_kernel(
     dt_bias,
     seq_len,
     NUM_HEADS: tl.constexpr,
+    stride_a_batch,
+    stride_b_batch,
     beta: tl.constexpr,
     threshold: tl.constexpr,
     BLK_HEADS: tl.constexpr,
 ):
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
-    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    out_off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
     mask = head_off < NUM_HEADS
     blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
-    blk_b = tl.load(b + off, mask=mask)
+    blk_a = tl.load(a + i_b * stride_a_batch + head_off, mask=mask)
+    blk_b = tl.load(b + i_b * stride_b_batch + head_off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off, mask=mask)
     # If the model is loaded in fp16, without the .float() here, A might be -inf
     x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
@@ -93,11 +124,13 @@ def fused_gdn_gating_kernel(
         beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    tl.store(g + out_off, blk_g.to(g.dtype.element_ty), mask=mask)
     # compute beta_output = sigmoid(b)
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
     tl.store(
-        beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
+        beta_output + out_off,
+        blk_beta_output.to(beta_output.dtype.element_ty),
+        mask=mask,
     )
 
 
@@ -129,6 +162,8 @@ def fused_gdn_gating(
         dt_bias,
         seq_len,
         num_heads,
+        a.stride(0),
+        b.stride(0),
         beta,
         threshold,
         8,
@@ -152,8 +187,20 @@ class GatedDeltaNet(nn.Module):
         conv1d,
         activation,
         layer_num: int = 0,
+        use_vk_layout: bool = True,
         **kwargs,
     ):
+        """
+        Args:
+            use_vk_layout: When True (default), prefill writes ssm_state in
+                vLLM's `[V, K]`-per-head layout — required for this file's
+                decode kernels (fused_sigmoid_gating_delta_rule_update,
+                flydsl_gdr_decode) to read it correctly. The vLLM ssm_state
+                allocator (MambaStateShapeCalculator.gated_delta_net_state_shape)
+                also uses this layout. Set False ONLY for developer
+                experiments — the plugin path's decode kernels are vk-only,
+                so kv prefill would corrupt the prefill→decode round-trip.
+        """
         super().__init__()
         self.layer_num = layer_num
 
@@ -169,7 +216,8 @@ class GatedDeltaNet(nn.Module):
         self.num_v_heads = num_v_heads
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
+        self.use_vk_layout = use_vk_layout
+        self.chunk_gated_delta_rule = ChunkGatedDeltaRule(use_vk_layout=use_vk_layout)
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
@@ -206,6 +254,7 @@ class GatedDeltaNet(nn.Module):
 
         if attn_metadata is None:
             # V1 profile run
+            core_attn_out.zero_()
             return core_attn_out
 
         assert isinstance(attn_metadata, dict)
@@ -360,6 +409,18 @@ class GatedDeltaNet(nn.Module):
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
+            # When spec_sequence_masks is None, T_nonspec == num_actual_tokens
+            # and core_attn_out[:num_actual_tokens] is contiguous, so the
+            # prefill kernel can write its output directly into that slice —
+            # saves a `core_attn_out_non_spec.squeeze(0)` copy per layer per
+            # prefill step. With spec decode active, mixed_qkv was index_select'd
+            # by non_spec_token_indx so T_nonspec < num_actual_tokens and the
+            # merge below (index_copy_) needs a separately-allocated buffer to
+            # scatter back to the correct slot positions — fall back to o=None.
+            if spec_sequence_masks is None:
+                o_buf = core_attn_out[:num_actual_tokens].unsqueeze(0)
+            else:
+                o_buf = None
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -373,27 +434,33 @@ class GatedDeltaNet(nn.Module):
                 output_final_state=True,
                 cu_seqlens=non_spec_query_start_loc,
                 use_qk_l2norm_in_kernel=True,
+                o=o_buf,
             )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
-            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+            # When spec_sequence_masks is None the kernel already wrote into
+            # core_attn_out via o_buf — no copy needed here. With spec decode,
+            # core_attn_out_non_spec is a separate alloc and the merge below
+            # scatters it via index_copy_.
         elif attn_metadata.num_decodes > 0:
+            o = core_attn_out[: attn_metadata.num_decode_tokens]
             if USE_FLYDSL_GDR:
                 core_attn_out_non_spec = query_non_spec.new_empty(*value_non_spec.shape)
                 query_non_spec = query_non_spec.permute(1, 0, 2, 3)
+                # NOTE: a and b should use the (batch, seq, num_v_heads) layout
                 flydsl_gdr_decode(
                     query=query_non_spec,
                     key=key_non_spec,
                     value=value_non_spec,
-                    a=a,
-                    b=b,
+                    a=a.unsqueeze(1),
+                    b=b.unsqueeze(1),
                     dt_bias=self.dt_bias,
                     A_log=self.A_log,
                     indices=non_spec_state_indices_tensor,
                     state=ssm_state,
-                    out=core_attn_out_non_spec,
+                    out=o,
                     use_qk_l2norm=True,
                     need_shuffle_state=False,
                     stream=torch.cuda.current_stream(),
@@ -401,7 +468,6 @@ class GatedDeltaNet(nn.Module):
 
                 last_recurrent_state = None
             else:
-                o = core_attn_out[: attn_metadata.num_decode_tokens]
                 core_attn_out_non_spec, last_recurrent_state = (
                     fused_sigmoid_gating_delta_rule_update(
                         A_log=self.A_log,
@@ -436,5 +502,9 @@ class GatedDeltaNet(nn.Module):
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+
+        # Zero padding tail for CUDA graph replay safety
+        if num_actual_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_actual_tokens:].zero_()
 
         return core_attn_out
