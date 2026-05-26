@@ -38,27 +38,6 @@ from torch import nn
 logger = logging.getLogger("atom")
 
 
-# --- gfx1201 (RDNA4) FP8 GEMM fallback --------------------------------------
-# AITER prebuilts (gemm_a8w8*, tgemm.mm dispatched to aiter HIP) do not have
-# gfx1201 code objects in the rocm/atom-dev:latest image, causing SIGSEGV on
-# kernel load. We dequantize FP8 weights to BF16 and run F.linear instead.
-# Detection is cached after first call.
-def _detect_gfx1201() -> bool:
-    try:
-        return (torch.cuda.get_device_properties(0).gcnArchName or "").startswith(
-            "gfx1201"
-        )
-    except Exception:
-        return False
-
-
-_IS_GFX1201: bool = _detect_gfx1201()
-
-
-def _is_gfx1201_linear() -> bool:
-    return _IS_GFX1201
-
-
 _TRITON_FP8_GEMM = None
 
 
@@ -671,10 +650,6 @@ class LinearBase(nn.Module):
             # per_1x128 only needs shuffle when using the preshuffle GEMM path
             if not need_shuffle and self.quant_type == QuantType.per_1x128:
                 need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-                # gfx1201: we use the a16w8 blockscale kernel which expects the
-                # plain (N, K) weight layout — never preshuffle on this arch.
-                if _is_gfx1201_linear():
-                    need_shuffle = False
             if need_shuffle:
                 if self.weight.dim() == 2:
                     shuffle_weights(self.weight)
@@ -708,19 +683,11 @@ class LinearBase(nn.Module):
                         transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
-                    if (
-                        self.quant_type.value == QuantType.per_1x128.value
-                        and _is_gfx1201_linear()
-                    ):
-                        # gfx1201 per_1x128 routes to aiter triton a16w8 below,
-                        # which takes BF16 x; skip the FP8 pre-quant.
-                        x_scale = getattr(self, "input_scale", None)
-                    else:
-                        x, x_scale = quant_func(
-                            x,
-                            quant_dtype=self.params_dtype,
-                            scale=getattr(self, "input_scale", None),
-                        )
+                    x, x_scale = quant_func(
+                        x,
+                        quant_dtype=self.params_dtype,
+                        scale=getattr(self, "input_scale", None),
+                    )
             if self.quant_type.value == QuantType.per_Tensor.value:
                 # aiter.tgemm.mm handles per-Tensor FP8 on every supported arch
                 # now that aiter#3332 added gfx1200 / gfx1201 to the FP8 dtype
@@ -757,61 +724,7 @@ class LinearBase(nn.Module):
                     if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
-                if _is_gfx1201_linear():
-                    # gfx1201: aiter's HIP gemm_a8w8_blockscale has no
-                    # gfx1201 code object (the rocm/atom-dev:latest image
-                    # ships prebuilt .so files for gfx94x/95x only) -- both
-                    # the plain and bpreshuffle HIP variants either SIGSEGV
-                    # or return "GEMM is not supported" on this arch. Route
-                    # to aiter's triton non-preshuffle gemm_a8w8_blockscale
-                    # instead; it JIT-compiles for gfx1201 and matches
-                    # F.linear(bf16) at the FP8 quant-noise floor.
-                    #
-                    # The shared pre-quant block above honors
-                    # ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE (defaults True),
-                    # which produces column-major x_scale for the HIP
-                    # preshuffle kernel. The non-preshuffle triton kernel
-                    # expects row-major x_scale -- so on gfx1201 the shared
-                    # pre-quant is skipped (x stays BF16) and we run quant
-                    # inline here with transpose_scale=False.
-                    #
-                    # weight is stored as torch.uint8 (aiter d_dtypes['fp8']
-                    # convention) on aiter builds without #3332; .view to
-                    # float8_e4m3fn so triton's tl.dot accepts it. With
-                    # #3332 the weight is already float8_e4m3fn and the
-                    # view is a no-op. need_shuffle=False at init keeps
-                    # the weight in plain (N, K) layout.
-                    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-                        gemm_a8w8_blockscale as gemm_a8w8_blockscale_triton,
-                    )
-
-                    # x is BF16 here (the shared pre-quant block above leaves
-                    # gfx1201 per_1x128 alone). Quantize inline with the row-major
-                    # x_scale layout the triton non-preshuffle kernel expects.
-                    x_inline, x_scale_inline = self.quant_func(
-                        x,
-                        quant_dtype=self.params_dtype,
-                        scale=getattr(self, "input_scale", None),
-                        transpose_scale=False,
-                    )
-                    xf = (
-                        x_inline
-                        if x_inline.dtype == torch.float8_e4m3fn
-                        else x_inline.view(torch.float8_e4m3fn)
-                    )
-                    wf = self.weight
-                    if wf.dtype in (torch.uint8, torch.int8):
-                        wf = wf.view(torch.float8_e4m3fn)
-                    y = gemm_a8w8_blockscale_triton(
-                        xf,
-                        wf,
-                        x_scale_inline,
-                        self.weight_scale,
-                        dtype=otype,
-                    )
-                    if self.bias is not None:
-                        y += self.bias
-                elif envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+                if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
                     y = gemm_a8w8_blockscale_preshuffle_impl(
                         x,
                         self.weight,
