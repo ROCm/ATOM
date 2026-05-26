@@ -2,8 +2,20 @@
 
 This recipe describes running `mistralai/Ministral-3-8B-Instruct-2512`
 (natively FP8 trained) on a single RDNA4 GPU using ATOM's
-`TritonMHABackend` (aiter triton `unified_attention`) backend. The backend is selected automatically
-when ATOM detects gfx1201; on other archs it does nothing.
+`TritonMHABackend` (aiter triton `unified_attention`) backend.
+
+The backend is opt-in via env var:
+
+```bash
+export ATOM_USE_UNIFIED_ATTN=1
+```
+
+This is **required on gfx1201** — the default `AiterBackend` calls
+`torch.ops.aiter.unified_attention_with_output_base` (HIP), and the
+prebuilt `.so` files in `rocm/atom-dev:latest` ship code objects only
+for gfx94x/95x, so the kernel launch SIGSEGVs on gfx1201 at first
+forward. `ATOM_USE_UNIFIED_ATTN=1` routes through `TritonMHABackend`,
+which uses aiter triton `unified_attention` (JIT-compiled per arch).
 
 ## Why not the default AITER path?
 

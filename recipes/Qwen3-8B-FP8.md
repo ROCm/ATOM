@@ -16,6 +16,21 @@ hf download Qwen/Qwen3-8B-FP8 \
 
 ## Required setup (run once per fresh container)
 
+### 1. Force the triton attention backend
+
+```bash
+export ATOM_USE_UNIFIED_ATTN=1
+```
+
+Required on gfx1201 — the default `AiterBackend` calls
+`torch.ops.aiter.unified_attention_with_output_base` (HIP), and the
+prebuilt `.so` files in `rocm/atom-dev:latest` ship code objects only
+for gfx94x/95x, so the kernel launch SIGSEGVs on gfx1201 at first
+forward. `ATOM_USE_UNIFIED_ATTN=1` routes through `TritonMHABackend`
+which uses aiter triton `unified_attention` (JIT-compiled per arch).
+
+### 2. Alias gfx1250 GEMM tuning configs
+
 aiter ships **zero** gfx1201 GEMM tuned configs. Without aliasing the
 gfx1250 ones to gfx1201, the autotuner falls back to a default that is
 **~50% slower** at 8B-class shapes (Mistral TPOT 22 ms with this step,

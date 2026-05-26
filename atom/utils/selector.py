@@ -63,25 +63,11 @@ def get_attn_backend_cls(
                 "atom.plugin.sglang.attention_backend.attention_gdn.GDNAttentionBackend"
             )
         return "atom.model_ops.attentions.gdn_attn.GDNAttentionBackend"
-    # Capability dispatch: aiter's prebuilt HIP attention modules ship
-    # code objects only for the CDNA archs below; on any other arch
-    # (e.g. gfx1201 RDNA4 in rocm/atom-dev:latest) the HIP kernel launch
-    # SIGSEGVs at first forward, so route to TritonMHABackend which uses
-    # aiter triton unified_attention for both prefill and decode via a
-    # flash-layout (NHD) KV cache. Forced via ATOM_USE_UNIFIED_ATTN=1.
-    _AITER_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
-
-    def _hip_attention_supported() -> bool:
-        try:
-            import torch
-
-            if not torch.cuda.is_available():
-                return False
-            arch = (torch.cuda.get_device_properties(0).gcnArchName or "").split(":")[0]
-            return arch in _AITER_HIP_PREBUILT_ARCHES
-        except Exception:
-            return False
-
-    if envs.ATOM_USE_UNIFIED_ATTN or not _hip_attention_supported():
+    # Set ATOM_USE_UNIFIED_ATTN=1 to route through TritonMHABackend (aiter
+    # triton unified_attention for both prefill and decode via a flash-layout
+    # NHD KV cache). Required on arches without a prebuilt HIP attention
+    # code object (e.g. gfx1201 RDNA4 in rocm/atom-dev:latest); see
+    # recipes/{Ministral-3-8B,Qwen3-8B-FP8}.md.
+    if envs.ATOM_USE_UNIFIED_ATTN:
         return "atom.model_ops.attentions.triton_mha.TritonMHABackend"
     return "atom.model_ops.attentions.aiter_attention.AiterBackend"  # noqa: E501
