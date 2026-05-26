@@ -82,7 +82,6 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-from atom.plugin import is_vllm
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
 # shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
