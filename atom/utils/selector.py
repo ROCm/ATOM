@@ -63,18 +63,25 @@ def get_attn_backend_cls(
                 "atom.plugin.sglang.attention_backend.attention_gdn.GDNAttentionBackend"
             )
         return "atom.model_ops.attentions.gdn_attn.GDNAttentionBackend"
-    # Capability fallback: when aiter's prebuilt HIP modules don't expose
-    # the unified_attention op on the running device (e.g. gfx1201, where
-    # rocm/atom-dev:latest ships no matching code objects), route through
-    # the in-tree triton backend which JIT-compiles for any arch. Forced
-    # on/off via ATOM_NATIVE_TRITON_ATTN=1/0 for testing.
-    try:
-        from atom.model_ops.attentions.native_triton_attn import use_native_triton_attn
+    # Capability dispatch: aiter's prebuilt HIP attention modules ship
+    # code objects only for the CDNA archs below; on any other arch
+    # (e.g. gfx1201 RDNA4 in rocm/atom-dev:latest) the HIP kernel launch
+    # SIGSEGVs at first forward, so route to TritonMHABackend which uses
+    # aiter triton unified_attention for both prefill and decode via a
+    # flash-layout (NHD) KV cache. Forced via ATOM_USE_UNIFIED_ATTN=1.
+    _AITER_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
 
-        if use_native_triton_attn():
-            return "atom.model_ops.attentions.native_triton_attn.NativeTritonBackend"
-    except Exception:
-        pass
-    if envs.ATOM_USE_UNIFIED_ATTN:
+    def _hip_attention_supported() -> bool:
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return False
+            arch = (torch.cuda.get_device_properties(0).gcnArchName or "").split(":")[0]
+            return arch in _AITER_HIP_PREBUILT_ARCHES
+        except Exception:
+            return False
+
+    if envs.ATOM_USE_UNIFIED_ATTN or not _hip_attention_supported():
         return "atom.model_ops.attentions.triton_mha.TritonMHABackend"
     return "atom.model_ops.attentions.aiter_attention.AiterBackend"  # noqa: E501

@@ -2,7 +2,7 @@
 
 This recipe describes running `mistralai/Ministral-3-8B-Instruct-2512`
 (natively FP8 trained) on a single RDNA4 GPU using ATOM's
-`NATIVE_TRITON_ATTENTION` backend. The backend is selected automatically
+`TritonMHABackend` (aiter triton `unified_attention`) backend. The backend is selected automatically
 when ATOM detects gfx1201; on other archs it does nothing.
 
 ## Why not the default AITER path?

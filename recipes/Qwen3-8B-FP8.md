@@ -134,7 +134,7 @@ agent-stack backend going forward.
 | Dynamic per-token FP8 quant of `x` | n/a — `gemm_a16w8_blockscale` casts FP8 weight → BF16 inside the kernel and runs `tl.dot(bf16, bf16)`, so `x` stays BF16 (no activation quant needed) |
 | RMSNorm (incl. Qwen3 q_norm/k_norm) | triton `RMSNorm` |
 | SiLU+Mul | triton `SiluAndMul` |
-| Paged attention decode + prefill | triton `native_triton_attn` (our gfx1201 backend) |
+| Paged attention decode + prefill | aiter triton `unified_attention` via `TritonMHABackend` |
 | KV-cache write | triton kernel (handles -1 sentinels in-kernel) |
 | RoPE | aiter triton `get_rope` |
 

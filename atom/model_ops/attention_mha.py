@@ -269,17 +269,38 @@ class PagedAttentionImpl(nn.Module):
                     asm_layout=asm_layout,
                 )
             else:
-                aiter.reshape_and_cache(
-                    k,
-                    v,
-                    k_cache,
-                    v_cache,
-                    attn_metadata.slot_mapping,
-                    kv_cache_dtype="auto",
-                    k_scale=None,
-                    v_scale=None,
-                    asm_layout=asm_layout,
-                )
+                if self.use_flash_layout:
+                    # Flash layout: cache is NHD [num_blocks, block_size,
+                    # num_kv_heads, head_dim]. The aiter HIP reshape_and_cache
+                    # expects an HND-with-asm-packing layout when asm_layout
+                    # is True, which doesn't fit flash NHD. Call the aiter
+                    # triton path directly so the cache write matches the
+                    # cache layout TritonMHAMetadataBuilder.build_kv_cache_tensor
+                    # allocated.
+                    from aiter.ops.triton.kv_cache import (
+                        reshape_and_cache as _reshape_and_cache_triton,
+                    )
+
+                    _reshape_and_cache_triton(
+                        k,
+                        v,
+                        k_cache,
+                        v_cache,
+                        attn_metadata.slot_mapping,
+                        kv_cache_layout="NHD",
+                    )
+                else:
+                    aiter.reshape_and_cache(
+                        k,
+                        v,
+                        k_cache,
+                        v_cache,
+                        attn_metadata.slot_mapping,
+                        kv_cache_dtype="auto",
+                        k_scale=None,
+                        v_scale=None,
+                        asm_layout=asm_layout,
+                    )
 
         # Prefix cache hit: gather cached KV from paged cache and concat with new tokens
         if attn_metadata.has_cached:
