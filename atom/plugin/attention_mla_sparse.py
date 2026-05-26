@@ -59,6 +59,21 @@ def _debug_dsv32_mtp_sparse(message: str):
     logger.warning("[DSV32-MTP-SPARSE] %s", message)
 
 
+def _ensure_sparse_kv_indices_buffer(
+    buffer: torch.Tensor | None,
+    required_numel: int,
+    where: str,
+):
+    actual_numel = 0 if buffer is None else buffer.numel()
+    if actual_numel < required_numel:
+        raise RuntimeError(
+            f"Sparse MLA {where} has an unbound or undersized "
+            f"sparse_kv_indices_buffer: required={required_numel}, "
+            f"actual={actual_numel}. This usually means the sparse MLA metadata "
+            "builder bound the buffer to the wrong atom_config/static_forward_context."
+        )
+
+
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
     req_id_ptr,  # int32 [num_tokens]
@@ -312,6 +327,12 @@ class MLASparseAttentionImplPluginModeMethods:
             f"paged_indptr_ptr={sparse_meta.paged_kv_indptr.data_ptr()} "
             f"meta_indices_ptr={sparse_meta.paged_kv_indices.data_ptr()} "
             f"impl_indices_ptr={getattr(self, 'sparse_kv_indices_buffer', torch.empty(0)).data_ptr()}"
+        )
+
+        _ensure_sparse_kv_indices_buffer(
+            getattr(self, "sparse_kv_indices_buffer", None),
+            sparse_meta.paged_kv_indices.numel(),
+            "attention",
         )
 
         num_tokens = q.shape[0]
@@ -650,6 +671,11 @@ def sparse_attn_indexer_plugin_mode(
         f"paged_indptr_ptr={sparse_meta.paged_kv_indptr.data_ptr()} "
         f"meta_indices_ptr={sparse_meta.paged_kv_indices.data_ptr()} "
         f"arg_indices_ptr={sparse_kv_indices_buffer.data_ptr()}"
+    )
+    _ensure_sparse_kv_indices_buffer(
+        sparse_kv_indices_buffer,
+        sparse_meta.paged_kv_indices.numel(),
+        "indexer",
     )
     kv_block_size = kv_cache.shape[1]
     preshuffle_cache = kv_block_size != 1

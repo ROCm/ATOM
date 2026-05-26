@@ -331,6 +331,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # their prefix parameter (e.g. "model.layers.0.self_attn.attn").
         vllm_sfc = self.vllm_compilation_config.static_forward_context
         for module in indexer_caches:
+            # MTP draft models own a separate atom_config/static_forward_context.
+            # Keep that ownership on the cache so metadata builders can bind
+            # sparse buffers back to the draft modules instead of the main model.
+            module.atom_config = self.atom_config
             prefix = module.prefix
             if prefix not in vllm_sfc:
                 vllm_sfc[prefix] = module
