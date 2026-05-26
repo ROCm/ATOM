@@ -34,19 +34,6 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
-def _extract_layer_index(name: str | None) -> int | None:
-    if not name:
-        return None
-    parts = name.split(".")
-    for idx, part in enumerate(parts[:-1]):
-        if part == "layers":
-            try:
-                return int(parts[idx + 1])
-            except ValueError:
-                return None
-    return None
-
-
 @AiterBackendDecoratorForPluginMode
 class AiterMLABackend(AttentionBackend):
     @staticmethod
@@ -156,11 +143,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
-            self._sparse_kv_indices_draft_gpu = (
-                torch.empty_like(self._sparse_kv_indices_gpu)
-                if hasattr(model_runner, "drafter")
-                else None
-            )
 
         if self.is_sparse and max_seqlen_qo > 1:
             # Allocate a second set of persistent work buffers for sparse MTP
@@ -205,23 +187,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if self.is_sparse:
             sfc = config.compilation_config.static_forward_context
-            for name, module in sfc.items():
-                layer_idx = _extract_layer_index(name)
-                is_draft_layer = (
-                    self._sparse_kv_indices_draft_gpu is not None
-                    and layer_idx is not None
-                    and layer_idx >= hf_config.num_hidden_layers
-                )
-                sparse_kv_indices_buffer = (
-                    self._sparse_kv_indices_draft_gpu
-                    if is_draft_layer
-                    else self._sparse_kv_indices_gpu
-                )
+            for module in sfc.values():
                 if hasattr(module, "sparse_kv_indices_buffer"):
-                    module.sparse_kv_indices_buffer = sparse_kv_indices_buffer
+                    module.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
                 impl = getattr(module, "impl", None)
                 if impl is not None and hasattr(impl, "sparse_kv_indices_buffer"):
-                    impl.sparse_kv_indices_buffer = sparse_kv_indices_buffer
+                    impl.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
             self._token_to_seq_idxs_gpu = torch.zeros(
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
