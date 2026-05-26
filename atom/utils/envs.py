@@ -83,6 +83,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_EMBEDDING": lambda: (
         os.getenv("ATOM_USE_TRITON_EMBEDDING", "0") == "1"
     ),
+    # Route the sampler's Exp(1) noise generation through aiter's Triton kernel
+    # (aiter.ops.triton.rng.exponential) instead of
+    # torch.empty(...).exponential_(1) which dispatches to aten's Philox RNG
+    # (distribution_elementwise_grid_stride_kernel). NOT bit-exact vs aten
+    # (different RNG family) but distribution-equivalent (mean=1, var=1) and
+    # deterministic given a fixed torch.manual_seed.
+    "ATOM_USE_TRITON_EXPONENTIAL": lambda: (
+        os.getenv("ATOM_USE_TRITON_EXPONENTIAL", "0") == "1"
+    ),
     # --- Kernel Fusion Toggles ---
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.

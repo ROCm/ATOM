@@ -42,13 +42,29 @@ _NATIVE_SAMPLING_WARNING_ISSUED = False
 SAMPLER_EPS = 1e-10
 
 
+def _exponential_noise(shape, dtype, device) -> torch.Tensor:
+    """Exp(1) noise allocator. Routes to aiter's Triton kernel when
+    ATOM_USE_TRITON_EXPONENTIAL=1, else uses torch.empty().exponential_(1)
+    (which dispatches to aten's Philox `distribution_elementwise_grid_stride_kernel`).
+
+    The Triton variant is NOT bit-exact vs aten (different RNG family) but is
+    distribution-equivalent (mean=1, var=1) and obeys torch.manual_seed for
+    repeat-call reproducibility within the same process.
+    """
+    if envs.ATOM_USE_TRITON_EXPONENTIAL:
+        # Lazy import to keep ATOM startable on aiter builds without this module.
+        from aiter.ops.triton.rng.exponential import (
+            exponential as _triton_exponential,
+        )
+        return _triton_exponential(shape, dtype=dtype, device=device)
+    return torch.empty(shape, dtype=dtype, device=device).exponential_(1)
+
+
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     """Returns a tensor of shape (1, vocab_size) filled with exponential random values.
     This is key to deterministic inference, as it ensures that the same random values are used for each token across different runs.
     """
-    return torch.empty((1, vocab_size), dtype=torch.float, device=device).exponential_(
-        1
-    )
+    return _exponential_noise((1, vocab_size), torch.float, device)
 
 
 class Sampler(nn.Module):
@@ -130,9 +146,9 @@ class Sampler(nn.Module):
         num_tokens, vocab_size = logits.shape
         sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
         if needs_independent_noise:
-            exponential = torch.empty(
-                (num_tokens, vocab_size), dtype=torch.float, device=logits.device
-            ).exponential_(1)
+            exponential = _exponential_noise(
+                (num_tokens, vocab_size), torch.float, logits.device
+            )
         else:
             exponential = get_per_token_exponential(vocab_size, logits.device).expand(
                 num_tokens, vocab_size
@@ -316,6 +332,8 @@ class Sampler(nn.Module):
         self, logits: torch.Tensor  # (token_num, vocab_size)
     ) -> torch.Tensor:  # (token_num,)
         probs = softmax(logits)
-        logits = probs.div_(torch.empty_like(probs).exponential_(1) + self.eps)
+        logits = probs.div_(
+            _exponential_noise(probs.shape, probs.dtype, probs.device) + self.eps
+        )
         _, sampled_tokens = topk(logits, 1)
         return sampled_tokens.view(-1)
