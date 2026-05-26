@@ -268,7 +268,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         else:
             final_hidden_states = routed_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not envs.ATOM_POSTPONE_MOE_ALL_REDUCE:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
@@ -926,6 +926,12 @@ class Qwen3NextDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         hidden_states = self.mlp(hidden_states)
+        if (
+            envs.ATOM_POSTPONE_MOE_ALL_REDUCE
+            and isinstance(self.mlp, Qwen3NextSparseMoeBlock)
+            and self.mlp.tp_size > 1
+        ):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:

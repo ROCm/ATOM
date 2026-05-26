@@ -152,6 +152,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sampler top-K logits log — int K, 0/empty disables.
     "ATOM_DEBUG_TOPK": lambda: int(os.getenv("ATOM_DEBUG_TOPK", "0") or "0"),
     "ATOM_DEBUG_TOPK_PATH": lambda: os.getenv("ATOM_DEBUG_TOPK_PATH", ""),
+    "ATOM_POSTPONE_MOE_ALL_REDUCE": lambda: (
+        os.getenv("ATOM_POSTPONE_MOE_ALL_REDUCE", "0").lower() == "1"
+    ),
 }
 
 
