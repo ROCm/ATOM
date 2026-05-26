@@ -502,7 +502,7 @@ class Scheduler:
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if num_new_tokens > self.max_num_batched_tokens:
                 continue
-            if not self.block_manager.can_allocate(seq):
+            if self.block_manager.can_allocate(seq) < 0:
                 return False  # KV-pressured: definitely cannot prefill
             return True
         return False
