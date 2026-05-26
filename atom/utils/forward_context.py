@@ -246,9 +246,6 @@ class AttentionMetaData:
     total_kv: Optional[int] = None
     num_cached_tokens: Optional[torch.Tensor] = None
     seq_starts: Optional[torch.Tensor] = None
-    # original block_tables before sub-block conversion (for gather kernels
-    # that index at model_runner block_size, not attention backend block_size)
-    orig_block_tables: Optional[torch.Tensor] = None
 
     # only used for plugin mode to store the metadata for attn
     plugin_metadata: Optional["MetadataForPluginMode"] = None

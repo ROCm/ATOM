@@ -363,14 +363,7 @@ class PagedAttentionImpl(nn.Module):
             v_cache_gather = v_cache
             block_size = k_cache.shape[1]
 
-        # Use original (unconverted) block_tables for gather: the kernel indexes
-        # at model_runner block_size (PAGE_SIZE from k_cache shape), not the
-        # attention backend's sub-block size.
-        block_tables = (
-            attn_metadata.orig_block_tables
-            if attn_metadata.orig_block_tables is not None
-            else attn_metadata.block_tables
-        )
+        block_tables = attn_metadata.block_tables
         per_token_quant = (
             self.kv_cache_dtype.startswith("fp8")
             and k_scale is not None

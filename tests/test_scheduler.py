@@ -159,7 +159,8 @@ class TestPrefixCaching:
         batch1, _ = sched.schedule()
         assert batch1.total_tokens_num_prefill == 9  # no cache, all tokens
 
-        # Complete seq1 so its blocks are freed (but hashes remain)
+        # Complete seq1 so its blocks are freed (but hashes remain).
+        # `batch=batch1` is required for postprocess to call hash_blocks().
         seq1.append_token(2)  # EOS
         sched.postprocess(
             list(sched.running),
@@ -170,6 +171,7 @@ class TestPrefixCaching:
                 num_bonus=None,
                 draft_token_ids=None,
             ),
+            batch=batch1,
         )
 
         # Second request shares the same prefix, differs in last block
@@ -190,7 +192,7 @@ class TestPrefixCaching:
 
         seq1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9])
         sched.add(seq1)
-        sched.schedule()
+        batch1, _ = sched.schedule()
 
         seq1.append_token(2)  # EOS
         sched.postprocess(
@@ -202,6 +204,7 @@ class TestPrefixCaching:
                 num_bonus=None,
                 draft_token_ids=None,
             ),
+            batch=batch1,
         )
 
         seq2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 10, 11])

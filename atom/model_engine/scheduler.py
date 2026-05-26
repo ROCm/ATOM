@@ -456,9 +456,11 @@ class Scheduler:
             CacheStats() if config.enable_prefix_caching else None
         )
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        # Track which seq IDs were partial prefill in the previous step.
-        # Their deferred output tokens are garbage and must be discarded.
-        self._prev_partial_prefill_ids: set[int] = set()
+        # Number of running seqs currently mid-prefill (per-seq state lives in
+        # `Sequence.is_partial_prefill`). Maintained as a counter so Phase 1
+        # of `schedule()` can skip the running-queue scan entirely on
+        # pure-decode steps (the common case).
+        self._partial_prefill_count: int = 0
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -661,13 +663,16 @@ class Scheduler:
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `_delayer_allows_prefill` so cross-DP alignment still
         # holds when one rank is mid-chunked-prefill: a delayer veto skips
-        # both Phase 1 and Phase 2 in lockstep.
-        if _delayer_allows_prefill:
+        # both Phase 1 and Phase 2 in lockstep. Inside that, skip the
+        # running-queue scan entirely when no seq is mid-prefill — the
+        # common steady-state decode case — using the counter maintained by
+        # postprocess / preempt / finished-removal.
+        if _delayer_allows_prefill and self._partial_prefill_count > 0:
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
-                if seq.num_kv_computed >= seq.num_prompt_tokens:
-                    continue  # already completed prefill
+                if not seq.is_partial_prefill:
+                    continue
                 remaining = seq.num_prompt_tokens - seq.num_kv_computed
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = min(remaining, budget_remaining)
@@ -744,18 +749,32 @@ class Scheduler:
                 self.running.append(seq)
                 continue
 
-            # Early budget check when chunked prefill is disabled
-            if not self.enable_chunked_prefill:
-                num_new_tokens_est = seq.num_prompt_tokens - seq.num_kv_computed
-                budget_remaining = self.max_num_batched_tokens - num_batched_tokens
-                if num_new_tokens_est > budget_remaining and num_batched_tokens > 0:
-                    self.waiting.appendleft(seq)
-                    break
-
+            # Probe cache hits FIRST so budget check sees the real
+            # (post-prefix-cache) remaining token count. `can_allocate`
+            # excludes the last block from cache hits (prefill must forward
+            # at least one block to produce logits), so num_new_tokens ≥ 1
+            # is guaranteed.
             num_cached_blocks = self.block_manager.can_allocate(seq)
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
+
+            num_new_tokens = (
+                seq.num_prompt_tokens
+                - num_cached_blocks * self.block_manager.block_size
+            )
+            budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+            if self.enable_chunked_prefill:
+                chunk = min(num_new_tokens, budget_remaining)
+            else:
+                if num_new_tokens > budget_remaining and num_batched_tokens > 0:
+                    self.waiting.appendleft(seq)
+                    break
+                chunk = num_new_tokens
+            assert chunk > 0, (
+                f"chunk must be positive: {chunk=}, "
+                f"{num_new_tokens=}, {budget_remaining=}"
+            )
 
             self.block_manager.allocate(seq, num_cached_blocks)
 
@@ -767,24 +786,8 @@ class Scheduler:
                 seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
                 continue
 
-            # After allocate, num_kv_computed reflects prefix cache hits
             if self.cache_stats:
                 self.cache_stats.update(seq.num_kv_computed, seq.num_tokens)
-            num_new_tokens = seq.num_prompt_tokens - seq.num_kv_computed
-            if num_new_tokens == 0:
-                # Fully cached prompt (all blocks hit prefix cache).
-                # Still need at least 1 token for logits computation.
-                seq.num_kv_computed = seq.num_prompt_tokens - 1
-                num_new_tokens = 1
-            budget_remaining = self.max_num_batched_tokens - num_batched_tokens
-            if self.enable_chunked_prefill:
-                chunk = min(num_new_tokens, budget_remaining)
-            else:
-                chunk = num_new_tokens
-            assert chunk > 0, (
-                f"chunk must be positive after budget guard: {chunk=}, "
-                f"{num_new_tokens=}, {budget_remaining=}"
-            )
             num_batched_tokens += chunk
             num_seqs_prefill += 1
             seq.status = SequenceStatus.RUNNING
@@ -931,6 +934,9 @@ class Scheduler:
         seq.num_bonus_tokens = 0
         seq.spec_token_ids = np.array([], dtype=np.int32)
         seq.is_first_decode = False
+        if seq.is_partial_prefill:
+            seq.is_partial_prefill = False
+            self._partial_prefill_count -= 1
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
@@ -947,23 +953,32 @@ class Scheduler:
         are still mid-prefill (partial chunks) so their sampled tokens can be
         discarded.
         """
-        partial_prefill_ids: set[int] = set()
+        # Snapshot of seqs that were mid-prefill coming into this step.
+        # Their `is_deferred_out` token (sampled from the prior partial chunk)
+        # is garbage and must be discarded — even for seqs whose prefill
+        # finishes in *this* step. Captured before we mutate the flag below.
+        prev_partial_ids: set[int] = set()
         if batch is not None:
             running_by_id = {seq.id: seq for seq in self.running}
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
-                if seq is not None and seq.type == SequenceType.PREFILL:
-                    chunk = int(batch.num_scheduled_tokens[i])
-                    # Register prefix-cache hashes for blocks the prefill step
-                    # just finalized BEFORE advancing num_kv_computed. Deferred
-                    # from BlockManager.allocate() so a hash is only published
-                    # once the block's KV has been computed by the forward —
-                    # correct under chunked-prefill where one block may span
-                    # multiple steps (hash_blocks clips to fully-filled blocks).
-                    self.block_manager.hash_blocks(seq, chunk)
-                    seq.num_kv_computed += chunk
-                    if seq.num_kv_computed < seq.num_prompt_tokens:
-                        partial_prefill_ids.add(seq.id)
+                if seq is None or seq.type != SequenceType.PREFILL:
+                    continue
+                if seq.is_partial_prefill:
+                    prev_partial_ids.add(seq.id)
+                chunk = int(batch.num_scheduled_tokens[i])
+                # Register prefix-cache hashes for blocks the prefill step
+                # just finalized BEFORE advancing num_kv_computed. Deferred
+                # from BlockManager.allocate() so a hash is only published
+                # once the block's KV has been computed by the forward —
+                # correct under chunked-prefill where one block may span
+                # multiple steps (hash_blocks clips to fully-filled blocks).
+                self.block_manager.hash_blocks(seq, chunk)
+                seq.num_kv_computed += chunk
+                now_partial = seq.num_kv_computed < seq.num_prompt_tokens
+                if now_partial != seq.is_partial_prefill:
+                    self._partial_prefill_count += 1 if now_partial else -1
+                    seq.is_partial_prefill = now_partial
 
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
@@ -986,13 +1001,12 @@ class Scheduler:
             # Partial prefill: KV written but prefill not complete — discard
             # the sampled token. Prefix hashes are also deferred since
             # num_tokens < num_prompt_tokens until the prompt finishes.
-            if seq.id in partial_prefill_ids:
+            if seq.is_partial_prefill:
                 continue
-            # Deferred output from a previous partial-prefill step is garbage
+            # Deferred output from a previous partial prefill step is garbage
             # under deferred-out: drop it once, then let the next step's real
             # first completion token populate the placeholder.
-            if seq.id in self._prev_partial_prefill_ids:
-                self._prev_partial_prefill_ids.discard(seq.id)
+            if seq.id in prev_partial_ids:
                 continue
             # Register prefix-cache hashes for blocks the prefill step just
             # finalized. Deferred from BlockManager.allocate() so a hash is
@@ -1183,10 +1197,7 @@ class Scheduler:
         if need_placeholder:
             # placeholder for the each decode step
             for seq in seqs:
-                if (
-                    seq.status == SequenceStatus.RUNNING
-                    and seq.id not in partial_prefill_ids
-                ):
+                if seq.status == SequenceStatus.RUNNING and not seq.is_partial_prefill:
                     num = num_placeholder - seq.num_rejected
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
@@ -1195,6 +1206,9 @@ class Scheduler:
                     # )
         for seq in finished_seqs:
             logger.debug("Freeing blocks for finished seq %s", seq.id)
+            if seq.is_partial_prefill:
+                seq.is_partial_prefill = False
+                self._partial_prefill_count -= 1
             if self.kv_connector is not None:
                 if not self.kv_connector.is_producer:
                     self.block_manager.deallocate(seq)
@@ -1207,8 +1221,6 @@ class Scheduler:
             else:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
-        # Save partial prefill IDs for next step's deferred output filtering
-        self._prev_partial_prefill_ids = partial_prefill_ids
         return finished_seqs
 
     def _update_waiting_for_remote_kv(self, seq: Sequence) -> bool:
