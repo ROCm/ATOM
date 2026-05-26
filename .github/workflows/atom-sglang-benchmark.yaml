@@ -830,21 +830,11 @@ jobs:
 
           printf '%s\n' "${{ matrix.model.env_vars }}" | sed 's/^[[:space:]]*//' > /tmp/oot_env_file.txt
 
-          GROUP_ADD_FLAGS="--group-add video"
-          if [ "${CONTAINER_ENGINE:-docker}" = "podman" ]; then
-            GROUP_ADD_FLAGS="$GROUP_ADD_FLAGS --group-add keep-groups"
-          else
-            for gid in $(id -G); do
-              GROUP_ADD_FLAGS="$GROUP_ADD_FLAGS --group-add $gid"
-            done
-          fi
-          echo "Container group flags: $GROUP_ADD_FLAGS"
-
           $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host $GROUP_ADD_FLAGS \
+            --ipc=host --group-add video \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
