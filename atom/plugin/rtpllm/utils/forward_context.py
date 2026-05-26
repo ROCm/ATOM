@@ -434,9 +434,9 @@ class RTPForwardContext:
     def _build_seq_lens(attn_inputs: Any, *, device: torch.device) -> torch.Tensor:
         """Build kernel seq_lens using RTP-native field priority.
 
-        Decode should prefer sequence_lengths when present because it carries the
-        committed context length before adding the current input token count.
-        sequence_lengths_plus_1_d is kept as the older fallback used by RTP graph
+        Non-cuda-graph decode keeps the pre-cuda-graph field priority:
+        sequence_lengths_plus_1_d first, then sequence_lengths + input_lengths.
+        Cuda-graph warmup/replay keeps the graph-safe priority introduced for
         dummy inputs.
         """
         input_lengths = RTPForwardContext._non_empty_int32(
@@ -470,6 +470,23 @@ class RTPForwardContext:
                 )
             return (prefix_lengths + input_lengths).contiguous()
 
+        non_cuda_graph_mode = not torch.cuda.is_current_stream_capturing() and not bool(
+            getattr(attn_inputs, "is_cuda_graph", False)
+        )
+        if non_cuda_graph_mode:
+            sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
+                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                device=device,
+            )
+            if sequence_lengths_plus_1 is not None:
+                if int(sequence_lengths_plus_1.numel()) != int(input_lengths.numel()):
+                    raise ValueError(
+                        "RTP plugin sequence_lengths_plus_1_d/input_lengths batch mismatch "
+                        f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
+                        f"input_lengths={int(input_lengths.numel())})."
+                    )
+                return sequence_lengths_plus_1.contiguous()
+
         sequence_lengths = RTPForwardContext._non_empty_int32(
             getattr(attn_inputs, "sequence_lengths", None),
             device=device,
@@ -485,22 +502,23 @@ class RTPForwardContext:
             # real context length is sequence_lengths + input_lengths.
             return (sequence_lengths + input_lengths).contiguous()
 
-        sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
-            getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
-            device=device,
-        )
-        if sequence_lengths_plus_1 is not None:
-            if int(sequence_lengths_plus_1.numel()) != int(input_lengths.numel()):
-                raise ValueError(
-                    "RTP plugin sequence_lengths_plus_1_d/input_lengths batch mismatch "
-                    f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
-                    f"input_lengths={int(input_lengths.numel())})."
-                )
-            return sequence_lengths_plus_1.contiguous()
+        if not non_cuda_graph_mode:
+            sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
+                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                device=device,
+            )
+            if sequence_lengths_plus_1 is not None:
+                if int(sequence_lengths_plus_1.numel()) != int(input_lengths.numel()):
+                    raise ValueError(
+                        "RTP plugin sequence_lengths_plus_1_d/input_lengths batch mismatch "
+                        f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
+                        f"input_lengths={int(input_lengths.numel())})."
+                    )
+                return sequence_lengths_plus_1.contiguous()
 
         raise ValueError(
-            "RTP decode requires attention_inputs.sequence_lengths or "
-            "sequence_lengths_plus_1_d for seq_lens."
+            "RTP decode requires attention_inputs.sequence_lengths_plus_1_d or "
+            "sequence_lengths for seq_lens."
         )
 
     @staticmethod
