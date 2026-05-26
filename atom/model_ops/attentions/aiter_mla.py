@@ -138,6 +138,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             mla_metadata["sparse_kv_last_page_lens"].np[:] = 1
             mla_metadata["sparse_kv_last_page_lens"].copy_to_gpu()
+            self._sparse_kv_indices_gpu = torch.empty(
+                self.max_num_batched_tokens * self.index_topk,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         if self.is_sparse and max_seqlen_qo > 1:
             # Allocate a second set of persistent work buffers for sparse MTP
@@ -181,6 +186,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.model_runner.forward_vars.update(mla_metadata)
 
         if self.is_sparse:
+            sfc = config.compilation_config.static_forward_context
+            for module in sfc.values():
+                if hasattr(module, "sparse_kv_indices_buffer"):
+                    module.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
             self._token_to_seq_idxs_gpu = torch.zeros(
                 self.max_num_batched_tokens,
                 dtype=torch.int32,

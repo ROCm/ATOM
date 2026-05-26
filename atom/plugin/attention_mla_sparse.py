@@ -308,7 +308,7 @@ class MLASparseAttentionImplPluginModeMethods:
             output,
             sparse_meta.qo_indptr,
             sparse_meta.paged_kv_indptr,
-            self.sparse_kv_indices_buffer,
+            sparse_meta.paged_kv_indices,
             sparse_meta.paged_kv_last_page_len,
             1,
             sm_scale=self.scale,

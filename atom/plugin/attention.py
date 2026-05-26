@@ -2374,6 +2374,20 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
+        sfc = get_current_atom_config().compilation_config.static_forward_context
+        for layer_name in layer_names or []:
+            attention_prefix = (
+                layer_name[: -len(".attn")]
+                if layer_name.endswith(".attn")
+                else layer_name
+            )
+            indexer = sfc.get(f"{attention_prefix}.indexer")
+            if indexer is not None:
+                indexer.sparse_kv_indices_buffer = self.paged_kv_indices
+            paged_attn = sfc.get(attention_prefix)
+            impl = getattr(getattr(paged_attn, "attn", None), "impl", None)
+            if impl is not None and hasattr(impl, "sparse_kv_indices_buffer"):
+                impl.sparse_kv_indices_buffer = self.paged_kv_indices
 
         # ----- Persistent MLA metadata buffers -----
         # The aiter sparse decode kernel supports a "persistent" path that

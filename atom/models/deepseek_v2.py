@@ -82,6 +82,7 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
+from atom.plugin import is_vllm
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
 # shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
@@ -1438,10 +1439,8 @@ class Indexer(nn.Module):
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
-        max_buf = atom_config.max_num_batched_tokens * self.topk_tokens
-        self.sparse_kv_indices_buffer = torch.empty(
-            max_buf, dtype=torch.int32, device="cuda"
-        )
+        self.sparse_kv_indices_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
+        atom_config.compilation_config.static_forward_context[prefix] = self
 
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
 
