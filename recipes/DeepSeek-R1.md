@@ -48,6 +48,24 @@ python -m atom.entrypoints.openai_server \
   --method mtp --num-speculative-tokens 3
 ```
 
+### Online Quantization from the FP8 Checkpoint
+
+Use `--online_quant_config` to quantize the source checkpoint during weight
+loading. The following command matches the common DeepSeek-R1-0528 mixed
+precision layout: FP8 for non-expert layers, MXFP4 for MoE experts, and no
+quantization for `lm_head` or gate/router weights.
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-R1-0528 \
+  --kv_cache_dtype fp8 -tp 8 \
+  --method mtp --num-speculative-tokens 3 \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "layer_quant_config": {"*expert*": "mxfp4"}, "exclude_layer": ["lm_head", "*.gate.*"]}'
+```
+
+`exclude_layer` should be a JSON list when more than one pattern is needed. An
+empty config (`--online_quant_config '{}'`) disables online quantization.
+
 Tips on server configuration:
 - Always use `--kv_cache_dtype fp8` for better memory efficiency.
 - MTP with `--num-speculative-tokens 3` provides the best throughput/latency tradeoff.

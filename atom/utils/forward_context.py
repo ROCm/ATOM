@@ -5,6 +5,7 @@ import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Union
 
 import numpy as np
@@ -13,6 +14,29 @@ from atom.config import Config, KVCacheTensor, ParallelConfig
 
 if TYPE_CHECKING:
     from atom.plugin.attention import MetadataForPluginMode
+
+
+class AttnState(Enum):
+    """Attention dispatch state — controls which kv-indices buffers are built
+    and which forward branch fires.
+
+    Backends that distinguish only "decode vs prefill" can treat any
+    ``PREFILL_*`` value as prefill. Backends with chunked-prefill awareness
+    (e.g. V4) further distinguish ``PREFILL_NATIVE`` from ``PREFILL_PREFIX``.
+
+    - ``DECODE``: 1+K tokens/seq uniformly (decode + spec). Per-token decode
+      kv-indices buffers are valid; prefill prefix buffers may be stale.
+    - ``PREFILL_NATIVE``: fresh prefill — every seq starts at position 0 in
+      this fwd. No prior-chunk KV history to read; the prefix region is
+      empty per token.
+    - ``PREFILL_PREFIX``: chunked prefill — at least one seq has
+      ``chunk_start > 0`` and therefore reads its prior chunk's KV from
+      the paged history (e.g. V4 SWA ring via ``kv_indices_prefix_swa``).
+    """
+
+    DECODE = "decode"
+    PREFILL_NATIVE = "prefill_native"
+    PREFILL_PREFIX = "prefill_prefix"
 
 
 def _compute_chunked_local_num_tokens(
@@ -182,6 +206,13 @@ class AttentionMetaData:
     block_tables: Optional[torch.Tensor] = None
     dropout_p: float = 0.0
 
+    state: AttnState = AttnState.PREFILL_NATIVE
+    """One of `DECODE / PREFILL_NATIVE / PREFILL_PREFIX` — controls which
+    kv-indices buffers downstream forward branches read. Default is
+    `PREFILL_NATIVE`; every `prepare_*` path overrides explicitly.
+    Backends that don't need the NATIVE/PREFIX distinction can treat
+    `any PREFILL_*` as prefill. See ``AttnState`` for full semantics."""
+
     kv_indptr: Optional[torch.Tensor] = None
     kv_indices: Optional[torch.Tensor] = None
     kv_last_page_lens: Optional[torch.Tensor] = None
@@ -195,8 +226,6 @@ class AttentionMetaData:
     reduce_indptr: Optional[torch.Tensor] = None
     reduce_final_map: Optional[torch.Tensor] = None
     reduce_partial_map: Optional[torch.Tensor] = None
-
-    block_tables_converted: Optional[torch.Tensor] = None
 
     # for prefix cache
     has_cached: bool = False
@@ -218,6 +247,7 @@ class AttentionMetaData:
         context_lens: Optional[torch.Tensor] = None,
         block_tables: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
+        state: AttnState = AttnState.PREFILL_NATIVE,
         kv_indptr: Optional[torch.Tensor] = None,
         kv_indices: Optional[torch.Tensor] = None,
         kv_last_page_lens: Optional[torch.Tensor] = None,
@@ -230,7 +260,6 @@ class AttentionMetaData:
         reduce_indptr: Optional[torch.Tensor] = None,
         reduce_final_map: Optional[torch.Tensor] = None,
         reduce_partial_map: Optional[torch.Tensor] = None,
-        block_tables_converted: Optional[torch.Tensor] = None,
         sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
         token_to_seq_idxs: Optional[torch.Tensor] = None,
         plugin_metadata: Optional["MetadataForPluginMode"] = None,
@@ -252,6 +281,7 @@ class AttentionMetaData:
         self.context_lens = context_lens
         self.block_tables = block_tables
         self.dropout_p = dropout_p
+        self.state = state
         self.kv_indptr = kv_indptr
         self.kv_indices = kv_indices
         self.kv_last_page_lens = kv_last_page_lens
@@ -264,8 +294,6 @@ class AttentionMetaData:
         self.reduce_indptr = reduce_indptr
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
-        if block_tables_converted is not None:
-            self.block_tables = block_tables_converted
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs
         if plugin_metadata is not None:
@@ -336,6 +364,28 @@ class ForwardContext:
 
     ubatch_slices: Optional[list[Any]] = None
 
+    # Cached current_stream() captured at set_forward_context() time, so
+    # downstream code (V4 attention / MoE / metadata builder) doesn't have
+    # to query torch.cuda.current_stream() repeatedly during a forward —
+    # multiple call sites caching independent Stream handles was widening
+    # the hipStream handle pool and complicating reasoning about which
+    # logical stream each wait_stream() refers to. CG capture / TBO
+    # threads each call set_forward_context() inside their own stream
+    # context, so the cached value is correct for the captured graph or
+    # active thread.
+    main_stream: Optional[torch.cuda.Stream] = None
+
+    # True only while the model forward runs inside a CUDAGraph capture
+    # block (model_runner.capture_model loop). Components that gate
+    # multi-stream side-launches (V4 main Compressor on alt_stream,
+    # indexer.compressor on compress_stream) check this flag: side-stream
+    # work is safe to emit inside a captured graph (graph records the
+    # fork-join edges and replay re-uses the same stream layout) but
+    # racy in eager mode where launches accumulate across layers and
+    # deadlock the hipStream queue. Replay does not re-execute Python
+    # forward, so it ignores the flag entirely.
+    in_hipgraph: bool = False
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -345,6 +395,10 @@ class ForwardContext:
 
 _forward_context: Optional[ForwardContext] = ForwardContext()
 _forward_kv_cache_context: Optional[ForwardContext] = ForwardContext()
+
+# Cached once at module import — CUDA availability does not change at
+# runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
+_CUDA_AVAILABLE: bool = torch.cuda.is_available()
 
 # Thread-local storage for TBO dual-thread execution
 
@@ -373,6 +427,7 @@ def set_forward_context(
     num_tokens_across_dp: Optional[torch.Tensor] = None,
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
     ubatch_slices: Optional[list[Any]] = None,
+    in_hipgraph: bool = False,
 ) -> None:
     global _forward_context
     dp_metadata: Optional[DPMetadata] = None
@@ -392,6 +447,8 @@ def set_forward_context(
         dp_metadata=dp_metadata,
         spec_decode_metadata=spec_decode_metadata,
         ubatch_slices=ubatch_slices,
+        main_stream=(torch.cuda.current_stream() if _CUDA_AVAILABLE else None),
+        in_hipgraph=in_hipgraph,
     )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
@@ -469,7 +526,9 @@ def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> An
 
 
 def set_kv_cache_data(
-    kv_cache_data: dict[int, KVCacheTensor], config: Optional[Config] = None
+    kv_cache_data: dict[int, KVCacheTensor],
+    config: Optional[Config] = None,
+    transfer_tensors: Any = None,
 ) -> None:
     """Register KV cache data globally and with the KV connector if enabled."""
     global _forward_kv_cache_context
@@ -477,6 +536,6 @@ def set_kv_cache_data(
     if hasattr(config, "kv_transfer_config") and config.kv_transfer_config:
         connector = get_kvconnector(config=config)
         if connector is not None:
-            connector.register_kv_caches(kv_cache_data)
+            connector.register_kv_caches(kv_cache_data, transfer_tensors)
 
     _forward_kv_cache_context.kv_cache_data = kv_cache_data

@@ -3,15 +3,18 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, Optional, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
+
+if TYPE_CHECKING:
+    from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
 import torch
+from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
-from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
-from atom.utils.forward_context import AttentionMetaData
+from atom.utils.forward_context import AttentionMetaData, AttnState
 from torch import nn
 
 logger = logging.getLogger("atom")
@@ -134,6 +137,19 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return {}
 
+    def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
+        """Return RDMA transfer regions for PD disaggregation.
+
+        Each attention backend overrides this to describe its block-indexed
+        and slot-indexed tensor regions.  The KV connector uses the result
+        to register RDMA memory and compute transfer offsets without knowing
+        the backend's internal layout.
+
+        Returns ``None`` when KV transfer is not configured or tensors have
+        not been allocated yet.
+        """
+        return None
+
     def compute_block_bytes(self) -> int:
         """Per-block bytes contributed by this attention type's primary KV
         tensors (kv_cache + kv_scale + any side caches like the V3.2
@@ -208,6 +224,13 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.max_num_blocks_per_seq = (
             config.max_model_len + self.block_size - 1
         ) // self.block_size
+        # Per-rank attention head count. eagle.propose's mid-step path reads
+        # this to gate the `do_attn_metadata_update` branch. Subclasses that
+        # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
+        # separately (it does NOT replace this attribute).
+        self.num_attention_heads = (
+            hf_config.num_attention_heads // get_tp_group().world_size
+        )
 
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
@@ -225,12 +248,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             # seq_starts for cp_mha_gather_cache: always zeros (prefix at position 0)
             "seq_starts": CpuGpuBuffer(self.max_bs, **i32_kwargs),
         }
-        if self.block_ratio > 1:
-            attn_metadata["block_tables_converted"] = CpuGpuBuffer(
-                self.max_bs,
-                self.max_num_blocks_per_seq,
-                **i32_kwargs,
-            )
 
         attn_metadata["cu_seqlens_q"].cpu.copy_(
             torch.arange(0, self.max_bs + 1, step=1, dtype=torch.int32)
@@ -322,14 +339,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             vars_used.append(("seq_starts", bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
-        if self.block_ratio > 1 and "block_tables" in ctx:
-            block_table_convert_triton(
-                var["block_tables"].gpu[:bs],
-                var["block_tables_converted"].gpu[:bs],
-                var["context_lens"].gpu[:bs],
-                self.block_ratio,
-            )
-            ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         num_cached_tokens = None
         if has_cached:
             num_cached_tokens = torch.tensor(
@@ -339,19 +348,22 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         total_kv = total_tokens if has_cached else sum_scheduled_tokens
         attn_metadata = AttentionMetaData(
             cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            min_seqlen_q=min_seqlen_q,
+            # Cast to python int — numpy.int32 leaks in via batch.context_lens
+            # (numpy array) and breaks downstream Triton kernel constexpr
+            # binding (`tl.minimum` rejects numpy scalars).
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            min_seqlen_q=int(min_seqlen_q),
             dropout_p=dropout_p,
             has_cached=has_cached,
-            total_kv=total_kv,
+            total_kv=int(total_kv),
             num_cached_tokens=num_cached_tokens,
+            state=AttnState.PREFILL_PREFIX if has_cached else AttnState.PREFILL_NATIVE,
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
         return attn_metadata, positions
-        # return var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
     def build_ubatch_prefill_metadata(
         self,

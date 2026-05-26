@@ -156,18 +156,28 @@ class tokenIDProcessor:
         #   prev acc decode have 0 rej, 1 bonus
         #   prev rej decode have 1 rej, 0 bonus
         # It is clear that only rejected number is not sufficient for all status tracking, bonus number is also needed.
-        self.send_to_cpu_async(num_rejected, self.rejected_tokens_cpu, data_ready)
-        self.send_to_cpu_async(num_bonus, self.bonus_tokens_cpu, data_ready)
+        # Single Event for both copies (vs. per-tensor send_to_cpu_async) so the
+        # consumer pops one queue entry and synchronizes once instead of twice.
+        copy_done = torch.cuda.Event()
+        with torch.cuda.stream(self.async_copy_stream):
+            data_ready.wait(stream=self.async_copy_stream)
+            cpu_num_rejected = num_rejected.to("cpu", non_blocking=True)
+            cpu_num_bonus = num_bonus.to("cpu", non_blocking=True)
+            copy_done.record(self.async_copy_stream)
+        self.pending_mtp_status_copies.append(
+            (cpu_num_rejected, cpu_num_bonus, copy_done)
+        )
 
     def recv_mtp_status_async(
         self,
     ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        if not self.rejected_tokens_cpu:
+        if not self.pending_mtp_status_copies:
             return None, None
-        return (
-            self.recv_async_output(self.rejected_tokens_cpu).numpy(),
-            self.recv_async_output(self.bonus_tokens_cpu).numpy(),
+        cpu_num_rejected, cpu_num_bonus, copy_done = self.pending_mtp_status_copies.pop(
+            0
         )
+        copy_done.synchronize()
+        return cpu_num_rejected.numpy(), cpu_num_bonus.numpy()
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -178,8 +188,12 @@ class tokenIDProcessor:
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: Optional[torch.Tensor] = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
-        self.rejected_tokens_cpu: list[torch.Tensor] = []
-        self.bonus_tokens_cpu: list[torch.Tensor] = []
+        # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event) — async
+        # D2H copies fired by send_mtp_status_to_cpu_async, drained by
+        # recv_mtp_status_async after the event syncs.
+        self.pending_mtp_status_copies: list[
+            tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
+        ] = []
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
@@ -737,9 +751,18 @@ class ModelRunner:
         return False
 
     def is_deepseek_v4(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        return self.hf_text_config.model_type == "deepseek_v4"
+        # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
+        # `_CONFIG_REGISTRY` maps deepseek_v4 → deepseek_v3 (V4 reuses V3 schema).
+        # Use `architectures` (preserved by get_hf_config:567) instead. Covers
+        # both target (DeepseekV4ForCausalLM[NextN]) and draft (whose model_type
+        # SpeculativeConfig stamps as deepseek_v4_mtp).
+        arches = getattr(self.hf_text_config, "architectures", None) or []
+        if any("DeepseekV4" in str(a) for a in arches):
+            return True
+        return getattr(self.hf_text_config, "model_type", None) in (
+            "deepseek_v4",
+            "deepseek_v4_mtp",
+        )
 
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -1084,8 +1107,15 @@ class ModelRunner:
             "top_ks": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "top_ps": CpuGpuBuffer(self.max_bs, **f32_kwargs),
             # Keep enough space for MTP decode (max_q_len > 1).
+            # `extra_output_dims` lets a model insert dims between N and dim
+            # (e.g. DeepSeek-V4 returns the un-reduced mHC residual
+            # [N, hc_mult, dim] from forward, with hc_head + LM head deferred
+            # to compute_logits). Default `()` keeps the standard 2D layout.
             "outputs": torch.empty(
-                self.max_num_batched_tokens, hidden_size, dtype=hidden_type
+                self.max_num_batched_tokens,
+                *getattr(self.model, "extra_output_dims", ()),
+                hidden_size,
+                dtype=hidden_type,
             ),
         }
         if hasattr(self, "drafter"):
@@ -1253,6 +1283,39 @@ class ModelRunner:
                 f"pool_blocks={num_kvcache_blocks}"
             )
 
+        # Concurrent-capacity table: at each context-length percentage of
+        # max_model_len, how many requests can simultaneously hold their
+        # KV in the pool. Per-req block usage = ceil(ctx_len/block_size);
+        # per-req state cache is in its own pre-allocated tensor (already
+        # excluded from `num_kvcache_blocks` at sizing time), so it adds
+        # no per-block cost. Concurrency is also capped by
+        # max_per_req_cache_slots (state buffer slot count).
+        max_model_len = config.max_model_len
+        cap = (
+            max_per_req_cache_slots if per_req_cache_bytes > 0 else config.max_num_seqs
+        )
+        pct_lines = []
+        for pct in (10, 30, 50, 70, 90, 100):
+            ctx = max(1, max_model_len * pct // 100)
+            blocks_per_req = math.ceil(ctx / self.block_size)
+            block_bound = (
+                num_kvcache_blocks // blocks_per_req if blocks_per_req > 0 else 0
+            )
+            max_conc = min(cap, block_bound) if cap > 0 else block_bound
+            bound_label = (
+                "slots" if cap > 0 and max_conc == cap < block_bound else "blocks"
+            )
+            pct_lines.append(
+                f"  {pct:>3}% ({ctx:>7} tok): {blocks_per_req:>6} blk/req "
+                f"→ max_concurrent={max_conc:<5} (bound by {bound_label})"
+            )
+        logger.info(
+            f"Concurrent capacity vs context length "
+            f"(max_model_len={max_model_len}, block_size={self.block_size}, "
+            f"max_slots={cap}, pool_blocks={num_kvcache_blocks}):\n"
+            + "\n".join(pct_lines)
+        )
+
         assert num_kvcache_blocks > 0, (
             f"Not enough memory for KV cache with block size({self.block_size}). "
             f"At least 1 block ({block_bytes / (1 << 20):.2f}MB) is required, "
@@ -1409,8 +1472,8 @@ class ModelRunner:
             f"layer_{i}": kv_cache_tensor
             for i, kv_cache_tensor in enumerate(kv_cache_tensors)
         }
-        # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
-        set_kv_cache_data(kv_cache_data, config)
+        transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
+        set_kv_cache_data(kv_cache_data, config, transfer_tensors)
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -1689,7 +1752,7 @@ class ModelRunner:
 
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             # prefill[bs=1 tok=115 ctx=115]
-            label = f"prefill[bs={bs}"
+            label = f"prefill[bs={bs}" if is_prefill else f"eager_decode[bs={bs}"
             if batch is not None:
                 ctx = batch.context_lens
                 if len(ctx) == 1:
@@ -2019,6 +2082,7 @@ class ModelRunner:
                     num_tokens=num_tokens,
                     num_tokens_across_dp=num_tokens_across_dp,
                     ubatch_slices=ubatch_slices,
+                    in_hipgraph=True,
                 )
 
                 # Warmup

@@ -24,9 +24,9 @@ vllm serve amd/Kimi-K2.5-MXFP4-AttnFP8 \
     --host localhost \
     --port 8000 \
     --async-scheduling \
-    --tensor-parallel-size 8 \
+    --load-format fastsafetensors \
+    --tensor-parallel-size 4 \
     --trust-remote-code \
-    --gpu_memory_utilization 0.9 \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --kv-cache-dtype fp8 \
     --max-num-batched-tokens 16384 \
@@ -123,16 +123,21 @@ The expected response:
 Users can use the default vllm bench command for performance benchmarking.
 ```bash
 vllm bench serve \
-    --host localhost \
-    --port 8000 \
+    --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --endpoint /v1/completions \
     --model amd/Kimi-K2.5-MXFP4-AttnFP8 \
     --dataset-name random \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.8 \
-    --max-concurrency 64 \
-    --num-prompts 640 \
+    --random-input-len 1000 \
+    --random-output-len 100 \
+    --max-concurrency 4 \
+    --num-prompts 40 \
     --trust_remote_code \
+    --num-warmups 8 \
+    --request-rate inf \
+    --ignore-eos \
+    --disable-tqdm \
+    --save-result \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 

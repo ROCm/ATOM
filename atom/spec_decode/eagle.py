@@ -18,6 +18,7 @@ logger = logging.getLogger("atom")
 
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
+    "DeepseekV4MTPModel": "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
     "MiMoV2FlashMTPModel": "atom.models.mimo_v2_flash_mtp.MiMoV2FlashMTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
@@ -260,6 +261,15 @@ class EagleProposer:
         # Resolve the base model (unwrap multimodal wrapper if present)
         target_base = getattr(target_model, "language_model", target_model)
 
+        # Model-specific share hook escape valve. Models whose embed/lm_head
+        # naming doesn't match the standard `model.embed_tokens` /
+        # `lm_head` convention (e.g. DeepSeek-V4 uses `model.embed` /
+        # `model.head`) implement `share_with_target(target_base)` to do
+        # their own setattr-rebinding and short-circuit the default path.
+        if hasattr(self.model, "share_with_target"):
+            self.model.share_with_target(target_base, loaded)
+            return
+
         # Share embed_tokens with the target model
         if (
             get_pp_group().world_size == 1
@@ -344,31 +354,29 @@ class EagleProposer:
         # Eaale3 only support mha currently
         draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
 
-        # Eagle3 MLA: re-slice slot_mapping to len(input_ids).
-        # Target's MLA prepare_decode sized it
-        # to bs*max_q_len; after rejection len(input_ids) may be smaller,
-        # and the MHA cache-write kernel asserts slot_mapping <= q.
-        # Other fields (block_tables, context_lens, slot_mapping values
-        # themselves) are already in a draft-compatible format because
-        # MLA's prepare_decode uses the same runner.block_size as the draft.
+        # Eagle3 MHA reuses target metadata, but the target may be MLA.  Keep
+        # write slots sized to this draft pass, and when prefix cache is active
+        # restore logical block ids: MLA prefill expands block_tables by
+        # block_ratio for its physical block_size=1 pool, while the draft MHA
+        # cache is indexed by runner.block_size blocks.
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
+            attn_metadata.block_tables = var["block_tables"].gpu[:bs]
+
+        # Backends that expose flat per-seq kv_indices/kv_indptr (MLA, MHA)
+        # wire them through eagle's mid-step block; V4 has block_tables +
+        # context_lens instead (its v4_kv_indices_{swa,csa,hca} are per-token
+        # non-equivalent). Hoisted out of the loop so the value is bound for
+        # every iteration (used at i>=1 too, even though i==0 sets it).
+        has_flat_kv = "kv_indices" in var
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
-                model_output = self.model(
+                ret_hidden_states = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     hidden_states=hidden_states,
                 )
-                # Eagle3 draft (the only draft_uses_mha case under narrow
-                # semantics) returns (post_norm, pre_norm); MTP drafts return
-                # a single hidden tensor.
-                if draft_uses_mha:
-                    ret_hidden_states, ret_hidden_prenorm = model_output
-                else:
-                    ret_hidden_states = model_output
-                    ret_hidden_prenorm = None
 
                 sample_hidden_states = (
                     torch.index_select(ret_hidden_states, 0, last_token_indices)
@@ -388,16 +396,17 @@ class EagleProposer:
                     if i == 0:
                         i0_max_seqlen_q = attn_metadata.max_seqlen_q
                         attn_metadata.max_seqlen_q = 1
-                        kv_indptr = var["kv_indptr"].gpu[: bs + 1]
-                        kv_indices = var["kv_indices"].gpu
                         slot_mapping = var["slot_mapping"].gpu[
                             : bs * attn_metadata.max_seqlen_q
                         ]
                         cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
-                        attn_metadata.kv_indptr = kv_indptr
-                        attn_metadata.kv_indices = kv_indices
                         attn_metadata.cu_seqlens_q = cu_seqlens_q
                         attn_metadata.slot_mapping = slot_mapping
+                        if has_flat_kv:
+                            kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+                            kv_indices = var["kv_indices"].gpu
+                            attn_metadata.kv_indptr = kv_indptr
+                            attn_metadata.kv_indices = kv_indices
                         if target_uses_mla:
                             kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
                             attn_metadata.kv_last_page_lens = kv_last_page_lens
@@ -410,7 +419,7 @@ class EagleProposer:
                                 "sparse_kv_indptr"
                             ].gpu[: bs + 1]
                         cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
-                        if target_uses_mla:
+                        if target_uses_mla and has_flat_kv:
                             # MLA: block_size=1, kv_indptr tracks tokens
                             kv_indptr[1 : bs + 1] -= torch.cumsum(
                                 num_reject_tokens, dim=0
@@ -423,6 +432,7 @@ class EagleProposer:
                     # Update context_lens for each draft step (needed by both
                     # MHA attention and MLA+sparse indexer)
                     attn_metadata.context_lens[:bs] += 1
+                    positions += 1
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
                         (
@@ -431,25 +441,18 @@ class EagleProposer:
                             else i0_max_seqlen_q
                         ),
                         attn_metadata.max_seqlen_k,
+                        positions,
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,
                     )
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
-                    slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
+                    if has_flat_kv:
+                        # MLA/MHA path: slot derived from flat kv_indices.
+                        slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
-                    positions += 1
-                    if ret_hidden_prenorm is not None:
-                        hidden_states = (
-                            torch.index_select(
-                                ret_hidden_prenorm, 0, last_token_indices
-                            )
-                            if i == 0
-                            else ret_hidden_prenorm
-                        )
-                    else:
-                        hidden_states = sample_hidden_states
+                    hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]

@@ -33,6 +33,7 @@ from atom.model_ops.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
+from atom.quantization.quark.utils import weight_dequant_fp8
 from torch import nn
 
 logger = logging.getLogger("atom")
@@ -435,6 +436,7 @@ class LinearBase(nn.Module):
         params_dtype = layer_quant_config.quant_dtype
         self.source_quant_dtype = source_quant_dtype
         self.layer_quant_config = layer_quant_config
+        self.quant_config = quant_config
         super().__init__()
         self.reduce_results = reduce_results
         self.input_size = input_size
@@ -556,7 +558,123 @@ class LinearBase(nn.Module):
         param_data = param.data
         param.weight_loader_process(param_data, loaded_weight)
 
+    def _gather_full_weight(self, weight):
+        """Gather sharded weight from all TP ranks to reconstruct the full unpartitioned weight."""
+        if self.tp_size <= 1 or self.tp_dim is None:
+            return weight
+        return get_tp_group().all_gather(weight, dim=self.tp_dim)
+
+    def _shard_quantized_weight(self, q_weight, weight_scale):
+        """Split the quantized full weight and scale back to this rank's shard."""
+        if self.tp_size <= 1 or self.tp_dim is None:
+            return q_weight, weight_scale
+        # fp4x2 packs 2 values per byte; view as uint8 so narrow() works correctly
+        is_mxfp4 = q_weight.dtype == torch.float4_e2m1fn_x2
+        if is_mxfp4:
+            q_weight = q_weight.view(torch.uint8)
+        w_shard = q_weight.shape[self.tp_dim] // self.tp_size
+        w_start = self.tp_rank * w_shard
+        q_weight_local = q_weight.narrow(self.tp_dim, w_start, w_shard).contiguous()
+        if is_mxfp4:
+            q_weight_local = q_weight_local.view(torch.float4_e2m1fn_x2)
+
+        # for col linear qkv, w13, [m, n] -> [m // tp, n] -> [m // tp, 1], TP and non-TP are equivalent
+        if weight_scale.dim() > self.tp_dim and weight_scale.shape[self.tp_dim] > 1:
+            s_shard = weight_scale.shape[self.tp_dim] // self.tp_size
+            s_start = self.tp_rank * s_shard
+            weight_scale_local = weight_scale.narrow(
+                self.tp_dim, s_start, s_shard
+            ).contiguous()
+        # for row linear o, w2, [m, n] -> [m, n // tp] -> [m, 1], TP and non-TP are not equivalent
+        else:
+            weight_scale_local = weight_scale
+
+        return q_weight_local, weight_scale_local
+
+    def online_quantize_weight(self):
+        """Re-quantize this layer's weight at load time using the online quant config.
+
+        Handles TP gather/shard when local quantization would produce
+        different results than quantizing the full unpartitioned weight.
+        """
+        online_layer_quant_config = self.quant_config.get_layer_quant_config(
+            self.prefix, use_online_quant=True
+        )
+        online_quant_type = online_layer_quant_config.quant_type
+        online_quant_dtype = online_layer_quant_config.quant_dtype
+        online_quant_func = get_hip_quant(online_quant_type)
+        assert online_quant_dtype in [
+            torch.float8_e4m3fn,
+            torch.float4_e2m1fn_x2,
+        ], (
+            f"Unsupported online quant: "
+            f"dtype={online_quant_dtype}, type={online_quant_type}"
+        )
+        assert self.quant_type in [QuantType.No, QuantType.per_1x128], (
+            f"Unsupported source quant_type for online quantization: "
+            f"{self.quant_type} (layer={self.prefix})"
+        )
+        weight = self.weight.data
+        weight_scale = getattr(self, "weight_scale", None)
+        # Gather is required whenever local quantization would differ from
+        # quantizing the full unpartitioned weight (bit-exact with offline).
+        need_gather = False
+        if self.tp_size > 1 and self.tp_dim is not None:
+            if isinstance(self, ReplicatedLinear):
+                # W and S of kv_a_proj_with_mqa don't match,
+                # but it doesn't need to be split.
+                return
+            # col qkv w13, tp_dim=0, [m, n] -> [m // tp, n] -> [m // tp, 1], don't need gather
+            # row o, w2, tp_dim=1, [m, n] -> [m, n //tp] -> [m, 1], need gather
+            if online_quant_type == QuantType.per_Token:
+                # per_Token: scale = max(|full_row|), tp_dim=1 has partial rows
+                need_gather = self.tp_dim == 1
+            elif online_quant_type == QuantType.per_1x128:
+                # 128×128 blocks: misaligned if partition size % 128 != 0
+                if self.tp_dim == 0:
+                    need_gather = self.output_size % 128 != 0
+                else:
+                    need_gather = self.input_size % 128 != 0
+            elif online_quant_type == QuantType.per_1x32:
+                # 1×32 blocks: row dim is 1 (always aligned), only column matters
+                # col qkv w13, tp_dim=0, [m, n] -> [m // tp, n] -> [m // tp, n // 32], don't need gather
+                # row o, w2, tp_dim=1, [m, n] -> [m, n //tp] -> [m, n // tp // 32], need gather
+                need_gather = self.tp_dim == 1 and self.input_size % 32 != 0
+        if need_gather:
+            weight = self._gather_full_weight(weight)
+            if weight_scale is not None:
+                weight_scale = self._gather_full_weight(weight_scale)
+
+        if self.quant_type == QuantType.per_1x128:
+            # dequant per block fp8
+            weight = weight_dequant_fp8(weight, weight_scale)
+        q_weight, weight_scale = online_quant_func(
+            weight, quant_dtype=online_quant_dtype
+        )
+        if need_gather:
+            q_weight, weight_scale = self._shard_quantized_weight(
+                q_weight, weight_scale
+            )
+        self.weight = nn.Parameter(q_weight, requires_grad=False)
+        self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+
+        # Update quant state
+        self.quant_type = online_quant_type
+        self.params_dtype = online_quant_dtype
+        self.quant_func = online_quant_func
+        self.need_normalize_e4m3fn_to_e4m3fnuz = (
+            online_quant_dtype == torch.float8_e4m3fnuz
+        )
+        self._online_quant_info = {
+            "layer": self.prefix,
+            "quant_type": online_quant_type.name,
+            "quant_dtype": str(online_quant_dtype),
+        }
+
     def process_weights_after_loading(self):
+        # Re-quantize before process_weights if online quantization is enabled
+        if self.quant_config is not None and self.quant_config.online_quant:
+            self.online_quantize_weight()
         if (
             self.quant_type == QuantType.per_Tensor
             and len(self.output_partition_sizes) > 1

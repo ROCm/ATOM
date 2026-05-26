@@ -118,6 +118,7 @@ class MockConfig:
             enable_prefix_caching=False,
             max_num_seqs=4,
             max_num_batched_tokens=64,
+            max_model_len=64,
             bos_token_id=1,
             eos_token_id=2,
             stop_token_ids=[],

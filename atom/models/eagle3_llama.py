@@ -290,12 +290,11 @@ class Eagle3LlamaModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         embeds = self.embed_tokens(input_ids)
         hidden_states = self.midlayer(positions, embeds, hidden_states)
-        hidden_states_prenorm = hidden_states
-        hidden_states = self.norm(hidden_states)
-        return hidden_states, hidden_states_prenorm
+        return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
