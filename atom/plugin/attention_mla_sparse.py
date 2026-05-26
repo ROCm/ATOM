@@ -617,8 +617,6 @@ def sparse_attn_indexer_plugin_mode(
 
     if use_qk_rope_cache_fusion:
         q_bf16 = q_input
-        if not k.is_contiguous():
-            k = k.contiguous()
         q_fp8 = torch.empty_like(q_bf16, dtype=dtypes.fp8)
         weights_out = torch.empty(
             weights.shape, device=weights.device, dtype=torch.float32
