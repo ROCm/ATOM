@@ -79,4 +79,3 @@ Key entry points:
 | Performance benchmark | `/benchmark-guide` |
 | Debugging | `/debug-guide` |
 | Adding a model | `/add-model` |
-| Mesh PD end-to-end test (sglang/vllm × http/grpc) | `/mesh-e2e-test` |
