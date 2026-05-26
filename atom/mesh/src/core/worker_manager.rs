@@ -4,12 +4,10 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use axum::response::{IntoResponse, Response};
 use futures::{
     future,
     stream::{self, StreamExt},
 };
-use http::StatusCode;
 use serde_json::Value;
 use tokio::{
     sync::{watch, Mutex},
@@ -18,7 +16,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    core::{metrics_aggregator::MetricPack, ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
@@ -65,20 +63,6 @@ async fn fan_out(
         .buffer_unordered(MAX_CONCURRENT)
         .collect()
         .await
-}
-
-pub enum EngineMetricsResult {
-    Ok(String),
-    Err(String),
-}
-
-impl IntoResponse for EngineMetricsResult {
-    fn into_response(self) -> Response {
-        match self {
-            Self::Ok(text) => (StatusCode::OK, text).into_response(),
-            Self::Err(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
-        }
-    }
 }
 
 pub struct WorkerManager;
@@ -226,42 +210,6 @@ impl WorkerManager {
                 _ => -1,
             },
             _ => -1,
-        }
-    }
-
-    pub async fn get_engine_metrics(
-        worker_registry: &WorkerRegistry,
-        client: &reqwest::Client,
-    ) -> EngineMetricsResult {
-        let workers = worker_registry.get_all();
-
-        if workers.is_empty() {
-            return EngineMetricsResult::Err("No available workers".to_string());
-        }
-
-        let responses = fan_out(&workers, client, "metrics", reqwest::Method::GET).await;
-
-        let mut metric_packs = Vec::new();
-        for resp in responses {
-            if let Ok(r) = resp.result {
-                if r.status().is_success() {
-                    if let Ok(text) = r.text().await {
-                        metric_packs.push(MetricPack {
-                            labels: vec![("worker_addr".into(), resp.url)],
-                            metrics_text: text,
-                        });
-                    }
-                }
-            }
-        }
-
-        if metric_packs.is_empty() {
-            return EngineMetricsResult::Err("All backend requests failed".to_string());
-        }
-
-        match crate::core::metrics_aggregator::aggregate_metrics(metric_packs) {
-            Ok(text) => EngineMetricsResult::Ok(text),
-            Err(e) => EngineMetricsResult::Err(format!("Failed to aggregate metrics: {}", e)),
         }
     }
 }

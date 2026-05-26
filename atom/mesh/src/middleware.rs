@@ -27,7 +27,7 @@ pub use crate::core::token_bucket::TokenBucket;
 use crate::{
     observability::{
         inflight_tracker::InFlightRequestTracker,
-        metrics::{method_to_static_str, metrics_labels, Metrics},
+        metrics::{method_to_static_str, metrics_labels, MeshMetrics, normalize_path_for_metrics},
     },
     routers::comm::error::extract_error_code_from_response,
     server::AppState,
@@ -247,7 +247,7 @@ impl<B> OnRequest<B> for RequestLogger {
 
         let method = method_to_static_str(request.method().as_str());
         let path = normalize_path_for_metrics(request.uri().path());
-        Metrics::record_http_request(method, &path);
+        MeshMetrics::record_http_request(method, &path);
 
         // Log the request start
         info!(
@@ -269,7 +269,7 @@ impl<B> OnResponse<B> for ResponseLogger {
         let error_code = extract_error_code_from_response(response);
 
         // Layer 1: HTTP metrics
-        Metrics::record_http_response(status_code, error_code);
+        MeshMetrics::record_http_response(status_code, error_code);
 
         // Record these in the span for structured logging/observability tools
         span.record("status_code", status_code);
@@ -430,7 +430,7 @@ pub async fn concurrency_limit_middleware(
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
-        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+        MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
         let response = next.run(request).await;
 
         // Wrap the response body with TokenGuardBody to return token when stream ends
@@ -459,7 +459,7 @@ pub async fn concurrency_limit_middleware(
                     match permit_rx.await {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+                            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
 
                             let response = next.run(request).await;
 
@@ -470,25 +470,25 @@ pub async fn concurrency_limit_middleware(
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                             status.into_response()
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
                     }
                 }
                 Err(_) => {
                     warn!("Request queue is full, returning 429");
-                    Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                    MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                     StatusCode::TOO_MANY_REQUESTS.into_response()
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
-            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
     }
@@ -557,7 +557,7 @@ where
         Box::pin(async move {
             // Increment inside async block - ensures no leak if future is dropped before polling
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
-            Metrics::set_http_connections_active(active as usize);
+            MeshMetrics::set_http_connections_active(active as usize);
 
             let guard = in_flight_request_tracker.track();
 
@@ -568,74 +568,16 @@ where
 
             // Always decrement, regardless of success or failure
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            Metrics::set_http_connections_active(active as usize);
+            MeshMetrics::set_http_connections_active(active as usize);
 
             let response = result?;
 
             let duration = start.elapsed();
-            Metrics::record_http_duration(method, &path, duration);
+            MeshMetrics::record_http_duration(method, &path, duration);
 
             Ok(response)
         })
     }
-}
-
-/// Normalize path for metrics to avoid high cardinality.
-/// Replaces dynamic segments (IDs, UUIDs) with `{id}` placeholder.
-/// Only allocates when normalization is needed; uses single-pass with byte offsets.
-fn normalize_path_for_metrics(path: &str) -> String {
-    let bytes = path.as_bytes();
-    let mut segment_start = 0;
-    let mut segment_idx = 0;
-    let mut result: Option<String> = None;
-
-    for (pos, &b) in bytes.iter().enumerate() {
-        if b == b'/' || pos == bytes.len() - 1 {
-            // Determine segment end (include last char if not a slash)
-            let segment_end = if b == b'/' { pos } else { pos + 1 };
-            let segment = &path[segment_start..segment_end];
-
-            // Check segments after index 2 for dynamic IDs
-            if segment_idx > 2 && !segment.is_empty() && is_dynamic_id(segment) {
-                // Initialize result with everything before this segment
-                let result = result.get_or_insert_with(|| {
-                    let mut s = String::with_capacity(path.len());
-                    s.push_str(&path[..segment_start]);
-                    s
-                });
-                result.push_str("{id}");
-            } else if let Some(ref mut r) = result {
-                // Already normalizing, append this segment as-is
-                r.push_str(segment);
-            }
-
-            // Add slash after segment (except at end)
-            if b == b'/' {
-                if let Some(ref mut r) = result {
-                    r.push('/');
-                }
-                segment_start = pos + 1;
-                segment_idx += 1;
-            }
-        }
-    }
-
-    result.unwrap_or_else(|| path.to_owned())
-}
-
-/// Check if segment looks like a dynamic ID (prefixed ID, UUID, or numeric).
-#[inline]
-fn is_dynamic_id(s: &str) -> bool {
-    // Prefixed IDs: resp_xxx, chatcmpl_xxx (len > 10 with underscore)
-    if s.len() > 10 && s.contains('_') {
-        return true;
-    }
-    // UUIDs: 32+ hex chars with dashes
-    if s.len() >= 32 && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
-        return true;
-    }
-    // Numeric IDs
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -684,25 +626,5 @@ mod tests {
             normalize_path_for_metrics("/v1/workers/12345"),
             "/v1/workers/{id}"
         );
-    }
-
-    #[test]
-    fn test_is_dynamic_id() {
-        // Prefixed IDs
-        assert!(is_dynamic_id("resp_abc123def"));
-        assert!(is_dynamic_id("chatcmpl_xyz789"));
-        assert!(!is_dynamic_id("short_id")); // Too short
-
-        // UUIDs
-        assert!(is_dynamic_id("550e8400-e29b-41d4-a716-446655440000"));
-        assert!(is_dynamic_id("550e8400e29b41d4a716446655440000")); // No dashes
-
-        // Numeric
-        assert!(is_dynamic_id("12345"));
-        assert!(!is_dynamic_id("")); // Empty
-
-        // Regular words
-        assert!(!is_dynamic_id("completions"));
-        assert!(!is_dynamic_id("chat"));
     }
 }

@@ -8,7 +8,9 @@ use wfaas::{
     StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
-use crate::{core::steps::workflow_data::WorkerRegistrationData, observability::metrics::Metrics};
+use crate::{
+    core::steps::workflow_data::WorkerRegistrationData, observability::metrics::MeshMetrics,
+};
 
 /// Unified step to register workers in the registry.
 ///
@@ -74,7 +76,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
                 )
                 .len();
 
-            Metrics::set_worker_pool_size(
+            MeshMetrics::set_worker_pool_size(
                 worker_type_label,
                 connection_mode_label,
                 &model_id,

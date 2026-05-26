@@ -18,7 +18,7 @@ use crate::{
         },
         AttachedBody, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
-    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
+    observability::metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
     policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
@@ -103,7 +103,7 @@ impl Pipeline {
         let start = Instant::now();
         let model = req.model.clone();
         let streaming = req.stream;
-        Metrics::record_router_request(
+        MeshMetrics::record_router_request(
             metrics_labels::ROUTER_GRPC,
             self.backend_label,
             metrics_labels::CONNECTION_GRPC,
@@ -134,7 +134,7 @@ impl Pipeline {
         };
         let response = AttachedBody::wrap_response(response, guards);
 
-        Metrics::record_router_duration(
+        MeshMetrics::record_router_duration(
             metrics_labels::ROUTER_GRPC,
             self.backend_label,
             metrics_labels::CONNECTION_GRPC,
@@ -157,7 +157,7 @@ impl Pipeline {
             .clone()
             .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
         let streaming = req.stream;
-        Metrics::record_router_request(
+        MeshMetrics::record_router_request(
             metrics_labels::ROUTER_GRPC,
             self.backend_label,
             metrics_labels::CONNECTION_GRPC,
@@ -195,7 +195,7 @@ impl Pipeline {
         };
         let response = AttachedBody::wrap_response(response, guards);
 
-        Metrics::record_router_duration(
+        MeshMetrics::record_router_duration(
             metrics_labels::ROUTER_GRPC,
             self.backend_label,
             metrics_labels::CONNECTION_GRPC,
@@ -257,7 +257,7 @@ impl Pipeline {
     }
 
     fn record_chat_err(&self, model: &str, _start: Instant, resp: Response) -> Response {
-        Metrics::record_router_error(
+        MeshMetrics::record_router_error(
             metrics_labels::ROUTER_GRPC,
             self.backend_label,
             metrics_labels::CONNECTION_GRPC,
@@ -269,7 +269,7 @@ impl Pipeline {
     }
 
     fn record_generate_err(&self, model: &str, _start: Instant, resp: Response) -> Response {
-        Metrics::record_router_error(
+        MeshMetrics::record_router_error(
             metrics_labels::ROUTER_GRPC,
             self.backend_label,
             metrics_labels::CONNECTION_GRPC,
