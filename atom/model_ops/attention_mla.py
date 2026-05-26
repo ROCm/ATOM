@@ -1115,7 +1115,18 @@ def triton_gather_kv_indices_sparse(
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0
 
-    num_tokens = token_to_seq_idxs.shape[0]
+    # MTP decode can carry metadata tensors padded to a larger query layout
+    # than the number of rows produced by the current indexer call. Keep all
+    # per-token inputs aligned to the actual valid intersection before launch;
+    # otherwise the kernel may read past topk_indices.
+    num_tokens = min(
+        token_to_seq_idxs.shape[0],
+        topk_indices.shape[0],
+        sparse_kv_indptr.shape[0] - 1,
+    )
+    sparse_kv_indptr = sparse_kv_indptr[: num_tokens + 1]
+    token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
+    topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     total_out = num_tokens * NUM_TOPK_TOKENS
