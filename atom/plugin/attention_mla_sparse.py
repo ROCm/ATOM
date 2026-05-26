@@ -9,9 +9,9 @@ In vLLM plugin mode, the execution path is:
   → ATOM's forward_impl_plugin_mode() → forward_impl_sparse_plugin_mode()
 
 The patched forward_impl (see register.py) redirects to ATOM's impl, which
-dispatches to sparse or non-sparse based on topk_indices_buffer presence.
-forward_impl_sparse_plugin_mode handles everything end-to-end: RoPE, KV cache
-write, Q absorption, topk index conversion, sparse kernel, V up-projection.
+dispatches to sparse or non-sparse based on the MLA module's sparse-indexer
+flag. forward_impl_sparse_plugin_mode handles everything end-to-end: RoPE, KV
+cache write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
 import torch
@@ -291,7 +291,6 @@ class MLASparseAttentionImplPluginModeMethods:
         layer,
     ) -> torch.Tensor:
         sparse_meta = attn_metadata.plugin_metadata
-
         num_tokens = q.shape[0]
         output = torch.empty(
             [num_tokens, self.padded_num_heads, self.kv_lora_rank],
@@ -459,21 +458,6 @@ class MLASparseAttentionImplPluginModeMethods:
         if self.head_repeat_factor > 1:
             q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
 
-        assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
-
-        req_id_i32 = sparse_meta.req_id_per_token.to(dtype=torch.int32)
-        block_table_i32 = sparse_meta.block_table.to(dtype=torch.int32)
-        topk_indices_i32 = topk_indices.to(dtype=torch.int32)
-        triton_convert_req_index_to_global_index(
-            req_id_i32,
-            block_table_i32,
-            topk_indices_i32,
-            sparse_meta.paged_kv_indptr,
-            sparse_meta.paged_kv_indices,
-            BLOCK_SIZE=sparse_meta.block_size,
-            NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
-        )
         if fp8_attention:
             from vllm import _custom_ops as ops
 
@@ -507,11 +491,6 @@ def _mla_sparse_plugin_mode_init(self, *args, **kwargs):
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.head_repeat_factor = self.padded_num_heads // self.num_heads
 
-        # Sparse MLA specific: verify topk_indices_buffer is present
-        assert getattr(self, "topk_indices_buffer", None) is not None, (
-            "topk_indices_buffer must be set for sparse MLA plugin mode. "
-            "Ensure the model's Indexer is properly initialized."
-        )
         self._is_sparse_mla = True
 
 
@@ -522,8 +501,8 @@ def MLASparseAttentionImplDecoratorForPluginMode(cls):
 
     Injects forward_impl_sparse_plugin_mode and _forward_sparse_mla.
     The patched forward_impl in register.py calls forward_impl_plugin_mode,
-    which dispatches to forward_impl_sparse_plugin_mode when topk_indices_buffer
-    is set.
+    which dispatches to forward_impl_sparse_plugin_mode when the MLA module
+    has a V3.2 sparse indexer.
     """
     sparse_method_names = [
         "_forward_sparse_mla",
@@ -544,14 +523,26 @@ def MLASparseAttentionImplDecoratorForPluginMode(cls):
 
     def new_init(self, *args, **kwargs):
         orig_init(self, *args, **kwargs)
-        # Only run sparse init if this instance has a topk_indices_buffer
-        # (i.e., the model uses sparse MLA)
-        if getattr(self, "topk_indices_buffer", None) is not None:
+        # Only run sparse init if this instance has a V3.2 sparse indexer.
+        if getattr(self, "is_sparse_mla", False):
             _mla_sparse_plugin_mode_init(self, *args, **kwargs)
 
     cls.__init__ = new_init
 
     return cls
+
+
+def _get_sparse_mla_plugin_metadata(attn_metadata_dict, k_cache_prefix: str):
+    if not k_cache_prefix.endswith(".indexer.k_cache"):
+        return None
+
+    attention_prefix = k_cache_prefix[: -len(".indexer.k_cache")]
+    for sparse_attn_prefix in (f"{attention_prefix}.attn", attention_prefix):
+        sparse_attn_meta = attn_metadata_dict.get(sparse_attn_prefix)
+        sparse_plugin_meta = getattr(sparse_attn_meta, "plugin_metadata", None)
+        if getattr(sparse_plugin_meta, "paged_kv_indices", None) is not None:
+            return sparse_plugin_meta
+    return None
 
 
 def sparse_attn_indexer_plugin_mode(
@@ -567,7 +558,7 @@ def sparse_attn_indexer_plugin_mode(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
+    sparse_kv_indices_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -578,6 +569,12 @@ def sparse_attn_indexer_plugin_mode(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
+    topk_indices = torch.empty(
+        hidden_states.shape[0],
+        topk_tokens,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
@@ -604,6 +601,12 @@ def sparse_attn_indexer_plugin_mode(
     # AiterMLASparseIndexerMetadataBuilder.
     plugin_meta = layer_meta.plugin_metadata
     indexer_meta = plugin_meta
+    sparse_meta = _get_sparse_mla_plugin_metadata(attn_metadata_dict, k_cache_prefix)
+    if sparse_meta is None:
+        raise RuntimeError(
+            "Sparse MLA plugin metadata not found for indexer cache "
+            f"{k_cache_prefix!r}. The indexer cannot populate paged_kv_indices."
+        )
     slot_mapping = indexer_meta.slot_mapping
     has_decode = indexer_meta.num_decodes > 0
     has_prefill = indexer_meta.num_prefills > 0
@@ -649,8 +652,6 @@ def sparse_attn_indexer_plugin_mode(
             preshuffle=preshuffle_cache,
         )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
-    # topk_indices_buffer[: num_actual_tokens] = -1
     if has_prefill:
         prefill_metadata = indexer_meta.prefill
         for chunk in prefill_metadata.chunks:
@@ -684,7 +685,7 @@ def sparse_attn_indexer_plugin_mode(
             )
             num_rows = logits.shape[0]
             assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-            topk_indices = topk_indices_buffer[
+            topk_indices_prefill = topk_indices[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
             # Use top_k_per_row_prefill from vLLM to correctly handle row starts
@@ -694,7 +695,7 @@ def sparse_attn_indexer_plugin_mode(
                 logits,
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
-                topk_indices,
+                topk_indices_prefill,
                 num_rows,
                 logits.stride(0),
                 logits.stride(1),
@@ -745,12 +746,12 @@ def sparse_attn_indexer_plugin_mode(
 
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
+        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         top_k_per_row_decode(
             logits,
             next_n,
             decode_metadata.seq_lens,
-            topk_indices,
+            topk_indices_decode,
             num_rows,
             logits.stride(0),
             logits.stride(1),
@@ -761,13 +762,25 @@ def sparse_attn_indexer_plugin_mode(
             # the topk indices removing padded tokens
             from vllm.v1.attention.ops.common import unpack_seq_triton
 
-            topk_indices = unpack_seq_triton(
-                topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
+            unpacked_topk_indices = unpack_seq_triton(
+                topk_indices_decode.reshape(
+                    batch_size, -1, topk_indices_decode.shape[-1]
+                ),
                 decode_lens,
             )
-            topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
-                topk_indices
+            topk_indices[:num_decode_tokens, : unpacked_topk_indices.shape[-1]] = (
+                unpacked_topk_indices
             )
+
+    triton_convert_req_index_to_global_index(
+        sparse_meta.req_id_per_token.to(dtype=torch.int32),
+        sparse_meta.block_table.to(dtype=torch.int32),
+        topk_indices[: sparse_meta.num_actual_tokens].to(dtype=torch.int32),
+        sparse_meta.paged_kv_indptr,
+        sparse_kv_indices_buffer,
+        BLOCK_SIZE=sparse_meta.block_size,
+        NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
+    )
 
     return weights
 
@@ -785,7 +798,7 @@ def sparse_attn_indexer_fake(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
+    sparse_kv_indices_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -810,7 +823,7 @@ def sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer_plugin_mode",
     op_func=sparse_attn_indexer_plugin_mode,
-    mutates_args=["topk_indices_buffer"],
+    mutates_args=["sparse_kv_indices_buffer"],
     fake_impl=sparse_attn_indexer_fake,
 )
 

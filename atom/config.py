@@ -932,6 +932,7 @@ class Config:
     model: str
     trust_remote_code: bool = False
     max_num_batched_tokens: int = 16384
+    attn_prefill_chunk_size: int = 16384
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None

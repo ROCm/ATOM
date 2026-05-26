@@ -29,6 +29,27 @@ vllm serve deepseek-ai/DeepSeek-V3.2 \
     --no-enable-prefix-caching
 ```
 
+### DeepSeek-V3.2 MTP (TP=4/TP=8, MTP=1/MTP=3, MI355X)
+
+```bash
+TP=4
+MTP=3
+
+vllm serve deepseek-ai/DeepSeek-V3.2 \
+    --host localhost \
+    --port 8000 \
+    --tensor-parallel-size "${TP}" \
+    --kv-cache-dtype fp8 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP}}" \
+    --no-enable-prefix-caching
+```
+
 ## Step 3: Performance Benchmark
 
 Users can use the default vllm bench commands for performance benchmarking.

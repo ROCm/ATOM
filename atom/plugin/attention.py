@@ -2374,6 +2374,39 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
+        default_sfc = (
+            get_current_atom_config().compilation_config.static_forward_context
+        )
+        vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
+        for layer_name in layer_names or []:
+            attention_prefix = (
+                layer_name[: -len(".attn")]
+                if layer_name.endswith(".attn")
+                else layer_name
+            )
+            indexer_cache = vllm_sfc.get(f"{attention_prefix}.indexer.k_cache")
+            owner_atom_config = getattr(indexer_cache, "atom_config", None)
+            sfc = (
+                owner_atom_config.compilation_config.static_forward_context
+                if owner_atom_config is not None
+                else default_sfc
+            )
+            indexer = sfc.get(f"{attention_prefix}.indexer")
+            if indexer is not None:
+                indexer.sparse_kv_indices_buffer = self.paged_kv_indices
+            paged_attn = sfc.get(attention_prefix)
+            impl = getattr(getattr(paged_attn, "attn", None), "impl", None)
+            if impl is not None and hasattr(impl, "sparse_kv_indices_buffer"):
+                impl.sparse_kv_indices_buffer = self.paged_kv_indices
+            if indexer is None or impl is None:
+                logger.warning(
+                    "Sparse MLA buffer binding incomplete for %s "
+                    "(indexer=%s, impl=%s, owner_atom_config=%s)",
+                    attention_prefix,
+                    indexer is not None,
+                    impl is not None,
+                    owner_atom_config is not None,
+                )
 
         # ----- Persistent MLA metadata buffers -----
         # The aiter sparse decode kernel supports a "persistent" path that

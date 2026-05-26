@@ -52,7 +52,13 @@ from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.activation import SiluAndMul
-from atom.model_ops.attention_mla import MLAModules, is_rocm_aiter_fp4bmm_enabled
+from atom.model_ops.attention_mla import (
+    MLAModules,
+    is_rocm_aiter_fp4bmm_enabled,
+    triton_convert_req_index_to_global_index,
+    triton_convert_req_index_to_global_index_dsa_prefill,
+    triton_gather_kv_indices_sparse,
+)
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
@@ -998,7 +1004,7 @@ def sparse_attn_indexer(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
+    sparse_kv_indices_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1009,6 +1015,12 @@ def sparse_attn_indexer(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
+    topk_indices = torch.empty(
+        hidden_states.shape[0],
+        topk_tokens,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
     attn_metadata = forward_context.attn_metadata
@@ -1062,7 +1074,7 @@ def sparse_attn_indexer(
             preshuffle=True,
         )
     if context.is_prefill:
-        if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
+        if attn_metadata.max_seqlen_k <= topk_tokens:
             return weights
         prefill_metadata = attn_metadata
         num_prefills = context.batch_size
@@ -1107,16 +1119,27 @@ def sparse_attn_indexer(
 
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices = topk_indices_buffer[num_decode_tokens:num_tokens, :topk_tokens]
+        topk_indices_prefill = topk_indices[num_decode_tokens:num_tokens, :topk_tokens]
         top_k_per_row_prefill(
             logits=logits,
             rowStarts=cu_seqlen_ks,
             rowEnds=cu_seqlen_ke,
-            indices=topk_indices,
+            indices=topk_indices_prefill,
             values=None,
             numRows=num_rows,
             stride0=logits.stride(0),
             stride1=logits.stride(1),
+        )
+        triton_convert_req_index_to_global_index_dsa_prefill(
+            attn_metadata.sparse_cu_seqlens_q,
+            attn_metadata.sparse_kv_indptr,
+            attn_metadata.token_to_seq_idxs,
+            topk_indices,
+            attn_metadata.block_tables,
+            attn_metadata.cu_seqlens_k,
+            NUM_TOPK_TOKENS=topk_tokens,
+            PAGE_SIZE=runner_block_size,
+            out=sparse_kv_indices_buffer,
         )
     else:
         decode_metadata = attn_metadata
@@ -1148,16 +1171,36 @@ def sparse_attn_indexer(
         )
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
+        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         top_k_per_row_decode(
             logits,
             next_n,
             decode_metadata.context_lens,
-            topk_indices,
+            topk_indices_decode,
             num_rows,
             logits.stride(0),
             logits.stride(1),
         )
+        if attn_metadata.max_seqlen_q > 1:
+            triton_gather_kv_indices_sparse(
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.token_to_seq_idxs,
+                topk_indices,
+                attn_metadata.kv_indices,
+                attn_metadata.kv_indptr,
+                NUM_TOPK_TOKENS=topk_tokens,
+                out=sparse_kv_indices_buffer,
+            )
+        else:
+            triton_convert_req_index_to_global_index(
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.kv_indptr,
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.kv_indices,
+                topk_indices,
+                NUM_TOPK_TOKENS=topk_tokens,
+                out=sparse_kv_indices_buffer,
+            )
     return weights
 
 
@@ -1174,7 +1217,7 @@ def sparse_attn_indexer_fake(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
+    sparse_kv_indices_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1199,7 +1242,7 @@ def sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer",
     op_func=sparse_attn_indexer,
-    mutates_args=["topk_indices_buffer"],
+    mutates_args=["sparse_kv_indices_buffer"],
     fake_impl=sparse_attn_indexer_fake,
 )
 
@@ -1326,7 +1369,6 @@ class Indexer(nn.Module):
         q_lora_rank: int,
         quant_config: Optional[QuantizationConfig],
         cache_config: str,
-        topk_indices_buffer: Optional[torch.Tensor],
         use_wk_weights_proj_fusion: bool = True,
         prefix: str = "",
     ):
@@ -1384,8 +1426,6 @@ class Indexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
 
-        self.topk_indices_buffer = topk_indices_buffer
-
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)
         self.k_cache = DeepseekV32IndexerCache(
             head_dim=self.head_dim + 4,
@@ -1397,6 +1437,9 @@ class Indexer(nn.Module):
         self.prefix = prefix
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
+
+        self.sparse_kv_indices_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
+        atom_config.compilation_config.static_forward_context[prefix] = self
 
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
 
@@ -1455,7 +1498,7 @@ class Indexer(nn.Module):
             self.head_dim,
             self.max_model_len,
             self.max_total_seq_len,
-            self.topk_indices_buffer,
+            self.sparse_kv_indices_buffer,
             self.k_norm.weight,
             self.k_norm.bias,
             self.k_norm.eps,
@@ -1491,7 +1534,6 @@ class DeepseekV2MLAAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         layer_num: int = 0,
-        topk_indices_buffer: Optional[torch.Tensor] = None,
         use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
     ) -> None:
         super().__init__()
@@ -1664,7 +1706,6 @@ class DeepseekV2MLAAttention(nn.Module):
                 q_lora_rank,
                 base_quant_config,
                 cache_config,
-                topk_indices_buffer,
                 (
                     _can_fuse_indexer_wk_weights_proj(
                         config,
@@ -1803,7 +1844,7 @@ class DeepseekV2MLAAttention(nn.Module):
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
         if self.is_v32 and self.indexer is not None:
-            _topk_indices = self.indexer(
+            self.indexer(
                 hidden_states,
                 hidden_states_or_q_c,
                 hidden_states_or_q_c_scale,
@@ -1825,7 +1866,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         prefix: str,
-        topk_indices_buffer: Optional[torch.Tensor] = None,
         cache_config: str = "bf16",
         quant_config: Optional[QuantizationConfig] = None,
         layer_num: int = 0,
@@ -1855,7 +1895,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             layer_num=layer_num,
-            topk_indices_buffer=topk_indices_buffer,
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
 
@@ -2039,16 +2078,6 @@ class DeepseekV2Model(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
-        if self.is_v32:
-            topk_tokens = config.index_topk
-            topk_indices_buffer = torch.empty(
-                atom_config.max_num_batched_tokens,
-                topk_tokens,
-                dtype=torch.int32,
-                device="cuda",
-            )
-        else:
-            topk_indices_buffer = None
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -2068,7 +2097,6 @@ class DeepseekV2Model(nn.Module):
             lambda prefix, layer_num=None: DeepseekV2DecoderLayer(
                 config,
                 prefix,
-                topk_indices_buffer=topk_indices_buffer,
                 cache_config=cache_config,
                 quant_config=quant_config,
                 layer_num=layer_num,

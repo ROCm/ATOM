@@ -35,6 +35,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -71,6 +72,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -107,6 +109,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -143,6 +146,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -179,6 +183,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -215,6 +220,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -251,6 +257,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -287,6 +294,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -603,6 +611,16 @@ jobs:
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
+                  "toggle_env": "RUN_DSV32_FP8_MTP_TP8",
+                  "model_name": "DeepSeek-V3.2-FP8 MTP TP8",
+                  "model_path": "deepseek-ai/DeepSeek-V3.2",
+                  "extra_args": "--tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
                   "toggle_env": "RUN_GPT_OSS_120B_TP1",
                   "model_name": "gpt-oss-120b TP1",
                   "model_path": "openai/gpt-oss-120b",
@@ -761,6 +779,10 @@ jobs:
               },
               "DeepSeek-V3.2-FP8 TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "",
+              },
+              "DeepSeek-V3.2-FP8 MTP TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "env_vars": "",
               },
               "gpt-oss-120b TP1": {
@@ -1190,21 +1212,11 @@ jobs:
               "AITER_LOG_MORE=0"
           } | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//' > /tmp/oot_env_file.txt
 
-          GROUP_ADD_FLAGS="--group-add video"
-          if [ "${CONTAINER_ENGINE:-docker}" = "podman" ]; then
-            GROUP_ADD_FLAGS="$GROUP_ADD_FLAGS --group-add keep-groups"
-          else
-            for gid in $(id -G); do
-              GROUP_ADD_FLAGS="$GROUP_ADD_FLAGS --group-add $gid"
-            done
-          fi
-          echo "Container group flags: $GROUP_ADD_FLAGS"
-
           $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host $GROUP_ADD_FLAGS \
+            --ipc=host --group-add keep-groups \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
