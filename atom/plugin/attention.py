@@ -2374,7 +2374,9 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
-        default_sfc = get_current_atom_config().compilation_config.static_forward_context
+        default_sfc = (
+            get_current_atom_config().compilation_config.static_forward_context
+        )
         vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
         for layer_name in layer_names or []:
             attention_prefix = (
