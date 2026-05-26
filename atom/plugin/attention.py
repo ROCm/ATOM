@@ -378,10 +378,6 @@ class vllmAttentionMetadataBuilderMethods:
         decode_only = num_decodes > 0 and num_extends == 0 and num_prefills == 0
         mixed = not (prefill_only or decode_only)
 
-        # common_attn_metadata._seq_lens_cpu is equal to common_attn_metadata.seq_lens.cpu(),
-        # but using seq_lens.cpu() can get the better performance in low concurrency.
-        # seq_lens = common_attn_metadata._seq_lens_cpu
-        seq_lens = common_attn_metadata.seq_lens.cpu()
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
@@ -390,11 +386,6 @@ class vllmAttentionMetadataBuilderMethods:
         # num_speculative_tokens > 1.
         # Fall back to seq_lens - query_lens computed on already-CPU tensors.
         num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
-        # In async spec-decode mode (auto-enabled for MTP/EAGLE), vLLM sets
-        # _num_computed_tokens_cpu to None because the GPU seq_lens is the
-        # authoritative source. Reconstruct from CPU tensors we already have.
-        if num_computed_tokens_cpu is None:
-            num_computed_tokens_cpu = seq_lens - query_lens_cpu
 
         prefill_max_query_len = decode_max_query_len = (
             common_attn_metadata.max_query_len
@@ -403,19 +394,25 @@ class vllmAttentionMetadataBuilderMethods:
         prefill_query_start_loc = decode_query_start_loc = (
             common_attn_metadata.query_start_loc
         )
+        # Not needed for prefill-only or decode-only cases
+        seq_lens_cpu = None
 
         if mixed:
+            # common_attn_metadata._seq_lens_cpu is equal to common_attn_metadata.seq_lens.cpu(),
+            # but using seq_lens.cpu() can get the better performance in low concurrency.
+            # seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+            seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
             prefill_start = num_decodes + num_extends
             if num_prefills > 0:
                 prefill_max_query_len = query_lens_cpu[prefill_start:].max().item()
-                prefill_max_seq_len = seq_lens[prefill_start:].max().item()
+                prefill_max_seq_len = seq_lens_cpu[prefill_start:].max().item()
                 prefill_query_start_loc = (
                     prefill_query_start_loc[prefill_start:]
                     - prefill_query_start_loc[prefill_start]
                 )
             if num_decodes > 0:
                 decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
-                decode_max_seq_len = seq_lens[:num_decodes].max().item()
+                decode_max_seq_len = seq_lens_cpu[:num_decodes].max().item()
                 decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
 
         prefill_metadata = None
@@ -437,9 +434,15 @@ class vllmAttentionMetadataBuilderMethods:
             )
 
         if num_extends > 0:
+            assert seq_lens_cpu is not None
+            # In async spec-decode mode (auto-enabled for MTP/EAGLE), vLLM sets
+            # _num_computed_tokens_cpu to None because the GPU seq_lens is the
+            # authoritative source. Reconstruct from CPU tensors we already have.
+            if num_computed_tokens_cpu is None:
+                num_computed_tokens_cpu = seq_lens_cpu - query_lens_cpu
             num_extends_slice = slice(num_decodes, num_decodes + num_extends)
             query_lens_extend = query_lens_cpu[num_extends_slice]
-            seq_lens_extend = seq_lens[num_extends_slice]
+            seq_lens_extend = seq_lens_cpu[num_extends_slice]
             computed_kv_lens = num_computed_tokens_cpu[num_extends_slice]
 
             swa_metadata = None
@@ -557,7 +560,7 @@ class vllmAttentionMetadataBuilderMethods:
             )
             extend_metadata = AiterFlashAttentionChunkPrefillMetadata(
                 max_query_len=query_lens_extend.max().item(),
-                max_seq_len=seq_lens[num_extends_slice].max().item(),
+                max_seq_len=seq_lens_cpu[num_extends_slice].max().item(),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
                 chunk_context_metadata=chunk_context_metadata,
             )
@@ -613,6 +616,68 @@ class vllmAttentionMetadataBuilderMethods:
             plugin_metadata=attn_metadata_for_plugin_mode,
         )
 
+        return attn_metadata
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata,
+        draft_index: int,
+    ) -> AttentionMetaData:
+        """
+        Build attention metadata for draft model without CPU-GPU sync.
+
+        During EAGLE/MTP drafting all requests are uniform decodes, so we can
+        skip split_decodes_prefills_and_extends() and avoid all .cpu() /
+        .item() calls that would otherwise break CUDA graph capture.
+        """
+        from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata=common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+            )
+        )
+        if num_prefills > 0:
+            return self.build(
+                common_prefix_len=0, common_attn_metadata=common_attn_metadata
+            )
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        decode_metadata = AiterFlashAttentionDecodeMetadata(
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            query_start_loc=common_attn_metadata.query_start_loc,
+        )
+        attn_metadata_for_plugin_mode = AiterFlashAttentionMetadataForPluginMode(
+            num_actual_tokens=num_tokens,
+            num_actual_kv_tokens=0,
+            max_query_len=common_attn_metadata.max_query_len,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            seq_lens=common_attn_metadata.seq_lens,
+            block_table=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            num_decodes=num_reqs,
+            num_decode_tokens=num_tokens,
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_extends=0,
+            num_extend_tokens=0,
+            decode_metadata=decode_metadata,
+            prefill_metadata=None,
+            extend_metadata=None,
+            use_cascade=False,
+            common_prefix_len=0,
+            total_tokens=self.total_tokens,
+        )
+
+        attn_metadata = AttentionMetaData(
+            max_seqlen_q=common_attn_metadata.max_query_len,
+            block_tables=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            plugin_metadata=attn_metadata_for_plugin_mode,
+        )
         return attn_metadata
 
     # this method will be called by vllm, so it follows the vllm's interface convention
