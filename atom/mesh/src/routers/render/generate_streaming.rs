@@ -13,7 +13,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::error;
 
 use crate::{
-    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    observability::metrics::{metrics_labels, MeshMetrics, StreamingMetricsParams},
     protocols::generate::{GenerateFinishReason, GenerateRequest},
     routers::{
         prepare::response_context::{ProtocolRequest, ResponseContext},
@@ -199,7 +199,7 @@ async fn run_generate_stream(
 
     stream.mark_completed();
 
-    Metrics::record_streaming_metrics(StreamingMetricsParams {
+    MeshMetrics::record_streaming_metrics(StreamingMetricsParams {
         router_type: metrics_labels::ROUTER_GRPC,
         backend_type: cfg.backend_label,
         model_id: &model,
