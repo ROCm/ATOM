@@ -76,20 +76,42 @@ def _install_vllm_init_stubs(monkeypatch):
     class VllmConfig:
         pass
 
+    vllm = types.ModuleType("vllm")
+    vllm.__path__ = []
+    vllm_utils = types.ModuleType("vllm.utils")
+    vllm_utils.__path__ = []
+    vllm_v1 = types.ModuleType("vllm.v1")
+    vllm_v1.__path__ = []
+    vllm_v1_worker = types.ModuleType("vllm.v1.worker")
+    vllm_v1_worker.__path__ = []
+
     vllm_config = types.ModuleType("vllm.config")
     vllm_config.VllmConfig = VllmConfig
-    monkeypatch.setitem(sys.modules, "vllm.config", vllm_config)
 
     platform_utils = types.ModuleType("vllm.utils.platform_utils")
     platform_utils.num_compute_units = lambda device_index: 1
-    monkeypatch.setitem(sys.modules, "vllm.utils.platform_utils", platform_utils)
 
     cp_utils = types.ModuleType("vllm.v1.worker.cp_utils")
     cp_utils.get_total_cp_world_size = lambda: 1
-    monkeypatch.setitem(sys.modules, "vllm.v1.worker.cp_utils", cp_utils)
 
     math_utils = types.ModuleType("vllm.utils.math_utils")
     math_utils.cdiv = lambda a, b: (a + b - 1) // b
+
+    vllm.config = vllm_config
+    vllm.utils = vllm_utils
+    vllm.v1 = vllm_v1
+    vllm_utils.platform_utils = platform_utils
+    vllm_utils.math_utils = math_utils
+    vllm_v1.worker = vllm_v1_worker
+    vllm_v1_worker.cp_utils = cp_utils
+
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.utils", vllm_utils)
+    monkeypatch.setitem(sys.modules, "vllm.v1", vllm_v1)
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker", vllm_v1_worker)
+    monkeypatch.setitem(sys.modules, "vllm.config", vllm_config)
+    monkeypatch.setitem(sys.modules, "vllm.utils.platform_utils", platform_utils)
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.cp_utils", cp_utils)
     monkeypatch.setitem(sys.modules, "vllm.utils.math_utils", math_utils)
 
     models_utils = types.ModuleType("atom.models.utils")
