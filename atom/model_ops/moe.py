@@ -2058,7 +2058,25 @@ class FusedMoE(torch.nn.Module):
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
-        fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+        is_deepseek = any(
+            "deepseek" in str(architecture).lower()
+            for architecture in getattr(config, "architectures", []) or []
+        )
+        if is_deepseek:
+            # Added specifically to support shared expert fusion for
+            # DeepSeek-R1-0528-MXFP4-v2, whose shared/routed dtypes can differ
+            # by layer. Keep other models on the legacy global gate.
+            shared_expert_prefix = (
+                prefix[: -len(".experts")] + ".shared_experts"
+                if prefix.endswith(".experts")
+                else None
+            )
+            fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled(
+                shared_expert_prefix=shared_expert_prefix,
+                routed_expert_prefix=prefix,
+            )
+        else:
+            fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
         self.num_fused_shared_experts = (
             config.n_shared_experts
             if config is not None

@@ -870,9 +870,15 @@ class DeepseekV2MoE(nn.Module):
         self._use_dual_stream = False
         self.alt_stream = alt_stream
         self.prefix = prefix
+        self.is_rocm_aiter_fusion_shared_expert_enabled = (
+            is_rocm_aiter_fusion_shared_expert_enabled(
+                shared_expert_prefix=f"{prefix}.shared_experts",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
+        )
 
         if config.n_shared_experts is not None:
-            if not is_rocm_aiter_fusion_shared_expert_enabled():
+            if not self.is_rocm_aiter_fusion_shared_expert_enabled:
                 tbo_active = get_current_atom_config().enable_tbo
                 if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                     self._use_dual_stream = True
@@ -945,7 +951,7 @@ class DeepseekV2MoE(nn.Module):
         shared_output = None
         if (
             self.n_shared_experts is not None
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             shared_output = self.shared_experts(hidden_states)
 
@@ -2207,11 +2213,7 @@ class DeepseekV2Model(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
-                else 0
-            ),
+            + (self.config.n_shared_experts or 0),
         )
 
 
