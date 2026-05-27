@@ -8,6 +8,7 @@ import torch
 from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton import (
+    batched_gemm_a16wfp4 as _fp4_bmm_module,
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _fp8_bmm_module,
 )
 from atom.config import get_current_atom_config
@@ -24,27 +25,24 @@ from atom.utils import envs
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
-
 logger = logging.getLogger("atom")
 
 functools_partial = functools.partial
 _aiter_triton_fp8_bmm = (
     _fp8_bmm_module.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
 )
-batched_gemm_a16wfp4 = None
+batched_gemm_a16wfp4 = _fp4_bmm_module.batched_gemm_a16wfp4
 fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 fused_gemm_afp4wfp4_preshuffle_split_cat = None
 
 
 if use_triton_gemm():
     try:
-        from aiter.ops.triton import batched_gemm_a16wfp4 as _fp4_bmm_module
         from aiter.ops.triton import (
             fused_gemm_a8w8_blockscale_split_cat as _fp8_split_cat,
         )
         from aiter.ops.triton import fused_gemm_afp4wfp4_split_cat as _fp4_split_cat
 
-        batched_gemm_a16wfp4 = _fp4_bmm_module.batched_gemm_a16wfp4
         fused_gemm_a8w8_blockscale_preshuffle_split_cat = (
             _fp8_split_cat.fused_gemm_a8w8_blockscale_preshuffle_split_cat
         )
@@ -128,6 +126,7 @@ def reorg_kvcache(
     assert reorganized_k_pe.shape[0] == sum_seq_len
     assert max_seq_len_check == max_seq_len
     return reorganized_kv_c_normed, reorganized_k_pe
+
 
 class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
     attn_backend_cls = AiterMlaBackendForVllm

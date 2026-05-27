@@ -384,8 +384,6 @@ class AiterMlaSparseMetadataForVllm:
     reduce_partial_map: torch.Tensor | None = None
 
 
-
-
 # vLLM metadata builders
 class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
     """vLLM-only MHA metadata builder."""
@@ -1322,7 +1320,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
     """vLLM-only metadata builder for sparse MLA main attention."""
 
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
 
     def __init__(
@@ -1349,6 +1347,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         parallel_config = config.parallel_config
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
@@ -1406,6 +1405,15 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
                 sparse_attn, "sparse_kv_indices_buffer"
             ):
                 sparse_attn.sparse_kv_indices_buffer = self.paged_kv_indices
+            if indexer is None or sparse_attn is None:
+                logger.warning(
+                    "Sparse MLA buffer binding incomplete for %s "
+                    "(indexer=%s, sparse_attn=%s, owner_atom_config=%s)",
+                    attention_prefix,
+                    indexer is not None,
+                    sparse_attn is not None,
+                    owner_atom_config is not None,
+                )
 
         (
             (work_meta_data_size, work_meta_data_type),
@@ -1541,7 +1549,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
 
 
 class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
 
     def __init__(
@@ -1576,6 +1584,12 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(
             self.model_config.max_model_len
         )
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+        # Determine if this builder is for draft model layers (MTP).
+        # Draft model layers have layer indices >= num_hidden_layers.
+        # The draft model itself does not do speculative decoding, so
+        # num_speculative_tokens should be 0 for its builders.
         is_draft_layer = False
         if layer_names:
             num_hidden_layers = config.model_config.hf_config.num_hidden_layers
@@ -1591,7 +1605,6 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                 if self.vllm_config.speculative_config
                 else 0
             )
-        self.reorder_batch_threshold += self.num_speculative_tokens
 
         sm_count = num_compute_units(self.device.index)
         self.num_sms = sm_count
