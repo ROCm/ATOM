@@ -9,7 +9,7 @@ use crate::{
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
-    python::atom_standalone::AtomStandaloneRuntime,
+    routers::atom_standalone::AtomStandaloneRuntime,
     server::ServerConfig,
 };
 

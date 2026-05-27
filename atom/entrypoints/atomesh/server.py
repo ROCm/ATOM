@@ -21,50 +21,8 @@ engine: Any | None = None
 tokenizer: Any | None = None
 
 
-def ensure_atom_source_on_path() -> None:
-    atom_source_root = Path(__file__).resolve().parents[4]
-    atom_source_root_str = str(atom_source_root)
-    if atom_source_root_str in sys.path:
-        sys.path.remove(atom_source_root_str)
-    sys.path.insert(0, atom_source_root_str)
-
-    loaded_atom = sys.modules.get("atom")
-    if loaded_atom is not None and not module_loaded_from(
-        loaded_atom, atom_source_root
-    ):
-        for module_name in list(sys.modules):
-            if module_name == "atom" or module_name.startswith("atom."):
-                del sys.modules[module_name]
-    importlib.invalidate_caches()
-
-
-def module_loaded_from(module: Any, root: Path) -> bool:
-    paths: list[str] = []
-    module_file = getattr(module, "__file__", None)
-    if module_file:
-        paths.append(module_file)
-    module_path = getattr(module, "__path__", None)
-    if module_path:
-        paths.extend(str(path) for path in module_path)
-    spec = getattr(module, "__spec__", None)
-    locations = getattr(spec, "submodule_search_locations", None)
-    if locations:
-        paths.extend(str(path) for path in locations)
-    if not paths:
-        return False
-    return any(is_relative_to(Path(path).resolve(), root) for path in paths)
-
-
-def is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
 def import_atomesh_runner() -> Any:
-    # Provided by the Rust PyO3 module in atom/mesh/src/python/mod.rs.
+    # Provided by the Rust PyO3 module in atom/mesh/src/python.rs.
     try:
         import atomesh_runner
 
@@ -73,7 +31,8 @@ def import_atomesh_runner() -> Any:
         if exc.name != "atomesh_runner":
             raise ModuleNotFoundError(f"Module named 'atomesh_runner' not found: {exc}")
 
-    mesh_root = Path(__file__).resolve().parents[2]
+    atom_source_root = Path(__file__).resolve().parents[3]
+    mesh_root = atom_source_root / "atom" / "mesh"
     candidates = [
         mesh_root / "target" / "debug" / "libmesh.so",
         mesh_root / "target" / "release" / "libmesh.so",
@@ -126,7 +85,7 @@ def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
 
 
 def initialize_standalone_service(args: argparse.Namespace) -> Any:
-    from atom_standalone_service import AtomStandaloneService
+    from atom.entrypoints.atomesh.atom_standalone_service import AtomStandaloneService
 
     global engine, tokenizer
     return AtomStandaloneService(
@@ -185,7 +144,6 @@ def launch_atomesh(atomesh_runner: Any, raw_args: list[str]) -> None:
 
 
 def main() -> None:
-    ensure_atom_source_on_path()
     raw_args = sys.argv[1:]
     for arg in raw_args:
         if arg in ("--version", "-V"):
@@ -194,7 +152,6 @@ def main() -> None:
         if arg == "--version-verbose":
             print_version(verbose=True)
             return
-
     # `python xxx mesh-only ...` starts mesh routing;
     # other invocations default to ATOM standalone.
     use_atom_standalone = "mesh-only" not in raw_args

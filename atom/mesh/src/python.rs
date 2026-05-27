@@ -3,13 +3,13 @@ use std::sync::Arc;
 use clap::Parser;
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
 
-pub mod atom_standalone;
-
 use crate::{
-    cliargs::{filter_prefill_args_from, parse_prefill_args_from, 
-        filter_decode_args_from, parse_decode_args_from, Backend, Cli, CliArgs, Commands},
+    cliargs::{
+        filter_decode_args_from, filter_prefill_args_from, parse_decode_args_from,
+        parse_prefill_args_from, Backend, Cli, CliArgs, Commands,
+    },
     config::RoutingMode,
-    python::atom_standalone::AtomStandaloneRuntime,
+    routers::atom_standalone::AtomStandaloneRuntime,
     server::{self, ServerConfig},
     version,
 };
@@ -72,9 +72,7 @@ pub fn launch_mesh(
     server_config.router_config.atom_standalone = runtime.is_some();
     server_config.atom_standalone_runtime = runtime;
 
-    py.detach(move || {
-        startup_runtime(server_config)
-    })
+    py.detach(move || startup_runtime(server_config))
 }
 
 fn startup_runtime(server_config: ServerConfig) -> PyResult<()> {
@@ -85,7 +83,10 @@ fn startup_runtime(server_config: ServerConfig) -> PyResult<()> {
         .map_err(|e| PyRuntimeError::new_err(format!("ATOM mesh exited with error: {e}")))
 }
 
-fn build_server_config(cli_args: &CliArgs, prefill_urls: Vec<(String, Option<u16>)>) -> PyResult<PyServerConfig> {
+fn build_server_config(
+    cli_args: &CliArgs,
+    prefill_urls: Vec<(String, Option<u16>)>,
+) -> PyResult<PyServerConfig> {
     let router_config = cli_args
         .to_router_config(prefill_urls)
         .map_err(|e| PyRuntimeError::new_err(format!("Invalid router config: {e}")))?;
@@ -105,8 +106,11 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
     let decode_urls = parse_decode_args_from(&args);
     let filtered_args = filter_prefill_args_from(&args);
     let filtered_args = filter_decode_args_from(&filtered_args);
+    let mut clap_args = Vec::with_capacity(filtered_args.len() + 1);
+    clap_args.push("atomesh".to_string());
+    clap_args.extend(filtered_args);
 
-    let cli = Cli::parse_from(filtered_args);
+    let cli = Cli::parse_from(clap_args);
     let cli_args = match cli.command {
         Some(Commands::Launch { args }) => args,
         None => cli.router_args,
