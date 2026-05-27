@@ -166,8 +166,6 @@ export MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_NUM_MAX_DISPATCH_TOKENS_PER_
 
 rm -rf /root/.cache/atom/* 2>/dev/null || true
 
-pip install msgpack msgspec quart 2>/dev/null || true
-
 python3 -m atom.entrypoints.openai_server \\
     --model "${MODEL_PATH}" \\
     --host 0.0.0.0 --server-port "${P_PORT}" \\
@@ -200,8 +198,6 @@ export MORI_DISPATCH_DTYPE=${MORI_DISPATCH_DTYPE}
 export MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}
 
 rm -rf /root/.cache/atom/* 2>/dev/null || true
-
-pip install msgpack msgspec quart 2>/dev/null || true
 
 python3 -m atom.entrypoints.openai_server \\
     --model "${MODEL_PATH}" \\
@@ -513,19 +509,33 @@ wait_endpoint "$DECODE_NODE"    "http://${DECODE_IP}:${DECODE_PORT}/health" \
 # reports kv_role != "kv_producer").
 echo ""
 echo "=== verifying /kv_transfer_info ==="
-for spec in "prefill0:${PREFILL_NODE_0}:${PREFILL0_IP}:${PREFILL0_PORT}:kv_producer" \
-            "prefill1:${PREFILL_NODE_1}:${PREFILL1_IP}:${PREFILL1_PORT}:kv_producer" \
-            "decode:${DECODE_NODE}:${DECODE_IP}:${DECODE_PORT}:kv_consumer"; do
-    IFS=: read -r role node ip port want <<<"$spec"
-    info=$(srun --nodelist="$node" --nodes=1 --ntasks=1 bash -lc \
-        "curl -sf http://${ip}:${port}/kv_transfer_info")
+verify_kv_info() {
+    local role="$1" node="$2" ip="$3" port="$4" want="$5"
+    local info="" got="" attempt=0 max_attempts=3
+    while [[ $attempt -lt $max_attempts ]]; do
+        attempt=$((attempt + 1))
+        info=$(srun --nodelist="$node" --nodes=1 --ntasks=1 bash -c \
+            "curl -sf http://${ip}:${port}/kv_transfer_info" 2>&1) && break
+        echo "[kv_info][${role}] attempt ${attempt}/${max_attempts} failed (rc=$?): ${info:0:200}" >&2
+        sleep 5
+    done
+    if [[ -z "$info" ]]; then
+        echo "ERROR: ${role} /kv_transfer_info returned empty after ${max_attempts} attempts" >&2
+        return 1
+    fi
     echo "[kv_info][${role}] ${info}"
-    got=$(echo "$info" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("kv_role",""))')
+    got=$(echo "$info" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("kv_role",""))' 2>&1) || {
+        echo "ERROR: ${role} failed to parse kv_transfer_info JSON: ${info:0:200}" >&2
+        return 1
+    }
     if [[ "$got" != "$want" ]]; then
         echo "ERROR: ${role} kv_role mismatch: want=${want} got=${got}" >&2
-        exit 1
+        return 1
     fi
-done
+}
+verify_kv_info prefill0  "$PREFILL_NODE_0" "$PREFILL0_IP"  "$PREFILL0_PORT" kv_producer
+verify_kv_info prefill1  "$PREFILL_NODE_1" "$PREFILL1_IP"  "$PREFILL1_PORT" kv_producer
+verify_kv_info decode    "$DECODE_NODE"    "$DECODE_IP"    "$DECODE_PORT"   kv_consumer
 
 # ======================== 5. start router (detached) ========================
 echo ""

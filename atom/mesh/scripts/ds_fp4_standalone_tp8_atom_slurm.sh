@@ -126,8 +126,6 @@ export LD_LIBRARY_PATH=/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 rm -rf /root/.cache/atom/* 2>/dev/null || true
 
-pip install msgpack msgspec quart 2>/dev/null || true
-
 python3 -m atom.entrypoints.openai_server \
     --model "${MODEL_PATH}" \
     --host 0.0.0.0 --server-port "${PORT}" \
