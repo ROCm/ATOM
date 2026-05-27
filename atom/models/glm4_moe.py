@@ -36,6 +36,7 @@ from .utils import (
     maybe_prefix,
 )
 
+ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
@@ -187,7 +188,7 @@ class Glm4MoE(nn.Module):
         ):
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -251,6 +252,7 @@ class Glm4MoeAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=atom_config.quant_config,
+            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -267,9 +269,11 @@ class Glm4MoeAttention(nn.Module):
         if self.enable_qk_norm_rope_cache_quant_fusion:
             cos = self.rotary_emb.cos_cache
             sin = self.rotary_emb.sin_cache
-            joint_cache = torch.cat((cos, sin), dim=-1).view(cos.size(0), -1)
+            joint_cache = torch.cat((cos, sin), dim=-1)
             self.rotary_emb.register_buffer(
-                "cos_sin_cache", joint_cache.contiguous(), persistent=False
+                "cos_sin_cache",
+                joint_cache.view(joint_cache.size(0), -1).contiguous(),
+                persistent=False,
             )
         self.q_norm = None
         self.k_norm = None
@@ -301,7 +305,7 @@ class Glm4MoeAttention(nn.Module):
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.enable_qk_norm_rope_cache_quant_fusion:
             attn_output = self.attn(
-                query=q, key=k, value=v, positions=positions, qkv=qkv
+                query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
             )
         else:
             if self.use_qk_norm:
@@ -309,9 +313,9 @@ class Glm4MoeAttention(nn.Module):
                 q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(
                     q.shape
                 )
-                k = self.k_norm(k.reshape(-1, self.num_kv_heads, self.head_dim)).reshape(
-                    k.shape
-                )
+                k = self.k_norm(
+                    k.reshape(-1, self.num_kv_heads, self.head_dim)
+                ).reshape(k.shape)
 
             # q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v, positions, **model_kwargs)
@@ -371,12 +375,21 @@ class Glm4MoeDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=atom_config.quant_config,
+                reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                 prefix=f"{prefix}.mlp",
             )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION
+            and self.layer_idx > 0
+            and self.layer_idx < config.num_hidden_layers,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
         self.routed_scaling_factor = config.routed_scaling_factor
 
@@ -439,7 +452,11 @@ class Glm4MoeModel(nn.Module):
         )
 
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            )
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
