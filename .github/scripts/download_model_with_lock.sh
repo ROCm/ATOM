@@ -46,14 +46,14 @@ print_dir_snapshot() {
   local size
   local file_count
   size="$(du -sh "${dir}" 2>/dev/null | awk '{print $1}')"
-  file_count="$(find "${dir}" -type f 2>/dev/null | wc -l | tr -d ' ')"
-  log "Directory snapshot for ${dir}: size=${size:-0} files=${file_count:-0}"
-  find "${dir}" -maxdepth 2 -type f 2>/dev/null | sort | head -20 | sed 's/^/[model-download]   /' || true
+  file_count="$(find "${dir}" \( -type f -o -type l \) 2>/dev/null | wc -l | tr -d ' ')"
+  log "Directory snapshot for ${dir}: size=${size:-0} files_or_links=${file_count:-0}"
+  find "${dir}" -maxdepth 2 \( -type f -o -type l \) 2>/dev/null | sort | head -20 | sed 's/^/[model-download]   /' || true
 }
 
 has_model_payload() {
   local dir="$1"
-  find "${dir}" -type f \
+  find "${dir}" \( -type f -o -type l \) \
     ! -name 'config.json' \
     ! -name '.atom_download_complete' \
     ! -name '.download-complete' \
