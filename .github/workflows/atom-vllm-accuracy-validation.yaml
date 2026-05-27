@@ -35,7 +35,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
-          - DeepSeek-V3.2-FP8 MTP TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -72,7 +72,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
-          - DeepSeek-V3.2-FP8 MTP TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -109,7 +109,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
-          - DeepSeek-V3.2-FP8 MTP TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -146,7 +146,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
-          - DeepSeek-V3.2-FP8 MTP TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -183,7 +183,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
-          - DeepSeek-V3.2-FP8 MTP TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -220,7 +220,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
-          - DeepSeek-V3.2-FP8 MTP TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -257,7 +257,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
-          - DeepSeek-V3.2-FP8 MTP TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -294,7 +294,7 @@ on:
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
-          - DeepSeek-V3.2-FP8 MTP TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -611,10 +611,10 @@ jobs:
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
-                  "toggle_env": "RUN_DSV32_FP8_MTP_TP8",
-                  "model_name": "DeepSeek-V3.2-FP8 MTP TP8",
+                  "toggle_env": "RUN_DSV32_FP8_MTP_TP4",
+                  "model_name": "DeepSeek-V3.2-FP8 MTP TP4",
                   "model_path": "deepseek-ai/DeepSeek-V3.2",
-                  "extra_args": "--tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
@@ -781,8 +781,8 @@ jobs:
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
                   "env_vars": "",
               },
-              "DeepSeek-V3.2-FP8 MTP TP8": {
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
+              "DeepSeek-V3.2-FP8 MTP TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "env_vars": "",
               },
               "gpt-oss-120b TP1": {
