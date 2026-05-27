@@ -1448,7 +1448,9 @@ jobs:
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
 
       - name: Download model if needed
+        timeout-minutes: 150
         run: |
+          set -euo pipefail
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
@@ -1460,14 +1462,27 @@ jobs:
             model_dir="/models/${model_dir}"
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "/models directory found, downloading model to ${model_dir}"
-            if ! $CONTAINER_ENGINE exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download \"${MODEL_SOURCE_PATH}\" --local-dir \"$model_dir\""; then
+            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            if ! $CONTAINER_ENGINE exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${MODEL_SOURCE_PATH}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+              "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
               echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
               exit 1
             fi
           else
             echo "/models directory not mounted; skipping model download"
           fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "2h"
+          MODEL_LOCK_WAIT_SECONDS: "1800"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Resolve OOT model path
         run: |
