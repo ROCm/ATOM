@@ -286,6 +286,16 @@ def gdn_decode_update_lossy_fast_fwd_kernel(
 
     state_idx = tl.load(state_indices + i_n).to(tl.int64)
     if state_idx < 0:
+        # Padded / idle slot (e.g. PAD_SLOT_ID = -1 from SGLang's
+        # mamba_cache_indices). Skip the state load/store and write zeros so
+        # downstream ops that consume the full out buffer do not see
+        # uninitialized memory.
+        out_offsets = (i_n * HV + i_hv) * V + o_v
+        tl.store(
+            out + out_offsets,
+            tl.zeros([BV], dtype=out.dtype.element_ty),
+            mask=mask_v,
+        )
         return
 
     state_base = ((state_idx * HV + i_hv) * K) * V
