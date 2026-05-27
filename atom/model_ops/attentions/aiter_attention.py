@@ -649,7 +649,13 @@ class AiterAttentionMetadataBuilder:
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
-        positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+        mrope_positions = self._build_mrope_decode_positions(
+            batch, context_lens, max_seqlen_q
+        )
+        if mrope_positions is not None:
+            positions = mrope_positions
+        else:
+            positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,

@@ -209,8 +209,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         if model_arch in _MTP_MASK_INPUT_ARCH:
             self._adapt_mtp_layers_for_vllm()
-        # Mirror nested attributes required by vLLM speculative decoding.
-        self._expose_spec_decode_attrs()
+        if self.is_mtp:
+            # Mirror nested attributes required by vLLM speculative decoding.
+            self._expose_spec_decode_attrs()
 
         # For sparse MLA, register the Indexer's DeepseekV32IndexerCache as
         # a virtual subclass of vLLM's AttentionLayerBase so vLLM can discover
@@ -330,6 +331,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # their prefix parameter (e.g. "model.layers.0.self_attn.attn").
         vllm_sfc = self.vllm_compilation_config.static_forward_context
         for module in indexer_caches:
+            # MTP draft models own a separate atom_config/static_forward_context.
+            # Keep that ownership on the cache so metadata builders can bind
+            # sparse buffers back to the draft modules instead of the main model.
+            module.atom_config = self.atom_config
             prefix = module.prefix
             if prefix not in vllm_sfc:
                 vllm_sfc[prefix] = module

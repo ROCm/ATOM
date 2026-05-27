@@ -51,6 +51,7 @@ python3 -m sglang.launch_server \
     --port 8000 \
     --trust-remote-code \
     --tensor-parallel-size 4 \
+    --attention-backend aiter \
     --kv-cache-dtype fp8_e4m3 \
     --mem-fraction-static 0.8 \
     --page-size 1 \
@@ -102,6 +103,7 @@ export SGLANG_USE_AITER=1
 export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+export SGLANG_ENABLE_SPEC_V2=1
 TP_SIZE=8
 MTP=${MTP:-1}
 SPECULATIVE_NUM_DRAFT_TOKENS=${SPECULATIVE_NUM_DRAFT_TOKENS:-$((MTP + 1))}

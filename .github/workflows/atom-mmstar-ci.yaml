@@ -1,0 +1,295 @@
+name: ATOM Test
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  schedule:
+    # Daily at 03:00 Beijing time (19:00 UTC on the previous day).
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+    # Manual runs use GitHub Actions' built-in branch dropdown ("Use workflow
+    # from") as the ATOM branch selector.
+    inputs:
+      run_qwen35_35b_a3b_fp8:
+        description: "Qwen3.5-35B-A3B-FP8 MMStar"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  # Keep scheduled main runs from blocking branch/PR validation.
+  group: ATOM-MMStar-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  ATOM_BASE_IMAGE: rocm/atom-dev:latest
+
+jobs:
+  prepare-mmstar-matrix:
+    name: Prepare MMStar model matrix
+    runs-on: ubuntu-latest
+    outputs:
+      model_matrix: ${{ steps.matrix.outputs.model_matrix }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Resolve model matrix
+        id: matrix
+        env:
+          RUN_QWEN35_35B_A3B_FP8: ${{ inputs.run_qwen35_35b_a3b_fp8 }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import sys
+
+          event = os.environ["GITHUB_EVENT_NAME"]
+          models = [
+              {
+                  "toggle_env": "RUN_QWEN35_35B_A3B_FP8",
+                  "model_name": "Qwen3.5-35B-A3B-FP8 MMStar",
+                  "model_path": "Qwen/Qwen3.5-35B-A3B-FP8",
+                  "extra_args": "--no-enable_prefix_caching",
+                  "env_vars": "",
+                  "runner": "linux-atom-mi35x-1",
+                  "mmstar_limit": "",
+                  "mmstar_threshold": 0.72,
+                  "max_new_tokens": 8192,
+              },
+          ]
+
+          selected = []
+          for model in models:
+              enabled = event != "workflow_dispatch" or os.environ.get(model["toggle_env"], "").lower() == "true"
+              if enabled:
+                  selected.append({k: v for k, v in model.items() if k != "toggle_env"})
+
+          if event == "workflow_dispatch" and not selected:
+              print("No models selected for manual MMStar run.", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"model_matrix={json.dumps({'include': selected})}")
+          PY
+
+  mmstar-model-accuracy:
+    name: MMStar Accuracy (${{ matrix.model_name }})
+    needs: [prepare-mmstar-matrix]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-mmstar-matrix.outputs.model_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    env:
+      CONTAINER_NAME: atom_mmstar_validation_${{ strategy.job-index }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Docker Login
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+      - name: Set HF_TOKEN
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
+
+      - name: Prepare model cache mount
+        run: |
+          MODEL_CACHE_MOUNT=""
+          MODEL_CACHE_DESC="container-local /models (no host cache mount)"
+
+          if [ -d "/models" ]; then
+            MODEL_CACHE_MOUNT="-v /models:/models"
+            MODEL_CACHE_DESC="/models (host mount)"
+          else
+            echo "Warning: /models directory not found on runner; using container-local /models."
+          fi
+
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
+          echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
+
+      - name: Clean up old containers
+        run: |
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+      - name: Download latest aiter wheel
+        run: |
+          set -euo pipefail
+          mkdir -p aiter-whl
+          rm -f aiter-whl/amd_aiter*.whl
+
+          manifest_url="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json?ts=$(date +%s)"
+          manifest_file="$(mktemp)"
+          curl -fsSL -H "Cache-Control: no-cache" "${manifest_url}" -o "${manifest_file}"
+
+          wheel_url="$(jq -r '.wheel_url // empty' "${manifest_file}")"
+          wheel_name="$(jq -r '.wheel_name // empty' "${manifest_file}")"
+          if [ -z "${wheel_url}" ] || [ -z "${wheel_name}" ]; then
+            echo "Invalid aiter wheel manifest:"
+            cat "${manifest_file}"
+            exit 1
+          fi
+
+          python3 -c 'import sys; from urllib.parse import quote, unquote, urlsplit, urlunsplit; parts = urlsplit(sys.argv[1]); encoded_path = "/".join(quote(unquote(segment), safe="") for segment in parts.path.split("/")); print(urlunsplit((parts.scheme, parts.netloc, encoded_path, parts.query, parts.fragment)))' "${wheel_url}" > /tmp/aiter_wheel_url.txt
+          resolved_wheel_url="$(cat /tmp/aiter_wheel_url.txt)"
+          echo "Downloading aiter wheel: ${wheel_name}"
+          curl -fsSL "${resolved_wheel_url}" -o "aiter-whl/${wheel_name}"
+
+      - name: Start validation container
+        run: |
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+
+          cat > /tmp/mmstar_env_file.txt << 'EOF'
+          ${{ matrix.env_vars }}
+          EOF
+
+          docker pull "${ATOM_BASE_IMAGE}"
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+            $MODEL_MOUNT \
+            -w /workspace \
+            --ipc=host --group-add video \
+            --shm-size=16G \
+            --privileged \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            --env-file /tmp/mmstar_env_file.txt \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            --name "$CONTAINER_NAME" \
+            "${ATOM_BASE_IMAGE}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install aiter wheel
+        run: |
+          AITER_WHL="$(ls -t aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)"
+          if [ -z "${AITER_WHL}" ]; then
+            echo "ERROR: No amd_aiter wheel found under aiter-whl/"
+            exit 1
+          fi
+          WHL_NAME="$(basename "${AITER_WHL}")"
+          docker cp "${AITER_WHL}" "$CONTAINER_NAME:/tmp/${WHL_NAME}"
+          docker exec "$CONTAINER_NAME" bash -lc "
+            set -euo pipefail
+            python3 -m pip uninstall -y amd-aiter || true
+            python3 -m pip install --no-deps /tmp/${WHL_NAME}
+            python3 -m pip show amd-aiter
+          "
+
+      - name: Install ATOM without dependency resolution
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            cd /workspace
+            git config --global --add safe.directory /workspace
+            python3 -m pip uninstall -y atom || true
+            python3 -m pip install -e . --no-deps
+            python3 -m pip show atom
+          '
+
+      - name: Install lmms-eval without changing torch stack
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            cd /workspace
+            bash .github/scripts/install_lmms_eval_no_deps.sh
+          '
+
+      - name: Download model if needed
+        timeout-minutes: 150
+        run: |
+          set -euo pipefail
+          model_dir="/models/${{ matrix.model_path }}"
+          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+            if ! docker exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${{ matrix.model_path }}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+              "$CONTAINER_NAME" \
+              bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+              exit 1
+            fi
+            echo "MMSTAR_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
+          else
+            echo "/models directory not mounted; using model id/path directly"
+            echo "MMSTAR_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+          fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "3h"
+          MODEL_LOCK_WAIT_SECONDS: "7200"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
+
+      - name: Run MMStar accuracy
+        timeout-minutes: 180
+        env:
+          MMSTAR_LIMIT: ${{ matrix.mmstar_limit }}
+          MMSTAR_THRESHOLD: ${{ matrix.mmstar_threshold }}
+          MAX_NEW_TOKENS: ${{ matrix.max_new_tokens }}
+          EXTRA_SERVER_ARGS: ${{ matrix.extra_args }}
+        run: |
+          docker exec \
+            -e MODEL_PATH="${MMSTAR_RESOLVED_MODEL_PATH}" \
+            -e LIMIT="${MMSTAR_LIMIT}" \
+            -e MAX_NEW_TOKENS="${MAX_NEW_TOKENS}" \
+            -e MMSTAR_THRESHOLD="${MMSTAR_THRESHOLD}" \
+            -e EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS}" \
+            -e RESULT_DIR="/tmp/atom_mmstar_results" \
+            "$CONTAINER_NAME" \
+            bash -lc 'bash /workspace/.github/scripts/atom_mmstar_ci.sh'
+
+      - name: Collect summary
+        if: success()
+        run: |
+          echo "MMStar summary for ${{ matrix.model_name }}:" >> "$GITHUB_STEP_SUMMARY"
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Filter\|/,/^$/ { if (NF > 0) print }' /tmp/atom_mmstar_client.log" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          docker cp "$CONTAINER_NAME":/tmp/atom_mmstar_server.log ./atom_mmstar_server.log || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_mmstar_client.log ./atom_mmstar_client.log || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_mmstar_results ./atom_mmstar_results || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmstar-validation-${{ matrix.model_name }}-${{ github.run_id }}
+          path: |
+            atom_mmstar_server.log
+            atom_mmstar_client.log
+            atom_mmstar_results
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop "$CONTAINER_NAME" || true
+          docker rm "$CONTAINER_NAME" || true

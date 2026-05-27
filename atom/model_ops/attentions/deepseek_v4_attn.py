@@ -346,6 +346,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Non-spec (max_spec_steps=0) → ring_size = K_pool: no rejections ever
         # happen, so the bare commit pool is sufficient (causal writes mean
         # the alias slot is never read before being overwritten).
+        # `ring_extra` is slack beyond K_pool for the compressor ring buffer.
+        # Validated via `ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL=1` (100% reject =
+        # worst case for aliasing): even at ring_extra=0, decode commits the
+        # correct next token, confirming no read-from-stale slot collision.
+        # See `Adding a further +1 (the old layout) was unnecessary slack` below.
         ring_extra = self.max_spec_steps
         self.csa_main_state_shape = (2 * 4 + ring_extra, 2 * self.head_dim)
         self.csa_idx_state_shape = (2 * 4 + ring_extra, 2 * self.index_head_dim)
@@ -1268,11 +1273,44 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return attn_metadata, positions
 
+    def _get_ubatch_compress_plan_buffers(
+        self, ubatch_idx: int
+    ) -> dict[int, dict[str, "CpuGpuBuffer"]]:
+
+        if not hasattr(self, "_ubatch_compress_plan_buffers"):
+            self._ubatch_compress_plan_buffers: dict[
+                int, dict[int, dict[str, CpuGpuBuffer]]
+            ] = {}
+        cached = self._ubatch_compress_plan_buffers.get(ubatch_idx)
+        if cached is not None:
+            return cached
+
+        var = self.model_runner.forward_vars
+        pool: dict[int, dict[str, CpuGpuBuffer]] = {}
+        for ratio, _ in self._unique_compress_ratios_overlap:
+            tmpl_c = var[f"v4_compress_plan_{ratio}"]
+            tmpl_w = var[f"v4_write_plan_{ratio}"]
+            buf_c = CpuGpuBuffer(
+                *tmpl_c.cpu.shape, dtype=tmpl_c.cpu.dtype, device=tmpl_c.gpu.device
+            )
+            buf_w = CpuGpuBuffer(
+                *tmpl_w.cpu.shape, dtype=tmpl_w.cpu.dtype, device=tmpl_w.gpu.device
+            )
+            # Sentinel-fill so any unused tail rows behave like the main pool.
+            buf_c.cpu.fill_(-1)
+            buf_c.copy_to_gpu()
+            buf_w.cpu.fill_(-1)
+            buf_w.copy_to_gpu()
+            pool[ratio] = {"compress": buf_c, "write": buf_w}
+        self._ubatch_compress_plan_buffers[ubatch_idx] = pool
+        return pool
+
     def build_ubatch_prefill_metadata(
         self,
         attn_metadata: AttentionMetaData,
         ub_slice,
         padded_bs: int,
+        ubatch_idx: int = 0,
     ) -> AttentionMetaData_DSV4:
         """Split prefill AttentionMetaData for V4 TBO micro-batches."""
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
@@ -1305,17 +1343,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         context_lens_np = np.asarray(
             var["context_lens"].np[rs.start : rs.stop], dtype=np.int32
         ).copy()
-        device = src.state_slot_mapping.device
-
         from atom.model_ops.v4_kernels import make_compress_plans
 
         if self._unique_compress_ratios_overlap:
+            # Per-ubatch plan buffers — sharing the main pool would let
+            # ubatch 1's CPU build overwrite ubatch 0's before ubatch 0
+            # launches its compressor kernel. TBO prefill is eager-only,
+            # so `decode_capacity_per_ratio=None` (tight n_compress slice).
+            ub_plan_buffers = self._get_ubatch_compress_plan_buffers(ubatch_idx)
             ub_attn.compress_plans = make_compress_plans(
                 np.ascontiguousarray(extend_lens_np, dtype=np.int32),
                 np.ascontiguousarray(context_lens_np, dtype=np.int32),
                 self._unique_compress_ratios_overlap,
-                device,
-                plan_buffers=None,
+                plan_buffers=ub_plan_buffers,
                 decode_capacity_per_ratio=None,
             )
         else:
@@ -1351,6 +1391,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
             # start_pos = position of first token of each seq in this ubatch.
             ub_start_pos_per_seq_np = positions_np[ub_cu[:ub_num_reqs]]
+            ub_positions_gpu = var["positions"].gpu[ts.start : ts.stop]
+            ub_block_tables_gpu = var["block_tables"].gpu[rs.start : rs.stop]
+            ub_cu_q_per_seq_gpu = torch.from_numpy(
+                np.ascontiguousarray(ub_cu[:ub_num_reqs], dtype=np.int32)
+            ).to(self.device, non_blocking=True)
             self._build_paged_prefill_meta(
                 ub_attn,
                 positions_np,
@@ -1360,6 +1405,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 ub_attn.state_slot_mapping_cpu,
                 ub_num_reqs,
                 ub_num_tokens,
+                positions_gpu=ub_positions_gpu,
+                cu_q_per_seq_gpu=ub_cu_q_per_seq_gpu,
+                block_tables_gpu=ub_block_tables_gpu,
             )
         finally:
             bt[:ub_num_reqs] = saved_bt
@@ -1735,6 +1783,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         state_slot_mapping_cpu: np.ndarray,
         scheduled_bs: int,
         total_tokens: int,
+        *,
+        positions_gpu: Optional[torch.Tensor] = None,
+        cu_q_per_seq_gpu: Optional[torch.Tensor] = None,
+        block_tables_gpu: Optional[torch.Tensor] = None,
     ) -> None:
         """Build per-fwd index buffers consumed by sparse_attn_v4_paged_prefill.
 
@@ -1864,10 +1916,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the kernel was designed/tested against int32 (downstream paged
         # offsets stored in int32 buffers; int32 throughout avoids mixed-
         # dtype Triton arithmetic that can silently truncate).
-        positions_gpu = var["positions"].gpu[:T]
-        cu_q_per_seq_gpu = var["cu_seqlens_q"].gpu[:scheduled_bs]
+        if positions_gpu is None:
+            positions_gpu = var["positions"].gpu[:T]
+        if cu_q_per_seq_gpu is None:
+            cu_q_per_seq_gpu = var["cu_seqlens_q"].gpu[:scheduled_bs]
+        if block_tables_gpu is None:
+            block_tables_gpu = var["block_tables"].gpu[:scheduled_bs]
         state_slot_per_seq_gpu = attn_metadata.state_slot_mapping[:scheduled_bs]
-        block_tables_gpu = var["block_tables"].gpu[:scheduled_bs]
         # batch_id_per_token is int64 in storage (PyTorch fancy-index
         # compatibility upstream); kernel uses tl.load which is dtype-agnostic
         # but cast for safety + consistency.
@@ -2242,12 +2297,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # The decode CG path uses a much tighter capacity than the prefill
         # worst case — the kernel grid is dictated by the slice of this
         # buffer that we hand to the kernel, and decode only ever needs
-        # `max_decode_tokens // ratio + max_bs` rows (vs `mnbt // ratio + bs`
-        # for prefill, which is ~13× larger at typical config). We still
-        # allocate the full prefill capacity (eager prefill needs it), but
-        # both decode capture and replay slice down to `_decode_compress_cap`
-        # so the captured grid is the decode-tight bound. capture and
-        # replay MUST use the same value (CG kernel call args are baked).
+        # `bs * ceil((1 + max_spec_steps) / ratio)` rows (vs `mnbt // ratio
+        # + bs` for prefill, which is ~13× larger at typical config). We
+        # still allocate the full prefill capacity (eager prefill needs it),
+        # but both decode capture and replay slice down to
+        # `_decode_compress_cap` so the captured grid is the decode-tight
+        # bound. capture and replay MUST use the same value (CG kernel call
+        # args are baked).
         self._decode_compress_cap: dict[int, int] = {}
         for ratio, is_overlap in self._unique_compress_ratios_overlap:
             # NOTE: this is the pool-window size (algorithm constant), NOT the
@@ -2266,12 +2322,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"v4_compress_plan_{ratio}"].copy_to_gpu()
             bufs[f"v4_write_plan_{ratio}"].cpu.fill_(-1)
             bufs[f"v4_write_plan_{ratio}"].copy_to_gpu()
-            # Decode-tight bound. Worst case = total_tokens_decode boundaries
-            # all firing simultaneously, each in its own ratio-aligned slot.
-            # `total_tokens_decode = max_decode_tokens` (= max_bs * (1+spec)).
-            # The `+ max_bs` covers per-seq alignment slack (each seq can hit
-            # at most one extra boundary when extend_len isn't ratio-aligned).
-            self._decode_compress_cap[ratio] = self.max_decode_tokens // ratio + bs
+            # Decode-tight bound: each seq's qlen-token window contains at
+            # most ceil(qlen / ratio) ratio-aligned boundaries (qlen =
+            # 1 + max_spec_steps), so total ≤ bs * ceil(qlen / ratio).
+            # The integer expression `(max_spec_steps + ratio) // ratio`
+            # is ceil((1 + max_spec_steps) / ratio).
+            #
+            # Tighter than the old `max_decode_tokens // ratio + max_bs`:
+            #   CSA r=4 MTP3 bs=256:  256 vs 512 (2× smaller)
+            #   HCA r=128 MTP3 bs=256: 256 vs 264 (8 smaller)
+            #
+            # Smaller plan slice → fewer sentinel rows the kernel skips →
+            # smaller grid → less launch + scheduling overhead.
+            per_seq_max = (self.max_spec_steps + ratio) // ratio
+            self._decode_compress_cap[ratio] = bs * per_seq_max
 
         self.model_runner.forward_vars.update(bufs)
 

@@ -316,6 +316,14 @@ def load_model(
     # it is only used in plugin mode for vllm
     loaded_weights_record: set[str] = set()
 
+    # Auto-detect weight mapper from model if not provided explicitly
+    if weights_mapper is None:
+        model_mapper = getattr(model, "hf_to_atom_mapper", None)
+        if isinstance(model_mapper, dict):
+            weights_mapper = WeightsMapper(orig_to_new_prefix=model_mapper)
+        elif isinstance(model_mapper, WeightsMapper):
+            weights_mapper = model_mapper
+
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
     skip_weight_prefixes = getattr(model, "skip_weight_prefixes", [])

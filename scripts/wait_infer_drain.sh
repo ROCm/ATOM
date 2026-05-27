@@ -32,15 +32,22 @@
 # the HTTP endpoint can fail to respond within reasonable timeout even when
 # the server is alive, producing false-positive "dead" reports).
 #
-# Usage: bash scripts/wait_infer_drain.sh [PORT] [MAX_MIN] [POLL_SEC] [LOG_FILE] [STUCK_POLLS]
-#   PORT         default 8000  (kept for API symmetry with wait_server_ready.sh; unused in offline mode)
-#   MAX_MIN      default 30    (full GSM8K 1319 typically 5-15 min on V4-Pro)
-#   POLL_SEC     default 10    (fast poll for quick hang detection)
-#   LOG_FILE     default empty (server log auto-discovered via /proc). Pass a
-#                client/workload log (e.g. benchmark.log, simple_inference.log)
-#                to add it as a secondary signal source for fault grep and
-#                mtime-based progress detection.
-#   STUCK_POLLS  default 6     (6 × 10s = 1 min of no progress → declare hang)
+# Usage: bash scripts/wait_infer_drain.sh [PORT] [MAX_MIN] [POLL_SEC] [LOG_FILE] [STUCK_POLLS] [STARTUP_MAX_MIN]
+#   PORT             default 8000  (kept for API symmetry with wait_server_ready.sh; unused in offline mode)
+#   MAX_MIN          default 30    (full GSM8K 1319 typically 5-15 min on V4-Pro)
+#   POLL_SEC         default 10    (fast poll for quick hang detection)
+#   LOG_FILE         default empty (server log auto-discovered via /proc). Pass a
+#                    client/workload log (e.g. benchmark.log, simple_inference.log)
+#                    to add it as a secondary signal source for fault grep and
+#                    mtime-based progress detection.
+#   STUCK_POLLS      default 6     (6 × 10s = 1 min of no progress → declare hang)
+#   STARTUP_MAX_MIN  default 15    (how long to wait for the workload python
+#                                   process to first appear before giving up;
+#                                   V4-Pro launchers spend minutes in GPU
+#                                   cleanup + cache prep + model load before
+#                                   exec'ing python. During this window the
+#                                   pgrep miss must NOT be interpreted as a
+#                                   clean exit.)
 #
 # Exit codes:
 #   0 — workload drained cleanly (server: client gone + no pending output;
@@ -56,7 +63,9 @@ MAX_MIN="${2:-30}"
 POLL="${3:-10}"
 LOG_FILE="${4:-}"
 STUCK_POLLS="${5:-6}"
+STARTUP_MAX_MIN="${6:-15}"
 ITERS=$(( MAX_MIN * 60 / POLL ))
+STARTUP_ITERS=$(( STARTUP_MAX_MIN * 60 / POLL ))
 
 # Match anything that indicates the eval driver is still hammering the
 # server. Extend if you use a different client.
@@ -101,6 +110,11 @@ prev_outputs=0
 prev_mtime=0
 stuck=0
 server_log=""
+# Whether we've ever observed the workload python process. Until this flips
+# to 1, a pgrep miss means "launcher script still in pre-exec setup" (GPU
+# cleanup, cache prep, model load), NOT "workload finished". Without this
+# guard the script returns DRAINED in ~10s for any V4-Pro / large-model run.
+ever_seen=0
 
 for ((i=1; i<=ITERS; i++)); do
     sleep "$POLL"
@@ -128,10 +142,22 @@ for ((i=1; i<=ITERS; i++)); do
 
     # Workload process alive? Only by process presence — no curl (HTTP can
     # false-negative under heavy load).
-    if ! pgrep -f "$SERVER_PATTERN" >/dev/null 2>&1; then
-        # No fault grep matched above + process gone = clean exit (drain).
-        # Covers both stop_atom_server (server mode) and simple_inference
-        # finishing its prompts (offline mode).
+    if pgrep -f "$SERVER_PATTERN" >/dev/null 2>&1; then
+        ever_seen=1
+    else
+        if [ "$ever_seen" -eq 0 ]; then
+            # Launcher script still in pre-exec setup (GPU cleanup, cache prep,
+            # initial model load). Don't mistake "not started yet" for "drained".
+            if [ "$i" -ge "$STARTUP_ITERS" ]; then
+                echo "[t=$((i*POLL))s] workload python never appeared in ${STARTUP_MAX_MIN} min — giving up (exit 4)"
+                exit 4
+            fi
+            echo "[t=$((i*POLL))s] waiting for workload python to exec (startup ${i}/${STARTUP_ITERS})"
+            continue
+        fi
+        # Process was seen, now gone, no fault → clean drain. Covers both
+        # stop_atom_server (server mode) and simple_inference finishing its
+        # prompts (offline mode).
         echo "[t=$((i*POLL))s] workload process exited cleanly — DRAINED"
         exit 0
     fi
