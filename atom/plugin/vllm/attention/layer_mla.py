@@ -919,9 +919,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 decode_q = get_dcp_group().all_gather(decode_q, dim=1)
 
             # call decode attn
-            attn_out, lse = self._forward_decode(
-                decode_q, kv_cache, attn_metadata
-            )
+            attn_out, lse = self._forward_decode(decode_q, kv_cache, attn_metadata)
 
             # correct dcp attn_out with lse.
             if self.dcp_world_size > 1:
