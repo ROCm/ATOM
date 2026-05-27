@@ -2,6 +2,8 @@
 
 High-performance model routing gateway for **PD (Prefill–Decode) disaggregated** LLM serving. It routes inference across heterogeneous worker fleets with cache-aware load balancing, a gRPC pipeline that keeps tokenization in Rust, and built-in reliability primitives.
 
+ATOM Mesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine, tokenizer, and OpenAI-compatible serving semantics, while Rust Mesh provides the HTTP server, request routing, lifecycle management, observability, and PyO3 bridge. This allows the same Mesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
+
 ## Features
 
 - **PD disaggregation**: Separate prefill and decode workers, independent routing policies, and optional bootstrap ports for KV transfer
@@ -49,12 +51,6 @@ cargo build --release
 
 Artifacts: `target/release/atom-mesh`, `target/release/libmesh.so`.
 
-### Verify
-
-```bash
-./target/release/atom-mesh --version
-```
-
 ## Usage
 
 ### Startup entrypoints
@@ -65,7 +61,6 @@ Use the Rust binary when routing to external workers:
 
 ```bash
 cd atom/mesh
-cargo build --release
 ./target/release/atom-mesh launch \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
@@ -74,10 +69,6 @@ cargo build --release
 Use the Python entrypoint when Python needs to own the ATOM engine and tokenizer. The Python entrypoint loads the Rust PyO3 module from `atom/mesh/target/{debug,release}/libmesh.so`, so build the Rust library first:
 
 ```bash
-cd atom/mesh
-cargo build --release
-cd ../..
-
 python atom/mesh/src/python/server.py \
   --model /path/to/model \
   --host 0.0.0.0 \
@@ -87,17 +78,21 @@ python atom/mesh/src/python/server.py \
 The Python entrypoint can also run the normal mesh router with the same mesh arguments:
 
 ```bash
-python atom/mesh/src/python/server.py launch \
+python atom/mesh/src/python/server.py mesh-only \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 ```
 
-For the Python entrypoint, `launch` selects mesh routing. Without `launch`, it defaults to ATOM standalone mode and constructs a Python-owned engine/tokenizer runtime.
+For the Python entrypoint, `mesh-only` selects mesh routing. Without `mesh-only`, it defaults to ATOM standalone mode and constructs a Python-owned engine/tokenizer runtime.
 
 ### Regular HTTP routing
 
 ```bash
 ./target/release/atom-mesh launch \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware
+
+python atom/mesh/src/python/server.py mesh-only \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 ```
@@ -111,6 +106,13 @@ For the Python entrypoint, `launch` selects mesh routing. Without `launch`, it d
   --decode http://decode1:30011 \
   --decode http://decode2:30012 \
   --prefill-policy cache_aware --decode-policy power_of_two
+
+python atom/mesh/src/python/server.py mesh-only \
+  --prefill http://prefill1:30001 9001 \
+  --prefill http://prefill2:30002 \
+  --decode http://decode1:30011 \
+  --decode http://decode2:30012 \
+  --prefill-policy cache_aware --decode-policy power_of_two
 ```
 
 Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cache transfer).
@@ -119,6 +121,12 @@ Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cac
 
 ```bash
 ./target/release/atom-mesh launch \
+  --worker-urls grpc://worker1:31001 grpc://worker2:31002 \
+  --tokenizer-path /path/to/tokenizer.json \
+  --reasoning-parser deepseek-r1 \
+  --tool-call-parser json
+
+python atom/mesh/src/python/server.py mesh-only \
   --worker-urls grpc://worker1:31001 grpc://worker2:31002 \
   --tokenizer-path /path/to/tokenizer.json \
   --reasoning-parser deepseek-r1 \
@@ -203,17 +211,13 @@ Optional API key protection for router endpoints:
 ```bash
 ./target/release/atom-mesh launch --api-key "your-secret-key" \
   --worker-urls http://worker1:8000 http://worker2:8000
+
+python atom/mesh/src/python/server.py mesh-only --api-key "your-secret-key" \
+  --worker-urls http://worker1:8000 http://worker2:8000
 ```
 
 Clients send `Authorization: Bearer <key>`. Workers declared on the CLI inherit the router key.
 
-## Development
-
-```bash
-cargo build           # debug
-cargo build --release # release
-```
-
 ## Acknowledgments and upstream
 
-[**sgl-model-gateway**](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway) is an excellent reference implementation for disaggregated model routing and high-throughput serving. ATOM Mesh builds on that design, then adapts it for the **ATOM** stack and **AMD** hardware: scheduling, defaults, and performance-related paths are tuned for AMD accelerators and typical AMD deployment constraints so the gateway remains a strong fit for AMD-centric clusters.
+[**sgl-model-gateway**](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway) remains an excellent reference for disaggregated model routing and high-throughput serving. ATOM Mesh acknowledges that work as useful inspiration, but has since been substantially reworked into an independent serving layer for the **ATOM** stack and **AMD** hardware. Its routing, scheduling, runtime integration, and performance-sensitive paths are designed around AMD accelerator deployments and ATOM-specific serving requirements.
