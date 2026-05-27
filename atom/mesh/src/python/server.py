@@ -130,21 +130,12 @@ def initialize_standalone_service(args: argparse.Namespace) -> Any:
         model_name=args.model,
     )
 
-
-def parse_engine_args(raw_args: list[str]) -> tuple[argparse.Namespace, list[str]]:
+def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
     from atom.model_engine.arg_utils import EngineArgs
 
     parser = argparse.ArgumentParser(description="ATOM Mesh Python interface")
     EngineArgs.add_cli_args(parser)
-    return parser.parse_known_args(raw_args)
-
-
-def mesh_launch_requested(args: list[str]) -> bool:
-    return "launch" in args
-
-
-def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
-    engine_args, mesh_args = parse_engine_args(raw_args)
+    engine_args, mesh_args = parser.parse_known_args(raw_args)
     parsed_args = atomesh_runner.parse_from(mesh_args)
     cli_args = parsed_args["cli_args"]
     initialize_engine(engine_args)
@@ -159,7 +150,9 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
 
 
 def launch_atomesh(atomesh_runner: Any, raw_args: list[str]) -> None:
-    parsed_args = atomesh_runner.parse_from(raw_args)
+    parsed_args = atomesh_runner.parse_from(
+        [arg for arg in raw_args if arg != "mesh-only"]
+    )
     cli_args = parsed_args["cli_args"]
     prefill_urls = parsed_args["prefill_urls"]
     decode_urls = parsed_args["decode_urls"]
@@ -196,9 +189,9 @@ def main() -> None:
             print_version(verbose=True)
             return
     
-    # `python xxx launch ...` starts mesh routing; 
+    # `python xxx mesh-only ...` starts mesh routing;
     # other invocations default to ATOM standalone.
-    use_atom_standalone = not mesh_launch_requested(raw_args)
+    use_atom_standalone = "mesh-only" not in raw_args
     # Import the mesh_python module.
     atomesh_runner = import_atomesh_runner()
 
