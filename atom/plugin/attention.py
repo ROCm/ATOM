@@ -630,15 +630,11 @@ class vllmAttentionMetadataBuilderMethods:
         skip split_decodes_prefills_and_extends() and avoid all .cpu() /
         .item() calls that would otherwise break CUDA graph capture.
         """
-        from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+        query_start_loc = common_attn_metadata.query_start_loc_cpu
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        is_prefill = query_lens > self.reorder_batch_threshold
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata=common_attn_metadata,
-                decode_threshold=self.reorder_batch_threshold,
-            )
-        )
-        if num_prefills > 0:
+        if torch.any(is_prefill):
             return self.build(
                 common_prefix_len=0, common_attn_metadata=common_attn_metadata
             )
