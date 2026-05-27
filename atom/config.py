@@ -826,10 +826,8 @@ class SpeculativeConfig:
         self.hf_config_override(self.draft_model_hf_config, self.model)
 
         if self.method == "eagle3":
-            if getattr(self.draft_model_hf_config, "kv_lora_rank", None):
-                raise NotImplementedError(
-                    "Eagle3 draft model with MLA attention is not supported"
-                )
+            # MLA drafts (kv_lora_rank set) route to Eagle3DeepseekMLAModel
+            # via the arch rewrite in hf_config_override; no early reject.
             # Aux hidden state layers: prefer the draft checkpoint's
             # eagle_config; if absent or the list is empty, ModelRunner
             # falls back to model.get_eagle3_aux_hidden_state_layers(),
@@ -854,6 +852,8 @@ class SpeculativeConfig:
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
         if arch == "LlamaForCausalLMEagle3":
             hf_config.architectures = ["Eagle3LlamaModel"]
+        elif arch == "Eagle3DeepseekV2ForCausalLM":
+            hf_config.architectures = ["Eagle3DeepseekMLAModel"]
 
         # Step 1: resolve model_type → mtp model_type
         mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)

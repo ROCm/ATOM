@@ -23,6 +23,7 @@ support_eagle_model_arch_dict = {
     "MiMoV2FlashMTPModel": "atom.models.mimo_v2_flash_mtp.MiMoV2FlashMTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
+    "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
 }
 
 
@@ -183,12 +184,19 @@ class EagleProposer:
         model_class = resolve_obj_by_qualname(support_eagle_model_arch_dict[draft_model_hf_config.architectures[0]])  # type: ignore
 
         if self.speculative_config.method == "eagle3":
-            # Eagle3 draft model has its own architecture (Llama, not MLA),
-            # so it must be constructed with the draft model's hf_config.
-            # Also disable torch.compile for the draft model to avoid
+            # Eagle3 draft has its own architecture, so build it from the
+            # draft hf_config. Disable torch.compile for the draft to avoid
             # Dynamo tracing issues with the separate KV cache binding.
-            draft_atom_config = copy.deepcopy(atom_config)
+            # Shallow-copy instead of deepcopy: with MLA targets (K2.6), the
+            # atom_config holds non-picklable cuda.Stream objects under
+            # downstream fields that deepcopy can't traverse. We only mutate
+            # hf_config and compilation_config.level on the draft, so
+            # isolating just those two attrs is sufficient.
+            draft_atom_config = copy.copy(atom_config)
             draft_atom_config.hf_config = draft_model_hf_config
+            draft_atom_config.compilation_config = copy.copy(
+                atom_config.compilation_config
+            )
             draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
             # Draft attention layer_num must continue from the target model's
             # layer count so it maps to the correct kv_cache_data entry.
@@ -196,13 +204,16 @@ class EagleProposer:
                 draft_atom_config,
                 layer_offset=atom_config.hf_config.num_hidden_layers,
             )
-            # Attach the draft's KV-cache builder to the runner. ModelRunner
-            # consults `runner.eagle3_draft_builder` from `_compute_block_bytes`
-            # / `allocate_kv_cache` to size + allocate + bind the draft's
-            # independent non-MLA cache through the standard builder protocol.
-            runner.eagle3_draft_builder = Eagle3DraftBuilder(
-                runner, draft_model_hf_config
-            )
+            # MHA draft (e.g. K2.5 LlamaForCausalLMEagle3): owns an independent
+            # non-MLA KV cache via Eagle3DraftBuilder, attached to the runner.
+            # MLA draft (e.g. K2.6 EAGLE 3.1): same MLA shape as target, so
+            # it piggybacks on the target's MLA pool (model_runner accounts
+            # for the +1 draft layer via num_nextn_predict_layers default).
+            draft_is_mla = bool(getattr(draft_model_hf_config, "kv_lora_rank", None))
+            if not draft_is_mla:
+                runner.eagle3_draft_builder = Eagle3DraftBuilder(
+                    runner, draft_model_hf_config
+                )
         else:
             self.model = model_class(self.config)
 
@@ -372,17 +383,30 @@ class EagleProposer:
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
-                ret_hidden_states = self.model(
+                model_out = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     hidden_states=hidden_states,
                 )
+                # EAGLE 3.1: drafter returns (hidden_for_logits, hidden_for_next_step).
+                # EAGLE 3: drafter returns a single tensor (legacy MTP/Eagle3); both
+                # roles are the same pre-norm tensor.
+                if isinstance(model_out, tuple):
+                    ret_hidden_states, ret_aux_hidden_states = model_out
+                else:
+                    ret_hidden_states = model_out
+                    ret_aux_hidden_states = model_out
 
-                sample_hidden_states = (
-                    torch.index_select(ret_hidden_states, 0, last_token_indices)
-                    if i == 0
-                    else ret_hidden_states
-                )
+                if i == 0:
+                    sample_hidden_states = torch.index_select(
+                        ret_hidden_states, 0, last_token_indices
+                    )
+                    sample_aux_hidden_states = torch.index_select(
+                        ret_aux_hidden_states, 0, last_token_indices
+                    )
+                else:
+                    sample_hidden_states = ret_hidden_states
+                    sample_aux_hidden_states = ret_aux_hidden_states
                 logits = self.model.compute_logits(sample_hidden_states)
                 new_draft_ids = logits.argmax(dim=-1)
                 draft_token_ids[:, i] = new_draft_ids
@@ -452,7 +476,9 @@ class EagleProposer:
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
-                    hidden_states = sample_hidden_states
+                    # EAGLE 3.1 post-norm feedback: feed aux (post-norm) when
+                    # the drafter exposes it; legacy path uses pre-norm.
+                    hidden_states = sample_aux_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]

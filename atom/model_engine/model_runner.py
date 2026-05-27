@@ -1426,11 +1426,18 @@ class ModelRunner:
         layer_id = 0
         # Promote to self so the attention builder's build_kv_cache_tensor()
         # can access it without recomputing from drafter state. Heterogeneous
-        # drafts (Eagle3) own their own layer space via their builder, so
-        # leave mtp_start_layer_idx at hf_config.num_hidden_layers in that mode.
+        # drafts (Eagle3 MHA) own their own layer space via their builder.
+        # Eagle3 MLA drafts (K2.6) share the target's MLA pool but still
+        # appear as one extra layer at index num_hidden_layers. In both Eagle3
+        # variants the eagle3 draft model has no `.model.mtp_start_layer_idx`,
+        # so only MTP-style drafts take the first branch.
+        is_eagle3 = (
+            self.config.speculative_config is not None
+            and self.config.speculative_config.method == "eagle3"
+        )
         self.mtp_start_layer_idx = (
             self.drafter.model.model.mtp_start_layer_idx
-            if hasattr(self, "drafter") and not hasattr(self, "eagle3_draft_builder")
+            if hasattr(self, "drafter") and not is_eagle3
             else hf_config.num_hidden_layers
         )
         for model_name, model in models_to_bind:
