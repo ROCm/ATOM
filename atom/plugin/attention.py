@@ -378,6 +378,10 @@ class vllmAttentionMetadataBuilderMethods:
         decode_only = num_decodes > 0 and num_extends == 0 and num_prefills == 0
         mixed = not (prefill_only or decode_only)
 
+        # common_attn_metadata._seq_lens_cpu is equal to common_attn_metadata.seq_lens.cpu(),
+        # but using seq_lens.cpu() can get the better performance in low concurrency.
+        # seq_lens = common_attn_metadata._seq_lens_cpu
+        seq_lens = common_attn_metadata.seq_lens.cpu()
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
@@ -386,6 +390,11 @@ class vllmAttentionMetadataBuilderMethods:
         # num_speculative_tokens > 1.
         # Fall back to seq_lens - query_lens computed on already-CPU tensors.
         num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
+        # In async spec-decode mode (auto-enabled for MTP/EAGLE), vLLM sets
+        # _num_computed_tokens_cpu to None because the GPU seq_lens is the
+        # authoritative source. Reconstruct from CPU tensors we already have.
+        if num_computed_tokens_cpu is None:
+            num_computed_tokens_cpu = seq_lens - query_lens_cpu
 
         prefill_max_query_len = decode_max_query_len = (
             common_attn_metadata.max_query_len
@@ -394,25 +403,19 @@ class vllmAttentionMetadataBuilderMethods:
         prefill_query_start_loc = decode_query_start_loc = (
             common_attn_metadata.query_start_loc
         )
-        # Not needed for prefill-only or decode-only cases
-        seq_lens_cpu = None
 
         if mixed:
-            # common_attn_metadata._seq_lens_cpu is equal to common_attn_metadata.seq_lens.cpu(),
-            # but using seq_lens.cpu() can get the better performance in low concurrency.
-            # seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-            seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
             prefill_start = num_decodes + num_extends
             if num_prefills > 0:
                 prefill_max_query_len = query_lens_cpu[prefill_start:].max().item()
-                prefill_max_seq_len = seq_lens_cpu[prefill_start:].max().item()
+                prefill_max_seq_len = seq_lens[prefill_start:].max().item()
                 prefill_query_start_loc = (
                     prefill_query_start_loc[prefill_start:]
                     - prefill_query_start_loc[prefill_start]
                 )
             if num_decodes > 0:
                 decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
-                decode_max_seq_len = seq_lens_cpu[:num_decodes].max().item()
+                decode_max_seq_len = seq_lens[:num_decodes].max().item()
                 decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
 
         prefill_metadata = None
@@ -434,15 +437,9 @@ class vllmAttentionMetadataBuilderMethods:
             )
 
         if num_extends > 0:
-            assert seq_lens_cpu is not None
-            # In async spec-decode mode (auto-enabled for MTP/EAGLE), vLLM sets
-            # _num_computed_tokens_cpu to None because the GPU seq_lens is the
-            # authoritative source. Reconstruct from CPU tensors we already have.
-            if num_computed_tokens_cpu is None:
-                num_computed_tokens_cpu = seq_lens_cpu - query_lens_cpu
             num_extends_slice = slice(num_decodes, num_decodes + num_extends)
             query_lens_extend = query_lens_cpu[num_extends_slice]
-            seq_lens_extend = seq_lens_cpu[num_extends_slice]
+            seq_lens_extend = seq_lens[num_extends_slice]
             computed_kv_lens = num_computed_tokens_cpu[num_extends_slice]
 
             swa_metadata = None
@@ -560,7 +557,7 @@ class vllmAttentionMetadataBuilderMethods:
             )
             extend_metadata = AiterFlashAttentionChunkPrefillMetadata(
                 max_query_len=query_lens_extend.max().item(),
-                max_seq_len=seq_lens_cpu[num_extends_slice].max().item(),
+                max_seq_len=seq_lens[num_extends_slice].max().item(),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
                 chunk_context_metadata=chunk_context_metadata,
             )
