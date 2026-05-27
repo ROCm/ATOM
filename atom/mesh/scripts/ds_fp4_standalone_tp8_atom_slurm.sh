@@ -33,8 +33,6 @@ MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
 CONTAINER="${CONTAINER:-atom_atom_standalone_${SLURM_JOB_ID}}"
 
-ATOM_SRC="${ATOM_SRC:-/it-share/yajizhan/code/ATOM}"
-
 TP="${TP:-8}"
 PORT="${PORT:-8000}"
 
@@ -98,7 +96,6 @@ NODE     : ${NODE} (IP=${NODE_IP}, TP=${TP}, port=${PORT})
 MODEL    : ${MODEL_PATH}
 IMAGE    : ${DOCKER_IMAGE}
 BACKEND  : atom (standalone, no PD)
-ATOM_SRC : ${ATOM_SRC}
 RUN_GSM8K   : ${RUN_GSM8K} (limit=${GSM8K_LIMIT:-all}, fewshot=${GSM8K_NUM_FEWSHOT})
 ISL:OSL pairs : ${ISL_OSL_LIST}
 CONC_LIST     : ${CONC_LIST}
@@ -118,7 +115,6 @@ echo "[server] IP=${NODE_IP} TP=${TP} port=${PORT}"
 mkdir -p /workspace/logs
 
 export HIP_VISIBLE_DEVICES=${GPU_IDS}
-export PYTHONPATH=${ATOM_SRC}:${PYTHONPATH:-}
 export PYTHONUNBUFFERED=1
 export AITER_LOG_LEVEL=WARNING
 export ATOM_HOST_IP=${NODE_IP}
@@ -285,7 +281,6 @@ for script in "${LOG_ROOT}"/scripts/*.sh; do
         -e "s|\${MODEL_PATH}|${MODEL_PATH}|g" \
         -e "s|\${KV_CACHE_DTYPE}|${KV_CACHE_DTYPE}|g" \
         -e "s|\${BLOCK_SIZE}|${BLOCK_SIZE}|g" \
-        -e "s|\${ATOM_SRC}|${ATOM_SRC}|g" \
         -e "s|\${GPU_IDS}|${GPU_IDS}|g" \
         -e "s|\${EXTRA_SERVER_ARGS}|${EXTRA_SERVER_ARGS}|g" \
         -e "s|\${ISL_OSL_LIST}|${ISL_OSL_LIST}|g" \
