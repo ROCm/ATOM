@@ -309,7 +309,6 @@ class Glm4MoeAttention(nn.Module):
             )
         else:
             if self.use_qk_norm:
-                assert self.q_norm is not None and self.k_norm is not None
                 q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(
                     q.shape
                 )
@@ -317,7 +316,6 @@ class Glm4MoeAttention(nn.Module):
                     k.reshape(-1, self.num_kv_heads, self.head_dim)
                 ).reshape(k.shape)
 
-            # q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v, positions, **model_kwargs)
         output = self.o_proj(attn_output)
         return output
