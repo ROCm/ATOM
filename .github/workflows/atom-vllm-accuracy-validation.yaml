@@ -1110,12 +1110,12 @@ jobs:
       - name: Detect container engine
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          if docker info > /dev/null 2>&1; then
-            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
-            echo "Container engine: docker"
-          elif command -v podman > /dev/null 2>&1; then
+          if command -v podman > /dev/null 2>&1; then
             echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
             echo "Container engine: podman"
+          elif docker info > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
+            echo "Container engine: docker"
           else
             echo "ERROR: Neither docker nor podman is available on this runner."
             exit 1
