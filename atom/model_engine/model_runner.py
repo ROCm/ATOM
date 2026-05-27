@@ -1684,6 +1684,10 @@ class ModelRunner:
         With the packed-reduce path the eligibility (local + cross-DP AND)
         is decided in ``_preprocess``; here we just realise the split.
         """
+        if getattr(batch, "is_mixed", False):
+            # TBO ubatch splitting on a [prefill | decode] layout is not yet
+            # supported (P2-M5 follow-up). Run mixed batches without TBO.
+            return None
         if not tbo_collective_active:
             return None
 
