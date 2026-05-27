@@ -455,6 +455,8 @@ class AiterMlaSparseMetadataBuilderMethodsForVllm:
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=True,
+            dtype_q=get_aiter_kv_cache_dtype(self.vllm_config),
+            dtype_kv=get_aiter_kv_cache_dtype(self.vllm_config),
         )
 
         attn_metadata = AiterMlaSparseMetadataForVllm(
@@ -1346,7 +1348,11 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
+        ctx_mla_ps = self._set_mla_persistent_worker_buffers(
+            num_reqs,
+            qo_indptr,
+            max_qo_len,
+        )
         self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMlaDecodeMetadataForVllm(
@@ -1753,7 +1759,7 @@ class AiterMLASparseMetadataBuilder(
             max_num_batched_tokens,
             1,
             self.padded_num_heads,
-            torch.bfloat16,
+            get_aiter_kv_cache_dtype(config),
             get_aiter_kv_cache_dtype(config),
             is_sparse=True,
             fast_mode=True,
