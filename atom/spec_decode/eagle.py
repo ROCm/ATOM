@@ -10,6 +10,7 @@ from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config, KVCacheTensor
 from atom.model_loader.loader import load_model
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
+from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata, get_forward_context
 from torch.profiler import record_function
 
@@ -334,6 +335,7 @@ class EagleProposer:
         context.is_draft = True
 
         assert self.runner is not None
+
         input_ids = target_token_ids
         # input_ids[last_token_indices] = next_token_ids
         input_ids.scatter_(0, last_token_indices, next_token_ids)
@@ -349,6 +351,8 @@ class EagleProposer:
         draft_token_ids = torch.empty(
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
+        if envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL:
+            draft_token_ids.fill_(-1)
         var = self.runner.forward_vars
         target_uses_mla = self.runner.use_mla
         # Eaale3 only support mha currently
