@@ -522,11 +522,12 @@ class AiterAttentionMetadataBuilder:
         )
 
         runner = self.model_runner
-        has_unified = hasattr(runner, "kv_cache") and runner.kv_cache is not None
-        has_per_layer = (
+        has_unified_kv = hasattr(runner, "kv_cache") and runner.kv_cache is not None
+        # for MiMoV2 model per layer kv binding
+        has_per_layer_kv = (
             hasattr(runner, "_kv_layer_cache_store") and runner._kv_layer_cache_store
         )
-        if not has_unified and not has_per_layer:
+        if not has_unified_kv and not has_per_layer_kv:
             return None
 
         block_regions: list[KVTransferRegion] = []
