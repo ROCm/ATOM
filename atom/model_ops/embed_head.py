@@ -214,6 +214,19 @@ class ParallelLMHead(VocabParallelEmbedding):
             if context.is_prefill and not context.is_draft:
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
+            elif getattr(context, "is_mixed", False) and not context.is_draft:
+                # Mixed prefill+decode: gather last-token-per-prefill-seq
+                # for the prefill rows, keep every token for the decode rows
+                # (decode rows produce one sample per token).
+                n_p_tokens = context.num_prefill_tokens
+                n_p_seqs = context.num_prefill_seqs
+                if n_p_seqs > 0:
+                    prefill_last = attn_metadata.cu_seqlens_q[1 : n_p_seqs + 1] - 1
+                    decode_range = torch.arange(
+                        n_p_tokens, x.shape[0], device=x.device, dtype=prefill_last.dtype
+                    )
+                    sample_indices = torch.cat([prefill_last, decode_range])
+                    x = x[sample_indices].contiguous()
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER

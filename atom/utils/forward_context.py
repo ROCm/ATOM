@@ -326,6 +326,12 @@ class Context:
     # that need the token ids but cannot receive them as a function arg
     # (the op signature is fixed by the consumer's plugin contract).
     input_ids: Optional[torch.Tensor] = None
+    # Mixed prefill+decode (Phase 2). When True, the first num_prefill_tokens
+    # rows of q/k/v are prefill chunks and the rest are decode tokens; the
+    # attention backend splits them via prefill_attn_metadata / decode_attn_metadata.
+    is_mixed: bool = False
+    num_prefill_tokens: int = 0
+    num_prefill_seqs: int = 0
 
     def __init__(
         self,
@@ -338,6 +344,9 @@ class Context:
         dp_uniform_decode: bool = True,
         forward_mode: Optional[ForwardMode] = None,
         input_ids: Optional[torch.Tensor] = None,
+        is_mixed: bool = False,
+        num_prefill_tokens: int = 0,
+        num_prefill_seqs: int = 0,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -348,6 +357,9 @@ class Context:
         self.dp_uniform_decode = dp_uniform_decode
         self.forward_mode = forward_mode
         self.input_ids = input_ids
+        self.is_mixed = is_mixed
+        self.num_prefill_tokens = num_prefill_tokens
+        self.num_prefill_seqs = num_prefill_seqs
 
 
 @dataclass
