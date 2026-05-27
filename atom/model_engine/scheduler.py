@@ -271,6 +271,17 @@ class ScheduledBatch:
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
         ]
+        self.mrope_positions_by_req = {
+            seq.id: seq.mrope_positions
+            for seq in seqs.values()
+            if getattr(seq, "mrope_positions", None) is not None
+        }
+        self.mrope_position_deltas = {
+            seq.id: getattr(seq, "mrope_position_delta", 0)
+            for seq in seqs.values()
+            if getattr(seq, "mrope_positions", None) is not None
+        }
+        self.has_mrope = bool(self.mrope_positions_by_req)
 
         offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
@@ -308,6 +319,14 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
+
+        # Collect multimodal data from prefill sequences
+        self.multimodal_data = {}
+        for seq in seqs.values():
+            if getattr(seq, "multimodal_data", None) is not None:
+                self.multimodal_data[seq.id] = seq.multimodal_data
+                # Clear after first use to avoid re-sending on decode steps
+                seq.multimodal_data = None
 
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
+import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
@@ -265,6 +266,71 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             block_tables[i] = 0
             block_tables[i, : len(block_table)] = block_table
 
+    def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
+        return (
+            self.model_runner.forward_vars["mrope_positions"]
+            .np.reshape(-1)[: 3 * num_tokens]
+            .reshape(3, num_tokens)
+        )
+
+    def _copy_mrope_to_gpu(self, num_tokens: int) -> torch.Tensor:
+        buf = self.model_runner.forward_vars["mrope_positions"]
+        buf.gpu.reshape(-1)[: 3 * num_tokens].copy_(
+            buf.cpu.reshape(-1)[: 3 * num_tokens], non_blocking=True
+        )
+        return self.model_runner._mrope_positions_view(num_tokens)
+
+    def _build_mrope_prefill_positions(
+        self, batch: ScheduledBatch
+    ) -> torch.Tensor | None:
+        if not getattr(self.model_runner, "use_mrope", False):
+            return None
+
+        total_tokens = batch.total_tokens_num_prefill
+        positions = self._mrope_cpu_view(total_tokens)
+        offset = 0
+        for req_id, seqlen, cached_seqlen in zip(
+            batch.req_ids, batch.context_lens, batch.num_cached_tokens
+        ):
+            num_tokens = int(seqlen) - int(cached_seqlen)
+            mrope_positions = batch.mrope_positions_by_req.get(req_id)
+            if mrope_positions is None:
+                positions[:, offset : offset + num_tokens] = np.arange(
+                    cached_seqlen, seqlen, dtype=np.int64
+                )[None, :]
+            else:
+                positions[:, offset : offset + num_tokens] = mrope_positions[
+                    :, cached_seqlen:seqlen
+                ]
+            offset += num_tokens
+
+        return self._copy_mrope_to_gpu(total_tokens)
+
+    def _build_mrope_decode_positions(
+        self,
+        batch: ScheduledBatch,
+        context_lens: np.ndarray,
+        max_seqlen_q: int,
+    ) -> torch.Tensor | None:
+        if not getattr(self.model_runner, "use_mrope", False):
+            return None
+
+        total_tokens = batch.total_tokens_num_decode
+        positions = self._mrope_cpu_view(total_tokens)
+        offset = 0
+        for req_id, context_len in zip(batch.req_ids, context_lens):
+            start = int(context_len) - max_seqlen_q
+            stop = int(context_len)
+            delta = batch.mrope_position_deltas.get(req_id)
+            if delta is None:
+                base = np.arange(start, stop, dtype=np.int64)
+            else:
+                base = np.arange(start + int(delta), stop + int(delta), dtype=np.int64)
+            positions[:, offset : offset + max_seqlen_q] = base[None, :]
+            offset += max_seqlen_q
+
+        return self._copy_mrope_to_gpu(total_tokens)
+
     def prepare_prefill(self, batch: ScheduledBatch):
         bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
@@ -361,7 +427,11 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             state=AttnState.PREFILL_PREFIX if has_cached else AttnState.PREFILL_NATIVE,
             **ctx,
         )
-        positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+        mrope_positions = self._build_mrope_prefill_positions(batch)
+        if mrope_positions is not None:
+            positions = mrope_positions
+        else:
+            positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
         return attn_metadata, positions
 

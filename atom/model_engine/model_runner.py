@@ -62,8 +62,8 @@ support_model_arch_dict = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5ForConditionalGenerationTextOnly",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly",
+    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2_flash.MiMoV2FlashForCausalLM",
@@ -517,6 +517,8 @@ class ModelRunner:
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
         self.use_v4 = self.is_deepseek_v4()
+        rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
+        self.use_mrope = "mrope_section" in rope_parameters
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
@@ -1116,6 +1118,10 @@ class ModelRunner:
                 dtype=hidden_type,
             ),
         }
+        if self.use_mrope:
+            self.forward_vars["mrope_positions"] = CpuGpuBuffer(
+                3, self.max_num_batched_tokens, **i64_kwargs
+            )
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
@@ -1131,6 +1137,11 @@ class ModelRunner:
         else:
             assert self.world_size % hf_config.num_key_value_heads == 0
             return 1
+
+    def _mrope_positions_view(self, num_tokens: int) -> torch.Tensor:
+        return self.forward_vars["mrope_positions"].gpu.as_strided(
+            (3, num_tokens), (num_tokens, 1)
+        )
 
     def _get_total_num_layers(self):
         """Return total layer count including draft (MTP) layers.
@@ -1762,7 +1773,37 @@ class ModelRunner:
                 label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
             label += "]"
             with record_function(label):
-                model_output = self.model(input_ids, positions)
+                # Handle multimodal prefill: compute vision embeddings and merge
+                inputs_embeds = None
+                if (
+                    is_prefill
+                    and hasattr(self.model, "get_vision_embeddings")
+                    and batch is not None
+                    and hasattr(batch, "multimodal_data")
+                    and batch.multimodal_data
+                ):
+                    mm_data_values = list(batch.multimodal_data.values())
+                    pixel_values = torch.cat(
+                        [mm_data["pixel_values"] for mm_data in mm_data_values], dim=0
+                    ).to(device=self.device, dtype=self.config.torch_dtype)
+                    grid_thw = torch.cat(
+                        [mm_data["image_grid_thw"] for mm_data in mm_data_values],
+                        dim=0,
+                    ).to(device=self.device)
+                    vision_embeds = self.model.get_vision_embeddings(
+                        pixel_values, grid_thw
+                    )
+                    text_embeds = self.model.embed_input_ids(input_ids)
+                    inputs_embeds = self.model.merge_multimodal_embeddings(
+                        input_ids, text_embeds, vision_embeds
+                    )
+
+                if inputs_embeds is None:
+                    model_output = self.model(input_ids, positions)
+                else:
+                    model_output = self.model(
+                        input_ids, positions, inputs_embeds=inputs_embeds
+                    )
                 if self.use_aux_hidden_state_outputs:
                     hidden_states, self._aux_hidden_states = model_output
                 else:
@@ -2059,10 +2100,15 @@ class ModelRunner:
                 self.forward_vars["positions"].np[:num_tokens] = (
                     np.arange(num_tokens, dtype=np.int64) % max_q_len
                 )
-
                 attn_metadata, context = (
                     self.attn_metadata_builder.build_for_cudagraph_capture(bs=bs)
                 )
+                if self.use_mrope:
+                    mrope_positions = self._mrope_positions_view(num_tokens)
+                    mrope_positions.copy_(
+                        positions[:num_tokens].unsqueeze(0).expand(3, -1)
+                    )
+                    context.positions = mrope_positions
                 num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
                 num_tokens += num_pad
                 # Create ubatch slices for TBO capture (need >= 2 requests)
@@ -2084,8 +2130,14 @@ class ModelRunner:
                 )
 
                 # Warmup
+                model_positions = (
+                    self._mrope_positions_view(num_tokens)
+                    if self.use_mrope
+                    else positions[:num_tokens]
+                )
                 model_output = self.model(
-                    input_ids[:num_tokens], positions[:num_tokens]
+                    input_ids[:num_tokens],
+                    model_positions,
                 )
                 if self.use_aux_hidden_state_outputs:
                     outputs[:num_tokens] = model_output[0]
@@ -2113,9 +2165,15 @@ class ModelRunner:
                     else:
                         # Standard single-stream capture
                         graph = torch.cuda.CUDAGraph()
+                        model_positions = (
+                            self._mrope_positions_view(num_tokens)
+                            if self.use_mrope
+                            else positions[:num_tokens]
+                        )
                         with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
                             model_output = self.model(
-                                input_ids[:num_tokens], positions[:num_tokens]
+                                input_ids[:num_tokens],
+                                model_positions,
                             )
                             if self.use_aux_hidden_state_outputs:
                                 outputs[:num_tokens] = model_output[0]

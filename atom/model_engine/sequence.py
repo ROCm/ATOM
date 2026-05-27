@@ -47,6 +47,9 @@ class Sequence:
         needs_independent_noise: bool = False,
         parent_request_id: Optional[str] = None,
         sibling_index: int = 0,
+        multimodal_data: Optional[dict] = None,
+        mrope_positions: Optional[np.ndarray] = None,
+        mrope_position_delta: int = 0,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
@@ -61,6 +64,9 @@ class Sequence:
         # Triggers BlockManager to allocate a per-req cache slot in
         # allocate() / free it in deallocate().
         self.has_per_req_cache = has_per_req_cache
+        self.multimodal_data = multimodal_data
+        self.mrope_positions = mrope_positions
+        self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
