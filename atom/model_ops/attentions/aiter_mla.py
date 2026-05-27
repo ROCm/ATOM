@@ -681,7 +681,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         num_layers = runner.kv_cache.shape[0]
         for layer_id in range(num_layers):
             t = runner.kv_cache[layer_id]
-            bpb = t.stride(0) * t.element_size()
+            bpb = t.stride(0) * t.element_size() * self.block_ratio
             block_regions.append(
                 KVTransferRegion(
                     base_addr=t.data_ptr(),
@@ -693,7 +693,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if hasattr(runner, "index_cache"):
             for layer_id in range(runner.index_cache.shape[0]):
                 t = runner.index_cache[layer_id]
-                bpb = t.stride(0) * t.element_size()
+                bpb = t.stride(0) * t.element_size() * self.block_ratio
                 block_regions.append(
                     KVTransferRegion(
                         base_addr=t.data_ptr(),
@@ -705,7 +705,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
-            num_blocks=runner.num_physical_kvcache_blocks,
+            num_blocks=runner.config.num_kvcache_blocks,
         )
 
     def prepare_prefill(self, batch: ScheduledBatch):
