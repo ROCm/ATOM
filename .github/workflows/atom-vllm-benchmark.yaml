@@ -45,6 +45,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP8 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -56,7 +57,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_2:
         description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
@@ -82,6 +82,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP8 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -93,7 +94,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_3:
         description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
@@ -119,6 +119,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP8 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -130,7 +131,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_4:
         description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
@@ -156,6 +156,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP8 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -167,7 +168,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_5:
         description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
@@ -193,6 +193,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP8 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -204,7 +205,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_6:
         description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
@@ -230,6 +230,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP8 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -241,7 +242,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_7:
         description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
@@ -267,6 +267,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP8 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -278,7 +279,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_8:
         description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
@@ -304,6 +304,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP8 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -315,7 +316,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -484,6 +484,8 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
@@ -895,6 +897,7 @@ jobs:
               "MiniMax-M2.5 TP2 (AW)",
               "MiniMax-M2.5 TP4 (AW)",
               "DeepSeek-V3.2 FP8 TP8 (AW)",
+              "DeepSeek-V3.2 FP8 MTP TP8 (AW)",
               "gpt-oss-120b TP2 (AW)",
               "gpt-oss-120b TP8 (AW)",
           }
@@ -1145,11 +1148,13 @@ jobs:
           fi
 
       - name: Persist benchmark matrix payload
+        env:
+          BENCHMARK_MATRIX: ${{ steps.build.outputs.benchmark_matrix }}
         run: |
-          printf '%s' '${{ steps.build.outputs.benchmark_matrix }}' > benchmark_matrix.json
+          printf '%s' "${BENCHMARK_MATRIX}" > benchmark_matrix.json
 
       - name: Upload benchmark matrix payload
-        uses: actions/upload-artifact@v8
+        uses: actions/upload-artifact@v7
         with:
           name: oot-benchmark-matrix
           path: benchmark_matrix.json
@@ -1304,6 +1309,24 @@ jobs:
       UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
       BENCHMARK_CLIENT: ${{ contains(matrix.model.prefix, '-aw-') && 'vLLM bench' || needs.resolve-atom-source.outputs.benchmark_client }}
     steps:
+      - name: Print runner user
+        run: |
+          echo "=== Container engine diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "docker path: $(command -v docker || true)"
+          echo "podman path: $(command -v podman || true)"
+          echo "docker version:"
+          docker version || true
+          echo "docker info:"
+          docker info || true
+          echo "podman version:"
+          podman version || true
+          echo "podman info:"
+          podman info || true
+          echo "=== End container engine diagnostics ==="
+
       - name: Detect container engine
         run: |
           if docker info > /dev/null 2>&1; then

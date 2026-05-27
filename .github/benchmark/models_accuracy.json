@@ -3,7 +3,7 @@
     "model_name": "Meta-Llama-3-8B-Instruct",
     "model_path": "meta-llama/Meta-Llama-3-8B-Instruct",
     "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",
-    "env_vars": "",
+    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
     "runner": "linux-atom-mi35x-1",
     "test_level": "pr",
     "accuracy_threshold": 0.73,
@@ -30,7 +30,7 @@
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
-    "accuracy_threshold": 0.92,
+    "accuracy_threshold": 0.94,
     "accuracy_baseline": 0.96,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "Local 4-run average GSM8K-100 3-shot flexible-extract = 0.96 (runs: 0.96/0.98/0.96/0.94, stderr ~0.024). ATOM_USE_TRITON_MOE=1 is required — without it accuracy drops to ~0.6. Threshold set 4pp below local baseline to absorb full-eval (1319 samples) noise; refresh after first CI measurement."
@@ -38,14 +38,14 @@
   {
     "model_name": "DeepSeek-V4-Pro MTP",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 1",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3",
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
-    "accuracy_threshold": 0.92,
+    "accuracy_threshold": 0.94,
     "accuracy_baseline": 0.96,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
-    "_baseline_note": "Same base model as DeepSeek-V4-Pro FP8 (MTP-1: 1 speculative token)"
+    "_baseline_note": "Same base model as DeepSeek-V4-Pro FP8 (MTP-3: 3 speculative tokens). Local full-eval (1319 samples, 3-shot) flexible-extract = 0.9560 ± 0.0056."
   },
   {
     "model_name": "DeepSeek-R1-0528 MTP",
@@ -230,16 +230,16 @@
     "_baseline_note": "CI uses 3-shot, not comparable to HF 5-shot baseline"
   },
   {
-    "model_name": "Qwen3.5-397B-A17B",
-    "model_path": "Qwen/Qwen3.5-397B-A17B",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8",
+    "model_name": "Qwen3.5-35B-A3B TP2",
+    "model_path": "Qwen/Qwen3.5-35B-A3B",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 2",
     "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "nightly",
-    "accuracy_threshold": 0.85,
-    "accuracy_baseline": 0.9538,
-    "accuracy_baseline_model": "Qwen3.5-397B-A17B-FP8",
-    "_baseline_note": "BF16 weight, TP8. Placeholder threshold/baseline copied from FP8 entry; refresh after first CI measurement."
+    "accuracy_threshold": 0.83,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "Qwen/Qwen3.5-35B-A3B",
+    "_baseline_note": "Threshold referenced from the sglang nightly entry for the same model; refresh after first CI measurement."
   },
   {
     "model_name": "Qwen3.5-397B-A17B-FP8",
@@ -320,10 +320,10 @@
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "nightly",
-    "accuracy_threshold": 0.81,
-    "accuracy_baseline": 0.8294,
+    "accuracy_threshold": 0.778,
+    "accuracy_baseline": 0.79,
     "accuracy_baseline_model": "XiaomiMiMo/MiMo-V2-Flash",
-    "_baseline_note": "CI measured GSM8K 5-shot flexible-extract = 0.8294 (±0.0104) under MTP1 greedy decoding (see MiMo-V2-Flash MTP entry); base-only number is identical because MTP only proposes speculative drafts that the target verifies. tp pinned to 4 to match the MTP entry's setup (no separate base measurement)."
+    "_baseline_note": "CI runs GSM8K 3-shot (atom_test.sh hardcodes --num_fewshot 3). Observed CI flexible-extract on the first stable run: base=0.8082 (run 26410931088, commit 24e4367b). Baseline 0.79 sits ~1.5pp below that to absorb run-to-run noise (stderr ±0.011); threshold 0.778 leaves ~1.2pp headroom below baseline (~1.1σ), matching the headroom pattern in DeepSeek-R1 / Kimi-Eagle3 / MiniMax-M2.7 entries. The original 0.8294 baseline was an out-of-band local 5-shot measurement that never matched what CI actually computes. tp pinned to 4 to match the MTP entry's setup (no separate base measurement)."
   },
   {
     "model_name": "MiMo-V2-Flash MTP",
@@ -332,9 +332,9 @@
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "nightly",
-    "accuracy_threshold": 0.81,
-    "accuracy_baseline": 0.8294,
+    "accuracy_threshold": 0.778,
+    "accuracy_baseline": 0.79,
     "accuracy_baseline_model": "XiaomiMiMo/MiMo-V2-Flash",
-    "_baseline_note": "CI measured GSM8K 5-shot flexible-extract = 0.8294 (±0.0104) on FP8 KV + MTP1. tp MUST be 4 and num-speculative-tokens MUST be 1: ATOM only constructs MTP layer 0 (matches vLLM _MIMO_V2_FLASH_NUM_MTP_LAYERS=1); driving more spec tokens would route through layers 1/2 whose KV is never populated and accept rate craters."
+    "_baseline_note": "CI runs GSM8K 3-shot (atom_test.sh hardcodes --num_fewshot 3). Observed CI flexible-extract on the first stable run: MTP1=0.7983 (run 26410931088, commit 24e4367b); local reproduction with the fp8 + prefix-cache crash patches gave 0.8052. Baseline 0.79 sits just below the observed values to absorb run-to-run noise (stderr ±0.011); threshold 0.778 leaves ~1.2pp headroom below baseline (~1.1σ), matching the headroom pattern in DeepSeek-R1 / Kimi-Eagle3 / MiniMax-M2.7 entries. tp MUST be 4 and num-speculative-tokens MUST be 1: ATOM only constructs MTP layer 0 (matches vLLM _MIMO_V2_FLASH_NUM_MTP_LAYERS=1); driving more spec tokens would route through layers 1/2 whose KV is never populated and accept rate craters."
   }
 ]

@@ -1,10 +1,21 @@
 ---
 name: debug-agent-locate-kernel
-description: Use rocm-debug-agent to identify which GPU kernel is faulting/hanging when ATOM server hits a HIP memory access fault, MEMORY_VIOLATION, or silent infinite loop. The agent dumps wave registers, faulting PC, and (with --save-code-objects) the disassembled code object so you can name the exact kernel and trace it back to the Python call site. Use when: server crashes with "Memory access fault by GPU node-N", server hangs with GPU at 100% but no token output, or you need to identify a kernel asserting `s_trap`. Do NOT use for: numerical bugs (use dump-bisect-debug), compile errors, OOM.
-version: 1.0.0
-scope: ATOM on AMD ROCm (debug-agent at /opt/rocm/lib/librocm-debug-agent.so.2)
-last_updated: 2026-05-14
+description: Identify which GPU kernel is faulting/hanging in ATOM via rocm-debug-agent (for faults/asserts) or rocgdb (for silent livelocks). debug-agent dumps wave registers + faulting PC + (with --save-code-objects) disassembled code object on memory faults / ASSERT_TRAP. rocgdb attaches to a live process and lists in-flight `info dispatches` + HSA `info queues` — works when the kernel isn't faulting but just stuck (e.g. atomic-counter deadlock). Use when: server crashes with "Memory access fault by GPU node-N", server hangs with GPU at 100% but no token output, kernel asserting `s_trap`, or `HIP_LAUNCH_BLOCKING=1` makes a hang vanish. Do NOT use for: numerical bugs (use dump-bisect-debug), compile errors, OOM.
+version: 1.2.0
+scope: ATOM on AMD ROCm (debug-agent at /opt/rocm/lib/librocm-debug-agent.so.2; rocgdb at /opt/rocm/bin/rocgdb)
+last_updated: 2026-05-20
 ---
+
+## Tool selection: debug-agent vs rocgdb
+
+| Symptom | Use first |
+|---------|-----------|
+| `Memory access fault by GPU node-N` / `MEMORY_VIOLATION` / `ASSERT_TRAP` in log | **debug-agent** — only it dumps wave regs + faulting PC + code-object disassembly |
+| Silent livelock (GPU 100%, no fault, no log output) | **rocgdb** — debug-agent never fires (no trap event); rocgdb's `info dispatches` lists in-flight kernels directly |
+| `HIP_LAUNCH_BLOCKING=1` makes hang disappear (async race) | **rocgdb first** to name the stuck kernel(s); debug-agent only if you need wave-level detail later |
+| Need disassembly / per-lane register values | **debug-agent** (rocgdb doesn't go to that depth on AMD) |
+
+**The two tools cannot be combined.** debug-agent loads `HSA_TOOLS_LIB=librocm-debug-agent.so.2` which occupies the HSA debugger hook — rocgdb attached to the same process reports "No queues / No dispatches are currently active" because the agent has the slot. To use rocgdb, launch the server with **plain** `start_atom_server.sh` (no `run_debug_agent.sh` wrapper).
 
 ## When to use
 
@@ -21,12 +32,13 @@ Do NOT use this skill for: precision bugs (use [[dump-bisect-debug]]), build/com
 ## Required tools (verify before starting)
 
 ```bash
-ls /opt/rocm/lib/librocm-debug-agent.so.2     # the agent itself
+ls /opt/rocm/lib/librocm-debug-agent.so.2     # debug-agent (fault path)
+ls /opt/rocm/bin/rocgdb                       # rocgdb (livelock path)
 ls /opt/rocm/llvm/bin/llvm-objdump            # for disassembling code objects
-which py-spy && py-spy --version              # for stack traces of stuck workers
+which py-spy && py-spy --version              # Python stacks of stuck workers
 ```
 
-If any missing: install `rocm-debug-agent`, `llvm`, `pip install py-spy`. Stop here if not available.
+If any missing: install `rocm-debug-agent`, `rocgdb`, `llvm`, `pip install py-spy`. Stop here if not available.
 
 ## Critical pre-flight
 
@@ -154,6 +166,95 @@ Per [[atom-patterns]] / DeepSeek V4 guidance, do not ship `cuda.synchronize()` w
 | Per-fwd kernel reads stale forward_vars from prior fwd | Switch H2D path off `prep_stream` to default stream (matches ATOM `prepare_mtp_decode` v2 pattern). |
 | Cross-rank inconsistency causes one rank to OOB | Ensure all ranks see identical batch shapes before launching kernel; check `cu_seqlens_q` / `state_slot_mapping` parity. |
 
+## rocgdb workflow (for silent livelocks — when debug-agent gives no wave dump)
+
+debug-agent only fires on `MEMORY_VIOLATION` / `ASSERT_TRAP` etc. — for a **silent livelock** (GPU stuck at 100% with no kernel making progress, no fault, no log), it sits idle and gives you nothing. rocgdb fills that gap: attached to a live worker, it can enumerate in-flight HSA dispatches and queue head/tail pointers, naming the stuck kernel directly.
+
+### Pre-flight (rocgdb only)
+
+```bash
+which rocgdb                                          # /opt/rocm/bin/rocgdb
+rocgdb --version | head -3                            # confirm GNU gdb 16.x rocm-rel
+```
+
+The "Symbol PySlice_Type has different size" warnings on attach are benign — Python symbol size mismatch between rocgdb's bundled Python and the venv. Wave-debug commands still work.
+
+### Step R1: Launch WITHOUT debug-agent
+
+Use plain `start_atom_server.sh` — **NOT** `run_debug_agent.sh`. debug-agent's `HSA_TOOLS_LIB` occupies the HSA debugger hook and rocgdb will report "No agents / No dispatches / No queues are currently active" because the agent has the slot. Run only ONE of the two tools at a time on the same process.
+
+```bash
+bash scripts/stop_atom_server.sh
+<MODEL_ENV> bash scripts/start_atom_server.sh <MODEL> <TP> <PORT> <EXTRA_ARGS...> &
+bash scripts/wait_server_ready.sh <PORT> 10 5 /app/logs_claude/atom_server.log
+<run workload that triggers the hang>
+```
+
+### Step R2: Pick the right worker PID (NOT the dispatcher)
+
+ATOM at TP=N has 1 `openai_server` + 1 spawn dispatcher + N spawn workers. Only the **workers** hold GPU queues — attaching to the dispatcher returns "No dispatches" (it has no GPU work).
+
+```bash
+# Process tree: dispatcher has PPID = openai_server; workers have PPID = dispatcher
+ps -ef | grep spawn_main | grep -v grep
+# Workers' PPID equals the dispatcher PID and they sit ~99% CPU during forward;
+# the dispatcher itself shows lower CPU. Pick any worker.
+WORKER_PID=<one of the worker PIDs>
+```
+
+### Step R3: Dump GPU state non-interactively
+
+```bash
+cat > /tmp/rocgdb_cmds.txt <<'EOF'
+set pagination off
+set confirm off
+set logging file /app/logs_claude/rocgdb_dump.txt
+set logging overwrite on
+set logging on
+echo === info agents ===\n
+info agents
+echo \n=== info dispatches ===\n
+info dispatches
+echo \n=== info queues ===\n
+info queues
+echo \n=== main thread bt ===\n
+bt 30
+detach
+quit
+EOF
+timeout 90 rocgdb -p $WORKER_PID -x /tmp/rocgdb_cmds.txt -batch
+```
+
+`detach` (not just `quit`) is required or the worker stays SIGSTOP'd after rocgdb exits — kills your repro and leaves zombies.
+
+### Step R4: Read the dump
+
+`/app/logs_claude/rocgdb_dump.txt` contains four sections:
+
+| Section | What to read |
+|---------|--------------|
+| `info agents` | One row per GPU (8 for TP=8). Confirms rocgdb sees the HSA runtime. If empty → debug-agent is still loaded, restart without it. |
+| `info dispatches` | **The smoking gun.** Each in-flight kernel: dispatch ID, grid, workgroup, fence, demangled kernel name. Two-or-more dispatches active = concurrent streams. |
+| `info queues` | HSA queue table with `Read` and `Write` pointers per queue. `Write > Read` = packets pending; queue is stalled if the head dispatch never completes. Type DMA queues handle memcpy, HSA queues handle kernel launches. |
+| `bt` | Python main thread's C stack. Look for `hipMemcpyAsync → memcpy_and_sync → _local_scalar_dense_cuda` to confirm `.item()` is blocked waiting for GPU. |
+
+### Step R5: Cross-reference kernel name → source
+
+The demangled name in `info dispatches` is the AITER (or PyTorch) kernel symbol. For AITER ASM-precompiled kernels, grep the kernel name across `aiter/aiter/ops/` to find the Python wrapper, then check whatever singleton workspace / semaphore the wrapper allocates — that is the most common shared resource a cross-stream race fights over.
+
+### Step R6: Tell-tale of the shared-workspace deadlock class
+
+**Two or more `_clean`-suffixed dispatches on different queues, each with `Fence: B|Aa|Ra` (full memory fence)** = the classic shared-workspace race. Split-K GEMMs use a reduction phase that atomic-increments a counter in a per-process workspace; if that workspace is a singleton (e.g. `@functools.lru_cache(maxsize=1)` over device only) and two splitk kernels run concurrently on different streams, their counters interleave → neither hits its expected count → both deadlock.
+
+Fix shape (general): make the workspace cache stream-keyed (e.g. `lru_cache` over `(device, stream_id)`) so each stream gets its own counter. Workaround shape: serialize the streams (`current_stream.wait_stream(other_stream)`) — masks the bug for one workload but resurfaces on a larger one; not shippable per [[atom-patterns]].
+
+### rocgdb anti-patterns
+
+- **Don't attach to the dispatcher** (PPID = openai_server). It has no GPU queues; you'll get "No dispatches" and waste 90s on the timeout.
+- **Don't combine debug-agent + rocgdb on the same process**. The debug-agent's HSA tool hook shadows rocgdb's queue/dispatch visibility — you'll see agents but no dispatches.
+- **Don't run rocgdb interactively** when the worker is in HSA wait — it can take 30+ seconds to attach, and an accidental `^C` SIGSTOPs the worker permanently. Use `-x scriptfile -batch` with `detach` before `quit`.
+- **Don't trust `info threads`' Python frame names** — rocgdb's Python integration doesn't speak the venv ABI. Use `py-spy dump --pid $WORKER_PID` in parallel for the Python-side stack.
+
 ## Recovery checklist (after agent run)
 
 1. `bash scripts/stop_atom_server.sh` — agent leaves zombie KFD entries; if you skip, next launch OOMs at NCCL barrier.
@@ -170,26 +271,12 @@ Per [[atom-patterns]] / DeepSeek V4 guidance, do not ship `cuda.synchronize()` w
 - **Don't leave `--save-code-objects` on for routine runs** — each run dumps ~500 MB. Only enable for the bisect run.
 - **Don't add `torch.cuda.synchronize()` "fixes" and ship** — they mask the race for one workload and surface a worse hang (livelock) on a larger one. Find the allocator/stream root cause.
 
-## Real example (May 14 2026 — V4-Pro MTP-3 prefill hang)
-
-**Symptom**: `Memory access fault by GPU node-N` on all 8 ranks within 1s of "Scheduled prefill batch: 19 reqs, 9573 tokens". `HIP_LAUNCH_BLOCKING=1` and `ATOM_DUMP_SWA_WRITE=1` (which inserts `.cpu()` sync) both eliminated it.
-
-**Workflow**:
-1. Step 1-2: ran `run_debug_agent.sh`, grep `"stopped, reason"` → got `ASSERT_TRAP` in `at::native::index_copy_kernel_impl<OpaqueType<4>>`.
-2. Step 4: disassembled code object → confirmed `s_trap 2` followed by `s_endpgm` → PyTorch `CUDA_KERNEL_ASSERT` failed (bound check on index_copy).
-3. Step 5: grep'd ATOM source for `index_copy_` of int32 dtype → only csa/hca calls in `deepseek_v4_attn.py:1505-1506`.
-4. Step 6: bisected — neither alone trapped, both together did. Added `torch.cuda.synchronize()` between → small workload passed, GSM8K (1319 reqs) eventually livelocked at 1281, py-spy showed all ranks stuck in the synchronize call → confirmed root cause is allocator churn from transient tensors (`csa_win_pos`/`hca_win_pos`/`swa_paged_flat` built via `torch.where`/`arange`/`.reshape`/`.to(int64)`).
-5. Real fix (in progress): replace 3 sequential `index_copy_` + transient tensor construction with a single Triton kernel reading only persistent forward_vars buffers.
-
-Wave dumps and code objects from this run: `/app/logs_claude/atom_server.log` (line 419+), `/app/logs_claude/debug_run/`, `/app/logs_claude/fault.s`.
-
 ## Sample wave dump (what to expect in atom_server.log)
 
-Trimmed real example from the May 14 2026 V4-Pro MTP-3 run. Key fields are the
-mangled function name in `kernel_code_entry=...`, the `stopped, reason: ...`
-tag, the `code object: memory://<pid>#offset=<hex>&size=<bytes>` line that
-points at the saved file, and the `=> <pc>: <instruction>` arrow showing the
-faulting PC. Vector registers (only v0/v1/v6 shown — full dump prints v0..v15
+Trimmed example. Key fields are the mangled function name in `kernel_code_entry=...`,
+the `stopped, reason: ...` tag, the `code object: memory://<pid>#offset=<hex>&size=<bytes>`
+line that points at the saved file, and the `=> <pc>: <instruction>` arrow showing
+the faulting PC. Vector registers (only v0/v1/v6 shown — full dump prints v0..v15
 and beyond) often reveal address / index values that pin down the operand.
 
 ```

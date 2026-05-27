@@ -9,10 +9,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils import CpuGpuBuffer
-from atom.utils.block_convert import (
-    block_table_convert_triton,
-    kv_indices_generate_triton,
-)
+from atom.utils.block_convert import kv_indices_generate_triton
 import atom.model_ops as ops
 from atom.model_ops.paged_attention import PagedAttention
 from atom.model_ops.attention_mha import PagedAttentionImpl
@@ -184,12 +181,6 @@ class AiterAttentionMetadataBuilder:
                 self.max_num_blocks_per_seq // self.block_ratio,
                 **i32_kwargs,
             )
-            if self.block_ratio > 1:
-                var[f"{p}block_tables_converted"] = CpuGpuBuffer(
-                    ub_max_bs,
-                    self.max_num_blocks_per_seq,
-                    **i32_kwargs,
-                )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
                 torch.arange(
@@ -524,6 +515,52 @@ class AiterAttentionMetadataBuilder:
             v_scale=module.v_scale,
         )
 
+    def get_kv_transfer_tensors(self):
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferRegion,
+            KVTransferTensors,
+        )
+
+        runner = self.model_runner
+        if not hasattr(runner, "kv_cache") or runner.kv_cache is None:
+            return None
+
+        block_regions: list[KVTransferRegion] = []
+
+        def _add_region(tensor):
+            bpb = tensor.stride(0) * tensor.element_size()
+            block_regions.append(
+                KVTransferRegion(
+                    base_addr=tensor.data_ptr(),
+                    total_bytes=tensor.numel() * tensor.element_size(),
+                    unit_bytes=bpb,
+                )
+            )
+
+        if hasattr(runner, "_kv_layer_cache_store") and runner._kv_layer_cache_store:
+            for k_cache, v_cache, k_scale, v_scale in runner._kv_layer_cache_store:
+                _add_region(k_cache)
+                _add_region(v_cache)
+                if k_scale is not None:
+                    _add_region(k_scale)
+                if v_scale is not None:
+                    _add_region(v_scale)
+        else:
+            num_layers = runner.kv_cache.shape[1]
+            for layer_id in range(num_layers):
+                _add_region(runner.kv_cache[0, layer_id])  # K
+                _add_region(runner.kv_cache[1, layer_id])  # V
+            if hasattr(runner, "kv_scale") and runner.kv_scale is not None:
+                for layer_id in range(num_layers):
+                    _add_region(runner.kv_scale[0, layer_id])
+                    _add_region(runner.kv_scale[1, layer_id])
+
+        return KVTransferTensors(
+            block_regions=block_regions,
+            slot_regions=[],
+            num_blocks=runner.num_physical_kvcache_blocks,
+        )
+
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0
@@ -605,14 +642,6 @@ class AiterAttentionMetadataBuilder:
             self.block_ratio,
             max_seqlen_k,
         )
-        if self.block_ratio > 1 and "block_tables" in ctx:
-            block_table_convert_triton(
-                var["block_tables"].gpu[:bs],
-                var["block_tables_converted"].gpu[:bs],
-                var["context_lens"].gpu[:bs],
-                self.block_ratio,
-            )
-            ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
@@ -774,11 +803,6 @@ class AiterAttentionMetadataBuilder:
             cu_seqlens_q=var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
             kv_indptr=var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
             kv_indices=var[f"{p}kv_indices"].gpu,
-            block_tables_converted=(
-                var[f"{p}block_tables_converted"].gpu[:padded_bs]
-                if f"{p}block_tables_converted" in var
-                else None
-            ),
             work_meta_data=var[f"{p}work_meta_data"],
             work_info_set=var[f"{p}work_info_set"],
             work_indptr=var[f"{p}work_indptr"],
@@ -803,11 +827,6 @@ class AiterAttentionMetadataBuilder:
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu,
             max_seqlen_k=self.model_runner.config.max_model_len,
-            block_tables_converted=(
-                var["block_tables_converted"].gpu[:bs]
-                if "block_tables_converted" in var
-                else None
-            ),
             **ctx_pa_ps,
         )
 
