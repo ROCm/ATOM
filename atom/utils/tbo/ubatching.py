@@ -20,26 +20,11 @@ def tbo_enabled() -> bool:
     return getattr(config, "enable_tbo", False)
 
 
-def sync_dp_for_tbo(
-    dp_size: int,
-    dp_rank: int,
-    num_input_tokens: int,
-    num_reqs: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sync token counts and request counts across DP ranks in one all_reduce.
-
-    Returns (num_tokens_across_dp, reqs_across_dp).
-    reqs_across_dp is used to decide TBO on/off (min_reqs >= 2).
-    """
-    import torch.distributed as dist
-    from aiter.dist.parallel_state import get_dp_group
-
-    # Layout: [tokens_r0, ..., tokens_rN, reqs_r0, ..., reqs_rN]
-    sync_tensor = torch.zeros(dp_size * 2, device="cpu", dtype=torch.int32)
-    sync_tensor[dp_rank] = num_input_tokens
-    sync_tensor[dp_size + dp_rank] = num_reqs
-    dist.all_reduce(sync_tensor, group=get_dp_group().cpu_group)
-    return sync_tensor[:dp_size], sync_tensor[dp_size:]
+# NOTE: ``sync_dp_for_tbo`` was removed. The DP TBO-eligibility / token-count
+# synchronisation has been folded into the packed single all_reduce in
+# ``ModelRunner._preprocess`` (see Plan B). Two callers used to issue it
+# every step (one for tokens+reqs, one for the per-ubatch token MAX in
+# ``UBatchWrapper``); both are now derived from the packed reduce.
 
 
 _THREAD_ID_TO_CONTEXT: dict[int, int] = {}
@@ -86,6 +71,12 @@ class TBOContext:
         self.gpu_compute_done_event = gpu_compute_done_event
         self.current_stream = compute_stream
         self.recv_hook: Optional[Callable] = None
+        # Set True when this ubatch's model.forward returns (or raises).
+        # Partner thread checks this in `_cpu_yield` so it doesn't sleep
+        # forever if we exited (cleanly or via exception) ahead of it.
+        self.done: bool = False
+        # Filled by `make_tbo_contexts` — points to the OTHER ubatch's ctx.
+        self.partner: Optional["TBOContext"] = None
 
     # -- context manager protocol ----------------------------------------
 
@@ -110,6 +101,14 @@ class TBOContext:
         _CURRENT_CONTEXTS[self.ubatch_id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         self.maybe_run_recv_hook()
+        # Mark this ubatch done BEFORE the final signal so that if the partner
+        # is racing into its next `_cpu_yield` between our signal and its wait,
+        # it observes `partner.done == True` and skips the wait instead of
+        # sleeping forever. Without this, any asymmetry (e.g. partner exits
+        # mid-forward via exception) leaves the survivor wedged on the next
+        # yield: the dead partner only signals exactly once from __exit__,
+        # but the survivor still has ≥1 yield left to do.
+        self.done = True
         # No CPU-blocking synchronize — GPU ordering is handled by
         # torch.Event record/wait in switch_to_comm_sync / switch_to_compute_sync.
         self.cpu_signal_event.set()
@@ -158,8 +157,19 @@ class TBOContext:
     # -- CPU yield (ping-pong) -------------------------------------------
 
     def _cpu_yield(self):
-        """Wake the next thread and sleep until woken."""
+        """Wake the next thread and sleep until woken.
+
+        If the partner ubatch has already finished (cleanly or via exception
+        — see `__exit__` above), there is nobody to wake us, so we must not
+        block. Returning immediately here lets the survivor finish its
+        remaining yields and exit normally, so the main thread's `t.join()`
+        can complete and any captured `errors[idx]` can be raised.
+        """
         self.cpu_signal_event.set()
+        if self.partner is not None and self.partner.done:
+            self.cpu_wait_event.clear()
+            self._restore_context()
+            return
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
         self._restore_context()
@@ -297,5 +307,13 @@ def make_tbo_contexts(
             gpu_compute_done_event=gpu_compute_done_events[i],
         )
         ctxs.append(ctx)
+
+    # Link each ctx to its neighbour in the ping-pong ring so that `_cpu_yield`
+    # can short-circuit when the partner has exited. For N=2 (the only case
+    # we run today) `partner` is just the other ctx. For N>2 we point at the
+    # NEXT ctx (the one whose `cpu_wait_event` is our `cpu_signal_event`'s
+    # target) — that's the only one whose `done` flag can leave us wedged.
+    for i, ctx in enumerate(ctxs):
+        ctx.partner = ctxs[(i + 1) % num_micro_batches]
 
     return ctxs

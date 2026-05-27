@@ -490,8 +490,6 @@ class Scheduler:
         """
         if not self.waiting:
             return False
-        # Bounded peek: in practice the head is admissible or not; we
-        # cap at 4 to avoid pathological O(queue) work per tick.
         for i, seq in enumerate(self.waiting):
             if i >= 4:
                 break

@@ -23,13 +23,6 @@ from .ubatching import make_tbo_contexts
 logger = logging.getLogger("atom")
 
 
-def _get_dp_group_handle():
-    """Return the torch.distributed process group for DP."""
-    from aiter.dist.parallel_state import get_dp_group
-
-    return get_dp_group().device_group
-
-
 @dataclass
 class TBOGraphData:
     """Stores a captured CUDAGraph alongside objects that must stay alive."""
@@ -64,6 +57,54 @@ class UBatchWrapper(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         ctx = get_forward_context()
+        # Hit-rate counters: split by prefill / decode to diagnose whether
+        # the collective TBO decision is firing where we expect.
+        is_prefill = ctx.context.is_prefill
+        if ctx.ubatch_slices is None:
+            if is_prefill:
+                self._n_skip_prefill = getattr(self, "_n_skip_prefill", 0) + 1
+            else:
+                self._n_skip_decode = getattr(self, "_n_skip_decode", 0) + 1
+        else:
+            if is_prefill:
+                self._n_used_prefill = getattr(self, "_n_used_prefill", 0) + 1
+            else:
+                self._n_used_decode = getattr(self, "_n_used_decode", 0) + 1
+        total = (
+            getattr(self, "_n_skip_prefill", 0)
+            + getattr(self, "_n_skip_decode", 0)
+            + getattr(self, "_n_used_prefill", 0)
+            + getattr(self, "_n_used_decode", 0)
+        )
+        # Log on (a) the very first TBO hit so we know it actually fired,
+        # (b) every 50 fwds thereafter. Prefill-only TBO can total way less
+        # than 200 fwds across a whole benchmark, so the old `% 200 == 0`
+        # gate could silently never fire.
+        first_hit = ctx.ubatch_slices is not None and (
+            getattr(self, "_n_used_prefill", 0) + getattr(self, "_n_used_decode", 0)
+        ) == 1
+        if first_hit or total % 50 == 0:
+            logger.info(
+                "[TBO] used_p=%d skip_p=%d used_d=%d skip_d=%d (hit_p=%.1f%% hit_d=%.1f%%)",
+                getattr(self, "_n_used_prefill", 0),
+                getattr(self, "_n_skip_prefill", 0),
+                getattr(self, "_n_used_decode", 0),
+                getattr(self, "_n_skip_decode", 0),
+                100.0
+                * getattr(self, "_n_used_prefill", 0)
+                / max(
+                    1,
+                    getattr(self, "_n_used_prefill", 0)
+                    + getattr(self, "_n_skip_prefill", 0),
+                ),
+                100.0
+                * getattr(self, "_n_used_decode", 0)
+                / max(
+                    1,
+                    getattr(self, "_n_used_decode", 0)
+                    + getattr(self, "_n_skip_decode", 0),
+                ),
+            )
         if ctx.ubatch_slices is None:
             return self.model(input_ids, positions)
         return self._run_ubatches(input_ids, positions, ctx)
@@ -114,12 +155,21 @@ class UBatchWrapper(nn.Module):
                 ub_graph_bs=ub_graph_bs_list[i],
             )
             forward_contexts.append(ub_ctx)
-            ub_inputs.append(
-                (
-                    input_ids[ub_slice.token_slice],
-                    positions[ub_slice.token_slice],
-                )
+            ub_token_slice = (
+                input_ids[ub_slice.token_slice],
+                positions[ub_slice.token_slice],
             )
+            # Empty ubatch would return immediately, leaving the partner
+            # wedged at its next yield (see TBOContext.__exit__ comment).
+            # The new partner.done short-circuit covers this case too, but
+            # an empty ubatch is always a metadata bug upstream — assert
+            # loudly rather than silently waste a TBO split.
+            assert ub_token_slice[0].numel() > 0, (
+                f"ubatch {i} produced an empty token slice "
+                f"(ts={ub_slice.token_slice}, rs={ub_slice.request_slice}); "
+                "check _local_tbo_precompute / maybe_create_ubatch_slices."
+            )
+            ub_inputs.append(ub_token_slice)
 
         tbo_ctxs = make_tbo_contexts(
             num_micro_batches=N,
@@ -148,9 +198,14 @@ class UBatchWrapper(nn.Module):
                     model_output = self.model(ub_input_ids, ub_positions)
                 results.append((idx, model_output))
             except Exception as e:
-                import traceback
-
-                traceback.print_exc()
+                # `logger.exception` captures the full traceback to the atom
+                # logger (which goes to stderr + log file); previously the
+                # bare `traceback.print_exc()` could be drowned by other
+                # stderr output across 8 worker procs. The partner thread
+                # is now unblocked via TBOContext.partner.done (set in
+                # __exit__) so the main thread's `t.join()` will return
+                # promptly and re-raise this `errors[idx]`.
+                logger.exception("[TBO] ubatch %d crashed: %s", idx, e)
                 errors[idx] = e
 
         # Clear thread-local forward context so threads don't inherit it
@@ -326,23 +381,24 @@ class UBatchWrapper(nn.Module):
         device: torch.device,
     ) -> list[int]:
         """
-        For prefill (eager only): all_reduce(MAX) per-ubatch token counts
+        For prefill (eager only): use cross-DP per-ubatch token MAX that
+            ``ModelRunner._preprocess`` already packed into the single DP
+            all_reduce (``ctx.ub_max_tokens_across_dp``). Falls back to
+            local sizes when DP is off / value not precomputed.
         For decode: padded_bs * dp_size.
         """
         if ctx.context.is_prefill:
+            if (
+                dp_size > 1
+                and ctx.ub_max_tokens_across_dp is not None
+                and len(ctx.ub_max_tokens_across_dp) == N
+            ):
+                # Precomputed via the packed DP reduce — no extra all_reduce.
+                return list(ctx.ub_max_tokens_across_dp)
             ub_sizes = []
             for ub_slice in ctx.ubatch_slices:
                 ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
                 ub_sizes.append(ub_num_tokens)
-
-            if dp_size > 1:
-                sizes_t = torch.tensor(ub_sizes, device=device, dtype=torch.int64)
-                torch.distributed.all_reduce(
-                    sizes_t,
-                    op=torch.distributed.ReduceOp.MAX,
-                    group=_get_dp_group_handle(),
-                )
-                return sizes_t.tolist()
             return ub_sizes
         else:
             result = []
@@ -371,6 +427,7 @@ class UBatchWrapper(nn.Module):
                 ctx.attn_metadata,
                 ub_slice,
                 padded_bs,
+                ubatch_idx=ubatch_idx,
             )
         else:
             attn_bs = actual_num_reqs if actual_num_reqs is not None else padded_bs
@@ -404,6 +461,18 @@ class UBatchWrapper(nn.Module):
             dp_metadata=ctx.dp_metadata,  # shared across ubatches
             spec_decode_metadata=None,  # not supported with TBO
             ubatch_slices=None,  # prevent recursion
+            # Propagate parent's cached current_stream so downstream code
+            # (V4 dual-stream MoE / attention compressor / etc.) that reads
+            # `get_forward_context().main_stream` sees a real Stream rather
+            # than None. Without this the per-ubatch ForwardContext picks up
+            # the dataclass default (None) and the first `wait_stream(None)`
+            # crashes with `AttributeError: 'NoneType' has no record_event`.
+            # The TBO worker thread switches stream via TBOContext, so we
+            # use the parent's stream here (= the original compute stream),
+            # which is also the stream the worker resumes on after each
+            # comm→compute switch.
+            main_stream=ctx.main_stream,
+            in_hipgraph=ctx.in_hipgraph,
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

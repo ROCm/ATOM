@@ -1273,11 +1273,44 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return attn_metadata, positions
 
+    def _get_ubatch_compress_plan_buffers(
+        self, ubatch_idx: int
+    ) -> dict[int, dict[str, "CpuGpuBuffer"]]:
+
+        if not hasattr(self, "_ubatch_compress_plan_buffers"):
+            self._ubatch_compress_plan_buffers: dict[
+                int, dict[int, dict[str, CpuGpuBuffer]]
+            ] = {}
+        cached = self._ubatch_compress_plan_buffers.get(ubatch_idx)
+        if cached is not None:
+            return cached
+
+        var = self.model_runner.forward_vars
+        pool: dict[int, dict[str, CpuGpuBuffer]] = {}
+        for ratio, _ in self._unique_compress_ratios_overlap:
+            tmpl_c = var[f"v4_compress_plan_{ratio}"]
+            tmpl_w = var[f"v4_write_plan_{ratio}"]
+            buf_c = CpuGpuBuffer(
+                *tmpl_c.cpu.shape, dtype=tmpl_c.cpu.dtype, device=tmpl_c.gpu.device
+            )
+            buf_w = CpuGpuBuffer(
+                *tmpl_w.cpu.shape, dtype=tmpl_w.cpu.dtype, device=tmpl_w.gpu.device
+            )
+            # Sentinel-fill so any unused tail rows behave like the main pool.
+            buf_c.cpu.fill_(-1)
+            buf_c.copy_to_gpu()
+            buf_w.cpu.fill_(-1)
+            buf_w.copy_to_gpu()
+            pool[ratio] = {"compress": buf_c, "write": buf_w}
+        self._ubatch_compress_plan_buffers[ubatch_idx] = pool
+        return pool
+
     def build_ubatch_prefill_metadata(
         self,
         attn_metadata: AttentionMetaData,
         ub_slice,
         padded_bs: int,
+        ubatch_idx: int = 0,
     ) -> AttentionMetaData_DSV4:
         """Split prefill AttentionMetaData for V4 TBO micro-batches."""
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
@@ -1310,17 +1343,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         context_lens_np = np.asarray(
             var["context_lens"].np[rs.start : rs.stop], dtype=np.int32
         ).copy()
-        device = src.state_slot_mapping.device
-
         from atom.model_ops.v4_kernels import make_compress_plans
 
         if self._unique_compress_ratios_overlap:
+            # Per-ubatch plan buffers — sharing the main pool would let
+            # ubatch 1's CPU build overwrite ubatch 0's before ubatch 0
+            # launches its compressor kernel. TBO prefill is eager-only,
+            # so `decode_capacity_per_ratio=None` (tight n_compress slice).
+            ub_plan_buffers = self._get_ubatch_compress_plan_buffers(ubatch_idx)
             ub_attn.compress_plans = make_compress_plans(
                 np.ascontiguousarray(extend_lens_np, dtype=np.int32),
                 np.ascontiguousarray(context_lens_np, dtype=np.int32),
                 self._unique_compress_ratios_overlap,
-                device,
-                plan_buffers=None,
+                plan_buffers=ub_plan_buffers,
                 decode_capacity_per_ratio=None,
             )
         else:
@@ -1356,6 +1391,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
             # start_pos = position of first token of each seq in this ubatch.
             ub_start_pos_per_seq_np = positions_np[ub_cu[:ub_num_reqs]]
+            ub_positions_gpu = var["positions"].gpu[ts.start : ts.stop]
+            ub_block_tables_gpu = var["block_tables"].gpu[rs.start : rs.stop]
+            ub_cu_q_per_seq_gpu = torch.from_numpy(
+                np.ascontiguousarray(ub_cu[:ub_num_reqs], dtype=np.int32)
+            ).to(self.device, non_blocking=True)
             self._build_paged_prefill_meta(
                 ub_attn,
                 positions_np,
@@ -1365,6 +1405,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 ub_attn.state_slot_mapping_cpu,
                 ub_num_reqs,
                 ub_num_tokens,
+                positions_gpu=ub_positions_gpu,
+                cu_q_per_seq_gpu=ub_cu_q_per_seq_gpu,
+                block_tables_gpu=ub_block_tables_gpu,
             )
         finally:
             bt[:ub_num_reqs] = saved_bt
@@ -1740,6 +1783,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         state_slot_mapping_cpu: np.ndarray,
         scheduled_bs: int,
         total_tokens: int,
+        *,
+        positions_gpu: Optional[torch.Tensor] = None,
+        cu_q_per_seq_gpu: Optional[torch.Tensor] = None,
+        block_tables_gpu: Optional[torch.Tensor] = None,
     ) -> None:
         """Build per-fwd index buffers consumed by sparse_attn_v4_paged_prefill.
 
@@ -1869,10 +1916,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the kernel was designed/tested against int32 (downstream paged
         # offsets stored in int32 buffers; int32 throughout avoids mixed-
         # dtype Triton arithmetic that can silently truncate).
-        positions_gpu = var["positions"].gpu[:T]
-        cu_q_per_seq_gpu = var["cu_seqlens_q"].gpu[:scheduled_bs]
+        if positions_gpu is None:
+            positions_gpu = var["positions"].gpu[:T]
+        if cu_q_per_seq_gpu is None:
+            cu_q_per_seq_gpu = var["cu_seqlens_q"].gpu[:scheduled_bs]
+        if block_tables_gpu is None:
+            block_tables_gpu = var["block_tables"].gpu[:scheduled_bs]
         state_slot_per_seq_gpu = attn_metadata.state_slot_mapping[:scheduled_bs]
-        block_tables_gpu = var["block_tables"].gpu[:scheduled_bs]
         # batch_id_per_token is int64 in storage (PyTorch fancy-index
         # compatibility upstream); kernel uses tl.load which is dtype-agnostic
         # but cast for safety + consistency.

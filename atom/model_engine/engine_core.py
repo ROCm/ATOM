@@ -17,7 +17,7 @@ from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import init_exit_handler, make_zmq_socket
+from atom.utils import envs, init_exit_handler, make_zmq_socket
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -394,27 +394,16 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
-        if os.environ.get("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1":
+        if envs.ATOM_ENABLE_PREFILL_DELAYER:
             from atom.model_engine.prefill_delayer import PrefillDelayer
 
-            dp_size = config.parallel_config.data_parallel_size
-            max_delay_passes = int(
-                os.environ.get("ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES", "30")
-            )
-            max_delay_ms = float(
-                os.environ.get("ATOM_PREFILL_DELAYER_MAX_DELAY_MS", "5000")
-            )
-            watermark_env = os.environ.get(
-                "ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", ""
-            )
-            watermark = None if watermark_env == "" else float(watermark_env)
             self.scheduler.set_prefill_delayer(
                 PrefillDelayer(
-                    dp_size=dp_size,
+                    dp_size=config.parallel_config.data_parallel_size,
                     cpu_group=self.dp_group,
-                    max_delay_passes=max_delay_passes,
-                    max_delay_ms=max_delay_ms,
-                    token_usage_low_watermark=watermark,
+                    max_delay_passes=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES,
+                    max_delay_ms=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_MS,
+                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                 )
             )
 

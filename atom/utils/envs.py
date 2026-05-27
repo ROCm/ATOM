@@ -170,6 +170,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
     ),
+    # --- PrefillDelayer (cross-DP prefill alignment) ---
+    # Master switch; default on. Set "0" to disable construction.
+    "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
+        os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1"
+    ),
+    # Max consecutive scheduler passes the delayer is allowed to suppress
+    # prefill admission while waiting for cross-DP alignment.
+    "ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES", "30")
+    ),
+    # Wall-clock cap (milliseconds) on a single delay window.
+    "ATOM_PREFILL_DELAYER_MAX_DELAY_MS": lambda: float(
+        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_MS", "5000")
+    ),
+    # Optional KV-usage low watermark below which delaying is allowed.
+    # Empty string => None (use PrefillDelayer's internal default).
+    "ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": lambda: (
+        None
+        if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
+        else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
+    ),
 }
 
 

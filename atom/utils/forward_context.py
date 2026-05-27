@@ -375,6 +375,13 @@ class ForwardContext:
 
     ubatch_slices: Optional[list[Any]] = None
 
+    # Cross-DP MAX of per-ubatch token counts, precomputed in
+    # ``ModelRunner._preprocess`` and propagated here so
+    # ``UBatchWrapper._compute_ub_graph_bs`` no longer needs its own
+    # per-ubatch all_reduce. Shape: tuple of length N == len(ubatch_slices).
+    # None when DP is off or when TBO is not active this step.
+    ub_max_tokens_across_dp: Optional[tuple] = None
+
     # Cached current_stream() captured at set_forward_context() time, so
     # downstream code (V4 attention / MoE / metadata builder) doesn't have
     # to query torch.cuda.current_stream() repeatedly during a forward —
@@ -439,6 +446,7 @@ def set_forward_context(
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
     ubatch_slices: Optional[list[Any]] = None,
     in_hipgraph: bool = False,
+    ub_max_tokens_across_dp: Optional[tuple] = None,
 ) -> None:
     global _forward_context
     dp_metadata: Optional[DPMetadata] = None
@@ -458,6 +466,7 @@ def set_forward_context(
         dp_metadata=dp_metadata,
         spec_decode_metadata=spec_decode_metadata,
         ubatch_slices=ubatch_slices,
+        ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         main_stream=(torch.cuda.current_stream() if _CUDA_AVAILABLE else None),
         in_hipgraph=in_hipgraph,
     )  # _forward_context.attn_metadata = attn_metadata

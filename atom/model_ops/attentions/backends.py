@@ -370,7 +370,9 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         attn_metadata: AttentionMetaData,
         ub_slice: UBatchSlice,
         padded_bs: int,
+        ubatch_idx: int = 0,
     ) -> AttentionMetaData:
+        del ubatch_idx  # only used by builders with per-ubatch plan buffers
         return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
 
     def build(self, batch: ScheduledBatch, bs: int):
