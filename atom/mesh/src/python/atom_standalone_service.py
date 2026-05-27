@@ -6,11 +6,8 @@ standalone router only needs to bridge requests and responses.
 
 from __future__ import annotations
 
-import importlib
 import numbers
-import sys
 import uuid
-from pathlib import Path
 from typing import Any
 
 from atom.entrypoints.openai.api_server import _build_sampling_params, _coerce_n
@@ -88,9 +85,13 @@ class AtomStandaloneService:
         outputs = self._generate(request.prompt, request, effective_n)
         request_id = f"cmpl-{uuid.uuid4().hex}"
         if effective_n > 1:
-            response = build_completion_response_multi(request_id, self.model_name, outputs)
+            response = build_completion_response_multi(
+                request_id, self.model_name, outputs
+            )
         else:
-            response = build_completion_response(request_id, self.model_name, outputs[0])
+            response = build_completion_response(
+                request_id, self.model_name, outputs[0]
+            )
         return self._json_safe(response.model_dump(exclude_none=True))
 
     def close(self) -> None:
