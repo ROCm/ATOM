@@ -384,345 +384,6 @@ class AiterMlaSparseMetadataForVllm:
     reduce_partial_map: torch.Tensor | None = None
 
 
-class AiterMlaSparseMetadataBuilderMethodsForVllm:
-    def __init__(self):
-        raise TypeError(
-            f"{self.__class__.__name__} is a utility class and should not be instantiated. "
-            "Its methods are meant to be added to other classes via decorators."
-        )
-
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
-        num_tokens = common_attn_metadata.num_actual_tokens
-        starts = common_attn_metadata.query_start_loc_cpu.to(torch.int32)
-        seg_lengths = torch.diff(starts)
-        req_id_per_token = torch.repeat_interleave(
-            torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
-        )
-        # Zero-fill for cudagraphs
-        self.req_id_per_token_buffer.fill_(0)
-        self.paged_kv_indices.fill_(0)
-        self.paged_kv_indptr.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
-            req_id_per_token, non_blocking=True
-        )
-
-        query_lens = (
-            common_attn_metadata.query_start_loc[1:]
-            - common_attn_metadata.query_start_loc[:-1]
-        )
-        seq_lens = common_attn_metadata.seq_lens
-
-        from atom.plugin.vllm.attention.mla_sparse_impl import (
-            generate_sparse_seqlen_triton,
-        )
-
-        sparse_seqlen = generate_sparse_seqlen_triton(
-            query_lens,
-            seq_lens,
-            common_attn_metadata.query_start_loc,
-            self.topk_tokens,
-            num_tokens,
-            common_attn_metadata.max_query_len,
-        )
-        torch.cumsum(
-            sparse_seqlen,
-            dim=0,
-            out=self.paged_kv_indptr[1 : num_tokens + 1],
-        )
-        self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
-
-        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
-        qo_indptr = self.qo_indptr[: num_tokens + 1]
-        paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
-        paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
-        paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
-
-        get_mla_metadata_v1(
-            qo_indptr,
-            paged_kv_indptr,
-            paged_kv_last_page_len,
-            self.padded_num_heads,
-            1,
-            True,
-            self._mla_work_meta_data,
-            self._mla_work_info_set,
-            self._mla_work_indptr,
-            self._mla_reduce_indptr,
-            self._mla_reduce_final_map,
-            self._mla_reduce_partial_map,
-            page_size=1,
-            kv_granularity=16,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=True,
-            dtype_q=get_aiter_kv_cache_dtype(self.vllm_config),
-            dtype_kv=get_aiter_kv_cache_dtype(self.vllm_config),
-        )
-
-        attn_metadata = AiterMlaSparseMetadataForVllm(
-            num_reqs=common_attn_metadata.num_reqs,
-            max_query_len=common_attn_metadata.max_query_len,
-            max_seq_len=common_attn_metadata.max_seq_len,
-            seq_lens=common_attn_metadata.seq_lens,
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            block_table=common_attn_metadata.block_table_tensor,
-            req_id_per_token=req_id_per_token,
-            block_size=self.kv_cache_spec.block_size,
-            attn_out_dtype=self.model_dtype,
-            topk_tokens=self.topk_tokens,
-            qo_indptr=qo_indptr,
-            paged_kv_last_page_len=paged_kv_last_page_len,
-            paged_kv_indices=paged_kv_indices,
-            paged_kv_indptr=paged_kv_indptr,
-            work_meta_data=self._mla_work_meta_data,
-            work_indptr=self._mla_work_indptr,
-            work_info_set=self._mla_work_info_set,
-            reduce_indptr=self._mla_reduce_indptr,
-            reduce_final_map=self._mla_reduce_final_map,
-            reduce_partial_map=self._mla_reduce_partial_map,
-        )
-
-        return attn_metadata
-
-
-class AiterMlaSparseIndexerMetadataBuilderMethodsForVllm:
-    """Mixin for DeepseekV32IndexerCache: builds AiterMlaSparseIndexerMetadataForVllm only."""
-
-    def __init__(self):
-        raise TypeError(
-            f"{self.__class__.__name__} is a utility class and should not be instantiated. "
-            "Its methods are meant to be added to other classes via decorators."
-        )
-
-    def _build_indexer_one_prefill_chunk(
-        self, reqs_start, reqs_end, query_start_loc_cpu, seq_lens_cpu, block_table
-    ):
-        prefill_query_start_loc = (
-            query_start_loc_cpu[reqs_start : reqs_end + 1]
-            - query_start_loc_cpu[reqs_start]
-        )
-        cu_seqlen_ks, cu_seqlen_ke = kv_spans_from_batches(
-            prefill_query_start_loc, seq_lens_cpu[reqs_start:reqs_end], self.device
-        )
-        token_start = query_start_loc_cpu[reqs_start].item()
-        token_end = query_start_loc_cpu[reqs_end].item()
-        total_seq_lens = seq_lens_cpu[reqs_start:reqs_end].sum()
-        seq_idx = torch.arange(0, reqs_end - reqs_start, dtype=torch.int32)
-        token_to_seq = torch.repeat_interleave(
-            seq_idx, seq_lens_cpu[reqs_start:reqs_end]
-        ).to(self.device)
-        assert total_seq_lens <= self.max_prefill_buffer_size
-        cu_seq_lens = (
-            torch.cat(
-                [
-                    torch.zeros(1, dtype=torch.int32),
-                    seq_lens_cpu[reqs_start:reqs_end].cumsum(dim=0),
-                ]
-            )
-            .to(torch.int32)
-            .to(self.device)
-        )
-        return AiterMlaSparseIndexerPrefillChunkMetadataForVllm(
-            cu_seqlen_ks=cu_seqlen_ks,
-            cu_seqlen_ke=cu_seqlen_ke,
-            cu_seq_lens=cu_seq_lens,
-            token_to_seq=token_to_seq,
-            total_seq_lens=total_seq_lens,
-            block_table=block_table[reqs_start:reqs_end],
-            token_start=token_start,
-            token_end=token_end,
-            num_reqs=reqs_end - reqs_start,
-        )
-
-    def _build_indexer(
-        self,
-        common_prefix_len: int,
-        common_attn_metadata=None,
-        fast_build: bool = False,
-    ) -> AiterMlaSparseIndexerMetadataForVllm:
-        from vllm.v1.attention.backends.utils import (
-            split_decodes_and_prefills,
-            split_prefill_chunks,
-        )
-        from vllm.platforms import current_platform
-        from vllm.utils.deep_gemm import (
-            get_paged_mqa_logits_metadata,
-            is_deep_gemm_supported,
-        )
-
-        num_reqs = common_attn_metadata.num_reqs
-        num_tokens = common_attn_metadata.num_actual_tokens
-
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.reorder_batch_threshold
-            )
-        )
-
-        assert num_decodes + num_prefills == num_reqs
-        assert num_decode_tokens + num_prefill_tokens == num_tokens
-
-        prefill_metadata = None
-        if num_prefills > 0:
-            chunk_seq_ids = split_prefill_chunks(
-                common_attn_metadata.seq_lens_cpu[num_decodes:],
-                self.max_prefill_buffer_size,
-                request_offset=num_decodes,
-            )
-            chunks = [
-                self._build_indexer_one_prefill_chunk(
-                    reqs_start,
-                    reqs_end,
-                    query_start_loc_cpu,
-                    common_attn_metadata.seq_lens_cpu,
-                    common_attn_metadata.block_table_tensor,
-                )
-                for reqs_start, reqs_end in chunk_seq_ids
-            ]
-            prefill_metadata = AiterMlaSparseIndexerPrefillMetadataForVllm(
-                chunks=chunks,
-            )
-
-        decode_metadata = None
-        if num_decodes > 0:
-            torch.diff(
-                common_attn_metadata.query_start_loc[: num_decodes + 1],
-                out=self.decode_lens_buffer[:num_decodes],
-            )
-            decode_lens = self.decode_lens_buffer[:num_decodes]
-            decode_lens_cpu = torch.diff(
-                common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
-            )
-
-            seq_lens = common_attn_metadata.seq_lens[:num_decodes]
-            block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
-
-            # Padded CUDA graph requests have block_table entries of -1.
-            # Clamp to 0 to prevent OOB access in the DeepGEMM kernel.
-            # This is safe because padded requests have seq_lens=0, so the
-            # kernel produces no meaningful output for those rows.
-            block_table.clamp_(min=0)
-
-            max_decode_len = int(decode_lens_cpu.max().item())
-            if max_decode_len > 1:
-                # Flatten multi-token decode requests into single-token
-                # batch entries, expanding seq_lens and block tables so
-                # the kernel always sees next_n=1.
-
-                # Assume 4 requests with seq_lens [10, 7, 12, 0] (the final req is
-                # padding) and decode_lens [3, 1, 4, 0] in the below example comments.
-                # The context lengths are therefore
-                # [10-3, 7-1, 12-4, 0-0] = [7, 6, 8, 0].
-
-                # 3 + 1 + 4 + 0 = 8
-                actual_expanded = int(decode_lens_cpu.sum().item())
-
-                # [7, 6, 8, 0] -> [7, 7, 7, 6, 8, 8, 8, 8]
-                expanded_base = torch.repeat_interleave(
-                    seq_lens - decode_lens, decode_lens, output_size=actual_expanded
-                )
-
-                # [0, 3, 4, 8] -> [0, 0, 0, 3, 4, 4, 4, 4]
-                expanded_starts = torch.repeat_interleave(
-                    common_attn_metadata.query_start_loc[:num_decodes],
-                    decode_lens,
-                    output_size=actual_expanded,
-                )
-
-                # [0, 1, 2, 0, 0, 1, 2, 3]
-                positions_within = (
-                    self.arange_buffer[:actual_expanded] - expanded_starts
-                )
-
-                # [8, 9, 10, 7, 9, 10, 11, 12, ...] where ... is unused buffer space
-                self.expanded_seq_lens_buffer[:actual_expanded] = (
-                    expanded_base + positions_within + 1
-                )
-                self.expanded_seq_lens_buffer[actual_expanded:] = 0
-                seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
-
-                # Give each of the flattened entries the same block table row as the
-                # original request.
-                self.expanded_block_table_buffer[:actual_expanded] = (
-                    torch.repeat_interleave(
-                        block_table, decode_lens, dim=0, output_size=actual_expanded
-                    )
-                )
-                if actual_expanded < num_decode_tokens:
-                    self.expanded_block_table_buffer[
-                        actual_expanded:num_decode_tokens, 0
-                    ] = 0
-                block_table = self.expanded_block_table_buffer[:num_decode_tokens]
-
-                # All reqs now have decode_len=1
-                self.decode_lens_buffer[:num_decode_tokens] = 1
-                decode_lens = self.decode_lens_buffer[:num_decode_tokens]
-                offsets = None
-                batch_size = num_decode_tokens
-            else:
-                next_n = 1 + self.num_speculative_tokens
-                if next_n > 1:
-                    offsets = torch.arange(
-                        next_n, device=self.device, dtype=torch.int32
-                    )
-                else:
-                    offsets = None
-                batch_size = num_decodes
-
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
-            if current_platform.is_cuda() and is_deep_gemm_supported():
-                self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
-                    seq_lens,
-                    self.kv_cache_spec.block_size,
-                    self.num_sms,
-                )
-
-            # Decide which top-k kernel to use based on batch size and sequence length
-            # Decision logic based on micro-benchmark results:
-            # - large_context_topk wins for batch <= 128 and seq_len > 8K
-            # - top_k_per_row_decode wins for batch > 128 or seq_len <= 8K
-            _is_large_context = common_attn_metadata.max_seq_len > 8192
-            use_large_context_topk = batch_size <= 128 and _is_large_context
-
-            decode_metadata = AiterMlaSparseIndexerDecodeMetadataForVllm(
-                block_table=block_table,
-                seq_lens=seq_lens,
-                decode_lens=decode_lens,
-                requires_padding=False,
-                schedule_metadata=self.scheduler_metadata_buffer,
-                use_large_context_topk=use_large_context_topk,
-                offsets=offsets,
-            )
-
-        indexer_metadata = AiterMlaSparseIndexerMetadataForVllm(
-            seq_lens=common_attn_metadata.seq_lens,
-            num_reqs=common_attn_metadata.num_reqs,
-            max_query_len=common_attn_metadata.max_query_len,
-            max_seq_len=common_attn_metadata.max_seq_len,
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            head_dim=128,
-            num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens,
-            num_prefills=num_prefills,
-            num_prefill_tokens=num_prefill_tokens,
-            prefill=prefill_metadata,
-            decode=decode_metadata,
-        )
-
-        return indexer_metadata
-
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
-        indexer_metadata = self._build_indexer(
-            common_prefix_len,
-            common_attn_metadata,
-            fast_build,
-        )
-        return indexer_metadata
 
 
 # vLLM metadata builders
@@ -1658,9 +1319,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         return attn_metadata
 
 
-class AiterMLASparseMetadataBuilder(
-    AiterMlaSparseMetadataBuilderMethodsForVllm, AttentionMetadataBuilder
-):
+class AiterMLASparseMetadataBuilder(AttentionMetadataBuilder):
     """vLLM-only metadata builder for sparse MLA main attention."""
 
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
@@ -1785,10 +1444,103 @@ class AiterMLASparseMetadataBuilder(
             device=device,
         )
 
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        num_tokens = common_attn_metadata.num_actual_tokens
+        starts = common_attn_metadata.query_start_loc_cpu.to(torch.int32)
+        seg_lengths = torch.diff(starts)
+        req_id_per_token = torch.repeat_interleave(
+            torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
+        )
+        # Zero-fill for cudagraphs
+        self.req_id_per_token_buffer.fill_(0)
+        self.paged_kv_indices.fill_(0)
+        self.paged_kv_indptr.fill_(0)
+        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
+            req_id_per_token, non_blocking=True
+        )
 
-class AiterMLASparseIndexerMetadataBuilder(
-    AiterMlaSparseIndexerMetadataBuilderMethodsForVllm, AttentionMetadataBuilder
-):
+        query_lens = (
+            common_attn_metadata.query_start_loc[1:]
+            - common_attn_metadata.query_start_loc[:-1]
+        )
+        seq_lens = common_attn_metadata.seq_lens
+
+        from atom.plugin.vllm.attention.layer_sparse_mla import (
+            generate_sparse_seqlen_triton,
+        )
+
+        sparse_seqlen = generate_sparse_seqlen_triton(
+            query_lens,
+            seq_lens,
+            common_attn_metadata.query_start_loc,
+            self.topk_tokens,
+            num_tokens,
+            common_attn_metadata.max_query_len,
+        )
+        torch.cumsum(
+            sparse_seqlen,
+            dim=0,
+            out=self.paged_kv_indptr[1 : num_tokens + 1],
+        )
+        self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
+
+        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        qo_indptr = self.qo_indptr[: num_tokens + 1]
+        paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
+        paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
+        paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
+
+        get_mla_metadata_v1(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_last_page_len,
+            self.padded_num_heads,
+            1,
+            True,
+            self._mla_work_meta_data,
+            self._mla_work_info_set,
+            self._mla_work_indptr,
+            self._mla_reduce_indptr,
+            self._mla_reduce_final_map,
+            self._mla_reduce_partial_map,
+            page_size=1,
+            kv_granularity=16,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+            dtype_q=get_aiter_kv_cache_dtype(self.vllm_config),
+            dtype_kv=get_aiter_kv_cache_dtype(self.vllm_config),
+        )
+
+        attn_metadata = AiterMlaSparseMetadataForVllm(
+            num_reqs=common_attn_metadata.num_reqs,
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            seq_lens=common_attn_metadata.seq_lens,
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            block_table=common_attn_metadata.block_table_tensor,
+            req_id_per_token=req_id_per_token,
+            block_size=self.kv_cache_spec.block_size,
+            attn_out_dtype=self.model_dtype,
+            topk_tokens=self.topk_tokens,
+            qo_indptr=qo_indptr,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_indptr=paged_kv_indptr,
+            work_meta_data=self._mla_work_meta_data,
+            work_indptr=self._mla_work_indptr,
+            work_info_set=self._mla_work_info_set,
+            reduce_indptr=self._mla_reduce_indptr,
+            reduce_final_map=self._mla_reduce_final_map,
+            reduce_partial_map=self._mla_reduce_partial_map,
+        )
+
+        return attn_metadata
+
+
+class AiterMLASparseIndexerMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     reorder_batch_threshold = 1
 
@@ -1874,3 +1626,231 @@ class AiterMLASparseIndexerMetadataBuilder(
         self.scheduler_metadata_buffer = torch.empty(
             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
         )
+
+    def _build_indexer_one_prefill_chunk(
+        self, reqs_start, reqs_end, query_start_loc_cpu, seq_lens_cpu, block_table
+    ):
+        prefill_query_start_loc = (
+            query_start_loc_cpu[reqs_start : reqs_end + 1]
+            - query_start_loc_cpu[reqs_start]
+        )
+        cu_seqlen_ks, cu_seqlen_ke = kv_spans_from_batches(
+            prefill_query_start_loc, seq_lens_cpu[reqs_start:reqs_end], self.device
+        )
+        token_start = query_start_loc_cpu[reqs_start].item()
+        token_end = query_start_loc_cpu[reqs_end].item()
+        total_seq_lens = seq_lens_cpu[reqs_start:reqs_end].sum()
+        seq_idx = torch.arange(0, reqs_end - reqs_start, dtype=torch.int32)
+        token_to_seq = torch.repeat_interleave(
+            seq_idx, seq_lens_cpu[reqs_start:reqs_end]
+        ).to(self.device)
+        assert total_seq_lens <= self.max_prefill_buffer_size
+        cu_seq_lens = (
+            torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32),
+                    seq_lens_cpu[reqs_start:reqs_end].cumsum(dim=0),
+                ]
+            )
+            .to(torch.int32)
+            .to(self.device)
+        )
+        return AiterMlaSparseIndexerPrefillChunkMetadataForVllm(
+            cu_seqlen_ks=cu_seqlen_ks,
+            cu_seqlen_ke=cu_seqlen_ke,
+            cu_seq_lens=cu_seq_lens,
+            token_to_seq=token_to_seq,
+            total_seq_lens=total_seq_lens,
+            block_table=block_table[reqs_start:reqs_end],
+            token_start=token_start,
+            token_end=token_end,
+            num_reqs=reqs_end - reqs_start,
+        )
+
+    def _build_indexer(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata=None,
+        fast_build: bool = False,
+    ) -> AiterMlaSparseIndexerMetadataForVllm:
+        from vllm.v1.attention.backends.utils import (
+            split_decodes_and_prefills,
+            split_prefill_chunks,
+        )
+        from vllm.platforms import current_platform
+        from vllm.utils.deep_gemm import (
+            get_paged_mqa_logits_metadata,
+            is_deep_gemm_supported,
+        )
+
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata, decode_threshold=self.reorder_batch_threshold
+            )
+        )
+
+        assert num_decodes + num_prefills == num_reqs
+        assert num_decode_tokens + num_prefill_tokens == num_tokens
+
+        prefill_metadata = None
+        if num_prefills > 0:
+            chunk_seq_ids = split_prefill_chunks(
+                common_attn_metadata.seq_lens_cpu[num_decodes:],
+                self.max_prefill_buffer_size,
+                request_offset=num_decodes,
+            )
+            chunks = [
+                self._build_indexer_one_prefill_chunk(
+                    reqs_start,
+                    reqs_end,
+                    query_start_loc_cpu,
+                    common_attn_metadata.seq_lens_cpu,
+                    common_attn_metadata.block_table_tensor,
+                )
+                for reqs_start, reqs_end in chunk_seq_ids
+            ]
+            prefill_metadata = AiterMlaSparseIndexerPrefillMetadataForVllm(
+                chunks=chunks,
+            )
+
+        decode_metadata = None
+        if num_decodes > 0:
+            torch.diff(
+                common_attn_metadata.query_start_loc[: num_decodes + 1],
+                out=self.decode_lens_buffer[:num_decodes],
+            )
+            decode_lens = self.decode_lens_buffer[:num_decodes]
+            decode_lens_cpu = torch.diff(
+                common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
+            )
+
+            seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+            block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
+
+            # Padded CUDA graph requests have block_table entries of -1.
+            # Clamp to 0 to prevent OOB access in the DeepGEMM kernel.
+            # This is safe because padded requests have seq_lens=0, so the
+            # kernel produces no meaningful output for those rows.
+            block_table.clamp_(min=0)
+
+            max_decode_len = int(decode_lens_cpu.max().item())
+            if max_decode_len > 1:
+                # Flatten multi-token decode requests into single-token
+                # batch entries, expanding seq_lens and block tables so
+                # the kernel always sees next_n=1.
+
+                # Assume 4 requests with seq_lens [10, 7, 12, 0] (the final req is
+                # padding) and decode_lens [3, 1, 4, 0] in the below example comments.
+                # The context lengths are therefore
+                # [10-3, 7-1, 12-4, 0-0] = [7, 6, 8, 0].
+
+                # 3 + 1 + 4 + 0 = 8
+                actual_expanded = int(decode_lens_cpu.sum().item())
+
+                # [7, 6, 8, 0] -> [7, 7, 7, 6, 8, 8, 8, 8]
+                expanded_base = torch.repeat_interleave(
+                    seq_lens - decode_lens, decode_lens, output_size=actual_expanded
+                )
+
+                # [0, 3, 4, 8] -> [0, 0, 0, 3, 4, 4, 4, 4]
+                expanded_starts = torch.repeat_interleave(
+                    common_attn_metadata.query_start_loc[:num_decodes],
+                    decode_lens,
+                    output_size=actual_expanded,
+                )
+
+                # [0, 1, 2, 0, 0, 1, 2, 3]
+                positions_within = (
+                    self.arange_buffer[:actual_expanded] - expanded_starts
+                )
+
+                # [8, 9, 10, 7, 9, 10, 11, 12, ...] where ... is unused buffer space
+                self.expanded_seq_lens_buffer[:actual_expanded] = (
+                    expanded_base + positions_within + 1
+                )
+                self.expanded_seq_lens_buffer[actual_expanded:] = 0
+                seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
+
+                # Give each of the flattened entries the same block table row as the
+                # original request.
+                self.expanded_block_table_buffer[:actual_expanded] = (
+                    torch.repeat_interleave(
+                        block_table, decode_lens, dim=0, output_size=actual_expanded
+                    )
+                )
+                if actual_expanded < num_decode_tokens:
+                    self.expanded_block_table_buffer[
+                        actual_expanded:num_decode_tokens, 0
+                    ] = 0
+                block_table = self.expanded_block_table_buffer[:num_decode_tokens]
+
+                # All reqs now have decode_len=1
+                self.decode_lens_buffer[:num_decode_tokens] = 1
+                decode_lens = self.decode_lens_buffer[:num_decode_tokens]
+                offsets = None
+                batch_size = num_decode_tokens
+            else:
+                next_n = 1 + self.num_speculative_tokens
+                if next_n > 1:
+                    offsets = torch.arange(
+                        next_n, device=self.device, dtype=torch.int32
+                    )
+                else:
+                    offsets = None
+                batch_size = num_decodes
+
+            # DeepGEMM is required for the paged MQA logits on CUDA devices
+            if current_platform.is_cuda() and is_deep_gemm_supported():
+                self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
+                    seq_lens,
+                    self.kv_cache_spec.block_size,
+                    self.num_sms,
+                )
+
+            # Decide which top-k kernel to use based on batch size and sequence length
+            # Decision logic based on micro-benchmark results:
+            # - large_context_topk wins for batch <= 128 and seq_len > 8K
+            # - top_k_per_row_decode wins for batch > 128 or seq_len <= 8K
+            _is_large_context = common_attn_metadata.max_seq_len > 8192
+            use_large_context_topk = batch_size <= 128 and _is_large_context
+
+            decode_metadata = AiterMlaSparseIndexerDecodeMetadataForVllm(
+                block_table=block_table,
+                seq_lens=seq_lens,
+                decode_lens=decode_lens,
+                requires_padding=False,
+                schedule_metadata=self.scheduler_metadata_buffer,
+                use_large_context_topk=use_large_context_topk,
+                offsets=offsets,
+            )
+
+        indexer_metadata = AiterMlaSparseIndexerMetadataForVllm(
+            seq_lens=common_attn_metadata.seq_lens,
+            num_reqs=common_attn_metadata.num_reqs,
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            head_dim=128,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            prefill=prefill_metadata,
+            decode=decode_metadata,
+        )
+
+        return indexer_metadata
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        indexer_metadata = self._build_indexer(
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build,
+        )
+        return indexer_metadata

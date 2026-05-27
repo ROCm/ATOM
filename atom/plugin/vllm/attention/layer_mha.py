@@ -14,9 +14,7 @@ from atom.model_ops.base_attention import (
 )
 from atom.plugin.vllm.attention.backend import AiterMhaBackendForVllm
 from atom.plugin.vllm.attention.layer_common import (
-    _init_vllm_layer_state,
     _register_vllm_static_forward_context,
-    _set_default_scales,
 )
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -28,6 +26,40 @@ if TYPE_CHECKING:
 
 _QWEN_GLUON_PA_DECODE_BS = 64
 _NO_PS_FIXED_SPLITS = 64
+
+
+def _init_vllm_mha_layer_state(
+    layer,
+    *,
+    layer_name: str,
+    kv_cache_dtype: str,
+    calculate_kv_scales: bool,
+    quant_config,
+) -> None:
+    from vllm.model_executor.layers.attention.attention import _init_kv_cache_quant
+    from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
+    atom_config = get_current_atom_config()
+    vllm_config = atom_config.plugin_config.vllm_config
+
+    layer.layer_name = layer_name
+    layer.kv_cache_dtype = kv_cache_dtype
+    layer.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+        kv_cache_dtype, vllm_config.model_config
+    )
+    layer.calculate_kv_scales = calculate_kv_scales
+    layer.quant_config = quant_config
+    layer.kv_cache = torch.tensor([])
+
+    _init_kv_cache_quant(layer, quant_config, layer_name)
+
+
+def _set_default_mha_scales(layer) -> None:
+    from vllm.model_executor.layers.attention.attention import set_default_quant_scales
+
+    set_default_quant_scales(layer, register_buffer=False)
+    if hasattr(layer, "_o_scale_float"):
+        layer._o_scale_float = None
 
 
 class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
@@ -99,7 +131,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         self.use_flash_layout = False
         self.supports_quant_query_input = False
 
-        _init_vllm_layer_state(
+        _init_vllm_mha_layer_state(
             self,
             layer_name=layer_name,
             kv_cache_dtype=cache_dtype,
@@ -119,7 +151,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
     def process_weights_after_loading(
         self, act_dtype: torch.dtype = torch.bfloat16
     ) -> None:
-        _set_default_scales(self)
+        _set_default_mha_scales(self)
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)

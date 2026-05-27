@@ -227,3 +227,15 @@ class AiterSparseMlaIndexerBackendForVllm(AiterMlaBackendForVllm):
     @classmethod
     def full_cls_name(cls) -> tuple[str, str]:
         return (cls.__module__, cls.__qualname__)
+
+
+class GDNAttentionBackend:
+    @staticmethod
+    def get_name() -> str:
+        return "ROCM_GDN_ATTENTION"
+
+    @staticmethod
+    def get_impl_cls() -> Type:
+        from atom.plugin.vllm.attention.layer_gdn import GatedDeltaNet
+
+        return GatedDeltaNet
