@@ -33,6 +33,7 @@ class EngineArgs:
     data_parallel_size: int = 1
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
+    enable_mixed_prefill_decode: bool = False
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     block_size: int = 16
@@ -97,6 +98,13 @@ class EngineArgs:
             default=True,
             help="Enable prefix caching (default: enabled). "
             "Use --no-enable_prefix_caching to disable.",
+        )
+        parser.add_argument(
+            "--enable-mixed-prefill-decode",
+            action="store_true",
+            help="Pack prefill chunks and decode seqs into the same forward "
+            "pass. Requires attention backends with split-dispatch support; "
+            "off by default.",
         )
         parser.add_argument(
             "--port",

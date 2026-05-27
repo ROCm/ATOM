@@ -557,3 +557,96 @@ class TestScheduledBatchPDFirstDecodeMTP:
         )
 
         assert list(batch.scheduled_tokens) == toks[-(mtp_k + 1) :]
+
+
+# ── mixed prefill+decode batch (Phase 2) ───────────────────────────────────
+
+
+class TestMixedBatch:
+    """Verify that --enable-mixed-prefill-decode merges prefill chunks and
+    decode seqs into one ScheduledBatch (Phase 2 of chunked prefill)."""
+
+    def _mixed_scheduler(self, **overrides):
+        cfg = MockConfig(
+            enable_mixed_prefill_decode=True,
+            num_kvcache_blocks=20,
+            max_num_seqs=4,
+            max_num_batched_tokens=256,
+            **overrides,
+        )
+        return Scheduler(cfg)
+
+    def _prefill_only_scheduler(self, **overrides):
+        cfg = MockConfig(
+            enable_mixed_prefill_decode=False,
+            num_kvcache_blocks=20,
+            max_num_seqs=4,
+            max_num_batched_tokens=256,
+            **overrides,
+        )
+        return Scheduler(cfg)
+
+    def _ready_decode_seq(self, sched, seq_factory, token_ids):
+        seq = seq_factory(token_ids)
+        sched.add(seq)
+        sched.schedule()  # prefill
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        seq.append_token(99)
+        return seq
+
+    def test_flag_off_keeps_batch_pure_prefill(self, seq_factory):
+        """Back-compat: without the flag, a step with both pending prefill and
+        running decode emits prefill-only (decode waits)."""
+        sched = self._prefill_only_scheduler()
+        self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        sched.add(seq_factory([5, 6, 7, 8]))  # new prefill
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 1
+        assert batch.total_seqs_num_decode == 0
+        assert batch.is_mixed is False
+
+    def test_flag_on_produces_mixed_batch(self, seq_factory):
+        sched = self._mixed_scheduler()
+        self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        sched.add(seq_factory([5, 6, 7, 8]))  # new prefill
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 1
+        assert batch.total_seqs_num_decode == 1
+        assert batch.is_mixed is True
+        # prefill rows come first, then decode rows
+        assert batch.num_scheduled_tokens[0] == 4  # prefill chunk
+        assert batch.num_scheduled_tokens[1] == 1  # decode token
+
+    def test_decode_loop_skips_seq_already_scheduled_as_prefill(self, seq_factory):
+        """A newly-added prefill seq must not also be picked by the decode
+        loop in the same step (it isn't in running, but guard the contract)."""
+        sched = self._mixed_scheduler()
+        decode_seq = self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        prefill_seq = seq_factory([5, 6, 7, 8])
+        sched.add(prefill_seq)
+        batch, _ = sched.schedule()
+        # Both seqs scheduled exactly once
+        assert len(batch.num_scheduled_tokens) == 2
+        ids = list(batch.req_ids) if hasattr(batch, "req_ids") else None
+        if ids is not None:
+            assert ids.count(decode_seq.id) == 1
+            assert ids.count(prefill_seq.id) == 1
+
+    def test_mixed_batch_decode_only_when_no_prefill(self, seq_factory):
+        """If no prefill is pending, mixed flag still produces a decode-only
+        batch (is_mixed False)."""
+        sched = self._mixed_scheduler()
+        self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 0
+        assert batch.total_seqs_num_decode == 1
+        assert batch.is_mixed is False
+
+    def test_mixed_batch_prefill_only_when_no_decode(self, seq_factory):
+        """If no decode is ready, flag still produces a prefill-only batch."""
+        sched = self._mixed_scheduler()
+        sched.add(seq_factory([5, 6, 7, 8]))
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 1
+        assert batch.total_seqs_num_decode == 0
+        assert batch.is_mixed is False
