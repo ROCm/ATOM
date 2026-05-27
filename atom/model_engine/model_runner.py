@@ -355,6 +355,7 @@ class tokenIDProcessor:
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
+        is_mixed = getattr(batch, "is_mixed", False)
         """for prefill: all input ids are new"""
         self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
             :total_tokens_prefill
@@ -362,6 +363,29 @@ class tokenIDProcessor:
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
         self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
+
+        if is_mixed:
+            # Mixed batch: write decode tokens after the prefill region.
+            # MTP / deferred-output integration with mixed batches is not yet
+            # supported (P2-M4 follow-up) — keep the failure obvious until
+            # those paths are adapted to the layout
+            #   [prefill_tokens | decode_tokens].
+            assert not self.is_deferred_out, (
+                "Mixed prefill+decode batches do not yet support deferred output "
+                "(P2-M4 follow-up). Disable --enable-mixed-prefill-decode for now."
+            )
+            assert not self.use_spec, (
+                "Mixed prefill+decode batches do not yet support MTP / speculative "
+                "decode (P2-M4 follow-up). Disable --enable-mixed-prefill-decode for now."
+            )
+            token_ids = scheduled_tokens[
+                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
+            ]
+            self.input_ids.np[
+                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
+            ] = token_ids
+            self.input_ids.copy_to_gpu(total_tokens)
+            return self.input_ids.gpu[:total_tokens]
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
@@ -1758,6 +1782,7 @@ class ModelRunner:
 
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         is_prefill = batch.total_tokens_num_prefill > 0
+        is_mixed = getattr(batch, "is_mixed", False)
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
@@ -1814,11 +1839,19 @@ class ModelRunner:
             graph_bs=graph_bs,
             dp_uniform_decode=dp_uniform_decode,
             forward_mode=forward_mode,
+            is_mixed=is_mixed,
+            num_prefill_tokens=batch.total_tokens_num_prefill if is_mixed else 0,
+            num_prefill_seqs=batch.total_seqs_num_prefill if is_mixed else 0,
         )
 
         actual_num_tokens = batch.total_tokens_num
 
         spec_decode_metadata = None
+        if is_mixed and hasattr(self, "drafter") and not batch.is_dummy_run:
+            raise NotImplementedError(
+                "Mixed prefill+decode batches do not yet support MTP / speculative "
+                "decode (P2-M4 follow-up). Disable --enable-mixed-prefill-decode."
+            )
         if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
             scheduled_bs = batch.total_seqs_num_decode
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
