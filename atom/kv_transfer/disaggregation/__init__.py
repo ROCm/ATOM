@@ -11,6 +11,7 @@ rather than reaching into submodules directly.
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
+    KVConnectorRole,
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -22,6 +23,7 @@ from atom.kv_transfer.disaggregation.types import (
 
 __all__ = [
     "KVConnectorBase",
+    "KVConnectorRole",
     "KVConnectorSchedulerBase",
     "KVConnectorFactory",
     "KVConnectorOutput",

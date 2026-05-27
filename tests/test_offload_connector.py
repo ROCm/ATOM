@@ -1,0 +1,266 @@
+# SPDX-License-Identifier: MIT
+# Tests for atom/kv_transfer/offload/* — focused on the OFFLOAD admission
+# and load-queue path. GPU-dependent round-trip behavior is exercised by
+# ad-hoc scripts (see project/005-kvcache-offload notes) since the CI
+# environment mocks torch.cuda.
+
+import os
+
+import pytest
+
+# Connector __init__ enforces this, and it must be set before the module
+# is imported (tests inherit the env from pytest's own process).
+os.environ.setdefault("PYTHONHASHSEED", "0")
+
+from atom.kv_transfer.disaggregation.base import KVConnectorRole
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.offload import (  # noqa: F401  (registers factory entry)
+    OffloadConnectorBase,
+    OffloadConnectorMetadata,
+    OffloadConnectorSchedulerBase,
+    OffloadReqMeta,
+)
+from atom.kv_transfer.offload.lmcache.lmcache_connector import (
+    LMCacheOffloadConnector,
+    LMCacheOffloadConnectorScheduler,
+)
+from atom.model_engine.block_manager import BlockManager
+from conftest import MockConfig
+
+_OFFLOAD_CFG = MockConfig(
+    kv_transfer_config={
+        "kv_connector": "lmcache_offload",
+        "kv_role": "offload",
+        "cpu_bytes": 1024 * 1024 * 64,
+    },
+    tensor_parallel_size=1,
+    enable_prefix_caching=True,
+)
+
+
+# ── Factory wiring ────────────────────────────────────────────────────────
+
+
+class TestFactoryRegistration:
+    def test_lmcache_offload_registered(self):
+        assert "lmcache_offload" in KVConnectorFactory._registry
+
+    def test_worker_role_is_offload(self):
+        w = KVConnectorFactory.create_connector(_OFFLOAD_CFG, role="worker")
+        assert isinstance(w, LMCacheOffloadConnector)
+        assert w.role == KVConnectorRole.OFFLOAD
+        assert w.is_producer is False  # OFFLOAD is neither PD producer nor consumer
+
+    def test_scheduler_role_is_offload(self):
+        s = KVConnectorFactory.create_connector(_OFFLOAD_CFG, role="scheduler")
+        assert isinstance(s, LMCacheOffloadConnectorScheduler)
+        assert s.role == KVConnectorRole.OFFLOAD
+
+
+# ── Scheduler-side: queue_save + mirror ───────────────────────────────────
+
+
+class TestSchedulerSaveQueue:
+    def test_queue_save_populates_mirror(self):
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.queue_save("r1", [(11, 0xABCD), (12, 0xBCDE)])
+        assert s.saved_hashes == {0xABCD, 0xBCDE}
+        assert "r1" in s._pending_save
+        assert s._pending_save["r1"].block_hashes == [0xABCD, 0xBCDE]
+
+    def test_queue_save_multi_step_accumulates(self):
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.queue_save("r1", [(11, 0xAAA)])
+        s.queue_save("r1", [(12, 0xBBB)])
+        assert s._pending_save["r1"].block_ids == [11, 12]
+        assert s._pending_save["r1"].block_hashes == [0xAAA, 0xBBB]
+
+    def test_queue_save_empty_is_noop(self):
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.queue_save("r1", [])
+        assert s.saved_hashes == set()
+        assert s._pending_save == {}
+
+    def test_build_connector_meta_drains(self):
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.queue_save("r1", [(11, 0xAAA)])
+        meta1 = s.build_connector_meta()
+        assert meta1 is not None
+        assert "r1" in meta1.reqs_to_save
+        meta2 = s.build_connector_meta()
+        assert meta2 is None  # drained
+
+
+# ── Scheduler-side: lookup + admission path ───────────────────────────────
+
+
+def _seq_with_prompt(seq_factory, token_ids, block_size=4):
+    return seq_factory(token_ids, block_size=block_size)
+
+
+class TestSchedulerLookup:
+    def test_lookup_external_hits_chain_prefix(self):
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.saved_hashes = {1, 2, 3}
+        # Longest matching prefix from [1, 2, 99, 3]: [1, 2] then break.
+        assert s.lookup_external_hits(None, [1, 2, 99, 3]) == 2
+        assert s.lookup_external_hits(None, [1, 2, 3]) == 3
+        assert s.lookup_external_hits(None, [99, 1]) == 0
+
+    def test_get_num_new_matched_tokens_no_block_manager(self, seq_factory):
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        seq = _seq_with_prompt(seq_factory, [1, 2, 3, 4, 5, 6, 7, 8])
+        n_tok, async_load = s.get_num_new_matched_tokens(seq)
+        assert (n_tok, async_load) == (0, False)
+
+    def test_get_num_new_matched_tokens_no_external_hits(
+        self, block_manager_prefix, seq_factory
+    ):
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.bind_block_manager(block_manager_prefix)
+        # block_size=4 by MockConfig default; 3 blocks of distinct content.
+        seq = _seq_with_prompt(
+            seq_factory, [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+        )
+        n_tok, async_load = s.get_num_new_matched_tokens(seq)
+        assert (n_tok, async_load) == (0, False)
+
+    def test_get_num_new_matched_tokens_external_after_eviction(
+        self, block_manager_prefix, seq_factory
+    ):
+        """Simulate: prior request published 2 blocks to HBM + OFFLOAD.
+        HBM then evicted them (manually clear hash_to_block_id) but
+        OFFLOAD mirror retained them. New same-prefix request should see
+        2 blocks worth of external hits.
+        """
+        bm = block_manager_prefix
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.bind_block_manager(bm)
+
+        # 3-block prompt; last block is never considered by can_allocate
+        # so only first 2 blocks are eligible for prefix-cache reuse.
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # 12 tokens / bs=4 → 3 blocks
+        h1 = BlockManager.compute_hash([1, 2, 3, 4])
+        h2 = BlockManager.compute_hash([5, 6, 7, 8], prefix=h1)
+        # OFFLOAD mirror has both (as if a prior request had saved them).
+        s.saved_hashes = {h1, h2}
+        # HBM is empty (simulates eviction).
+        assert h1 not in bm.hash_to_block_id
+
+        seq = _seq_with_prompt(seq_factory, tokens)
+        n_tok, async_load = s.get_num_new_matched_tokens(seq)
+        # 2 external blocks × block_size=4 = 8 tokens.
+        assert async_load is True
+        assert n_tok == 8
+        # Stash should hold the 2 hashes for update_state_after_alloc.
+        stashed = s._external_match_stash[id(seq)]
+        assert stashed == [h1, h2]
+
+    def test_get_num_new_matched_tokens_hbm_takes_precedence(
+        self, block_manager_prefix, seq_factory
+    ):
+        """If HBM has the first block and OFFLOAD has both, we should
+        report only the residual (block 2) as external — block 1 is free
+        in HBM, no need to H2D it.
+        """
+        bm = block_manager_prefix
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.bind_block_manager(bm)
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        h1 = BlockManager.compute_hash([1, 2, 3, 4])
+        h2 = BlockManager.compute_hash([5, 6, 7, 8], prefix=h1)
+
+        # Seed HBM with block 1 only — use a dummy seq to allocate +
+        # hash, then mimic the post-publish state.
+        warmup_seq = _seq_with_prompt(seq_factory, [1, 2, 3, 4, 5, 6, 7, 8])
+        bm.allocate(warmup_seq)
+        bm.hash_blocks(warmup_seq, warmup_seq.num_tokens)
+        # Confirm both block hashes are in HBM now (block 0 and 1, since
+        # hash_blocks skips the last partial — but this seq has 2 full
+        # blocks; the "last is never considered for reuse" rule lives in
+        # can_allocate, not hash_blocks).
+        assert h1 in bm.hash_to_block_id
+
+        # OFFLOAD mirror has h2 too (from a hypothetical earlier save).
+        s.saved_hashes = {h1, h2}
+        # Simulate eviction of block 2 only (clear h2 from HBM).
+        if h2 in bm.hash_to_block_id:
+            del bm.hash_to_block_id[h2]
+
+        new_seq = _seq_with_prompt(seq_factory, tokens)
+        n_tok, async_load = s.get_num_new_matched_tokens(new_seq)
+        # Block 1 = HBM hit (free), block 2 = external (needs load) → 4 tokens.
+        assert async_load is True
+        assert n_tok == 4
+
+
+# ── Scheduler-side: update_state_after_alloc → load queue ────────────────
+
+
+class TestSchedulerLoadQueue:
+    def test_update_state_after_alloc_queues_load(
+        self, block_manager_prefix, seq_factory
+    ):
+        bm = block_manager_prefix
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.bind_block_manager(bm)
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        h1 = BlockManager.compute_hash([1, 2, 3, 4])
+        h2 = BlockManager.compute_hash([5, 6, 7, 8], prefix=h1)
+        s.saved_hashes = {h1, h2}
+
+        seq = _seq_with_prompt(seq_factory, tokens)
+        n_tok, async_load = s.get_num_new_matched_tokens(seq)
+        assert async_load and n_tok == 8
+
+        # Mimic admission: BlockManager allocates fresh blocks for all
+        # 3 prompt blocks (HBM was empty).
+        bm.allocate(seq)
+        s.update_state_after_alloc(seq)
+
+        assert str(seq.id) in s._pending_load
+        meta = s._pending_load[str(seq.id)]
+        assert meta.block_hashes == [h1, h2]
+        # dest_block_ids are seq.block_table[n_hbm : n_hbm + n_ext]; n_hbm=0
+        # here so the first 2 fresh slots.
+        assert meta.block_ids == list(seq.block_table[:2])
+
+    def test_no_stash_after_alloc_is_noop(self, block_manager_prefix, seq_factory):
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.bind_block_manager(block_manager_prefix)
+        seq = _seq_with_prompt(seq_factory, [1, 2, 3, 4])
+        s.update_state_after_alloc(seq)  # never went through lookup
+        assert s._pending_load == {}
+
+
+# ── Worker-side: pool sizing + degenerate paths ──────────────────────────
+
+
+class TestWorkerPool:
+    def test_environment_check_rejects_bad_pythonhashseed(self, monkeypatch):
+        monkeypatch.setenv("PYTHONHASHSEED", "42")
+        with pytest.raises(RuntimeError, match="PYTHONHASHSEED"):
+            LMCacheOffloadConnector(_OFFLOAD_CFG)
+
+    def test_start_load_kv_before_pool_init_drops(self):
+        w = LMCacheOffloadConnector(_OFFLOAD_CFG)
+        # register_kv_caches never called — pool is empty.
+        assert w._num_slots == 0
+        meta = OffloadConnectorMetadata()
+        meta.reqs_to_save["rX"] = OffloadReqMeta(block_ids=[1], block_hashes=[0xAAA])
+        meta.reqs_to_load["rY"] = OffloadReqMeta(block_ids=[2], block_hashes=[0xBBB])
+        w.start_load_kv(meta)
+        done_save, done_load = w.get_finished()
+        # Both reported as done so the scheduler doesn't stall, but no
+        # GPU motion happened.
+        assert done_save == {"rX"}
+        assert done_load == {"rY"}
+
+    def test_start_load_kv_empty_metadata_noop(self):
+        w = LMCacheOffloadConnector(_OFFLOAD_CFG)
+        w.start_load_kv(None)
+        w.start_load_kv(OffloadConnectorMetadata())
+        done_save, done_load = w.get_finished()
+        assert done_save == set() and done_load == set()

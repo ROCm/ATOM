@@ -19,15 +19,32 @@ Two roles are defined:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Any
 
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+
+
+class KVConnectorRole(str, Enum):
+    """Concrete role a connector plays inside the engine.
+
+    PD connectors (Mooncake/MoRIIO) historically routed via ``is_producer``;
+    that binary still works and the default ``PD_PRODUCER`` value is just a
+    placeholder for them. Offload connectors (CPU/NVMe-backed L2/L3 store)
+    set ``role = OFFLOAD`` so the scheduler can skip producer/consumer-only
+    invariants that only make sense for cross-node KV transfer.
+    """
+
+    PD_PRODUCER = "pd_producer"  # prefill node in P/D disaggregation
+    PD_CONSUMER = "pd_consumer"  # decode node in P/D disaggregation
+    OFFLOAD = "offload"  # local second/third-tier store
 
 
 class KVConnectorBase(ABC):
     """Worker-side KV connector interface (one instance per TP rank)."""
 
     is_producer: bool
+    role: KVConnectorRole = KVConnectorRole.PD_PRODUCER
 
     @abstractmethod
     def register_kv_caches(
@@ -69,6 +86,7 @@ class KVConnectorSchedulerBase(ABC):
     """Scheduler-side KV connector interface."""
 
     is_producer: bool
+    role: KVConnectorRole = KVConnectorRole.PD_PRODUCER
 
     @abstractmethod
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:

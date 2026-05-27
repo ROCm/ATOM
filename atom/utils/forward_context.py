@@ -491,6 +491,16 @@ def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> An
     if not (hasattr(config, "kv_transfer_config") and config.kv_transfer_config):
         return _global_kvconnector
 
+    # Ensure non-disagg backend packages have registered with the factory.
+    # `atom.kv_transfer.disaggregation` registers moriio/mooncake at import
+    # time (it's imported via the KVConnectorFactory module below), but
+    # offload backends (lmcache_offload, etc.) live under a sibling package
+    # and only register if explicitly imported. Doing it here (lazy, idem-
+    # potent) keeps the engine startup path agnostic of the chosen backend.
+    import importlib
+
+    importlib.import_module("atom.kv_transfer.offload")
+
     if role == "worker":
         from aiter.dist.parallel_state import get_tp_group
 

@@ -414,6 +414,16 @@ class Scheduler:
 
         self.kv_connector = get_kvconnector("scheduler", config)
 
+        # Hand the connector a BlockManager reference so OFFLOAD connectors
+        # can de-duplicate external-store hits against the in-HBM prefix
+        # cache (HBM hits are free; only the residual external-only prefix
+        # needs an H2D load). PD connectors don't need it and ignore the
+        # default bind via `KVConnectorSchedulerBase`'s no-op.
+        if self.kv_connector is not None and hasattr(
+            self.kv_connector, "bind_block_manager"
+        ):
+            self.kv_connector.bind_block_manager(self.block_manager)
+
     def is_finished(self):
         # `_rejected` must be considered too: if a batch of seqs is all
         # oversized, schedule() moves them straight from `waiting` to
@@ -794,10 +804,49 @@ class Scheduler:
             # chunked-prefill scheduling where one block may span multiple
             # steps. Must run before any seq state update so num_cached_tokens
             # and block_table still reflect the pre-step view.
-            if seq.type == SequenceType.PREFILL:
-                self.block_manager.hash_blocks(
-                    seq, seq.num_tokens - seq.num_cached_tokens
-                )
+            #
+            # Gate is `len(seq.output_tokens) == 0`, not `seq.type == PREFILL`,
+            # because ModelRunner runs in deferred-output mode (sampled tokens
+            # surface one engine step late, see tokenIDProcessor.is_deferred_out).
+            # In deferred mode, the prefill step's fwd_output is empty (no
+            # idx for the seq), and by the time its output IS processed the
+            # next step's schedule has already flipped seq.type to DECODE —
+            # so the old PREFILL gate never fired and hashes were never
+            # published. `len(output_tokens) == 0` is true exactly at the
+            # first postprocess that has an idx for the seq, in both modes.
+            if not seq.prefix_hashes_published:
+                # The prefill's KV is now fully written in HBM (its output
+                # has surfaced — `idx` is not None this step). Compute the
+                # count of prompt tokens that the prefill forward filled:
+                # `seq.num_tokens` at this point still reflects the prompt
+                # length plus any placeholder tokens that were appended at
+                # the end of the prefill-step postprocess (under
+                # `need_placeholder` below). Placeholder KV is computed in
+                # the *current* decode step, not the prefill, and the
+                # placeholder tokens themselves are about to be overwritten
+                # with the real sampled prefill output later in this loop —
+                # so they're NOT part of the prompt's hash chain. Subtract
+                # them to keep the published-block range to "fully-prompt"
+                # blocks only.
+                _num_new = seq.num_tokens - seq.num_cached_tokens
+                if need_placeholder:
+                    _num_new -= num_placeholder
+                published = self.block_manager.hash_blocks(seq, _num_new)
+                seq.prefix_hashes_published = True
+                if published:
+                    logger.debug(
+                        "Prefix hashes published for seq=%s: %d blocks (num_new=%d, cached=%d)",
+                        seq.id,
+                        len(published),
+                        _num_new,
+                        seq.num_cached_tokens,
+                    )
+                # For OFFLOAD connectors, every freshly-published block is
+                # a candidate for D2H save. The connector dedupes against
+                # its own external-store index; the scheduler just forwards
+                # the (block_id, hash) pairs the BlockManager just minted.
+                if published and self._connector_is_offload():
+                    self.kv_connector.queue_save(str(seq.id), published)
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
             if is_deferred_out or self.use_spec:
@@ -968,16 +1017,15 @@ class Scheduler:
                     # )
         for seq in finished_seqs:
             logger.debug("Freeing blocks for finished seq %s", seq.id)
-            if self.kv_connector is not None:
-                if not self.kv_connector.is_producer:
-                    self.block_manager.deallocate(seq)
-                else:
-                    logger.debug(
-                        "Deferring block free for seq %s until KV send completes.",
-                        seq.id,
-                    )
-                    self.deferred_free_blocks[seq.id] = seq
+            if self.kv_connector is not None and self._connector_defers_free():
+                logger.debug(
+                    "Deferring block free for seq %s until KV send completes.",
+                    seq.id,
+                )
+                self.deferred_free_blocks[seq.id] = seq
             else:
+                # No connector, OFFLOAD connector (saves are in-place D2H —
+                # blocks freed immediately), or a non-producer PD connector.
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
@@ -1000,21 +1048,30 @@ class Scheduler:
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """Reconcile scheduler state with completed KV transfers.
 
-        * ``finished_recving``: marks requests as ready for decode scheduling.
-        * ``finished_sending``: releases deferred block allocations on the
-          producer side.
+        * ``finished_recving``: marks requests as ready for decode scheduling
+          (PD decode consumer) or as loaded from external store (OFFLOAD).
+        * ``finished_sending``: releases deferred block allocations on the PD
+          producer side, or is purely informational for OFFLOAD (saves are
+          D2H copies; the source blocks were already freed at finish time).
         """
         if kv_connector_output is None:
             return
 
+        is_offload = self._connector_is_offload()
         for req_id in kv_connector_output.finished_recving or ():
             assert (
-                not self.kv_connector.is_producer
-            ), "Only consumer should update recving KV status"
+                is_offload or not self.kv_connector.is_producer
+            ), "Only consumer or offload connector should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.finished_sending or ():
+            if is_offload:
+                logger.debug(
+                    "Offload save completed for request %s (informational)",
+                    req_id,
+                )
+                continue
             assert (
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"
@@ -1023,6 +1080,32 @@ class Scheduler:
                 req_id in self.deferred_free_blocks
             ), f"req_id={req_id} not found in deferred_free_blocks"
             self.block_manager.deallocate(self.deferred_free_blocks.pop(req_id))
+
+    def _connector_role(self):
+        """Return the connector's role, or None if no connector is wired."""
+        if self.kv_connector is None:
+            return None
+        # Lazy import to avoid pulling kv_transfer at module import time.
+        from atom.kv_transfer.disaggregation.base import KVConnectorRole
+
+        return getattr(self.kv_connector, "role", KVConnectorRole.PD_PRODUCER)
+
+    def _connector_is_offload(self) -> bool:
+        from atom.kv_transfer.disaggregation.base import KVConnectorRole
+
+        return self._connector_role() == KVConnectorRole.OFFLOAD
+
+    def _connector_defers_free(self) -> bool:
+        """True if the connector takes over block lifetime after request
+        finish (PD producer transferring KV to the decode node). OFFLOAD
+        connectors do NOT defer — their D2H save is independent of the
+        source block's GPU lifetime, so finished_seqs can free immediately.
+        """
+        return (
+            self.kv_connector is not None
+            and not self._connector_is_offload()
+            and self.kv_connector.is_producer
+        )
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

@@ -177,7 +177,7 @@ class BlockManager:
         if seq.has_per_req_cache:
             seq.per_req_cache_group = self.free_per_req_cache_groups.pop()
 
-    def hash_blocks(self, seq: Sequence, num_new_tokens: int) -> None:
+    def hash_blocks(self, seq: Sequence, num_new_tokens: int) -> list[tuple[int, int]]:
         """Register hashes for blocks finalized by the most recent step.
 
         Called from scheduler.postprocess() after the forward completes, so a
@@ -188,20 +188,28 @@ class BlockManager:
         Caller passes `num_new_tokens` = tokens forwarded in this step. For
         single-shot prefill that's `seq.num_tokens - seq.num_cached_tokens`;
         chunked prefill will pass the per-chunk count.
+
+        Returns a list of `(block_id, block_hash)` pairs newly published by
+        this call (in finalization order). Offload connectors consume this
+        to enqueue D2H saves for the freshly-computed blocks. Empty when
+        prefix caching is disabled or no full block crossed the boundary.
         """
         if not self.enable_prefix_caching:
-            return
+            return []
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + num_new_tokens) // self.block_size
         if start >= end:
-            return
+            return []
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+        published: list[tuple[int, int]] = []
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+            published.append((block.block_id, h))
+        return published
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
