@@ -155,8 +155,6 @@ export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm
 # Clear any stale ATOM compile cache from prior runs.
 rm -rf /root/.cache/atom/* 2>/dev/null || true
 
-pip install msgpack msgspec quart 2>/dev/null || true
-
 python3 -m atom.entrypoints.openai_server \
     --model "${MODEL_PATH}" \
     --host 0.0.0.0 --server-port "${PREFILL_PORT}" \
@@ -186,8 +184,6 @@ export ATOM_HOST_IP=__DECODE_HANDSHAKE_IP__
 export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 rm -rf /root/.cache/atom/* 2>/dev/null || true
-
-pip install msgpack msgspec quart 2>/dev/null || true
 
 python3 -m atom.entrypoints.openai_server \
     --model "${MODEL_PATH}" \
@@ -542,19 +538,33 @@ wait_endpoint "$DECODE_NODE_2" "http://${DECODE_IP_2}:${DECODE_PORT}/health" \
 # reports kv_role != "kv_producer").
 echo ""
 echo "=== verifying /kv_transfer_info ==="
-for spec in "prefill:${PREFILL_NODE}:${PREFILL_IP}:${PREFILL_PORT}:kv_producer" \
-            "decode-1:${DECODE_NODE_1}:${DECODE_IP_1}:${DECODE_PORT}:kv_consumer" \
-            "decode-2:${DECODE_NODE_2}:${DECODE_IP_2}:${DECODE_PORT}:kv_consumer"; do
-    IFS=: read -r role node ip port want <<<"$spec"
-    info=$(srun --nodelist="$node" --nodes=1 --ntasks=1 bash -lc \
-        "curl -sf http://${ip}:${port}/kv_transfer_info")
+verify_kv_info() {
+    local role="$1" node="$2" ip="$3" port="$4" want="$5"
+    local info="" got="" attempt=0 max_attempts=3
+    while [[ $attempt -lt $max_attempts ]]; do
+        attempt=$((attempt + 1))
+        info=$(srun --nodelist="$node" --nodes=1 --ntasks=1 bash -c \
+            "curl -sf http://${ip}:${port}/kv_transfer_info" 2>&1) && break
+        echo "[kv_info][${role}] attempt ${attempt}/${max_attempts} failed (rc=$?): ${info:0:200}" >&2
+        sleep 5
+    done
+    if [[ -z "$info" ]]; then
+        echo "ERROR: ${role} /kv_transfer_info returned empty after ${max_attempts} attempts" >&2
+        return 1
+    fi
     echo "[kv_info][${role}] ${info}"
-    got=$(echo "$info" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("kv_role",""))')
+    got=$(echo "$info" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("kv_role",""))' 2>&1) || {
+        echo "ERROR: ${role} failed to parse kv_transfer_info JSON: ${info:0:200}" >&2
+        return 1
+    }
     if [[ "$got" != "$want" ]]; then
         echo "ERROR: ${role} kv_role mismatch: want=${want} got=${got}" >&2
-        exit 1
+        return 1
     fi
-done
+}
+verify_kv_info prefill   "$PREFILL_NODE"   "$PREFILL_IP"   "$PREFILL_PORT" kv_producer
+verify_kv_info decode-1  "$DECODE_NODE_1"  "$DECODE_IP_1"  "$DECODE_PORT"  kv_consumer
+verify_kv_info decode-2  "$DECODE_NODE_2"  "$DECODE_IP_2"  "$DECODE_PORT"  kv_consumer
 
 # ======================== 5. start router (detached) ========================
 echo ""

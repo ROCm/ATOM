@@ -132,8 +132,6 @@ export MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_NUM_MAX_DISPATCH_TOKENS_PER_
 
 rm -rf /root/.cache/atom/* 2>/dev/null || true
 
-pip install msgpack msgspec quart 2>/dev/null || true
-
 python3 -m atom.entrypoints.openai_server \
     --model "${MODEL_PATH}" \
     --host 0.0.0.0 --server-port "${PORT}" \
