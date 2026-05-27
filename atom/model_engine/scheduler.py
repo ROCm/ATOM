@@ -1520,6 +1520,17 @@ class Scheduler:
         return self.has_unfinished_requests()
 
     def get_next_batch_info(self) -> tuple[bool, int, int]:
+        # Predicts the next batch shape for cross-DP-rank sync. Returns
+        # (is_prefill, num_tokens, num_reqs).
+        #
+        # Mixed prefill+decode batches (--enable-mixed-prefill-decode) report
+        # is_prefill=True because they always carry at least one prefill seq
+        # — that matches the dummy-prefill sync semantics in engine_core
+        # (all ranks must agree on "prefill phase" so MoE all-to-all stays in
+        # sync). num_tokens here is a prediction; the actual mixed batch may
+        # add decode tokens on top, but DP padding uses the post-schedule
+        # batch.total_tokens_num so the prediction underestimating is fine.
+
         # Check for partial prefills in running (chunked prefill resume)
         for seq in self.running:
             if seq.num_cached_tokens < seq.num_tokens:
