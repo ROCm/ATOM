@@ -57,58 +57,6 @@ class UBatchWrapper(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         ctx = get_forward_context()
-        # Hit-rate counters: split by prefill / decode to diagnose whether
-        # the collective TBO decision is firing where we expect.
-        is_prefill = ctx.context.is_prefill
-        if ctx.ubatch_slices is None:
-            if is_prefill:
-                self._n_skip_prefill = getattr(self, "_n_skip_prefill", 0) + 1
-            else:
-                self._n_skip_decode = getattr(self, "_n_skip_decode", 0) + 1
-        else:
-            if is_prefill:
-                self._n_used_prefill = getattr(self, "_n_used_prefill", 0) + 1
-            else:
-                self._n_used_decode = getattr(self, "_n_used_decode", 0) + 1
-        total = (
-            getattr(self, "_n_skip_prefill", 0)
-            + getattr(self, "_n_skip_decode", 0)
-            + getattr(self, "_n_used_prefill", 0)
-            + getattr(self, "_n_used_decode", 0)
-        )
-        # Log on (a) the very first TBO hit so we know it actually fired,
-        # (b) every 50 fwds thereafter. Prefill-only TBO can total way less
-        # than 200 fwds across a whole benchmark, so the old `% 200 == 0`
-        # gate could silently never fire.
-        first_hit = (
-            ctx.ubatch_slices is not None
-            and (
-                getattr(self, "_n_used_prefill", 0) + getattr(self, "_n_used_decode", 0)
-            )
-            == 1
-        )
-        if first_hit or total % 50 == 0:
-            logger.info(
-                "[TBO] used_p=%d skip_p=%d used_d=%d skip_d=%d (hit_p=%.1f%% hit_d=%.1f%%)",
-                getattr(self, "_n_used_prefill", 0),
-                getattr(self, "_n_skip_prefill", 0),
-                getattr(self, "_n_used_decode", 0),
-                getattr(self, "_n_skip_decode", 0),
-                100.0
-                * getattr(self, "_n_used_prefill", 0)
-                / max(
-                    1,
-                    getattr(self, "_n_used_prefill", 0)
-                    + getattr(self, "_n_skip_prefill", 0),
-                ),
-                100.0
-                * getattr(self, "_n_used_decode", 0)
-                / max(
-                    1,
-                    getattr(self, "_n_used_decode", 0)
-                    + getattr(self, "_n_skip_decode", 0),
-                ),
-            )
         if ctx.ubatch_slices is None:
             return self.model(input_ids, positions)
         return self._run_ubatches(input_ids, positions, ctx)
