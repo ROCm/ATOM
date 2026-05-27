@@ -35,11 +35,6 @@ MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
 CONTAINER="${CONTAINER:-atom_atom_mesh_${SLURM_JOB_ID}}"
 
-# Local ATOM source tree (PYTHONPATH override so /kv_transfer_info endpoint
-# from this branch is picked up instead of /app/ATOM in the image).
-ATOM_SRC="${ATOM_SRC:-/it-share/yajizhan/code/ATOM}"
-MESH_SRC="${MESH_SRC:-${ATOM_SRC}/atom/mesh}"
-
 PREFILL_TP="${PREFILL_TP:-8}"
 DECODE_TP="${DECODE_TP:-8}"
 PREFILL_PORT="${PREFILL_PORT:-8010}"
@@ -121,7 +116,6 @@ ROUTER   : ${PREFILL_IP}:${ROUTER_PORT}
 MODEL    : ${MODEL_PATH}
 IMAGE    : ${DOCKER_IMAGE}
 BACKEND  : atom (Mooncake)
-ATOM_SRC : ${ATOM_SRC}
 HANDSHAKE_PORT : ${HANDSHAKE_PORT}
 RUN_GSM8K  : ${RUN_GSM8K} (limit=${GSM8K_LIMIT:-all}, fewshot=${GSM8K_NUM_FEWSHOT})
 ISL/OSL/CONC : ${ISL_LIST} / ${OSL} / ${CONC_LIST}
@@ -146,7 +140,6 @@ echo "[prefill] IP=${PREFILL_IP} TP=${PREFILL_TP} port=${PREFILL_PORT}"
 mkdir -p /workspace/logs
 
 export HIP_VISIBLE_DEVICES=${PREFILL_GPU_IDS}
-export PYTHONPATH=${ATOM_SRC}:${PYTHONPATH:-}
 export PYTHONUNBUFFERED=1
 export AITER_LOG_LEVEL=WARNING
 export ATOM_HOST_IP=${PREFILL_IP}
@@ -177,7 +170,6 @@ echo "[decode] IP=__DECODE_HANDSHAKE_IP__ TP=${DECODE_TP} port=${DECODE_PORT}"
 mkdir -p /workspace/logs
 
 export HIP_VISIBLE_DEVICES=${DECODE_GPU_IDS}
-export PYTHONPATH=${ATOM_SRC}:${PYTHONPATH:-}
 export PYTHONUNBUFFERED=1
 export AITER_LOG_LEVEL=WARNING
 export ATOM_HOST_IP=__DECODE_HANDSHAKE_IP__
@@ -379,7 +371,6 @@ for script in "${LOG_ROOT}"/scripts/*.sh; do
         -e "s|\${MODEL_PATH}|${MODEL_PATH}|g" \
         -e "s|\${KV_CACHE_DTYPE}|${KV_CACHE_DTYPE}|g" \
         -e "s|\${BLOCK_SIZE}|${BLOCK_SIZE}|g" \
-        -e "s|\${ATOM_SRC}|${ATOM_SRC}|g" \
         -e "s|\${MESH_BIN}|/usr/local/bin/atom-mesh|g" \
         -e "s|\${PREFILL_GPU_IDS}|${PREFILL_GPU_IDS}|g" \
         -e "s|\${DECODE_GPU_IDS}|${DECODE_GPU_IDS}|g" \
@@ -494,23 +485,7 @@ launch_container "$PREFILL_NODE"   prefill
 launch_container "$DECODE_NODE_1"  decode_1
 launch_container "$DECODE_NODE_2"  decode_2
 
-# ======================== 2. rebuild atom-mesh from working tree ========================
-echo ""
-echo "=== building atom-mesh on ${PREFILL_NODE} ==="
-srun --nodelist="$PREFILL_NODE" --nodes=1 --ntasks=1 bash -lc "
-    docker exec -w '${MESH_SRC}' '${CONTAINER}' cargo build --release --bin atom-mesh
-    docker exec '${CONTAINER}' cp '${MESH_SRC}/target/release/atom-mesh' /usr/local/bin/atom-mesh
-    docker exec '${CONTAINER}' /usr/local/bin/atom-mesh --version 2>&1 | head -1 || true
-"
-# Copy the same binary into the decode containers (cargo target dir lives on
-# /it-share so it's already visible; just install it).
-for decode_node in "$DECODE_NODE_1" "$DECODE_NODE_2"; do
-    srun --nodelist="$decode_node" --nodes=1 --ntasks=1 bash -lc "
-        docker exec '${CONTAINER}' cp '${MESH_SRC}/target/release/atom-mesh' /usr/local/bin/atom-mesh
-    " || true   # decode nodes don't actually run the router but keep it consistent
-done
-
-# ======================== 3. start prefill + decode (detached) ========================
+# ======================== 2. start prefill + decode (detached) ========================
 echo "[prefill] launching ATOM kv_producer on ${PREFILL_NODE}"
 srun --nodelist="$PREFILL_NODE" --nodes=1 --ntasks=1 bash -lc "
     docker exec -d '${CONTAINER}' bash '${LOG_ROOT}/scripts/prefill.sh'
@@ -525,7 +500,7 @@ srun --nodelist="$DECODE_NODE_2" --nodes=1 --ntasks=1 bash -lc "
     docker exec -d '${CONTAINER}' bash '${LOG_ROOT}/scripts/decode_2.sh'
 "
 
-# ======================== 4. wait for servers (HTTP health check) ========================
+# ======================== 3. wait for servers (HTTP health check) ========================
 wait_endpoint "$PREFILL_NODE"  "http://${PREFILL_IP}:${PREFILL_PORT}/health" \
     "$WAIT_SERVER_TIMEOUT" "prefill-http"
 wait_endpoint "$DECODE_NODE_1" "http://${DECODE_IP_1}:${DECODE_PORT}/health" \
@@ -566,7 +541,7 @@ verify_kv_info prefill   "$PREFILL_NODE"   "$PREFILL_IP"   "$PREFILL_PORT" kv_pr
 verify_kv_info decode-1  "$DECODE_NODE_1"  "$DECODE_IP_1"  "$DECODE_PORT"  kv_consumer
 verify_kv_info decode-2  "$DECODE_NODE_2"  "$DECODE_IP_2"  "$DECODE_PORT"  kv_consumer
 
-# ======================== 5. start router (detached) ========================
+# ======================== 4. start router (detached) ========================
 echo ""
 echo "[router] launching atom-mesh on ${PREFILL_NODE}"
 srun --nodelist="$PREFILL_NODE" --nodes=1 --ntasks=1 bash -lc "
@@ -576,7 +551,7 @@ srun --nodelist="$PREFILL_NODE" --nodes=1 --ntasks=1 bash -lc "
 wait_endpoint "$PREFILL_NODE" "http://${PREFILL_IP}:${ROUTER_PORT}/v1/models" \
     "$WAIT_ROUTER_TIMEOUT" "router-http"
 
-# ======================== 6. smoke completion (catches relay breakage fast) ========================
+# ======================== 5. smoke completion (catches relay breakage fast) ========================
 echo ""
 echo "=== smoke completion via mesh router ==="
 srun --nodelist="$PREFILL_NODE" --nodes=1 --ntasks=1 bash -lc "
@@ -590,7 +565,7 @@ srun --nodelist="$PREFILL_NODE" --nodes=1 --ntasks=1 bash -lc "
 wait_inference_ready "$PREFILL_NODE" "http://${PREFILL_IP}:${ROUTER_PORT}" \
     "$MODEL_PATH" "$WAIT_SERVER_TIMEOUT" "router-pipeline"
 
-# ======================== 7. run gsm8k accuracy (foreground, optional) ========================
+# ======================== 6. run gsm8k accuracy (foreground, optional) ========================
 if [[ "${RUN_GSM8K}" == "1" ]]; then
     echo ""
     echo "=== running GSM8K accuracy eval on ${PREFILL_NODE} ==="
@@ -601,7 +576,7 @@ else
     echo "=== skipping GSM8K (RUN_GSM8K=${RUN_GSM8K}) ==="
 fi
 
-# ======================== 8. run benchmark (foreground) ========================
+# ======================== 7. run benchmark (foreground) ========================
 echo ""
 echo "=== running benchmark on ${PREFILL_NODE} ==="
 srun --nodelist="$PREFILL_NODE" --nodes=1 --ntasks=1 bash -lc "
