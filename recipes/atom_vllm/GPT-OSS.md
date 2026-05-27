@@ -63,8 +63,16 @@ profiler_config=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_p
 ## Step 4: Accuracy Validation
 
 ```bash
-lm_eval --model local-completions \
-        --model_args model=openai/gpt-oss-120b,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+lm_eval --model local-chat-completions --apply_chat_template \
+        --model_args model=openai/gpt-oss-120b,base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False \
         --tasks gsm8k \
         --num_fewshot 3
+```
+
+Here is the reference value:
+```bash
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value|   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|----:|---|-----:|
+|gsm8k|      3|flexible-extract|     3|exact_match|↑  | 0.88|±  |0.0088|
+|     |       |strict-match    |     3|exact_match|↑  | 0.31|±  |0.0128|
 ```

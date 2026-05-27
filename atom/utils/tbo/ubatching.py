@@ -2,8 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import threading
+from dataclasses import dataclass
 from typing import Callable, Optional
 
+import numpy as np
 import torch
 
 from atom.config import get_current_atom_config
@@ -20,26 +22,142 @@ def tbo_enabled() -> bool:
     return getattr(config, "enable_tbo", False)
 
 
-def sync_dp_for_tbo(
-    dp_size: int,
-    dp_rank: int,
-    num_input_tokens: int,
-    num_reqs: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sync token counts and request counts across DP ranks in one all_reduce.
+# =====================================================================
+# DP-side TBO helpers (formerly ModelRunner._local_tbo_precompute and
+# the inline sync block inside ModelRunner._preprocess).
+# =====================================================================
 
-    Returns (num_tokens_across_dp, reqs_across_dp).
-    reqs_across_dp is used to decide TBO on/off (min_reqs >= 2).
+
+def local_tbo_precompute(
+    config,
+    batch,
+    is_prefill: bool,
+    num_scheduled_tokens: np.ndarray,
+) -> tuple[bool, int, int]:
+    """Decide locally whether this rank could TBO-split into 2 ubatches,
+    and if so what (ub0_tokens, ub1_tokens) the split would produce.
+
+    Returns ``(eligible, ub0_tokens, ub1_tokens)``. All zeros when
+    ineligible. The eligibility bit is later AND-reduced across DP ranks
+    by :func:`sync_dp_for_tbo`; the ub0/ub1 counts are MAX-reduced so
+    every rank picks the same per-ubatch CUDAGraph buffer size.
     """
-    import torch.distributed as dist
-    from aiter.dist.parallel_state import get_dp_group
+    if not config.enable_tbo:
+        return False, 0, 0
+    if is_prefill:
+        n_pref = batch.total_seqs_num_prefill
+        if n_pref < 2:
+            return False, 0, 0
+        # Mirror _split_prefill_balanced: pick boundary closest to total/2
+        # so the packed value matches what maybe_create_ubatch_slices will
+        # produce post-decision.
+        toks = np.asarray(num_scheduled_tokens[:n_pref], dtype=np.int64)
+        total = int(toks.sum())
+        target = total // 2
+        cumsum = 0
+        split_idx = 1
+        for j in range(n_pref):
+            cumsum += int(toks[j])
+            if cumsum >= target:
+                prev = cumsum - int(toks[j])
+                if j > 0 and (target - prev) < (cumsum - target):
+                    split_idx = j
+                else:
+                    split_idx = j + 1
+                break
+        split_idx = max(1, min(split_idx, n_pref - 1))
+        ub0 = int(toks[:split_idx].sum())
+        ub1 = total - ub0
+        return True, ub0, ub1
+    # Decode path
+    if not config.enable_tbo_decode or batch.is_dummy_run:
+        return False, 0, 0
+    scheduled_bs = batch.total_seqs_num_decode
+    if scheduled_bs < 2:
+        return False, 0, 0
+    num_tokens = batch.total_tokens_num
+    tokens_per_req = num_tokens // scheduled_bs if scheduled_bs else 1
+    reqs_per_ub = scheduled_bs // 2
+    ub0 = reqs_per_ub * tokens_per_req
+    ub1 = num_tokens - ub0
+    return True, ub0, ub1
 
-    # Layout: [tokens_r0, ..., tokens_rN, reqs_r0, ..., reqs_rN]
-    sync_tensor = torch.zeros(dp_size * 2, device="cpu", dtype=torch.int32)
-    sync_tensor[dp_rank] = num_input_tokens
-    sync_tensor[dp_size + dp_rank] = num_reqs
-    dist.all_reduce(sync_tensor, group=get_dp_group().cpu_group)
-    return sync_tensor[:dp_size], sync_tensor[dp_size:]
+
+@dataclass
+class DPSyncResult:
+    """Output of :func:`sync_dp_for_tbo`."""
+
+    # [dp_size] int32 CPU tensor — each rank's input token count.
+    num_tokens_across_dp: torch.Tensor
+    # True iff ANY rank has at least one prefill seq this step.
+    any_rank_has_prefill: bool
+    # True iff TBO is on AND every rank reported local_tbo_eligible.
+    tbo_collective_active: bool
+    # (ub0_max, ub1_max) across DP — only set when tbo_collective_active.
+    ub_max_tokens_across_dp: Optional[tuple[int, int]]
+
+
+def sync_dp_for_tbo(
+    *,
+    dp_group,
+    dp_size: int,
+    num_input_tokens: int,
+    is_prefill: bool,
+    tbo_on: bool,
+    local_tbo_eligible: bool = False,
+    local_ub_tokens: tuple[int, int] = (0, 0),
+) -> DPSyncResult:
+    """Single packed DP all_gather over the per-rank scalars needed to
+    decide DP padding, the prefill fan-out, and the cross-DP TBO gate.
+
+    Pre-Plan-B this required up to 3 separate all_reduces per step
+    (``get_dp_padding`` / ``sync_dp_for_tbo`` / a third inside
+    ``UBatchWrapper``). Now one all_gather of ``n_fields`` int32 values
+    per rank suffices. When TBO is off only the first 2 fields are
+    exchanged (saves 60 % payload + skips :func:`local_tbo_precompute`
+    at the call site).
+
+    Layout (``sync`` is ``[n_fields, dp_size]``):
+
+      row 0 : num_input_tokens         -> num_tokens_across_dp
+      row 1 : is_prefill (0/1)         -> any_rank_has_prefill (OR)
+      row 2 : tbo_eligible (0/1)       -> tbo_collective_active (AND)   [TBO only]
+      row 3 : ub0_tokens               -> ub_max_tokens_across_dp[0]    [TBO only]
+      row 4 : ub1_tokens               -> ub_max_tokens_across_dp[1]    [TBO only]
+    """
+    n_fields = 5 if tbo_on else 2
+    local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
+    local[0] = num_input_tokens
+    local[1] = 1 if is_prefill else 0
+    if tbo_on:
+        local[2] = 1 if local_tbo_eligible else 0
+        local[3] = local_ub_tokens[0]
+        local[4] = local_ub_tokens[1]
+
+    gathered = [
+        torch.empty(n_fields, dtype=torch.int32, device="cpu") for _ in range(dp_size)
+    ]
+    torch.distributed.all_gather(gathered, local, group=dp_group)
+    sync = torch.stack(gathered, dim=1)  # [n_fields, dp_size]
+
+    num_tokens_across_dp = sync[0]
+    any_rank_has_prefill = bool(sync[1].any().item())
+    tbo_collective_active = False
+    ub_max_tokens_across_dp: Optional[tuple[int, int]] = None
+    if tbo_on:
+        tbo_collective_active = bool(sync[2].all().item())
+        if tbo_collective_active:
+            ub_max_tokens_across_dp = (
+                int(sync[3].max().item()),
+                int(sync[4].max().item()),
+            )
+
+    return DPSyncResult(
+        num_tokens_across_dp=num_tokens_across_dp,
+        any_rank_has_prefill=any_rank_has_prefill,
+        tbo_collective_active=tbo_collective_active,
+        ub_max_tokens_across_dp=ub_max_tokens_across_dp,
+    )
 
 
 _THREAD_ID_TO_CONTEXT: dict[int, int] = {}
@@ -86,6 +204,12 @@ class TBOContext:
         self.gpu_compute_done_event = gpu_compute_done_event
         self.current_stream = compute_stream
         self.recv_hook: Optional[Callable] = None
+        # Set True when this ubatch's model.forward returns (or raises).
+        # Partner thread checks this in `_cpu_yield` so it doesn't sleep
+        # forever if we exited (cleanly or via exception) ahead of it.
+        self.done: bool = False
+        # Filled by `make_tbo_contexts` — points to the OTHER ubatch's ctx.
+        self.partner: Optional["TBOContext"] = None
 
     # -- context manager protocol ----------------------------------------
 
@@ -110,6 +234,14 @@ class TBOContext:
         _CURRENT_CONTEXTS[self.ubatch_id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         self.maybe_run_recv_hook()
+        # Mark this ubatch done BEFORE the final signal so that if the partner
+        # is racing into its next `_cpu_yield` between our signal and its wait,
+        # it observes `partner.done == True` and skips the wait instead of
+        # sleeping forever. Without this, any asymmetry (e.g. partner exits
+        # mid-forward via exception) leaves the survivor wedged on the next
+        # yield: the dead partner only signals exactly once from __exit__,
+        # but the survivor still has ≥1 yield left to do.
+        self.done = True
         # No CPU-blocking synchronize — GPU ordering is handled by
         # torch.Event record/wait in switch_to_comm_sync / switch_to_compute_sync.
         self.cpu_signal_event.set()
@@ -158,8 +290,19 @@ class TBOContext:
     # -- CPU yield (ping-pong) -------------------------------------------
 
     def _cpu_yield(self):
-        """Wake the next thread and sleep until woken."""
+        """Wake the next thread and sleep until woken.
+
+        If the partner ubatch has already finished (cleanly or via exception
+        — see `__exit__` above), there is nobody to wake us, so we must not
+        block. Returning immediately here lets the survivor finish its
+        remaining yields and exit normally, so the main thread's `t.join()`
+        can complete and any captured `errors[idx]` can be raised.
+        """
         self.cpu_signal_event.set()
+        if self.partner is not None and self.partner.done:
+            self.cpu_wait_event.clear()
+            self._restore_context()
+            return
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
         self._restore_context()
@@ -297,5 +440,13 @@ def make_tbo_contexts(
             gpu_compute_done_event=gpu_compute_done_events[i],
         )
         ctxs.append(ctx)
+
+    # Link each ctx to its neighbour in the ping-pong ring so that `_cpu_yield`
+    # can short-circuit when the partner has exited. For N=2 (the only case
+    # we run today) `partner` is just the other ctx. For N>2 we point at the
+    # NEXT ctx (the one whose `cpu_wait_event` is our `cpu_signal_event`'s
+    # target) — that's the only one whose `done` flag can leave us wedged.
+    for i, ctx in enumerate(ctxs):
+        ctx.partner = ctxs[(i + 1) % num_micro_batches]
 
     return ctxs

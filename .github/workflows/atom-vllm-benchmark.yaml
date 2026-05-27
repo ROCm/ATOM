@@ -45,6 +45,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -81,6 +82,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -117,6 +119,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -153,6 +156,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -189,6 +193,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -225,6 +230,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -261,6 +267,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -297,6 +304,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -889,6 +897,7 @@ jobs:
               "MiniMax-M2.5 TP2 (AW)",
               "MiniMax-M2.5 TP4 (AW)",
               "DeepSeek-V3.2 FP8 TP8 (AW)",
+              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
               "gpt-oss-120b TP2 (AW)",
               "gpt-oss-120b TP8 (AW)",
           }
@@ -1300,6 +1309,24 @@ jobs:
       UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
       BENCHMARK_CLIENT: ${{ contains(matrix.model.prefix, '-aw-') && 'vLLM bench' || needs.resolve-atom-source.outputs.benchmark_client }}
     steps:
+      - name: Print runner user
+        run: |
+          echo "=== Container engine diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "docker path: $(command -v docker || true)"
+          echo "podman path: $(command -v podman || true)"
+          echo "docker version:"
+          docker version || true
+          echo "docker info:"
+          docker info || true
+          echo "podman version:"
+          podman version || true
+          echo "podman info:"
+          podman info || true
+          echo "=== End container engine diagnostics ==="
+
       - name: Detect container engine
         run: |
           if docker info > /dev/null 2>&1; then
@@ -1408,21 +1435,11 @@ jobs:
               "AITER_LOG_MORE=0"
           } | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//' > /tmp/oot_env_file.txt
 
-          GROUP_ADD_FLAGS="--group-add video"
-          if [ "${CONTAINER_ENGINE:-docker}" = "podman" ]; then
-            GROUP_ADD_FLAGS="$GROUP_ADD_FLAGS --group-add keep-groups"
-          else
-            for gid in $(id -G); do
-              GROUP_ADD_FLAGS="$GROUP_ADD_FLAGS --group-add $gid"
-            done
-          fi
-          echo "Container group flags: $GROUP_ADD_FLAGS"
-
           $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host $GROUP_ADD_FLAGS \
+            --ipc=host --group-add video \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
@@ -1440,7 +1457,9 @@ jobs:
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
 
       - name: Download model if needed
+        timeout-minutes: 150
         run: |
+          set -euo pipefail
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
@@ -1452,14 +1471,27 @@ jobs:
             model_dir="/models/${model_dir}"
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "/models directory found, downloading model to ${model_dir}"
-            if ! $CONTAINER_ENGINE exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download \"${MODEL_SOURCE_PATH}\" --local-dir \"$model_dir\""; then
+            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            if ! $CONTAINER_ENGINE exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${MODEL_SOURCE_PATH}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+              "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
               echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
               exit 1
             fi
           else
             echo "/models directory not mounted; skipping model download"
           fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "2h"
+          MODEL_LOCK_WAIT_SECONDS: "1800"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Resolve OOT model path
         run: |

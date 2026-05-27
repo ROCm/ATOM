@@ -2000,14 +2000,26 @@ class MoE(nn.Module):
         # input_ids to match.
         num_tokens = gating_output.shape[0]
         if ids.shape[0] < num_tokens:
-            from atom.model_ops.moe import pad_for_all_gather
+            from aiter.dist.parallel_state import get_dp_group as _get_dp_group
 
-            ids_2d = ids.unsqueeze(-1)
-            ids_2d, _ = pad_for_all_gather(ids_2d)
-            from aiter.dist.parallel_state import get_dp_group
+            ctx = get_forward_context()
+            dp_eager_mode = (
+                not ctx.context.dp_uniform_decode
+            ) and ctx.dp_metadata is not None
+            if dp_eager_mode:
+                from atom.model_ops.moe import all_gatherv
 
-            ids_2d = get_dp_group().all_gather(ids_2d, dim=0)
-            ids = ids_2d[:num_tokens].flatten()
+                sizes = ctx.dp_metadata.get_sizes_across_dp()
+                ids_2d = ids.unsqueeze(-1)
+                ids_2d = all_gatherv(ids_2d, sizes, _get_dp_group())
+                ids = ids_2d.flatten()
+            else:
+                from atom.model_ops.moe import pad_for_all_gather
+
+                ids_2d = ids.unsqueeze(-1)
+                ids_2d, _ = pad_for_all_gather(ids_2d)
+                ids_2d = _get_dp_group().all_gather(ids_2d, dim=0)
+                ids = ids_2d[:num_tokens].flatten()
             ids = ids.clamp(0, self.gate.tid2eid.shape[0] - 1)
         topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
         scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
@@ -2509,7 +2521,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         # it here (rather than in ModelRunner) means any caller of
         # `model.forward` — production runner, warmup, benchmarks — gets
         # correct hash routing without a separate setup step.
-        get_forward_context().context.input_ids = input_ids
+        ctx = get_forward_context()
+        ctx.context.input_ids = input_ids
         return self.model(input_ids, positions)
 
     def compute_logits(

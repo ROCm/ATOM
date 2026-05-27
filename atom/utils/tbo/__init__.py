@@ -8,7 +8,10 @@ from .ubatch_splitting import (
 )
 from .ubatch_wrapper import UBatchWrapper
 from .ubatching import (
+    DPSyncResult,
     TBOContext,
+    local_tbo_precompute,
+    sync_dp_for_tbo,
     tbo_overlap_enabled,
     make_tbo_contexts,
     tbo_enabled,
@@ -27,9 +30,12 @@ from .ubatching import (
 )
 
 __all__ = [
+    "DPSyncResult",
     "TBOContext",
     "UBatchSlice",
     "UBatchWrapper",
+    "local_tbo_precompute",
+    "sync_dp_for_tbo",
     "tbo_overlap_enabled",
     "make_tbo_contexts",
     "maybe_create_ubatch_slices",
