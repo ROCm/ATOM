@@ -127,6 +127,9 @@ def register_model() -> None:
 
     _patch_vllm_attention_process_weights_after_loading(Attention)
     _patch_vllm_attention_process_weights_after_loading(MLAAttention)
+    # vLLM's speculative decoder keeps an allow-list of attention metadata
+    # classes. ATOM-vLLM uses its own metadata classes after attention
+    # isolation, so extend that allow-list before MTP/Eagle proposal runs.
     apply_vllm_spec_decode_patch()
 
     # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),

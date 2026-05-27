@@ -282,7 +282,7 @@ def sparse_attn_indexer_plugin_mode(
     if layer_meta is None:
         return torch.zeros_like(weights, dtype=torch.float32)
 
-    # vLLM sparse indexer builders return VllmDeepseekV32IndexerMetadata directly
+    # vLLM sparse indexer builders return AiterMlaSparseIndexerMetadataForVllm directly
     indexer_meta = layer_meta
     sparse_meta = _get_sparse_mla_metadata(attn_metadata_dict, k_cache_prefix)
     if sparse_meta is None:

@@ -220,7 +220,7 @@ class AiterMlaMetadataForVllm:
 
 
 @dataclass
-class VllmDeepseekV32IndexerPrefillChunkMetadata:
+class AiterMlaSparseIndexerPrefillChunkMetadataForVllm:
     block_table: torch.Tensor
     cu_seqlen_ks: torch.Tensor
     cu_seqlen_ke: torch.Tensor
@@ -233,12 +233,12 @@ class VllmDeepseekV32IndexerPrefillChunkMetadata:
 
 
 @dataclass
-class VllmDeepseekV32IndexerPrefillMetadata:
-    chunks: list[VllmDeepseekV32IndexerPrefillChunkMetadata]
+class AiterMlaSparseIndexerPrefillMetadataForVllm:
+    chunks: list[AiterMlaSparseIndexerPrefillChunkMetadataForVllm]
 
 
 @dataclass
-class VllmDeepseekV32IndexerDecodeMetadata:
+class AiterMlaSparseIndexerDecodeMetadataForVllm:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     decode_lens: torch.Tensor
@@ -249,7 +249,7 @@ class VllmDeepseekV32IndexerDecodeMetadata:
 
 
 @dataclass
-class VllmDeepseekV32IndexerMetadata:
+class AiterMlaSparseIndexerMetadataForVllm:
     # FIXME (zyongye)
     # hacky way to access the data now, need to be in chunked meta
     seq_lens: torch.Tensor
@@ -271,8 +271,8 @@ class VllmDeepseekV32IndexerMetadata:
     num_prefills: int
     num_prefill_tokens: int
 
-    decode: VllmDeepseekV32IndexerDecodeMetadata | None = None
-    prefill: VllmDeepseekV32IndexerPrefillMetadata | None = None
+    decode: AiterMlaSparseIndexerDecodeMetadataForVllm | None = None
+    prefill: AiterMlaSparseIndexerPrefillMetadataForVllm | None = None
 
 
 # TODO (zyongye) optimize this, this is now vibe coded
@@ -486,7 +486,7 @@ class AiterMlaSparseMetadataBuilderMethodsForVllm:
 
 
 class AiterMlaSparseIndexerMetadataBuilderMethodsForVllm:
-    """Mixin for DeepseekV32IndexerCache: builds VllmDeepseekV32IndexerMetadata only."""
+    """Mixin for DeepseekV32IndexerCache: builds AiterMlaSparseIndexerMetadataForVllm only."""
 
     def __init__(self):
         raise TypeError(
@@ -522,7 +522,7 @@ class AiterMlaSparseIndexerMetadataBuilderMethodsForVllm:
             .to(torch.int32)
             .to(self.device)
         )
-        return VllmDeepseekV32IndexerPrefillChunkMetadata(
+        return AiterMlaSparseIndexerPrefillChunkMetadataForVllm(
             cu_seqlen_ks=cu_seqlen_ks,
             cu_seqlen_ke=cu_seqlen_ke,
             cu_seq_lens=cu_seq_lens,
@@ -539,7 +539,7 @@ class AiterMlaSparseIndexerMetadataBuilderMethodsForVllm:
         common_prefix_len: int,
         common_attn_metadata=None,
         fast_build: bool = False,
-    ) -> VllmDeepseekV32IndexerMetadata:
+    ) -> AiterMlaSparseIndexerMetadataForVllm:
         from vllm.v1.attention.backends.utils import (
             split_decodes_and_prefills,
             split_prefill_chunks,
@@ -580,7 +580,7 @@ class AiterMlaSparseIndexerMetadataBuilderMethodsForVllm:
                 )
                 for reqs_start, reqs_end in chunk_seq_ids
             ]
-            prefill_metadata = VllmDeepseekV32IndexerPrefillMetadata(
+            prefill_metadata = AiterMlaSparseIndexerPrefillMetadataForVllm(
                 chunks=chunks,
             )
 
@@ -685,7 +685,7 @@ class AiterMlaSparseIndexerMetadataBuilderMethodsForVllm:
             _is_large_context = common_attn_metadata.max_seq_len > 8192
             use_large_context_topk = batch_size <= 128 and _is_large_context
 
-            decode_metadata = VllmDeepseekV32IndexerDecodeMetadata(
+            decode_metadata = AiterMlaSparseIndexerDecodeMetadataForVllm(
                 block_table=block_table,
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
@@ -695,7 +695,7 @@ class AiterMlaSparseIndexerMetadataBuilderMethodsForVllm:
                 offsets=offsets,
             )
 
-        indexer_metadata = VllmDeepseekV32IndexerMetadata(
+        indexer_metadata = AiterMlaSparseIndexerMetadataForVllm(
             seq_lens=common_attn_metadata.seq_lens,
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
