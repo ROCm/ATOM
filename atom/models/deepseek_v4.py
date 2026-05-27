@@ -2018,7 +2018,10 @@ class MoE(nn.Module):
 
                 ids_2d = ids.unsqueeze(-1)
                 ids_2d, _ = pad_for_all_gather(ids_2d)
-                ids_2d = _get_dp_group().all_gather(ids_2d, dim=0)
+                # use_custom=True: avoid NCCL all_gather recording an event
+                # inside CUDAGraph capture (watchdog would later query it and
+                # trigger hipErrorCapturedEvent).
+                ids_2d = _get_dp_group().all_gather(ids_2d, use_custom=True, dim=0)
                 ids = ids_2d[:num_tokens].flatten()
             ids = ids.clamp(0, self.gate.tid2eid.shape[0] - 1)
         topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
