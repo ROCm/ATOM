@@ -43,8 +43,8 @@ use crate::{
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
-    python::atom_standalone::AtomStandaloneRuntime,
     routers::{
+        atom_standalone::AtomStandaloneRuntime,
         comm::{conversations, parse, tokenize},
         router_manager::RouterManager,
         RouterTrait,
