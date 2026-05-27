@@ -84,6 +84,14 @@ class Sequence:
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
         self.is_first_decode = False
+        # Set to True by Scheduler.postprocess after BlockManager.hash_blocks
+        # has registered the prompt blocks for prefix caching. The trigger has
+        # to be per-seq because in deferred-output mode the prefill step's
+        # postprocess has no fwd_output entry for the seq (idx is None) — the
+        # prefill output surfaces one step later, at which point seq.type has
+        # already been flipped to DECODE. A seq.type / len(output_tokens) gate
+        # would never fire for the prefill blocks; this flag does.
+        self.prefix_hashes_published = False
         # stream callback
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens
