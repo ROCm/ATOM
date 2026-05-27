@@ -3,7 +3,7 @@
 
 from typing import Type
 
-from atom.plugin.vllm.attention_backend.attention_gdn import GatedDeltaNet
+from atom.plugin.vllm.attention.layer_gdn import GatedDeltaNet
 
 
 class GDNAttentionBackend:
