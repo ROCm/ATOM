@@ -92,7 +92,8 @@ def make_compress_plans(
                     `n_compress`) — required by the decode CUDAGraph path
                     so capture and replay produce kernel calls with
                     identical tensor shapes. Caller must size this to the
-                    decode worst case (`max_decode_tokens // ratio + bs`).
+                    decode worst case (`bs * ceil((1 + max_spec_steps) /
+                    ratio)`).
                     When NONE: the slice is exactly `n_compress` (tight,
                     eager-only) — gives the smallest possible kernel grid.
                     The slice is contiguous-from-base so the data pointer

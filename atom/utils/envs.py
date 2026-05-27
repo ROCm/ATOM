@@ -93,10 +93,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_EXPONENTIAL", "0") == "1"
     ),
     # --- Kernel Fusion Toggles ---
+    # fused_compress_attn: switch between Triton (default historical) and a
+    # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
+    # "auto" picks flydsl when shape matches the supported configs (D ∈
+    # {128, 512}, RD=64, OVERLAP=1, RATIO=4); "always" forces it (errors on
+    # unsupported); "never" pins Triton. flydsl pure-GPU time beats Triton
+    # across the full range on V4-Pro (1.1x small N → 2-3x at N≥4096).
+    "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
+        "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
+    ).lower(),
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
-        os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "1") == "1"
+        os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
     ),
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1") == "1"
@@ -210,6 +219,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sampler top-K logits log — int K, 0/empty disables.
     "ATOM_DEBUG_TOPK": lambda: int(os.getenv("ATOM_DEBUG_TOPK", "0") or "0"),
     "ATOM_DEBUG_TOPK_PATH": lambda: os.getenv("ATOM_DEBUG_TOPK_PATH", ""),
+    # Force-skip the draft-model forward in eagle/MTP propose() and return
+    # sentinel draft token ids (int max) so rejection_sampler rejects all
+    # speculative tokens. Used to reproduce 100% rejection behavior — the
+    # worst case for ring-buffer aliasing in compressor state caches.
+    # Default: False (run the draft model normally).
+    "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
+        os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
+    ),
+    # --- PrefillDelayer (cross-DP prefill alignment) ---
+    # Master switch; default on. Set "0" to disable construction.
+    "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
+        os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1"
+    ),
+    # Max consecutive scheduler passes the delayer is allowed to suppress
+    # prefill admission while waiting for cross-DP alignment.
+    "ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES", "30")
+    ),
+    # Wall-clock cap (milliseconds) on a single delay window.
+    "ATOM_PREFILL_DELAYER_MAX_DELAY_MS": lambda: float(
+        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_MS", "5000")
+    ),
+    # Optional KV-usage low watermark below which delaying is allowed.
+    # Empty string => None (use PrefillDelayer's internal default).
+    "ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": lambda: (
+        None
+        if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
+        else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
+    ),
 }
 
 
