@@ -1319,7 +1319,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         return attn_metadata
 
 
-class AiterMLASparseMetadataBuilder(AttentionMetadataBuilder):
+class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
     """vLLM-only metadata builder for sparse MLA main attention."""
 
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
@@ -1540,7 +1540,7 @@ class AiterMLASparseMetadataBuilder(AttentionMetadataBuilder):
         return attn_metadata
 
 
-class AiterMLASparseIndexerMetadataBuilder(AttentionMetadataBuilder):
+class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     reorder_batch_threshold = 1
 

@@ -175,9 +175,9 @@ class AiterSparseMlaBackendForVllm(AiterMlaBackendForVllm):
 
     @staticmethod
     def get_builder_cls() -> Type:
-        from atom.plugin.vllm.attention.metadata import AiterMLASparseMetadataBuilder
+        from atom.plugin.vllm.attention.metadata import AiterMlaSparseMetadataBuilder
 
-        return AiterMLASparseMetadataBuilder
+        return AiterMlaSparseMetadataBuilder
 
     @classmethod
     def is_sparse(cls) -> bool:
@@ -209,10 +209,10 @@ class AiterSparseMlaIndexerBackendForVllm(AiterMlaBackendForVllm):
     @staticmethod
     def get_builder_cls() -> Type:
         from atom.plugin.vllm.attention.metadata import (
-            AiterMLASparseIndexerMetadataBuilder,
+            AiterMlaSparseIndexerMetadataBuilder,
         )
 
-        return AiterMLASparseIndexerMetadataBuilder
+        return AiterMlaSparseIndexerMetadataBuilder
 
     @classmethod
     def is_sparse(cls) -> bool:
