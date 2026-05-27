@@ -358,9 +358,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         query_group_size = max_qlen * (num_q_heads_total // num_kv_heads)
         context_partition_size = 256
 
-        # use_ps = self.adopt_persistent_kernel(
-        #     head_size, num_kv_heads, num_q_heads_total
-        # )
         use_ps = True
         if use_ps:
             max_context_partition_num = get_recommended_splits(
@@ -516,7 +513,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=swa_cu_seqlens,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=swa_max_seqlens,  # need to confirm
+            max_seqlen_k=swa_max_seqlens,
             min_seqlen_q=1,
             dropout_p=0.0,
             softmax_scale=self.scale,
@@ -569,7 +566,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_q,  # need to confirm
+            max_seqlen_k=max_seqlen_q,
             min_seqlen_q=min_seqlen_q,
             dropout_p=0.0,
             softmax_scale=self.scale,
@@ -650,12 +647,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             suffix_output=out,
             suffix_lse=lse,
         )
-
-    def adopt_persistent_kernel(self, head_size, num_kv_heads, num_q_heads):
-        non_ps_database = {(256, 4, 1)}
-        if (head_size, num_q_heads, num_kv_heads) in non_ps_database:
-            return False
-        return True
 
     def forward_impl(
         self,

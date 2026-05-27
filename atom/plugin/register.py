@@ -75,6 +75,10 @@ def register_ops_to_sglang(atom_config: Config) -> None:
 def set_attn_cls() -> None:
     """Keep compatibility with old plugin init hooks.
 
+    FIXME: This is a legacy no-op after attention construction moved to the
+    frontend dispatcher. Remove it once downstream plugin init paths stop
+    calling ``set_attn_cls`` for side effects.
+
     Attention selection now happens in ``atom.model_ops.base_attention.Attention``
     at construction time, so plugin init no longer mutates ``atom.model_ops``.
     """

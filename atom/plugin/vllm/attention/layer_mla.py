@@ -186,7 +186,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self._v_scale_float = 1.0
         self._prob_scale_float = 1.0
 
-    def _concat_k_nope_k_pe_plugin_mode(
+    def _concat_k_nope_k_pe(
         self, k_nope: torch.Tensor, k_pe: torch.Tensor
     ) -> torch.Tensor:
         """
@@ -251,7 +251,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         return output
 
-    def _run_prefill_new_tokens_plugin_mode(self, prefill, q, k, v, return_softmax_lse):
+    def _run_prefill_new_tokens(self, prefill, q, k, v, return_softmax_lse):
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,
@@ -265,7 +265,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             return_softmax_lse=return_softmax_lse,
         )
 
-    def _run_prefill_context_chunk_plugin_mode(self, prefill, chunk_idx, q, k, v):
+    def _run_prefill_context_chunk(self, prefill, chunk_idx, q, k, v):
         assert prefill.chunked_context is not None
         return self._flash_attn_varlen_diff_headdims(
             q=q,
@@ -280,7 +280,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             return_softmax_lse=True,
         )
 
-    def _context_parallel_compute_prefill_context_plugin_mode(
+    def _context_parallel_compute_prefill_context(
         self,
         q,
         kv_c_and_k_pe_cache,
@@ -359,9 +359,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = self._concat_k_nope_k_pe_plugin_mode(k_nope, k_pe)
+            k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
-            attn_output, attn_softmax_lse = self._run_prefill_context_chunk_plugin_mode(
+            attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
                 chunk_idx=i,
                 q=q,
@@ -388,7 +388,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         return output, output_lse
 
-    def _compute_prefill_context_plugin_mode(
+    def _compute_prefill_context(
         self,
         q,
         kv_c_and_k_pe_cache,
@@ -427,9 +427,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-            k = self._concat_k_nope_k_pe_plugin_mode(k_nope, k_pe)
+            k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
-            attn_output, attn_softmax_lse = self._run_prefill_context_chunk_plugin_mode(
+            attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
                 chunk_idx=i,
                 q=q,
@@ -456,7 +456,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         return output, output_lse
 
-    def _forward_prefill_plugin_mode(
+    def _forward_prefill(
         self,
         q,
         kv_c_normed,
@@ -553,10 +553,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            # k = self._concat_k_nope_k_pe_plugin_mode(k_nope, k_pe)
+            # k = self._concat_k_nope_k_pe(k_nope, k_pe)
             k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
-        output_prefill = self._run_prefill_new_tokens_plugin_mode(
+        output_prefill = self._run_prefill_new_tokens(
             prefill=attn_metadata.prefill,
             q=q,
             k=k,
@@ -570,7 +570,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             suffix_output, suffix_lse = output_prefill
             if self.dcp_world_size > 1:
                 context_output, context_lse = (
-                    self._context_parallel_compute_prefill_context_plugin_mode(
+                    self._context_parallel_compute_prefill_context(
                         q,
                         kv_c_and_k_pe_cache,
                         attn_metadata,
@@ -579,7 +579,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     )
                 )
             else:
-                context_output, context_lse = self._compute_prefill_context_plugin_mode(
+                context_output, context_lse = self._compute_prefill_context(
                     q, kv_c_and_k_pe_cache, attn_metadata, k_scale
                 )
 
@@ -600,7 +600,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
             output.copy_(output_prefill)
 
-    def _forward_decode_plugin_mode(
+    def _forward_decode(
         self,
         q,
         kv_c_and_k_pe_cache,
@@ -802,7 +802,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         if has_prefill:
-            self._forward_prefill_plugin_mode(
+            self._forward_prefill(
                 prefill_q,
                 prefill_k_c_normed,
                 prefill_k_pe,
@@ -919,7 +919,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 decode_q = get_dcp_group().all_gather(decode_q, dim=1)
 
             # call decode attn
-            attn_out, lse = self._forward_decode_plugin_mode(
+            attn_out, lse = self._forward_decode(
                 decode_q, kv_cache, attn_metadata
             )
 
