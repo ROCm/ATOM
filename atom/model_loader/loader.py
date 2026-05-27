@@ -304,6 +304,25 @@ def load_model(
                 return maybe_matching_name
         return None
 
+    is_deepseek = any(
+        "deepseek" in str(architecture).lower()
+        for architecture in getattr(hf_config, "architectures", []) or []
+    )
+
+    def should_fuse_shared_expert_weight(name: str, matching_name: str) -> bool:
+        if not is_deepseek:
+            return is_rocm_aiter_fusion_shared_expert_enabled()
+        # Added specifically to support shared expert fusion for
+        # DeepSeek-R1-0528-MXFP4-v2, whose shared/routed dtypes can differ
+        # by layer. Keep other models on the legacy global remap gate.
+        layer_prefix = name.split(matching_name, 1)[0]
+        shared_expert_prefix = layer_prefix + matching_name.rstrip(".")
+        routed_expert_prefix = layer_prefix + "mlp.experts"
+        return is_rocm_aiter_fusion_shared_expert_enabled(
+            shared_expert_prefix=shared_expert_prefix,
+            routed_expert_prefix=routed_expert_prefix,
+        )
+
     def extract_expert_target_and_id(name: str) -> Tuple[str, int] | None:
         """Extract fused parameter name and expert id from expert checkpoint name.
         like 'model.layers.10.mlp.experts.100.w2_bias' -> model.layers.10.mlp.experts.w2_bias and 100
@@ -438,14 +457,14 @@ def load_model(
                 continue
             maybe_matching_name = have_shared_expert(name)
             if (
-                is_rocm_aiter_fusion_shared_expert_enabled()
-                and maybe_matching_name is not None
+                maybe_matching_name is not None
                 # When the model keeps shared experts unfused (e.g. V4-Pro with
                 # FP4 routed vs FP8 shared, or DP + mori all2all), do NOT rewrite
                 # the shared weights into the fused slot — they must load into the
                 # standalone Expert module. Stays True for models without this
                 # attr (GLM4 etc.) so their fused-shared path is unchanged.
                 and not getattr(model, "disable_fused_shared_loading", False)
+                and should_fuse_shared_expert_weight(name, maybe_matching_name)
             ):
                 # Preserve the module-naming prefix (mlp. / ffn.) so the rewritten
                 # name matches this model's routed-expert param naming.
