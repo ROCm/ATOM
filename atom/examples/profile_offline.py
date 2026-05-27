@@ -38,6 +38,12 @@ parser.add_argument(
     action="store_true",
     help="Use random repeated words as input. Otherwise use a predefined meaningful text.",
 )
+parser.add_argument(
+    "--temperature",
+    type=float,
+    default=0.6,
+    help="Sampling temperature. 0.0 = greedy (use for token-exact A/B).",
+)
 
 
 def main():
@@ -73,7 +79,7 @@ def main():
         print(f"Input_prompt: {prompt}")
 
     sampling_params = SamplingParams(
-        temperature=0.6,
+        temperature=args.temperature,
         max_tokens=args.output_length,
         ignore_eos=True,
     )

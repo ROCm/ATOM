@@ -5,9 +5,6 @@ import warnings
 
 import torch
 from aiter import mixed_sample_outer_exponential as _hip_mixed_sample_outer_exponential
-from aiter.ops.triton.sample.mix_sample import (
-    mixed_sample_outer_exponential as _triton_mixed_sample_outer_exponential,
-)
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from atom.utils import envs
@@ -15,8 +12,17 @@ from torch import nn
 
 
 def mixed_sample_outer_exponential(*args, **kwargs):
-    """Dispatch to Triton drop-in when ATOM_USE_TRITON_SAMPLE=1, else HIP."""
+    """Dispatch to Triton drop-in when ATOM_USE_TRITON_SAMPLE=1, else HIP.
+
+    The Triton import is lazy so ATOM stays startable on aiter builds that
+    don't ship aiter.ops.triton.sample.mix_sample (e.g. a clean clone of
+    ROCm/aiter:main, or any aiter branch other than the one that includes
+    the mix_sample drop-in).
+    """
     if envs.ATOM_USE_TRITON_SAMPLE:
+        from aiter.ops.triton.sample.mix_sample import (
+            mixed_sample_outer_exponential as _triton_mixed_sample_outer_exponential,
+        )
         return _triton_mixed_sample_outer_exponential(*args, **kwargs)
     return _hip_mixed_sample_outer_exponential(*args, **kwargs)
 
