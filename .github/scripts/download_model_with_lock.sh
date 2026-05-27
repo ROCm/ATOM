@@ -306,6 +306,7 @@ try:
         repo_id=model_id,
         revision=revision,
         local_dir=os.environ["STAGING_DIR"],
+        local_dir_use_symlinks=False,
         token=token,
     )
 except Exception as exc:
