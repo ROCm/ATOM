@@ -20,6 +20,7 @@ logger = logging.getLogger("atom")
 engine: Any | None = None
 tokenizer: Any | None = None
 
+
 def ensure_atom_source_on_path() -> None:
     atom_source_root = Path(__file__).resolve().parents[4]
     atom_source_root_str = str(atom_source_root)
@@ -28,7 +29,9 @@ def ensure_atom_source_on_path() -> None:
     sys.path.insert(0, atom_source_root_str)
 
     loaded_atom = sys.modules.get("atom")
-    if loaded_atom is not None and not module_loaded_from(loaded_atom, atom_source_root):
+    if loaded_atom is not None and not module_loaded_from(
+        loaded_atom, atom_source_root
+    ):
         for module_name in list(sys.modules):
             if module_name == "atom" or module_name.startswith("atom."):
                 del sys.modules[module_name]
@@ -64,6 +67,7 @@ def import_atomesh_runner() -> Any:
     # Provided by the Rust PyO3 module in atom/mesh/src/python/mod.rs.
     try:
         import atomesh_runner
+
         return atomesh_runner
     except ModuleNotFoundError as exc:
         if exc.name != "atomesh_runner":
@@ -123,12 +127,14 @@ def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
 
 def initialize_standalone_service(args: argparse.Namespace) -> Any:
     from atom_standalone_service import AtomStandaloneService
+
     global engine, tokenizer
     return AtomStandaloneService(
         engine=engine,
         tokenizer=tokenizer,
         model_name=args.model,
     )
+
 
 def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
     from atom.model_engine.arg_utils import EngineArgs
@@ -188,7 +194,7 @@ def main() -> None:
         if arg == "--version-verbose":
             print_version(verbose=True)
             return
-    
+
     # `python xxx mesh-only ...` starts mesh routing;
     # other invocations default to ATOM standalone.
     use_atom_standalone = "mesh-only" not in raw_args
@@ -199,6 +205,7 @@ def main() -> None:
         launch_atom_standalone(atomesh_runner, raw_args)
     else:
         launch_atomesh(atomesh_runner, raw_args)
+
 
 if __name__ == "__main__":
     main()
