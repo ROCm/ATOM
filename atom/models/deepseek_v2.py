@@ -870,9 +870,13 @@ class DeepseekV2MoE(nn.Module):
         self._use_dual_stream = False
         self.alt_stream = alt_stream
         self.prefix = prefix
+        self.fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled(
+            shared_expert_prefix=f"{prefix}.shared_experts",
+            routed_expert_prefix=f"{prefix}.experts",
+        )
 
         if config.n_shared_experts is not None:
-            if not is_rocm_aiter_fusion_shared_expert_enabled():
+            if not self.fuse_shared_experts:
                 tbo_active = get_current_atom_config().enable_tbo
                 if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                     self._use_dual_stream = True
@@ -943,10 +947,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         shared_output = None
-        if (
-            self.n_shared_experts is not None
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
-        ):
+        if self.n_shared_experts is not None and not self.fuse_shared_experts:
             shared_output = self.shared_experts(hidden_states)
 
         final_hidden_states = self.routed_expert_forward(hidden_states)
@@ -2185,11 +2186,7 @@ class DeepseekV2Model(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
-                else 0
-            ),
+            + (self.config.n_shared_experts or 0),
         )
 
 
