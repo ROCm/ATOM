@@ -51,48 +51,58 @@ cargo build --release
 
 Artifacts: `target/release/atom-mesh`, `target/release/libmesh.so`.
 
-## Usage
+### Build during ATOM package install
 
-### Startup entrypoints
-
-ATOM Mesh can be started through either the original Rust binary or the Python entrypoint.
-
-Use the Rust binary when routing to external workers:
+ATOM package installation does not build Mesh by default. To compile Mesh during
+package installation and include `libmesh.so` in the installed package, enable
+the Mesh build hook:
 
 ```bash
-cd atom/mesh
-./target/release/atom-mesh launch \
-  --worker-urls http://worker1:8000 http://worker2:8000 \
-  --policy cache_aware
+ATOM_MESH_BUILD=1 python -m pip install .
 ```
 
-Use the Python entrypoint when Python needs to own the ATOM engine and tokenizer. The Python entrypoint loads the Rust PyO3 module from `atom/mesh/target/{debug,release}/libmesh.so`, so build the Rust library first:
+For editable installs:
 
 ```bash
-python atom/mesh/src/python/server.py \
+ATOM_MESH_BUILD=1 python -m pip install -e .
+```
+
+The hook runs `cargo build --release` under `atom/mesh` before Python package
+files are collected.
+
+## Usage
+
+### ATOM standalone
+
+ATOM standalone mode starts the ATOM engine and tokenizer in Python, while Rust
+Mesh provides the HTTP server, lifecycle handling, observability, and PyO3
+request bridge. Enable the Atomesh entrypoint through
+`USE_ATOMESH_ENTRYPOINTS=1`:
+
+```bash
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server \
   --model /path/to/model \
   --host 0.0.0.0 \
   --port 30000
 ```
 
-The Python entrypoint can also run the normal mesh router with the same mesh arguments:
+Do not pass `mesh-only` for standalone mode. The `mesh-only` subcommand is only
+used when the Python entrypoint should run Mesh as a router for external
+workers.
 
-```bash
-python atom/mesh/src/python/server.py mesh-only \
-  --worker-urls http://worker1:8000 http://worker2:8000 \
-  --policy cache_aware
-```
-
-For the Python entrypoint, `mesh-only` selects mesh routing. Without `mesh-only`, it defaults to ATOM standalone mode and constructs a Python-owned engine/tokenizer runtime.
 
 ### Regular HTTP routing
+
+Routing mode can be started through either the Rust binary or the Python
+entrypoint. For the Python entrypoint, `mesh-only` selects Mesh routing;
+without `mesh-only`, it defaults to ATOM standalone mode.
 
 ```bash
 ./target/release/atom-mesh launch \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 
-python atom/mesh/src/python/server.py mesh-only \
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 ```
@@ -107,7 +117,8 @@ python atom/mesh/src/python/server.py mesh-only \
   --decode http://decode2:30012 \
   --prefill-policy cache_aware --decode-policy power_of_two
 
-python atom/mesh/src/python/server.py mesh-only \
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
+  --pd-disaggregation \
   --prefill http://prefill1:30001 9001 \
   --prefill http://prefill2:30002 \
   --decode http://decode1:30011 \
@@ -126,7 +137,7 @@ Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cac
   --reasoning-parser deepseek-r1 \
   --tool-call-parser json
 
-python atom/mesh/src/python/server.py mesh-only \
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
   --worker-urls grpc://worker1:31001 grpc://worker2:31002 \
   --tokenizer-path /path/to/tokenizer.json \
   --reasoning-parser deepseek-r1 \
@@ -212,7 +223,7 @@ Optional API key protection for router endpoints:
 ./target/release/atom-mesh launch --api-key "your-secret-key" \
   --worker-urls http://worker1:8000 http://worker2:8000
 
-python atom/mesh/src/python/server.py mesh-only --api-key "your-secret-key" \
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only --api-key "your-secret-key" \
   --worker-urls http://worker1:8000 http://worker2:8000
 ```
 

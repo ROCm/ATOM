@@ -15,9 +15,8 @@ use crate::{
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
-    python::atom_standalone::AtomStandaloneRuntime,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::router_manager::RouterManager,
+    routers::{atom_standalone::AtomStandaloneRuntime, router_manager::RouterManager},
     tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
 };
