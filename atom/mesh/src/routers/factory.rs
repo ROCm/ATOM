@@ -13,7 +13,7 @@ use crate::{
     config::{PolicyConfig, RoutingMode},
     core::ConnectionMode,
     policies::PolicyFactory,
-    python::atom_standalone::AtomStandaloneRouter,
+    routers::atom_standalone::AtomStandaloneRouter,
 };
 
 /// Factory for creating router instances based on configuration
