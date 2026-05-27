@@ -293,18 +293,28 @@ start_progress_reporter
   export MODEL_ID REMOTE_REVISION STAGING_DIR
   timeout --signal=TERM --kill-after=5m "${MODEL_DOWNLOAD_TIMEOUT}" python3 - <<'PY'
 import os
+import sys
 
-from huggingface_hub import snapshot_download
-
+model_id = os.environ["MODEL_ID"]
 revision = os.environ.get("REMOTE_REVISION") or None
 token = os.environ.get("HF_TOKEN") or None
 
-snapshot_download(
-    repo_id=os.environ["MODEL_ID"],
-    revision=revision,
-    local_dir=os.environ["STAGING_DIR"],
-    token=token,
-)
+try:
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        repo_id=model_id,
+        revision=revision,
+        local_dir=os.environ["STAGING_DIR"],
+        token=token,
+    )
+except Exception as exc:
+    print(
+        f"Failed to download model '{model_id}'"
+        f" at revision '{revision or 'default'}': {exc}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 PY
 ) &
 DOWNLOAD_PID="$!"
