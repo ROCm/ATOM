@@ -290,13 +290,22 @@ start_progress_reporter
 
 (
   export HF_HUB_ENABLE_HF_TRANSFER=1
-  if [ -n "${REMOTE_REVISION}" ]; then
-    timeout --signal=TERM --kill-after=5m "${MODEL_DOWNLOAD_TIMEOUT}" \
-      hf download "${MODEL_ID}" --revision "${REMOTE_REVISION}" --local-dir "${STAGING_DIR}"
-  else
-    timeout --signal=TERM --kill-after=5m "${MODEL_DOWNLOAD_TIMEOUT}" \
-      hf download "${MODEL_ID}" --local-dir "${STAGING_DIR}"
-  fi
+  export MODEL_ID REMOTE_REVISION STAGING_DIR
+  timeout --signal=TERM --kill-after=5m "${MODEL_DOWNLOAD_TIMEOUT}" python3 - <<'PY'
+import os
+
+from huggingface_hub import snapshot_download
+
+revision = os.environ.get("REMOTE_REVISION") or None
+token = os.environ.get("HF_TOKEN") or None
+
+snapshot_download(
+    repo_id=os.environ["MODEL_ID"],
+    revision=revision,
+    local_dir=os.environ["STAGING_DIR"],
+    token=token,
+)
+PY
 ) &
 DOWNLOAD_PID="$!"
 wait "${DOWNLOAD_PID}"
