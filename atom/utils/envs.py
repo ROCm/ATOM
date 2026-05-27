@@ -36,6 +36,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # --- Kernel Fusion Toggles ---
+    # fused_compress_attn: switch between Triton (default historical) and a
+    # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
+    # "auto" picks flydsl when shape matches the supported configs (D ∈
+    # {128, 512}, RD=64, OVERLAP=1, RATIO=4); "always" forces it (errors on
+    # unsupported); "never" pins Triton. flydsl pure-GPU time beats Triton
+    # across the full range on V4-Pro (1.1x small N → 2-3x at N≥4096).
+    "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
+        "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
+    ).lower(),
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
@@ -86,6 +95,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
     "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
+    # Force the Triton path for V4 sparse-paged-prefill attention; default backend
+    # is aiter's OPUS kernel (gfx950 fast path). Set to 1 to fall back to Triton
+    # (e.g. for debugging or on non-gfx950 builds).
+    "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
@@ -152,6 +165,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sampler top-K logits log — int K, 0/empty disables.
     "ATOM_DEBUG_TOPK": lambda: int(os.getenv("ATOM_DEBUG_TOPK", "0") or "0"),
     "ATOM_DEBUG_TOPK_PATH": lambda: os.getenv("ATOM_DEBUG_TOPK_PATH", ""),
+    # Force-skip the draft-model forward in eagle/MTP propose() and return
+    # sentinel draft token ids (int max) so rejection_sampler rejects all
+    # speculative tokens. Used to reproduce 100% rejection behavior — the
+    # worst case for ring-buffer aliasing in compressor state caches.
+    # Default: False (run the draft model normally).
+    "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
+        os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
+    ),
 }
 
 

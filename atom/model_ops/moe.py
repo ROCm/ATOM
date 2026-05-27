@@ -1031,7 +1031,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=expert_map,
+                expert_mask=layer.expert_mask,
                 activation=activation,
                 quant_type=self.quant_type,
                 w1_scale=layer.w13_weight_scale,
@@ -1947,6 +1947,8 @@ class FusedMoE(torch.nn.Module):
             tp_size, dp_size, atom_config
         )
         self.global_num_experts = num_experts
+        self.register_buffer("expert_map", None, persistent=False)
+        self.register_buffer("expert_mask", None, persistent=False)
         if self.use_ep:
             self.local_num_experts, self.expert_map = determine_expert_map(
                 ep_size=self.ep_size,
@@ -1955,7 +1957,6 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             self.local_num_experts = self.global_num_experts
-            self.expert_map = None
         self.top_k = top_k
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
@@ -1973,11 +1974,11 @@ class FusedMoE(torch.nn.Module):
             if config is not None and atom_config.torch_dtype != torch.float16
             else 1.0
         )
-        self.expert_mask = None
         if self.use_ep:
             expert_mask = torch.ones(
                 (self.global_num_experts + self.num_fused_shared_experts + 1,),
                 dtype=torch.int32,
+                device=self.expert_map.device,
             )
             expert_mask[-1] = 0
             expert_mask[: self.global_num_experts] = self.expert_map > -1

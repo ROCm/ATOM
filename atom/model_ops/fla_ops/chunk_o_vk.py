@@ -12,6 +12,9 @@
 
 import torch
 
+# Adapted for ATOM: replaced `from vllm.triton_utils import tl, triton`
+# with plain triton imports (consistent with the existing ATOM-vendored
+# FLA files).
 import triton
 import triton.language as tl
 
@@ -40,7 +43,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
     key=["H", "K", "V", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])
-def chunk_fwd_kernel_o(
+def chunk_fwd_kernel_o_vk(
     q,
     k,
     v,
@@ -86,7 +89,7 @@ def chunk_fwd_kernel_o(
     k += (bos * Hg + i_h // (H // Hg)) * K
     v += (bos * H + i_h) * V
     o += (bos * H + i_h) * V
-    h += (i_tg * H + i_h).to(tl.int64) * K * V
+    h += (i_tg * H + i_h).to(tl.int64) * V * K
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
@@ -99,17 +102,17 @@ def chunk_fwd_kernel_o(
             k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
         )
         p_h = tl.make_block_ptr(
-            h, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0)
+            h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
         )
         # [BT, BK]
         b_q = tl.load(p_q, boundary_check=(0, 1))
         # [BK, BT]
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [BK, BV]
+        # [BV, BK]
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
-        b_o += tl.dot(b_q, b_h)
+        b_o += tl.dot(b_q, tl.trans(b_h))
         # [BT, BK] @ [BK, BT] -> [BT, BT]
         b_A += tl.dot(b_q, b_k)
 
@@ -139,14 +142,14 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
-def chunk_fwd_o(
+def chunk_fwd_o_vk(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     h: torch.Tensor,
     g: torch.Tensor | None = None,  # cumsum of log decay
     scale: float | None = None,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
     o: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -155,10 +158,10 @@ def chunk_fwd_o(
     If ``o`` is provided, the kernel writes into it inplace and ``o`` is
     returned. The caller's buffer MUST match ``v``'s shape and dtype and
     be contiguous — the Triton kernel assumes stride ``(H * V, 1)`` along
-    ``(T, V)`` for a ``[B, T, H, V]`` layout. The public chunk_gated_delta_rule
-    entry point asserts these contracts before .apply() (so input_guard's
-    silent .contiguous() clone can't defeat them); we re-assert here as a
-    defense-in-depth backstop for any caller that bypasses the public API.
+    ``(T, V)`` for a ``[B, T, H, V]`` layout. Mismatches are rejected so
+    that a non-contiguous view (which would otherwise be silently replaced
+    by ``input_guard``'s ``.contiguous()`` copy upstream) cannot result
+    in a write to the wrong buffer.
     """
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -174,21 +177,22 @@ def chunk_fwd_o(
         o = torch.empty_like(v)
     else:
         assert o.shape == v.shape, (
-            f"chunk_fwd_o: caller-provided o.shape {tuple(o.shape)} != "
+            f"chunk_fwd_o_vk: caller-provided o.shape {tuple(o.shape)} != "
             f"v.shape {tuple(v.shape)}"
         )
         assert o.dtype == v.dtype, (
-            f"chunk_fwd_o: caller-provided o.dtype {o.dtype} != v.dtype " f"{v.dtype}"
+            f"chunk_fwd_o_vk: caller-provided o.dtype {o.dtype} != v.dtype "
+            f"{v.dtype}"
         )
         assert o.is_contiguous(), (
-            "chunk_fwd_o: caller-provided o must be contiguous (kernel "
+            "chunk_fwd_o_vk: caller-provided o must be contiguous (kernel "
             "assumes stride (H*V, 1) on the (T, V) plane)"
         )
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_fwd_kernel_o[grid](
+    chunk_fwd_kernel_o_vk[grid](
         q,
         k,
         v,

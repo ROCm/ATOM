@@ -5,6 +5,7 @@ import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Union
 
 import numpy as np
@@ -13,6 +14,29 @@ from atom.config import Config, KVCacheTensor, ParallelConfig
 
 if TYPE_CHECKING:
     from atom.plugin.attention import MetadataForPluginMode
+
+
+class AttnState(Enum):
+    """Attention dispatch state — controls which kv-indices buffers are built
+    and which forward branch fires.
+
+    Backends that distinguish only "decode vs prefill" can treat any
+    ``PREFILL_*`` value as prefill. Backends with chunked-prefill awareness
+    (e.g. V4) further distinguish ``PREFILL_NATIVE`` from ``PREFILL_PREFIX``.
+
+    - ``DECODE``: 1+K tokens/seq uniformly (decode + spec). Per-token decode
+      kv-indices buffers are valid; prefill prefix buffers may be stale.
+    - ``PREFILL_NATIVE``: fresh prefill — every seq starts at position 0 in
+      this fwd. No prior-chunk KV history to read; the prefix region is
+      empty per token.
+    - ``PREFILL_PREFIX``: chunked prefill — at least one seq has
+      ``chunk_start > 0`` and therefore reads its prior chunk's KV from
+      the paged history (e.g. V4 SWA ring via ``kv_indices_prefix_swa``).
+    """
+
+    DECODE = "decode"
+    PREFILL_NATIVE = "prefill_native"
+    PREFILL_PREFIX = "prefill_prefix"
 
 
 def _compute_chunked_local_num_tokens(
@@ -182,6 +206,13 @@ class AttentionMetaData:
     block_tables: Optional[torch.Tensor] = None
     dropout_p: float = 0.0
 
+    state: AttnState = AttnState.PREFILL_NATIVE
+    """One of `DECODE / PREFILL_NATIVE / PREFILL_PREFIX` — controls which
+    kv-indices buffers downstream forward branches read. Default is
+    `PREFILL_NATIVE`; every `prepare_*` path overrides explicitly.
+    Backends that don't need the NATIVE/PREFIX distinction can treat
+    `any PREFILL_*` as prefill. See ``AttnState`` for full semantics."""
+
     kv_indptr: Optional[torch.Tensor] = None
     kv_indices: Optional[torch.Tensor] = None
     kv_last_page_lens: Optional[torch.Tensor] = None
@@ -216,6 +247,7 @@ class AttentionMetaData:
         context_lens: Optional[torch.Tensor] = None,
         block_tables: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
+        state: AttnState = AttnState.PREFILL_NATIVE,
         kv_indptr: Optional[torch.Tensor] = None,
         kv_indices: Optional[torch.Tensor] = None,
         kv_last_page_lens: Optional[torch.Tensor] = None,
@@ -249,6 +281,7 @@ class AttentionMetaData:
         self.context_lens = context_lens
         self.block_tables = block_tables
         self.dropout_p = dropout_p
+        self.state = state
         self.kv_indptr = kv_indptr
         self.kv_indices = kv_indices
         self.kv_last_page_lens = kv_last_page_lens
