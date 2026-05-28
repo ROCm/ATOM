@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 import torch
 from aiter import dtypes
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size, get_tp_group
+from aiter.utility import fp4_utils
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mla import (
     concat_and_cache_mla,
@@ -52,6 +53,12 @@ from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
     batched_gemm_a16wfp4,
 )
+
+try:
+    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+except ImportError:
+    gemm_afp4wfp4 = None
+
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
@@ -157,6 +164,55 @@ def _fuse_qk_rmsnorm_and_q_quant(
         transpose_scale=True,
     )
     return q_quantized, q_scale, q_normed, k_nope_normed
+
+
+def _q_b_proj_mxfp4_raw_scale(
+    attn: DeepseekV2MLAAttention,
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Run q_b_proj with native SGLang-style raw MXFP4 activation scales."""
+
+    raw_weight = getattr(attn.q_b_proj, "_mxfp4_unshuffled_weight", None)
+    raw_weight_scale = getattr(attn.q_b_proj, "_mxfp4_unshuffled_weight_scale", None)
+    bias = getattr(attn.q_b_proj, "bias", None)
+    if (
+        gemm_afp4wfp4 is not None
+        and raw_weight is not None
+        and raw_weight_scale is not None
+        and bias is None
+    ):
+        q_2d = q.view(-1, q.size(-1))
+        y = torch.empty(
+            q_2d.shape[0],
+            raw_weight.shape[0],
+            device=q.device,
+            dtype=torch.bfloat16,
+        )
+        gemm_afp4wfp4(
+            q_2d.view(torch.uint8),
+            raw_weight.view(torch.uint8),
+            q_scale.view(torch.uint8),
+            raw_weight_scale.view(torch.uint8),
+            torch.bfloat16,
+            y,
+        )
+        return y
+
+    q_scale = fp4_utils.e8m0_shuffle(q_scale.view(torch.float8_e8m0fnu))
+    return _unwrap_linear_output(attn.q_b_proj(q, q_scale))
+
+
+def _q_b_proj_with_optional_scale(
+    attn: DeepseekV2MLAAttention,
+    q: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if q_scale is None:
+        return _unwrap_linear_output(attn.q_b_proj(q))
+    if getattr(attn, "quant_dtype", None) == dtypes.fp4x2:
+        return _q_b_proj_mxfp4_raw_scale(attn, q, q_scale)
+    return _unwrap_linear_output(attn.q_b_proj(q, q_scale))
 
 
 def _fuse_qk_rmsnorm(
@@ -476,11 +532,9 @@ def forward_sgl_prepare(
             attn.alt_stream.wait_stream(current_stream)
             with torch.cuda.stream(attn.alt_stream):
                 k_nope = k_nope.unsqueeze(1)
-                q = _unwrap_linear_output(
-                    attn.q_b_proj(q, q_scale)
-                    if q_scale is not None
-                    else attn.q_b_proj(q)
-                ).view(-1, attn.num_local_heads, attn.qk_head_dim)
+                q = _q_b_proj_with_optional_scale(attn, q, q_scale).view(
+                    -1, attn.num_local_heads, attn.qk_head_dim
+                )
             topk_indices = attn.indexer(
                 x=hidden_states,
                 q_lora=q_lora,
@@ -491,9 +545,9 @@ def forward_sgl_prepare(
             current_stream.wait_stream(attn.alt_stream)
         else:
             k_nope = k_nope.unsqueeze(1)
-            q = _unwrap_linear_output(
-                attn.q_b_proj(q, q_scale) if q_scale is not None else attn.q_b_proj(q)
-            ).view(-1, attn.num_local_heads, attn.qk_head_dim)
+            q = _q_b_proj_with_optional_scale(attn, q, q_scale).view(
+                -1, attn.num_local_heads, attn.qk_head_dim
+            )
             if q_lora is not None:
                 topk_indices = attn.indexer(
                     x=hidden_states,
@@ -817,7 +871,7 @@ def forward_sgl_mha_prepare(
                 output_unquantized_inp1=False,
                 transpose_scale=True,
             )
-            q = _unwrap_linear_output(attn.q_b_proj(q, q_scale)).view(
+            q = _q_b_proj_with_optional_scale(attn, q, q_scale).view(
                 -1, attn.num_local_heads, attn.qk_head_dim
             )
         else:
