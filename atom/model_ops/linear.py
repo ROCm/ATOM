@@ -16,6 +16,7 @@ from aiter import (
     gemm_a8w8_blockscale,
     get_hip_quant,
 )
+from aiter.ops.gemm_op_a4w4 import get_gemm_a4w4_backend
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
@@ -99,19 +100,26 @@ def gemm_a4w4_quant(
     output_size: int,
 ) -> torch.Tensor:
     if gemm_afp4wfp4_preshuffle is None:
+        m, k = x.view(-1, x.size(-1)).shape
+        if x_scale is not None:
+            k *= 2
+        backend = get_gemm_a4w4_backend(m, output_size, k)
+        shuffle_x_scale = not (
+            backend == "triton" and m < MXFP4_QUANT_BLOCK_SIZE
+        )
+
         if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
                 scale=input_scale,
-                shuffle=True,
+                shuffle=shuffle_x_scale,
             )
         else:
             x_scale = x_scale.view(torch.float8_e8m0fnu)
             x = x.view(torch.float4_e2m1fn_x2)
 
-        m = x.view(-1, x.size(-1)).shape[0]
         y = torch.empty(
             (
                 (m + MXFP4_QUANT_BLOCK_SIZE - 1)
