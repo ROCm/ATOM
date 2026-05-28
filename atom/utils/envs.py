@@ -76,6 +76,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
+    # --- Per-layer Tensor Dump (FusedMoE) ---
+    # Set to a directory to dump FusedMoE forward inputs/outputs as torch
+    # tensors. When unset (default), dumping is fully disabled and has zero
+    # overhead. Output layout:
+    #   <dir>/rank<rank>/<phase>/iter<idx>/<layer_name>.{hidden_in,router_logits,hidden_out}.pt
+    # where phase is "prefill" or "decode".
+    "ATOM_DUMP_MOE_DIR": lambda: os.getenv("ATOM_DUMP_MOE_DIR", None),
+    # Comma-separated substrings; only layers whose layer_name contains any of
+    # them will be dumped. Empty string means dump all FusedMoE layers.
+    "ATOM_DUMP_MOE_LAYERS": lambda: os.getenv("ATOM_DUMP_MOE_LAYERS", ""),
+    # Max number of forward iterations to dump per (rank, phase). Use a small
+    # value (e.g. 1-2) to avoid filling the disk. Set to -1 for unlimited.
+    "ATOM_DUMP_MOE_MAX_ITERS": lambda: int(os.getenv("ATOM_DUMP_MOE_MAX_ITERS", "1")),
+    # When ATOM_DUMP_MOE_DIR is set, weights of every matched FusedMoE layer
+    # are also dumped (once per (rank, layer)) under
+    #   <dir>/rank<rank>/weights/<layer_name>/<param>.pt
+    # MoE weights can be huge (per-expert), so always pair with
+    # ATOM_DUMP_MOE_LAYERS to restrict scope. Set this to "1" to disable the
+    # weight dump and keep only the activation dump.
+    "ATOM_DUMP_MOE_SKIP_WEIGHTS": lambda: os.getenv(
+        "ATOM_DUMP_MOE_SKIP_WEIGHTS", "0"
+    )
+    == "1",
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
     # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
     # GPU timestamps for both prefill and decode phases.

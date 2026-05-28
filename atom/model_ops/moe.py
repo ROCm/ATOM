@@ -1884,6 +1884,259 @@ direct_register_custom_op(
 )
 
 
+# ---------------------------------------------------------------------------
+# Per-layer FusedMoE I/O dump (debug-only, gated by ATOM_DUMP_MOE_DIR).
+#
+# Layout:
+#   <dir>/rank<rank>/<phase>/iter<idx>/<layer_name>.{hidden_in,
+#                                                    router_logits,
+#                                                    topk_weights,
+#                                                    topk_ids,
+#                                                    hidden_out}.pt
+#   <dir>/rank<rank>/weights/<layer_name>/<param_name>.pt   (once per layer)
+#   <dir>/rank<rank>/weights/<layer_name>/_meta.json
+#
+# One "iter" == one forward step of the whole model (all MoE layers in the
+# same step share the same iter index). The step boundary is detected by the
+# identity of the live ForwardContext object, which is replaced on every
+# `set_forward_context` call.
+# ---------------------------------------------------------------------------
+import threading as _threading
+
+# (rank, phase) -> {"ctx_id": int | None, "iter": int}; "iter" is the index of
+# the most-recently-seen step (-1 means no step seen yet).
+_MOE_DUMP_STATE: dict[tuple[int, str], dict] = {}
+# (rank, layer_name) for which weights were already dumped, to avoid repeats.
+_MOE_DUMP_WEIGHTS_DONE: set[tuple[int, str]] = set()
+# Per-thread "currently dumping" context, set by _moe_dump_begin and consumed
+# by select_experts via _moe_dump_topk. Using threadlocal avoids reaching the
+# `self` instance from the staticmethod select_experts.
+_MOE_DUMP_CURRENT = _threading.local()
+
+
+def _moe_dump_enabled() -> bool:
+    return bool(envs.ATOM_DUMP_MOE_DIR)
+
+
+def _moe_dump_layer_matches(layer_name: str) -> bool:
+    filt = envs.ATOM_DUMP_MOE_LAYERS or ""
+    parts = [p.strip() for p in filt.split(",") if p.strip()]
+    if not parts:
+        return True
+    return any(p in layer_name for p in parts)
+
+
+def _moe_dump_rank() -> int:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+    except Exception:
+        pass
+    return 0
+
+
+def _moe_dump_begin(
+    layer_name: str,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+) -> Optional[str]:
+    """Save inputs and return the dump directory for this iteration.
+
+    Returns None when dumping is disabled, this layer is filtered out, the
+    iteration budget is exhausted, or we're inside a dummy / profile run.
+    Also (re)sets the per-thread "current dump" state consumed by
+    `_moe_dump_topk` so topk_weights/topk_ids of THIS layer can be picked up
+    later from inside the staticmethod `FusedMoE.select_experts`.
+    """
+    if not _moe_dump_enabled():
+        return None
+    # Reset threadlocal first so a previous layer's dir cannot leak into the
+    # current layer's select_experts when this layer is skipped below.
+    _MOE_DUMP_CURRENT.dir = None
+    _MOE_DUMP_CURRENT.layer_name = None
+
+    if not _moe_dump_layer_matches(layer_name):
+        return None
+
+    try:
+        fwd_ctx = get_forward_context()
+        ctx = fwd_ctx.context
+    except Exception:
+        return None
+    if ctx is None or getattr(ctx, "is_dummy_run", False):
+        return None
+    phase = "prefill" if getattr(ctx, "is_prefill", False) else "decode"
+    rank = _moe_dump_rank()
+    key = (rank, phase)
+    ctx_id = id(fwd_ctx)
+    state = _MOE_DUMP_STATE.setdefault(key, {"ctx_id": None, "iter": -1})
+    if state["ctx_id"] != ctx_id:
+        state["ctx_id"] = ctx_id
+        state["iter"] += 1
+    cur_iter = state["iter"]
+
+    max_iters = envs.ATOM_DUMP_MOE_MAX_ITERS
+    if 0 <= max_iters <= cur_iter:
+        return None
+
+    import os
+
+    base = envs.ATOM_DUMP_MOE_DIR
+    out_dir = os.path.join(base, f"rank{rank}", phase, f"iter{cur_iter}")
+    os.makedirs(out_dir, exist_ok=True)
+    safe_name = layer_name.replace("/", "_")
+    torch.save(
+        hidden_states.detach().cpu(),
+        os.path.join(out_dir, f"{safe_name}.hidden_in.pt"),
+    )
+    torch.save(
+        router_logits.detach().cpu(),
+        os.path.join(out_dir, f"{safe_name}.router_logits.pt"),
+    )
+    _MOE_DUMP_CURRENT.dir = out_dir
+    _MOE_DUMP_CURRENT.layer_name = layer_name
+    return out_dir
+
+
+def _moe_dump_topk(topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> None:
+    """Dump (topk_weights, topk_ids) into the current layer's iteration dir.
+
+    Called from `FusedMoE.select_experts` (a staticmethod) — uses the per-thread
+    state set up by `_moe_dump_begin` to know where to write.
+    """
+    if not _moe_dump_enabled():
+        return
+    out_dir = getattr(_MOE_DUMP_CURRENT, "dir", None)
+    if out_dir is None:
+        return
+    layer_name = getattr(_MOE_DUMP_CURRENT, "layer_name", "") or ""
+
+    import os
+
+    safe_name = layer_name.replace("/", "_")
+    torch.save(
+        topk_weights.detach().cpu(),
+        os.path.join(out_dir, f"{safe_name}.topk_weights.pt"),
+    )
+    torch.save(
+        topk_ids.detach().cpu(),
+        os.path.join(out_dir, f"{safe_name}.topk_ids.pt"),
+    )
+
+
+def _moe_dump_end(
+    out_dir: Optional[str], layer_name: str, hidden_out: torch.Tensor
+) -> None:
+    if out_dir is None:
+        return
+    import os
+
+    safe_name = layer_name.replace("/", "_")
+    torch.save(
+        hidden_out.detach().cpu(),
+        os.path.join(out_dir, f"{safe_name}.hidden_out.pt"),
+    )
+
+
+# Tensor attributes that are present on FusedMoE but not registered as
+# parameter/buffer; we still want to capture them for downstream reproduction.
+_MOE_EXTRA_TENSOR_ATTRS: tuple[str, ...] = (
+    "expert_mask",
+    "e_score_correction_bias",
+)
+
+# Scalar/config attributes worth recording in the per-layer _meta.json.
+_MOE_META_SCALAR_ATTRS: tuple[str, ...] = (
+    "global_num_experts",
+    "local_num_experts",
+    "top_k",
+    "intermediate_size_per_partition",
+    "tp_size",
+    "ep_size",
+    "tp_rank",
+    "dp_rank",
+    "renormalize",
+    "use_grouped_topk",
+    "num_expert_group",
+    "topk_group",
+    "scoring_func",
+    "activation",
+    "apply_router_weight_on_input",
+    "reduce_results",
+)
+
+
+def _moe_dump_weights_once(layer) -> None:
+    """Dump every weight (and a small _meta.json) of `layer` exactly once
+    per (rank, layer_name). No-op when dumping is disabled, the layer is
+    filtered out, or ATOM_DUMP_MOE_SKIP_WEIGHTS=1.
+
+    Weights can be large (per-expert); always pair with ATOM_DUMP_MOE_LAYERS.
+    """
+    if not _moe_dump_enabled():
+        return
+    if envs.ATOM_DUMP_MOE_SKIP_WEIGHTS:
+        return
+    layer_name = getattr(layer, "layer_name", None)
+    if not layer_name:
+        return
+    if not _moe_dump_layer_matches(layer_name):
+        return
+    rank = _moe_dump_rank()
+    key = (rank, layer_name)
+    if key in _MOE_DUMP_WEIGHTS_DONE:
+        return
+    _MOE_DUMP_WEIGHTS_DONE.add(key)
+
+    import json
+    import os
+
+    base = envs.ATOM_DUMP_MOE_DIR
+    safe_name = layer_name.replace("/", "_")
+    out_dir = os.path.join(base, f"rank{rank}", "weights", safe_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Collect tensors. recurse=False so we only capture FusedMoE-owned weights
+    # (not any submodule's, of which there shouldn't be any but be safe).
+    tensors: dict[str, torch.Tensor] = {}
+    try:
+        for name, p in layer.named_parameters(recurse=False):
+            if p is not None:
+                tensors[name] = p
+        for name, b in layer.named_buffers(recurse=False):
+            if b is not None:
+                tensors[name] = b
+    except Exception:
+        pass
+    for name in _MOE_EXTRA_TENSOR_ATTRS:
+        t = getattr(layer, name, None)
+        if isinstance(t, torch.Tensor):
+            tensors.setdefault(name, t)
+
+    for name, t in tensors.items():
+        torch.save(t.detach().cpu(), os.path.join(out_dir, f"{name}.pt"))
+
+    meta: dict = {
+        "layer_name": layer_name,
+        "rank": rank,
+        "tensors": {
+            name: {"shape": list(t.shape), "dtype": str(t.dtype)}
+            for name, t in tensors.items()
+        },
+    }
+    for attr in _MOE_META_SCALAR_ATTRS:
+        v = getattr(layer, attr, None)
+        if isinstance(v, (int, float, str, bool)):
+            meta[attr] = v
+    try:
+        with open(os.path.join(out_dir, "_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2, default=str)
+    except Exception:
+        pass
+
+
 @FusedMoEDecoratorForPluginMode
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
@@ -2608,6 +2861,7 @@ class FusedMoE(torch.nn.Module):
                     f"Unsupported scoring function for non-grouped topk: {scoring_func}"
                 )
 
+        _moe_dump_topk(topk_weights, topk_ids)
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
@@ -2672,9 +2926,13 @@ class FusedMoE(torch.nn.Module):
 
     def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
+        _moe_dump_weights_once(self)
+        _dump_dir = _moe_dump_begin(self.layer_name, hidden_states, router_logits)
         # cuda graph not supported forward with combine and dispatch
         if self.use_chunked:
-            return self.forward_impl_graph(hidden_states, router_logits)
+            out = self.forward_impl_graph(hidden_states, router_logits)
+            _moe_dump_end(_dump_dir, self.layer_name, out)
+            return out
             # return self.forward_impl_chunked(hidden_states, router_logits)
 
         dp_group = get_dp_group()
@@ -2721,6 +2979,7 @@ class FusedMoE(torch.nn.Module):
                 final_hidden_states, ca_fp8_quant=False
             )
 
+        _moe_dump_end(_dump_dir, self.layer_name, final_hidden_states)
         return final_hidden_states
 
     @classmethod
