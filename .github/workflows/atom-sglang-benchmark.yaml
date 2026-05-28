@@ -504,6 +504,32 @@ jobs:
           models = json.loads(os.environ["MODELS_JSON"])
           params = json.loads(os.environ["PARAMS_JSON"])
 
+          def append_env_var(model, assignment):
+              env_vars = str(model.get("env_vars") or "")
+              env_key = assignment.split("=", 1)[0]
+              existing_keys = {
+                  line.split("=", 1)[0]
+                  for line in env_vars.splitlines()
+                  if line.strip() and "=" in line
+              }
+              if env_key in existing_keys:
+                  return model
+
+              model_with_env = dict(model)
+              model_with_env["env_vars"] = (
+                  f"{env_vars}\n{assignment}" if env_vars else assignment
+              )
+              return model_with_env
+
+          def append_env_vars(model, assignments):
+              if isinstance(assignments, str):
+                  assignments = assignments.splitlines()
+              for assignment in assignments or []:
+                  assignment = str(assignment).strip()
+                  if assignment:
+                      model = append_env_var(model, assignment)
+              return model
+
           include = []
           for model in models:
               supported_pairs = set(model.get("supported_input_output_pairs", []))
@@ -544,8 +570,12 @@ jobs:
                       continue
                   if supported_concurrency_values and int(param["concurrency"]) not in supported_concurrency_values:
                       continue
-                  
-                  include.append({"model": model, "params": param})
+
+                  matrix_model = append_env_vars(
+                      model, model.get("env_vars_by_pair", {}).get(pair, "")
+                  )
+
+                  include.append({"model": matrix_model, "params": param})
 
           print(json.dumps({"include": include}))
           PY
