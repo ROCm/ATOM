@@ -658,6 +658,7 @@ impl PDRouter {
                 error!(
                     decode_url = %decode.url(),
                     error = %e,
+                    error_debug = ?e,
                     "vLLM decode request failed"
                 );
                 decode.record_outcome(false);
@@ -1420,6 +1421,7 @@ impl PDRouter {
                 error!(
                     decode_url = %decode.url(),
                     error = %e,
+                    error_debug = ?e,
                     "Decode request failed"
                 );
                 error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
