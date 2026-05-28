@@ -328,7 +328,6 @@ def load_model(
     weights_mapping = getattr(model, "weights_mapping", {})
     skip_weight_prefixes = getattr(model, "skip_weight_prefixes", [])
     mtp_remap = getattr(model, "remap_mtp_weight_name", None)
-    load_fused_qkv_hook = getattr(model, "load_fused_qkv_hook", None)
     # Models can also expose a `weights_mapper` (WeightsMapper instance) for
     # precise prefix/suffix-anchored renames that the dumb substring-substitution
     # `weights_mapping` dict cannot express safely. If both are set they are
@@ -438,15 +437,6 @@ def load_model(
                     maybe_matching_name,
                     f"mlp.experts.{hf_config.n_routed_experts}.",
                 )
-            if load_fused_qkv_hook is not None and load_fused_qkv_hook(
-                name,
-                weight_tensor,
-                params_dict,
-                executor,
-                loaded_weights_record,
-                prefix,
-            ):
-                continue
             for k in packed_modules_mapping:
                 # We handle the experts below in expert_params_mapping
                 if "mlp.experts." in name and name not in params_dict:

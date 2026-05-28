@@ -7,10 +7,6 @@ import re
 import torch
 import torch.nn as nn
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from atom.config import Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
@@ -18,7 +14,7 @@ from atom.model_ops.linear import ReplicatedLinear
 from atom.models.utils import IntermediateTensors, ckpt_has_tensor_suffix, maybe_prefix
 from atom.utils.decorators import support_torch_compile
 
-from .mimo_v2 import MiMoV2Attention, MiMoV2MLP
+from .mimo_v2 import MiMoV2Attention, MiMoV2MLP, mark_prefused_qkv
 
 
 class MiMoV2MTPLayer(nn.Module):
@@ -215,9 +211,9 @@ class MiMoV2MultiTokenPredictor(nn.Module):
 class MiMoV2MTP(nn.Module):
 
     packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
+        "self_attn.q_proj": ("self_attn.qkv_proj", "q"),
+        "self_attn.k_proj": ("self_attn.qkv_proj", "k"),
+        "self_attn.v_proj": ("self_attn.qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
@@ -264,6 +260,7 @@ class MiMoV2MTP(nn.Module):
         self.model = MiMoV2MultiTokenPredictor(
             atom_config=atom_config, prefix=maybe_prefix(prefix, "model")
         )
+        mark_prefused_qkv(self.model, self.config)
 
         self.lm_head = ParallelLMHead(
             num_embeddings=self.config.vocab_size,
@@ -271,20 +268,6 @@ class MiMoV2MTP(nn.Module):
             bias=False,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
-
-    def load_fused_qkv_hook(
-        self, name, loaded_weight, params_dict, executor, loaded_weights_record, prefix
-    ):
-        """Handle fused qkv_proj checkpoint weights (Mimo-V2.5-Pro format)."""
-        if "qkv_proj" in name and name in params_dict:
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
-            param = params_dict[name]
-            weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-            executor.submit(param.weight_loader_process, param.data, weight)
-            loaded_weights_record.add(prefix + name)
-            return True
-        return False
 
     def forward(
         self,

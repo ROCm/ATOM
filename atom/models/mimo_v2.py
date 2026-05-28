@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
@@ -38,6 +37,57 @@ from atom.models.utils import (
 from torch import nn
 from transformers import PretrainedConfig
 from atom.utils.decorators import support_torch_compile
+
+
+def _prefused_qkv_weight_loader(self, param, loaded_weight, loaded_shard_id=None):
+    """weight_loader override for V2.5-Pro qkv_proj (no per-shard q/k/v calls;
+    disk layout along dim 0 is [(q,k,v)_rank0 | (q,k,v)_rank1 | ...]).
+    Accepts full fused tensor (chunk by tp_size, take this rank's slice) or a
+    per-rank slice at param shape. Quant scales / biases are NOT handled."""
+    assert (
+        loaded_shard_id is None
+    ), "MiMo-V2 Pro qkv_proj is pre-fused; per-shard q/k/v load not expected."
+    param_data = param.data
+    if loaded_weight.shape == param_data.shape:
+        param.weight_loader_process(param_data, loaded_weight)
+        return
+    fused_shape = (param_data.shape[0] * self.tp_size, *param_data.shape[1:])
+    if tuple(loaded_weight.shape) != fused_shape:
+        raise ValueError(
+            f"MiMo-V2 Pro qkv_proj: unexpected weight shape "
+            f"{tuple(loaded_weight.shape)}; expected per-rank "
+            f"{tuple(param_data.shape)} or fused {fused_shape}."
+        )
+    sharded = loaded_weight.chunk(self.tp_size, dim=0)[self.tp_rank]
+    param.weight_loader_process(param_data, sharded)
+
+
+def mark_prefused_qkv(root_module: nn.Module, hf_config) -> None:
+    """For V2.5-Pro ckpts (qkv_proj fused, TP-interleaved across
+    num_key_value_heads per-rank chunks along dim 0), fail-fast on TP mismatch
+    and rebind every QKVParallelLinear's weight_loader to the prefused variant.
+    No-op for Flash."""
+    if getattr(hf_config, "attention_projection_layout", None) is None:
+        return
+    expected_tp = hf_config.num_key_value_heads
+    runtime_tp = get_tensor_model_parallel_world_size()
+    if runtime_tp != expected_tp:
+        raise ValueError(
+            f"MiMo-V2 Pro checkpoint is fused for TP={expected_tp} "
+            f"(num_key_value_heads); got runtime tp_size={runtime_tp}. "
+            "Re-shard the checkpoint or run with matching TP."
+        )
+    import types
+
+    for module in root_module.modules():
+        if not isinstance(module, QKVParallelLinear):
+            continue
+        bound = types.MethodType(_prefused_qkv_weight_loader, module)
+        module.weight_loader = bound
+        for attr in ("weight", "weight_scale", "bias", "input_scale"):
+            p = getattr(module, attr, None)
+            if p is not None and hasattr(p, "weight_loader"):
+                p.weight_loader = bound
 
 
 class MiMoV2MLP(nn.Module):
@@ -477,10 +527,14 @@ class MiMoV2Model(nn.Module):
 
 
 class MiMoV2ForCausalLM(nn.Module):
+    # Keys are self_attn-qualified to avoid substring collision with
+    # "qkv_proj" in the loader's `if k in name` match — V2.5Pro checkpoints
+    # ship a fused `self_attn.qkv_proj` weight that would otherwise be
+    # mis-matched as q/k/v_proj and corrupt the param name.
     packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
+        "self_attn.q_proj": ("self_attn.qkv_proj", "q"),
+        "self_attn.k_proj": ("self_attn.qkv_proj", "k"),
+        "self_attn.v_proj": ("self_attn.qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
@@ -498,6 +552,7 @@ class MiMoV2ForCausalLM(nn.Module):
             atom_config=atom_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+        mark_prefused_qkv(self.model, self.config)
 
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -515,26 +570,6 @@ class MiMoV2ForCausalLM(nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-
-    def load_fused_qkv_hook(
-        self, name, loaded_weight, params_dict, executor, loaded_weights_record, prefix
-    ):
-        """Handle fused qkv_proj checkpoint weights (Mimo-V2.5-Pro format).
-
-        Pro checkpoints store a single qkv_proj weight in TP-interleaved
-        layout.  Chunk by TP rank and copy directly, bypassing the
-        packed_modules_mapping split logic.  For Flash checkpoints the
-        weight names are q_proj/k_proj/v_proj so this hook never fires.
-        """
-        if "qkv_proj" in name and name in params_dict:
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
-            param = params_dict[name]
-            weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-            executor.submit(param.weight_loader_process, param.data, weight)
-            loaded_weights_record.add(prefix + name)
-            return True
-        return False
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
