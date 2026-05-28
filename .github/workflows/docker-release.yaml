@@ -68,6 +68,9 @@ on:
       custom_tag:
         description: "Custom tag for the native Docker image (e.g. 'my-feature'). Produces rocm/atom-dev:<custom_tag>. When set, branch-based tagging and 'latest' update are skipped."
         default: ""
+      sglang_tag_suffix:
+        description: "Optional suffix appended to the SGLang nightly tag for manual runs. Example: custom -> rocm/atom-dev:sglang-v<version>-nightly_<date>-custom. When set, sglang-latest is not updated."
+        default: ""
       only_release_sglang:
         description: "Release the SGLang+ATOM image (skips native image test/push). If both this and OOT are checked, both will be released."
         type: boolean
@@ -122,6 +125,7 @@ jobs:
           echo "SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}"
           echo "SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}"
           echo "SGLANG_VERSION: ${{ inputs.sglang_version || env.SGLANG_VERSION }}"
+          echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
 
       - name: Build Docker image
         timeout-minutes: 180
@@ -284,13 +288,26 @@ jobs:
       - name: Push SGLang+ATOM Docker image
         if: ${{ success() && (inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true))) }}
         run: |
+          set -euo pipefail
           SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
+          SGLANG_TAG_SUFFIX="${{ inputs.sglang_tag_suffix || '' }}"
           SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"
           SGLANG_LATEST_TAG="sglang-latest"
+          if [ -n "${SGLANG_TAG_SUFFIX}" ]; then
+            if [[ ! "${SGLANG_TAG_SUFFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "Invalid sglang_tag_suffix '${SGLANG_TAG_SUFFIX}'. Allowed characters: letters, numbers, '.', '_' and '-'."
+              exit 1
+            fi
+            SGLANG_TAG="${SGLANG_TAG}-${SGLANG_TAG_SUFFIX}"
+          fi
           docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_TAG}
           docker push rocm/atom-dev:${SGLANG_TAG}
-          docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
-          docker push rocm/atom-dev:${SGLANG_LATEST_TAG}
+          if [ -z "${SGLANG_TAG_SUFFIX}" ]; then
+            docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
+            docker push rocm/atom-dev:${SGLANG_LATEST_TAG}
+          else
+            echo "Custom SGLang tag suffix '${SGLANG_TAG_SUFFIX}' provided; skipping rocm/atom-dev:${SGLANG_LATEST_TAG} update."
+          fi
 
       - name: Clean Up
         if: always()

@@ -306,9 +306,9 @@ RUN pip install --upgrade setuptools_scm
 RUN echo "========== [Parallel] Building Aiter ==========" && \
     git clone $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
-    pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \
     git submodule sync && git submodule update --init --recursive && \
+    pip install -r requirements.txt && \
     MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
     GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 
