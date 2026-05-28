@@ -202,7 +202,9 @@ def gemm_a8w8_blockscale_preshuffle_impl(
             x, weight_shuffled, x_scale, w_scale, dtype
         )
     else:
-        y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, zero_bias_buf, dtype=dtype)
+        y = gemm_a8w8_blockscale_bpreshuffle(
+            x, weight, x_scale, w_scale, dtype=dtype, zero_bias_buf=zero_bias_buf
+        )
     return y
 
 
@@ -295,10 +297,13 @@ class LinearBase(nn.Module):
                         dtype=dtypes.fp32,
                     )
                 )
-                self.zero_bias_buf = None
-                if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE and gemm_a8w8_blockscale_bpreshuffle_triton is None:
-                    self.zero_bias_buf = atom_parameter(
-                        torch.zeros(self.output_size, dtype=dtypes.fp32)
+                self.register_buffer("zero_bias_buf", None, persistent=False)
+                if (
+                    envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+                    and gemm_a8w8_blockscale_bpreshuffle_triton is None
+                ):
+                    self.zero_bias_buf = torch.zeros(
+                        self.output_size, dtype=dtypes.fp32
                     )
             elif quant_type == QuantType.per_1x32:
                 self.weight_scale = atom_parameter(
