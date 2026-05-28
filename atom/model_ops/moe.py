@@ -1021,37 +1021,51 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if needs_custom_routing:
                 # Use ATOM's full-featured select_experts for routing,
                 # then triton matmul_ogs for the actual MoE computation.
-                topk_weights, topk_ids = FusedMoE.select_experts(
-                    hidden_states=x,
-                    router_logits=router_logits,
-                    use_grouped_topk=use_grouped_topk,
-                    top_k=top_k,
-                    renormalize=renormalize,
-                    topk_group=topk_group,
-                    num_expert_group=num_expert_group,
-                    custom_routing_function=custom_routing_function,
-                    scoring_func=scoring_func,
-                    e_score_correction_bias=e_score_correction_bias,
-                    num_fused_shared_experts=layer.num_fused_shared_experts,
-                    routed_scaling_factor=layer.routed_scaling_factor,
-                )
-                n_expts_act = topk_weights.shape[1]
+                # topk_weights, topk_ids = FusedMoE.select_experts(
+                #     hidden_states=x,
+                #     router_logits=router_logits,
+                #     use_grouped_topk=use_grouped_topk,
+                #     top_k=top_k,
+                #     renormalize=renormalize,
+                #     topk_group=topk_group,
+                #     num_expert_group=num_expert_group,
+                #     custom_routing_function=custom_routing_function,
+                #     scoring_func=scoring_func,
+                #     e_score_correction_bias=e_score_correction_bias,
+                #     num_fused_shared_experts=layer.num_fused_shared_experts,
+                #     routed_scaling_factor=layer.routed_scaling_factor,
+                # )
+
+                # custom routing
+                n_expts_act = top_k#_weights.shape[1]
 
                 # Convert to triton routing data structures
                 n_expts_tot = router_logits.shape[-1]
-                logger.warning("n expts tot")
-                logger.warning(n_expts_tot)
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
-                    logger.warning(n_expts_tot)
-                logger.warning("num fused shared experts")
                 
-                logger.warning(layer.num_fused_shared_experts)
                 n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
-                routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
-                    topk_weights, topk_ids, n_expts_tot
+                from aiter.ops.triton.moe.moe_routing.routing import (
+                    routing_a8w4,
                 )
+
+                block_m = 64 if m >= 256 else 16
+
+                routing_data, gather_idx, scatter_idx = routing_a8w4(
+                    router_logits,
+                    n_expts_act=top_k,
+                    block_m=block_m,
+                    score_mode="sqrtsoftplus",
+                    bias=e_score_correction_bias,
+                    renorm=renormalize,
+                    routed_scaling_factor=layer.routed_scaling_factor,
+                )
+
+               
+                # routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
+                #     topk_weights, topk_ids, n_expts_tot
+                # )
                 x_q_dtype = self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None
 
                 output = torch.empty_like(x)
