@@ -25,7 +25,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -62,7 +62,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -99,7 +99,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -136,7 +136,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -173,7 +173,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -210,7 +210,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -247,7 +247,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -284,7 +284,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -520,7 +520,7 @@ jobs:
               },
               {
                   "toggle_env": "RUN_LLAMA405_FP8_TP8",
-                  "model_name": "Meta-Llama-3.1-405B-Instruct-FP8/ TP8",
+                  "model_name": "Meta-Llama-3.1-405B-Instruct-FP8 TP8",
                   "model_path": "Meta-Llama-3.1-405B-Instruct-FP8/",
                   "extra_args": "--tensor-parallel-size 8 --load-format safetensors --allow-deprecated-quantization",
                   "accuracy_test_threshold": 0.93,
@@ -1453,25 +1453,6 @@ jobs:
             echo "Using model id: ${{ matrix.model_path }}"
           fi
 
-      - name: Prepare OOT artifact names
-        id: artifact-names
-        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
-        env:
-          OOT_MODEL_NAME: ${{ matrix.model_name }}
-        run: |
-          safe_model_name=$(python3 - <<'PY'
-          import os
-          import re
-
-          name = os.environ["OOT_MODEL_NAME"]
-          safe = re.sub(r'["*:<>?\\|/\r\n]+', '_', name).strip()
-          safe = re.sub(r'\s+', ' ', safe)
-          print(safe or 'model')
-          PY
-          )
-          echo "safe_model_name=${safe_model_name}" >> "$GITHUB_OUTPUT"
-          echo "OOT_SAFE_MODEL_NAME=${safe_model_name}" >> "$GITHUB_ENV"
-
       - name: Start OOT accuracy server
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         timeout-minutes: 10
@@ -1625,7 +1606,7 @@ jobs:
         if: ${{ always() && steps.validation-window.outputs.should_run == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: oot-validation-${{ steps.artifact-names.outputs.safe_model_name }}-${{ github.run_id }}
+          name: oot-validation-${{ matrix.model_name }}-${{ github.run_id }}
           path: |
             vllm_oot.log
             oot_accuracy_client.log
@@ -1640,7 +1621,7 @@ jobs:
         if: ${{ always() && steps.validation-window.outputs.should_run == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
         uses: actions/upload-artifact@v7
         with:
-          name: accuracy-${{ steps.artifact-names.outputs.safe_model_name }}
+          name: accuracy-${{ matrix.model_name }}
           path: oot_accuracy_results/*.json
           if-no-files-found: ignore
 
