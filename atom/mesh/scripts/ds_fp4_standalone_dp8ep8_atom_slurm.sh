@@ -25,10 +25,10 @@ set -euo pipefail
 
 # ======================== configuration ========================
 MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:sglang-v0.5.10-nightly_20260528-mesh-sglang}"
 CONTAINER="${CONTAINER:-atom_atom_standalone_dp8ep8_${SLURM_JOB_ID}}"
 
-TP="${TP:-8}"
+TP="${TP:-1}"
 DP="${DP:-8}"
 EP="${EP:-8}"
 PORT="${PORT:-8000}"
@@ -107,7 +107,8 @@ LOG_ROOT : ${LOG_ROOT}
 INFO
 
 # ======================== generate in-container scripts ========================
-GPU_IDS=$(seq -s, 0 $((TP - 1)))
+NUM_GPUS=$((TP * DP))
+GPU_IDS=$(seq -s, 0 $((NUM_GPUS - 1)))
 
 cat > "${LOG_ROOT}/scripts/server.sh" <<'SERVER_EOF'
 #!/usr/bin/env bash
