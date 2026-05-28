@@ -953,15 +953,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
                 n_expts_act = topk_weights.shape[1]
 
-                # EP remapping: convert global expert IDs to local expert
-                # IDs so triton routing indices stay within the local weight
-                # tensors (which only hold local_num_experts entries).
-                if expert_map is not None:
-                    local_ids = expert_map[topk_ids.long()]
-                    invalid = local_ids < 0
-                    topk_weights = topk_weights.masked_fill(invalid, 0.0)
-                    topk_ids = local_ids.masked_fill(invalid, 0).to(torch.int32)
-
                 # Convert to triton routing data structures
                 if expert_map is not None:
                     # local_num_experts already includes fused shared experts
@@ -974,7 +965,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
                 routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
-                    topk_weights, topk_ids, n_expts_tot
+                    topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
                 )
 
                 output = torch.empty_like(x)
