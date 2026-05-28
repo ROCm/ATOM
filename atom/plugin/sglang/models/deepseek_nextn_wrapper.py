@@ -24,8 +24,11 @@ from atom.plugin.sglang.attention_backend.sgl_attention_mla import (
 )
 from atom.plugin.sglang.models.base_model_wrapper import (
     _current_forward_batch,
+    _is_dummy_forward,
+    _materialize_atom_dummy_forward,
     _reset_sglang_forward_context,
     _set_sglang_forward_context,
+    _trim_hidden_states_for_output,
     plugin_runtime_scope,
 )
 
@@ -42,6 +45,15 @@ def _replace_weight(module: nn.Module, attr_name: str, weight) -> None:
     if hasattr(module, attr_name):
         delattr(module, attr_name)
     setattr(module, attr_name, weight)
+
+
+def _materialize_dummy_hidden_states(
+    hidden_states: torch.Tensor,
+    *,
+    length: int,
+) -> torch.Tensor:
+    shape = (length, *hidden_states.shape[1:])
+    return hidden_states.new_zeros(shape)
 
 
 def _set_runtime_layer_id(layer_module: nn.Module, layer_id: int) -> None:
@@ -159,20 +171,54 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             raise ValueError("DeepSeek MTP draft forward requires speculative info")
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
-            token = _current_forward_batch.set(forward_batch)
+            if _is_dummy_forward(forward_batch):
+                (
+                    model_input_ids,
+                    model_positions,
+                    model_input_embeds,
+                    model_forward_batch,
+                ) = _materialize_atom_dummy_forward(
+                    input_ids,
+                    positions,
+                    input_embeds,
+                    forward_batch,
+                )
+                model_hidden_states = _materialize_dummy_hidden_states(
+                    forward_batch.spec_info.hidden_states,
+                    length=int(model_positions.shape[0]),
+                )
+            else:
+                (
+                    model_input_ids,
+                    model_positions,
+                    model_input_embeds,
+                    model_forward_batch,
+                ) = (
+                    input_ids,
+                    positions,
+                    input_embeds,
+                    forward_batch,
+                )
+                model_hidden_states = forward_batch.spec_info.hidden_states
+
+            token = _current_forward_batch.set(model_forward_batch)
             try:
-                _set_sglang_forward_context(self.atom_config, forward_batch, positions)
+                _set_sglang_forward_context(
+                    self.atom_config, model_forward_batch, model_positions
+                )
                 hidden_states = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    hidden_states=forward_batch.spec_info.hidden_states,
-                    inputs_embeds=input_embeds,
+                    input_ids=model_input_ids,
+                    positions=model_positions,
+                    hidden_states=model_hidden_states,
+                    inputs_embeds=model_input_embeds,
                 )
             finally:
                 _reset_sglang_forward_context()
                 _current_forward_batch.reset(token)
 
             if self.pp_group.is_last_rank:
+                if _is_dummy_forward(forward_batch):
+                    hidden_states = _trim_hidden_states_for_output(hidden_states, 0)
                 return self.logits_processor(
                     input_ids,
                     hidden_states,
