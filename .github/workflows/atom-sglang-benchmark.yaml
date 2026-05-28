@@ -645,12 +645,14 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
           RUN pip install "vcs-versioning>=1"
+          RUN python3 -c "import importlib.metadata as md, shutil, sysconfig; from pathlib import Path; roots={Path(sysconfig.get_paths()[k]).resolve() for k in ('purelib', 'platlib')}; [(print(f'Removing invalid package metadata: {p}'), shutil.rmtree(p, ignore_errors=True)) for d in md.distributions() for p in [Path(d._path).resolve()] if not d.metadata.get('Name') and any(root == p or root in p.parents for root in roots)]"
           RUN rm -rf /app/aiter-test
-          RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-test && \\
+          RUN git clone --depth 1 --branch main https://github.com/ROCm/aiter.git /app/aiter-test && \\
               cd /app/aiter-test && \\
-              git checkout HEAD && \\
+              git fetch --depth 1 origin 5bb904efb9f9ce832f9812a3e37191f5611dd78d && \\
+              git checkout 5bb904efb9f9ce832f9812a3e37191f5611dd78d && \\
               git submodule sync && git submodule update --init --recursive && \\
-              AITER_USE_SYSTEM_TRITON=1 MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
           RUN pip uninstall -y atom || true
