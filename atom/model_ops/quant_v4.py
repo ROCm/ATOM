@@ -228,6 +228,51 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Packed-UE8M0 helpers (DeepGEMM SM100 ABI, used by aiter fp8_einsum kernel).
+#
+# The flydsl fp8_einsum kernel consumes its block scales as INT32 tensors
+# where each i32 holds 4 consecutive UE8M0 bytes (little-endian) along the
+# K-axis. These helpers mirror those in op_tests/test_fp8_einsum.py so the
+# V4 weight-loading hook and the parity test can share one implementation.
+# ---------------------------------------------------------------------------
+
+
+def fp32_to_ue8m0_byte(scale_f32: torch.Tensor) -> torch.Tensor:
+    """fp32 scale → UE8M0 biased-exp byte (round-up to next power of 2).
+
+    Byte ``b`` represents ``2 ** (b - 127)``. Clamped to ``[0, 254]``.
+    Returns int32 (one byte per element, zero-extended).
+    """
+    s = scale_f32.clamp_min(2.0**-126).float()
+    m, e = torch.frexp(s)
+    e = e.to(torch.int32)
+    is_pow2 = m == 0.5
+    byte = torch.where(is_pow2, e - 1 + 127, e + 127)
+    return byte.clamp(0, 254).to(torch.int32)
+
+
+def pack_ue8m0_bytes_to_i32(bytes_along_k: torch.Tensor) -> torch.Tensor:
+    """Pack 4 UE8M0 bytes along the last dim into one little-endian i32.
+
+    Input shape ``... × (4N)`` → output shape ``... × N``. Input must be
+    int32 (one byte per element, low 8 bits used).
+    """
+    *lead, nk = bytes_along_k.shape
+    assert nk % 4 == 0, f"trailing dim {nk} must be divisible by 4"
+    b = bytes_along_k.to(torch.int32).reshape(*lead, nk // 4, 4)
+    return (
+        (
+            (b[..., 0] & 0xFF)
+            | ((b[..., 1] & 0xFF) << 8)
+            | ((b[..., 2] & 0xFF) << 16)
+            | ((b[..., 3] & 0xFF) << 24)
+        )
+        .contiguous()
+        .to(torch.int32)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Self-test (run as `python -m atom.model_ops.quant_v4`)
 # ---------------------------------------------------------------------------
 
