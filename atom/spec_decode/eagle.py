@@ -428,7 +428,14 @@ class EagleProposer:
                             kv_indptr[1 : bs + 1] -= torch.cumsum(
                                 num_reject_tokens, dim=0
                             )
-                        positions = torch.gather(positions, 0, last_token_indices)
+                        # Index along the last dim so this works for both
+                        # 1D text positions [num_tokens] and 2D mrope
+                        # positions [3, num_tokens] (Qwen3.5 sets
+                        # `mrope_section` in `rope_parameters`, which flips
+                        # `use_mrope=True` and makes context.positions 2D).
+                        # `torch.gather` requires input.ndim == index.ndim
+                        # and crashes on the 2D case during MTP warmup.
+                        positions = positions[..., last_token_indices]
                         context.is_prefill = False
 
                     # update metadata
