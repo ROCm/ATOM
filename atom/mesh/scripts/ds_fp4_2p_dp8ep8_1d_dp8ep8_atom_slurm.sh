@@ -14,9 +14,9 @@
 #SBATCH --error=/it-share/yajizhan/slurm_logs/ds_fp4_atom_2p_dp8ep8_1d_dp8ep8-%j.err
 #
 # 2P+1D PD-disaggregated benchmark for ATOM native server + atom-mesh router.
-#   prefill0: ATOM kv_producer, TP=8, DP=8, EP=8 (1 node)
-#   prefill1: ATOM kv_producer, TP=8, DP=8, EP=8 (1 node)
-#   decode:   ATOM kv_consumer, TP=8, DP=8, EP=8 (1 node)
+#   prefill0: ATOM kv_producer, TP=1, DP=8, EP=8 (1 node)
+#   prefill1: ATOM kv_producer, TP=1, DP=8, EP=8 (1 node)
+#   decode:   ATOM kv_consumer, TP=1, DP=8, EP=8 (1 node)
 #   router:   atom-mesh launch --backend atom (no bootstrap port)
 #   KV transfer: Mooncake RDMA (atom/kv_transfer/disaggregation/mooncake)
 #
@@ -33,11 +33,11 @@ set -euo pipefail
 
 # ======================== configuration ========================
 MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:sglang-v0.5.10-nightly_20260528-mesh-sglang}"
 CONTAINER="${CONTAINER:-atom_atom_mesh_${SLURM_JOB_ID}}"
 
-PREFILL_TP="${PREFILL_TP:-8}"
-DECODE_TP="${DECODE_TP:-8}"
+PREFILL_TP="${PREFILL_TP:-1}"
+DECODE_TP="${DECODE_TP:-1}"
 PREFILL_DP="${PREFILL_DP:-8}"
 DECODE_DP="${DECODE_DP:-8}"
 PREFILL_EP="${PREFILL_EP:-8}"
@@ -52,7 +52,10 @@ PREFILL_MEM_FRACTION="${PREFILL_MEM_FRACTION:-0.80}"
 DECODE_MEM_FRACTION="${DECODE_MEM_FRACTION:-0.85}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
+PREFILL_MAX_NUM_SEQS="${PREFILL_MAX_NUM_SEQS:-4096}"
+DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-4096}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
+MESH_BIN="${MESH_BIN:-/usr/local/bin/atom-mesh}"
 
 MORI_DISPATCH_DTYPE="${MORI_DISPATCH_DTYPE:-bf16}"
 MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-16384}"
@@ -136,8 +139,10 @@ LOG_ROOT: ${LOG_ROOT}
 INFO
 
 # ======================== generate in-container scripts ========================
-PREFILL_GPU_IDS=$(seq -s, 0 $((PREFILL_TP - 1)))
-DECODE_GPU_IDS=$(seq -s, 0 $((DECODE_TP - 1)))
+PREFILL_NUM_GPUS=$((PREFILL_TP * PREFILL_DP))
+PREFILL_GPU_IDS=$(seq -s, 0 $((PREFILL_NUM_GPUS - 1)))
+DECODE_NUM_GPUS=$((DECODE_TP * DECODE_DP))
+DECODE_GPU_IDS=$(seq -s, 0 $((DECODE_NUM_GPUS - 1)))
 
 for idx in 0 1; do
     eval "P_IP=\${PREFILL${idx}_IP}"
@@ -166,8 +171,13 @@ python3 -m atom.entrypoints.openai_server \\
     --host 0.0.0.0 --server-port "${P_PORT}" \\
     --trust-remote-code \\
     -tp "${PREFILL_TP}" \\
+    -dp "${PREFILL_DP}" \\
+    --enable-expert-parallel \\
+    --enable-dp-attention \\
     --kv_cache_dtype "${KV_CACHE_DTYPE}" \\
     --block-size "${BLOCK_SIZE}" \\
+    --gpu-memory-utilization "${PREFILL_MEM_FRACTION}" \\
+    --max-num-seqs "${PREFILL_MAX_NUM_SEQS}" \\
     --kv-transfer-config "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${P_IP}\",\"handshake_port\":${HANDSHAKE_PORT}}" \\
     ${EXTRA_SERVER_ARGS} \\
     2>&1 | tee /workspace/logs/prefill.log
@@ -198,8 +208,13 @@ python3 -m atom.entrypoints.openai_server \\
     --host 0.0.0.0 --server-port "${DECODE_PORT}" \\
     --trust-remote-code \\
     -tp "${DECODE_TP}" \\
+    -dp "${DECODE_DP}" \\
+    --enable-expert-parallel \\
+    --enable-dp-attention \\
     --kv_cache_dtype "${KV_CACHE_DTYPE}" \\
     --block-size "${BLOCK_SIZE}" \\
+    --gpu-memory-utilization "${DECODE_MEM_FRACTION}" \\
+    --max-num-seqs "${DECODE_MAX_NUM_SEQS}" \\
     --kv-transfer-config "{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${DECODE_IP}\",\"handshake_port\":${HANDSHAKE_PORT}}" \\
     ${EXTRA_SERVER_ARGS} \\
     2>&1 | tee /workspace/logs/decode.log
@@ -212,7 +227,7 @@ set -euo pipefail
 echo "[router] prefill0=http://${PREFILL0_IP}:${PREFILL0_PORT} prefill1=http://${PREFILL1_IP}:${PREFILL1_PORT} decode=http://${DECODE_IP}:${DECODE_PORT} router=0.0.0.0:${ROUTER_PORT}"
 mkdir -p /workspace/logs
 
-\${MESH_BIN} launch \\
+${MESH_BIN} launch \\
     --host 0.0.0.0 --port "${ROUTER_PORT}" \\
     --pd-disaggregation \\
     --prefill "http://${PREFILL0_IP}:${PREFILL0_PORT}" \\
