@@ -50,8 +50,6 @@ def _fused_merge_recompute_kernel(
         bos = i_b * T
         T_seq = T
 
-    o_16 = tl.arange(0, 16)
-
     Ai16_base = Ai16_ptr + (bos * H + i_h) * 16
     p_Ai11 = tl.make_block_ptr(
         Ai16_base, (T_seq, 16), (H * 16, 1), (i_t * 64, 0), (16, 16), (1, 0)
