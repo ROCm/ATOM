@@ -230,6 +230,7 @@ class BlockManager:
         if start >= end:
             return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+        record = self._event_log is not None
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
@@ -239,10 +240,10 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
-            if self._event_log is not None:
+            if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
-        if store_run_hashes and self._event_log is not None:
+        if record and store_run_hashes:
             self._event_log.append(
                 _make_block_stored(
                     store_run_hashes,

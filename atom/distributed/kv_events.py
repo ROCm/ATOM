@@ -6,6 +6,7 @@ plus ATOM extensions (`BlockTransferred`, CPU/DISK/REMOTE medium constants)."""
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -14,6 +15,8 @@ from collections.abc import Iterable
 from typing import Any, Final
 
 import msgspec
+
+logger = logging.getLogger("atom")
 
 # Where a block lives.
 MEDIUM_GPU: Final[str] = "GPU"
@@ -191,9 +194,17 @@ class ZmqEventPublisher(EventPublisher):
         try:
             payload = self._encoder.encode(batch)
         except Exception:
-            # Surface via stats.encode_errors instead of swallowing silently.
+            # Surface via stats.encode_errors. Log the first occurrence with
+            # traceback so the root cause is discoverable; further failures are
+            # tracked via the counter only to avoid log spam.
             with self._lock:
+                first_failure = self._encode_errors == 0
                 self._encode_errors += 1
+            if first_failure:
+                logger.exception(
+                    "KV event encode failed; subsequent failures will be "
+                    "tracked via stats['encode_errors']"
+                )
             return
 
         # Non-blocking enqueue; drop oldest on overflow.
@@ -218,6 +229,8 @@ class ZmqEventPublisher(EventPublisher):
             except queue.Full:
                 try:
                     self._queue.get_nowait()
+                    with self._lock:
+                        self._drops += 1
                 except queue.Empty:
                     pass
         self._sender.join(timeout=2.0)
