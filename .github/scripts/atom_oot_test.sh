@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Usage:
 #   .github/scripts/atom_oot_test.sh launch <mode> [model_name]
+#   .github/scripts/atom_oot_test.sh client <mode> [model_name]
 #   .github/scripts/atom_oot_test.sh accuracy <mode> [model_name]
 #
 # Alternatively, pass a single model explicitly through environment variables:
@@ -13,7 +14,8 @@ set -euo pipefail
 #
 # TYPE:
 #   launch   - launch vLLM server and wait until ready
-#   accuracy - run gsm8k accuracy test and save result JSON
+#   client   - run gsm8k accuracy against an existing server
+#   accuracy - launch server, run gsm8k accuracy, and save result JSON
 #
 # MODE:
 #   ci    - workflow-provided OOT CI model entry
@@ -26,8 +28,8 @@ TYPE=${1:-launch}
 MODE=${2:-ci}
 SELECTED_MODEL=${3:-}
 
-if [[ "$TYPE" != "launch" && "$TYPE" != "accuracy" ]]; then
-  echo "Invalid TYPE: $TYPE. Expected: launch or accuracy"
+if [[ "$TYPE" != "launch" && "$TYPE" != "client" && "$TYPE" != "accuracy" ]]; then
+  echo "Invalid TYPE: $TYPE. Expected: launch, client, or accuracy"
   exit 2
 fi
 
@@ -401,6 +403,11 @@ run_for_models() {
       break
     fi
 
+    if [[ "${action}" == "client" ]]; then
+      accuracy_one_model "${model_name}" "${model_path}" "${extra_args}" "${client_command}"
+      break
+    fi
+
     # accuracy mode: launch + evaluate each selected model, then stop server.
     launch_one_model "${model_name}" "${model_path}" "${extra_args}"
     accuracy_one_model "${model_name}" "${model_path}" "${extra_args}" "${client_command}"
@@ -425,6 +432,8 @@ trap 'cleanup_on_exit' EXIT
 
 if [[ "${TYPE}" == "launch" ]]; then
   run_for_models "launch"
+elif [[ "${TYPE}" == "client" ]]; then
+  run_for_models "client"
 else
   run_for_models "accuracy"
 fi
