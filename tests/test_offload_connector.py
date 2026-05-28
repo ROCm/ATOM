@@ -5,6 +5,10 @@
 # environment mocks torch.cuda.
 
 import os
+import importlib.util
+import sys
+import types
+from collections import deque
 
 import pytest
 
@@ -24,7 +28,10 @@ from atom.kv_transfer.offload.lmcache.lmcache_connector import (
     LMCacheOffloadConnector,
     LMCacheOffloadConnectorScheduler,
 )
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.sequence import SequenceStatus
 from conftest import MockConfig
 
 _OFFLOAD_CFG = MockConfig(
@@ -36,6 +43,25 @@ _OFFLOAD_CFG = MockConfig(
     tensor_parallel_size=1,
     enable_prefix_caching=True,
 )
+
+
+@pytest.fixture(autouse=True)
+def stub_lmcache_and_torch(monkeypatch):
+    """Keep offload unit tests independent of optional GPU/runtime deps."""
+    if importlib.util.find_spec("lmcache") is None:
+        fake_lmcache = types.SimpleNamespace(
+            c_ops=object(), _backend_module="lmcache.c_ops"
+        )
+        monkeypatch.setitem(sys.modules, "lmcache", fake_lmcache)
+
+    if importlib.util.find_spec("torch") is None:
+        fake_torch = types.SimpleNamespace(
+            uint8=object(),
+            empty=lambda num_bytes, dtype, pin_memory: types.SimpleNamespace(
+                data_ptr=lambda: 0
+            ),
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
 
 # ── Factory wiring ────────────────────────────────────────────────────────
@@ -91,11 +117,126 @@ class TestSchedulerSaveQueue:
         assert meta2 is None  # drained
 
 
+class TestSchedulerOffloadBlockLifetime:
+    def test_finished_seq_with_pending_offload_save_defers_block_free(self, seq_factory):
+        scheduler = _scheduler_with_offload_connector()
+        seq = _seq_with_prompt(seq_factory, [10, 11, 12, 13, 14, 15, 16, 17])
+        scheduler.block_manager.allocate(seq)
+        seq.status = SequenceStatus.RUNNING
+        scheduler.running.append(seq)
+
+        fwd_output = ScheduledBatchOutput(
+            req_ids=[seq.id],
+            token_ids=[(scheduler.eos_token_id,)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        )
+
+        finished = scheduler.postprocess([seq], fwd_output)
+
+        assert finished == [seq]
+        assert str(seq.id) in scheduler.offload_pending_save_req_ids
+        assert str(seq.id) in scheduler.deferred_free_blocks
+        assert seq.block_table
+
+    def test_offload_save_completion_releases_deferred_blocks(self, seq_factory):
+        scheduler = _scheduler_with_offload_connector()
+        seq = _seq_with_prompt(seq_factory, [10, 11, 12, 13, 14, 15, 16, 17])
+        scheduler.block_manager.allocate(seq)
+        seq.status = SequenceStatus.RUNNING
+        scheduler.running.append(seq)
+
+        fwd_output = ScheduledBatchOutput(
+            req_ids=[seq.id],
+            token_ids=[(scheduler.eos_token_id,)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        )
+        scheduler.postprocess([seq], fwd_output)
+
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={str(seq.id)})
+        )
+
+        assert str(seq.id) not in scheduler.offload_pending_save_req_ids
+        assert seq.id not in scheduler.deferred_free_blocks
+        assert seq.block_table == []
+
+    def test_finished_seq_without_offload_save_frees_immediately(self, seq_factory):
+        scheduler = _scheduler_with_offload_connector()
+        seq = _seq_with_prompt(seq_factory, [10, 11, 12])
+        scheduler.block_manager.allocate(seq)
+        seq.status = SequenceStatus.RUNNING
+        scheduler.running.append(seq)
+
+        fwd_output = ScheduledBatchOutput(
+            req_ids=[seq.id],
+            token_ids=[(scheduler.eos_token_id,)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        )
+
+        scheduler.postprocess([seq], fwd_output)
+
+        assert str(seq.id) not in scheduler.offload_pending_save_req_ids
+        assert seq.id not in scheduler.deferred_free_blocks
+        assert seq.block_table == []
+
+    def test_offload_save_completion_before_finish_allows_immediate_free(
+        self, seq_factory
+    ):
+        scheduler = _scheduler_with_offload_connector()
+        seq = _seq_with_prompt(seq_factory, [10, 11, 12, 13, 14, 15, 16, 17])
+        scheduler.block_manager.allocate(seq)
+        scheduler.kv_connector.queue_save(str(seq.id), [(seq.block_table[0], 0xAAA)])
+        scheduler.offload_pending_save_req_ids.add(str(seq.id))
+
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={str(seq.id)})
+        )
+
+        seq.prefix_hashes_published = True
+        seq.status = SequenceStatus.RUNNING
+        scheduler.running.append(seq)
+        fwd_output = ScheduledBatchOutput(
+            req_ids=[seq.id],
+            token_ids=[(scheduler.eos_token_id,)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        )
+        scheduler.postprocess([seq], fwd_output)
+
+        assert str(seq.id) not in scheduler.offload_pending_save_req_ids
+        assert seq.id not in scheduler.deferred_free_blocks
+        assert seq.block_table == []
+
+
 # ── Scheduler-side: lookup + admission path ───────────────────────────────
 
 
 def _seq_with_prompt(seq_factory, token_ids, block_size=4):
     return seq_factory(token_ids, block_size=block_size)
+
+
+def _scheduler_with_offload_connector():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_manager = BlockManager(_OFFLOAD_CFG)
+    scheduler.running = deque()
+    scheduler.eos_token_id = _OFFLOAD_CFG.eos_token_id
+    scheduler.stop_token_ids = _OFFLOAD_CFG.stop_token_ids
+    scheduler.use_spec = False
+    scheduler.mtp_k = 0
+    scheduler.spec_stats = None
+    scheduler.deferred_free_blocks = {}
+    scheduler.offload_pending_save_req_ids = set()
+    scheduler.finished_recving_kv_req_ids = []
+    scheduler.kv_connector = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+    scheduler.kv_connector.bind_block_manager(scheduler.block_manager)
+    return scheduler
 
 
 class TestSchedulerLookup:
@@ -264,3 +405,70 @@ class TestWorkerPool:
         w.start_load_kv(OffloadConnectorMetadata())
         done_save, done_load = w.get_finished()
         assert done_save == set() and done_load == set()
+
+    def test_register_kv_caches_mla_uses_block_bytes(self, monkeypatch):
+        """MLA k_cache is token-major: [num_blocks * block_size, 1, 576].
+
+        Offload slots must copy one logical paged block, not one token row.
+        """
+
+        class FakeTensor:
+            is_cuda = True
+
+            def __init__(
+                self,
+                shape=(8, 1, 576),
+                stride=(576, 576, 1),
+                element_size=2,
+            ):
+                self.shape = shape
+                self._stride = stride
+                self._element_size = element_size
+                self.device = "cuda:0"
+
+            def is_contiguous(self):
+                return True
+
+            def numel(self):
+                n = 1
+                for dim in self.shape:
+                    n *= dim
+                return n
+
+            def element_size(self):
+                return self._element_size
+
+            def stride(self, dim):
+                return self._stride[dim]
+
+            def view(self, *args):
+                return self
+
+            def data_ptr(self):
+                return 0xCAFE
+
+        class FakeKV:
+            k_cache = FakeTensor()
+            v_cache = None
+
+        class FakeCPUPool(FakeTensor):
+            def __init__(self, num_bytes):
+                super().__init__(shape=(num_bytes,), stride=(1,), element_size=1)
+
+        fake_torch = types.SimpleNamespace(
+            uint8=object(),
+            empty=lambda num_bytes, dtype, pin_memory: FakeCPUPool(num_bytes),
+        )
+        fake_lmcache = types.SimpleNamespace(
+            c_ops=object(), _backend_module="lmcache.c_ops"
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "lmcache", fake_lmcache)
+
+        w = LMCacheOffloadConnector(_OFFLOAD_CFG)
+        w.register_kv_caches({"layer0": FakeKV()})
+
+        # block_size=4, row bytes=576 * bf16(2) => one MLA block is 4608 bytes.
+        assert w._k_bytes_per_layer == [4 * 576 * 2]
+        assert w._v_bytes_per_layer == [0]
+        assert w.bytes_per_block == 4 * 576 * 2

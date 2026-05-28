@@ -56,9 +56,8 @@ overhead with no return. Keep it off in that regime.
 │  _update_from_kv_xfer_finished(out):◄─────┘    │
 │   ├─ finished_recving → WAITING_FOR_REMOTE_KVS │
 │   │   transitions back to WAITING              │
-│   └─ finished_sending → informational (no      │
-│       deferred-free; D2H is independent of     │
-│       the GPU block's lifetime)                │
+│   └─ finished_sending → clear pending save     │
+│       and release deferred GPU blocks          │
 └────────────────┬───────────────────────────────┘
                  │ ScheduledBatch.connector_meta_output
                  ▼
@@ -256,6 +255,37 @@ copy stream with the next-step compute stream via `wait_stream` —
 the only thing missing is intra-step overlap with the same forward's
 attention layers.
 
+## Save completion and block lifetime
+
+OFFLOAD saves are asynchronous D2H copies, so the scheduler must not
+return a finished request's GPU KV blocks to `BlockManager` until the
+worker has confirmed the save completed.
+
+The completion signal is a CUDA event recorded by the worker-side
+connector after all K/V block bytes for a request have been enqueued:
+
+1. `LMCacheOffloadConnector.start_load_kv()` issues `dst.copy_(src,
+   non_blocking=True)` on the dedicated copy stream.
+2. It records `torch.cuda.Event()` on that same stream and stores
+   `(req_id, "save", event)` in `_pending`.
+3. Each engine step calls `ModelRunner.async_proc_aggregation()`, which
+   calls `connector.get_finished()`.
+4. `get_finished()` polls each event with `evt.query()`. If the event
+   has completed and `kind == "save"`, the request id is returned in
+   `done_save`.
+5. `ModelRunner.async_proc_aggregation()` maps `done_save` to
+   `KVConnectorOutput.finished_sending`.
+6. `EngineCore` forwards that output to
+   `Scheduler._update_from_kv_xfer_finished()`.
+7. For `KVConnectorRole.OFFLOAD`, the scheduler removes the request id
+   from `offload_pending_save_req_ids`; if the finished sequence was
+   waiting in `deferred_free_blocks`, it finally calls
+   `block_manager.deallocate(seq)`.
+
+This matches the same lifetime invariant vLLM relies on: a paged GPU KV
+block may be reused only after the connector has either finished saving
+it or otherwise holds an extra reference preventing allocator reuse.
+
 ## Files
 
 | Path                                                       | What                                                |
@@ -267,10 +297,10 @@ attention layers.
 | `atom/kv_transfer/offload/lmcache/lmcache_connector.py`    | Concrete `LMCacheOffloadConnector` (worker + scheduler) |
 | `atom/kv_transfer/offload/README.md`                       | Module-local overview (this guide is the user-facing one) |
 | `atom/model_engine/block_manager.py`                       | `hash_blocks` returns the published `(bid, h)` list |
-| `atom/model_engine/scheduler.py`                           | Role-aware dispatch helpers + OFFLOAD queue_save hook + `bind_block_manager` |
+| `atom/model_engine/scheduler.py`                           | Role-aware dispatch helpers + OFFLOAD queue_save hook + pending-save deferred free |
 | `atom/model_engine/sequence.py`                            | `Sequence.prefix_hashes_published` flag             |
 | `atom/utils/forward_context.py`                            | Lazy `import atom.kv_transfer.offload` so factory registers in worker subprocesses |
-| `tests/test_offload_connector.py`                          | 17 cases: factory wiring, save-queue + mirror, lookup HBM-vs-external dedup, update_state_after_alloc, worker pool, env checks |
+| `tests/test_offload_connector.py`                          | Covers factory wiring, save-queue + mirror, block lifetime, lookup HBM-vs-external dedup, update_state_after_alloc, worker pool, env checks |
 
 ## Known limitations
 

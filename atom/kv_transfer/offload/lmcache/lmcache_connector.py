@@ -125,6 +125,7 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
         # KV cache geometry filled in by register_kv_caches.
         self.kv_caches: dict[str, Any] | None = None
         self.num_layers: int = 0
+        self.block_size = int(getattr(config, "kv_cache_block_size", 1))
         # Per layer: K block size in bytes + V block size in bytes. Each
         # K (resp. V) block is contiguous in GPU memory at offset
         # `block_id * bytes_per_block_per_layer_k` (resp. _v) into the
@@ -218,12 +219,19 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
                 )
                 self._num_slots = 0
                 return
-            k_bytes = (k.numel() // k.shape[0]) * k.element_size()
-            v_bytes = (
-                (v.numel() // v.shape[0]) * v.element_size()
-                if v is not None and v.numel() > 0
-                else 0
-            )
+            if v is None:
+                # MLA registers a token-major K-only cache shaped like
+                # [num_blocks * block_size, 1, hidden]. A logical paged block
+                # spans block_size consecutive token rows.
+                k_bytes = self.block_size * k.stride(0) * k.element_size()
+                v_bytes = 0
+            else:
+                k_bytes = (k.numel() // k.shape[0]) * k.element_size()
+                v_bytes = (
+                    (v.numel() // v.shape[0]) * v.element_size()
+                    if v.numel() > 0
+                    else 0
+                )
             self._k_bytes_per_layer.append(k_bytes)
             self._v_bytes_per_layer.append(v_bytes)
             # Flatten then reinterpret as bytes so block_id offsets are
@@ -246,6 +254,12 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
         # Plain pinned uint8 tensor; bypasses c_ops.alloc_pinned_ptr so the
         # storage participates in PyTorch's normal lifetime management. The
         # c_ops alloc is reserved for the M5 NUMA-aware LMCacheEngine pool.
+        # TODO: Avoid one huge pinned allocation for very large CPU KV caches.
+        # PyTorch's pinned host allocator may round large requests up to the
+        # next power-of-two bucket (e.g. ~100 GB -> 128 GB), causing surprising
+        # RSS/locked-memory pressure. Replace this with a segmented pool or
+        # power-of-two-aware planner before recommending multi-hundred-GB
+        # offload capacity.
         self._cpu_pool = torch.empty(
             self._cpu_pool_total_bytes, dtype=torch.uint8, pin_memory=True
         )
@@ -429,6 +443,15 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
             # The compute stream must wait for the H2D loads to finish
             # before reading those paged blocks for attention. Insert the
             # reverse barrier so the next forward sees fully-loaded KV.
+            # TODO: Align with vLLM SimpleCPUOffload's async-load model.
+            # The scheduler already parks load-hit requests in
+            # WAITING_FOR_REMOTE_KVS and wakes them via finished_recving, so
+            # the request that needs this H2D load should not participate in
+            # the current forward batch. This stream-wide wait is a conservative
+            # batch-level fence and can unnecessarily block unrelated forward
+            # work on the current stream. Prefer relying on per-load CUDA
+            # events + next-step scheduling once the load lifecycle is fully
+            # validated.
             torch.cuda.current_stream(device).wait_stream(self._copy_stream)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
@@ -639,5 +662,6 @@ class LMCacheOffloadConnectorScheduler(OffloadConnectorSchedulerBase):
 
     def request_finished(self, seq: "Sequence") -> None:
         # No-op for OFFLOAD: hash_blocks already queued saves block-by-block
-        # during postprocess. Block free is immediate (handled by scheduler).
+        # during postprocess. The scheduler defers block free while any queued
+        # async save for this request is still pending.
         return

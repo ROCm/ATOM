@@ -61,7 +61,7 @@ Key differences from the existing `atom/kv_transfer/disaggregation/` path:
 |---|---|---|
 | Store location | Remote node (RDMA via Mooncake/MoRIIO) | Local CPU DRAM / NVMe |
 | Transfer protocol | RDMA push (producer) or pull (consumer) | HIP `memcpy` / pinned buffers |
-| Block free policy | Producer defers free until send completes | Free immediately; save is independent D2H copy |
+| Block free policy | Producer defers free until send completes | Defer only while an async D2H save is pending |
 | `KVConnectorRole` | `PD_PRODUCER` / `PD_CONSUMER` | `OFFLOAD` |
 | Per-block hash key | Anchored by sequence id + remote tag | `BlockManager.compute_hash` (same as in-HBM prefix cache) |
 | Metadata shape | `ConnectorMetadata` with `remote_host`/`port` | `OffloadConnectorMetadata` with `block_ids`/`hashes` only |
@@ -70,6 +70,31 @@ The scheduler's role split is preserved (`get_num_new_matched_tokens`,
 `update_state_after_alloc`, `build_connector_meta`, `request_finished`,
 `_update_from_kv_xfer_finished`), so adding offload doesn't introduce a
 second scheduling path — only branching on `KVConnectorRole`.
+
+## Save completion and block free
+
+`queue_save(request_id, published)` only records scheduler-side metadata.
+The actual D2H save starts later on each worker when
+`EngineCore.process_kvconnector_output` dispatches the
+`OffloadConnectorMetadata` snapshot to `LMCacheOffloadConnector.start_load_kv`.
+
+The worker judges save completion with a CUDA event:
+
+1. `start_load_kv` enqueues `dst.copy_(src, non_blocking=True)` on the
+   connector's copy stream.
+2. After all K/V layer copies for a request are enqueued, it records
+   `torch.cuda.Event()` on that stream and stores `(req_id, "save", evt)`.
+3. `get_finished()` polls the event via `evt.query()`. Completed save
+   events become `done_save`.
+4. `ModelRunner.async_proc_aggregation()` returns `done_save` as
+   `KVConnectorOutput.finished_sending`.
+5. `Scheduler._update_from_kv_xfer_finished()` treats offload
+   `finished_sending` as the point where a pending save is complete and
+   any deferred GPU blocks may be returned to `BlockManager`.
+
+This means a finished request with no queued offload save still frees its
+blocks immediately, but a request with a pending async D2H save keeps its
+source GPU blocks alive until `finished_sending` arrives.
 
 ## Implementations
 

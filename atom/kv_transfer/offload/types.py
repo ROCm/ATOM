@@ -11,11 +11,11 @@ connectors in two key ways:
 * No remote engine. Saves/loads are local D2H/H2D copies, so transfer
   metadata carries only local ``(block_id, hash)`` pairs — no host/port
   or remote-engine identifiers.
-* No block-ownership transfer at request finish. The source GPU blocks
-  remain owned by the BlockManager; the offload connector's save is an
-  independent D2H copy that may complete before or after the block is
-  freed. Consequently the scheduler skips its PD producer "defer free"
-  behavior for OFFLOAD connectors (see ``Scheduler._connector_defers_free``).
+* No remote block-ownership transfer at request finish. The source GPU
+  blocks remain owned by the BlockManager, but an async D2H save still
+  needs those blocks to remain valid until the worker reports
+  ``finished_sending``. The scheduler therefore defers freeing only for
+  OFFLOAD requests with pending saves.
 """
 
 from __future__ import annotations

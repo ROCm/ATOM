@@ -388,7 +388,8 @@ class Scheduler:
 
         # KV transfer bookkeeping
         self.finished_recving_kv_req_ids: list[int] = []
-        self.deferred_free_blocks: dict[int, Sequence] = {}
+        self.deferred_free_blocks: dict[int | str, Sequence] = {}
+        self.offload_pending_save_req_ids: set[str] = set()
 
         # Scheduling delay for batching efficiency
         self.prev_time = 0.0
@@ -846,7 +847,9 @@ class Scheduler:
                 # its own external-store index; the scheduler just forwards
                 # the (block_id, hash) pairs the BlockManager just minted.
                 if published and self._connector_is_offload():
-                    self.kv_connector.queue_save(str(seq.id), published)
+                    req_id = self._normalize_req_id(seq.id)
+                    self.kv_connector.queue_save(req_id, published)
+                    self.offload_pending_save_req_ids.add(req_id)
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
             if is_deferred_out or self.use_spec:
@@ -1023,9 +1026,16 @@ class Scheduler:
                     seq.id,
                 )
                 self.deferred_free_blocks[seq.id] = seq
+            elif self.kv_connector is not None and self._offload_save_pending(seq.id):
+                logger.debug(
+                    "Deferring block free for offload seq %s until D2H save completes.",
+                    seq.id,
+                )
+                self.deferred_free_blocks[self._normalize_req_id(seq.id)] = seq
             else:
-                # No connector, OFFLOAD connector (saves are in-place D2H —
-                # blocks freed immediately), or a non-producer PD connector.
+                # No connector, no pending OFFLOAD save, or a non-producer PD
+                # connector. OFFLOAD saves that are still in-flight defer free
+                # above so their source GPU blocks cannot be reused early.
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
@@ -1051,8 +1061,8 @@ class Scheduler:
         * ``finished_recving``: marks requests as ready for decode scheduling
           (PD decode consumer) or as loaded from external store (OFFLOAD).
         * ``finished_sending``: releases deferred block allocations on the PD
-          producer side, or is purely informational for OFFLOAD (saves are
-          D2H copies; the source blocks were already freed at finish time).
+          producer side and for OFFLOAD requests whose async D2H saves kept
+          source GPU blocks alive after request finish.
         """
         if kv_connector_output is None:
             return
@@ -1068,9 +1078,17 @@ class Scheduler:
         for req_id in kv_connector_output.finished_sending or ():
             if is_offload:
                 logger.debug(
-                    "Offload save completed for request %s (informational)",
+                    "Offload save completed for request %s",
                     req_id,
                 )
+                self.offload_pending_save_req_ids.discard(
+                    self._normalize_req_id(req_id)
+                )
+                deferred_seq = self.deferred_free_blocks.pop(
+                    self._normalize_req_id(req_id), None
+                )
+                if deferred_seq is not None:
+                    self.block_manager.deallocate(deferred_seq)
                 continue
             assert (
                 self.kv_connector.is_producer
@@ -1098,13 +1116,22 @@ class Scheduler:
     def _connector_defers_free(self) -> bool:
         """True if the connector takes over block lifetime after request
         finish (PD producer transferring KV to the decode node). OFFLOAD
-        connectors do NOT defer — their D2H save is independent of the
-        source block's GPU lifetime, so finished_seqs can free immediately.
+        connectors defer only when a request has an in-flight D2H save.
         """
         return (
             self.kv_connector is not None
             and not self._connector_is_offload()
             and self.kv_connector.is_producer
+        )
+
+    @staticmethod
+    def _normalize_req_id(req_id) -> str:
+        return str(req_id)
+
+    def _offload_save_pending(self, req_id) -> bool:
+        return (
+            self._connector_is_offload()
+            and self._normalize_req_id(req_id) in self.offload_pending_save_req_ids
         )
 
     def get_request_counts(self) -> tuple[int, int]:
