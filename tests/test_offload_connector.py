@@ -8,7 +8,7 @@ import os
 import importlib.util
 import sys
 import types
-from collections import deque
+from collections import OrderedDict, deque
 
 import pytest
 
@@ -45,20 +45,47 @@ _OFFLOAD_CFG = MockConfig(
 )
 
 
+def _fake_lmcache_namespace() -> types.SimpleNamespace:
+    """Stub ``lmcache`` module that satisfies the connector's
+    ``_check_environment`` import probe plus the ``c_ops`` calls that
+    ``register_kv_caches`` and ``close`` make: ``alloc_pinned_ptr`` and
+    ``free_pinned_ptr``. Returned ptrs are bytearray ``id()`` so each call
+    is unique and ``int(...)`` cast succeeds.
+    """
+    fake_allocs: dict[int, bytearray] = {}
+
+    def alloc_pinned_ptr(size: int, device_id: int = 0) -> int:
+        buf = bytearray(int(size))
+        ptr = id(buf)
+        fake_allocs[ptr] = buf
+        return ptr
+
+    def free_pinned_ptr(ptr: int) -> None:
+        fake_allocs.pop(int(ptr), None)
+
+    return types.SimpleNamespace(
+        c_ops=types.SimpleNamespace(
+            alloc_pinned_ptr=alloc_pinned_ptr,
+            free_pinned_ptr=free_pinned_ptr,
+        ),
+        _backend_module="lmcache.c_ops",
+    )
+
+
 @pytest.fixture(autouse=True)
 def stub_lmcache_and_torch(monkeypatch):
     """Keep offload unit tests independent of optional GPU/runtime deps."""
     if importlib.util.find_spec("lmcache") is None:
-        fake_lmcache = types.SimpleNamespace(
-            c_ops=object(), _backend_module="lmcache.c_ops"
-        )
-        monkeypatch.setitem(sys.modules, "lmcache", fake_lmcache)
+        monkeypatch.setitem(sys.modules, "lmcache", _fake_lmcache_namespace())
 
     if importlib.util.find_spec("torch") is None:
         fake_torch = types.SimpleNamespace(
             uint8=object(),
             empty=lambda num_bytes, dtype, pin_memory: types.SimpleNamespace(
                 data_ptr=lambda: 0
+            ),
+            frombuffer=lambda buf, dtype: types.SimpleNamespace(
+                data_ptr=lambda: id(buf)
             ),
         )
         monkeypatch.setitem(sys.modules, "torch", fake_torch)
@@ -118,7 +145,9 @@ class TestSchedulerSaveQueue:
 
 
 class TestSchedulerOffloadBlockLifetime:
-    def test_finished_seq_with_pending_offload_save_defers_block_free(self, seq_factory):
+    def test_finished_seq_with_pending_offload_save_defers_block_free(
+        self, seq_factory
+    ):
         scheduler = _scheduler_with_offload_connector()
         seq = _seq_with_prompt(seq_factory, [10, 11, 12, 13, 14, 15, 16, 17])
         scheduler.block_manager.allocate(seq)
@@ -226,6 +255,7 @@ def _scheduler_with_offload_connector():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.block_manager = BlockManager(_OFFLOAD_CFG)
     scheduler.running = deque()
+    scheduler.waiting = deque()
     scheduler.eos_token_id = _OFFLOAD_CFG.eos_token_id
     scheduler.stop_token_ids = _OFFLOAD_CFG.stop_token_ids
     scheduler.use_spec = False
@@ -458,12 +488,10 @@ class TestWorkerPool:
         fake_torch = types.SimpleNamespace(
             uint8=object(),
             empty=lambda num_bytes, dtype, pin_memory: FakeCPUPool(num_bytes),
-        )
-        fake_lmcache = types.SimpleNamespace(
-            c_ops=object(), _backend_module="lmcache.c_ops"
+            frombuffer=lambda buf, dtype: FakeCPUPool(len(buf)),
         )
         monkeypatch.setitem(sys.modules, "torch", fake_torch)
-        monkeypatch.setitem(sys.modules, "lmcache", fake_lmcache)
+        monkeypatch.setitem(sys.modules, "lmcache", _fake_lmcache_namespace())
 
         w = LMCacheOffloadConnector(_OFFLOAD_CFG)
         w.register_kv_caches({"layer0": FakeKV()})
@@ -472,3 +500,240 @@ class TestWorkerPool:
         assert w._k_bytes_per_layer == [4 * 576 * 2]
         assert w._v_bytes_per_layer == [0]
         assert w.bytes_per_block == 4 * 576 * 2
+
+
+# ── §2.6: load-miss surfaces as failed_load (no silent wrong-KV) ─────────
+
+
+class TestFailedLoadSurfacing:
+    """OFFLOAD §2.6 — the worker must NOT silently let a load-miss leave
+    paged blocks uninitialized; it must report the req via
+    ``get_failed_load``, the scheduler-side handler must drop the mirror
+    entry, and ``_recover_failed_offload_load`` must free GPU blocks and
+    re-queue the seq for plain prefill.
+    """
+
+    def test_get_failed_load_returns_empty_by_default(self):
+        w = LMCacheOffloadConnector(_OFFLOAD_CFG)
+        assert w.get_failed_load() == set()
+
+    def test_get_failed_load_drains_each_call(self):
+        w = LMCacheOffloadConnector(_OFFLOAD_CFG)
+        w._failed_load = {"r1", "r2"}
+        assert w.get_failed_load() == {"r1", "r2"}
+        # Subsequent call returns empty — set was drained.
+        assert w.get_failed_load() == set()
+
+    def test_start_load_kv_miss_marks_failed_and_skips_enqueue(self):
+        """When a req's load hash isn't in hash_to_slot at worker time,
+        the req must go into _failed_load and NO load event should be
+        appended to _pending. The current step's _pending should only
+        contain events for the reqs the worker could fully satisfy."""
+        w = LMCacheOffloadConnector(_OFFLOAD_CFG)
+
+        # Set up minimal worker state without going through register_kv_caches
+        # so we don't need a real CUDA stream — start_load_kv early-outs
+        # on _num_slots == 0, so flip those flags to bypass that guard.
+        w._num_slots = 4
+
+        # Fake byte-view tensors so the per-block slicing doesn't blow up.
+        # __getitem__ returns self so dst[slice].copy_(src) works.
+        class _FakeView:
+            device = "cuda:0"
+
+            def __getitem__(self, _slc):
+                return self
+
+            def copy_(self, _src, non_blocking=False):
+                return self
+
+        fake_pool = _FakeView()
+        w._cpu_pool = fake_pool
+        w.hash_to_slot = OrderedDict({0x111: 0})  # only 0x111 is "in pool"
+        w._k_uint8_views = [_FakeView()]
+        w.num_layers = 1
+        w.bytes_per_block = 1
+        w._k_bytes_per_layer = [1]
+        w._v_bytes_per_layer = [0]
+        w._v_uint8_views = [None]
+
+        # Avoid real CUDA — patch the bits start_load_kv touches.
+        class _FakeStream:
+            def wait_stream(self, _other):
+                return None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class _FakeEvent:
+            def record(self, _stream):
+                return None
+
+            def query(self):
+                return True
+
+        w._copy_stream = _FakeStream()
+        w._ensure_copy_stream = lambda _device: None
+
+        import sys
+        import types as _types
+
+        fake_cuda = _types.SimpleNamespace(
+            current_stream=lambda _dev: _FakeStream(),
+            stream=lambda _s: _FakeStream(),
+            Event=lambda: _FakeEvent(),
+        )
+        torch_mod = sys.modules["torch"]
+        # SimpleNamespace doesn't accept arbitrary attribute assignment
+        # the way patching does, but works for setattr.
+        setattr(torch_mod, "cuda", fake_cuda)
+
+        # rA: chain hits — fully satisfied
+        # rB: chain misses (0x222 not in pool) — must fail entirely
+        meta = OffloadConnectorMetadata()
+        meta.reqs_to_load = {
+            "rA": OffloadReqMeta(block_ids=[10], block_hashes=[0x111]),
+            "rB": OffloadReqMeta(block_ids=[20, 21], block_hashes=[0x111, 0x222]),
+        }
+
+        w.start_load_kv(meta)
+
+        # rA load event was enqueued; rB was not (any block miss fails req)
+        load_event_reqs = [rid for rid, kind, _ in w._pending if kind == "load"]
+        assert load_event_reqs == ["rA"]
+        assert w._failed_load == {"rB"}
+
+    def test_scheduler_handle_failed_load_drops_mirror_and_stash(self):
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.saved_hashes = {0xAAA, 0xBBB, 0xCCC}
+        s._external_hashes_by_req["r99"] = [0xAAA, 0xBBB]
+
+        evicted = s.handle_failed_load("r99")
+
+        assert evicted == [0xAAA, 0xBBB]
+        # 0xAAA/0xBBB dropped, 0xCCC untouched (different req's hashes).
+        assert s.saved_hashes == {0xCCC}
+        assert "r99" not in s._external_hashes_by_req
+        # Idempotent: second call returns empty, no double-drop.
+        assert s.handle_failed_load("r99") == []
+
+    def test_update_state_after_alloc_records_external_hashes(
+        self, block_manager_prefix, seq_factory
+    ):
+        """After update_state_after_alloc the per-req external hashes
+        must be remembered so handle_failed_load can drop them later."""
+        bm = block_manager_prefix
+        s = LMCacheOffloadConnectorScheduler(_OFFLOAD_CFG)
+        s.bind_block_manager(bm)
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        h1 = BlockManager.compute_hash([1, 2, 3, 4])
+        h2 = BlockManager.compute_hash([5, 6, 7, 8], prefix=h1)
+        s.saved_hashes = {h1, h2}
+
+        seq = _seq_with_prompt(seq_factory, tokens)
+        n_tok, async_load = s.get_num_new_matched_tokens(seq)
+        assert async_load and n_tok == 8
+        bm.allocate(seq)
+        s.update_state_after_alloc(seq)
+
+        # The connector remembers what to evict on failure.
+        assert s._external_hashes_by_req[str(seq.id)] == [h1, h2]
+        # handle_failed_load drops them.
+        evicted = s.handle_failed_load(str(seq.id))
+        assert set(evicted) == {h1, h2}
+        assert h1 not in s.saved_hashes and h2 not in s.saved_hashes
+
+
+class TestSchedulerRecoverFailedOffloadLoad:
+    """End-to-end §2.6 recovery: scheduler sees ``failed_recving`` for a
+    seq parked in WAITING_FOR_REMOTE_KVS and must:
+      1. Free its allocated GPU blocks
+      2. Flip it back to WAITING (so the next scheduling pass treats it
+         as a fresh waiter)
+      3. Drop the corresponding mirror hashes from the connector
+    """
+
+    def test_recover_failed_load_releases_blocks_and_reverts_status(self, seq_factory):
+        scheduler = _scheduler_with_offload_connector()
+        bm = scheduler.block_manager
+        s = scheduler.kv_connector
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        h1 = BlockManager.compute_hash([1, 2, 3, 4])
+        h2 = BlockManager.compute_hash([5, 6, 7, 8], prefix=h1)
+        s.saved_hashes = {h1, h2, 0xCAFE}
+
+        seq = _seq_with_prompt(seq_factory, tokens)
+        # Drive through the admission path so block_table is laid out and
+        # the connector stash is populated, then park the seq in
+        # WAITING_FOR_REMOTE_KVS (the scheduler does this in its main loop).
+        n_tok, async_load = s.get_num_new_matched_tokens(seq)
+        assert async_load and n_tok == 8
+        bm.allocate(seq)
+        s.update_state_after_alloc(seq)
+        seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        scheduler.waiting.append(seq)
+
+        # Sanity precondition.
+        assert seq.block_table  # blocks allocated
+        assert str(seq.id) in s._external_hashes_by_req
+
+        # Worker reports the load failed.
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(failed_recving={str(seq.id)})
+        )
+
+        # The seq's blocks are freed and status flipped back to WAITING.
+        assert seq.block_table == []
+        assert seq.num_cached_tokens == 0
+        assert seq.status == SequenceStatus.WAITING
+        # The mirror dropped h1/h2 but kept the unrelated 0xCAFE entry.
+        assert h1 not in s.saved_hashes
+        assert h2 not in s.saved_hashes
+        assert 0xCAFE in s.saved_hashes
+        # Per-req stash cleared.
+        assert str(seq.id) not in s._external_hashes_by_req
+
+    def test_recover_failed_load_missing_seq_is_safe(self, seq_factory):
+        """A failure report after the seq has already moved on (e.g. an
+        out-of-band recovery) must not raise — log and move on."""
+        scheduler = _scheduler_with_offload_connector()
+        # No matching seq in waiting; just call directly.
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(failed_recving={"99999"})
+        )
+        # No exception, no state mutation.
+        assert scheduler.waiting == deque()
+
+
+class TestSchedulerOffloadWakeFromOffloadHit:
+    """§2.6-adjacent regression: scheduler's wake-from-WAITING_FOR_REMOTE_KVS
+    path used to compare seq.id (int) against finished_recving_kv_req_ids
+    (which OFFLOAD pushes as str(seq.id)). The mismatch silently kept the
+    seq parked forever — visible only when an OFFLOAD load is the FIRST
+    thing to wake a seq (HBM-evicted prefix, no PD producer in the mix).
+    Normalize both sides to str via _normalize_req_id."""
+
+    def test_finished_recving_str_id_unparks_int_seq_id(self, seq_factory):
+        scheduler = _scheduler_with_offload_connector()
+        seq = _seq_with_prompt(seq_factory, [10, 11, 12, 13])
+        scheduler.block_manager.allocate(seq)
+        seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        scheduler.waiting.append(seq)
+
+        # Worker reports str(seq.id) per connector convention.
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_recving={str(seq.id)})
+        )
+
+        # The bookkeeping list must hold the normalized form, AND the
+        # int-keyed lookup in _update_waiting_for_remote_kv must succeed.
+        assert str(seq.id) in scheduler.finished_recving_kv_req_ids
+        unparked = scheduler._update_waiting_for_remote_kv(seq)
+        assert unparked is True
+        # And the entry is consumed.
+        assert str(seq.id) not in scheduler.finished_recving_kv_req_ids

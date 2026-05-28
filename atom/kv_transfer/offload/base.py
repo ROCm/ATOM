@@ -60,6 +60,19 @@ class OffloadConnectorBase(KVConnectorBase):
         """
         ...
 
+    def get_failed_load(self) -> set[str]:
+        """Return request IDs whose load attempt could not be satisfied
+        since the last call (e.g. the optimistic scheduler-side mirror
+        said HIT but the worker's pool no longer has the block).
+
+        Default: empty set. Backends that may evict between scheduler
+        lookup and worker load (FIFO/LRU pools) MUST override and surface
+        the failed req_ids here, otherwise the scheduler will leave the
+        request in ``WAITING_FOR_REMOTE_KVS`` with uninitialized GPU
+        blocks and attention will read garbage KV.
+        """
+        return set()
+
 
 class OffloadConnectorSchedulerBase(KVConnectorSchedulerBase):
     """Scheduler-side interface for a local KV-offload backend."""
@@ -119,3 +132,19 @@ class OffloadConnectorSchedulerBase(KVConnectorSchedulerBase):
         metadata) signals no work for this step.
         """
         ...
+
+    def handle_failed_load(self, request_id: str) -> list[int]:
+        """Called by the scheduler when the worker reports a load failure
+        for ``request_id`` (pool eviction between the optimistic mirror
+        lookup and the actual H2D copy). The scheduler-side connector
+        must drop any mirror entries for the request's external hashes
+        so a future lookup does not re-hit the same stale entries, and
+        must clear any per-request stash that ``update_state_after_alloc``
+        populated.
+
+        Returns the list of hashes that were evicted from the mirror —
+        for logging only.
+
+        Default: no-op (PD and OFFLOAD-with-no-eviction backends).
+        """
+        return []

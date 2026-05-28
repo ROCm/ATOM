@@ -50,6 +50,9 @@ class KVOutputAggregator:
         self._world_size = world_size
         self._seen_sending: dict[str, set[int]] = {}
         self._seen_recving: dict[str, set[int]] = {}
+        # ``failed_recving`` uses any-rank-emit semantics (see aggregate
+        # docstring), so it doesn't need per-rank set tracking — we only
+        # need to suppress duplicate emissions within the same step.
 
     @property
     def world_size(self) -> int:
@@ -64,7 +67,10 @@ class KVOutputAggregator:
 
         Returns:
             A new :class:`KVConnectorOutput` containing only request IDs
-            that have been reported as finished by **all** workers.
+            that have been reported as finished by **all** workers, plus
+            any request IDs that **any** worker reported as failed (load
+            failures must propagate immediately — if even one TP shard is
+            missing KV, the request cannot forward correctly).
         """
         if not worker_outputs:
             return KVConnectorOutput()
@@ -88,6 +94,18 @@ class KVOutputAggregator:
             if len(workers) >= self._world_size
         }
 
+        # failed_recving: any-rank-emit. If rank R can't load its KV
+        # shard, the whole TP forward for that req is wrong even if the
+        # other ranks succeeded — emit immediately and drop any pending
+        # finished_recving tracking for the same req so the same req
+        # isn't both "failed" and "succeeded" in the scheduler's view.
+        failed_recving: set[str] = set()
+        for wo in worker_outputs:
+            if wo.failed_recving:
+                failed_recving.update(wo.failed_recving)
+        for rid in failed_recving:
+            self._seen_recving.pop(rid, None)
+
         for rid in done_sending:
             del self._seen_sending[rid]
         for rid in done_recving:
@@ -96,6 +114,7 @@ class KVOutputAggregator:
         return KVConnectorOutput(
             finished_sending=done_sending,
             finished_recving=done_recving,
+            failed_recving=failed_recving,
         )
 
     def reset(self) -> None:

@@ -143,15 +143,79 @@ class TestKVConnectorOutput:
         out = KVConnectorOutput()
         assert out.finished_sending == set()
         assert out.finished_recving == set()
+        assert out.failed_recving == set()
         assert out.expected_finished_count == 0
 
     def test_is_empty(self):
         assert KVConnectorOutput().is_empty()
         assert not KVConnectorOutput(finished_sending={"x"}).is_empty()
         assert not KVConnectorOutput(finished_recving={"x"}).is_empty()
+        assert not KVConnectorOutput(failed_recving={"x"}).is_empty()
 
     def test_repr(self):
-        out = KVConnectorOutput(finished_sending={"a"}, finished_recving={"b"})
+        out = KVConnectorOutput(
+            finished_sending={"a"},
+            finished_recving={"b"},
+            failed_recving={"c"},
+        )
         r = repr(out)
         assert "sending" in r
         assert "recving" in r
+        assert "failed_recving" in r
+
+
+class TestAggregateFailedRecving:
+    """OFFLOAD load failures must propagate to the scheduler as soon as
+    *any* TP rank reports them, not after every rank reports — even one
+    missing KV shard means the request can't TP-forward correctly."""
+
+    def test_single_rank_failure_emits_immediately(self):
+        agg = KVOutputAggregator(world_size=4)
+        outputs = [
+            KVConnectorOutput(failed_recving={"r_evicted"}),
+            KVConnectorOutput(),
+            KVConnectorOutput(),
+            KVConnectorOutput(),
+        ]
+        result = agg.aggregate(outputs)
+        assert result.failed_recving == {"r_evicted"}
+        # Aggregator state must be clean; we don't track failed by-rank.
+        assert agg.pending_count == (0, 0)
+
+    def test_failure_displaces_partial_finished_recving(self):
+        """If a req shows up as finished on some ranks but failed on
+        another, the failure wins: drop the partial finished-recving
+        tracking so the same req can't later be reported as 'done'."""
+        agg = KVOutputAggregator(world_size=4)
+        outputs = [
+            KVConnectorOutput(finished_recving={"r1"}),  # rank 0 done
+            KVConnectorOutput(finished_recving={"r1"}),  # rank 1 done
+            KVConnectorOutput(failed_recving={"r1"}),  # rank 2 failed
+            KVConnectorOutput(),  # rank 3 silent
+        ]
+        result = agg.aggregate(outputs)
+        assert result.failed_recving == {"r1"}
+        assert result.finished_recving == set()
+        # After the failure displacement no per-req state should remain.
+        assert agg.pending_count == (0, 0)
+
+    def test_dedup_within_step(self):
+        """Multiple ranks reporting the same failed req in one step
+        should emit the req once."""
+        agg = KVOutputAggregator(world_size=4)
+        outputs = [KVConnectorOutput(failed_recving={"rA"})] * 3 + [KVConnectorOutput()]
+        result = agg.aggregate(outputs)
+        assert result.failed_recving == {"rA"}
+
+    def test_failure_does_not_affect_other_reqs(self):
+        agg = KVOutputAggregator(world_size=2)
+        outputs = [
+            KVConnectorOutput(
+                finished_sending={"good"},
+                failed_recving={"bad"},
+            ),
+            KVConnectorOutput(finished_sending={"good"}),
+        ]
+        result = agg.aggregate(outputs)
+        assert result.failed_recving == {"bad"}
+        assert result.finished_sending == {"good"}

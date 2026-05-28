@@ -59,22 +59,35 @@ class KVConnectorOutput:
     Attributes:
         finished_sending: Request IDs whose KV send completed on this worker.
         finished_recving: Request IDs whose KV receive completed on this worker.
+        failed_recving: Request IDs whose KV receive was attempted but could
+            not be satisfied (e.g. an OFFLOAD pool eviction between the
+            scheduler-side optimistic lookup and the worker-side load).
+            The scheduler must drop its mirror state for these requests
+            and re-prefill them; leaving them in WAITING_FOR_REMOTE_KVS
+            with uninitialized GPU blocks would let attention read garbage
+            KV and corrupt generation.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
 
     finished_sending: set[str] = field(default_factory=set)
     finished_recving: set[str] = field(default_factory=set)
+    failed_recving: set[str] = field(default_factory=set)
     expected_finished_count: int = 0
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
-        return not self.finished_sending and not self.finished_recving
+        return (
+            not self.finished_sending
+            and not self.finished_recving
+            and not self.failed_recving
+        )
 
     def __repr__(self) -> str:
         return (
             f"KVConnectorOutput(sending={self.finished_sending}, "
-            f"recving={self.finished_recving})"
+            f"recving={self.finished_recving}, "
+            f"failed_recving={self.failed_recving})"
         )
 
 

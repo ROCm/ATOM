@@ -304,7 +304,7 @@ class ScheduledBatch:
         self.total_seqs_num_decode = total_seqs_num_decode
 
         self.connector_meta_output = connector_meta_output
-        self.finished_recving_kv_req_ids: list[int] = []
+        self.finished_recving_kv_req_ids: list[str] = []
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
@@ -387,7 +387,7 @@ class Scheduler:
         self._rejected: list[Sequence] = []
 
         # KV transfer bookkeeping
-        self.finished_recving_kv_req_ids: list[int] = []
+        self.finished_recving_kv_req_ids: list[str] = []
         self.deferred_free_blocks: dict[int | str, Sequence] = {}
         self.offload_pending_save_req_ids: set[str] = set()
 
@@ -1048,10 +1048,11 @@ class Scheduler:
         scheduling step.  When ready, the sequence transitions back
         from ``WAITING_FOR_REMOTE_KVS`` to ``WAITING``.
         """
-        if seq.id not in self.finished_recving_kv_req_ids:
+        req_id_norm = self._normalize_req_id(seq.id)
+        if req_id_norm not in self.finished_recving_kv_req_ids:
             return False
 
-        self.finished_recving_kv_req_ids.remove(seq.id)
+        self.finished_recving_kv_req_ids.remove(req_id_norm)
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
         return True
 
@@ -1060,6 +1061,13 @@ class Scheduler:
 
         * ``finished_recving``: marks requests as ready for decode scheduling
           (PD decode consumer) or as loaded from external store (OFFLOAD).
+        * ``failed_recving`` (OFFLOAD-only): worker reported the H2D load
+          could not be satisfied (pool eviction between scheduler-side
+          optimistic mirror lookup and the actual copy). Drop the mirror
+          entries, release the over-allocated GPU blocks, and put the
+          request back in WAITING for a plain re-prefill. Without this,
+          the request would forward against an uninitialized GPU block
+          and attention would read garbage KV.
         * ``finished_sending``: releases deferred block allocations on the PD
           producer side and for OFFLOAD requests whose async D2H saves kept
           source GPU blocks alive after request finish.
@@ -1073,7 +1081,11 @@ class Scheduler:
                 is_offload or not self.kv_connector.is_producer
             ), "Only consumer or offload connector should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            self.finished_recving_kv_req_ids.append(req_id)
+            self.finished_recving_kv_req_ids.append(self._normalize_req_id(req_id))
+
+        for req_id in kv_connector_output.failed_recving or ():
+            assert is_offload, "failed_recving is only produced by OFFLOAD connectors"
+            self._recover_failed_offload_load(req_id)
 
         for req_id in kv_connector_output.finished_sending or ():
             if is_offload:
@@ -1132,6 +1144,58 @@ class Scheduler:
         return (
             self._connector_is_offload()
             and self._normalize_req_id(req_id) in self.offload_pending_save_req_ids
+        )
+
+    def _recover_failed_offload_load(self, req_id: str) -> None:
+        """Handle ``failed_recving`` for an OFFLOAD request.
+
+        The worker reported it could not satisfy the H2D load (FIFO
+        eviction in the CPU pool). Three things must happen, in order:
+
+        1. Drop the scheduler-side mirror entries for the request's
+           external hashes so the next ``get_num_new_matched_tokens`` for
+           the same prompt won't re-hit the same stale entries and loop
+           through the failure path again.
+        2. Find the seq parked in ``WAITING_FOR_REMOTE_KVS`` and free
+           its allocated GPU blocks (HBM-prefix + external destinations).
+           ``BlockManager.deallocate`` clears ``block_table`` and resets
+           ``num_cached_tokens`` so the next scheduling pass treats the
+           seq as a fresh waiter.
+        3. Flip its status back to ``WAITING``; ``num_computed_tokens``
+           and ``block_table`` are already 0 / empty after step 2.
+
+        First-pass behavior: even the still-valid HBM prefix hits get
+        thrown away (deallocate is whole-seq). The next scheduling pass
+        will re-discover them via the HBM prefix-cache lookup, so
+        correctness is preserved; only the HBM-rediscovery cost is paid.
+        """
+        evicted = self.kv_connector.handle_failed_load(self._normalize_req_id(req_id))
+        # Locate the seq. failed_recving carries str req_id; seq.id is int.
+        target = next(
+            (
+                seq
+                for seq in self.waiting
+                if self._normalize_req_id(seq.id) == self._normalize_req_id(req_id)
+                and seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+            ),
+            None,
+        )
+        if target is None:
+            logger.warning(
+                "OFFLOAD load failed for req=%s but no matching "
+                "WAITING_FOR_REMOTE_KVS seq found (already moved on or "
+                "evicted). Dropped %d mirror entries; nothing else to do.",
+                req_id,
+                len(evicted),
+            )
+            return
+        self.block_manager.deallocate(target)
+        target.status = SequenceStatus.WAITING
+        logger.warning(
+            "OFFLOAD load failed for req=%s: dropped %d mirror entries, "
+            "released GPU blocks, re-queued for plain prefill.",
+            req_id,
+            len(evicted),
         )
 
     def get_request_counts(self) -> tuple[int, int]:

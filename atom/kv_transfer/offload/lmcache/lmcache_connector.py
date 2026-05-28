@@ -2,28 +2,29 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-LMCache-backed local KV cache offload for ATOM standalone serving.
+Per-rank CPU offload backend for ATOM standalone serving.
 
-Talks directly to ``lmcache.c_ops`` (the HIP-built transfer kernels) rather
-than going through ``lmcache.integration.vllm.vllm_v1_adapter`` — that path
-pulls vllm types into the import graph, which we want to avoid for the
-standalone build. ATOM owns the hash-to-CPU-slot index; LMCache provides
-the pinned-memory allocator and the H2D/D2H block-transfer kernel.
-
-Layout (M3 first commit — transfer kernels stubbed, see TODOs):
+Owns a single contiguous pinned CPU pool, allocated via
+``lmcache.c_ops.alloc_pinned_ptr`` — direct ``cudaHostRegister`` on raw
+``malloc()``-ed memory, bypassing PyTorch's pinned host allocator and its
+power-of-two bucket rounding. ATOM's per-layer K/V tensors use AITER
+swizzled layouts (K: ``(NB, NH, HD/x, BS, x)``, V: ``(NB, NH, HD, BS)``)
+that match none of LMCache's ``GPUKVFormat`` enums, so D2H/H2D copies stay
+on byte-view ``dst.copy_(src, non_blocking=True)`` over a dedicated copy
+stream rather than ``lmcache.c_ops.multi_layer_kv_transfer``.
 
 * Worker side: pinned CPU pool of N slots × sizeof(one paged block × all
   layers, K and V). ``register_kv_caches`` learns the per-layer geometry
   and (re)sizes the pool. ``start_load_kv`` is the single per-step entry
   the EngineCore dispatches to (matches the existing PD path).
-* Scheduler side: an *optimistic* mirror of the worker's index — entries
-  appear when the scheduler queues a save, are removed if the worker
-  reports a failed load. Stale mirror entries are safe: a load miss just
-  triggers re-prefill, never wrong KV.
+* Scheduler side: an *optimistic* mirror of the worker's index. Entries
+  appear when the scheduler queues a save; when the worker can't satisfy
+  a load (pool eviction), it reports the request via ``get_finished``'s
+  third return value ``failed_load`` and the scheduler drops the mirror
+  entry plus re-prefills the request.
 
-NVMe (L3) tier and proper LRU eviction are deferred to M5; the first cut
-uses a fixed-size FIFO pool. The known-good ``lmcache.engine.LMCacheEngine``
-wrapper is the natural upgrade path once we want disk-tier and metrics.
+NVMe (L3) tier, real LRU eviction (vs FIFO), and full LMCacheEngine
+integration are deferred — see ``atom_lmcache_integration_plan.md``.
 """
 
 from __future__ import annotations
@@ -141,11 +142,15 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
         self._v_uint8_views: list[Any] = []
 
         # CPU pool — allocated lazily in register_kv_caches once geometry
-        # is known. The pool is a single pinned uint8 tensor of size
-        # `num_slots * bytes_per_block`; slot `s` occupies bytes
+        # is known. The pool is a single contiguous pinned byte buffer of
+        # size `num_slots * bytes_per_block` allocated via
+        # ``c_ops.alloc_pinned_ptr`` (cudaHostRegister on raw malloc);
+        # ``self._cpu_pool`` is a ``torch.frombuffer`` uint8 view over the
+        # same memory, so ``dst.copy_(src, non_blocking=True)`` and offset
+        # slicing keep working unchanged. Slot ``s`` occupies bytes
         # [s * bytes_per_block : (s+1) * bytes_per_block].
-        self._cpu_pool: Any = None  # torch.Tensor, dtype=uint8, pin_memory=True
-        self._cpu_pool_base_ptr: int = 0
+        self._cpu_pool: Any = None  # torch.Tensor view, dtype=uint8
+        self._cpu_pool_base_ptr: int = 0  # raw ptr from c_ops, freed in close()
         self._cpu_pool_total_bytes: int = 0
         self._num_slots: int = 0
         # Hash -> slot index. OrderedDict so we can FIFO-evict on overflow.
@@ -165,6 +170,13 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
         # Per-step completion tracking (request_id sets).
         self._done_saving: set[str] = set()
         self._done_loading: set[str] = set()
+        # Per-step load failures (request had a pool miss between the
+        # scheduler's optimistic lookup and the worker's hash_to_slot
+        # check). Drained by get_failed_load and surfaced to the
+        # scheduler in KVConnectorOutput.failed_recving so the request
+        # can be re-prefilled instead of running attention against an
+        # uninitialized GPU block.
+        self._failed_load: set[str] = set()
 
         logger.info(
             "LMCacheOffloadConnector initialized (rank-local pool=%.2f GB, "
@@ -228,9 +240,7 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
             else:
                 k_bytes = (k.numel() // k.shape[0]) * k.element_size()
                 v_bytes = (
-                    (v.numel() // v.shape[0]) * v.element_size()
-                    if v.numel() > 0
-                    else 0
+                    (v.numel() // v.shape[0]) * v.element_size() if v.numel() > 0 else 0
                 )
             self._k_bytes_per_layer.append(k_bytes)
             self._v_bytes_per_layer.append(v_bytes)
@@ -251,19 +261,40 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
 
         self._num_slots = max(1, self.cpu_bytes_per_rank // self.bytes_per_block)
         self._cpu_pool_total_bytes = self._num_slots * self.bytes_per_block
-        # Plain pinned uint8 tensor; bypasses c_ops.alloc_pinned_ptr so the
-        # storage participates in PyTorch's normal lifetime management. The
-        # c_ops alloc is reserved for the M5 NUMA-aware LMCacheEngine pool.
-        # TODO: Avoid one huge pinned allocation for very large CPU KV caches.
-        # PyTorch's pinned host allocator may round large requests up to the
-        # next power-of-two bucket (e.g. ~100 GB -> 128 GB), causing surprising
-        # RSS/locked-memory pressure. Replace this with a segmented pool or
-        # power-of-two-aware planner before recommending multi-hundred-GB
-        # offload capacity.
-        self._cpu_pool = torch.empty(
-            self._cpu_pool_total_bytes, dtype=torch.uint8, pin_memory=True
+        # Allocate via lmcache.c_ops: a raw malloc() + cudaHostRegister on
+        # exactly self._cpu_pool_total_bytes bytes. This avoids PyTorch's
+        # pinned host allocator (which buckets large requests to the next
+        # power of two and would lock ~128 GB to satisfy a ~100 GB pool).
+        # We then wrap the raw pointer in a uint8 torch.Tensor view so
+        # ``dst.copy_(src, non_blocking=True)`` works unchanged. Lifetime:
+        # the buffer is freed in close()/__del__ via c_ops.free_pinned_ptr;
+        # torch.frombuffer does not own the memory.
+        import ctypes
+
+        from lmcache import c_ops
+
+        # c_ops wants an int device id for cudaHostRegister's flags lookup.
+        # A real torch.Tensor.device is a torch.device with int .index; fake
+        # tensors in tests use a string ("cuda:0"). Fall back to 0 if we
+        # can't extract a usable int — the registration works fine on any
+        # device, the id is only a hint to the driver.
+        view_device = self._k_uint8_views[0].device if self._k_uint8_views else None
+        device_id = getattr(view_device, "index", None)
+        if not isinstance(device_id, int):
+            device_id = 0
+        self._cpu_pool_base_ptr = int(
+            c_ops.alloc_pinned_ptr(self._cpu_pool_total_bytes, device_id)
         )
-        self._cpu_pool_base_ptr = self._cpu_pool.data_ptr()
+        if self._cpu_pool_base_ptr == 0:
+            raise RuntimeError(
+                "c_ops.alloc_pinned_ptr returned NULL — out of pinnable "
+                "host memory? Try lowering kv_transfer_config.cpu_bytes / "
+                "cpu_bytes_per_rank."
+            )
+        buf = (ctypes.c_uint8 * self._cpu_pool_total_bytes).from_address(
+            self._cpu_pool_base_ptr
+        )
+        self._cpu_pool = torch.frombuffer(buf, dtype=torch.uint8)
         self._free_slots = list(range(self._num_slots))
         first_layer_name = next(iter(kv_caches.keys()))
         logger.info(
@@ -394,20 +425,30 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
             )
             with torch.cuda.stream(self._copy_stream):
                 for req_id, meta in metadata.reqs_to_load.items():
-                    missed = 0
+                    # Pre-scan: if ANY block in this req's chain is no longer
+                    # in the worker pool (FIFO-evicted between the scheduler's
+                    # optimistic lookup and now), the whole request fails the
+                    # load. We do NOT enqueue partial H2D copies — the
+                    # corresponding GPU blocks would still be uninitialized
+                    # for the missed positions and attention would read
+                    # garbage. Instead surface req_id in self._failed_load
+                    # so the scheduler drops the mirror entry and re-prefills.
+                    missing_hashes = [
+                        h for h in meta.block_hashes if self.hash_to_slot.get(h, -1) < 0
+                    ]
+                    if missing_hashes:
+                        logger.warning(
+                            "LMCacheOffload: load FAILED for req=%s — "
+                            "%d/%d blocks evicted from CPU pool; re-prefill "
+                            "via scheduler failed_recving.",
+                            req_id,
+                            len(missing_hashes),
+                            len(meta.block_hashes),
+                        )
+                        self._failed_load.add(req_id)
+                        continue
                     for block_id, h in zip(meta.block_ids, meta.block_hashes):
-                        slot = self.hash_to_slot.get(h, -1)
-                        if slot < 0:
-                            # Optimistic mirror said HIT, worker doesn't
-                            # have it (likely FIFO-evicted). Leave the
-                            # paged block uninitialized — the scheduler
-                            # will see this seq finish with wrong KV; in
-                            # practice this only happens if the pool is
-                            # sized too small for the working set. TODO:
-                            # surface miss back so scheduler can drop the
-                            # mirror entry and trigger re-prefill.
-                            missed += 1
-                            continue
+                        slot = self.hash_to_slot[h]
                         cpu_offset = slot * self.bytes_per_block
                         for layer_idx in range(self.num_layers):
                             k_view = self._k_uint8_views[layer_idx]
@@ -429,30 +470,16 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
                                 ]
                                 dst_v.copy_(src_v, non_blocking=True)
                                 cpu_offset += v_bytes
-                    if missed:
-                        logger.warning(
-                            "LMCacheOffload: %d/%d H2D load misses for "
-                            "req=%s (pool eviction; expect wrong KV)",
-                            missed,
-                            len(meta.block_ids),
-                            req_id,
-                        )
                     evt = torch.cuda.Event()
                     evt.record(self._copy_stream)
                     self._pending.append((req_id, "load", evt))
-            # The compute stream must wait for the H2D loads to finish
-            # before reading those paged blocks for attention. Insert the
-            # reverse barrier so the next forward sees fully-loaded KV.
-            # TODO: Align with vLLM SimpleCPUOffload's async-load model.
-            # The scheduler already parks load-hit requests in
-            # WAITING_FOR_REMOTE_KVS and wakes them via finished_recving, so
-            # the request that needs this H2D load should not participate in
-            # the current forward batch. This stream-wide wait is a conservative
-            # batch-level fence and can unnecessarily block unrelated forward
-            # work on the current stream. Prefer relying on per-load CUDA
-            # events + next-step scheduling once the load lifecycle is fully
-            # validated.
-            torch.cuda.current_stream(device).wait_stream(self._copy_stream)
+            # No reverse barrier here: the request that needs this H2D
+            # load is parked in WAITING_FOR_REMOTE_KVS and only re-enters
+            # the next forward batch after get_finished() reports its
+            # load event done (via finished_recving). The current batch
+            # never reads load-target GPU blocks, so a stream-wide fence
+            # would only block unrelated forward work. Per-load CUDA
+            # events + next-step scheduling is the correctness contract.
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """Drain completed CUDA events into the done sets, then return
@@ -474,6 +501,34 @@ class LMCacheOffloadConnector(OffloadConnectorBase):
         self._done_saving = set()
         self._done_loading = set()
         return done_save, done_load
+
+    def get_failed_load(self) -> set[str]:
+        """Drain accumulated load-failures and return; called by the
+        worker once per step right after ``get_finished``."""
+        failed = self._failed_load
+        self._failed_load = set()
+        return failed
+
+    def close(self) -> None:
+        """Release the cudaHostRegister'd CPU pool. Safe to call twice.
+
+        Drop the torch view first so the pool's refcount goes to zero
+        before unpinning the underlying buffer — otherwise PyTorch could
+        access freed pinned memory during gc.
+        """
+        if self._cpu_pool is not None:
+            self._cpu_pool = None
+        if self._cpu_pool_base_ptr:
+            from lmcache import c_ops
+
+            c_ops.free_pinned_ptr(self._cpu_pool_base_ptr)
+            self._cpu_pool_base_ptr = 0
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 — destructors must not raise
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +562,13 @@ class LMCacheOffloadConnectorScheduler(OffloadConnectorSchedulerBase):
         # Per-seq stash between get_num_new_matched_tokens and
         # update_state_after_alloc, keyed by `id(seq)`.
         self._external_match_stash: dict[int, list[int]] = {}
+        # Per-request memory of the external hashes that were queued for
+        # load via update_state_after_alloc, keyed by str(seq.id). Used by
+        # handle_failed_load to drop the corresponding mirror entries
+        # when the worker reports the load could not be satisfied.
+        # Cleared on successful finished_recving (in request_finished) or
+        # on handle_failed_load.
+        self._external_hashes_by_req: dict[str, list[int]] = {}
         logger.info(
             "LMCacheOffloadConnectorScheduler initialized (chunk_size=%d)",
             self.chunk_size,
@@ -603,9 +665,13 @@ class LMCacheOffloadConnectorScheduler(OffloadConnectorSchedulerBase):
                 seq.num_blocks,
             )
             return
-        self._pending_load[str(seq.id)] = OffloadReqMeta(
+        req_id = str(seq.id)
+        self._pending_load[req_id] = OffloadReqMeta(
             block_ids=dest_block_ids, block_hashes=external_hashes
         )
+        # Remember the hashes so handle_failed_load can drop them from
+        # the mirror if the worker can't satisfy this load.
+        self._external_hashes_by_req[req_id] = list(external_hashes)
 
     def lookup_external_hits(self, seq: "Sequence", block_hashes: list[int]) -> int:
         """Return the longest prefix of ``block_hashes`` known to the
@@ -661,7 +727,23 @@ class LMCacheOffloadConnectorScheduler(OffloadConnectorSchedulerBase):
         return meta
 
     def request_finished(self, seq: "Sequence") -> None:
-        # No-op for OFFLOAD: hash_blocks already queued saves block-by-block
-        # during postprocess. The scheduler defers block free while any queued
-        # async save for this request is still pending.
-        return
+        # OFFLOAD: hash_blocks already queued saves block-by-block during
+        # postprocess; the scheduler defers block free while any queued
+        # async save for this request is still pending. Drop any
+        # outstanding load-recovery stash for this req — the load either
+        # succeeded (req moved out of WAITING_FOR_REMOTE_KVS) or failed
+        # and was already handled via handle_failed_load.
+        self._external_hashes_by_req.pop(str(seq.id), None)
+
+    def handle_failed_load(self, request_id: str) -> list[int]:
+        """Worker reported the H2D load for ``request_id`` could not be
+        satisfied (pool eviction). Drop the corresponding mirror entries
+        so a future ``get_num_new_matched_tokens`` does not re-hit the
+        same stale hashes, and clear the per-request stash.
+
+        Returns the evicted hashes for logging.
+        """
+        hashes = self._external_hashes_by_req.pop(request_id, [])
+        for h in hashes:
+            self.saved_hashes.discard(h)
+        return hashes

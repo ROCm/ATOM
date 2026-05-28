@@ -1946,14 +1946,30 @@ class ModelRunner:
 
     @torch.inference_mode()
     def async_proc_aggregation(self) -> KVConnectorOutput:
-        """Collect finished send/recv status from the KV connector."""
+        """Collect finished send/recv status from the KV connector.
+
+        For OFFLOAD connectors with a may-evict pool (FIFO/LRU), also
+        drain ``get_failed_load`` so the scheduler can drop its
+        optimistic mirror entry and re-prefill the request rather than
+        running attention against an uninitialized GPU block.
+        """
         connector = get_kvconnector()
         if connector is None:
             return KVConnectorOutput(finished_sending=[], finished_recving=[])
         done_sending, done_recving = connector.get_finished()
+        # PD connectors don't implement get_failed_load; the base method
+        # returns set() by default so this is safe to call unconditionally
+        # on anything routed here.
+        failed_recving = (
+            connector.get_failed_load()
+            if hasattr(connector, "get_failed_load")
+            else set()
+        )
 
         return KVConnectorOutput(
-            finished_sending=done_sending, finished_recving=done_recving
+            finished_sending=done_sending,
+            finished_recving=done_recving,
+            failed_recving=failed_recving,
         )
 
     def propose_draft_token_ids(
