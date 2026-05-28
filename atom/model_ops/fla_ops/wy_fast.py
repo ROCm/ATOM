@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .index import prepare_chunk_indices
+from .index import prepare_chunk_indices, prepare_rebased_cu_seqlens
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -124,13 +124,23 @@ def recompute_w_u_fwd(
     g_cumsum: torch.Tensor,
     A: torch.Tensor,
     cu_seqlens: torch.LongTensor | None,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
     BT = A.shape[-1]
 
+    # See `cumsum.chunk_local_cumsum_scalar` for the cache-stable contract.
     chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+        prepare_chunk_indices(cu_seqlens, BT, num_decodes, num_decode_tokens)
+        if cu_seqlens is not None
+        else None
+    )
+    kernel_cu_seqlens = (
+        prepare_rebased_cu_seqlens(cu_seqlens, num_decodes, num_decode_tokens)
+        if cu_seqlens is not None
+        else None
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
@@ -145,7 +155,7 @@ def recompute_w_u_fwd(
         u=u,
         A=A,
         g=g_cumsum,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=kernel_cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
         H=H,

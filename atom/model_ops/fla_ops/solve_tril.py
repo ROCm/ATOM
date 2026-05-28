@@ -15,7 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .index import prepare_chunk_indices
+from .index import prepare_chunk_indices, prepare_rebased_cu_seqlens
 from .op import make_tensor_descriptor
 from .utils import input_guard, is_amd, is_tma_supported
 
@@ -509,6 +509,8 @@ def solve_tril(
     A: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     output_dtype: torch.dtype = torch.float,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> torch.Tensor:
     """
     Compute the inverse of the matrix I + A
@@ -530,8 +532,17 @@ def solve_tril(
     output_dtype = A.dtype if output_dtype is None else output_dtype
 
     B, T, H, BT = A.shape
+    # See `cumsum.chunk_local_cumsum_scalar` for the cache-stable contract:
+    # original cu_seqlens to prepare_chunk_indices, rebased to the kernel.
     chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+        prepare_chunk_indices(cu_seqlens, BT, num_decodes, num_decode_tokens)
+        if cu_seqlens is not None
+        else None
+    )
+    kernel_cu_seqlens = (
+        prepare_rebased_cu_seqlens(cu_seqlens, num_decodes, num_decode_tokens)
+        if cu_seqlens is not None
+        else None
     )
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
@@ -546,7 +557,7 @@ def solve_tril(
     merge_fn[NT, B * H](
         A=A,
         Ai=Ai,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=kernel_cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
         H=H,

@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .index import prepare_chunk_indices
+from .index import prepare_chunk_indices, prepare_rebased_cu_seqlens
 from .op import exp
 
 
@@ -106,6 +106,8 @@ def chunk_scaled_dot_kkt_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype = torch.float32,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> torch.Tensor:
     r"""
     Compute beta * K * K^T.
@@ -133,8 +135,18 @@ def chunk_scaled_dot_kkt_fwd(
     B, T, Hg, K = k.shape
     H = beta.shape[-1]
     BT = chunk_size
+    # See `cumsum.chunk_local_cumsum_scalar` for the cache-stable contract:
+    # pass the original `cu_seqlens` to `prepare_chunk_indices` and the
+    # cached rebased tensor to the kernel.
     chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+        prepare_chunk_indices(cu_seqlens, BT, num_decodes, num_decode_tokens)
+        if cu_seqlens is not None
+        else None
+    )
+    kernel_cu_seqlens = (
+        prepare_rebased_cu_seqlens(cu_seqlens, num_decodes, num_decode_tokens)
+        if cu_seqlens is not None
+        else None
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
@@ -144,7 +156,7 @@ def chunk_scaled_dot_kkt_fwd(
         g=g,
         beta=beta,
         A=A,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=kernel_cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
         H=H,
