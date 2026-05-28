@@ -50,9 +50,7 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices_16 = (
             prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
         )
-        NT_16 = (
-            len(chunk_indices_16) if cu_seqlens is not None else triton.cdiv(T, 16)
-        )
+        NT_16 = len(chunk_indices_16) if cu_seqlens is not None else triton.cdiv(T, 16)
         Ai16 = torch.empty(B, T, Hv, 16, device=A.device, dtype=torch.float32)
         solve_tril_16x16_kernel[(NT_16, B * Hv)](
             A=A,
