@@ -6,10 +6,9 @@
 Usage:
     python -m atom.entrypoints.openai_server --model <model> [options]
 """
+from atom.utils import envs
 
-import os
-
-if os.environ.get("USE_ATOMESH_ENTRYPOINTS") == "1":
+if envs.USE_ATOMESH_ENTRYPOINTS:
     from atom.entrypoints.atomesh.server import main
 else:
     from atom.entrypoints.openai.api_server import main
