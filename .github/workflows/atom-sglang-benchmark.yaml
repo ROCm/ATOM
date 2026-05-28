@@ -650,7 +650,7 @@ jobs:
               cd /app/aiter-test && \\
               git checkout HEAD && \\
               git submodule sync && git submodule update --init --recursive && \\
-              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+              AITER_USE_SYSTEM_TRITON=1 MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
           RUN pip uninstall -y atom || true
