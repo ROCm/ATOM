@@ -16,7 +16,7 @@ from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import init_exit_handler, make_zmq_socket
+from atom.utils import envs, init_exit_handler, make_zmq_socket
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -393,6 +393,19 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
+        if envs.ATOM_ENABLE_PREFILL_DELAYER:
+            from atom.model_engine.prefill_delayer import PrefillDelayer
+
+            self.scheduler.set_prefill_delayer(
+                PrefillDelayer(
+                    dp_size=config.parallel_config.data_parallel_size,
+                    cpu_group=self.dp_group,
+                    max_delay_passes=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES,
+                    max_delay_ms=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_MS,
+                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                )
+            )
+
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
         dp_size = config.parallel_config.data_parallel_size
@@ -404,6 +417,10 @@ class DPEngineCoreProc(EngineCore):
 
         self.dp_rank = dp_rank
         self.dp_group = config.parallel_config.stateless_init_dp_group()
+        # NOTE: PrefillDelayer attachment lives in __init__ (after
+        # super().__init__ creates self.scheduler) — not here. This
+        # function runs during super().__init__, before self.scheduler
+        # exists.
 
     def exit(self):
         super().exit()
@@ -414,24 +431,10 @@ class DPEngineCoreProc(EngineCore):
         shutdown = False
         while True:
             shutdown = shutdown or self.pull_and_process_input_queue()
-
-            local_is_prefill, local_num_tokens, local_num_reqs = (
-                self.scheduler.get_next_batch_info()
-            )
             local_unfinished = not self.scheduler.is_finished()
 
-            (
-                global_has_prefill,
-                global_max_tokens,
-                global_max_reqs,
-                global_has_unfinished,
-                global_shutdown,
-            ) = self._sync_dp_state(
-                local_is_prefill,
-                local_num_tokens,
-                local_num_reqs,
-                local_unfinished,
-                shutdown,
+            global_has_unfinished, global_shutdown = self._sync_dp_state(
+                local_unfinished, shutdown
             )
 
             if global_shutdown and not global_has_unfinished:
@@ -444,68 +447,26 @@ class DPEngineCoreProc(EngineCore):
                 self.engines_running = False
                 continue
 
-            if global_has_prefill and not local_is_prefill:
-                # We must do dummy prefill to sync here
-                # Since we want to split mori output in moe, we need to make dp all run prefill or all run decode
-                dummy_reqs = min(
-                    global_max_reqs, 2
-                )  # dummy reqs at 2: just enough for TBO agreement, avoid wasting compute.
-                logger.info(
-                    f"{self.label}: Running dummy prefill ({global_max_tokens} tokens, {dummy_reqs} reqs) "
-                    f"to sync with other DP ranks doing prefill"
-                )
-                self._execute_dummy_prefill(global_max_tokens, dummy_reqs)
-            else:
-                executed = self._process_engine_step()
-                if not executed:
-                    if global_has_prefill:
-                        # get_next_batch_info predicted prefill but schedule()
-                        # skipped it (e.g. WAITING_FOR_REMOTE_KVS).  Other DP
-                        # ranks already committed to dummy_prefill, so we must
-                        # match to keep the all-reduce in sync.
-                        logger.info(
-                            f"{self.label}: Predicted prefill was not scheduled, "
-                            f"falling back to dummy prefill ({global_max_tokens} "
-                            f"tokens) to stay in sync with other DP ranks"
-                        )
-                        self._execute_dummy_prefill(global_max_tokens)
-                    else:
-                        self._execute_dummy_batch()
+            executed = self._process_engine_step()
+            if not executed:
+                self._execute_dummy_batch()
 
             self.engines_running = global_has_unfinished
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)
 
-    def _execute_dummy_prefill(self, num_tokens: int, num_reqs: int = 1):
-        return self.runner_mgr.call_func(
-            "dummy_prefill_execution", num_tokens, num_reqs, wait_out=True
-        )
-
     def _sync_dp_state(
         self,
-        local_is_prefill: bool,
-        local_num_tokens: int,
-        local_num_reqs: int,
         local_has_unfinished: bool,
         local_shutdown: bool = False,
-    ) -> tuple[bool, int, int, bool, bool]:
+    ) -> tuple[bool, bool]:
         if self._shutting_down:
-            return (
-                local_is_prefill,
-                local_num_tokens,
-                local_num_reqs,
-                local_has_unfinished,
-                True,
-            )
+            return local_has_unfinished, True
 
         try:
-            # Pack all state: [is_prefill, num_tokens, num_reqs, has_unfinished, shutdown]
             state_tensor = torch.tensor(
                 [
-                    1 if local_is_prefill else 0,
-                    local_num_tokens,
-                    local_num_reqs,
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
                 ],
@@ -515,29 +476,13 @@ class DPEngineCoreProc(EngineCore):
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
-            global_has_prefill = state_tensor[0].item() == 1
-            global_max_tokens = state_tensor[1].item()
-            global_max_reqs = state_tensor[2].item()
-            global_has_unfinished = state_tensor[3].item() == 1
-            global_shutdown = state_tensor[4].item() == 1
-            return (
-                global_has_prefill,
-                global_max_tokens,
-                global_max_reqs,
-                global_has_unfinished,
-                global_shutdown,
-            )
+            global_has_unfinished = state_tensor[0].item() == 1
+            global_shutdown = state_tensor[1].item() == 1
+            return global_has_unfinished, global_shutdown
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
-            # If sync fails, assume shutdown to prevent hang
             self._shutting_down = True
-            return (
-                local_is_prefill,
-                local_num_tokens,
-                local_num_reqs,
-                local_has_unfinished,
-                True,
-            )
+            return local_has_unfinished, True
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:

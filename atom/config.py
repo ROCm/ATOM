@@ -636,6 +636,16 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         for field in ("bos_token_id", "eos_token_id", "pad_token_id"):
             if getattr(hf_config, field, None) is None and field in config_dict:
                 setattr(hf_config, field, config_dict[field])
+        if not hasattr(hf_config, "text_config"):
+            hf_config.text_config = hf_config
+        # Store full multimodal config (with vision_config) for vision encoder init
+        try:
+            full_config = AutoConfig.from_pretrained(
+                model, trust_remote_code=trust_remote_code
+            )
+            hf_config._multimodal_config = full_config
+        except Exception:
+            hf_config._multimodal_config = None
         return hf_config
 
     if model_type in _CONFIG_REGISTRY:
@@ -994,6 +1004,8 @@ class Config:
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        # Multimodal config (full config with vision_config) for vision encoder init
+        self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:

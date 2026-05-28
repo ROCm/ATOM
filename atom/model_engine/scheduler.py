@@ -245,7 +245,7 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.context_lens = np.asarray(
-            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
+            [_seq.num_tokens for _seq in seqs.values()], dtype=np.int32
         )
         self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
@@ -271,6 +271,17 @@ class ScheduledBatch:
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
         ]
+        self.mrope_positions_by_req = {
+            seq.id: seq.mrope_positions
+            for seq in seqs.values()
+            if getattr(seq, "mrope_positions", None) is not None
+        }
+        self.mrope_position_deltas = {
+            seq.id: getattr(seq, "mrope_position_delta", 0)
+            for seq in seqs.values()
+            if getattr(seq, "mrope_positions", None) is not None
+        }
+        self.has_mrope = bool(self.mrope_positions_by_req)
 
         offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
@@ -289,9 +300,9 @@ class ScheduledBatch:
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
         self.last_block_num_tokens = [
-            seq.last_block_num_tokens for seq in seqs.values()
+            _seq.last_block_num_tokens for _seq in seqs.values()
         ]
-        self.num_cached_tokens = [seq.num_cached_tokens for seq in seqs.values()]
+        self.num_cached_tokens = [_seq.num_cached_tokens for _seq in seqs.values()]
 
         # Total number of tokens scheduled for all requests.
         self.total_tokens_num = total_tokens_num
@@ -308,6 +319,14 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
+
+        # Collect multimodal data from prefill sequences
+        self.multimodal_data = {}
+        for seq in seqs.values():
+            if getattr(seq, "multimodal_data", None) is not None:
+                self.multimodal_data[seq.id] = seq.multimodal_data
+                # Clear after first use to avoid re-sending on decode steps
+                seq.multimodal_data = None
 
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")
@@ -413,6 +432,61 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+
+        # Cross-DP prefill alignment. Set by DPEngineCoreProc after
+        # dp_group is available. See `prefill_delayer.py` for rationale.
+        from atom.model_engine.prefill_delayer import PrefillDelayer
+
+        self.prefill_delayer: Optional[PrefillDelayer] = None
+
+    def set_prefill_delayer(self, delayer) -> None:
+        self.prefill_delayer = delayer
+
+    def _can_admit_head_prefill(self) -> bool:
+        """Match SGL's `local_prefillable=True` semantics: report True iff
+        this rank would *actually* admit a new prefill this tick.
+
+        Just having `self.waiting` non-empty is too coarse — during a
+        concurrent-burst workload (e.g. 1k/1k @ high concurrency) every
+        DP rank has a full waiting queue, so `bool(self.waiting)` is
+        ALWAYS True on all ranks → status="all" → delayer never engages.
+        But only the 1-2 ranks with free KV blocks actually admit a
+        prefill that tick; the other 6-7 ranks decode. That's the real
+        "mixed" we need to delay.
+
+        We peek the front of `waiting` (skipping a few unschedulable
+        entries) and check `can_allocate` + token-budget, mirroring the
+        same checks the admission while-loop runs below.
+        """
+        if not self.waiting:
+            return False
+        for i, seq in enumerate(self.waiting):
+            if i >= 4:
+                break
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            if num_new_tokens > self.max_num_batched_tokens:
+                continue
+            if self.block_manager.can_allocate(seq) < 0:
+                return False  # KV-pressured: definitely cannot prefill
+            return True
+        return False
+
+    def _kv_usage(self) -> float:
+        """Fraction of KV-cache blocks currently in use ∈ [0, 1].
+
+        Used as the `token_usage` signal for PrefillDelayer's low-watermark
+        safety valve. Derived from BlockManager bookkeeping; cheap (no
+        traversal of seq tables).
+        """
+        bm = self.block_manager
+        total = len(bm.blocks)
+        if total <= 0:
+            return 0.0
+        return len(bm.used_block_ids) / total
 
     def is_finished(self):
         # `_rejected` must be considered too: if a batch of seqs is all
@@ -541,11 +615,25 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
+        # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
+        _delayer_allows_prefill = True
+        if self.prefill_delayer is not None:
+            _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
+                local_prefillable=self._can_admit_head_prefill(),
+                token_usage=self._kv_usage(),
+            )
+
         if not self.running and not self.waiting:
             return None
 
-        # --- Prefill scheduling ---
-        while self.waiting and num_seqs_prefill < self.max_num_seqs:
+        # --- Prefill scheduling --- (gated by `_delayer_allows_prefill`
+        # computed at the very top of schedule() to keep the cross-DP
+        # collective aligned across all early-return paths)
+        while (
+            _delayer_allows_prefill
+            and self.waiting
+            and num_seqs_prefill < self.max_num_seqs
+        ):
             seq = self.waiting.popleft()
 
             # Drop seqs the static-capacity check at submit-time flagged as
@@ -794,10 +882,27 @@ class Scheduler:
             # chunked-prefill scheduling where one block may span multiple
             # steps. Must run before any seq state update so num_cached_tokens
             # and block_table still reflect the pre-step view.
-            if seq.type == SequenceType.PREFILL:
-                self.block_manager.hash_blocks(
-                    seq, seq.num_tokens - seq.num_cached_tokens
-                )
+            #
+            # Gate is `not prefix_hashes_published`, not `seq.type ==
+            # PREFILL`: ModelRunner runs in deferred-output mode by default
+            # (tokenIDProcessor.is_deferred_out), so the prefill step's
+            # postprocess sees idx=None and skips this seq (above). By the
+            # time the prefill output surfaces, the next step's schedule
+            # has already flipped seq.type to DECODE — the old PREFILL
+            # gate never fires and `hash_to_block_id` stays empty for
+            # prompt blocks (HBM prefix cache silently dead). The flag
+            # gate fires once per seq at the first postprocess with idx.
+            #
+            # `num_new` subtracts `num_placeholder` when deferred-output is
+            # active: those slots are filled with the real prefill output
+            # later in this loop, so they're not part of the prompt hash
+            # chain — leaving them in would mint a stale partial-block hash.
+            if not seq.prefix_hashes_published:
+                _num_new = seq.num_tokens - seq.num_cached_tokens
+                if need_placeholder:
+                    _num_new -= num_placeholder
+                self.block_manager.hash_blocks(seq, _num_new)
+                seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
             if is_deferred_out or self.use_spec:
