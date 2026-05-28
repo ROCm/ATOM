@@ -42,6 +42,8 @@ from aiter.dist.communication_op import (
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
+from aiter.ops.flydsl.kernels.fp8_einsum import fp8_einsum
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -69,7 +71,11 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from aiter import rope_rotate_activation
-from atom.model_ops.quant_v4 import act_quant_inplace
+from atom.model_ops.quant_v4 import (
+    act_quant_inplace,
+    fp32_to_ue8m0_byte,
+    pack_ue8m0_bytes_to_i32,
+)
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
@@ -123,6 +129,11 @@ _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+# When on, the wo_a grouped LoRA is computed by the flydsl fp8_einsum kernel
+# instead of the BF16 torch.einsum. Activation quant is fused into the
+# inverse-RoPE Triton kernel (single launch). Requires `tp_size == 1` at V4-Pro
+# until per-TP shapes are added to the fp8_einsum autotune table.
+_V4_USE_FP8_WO_A = os.environ.get("ATOM_V4_USE_FP8_WO_A", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 
 
@@ -1372,35 +1383,119 @@ class DeepseekV4Attention(nn.Module):
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
 
     def process_weights_after_loading(self) -> None:
-        """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
+        """Convert wo_a (FP8 + e8m0 block scale) into the layout the grouped
+        LoRA expects.
 
-        Called by ATOM's standard loader (atom.model_loader.loader.load_model)
-        after all weights are filled. wo_a is allocated as FP8 ColumnParallelLinear
-        so both `.weight` (FP8) and `.weight_scale` (e8m0 block scale) load
-        correctly via the standard FP8 path. We then dequant to BF16 because
-        forward needs `wo_a.weight` as BF16 for the grouped LoRA einsum
-        (`bsgd,grd->bsgr`); aiter has no FP8 grouped einsum.
+        Two paths, switched by `_V4_USE_FP8_WO_A`:
 
-        Idempotent: if wo_a.weight is already BF16 (e.g. dequant was applied
-        elsewhere), this is a no-op.
+        - Default (BF16 path): dequant FP8 → BF16 in place. forward_impl runs
+          the grouped LoRA as a plain BF16 `torch.einsum`.
+
+        - FP8 path (env `ATOM_V4_USE_FP8_WO_A=1`): keep the weight as FP8 but
+          repack into the flydsl `fp8_einsum` ABI — preshuffled FP8 weight
+          `(G, R, K)` + packed-UE8M0 i32 scale `(G, R/128, K/512)`. forward_impl
+          fuses activation quant into `inverse_rope_inplace(quant_out=True)`
+          and dispatches the grouped LoRA through `fp8_einsum`.
+
+        Idempotent: if wo_a.weight has already been converted (BF16 with
+        scale dropped, or `wo_a_y_pre` already bound), this is a no-op.
         """
         w = self.wo_a.weight
+        if hasattr(self, "wo_a_y_pre"):
+            return  # already converted to fp8_einsum layout
         if w.dtype == torch.bfloat16:
-            return  # already dequanted
+            return  # already dequanted (default-path idempotency)
         scale = getattr(self.wo_a, "weight_scale", None)
         if w.dtype != torch.float8_e4m3fn or scale is None:
             return  # nothing to do
-        # Dequant: w (FP8 [out, in]) × scale (e8m0 [out/128, in/128]) → BF16
-        bf16 = _dequant_fp8_block_to_bf16(
-            w.data, scale.data.to(torch.float32), block=128
-        )
-        # Replace the weight tensor with BF16, drop the scale param so future
-        # loads / introspection don't try to use a stale FP8 scale.
-        self.wo_a.weight = atom_parameter(bf16)
-        try:
-            delattr(self.wo_a, "weight_scale")
-        except AttributeError:
-            pass
+
+        if _V4_USE_FP8_WO_A:
+            # Repack to fp8_einsum ABI. Disk layout:
+            #   w     : FP8 e4m3 [G * R, K] (n_local_groups * o_lora_rank rows,
+            #                                d_per_group cols)
+            #   scale : UE8M0    [G * R / 128, K / 128]
+            # Target layout (fp8_einsum):
+            #   y_pre : FP8 e4m3 [G, R/16, K/64, 4, 16, 16] (after shuffle_weight
+            #                                                 with layout=(16, 32))
+            #   sy_i32: i32      [G, R/128, K/512]   (4 UE8M0 bytes per i32, LE)
+            G = self.n_local_groups
+            R = self.o_lora_rank
+            assert w.shape[0] == G * R, f"wo_a.weight rows {w.shape[0]} != G*R = {G*R}"
+            K = w.shape[1]  # d_per_group
+            assert scale.shape == (G * R // 128, K // 128), (
+                f"wo_a.weight_scale shape {tuple(scale.shape)} != "
+                f"{(G * R // 128, K // 128)}"
+            )
+            # Check that the shape is in the fp8_einsum autotune table.
+            # tp>1 currently lands on (H<16, D=1024, R=4096) which is not tuned.
+            # When unsupported, transparently fall back to the BF16 path for
+            # THIS layer instead of failing engine startup — keeps the FP8
+            # path opt-in even when it can't cover the configured TP shape.
+            from aiter.ops.flydsl.kernels.fp8_einsum import (
+                _AUTOTUNE_WINNERS_BF16 as _winners,
+            )
+
+            tuned = {(h, d, r) for (h, d, r, _) in _winners}
+            if (G, R, K) not in tuned:
+                import warnings
+
+                warnings.warn(
+                    f"ATOM_V4_USE_FP8_WO_A=1 but wo_a shape "
+                    f"(H={G}, D={R}, R={K}) is not in fp8_einsum's autotune "
+                    f"table {sorted(tuned)}; falling back to BF16 einsum for "
+                    f"this layer. Tune the missing shape to enable FP8 here.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                # Fall back to the BF16 path for this layer. forward_impl
+                # checks `wo_a_y_pre` presence to know which branch to take,
+                # so we just refrain from setting it and let the BF16 dequant
+                # block below run.
+                bf16 = _dequant_fp8_block_to_bf16(
+                    w.data, scale.data.to(torch.float32), block=128
+                )
+                self.wo_a.weight = atom_parameter(bf16)
+                try:
+                    delattr(self.wo_a, "weight_scale")
+                except AttributeError:
+                    pass
+                self.wo_a.quant_type = QuantType.No
+                return
+            # Reshape weight to per-group (G, R, K), preshuffle for fp8_einsum.
+            w_grouped = w.data.view(G, R, K).contiguous()
+            y_pre = shuffle_weight(w_grouped, layout=(16, 32)).contiguous()
+            # Repack scale: (G, R/128, K/128) → (G, R/128, K/512) i32.
+            # The ATOM loader stores `weight_scale` as fp32 (see
+            # `model_ops/linear.py:per_1x128` allocator), regardless of whether
+            # the on-disk file used FP8_E8M0 or fp32; the loader runs the
+            # appropriate dequant/requant during weight load. Convert each fp32
+            # scale to its UE8M0 biased-exp byte (round-up-to-next-pow2),
+            # then pack 4 bytes per i32 to match fp8_einsum's ABI.
+            scale_f32 = scale.data.float().view(G, R // 128, K // 128)
+            sy_byte = fp32_to_ue8m0_byte(scale_f32)
+            sy_i32 = pack_ue8m0_bytes_to_i32(sy_byte)
+            self.wo_a_y_pre = y_pre
+            self.wo_a_sy_i32 = sy_i32
+            # Free the original FP8 weight + scale storage. We set the
+            # Linear's weight to an empty placeholder of the original shape
+            # so anything that introspects it still gets a sane dtype.
+            self.wo_a.weight = atom_parameter(
+                torch.empty(0, dtype=torch.float8_e4m3fn, device=w.device)
+            )
+            try:
+                delattr(self.wo_a, "weight_scale")
+            except AttributeError:
+                pass
+        else:
+            # Default (BF16) path: dequant in place, drop the scale.
+            bf16 = _dequant_fp8_block_to_bf16(
+                w.data, scale.data.to(torch.float32), block=128
+            )
+            self.wo_a.weight = atom_parameter(bf16)
+            try:
+                delattr(self.wo_a, "weight_scale")
+            except AttributeError:
+                pass
         # CRITICAL: prevent LinearBase.process_weights_after_loading from
         # `shuffle_weights(self.weight)` on the now-BF16 wo_a. That shuffle
         # is for the FP8 CK GEMM layout; applying it to a plain BF16 matrix
@@ -1672,11 +1767,74 @@ class DeepseekV4Attention(nn.Module):
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
-        self.rotary_emb.inverse(positions, o[..., -rd:])
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
-        o = o.view(num_tokens, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        # Use FP8 path only when env is on AND process_weights_after_loading
+        # successfully built the repacked FP8 weights for THIS layer (it falls
+        # back to BF16 per-layer when the shape isn't in the autotune table).
+        if _V4_USE_FP8_WO_A and hasattr(self, "wo_a_y_pre"):
+            # One launch: inverse RoPE on the rope tail of each head + per-D128
+            # amax → UE8M0 → FP8 e4m3 cast + packed-i32 scale write. Output
+            # layout matches fp8_einsum's X-operand ABI.
+            o_fp8, o_sx = inverse_rope_inplace(
+                o,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                positions,
+                quant_out=True,
+                n_groups=self.n_local_groups,
+            )  # o_fp8 [S, G, d_per_group], o_sx [S, G, d_per_group/512]
+            # Grouped LoRA via flydsl fp8_einsum ('bhr,hdr->bhd') in FP8-output
+            # mode: B=S, H=G, R=d_per_group, D=o_lora_rank. The fp8 + fp32
+            # per-D128 scale outputs are piped directly to wo_b's FP8 GEMM via
+            # `x_scale=` — skips wo_b's own per_1x128 quant step.
+            #
+            # Scale layout has to match wo_b's GEMM contract:
+            #   - preshuffle GEMM (`ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=1`,
+            #     default) reads `x_scale` shape `[S, k/128]` with COLUMN-MAJOR
+            #     data ordering — i.e. memory laid out as `[k/128, S]`
+            #     contiguous, viewed as `[S, k/128]`.  fp8_einsum's
+            #     `transpose_scale=True` produces `(D/128, S, G)` contiguous;
+            #     permute to `(G, D/128, S)` and reshape to `(S, G*D/128)`
+            #     so memory order is `[G*D/128, S]` which is exactly what the
+            #     preshuffle GEMM wants.
+            #   - non-preshuffle GEMM reads `x_scale` as plain row-major
+            #     `[S, k/128]`. `transpose_scale=False` gives `(S, G, D/128)`
+            #     row-major; flatten directly.
+            # tps = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+            z_fp8, _ = fp8_einsum(
+                o_fp8,
+                self.wo_a_y_pre,
+                o_sx,
+                self.wo_a_sy_i32,
+            )  # z_fp8 [S, G, o_lora_rank], sz [...]
+            x_fp8 = z_fp8.view(num_tokens, -1)  # [S, G*o_lora_rank]
+            # if tps:
+            #     # sz: (D/128, S, G) contig. The preshuffle GEMM wants
+            #     # `x_scale` memory laid out as (G*D/128, S) contig — i.e.
+            #     # column-major in the (S, G*D/128) view. Build that memory
+            #     # via permute(2, 0, 1).contiguous() → (G, D/128, S) contig
+            #     # = (G*D/128, S) contig after collapse; then expose as the
+            #     # transpose (m=S, scale_k=G*D/128) with strides (1, S).
+            #     G = self.n_local_groups
+            #     D_blk = self.o_lora_rank // 128
+            #     sz_km = (
+            #         sz.permute(2, 0, 1)  # (G, D/128, S) non-contig
+            #         .contiguous()  # contig, memory = g*D/128*S + d*S + s
+            #         .view(G * D_blk, num_tokens)  # (scale_k, m) contig
+            #     )
+            #     x_scale = sz_km.transpose(
+            #         0, 1
+            #     )  # (m, scale_k) non-contig, strides (1, m)
+            # else:
+            #     # sz: (S, G, D/128) row-major -> flatten last 2 dims.
+            #     x_scale = sz.view(num_tokens, -1)
+            x = self.wo_b(x_fp8)
+            return x
+        else:
+            self.rotary_emb.inverse(positions, o[..., -rd:])
+            o = o.view(num_tokens, self.n_local_groups, -1)
+            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+            o = torch.einsum("sgd,grd->sgr", o, wo_a)
         x = self.wo_b(o.flatten(1))
         return x
 
