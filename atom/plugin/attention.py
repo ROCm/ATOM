@@ -615,6 +615,64 @@ class vllmAttentionMetadataBuilderMethods:
 
         return attn_metadata
 
+    def build_for_drafting(
+        self,
+        common_attn_metadata,
+        draft_index: int,
+    ) -> AttentionMetaData:
+        """
+        Build attention metadata for draft model without CPU-GPU sync.
+
+        During EAGLE/MTP drafting all requests are uniform decodes, so we can
+        skip split_decodes_prefills_and_extends() and avoid all .cpu() /
+        .item() calls that would otherwise break CUDA graph capture.
+        """
+        query_start_loc = common_attn_metadata.query_start_loc_cpu
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        is_prefill = query_lens > self.reorder_batch_threshold
+
+        if torch.any(is_prefill):
+            return self.build(
+                common_prefix_len=0, common_attn_metadata=common_attn_metadata
+            )
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        decode_metadata = AiterFlashAttentionDecodeMetadata(
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            query_start_loc=common_attn_metadata.query_start_loc,
+        )
+        attn_metadata_for_plugin_mode = AiterFlashAttentionMetadataForPluginMode(
+            num_actual_tokens=num_tokens,
+            num_actual_kv_tokens=0,
+            max_query_len=common_attn_metadata.max_query_len,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            seq_lens=common_attn_metadata.seq_lens,
+            block_table=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            num_decodes=num_reqs,
+            num_decode_tokens=num_tokens,
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_extends=0,
+            num_extend_tokens=0,
+            decode_metadata=decode_metadata,
+            prefill_metadata=None,
+            extend_metadata=None,
+            use_cascade=False,
+            common_prefix_len=0,
+            total_tokens=self.total_tokens,
+        )
+
+        attn_metadata = AttentionMetaData(
+            max_seqlen_q=common_attn_metadata.max_query_len,
+            block_tables=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            plugin_metadata=attn_metadata_for_plugin_mode,
+        )
+        return attn_metadata
+
     # this method will be called by vllm, so it follows the vllm's interface convention
     def build_for_cudagraph_capture(
         self,

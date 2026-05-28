@@ -1337,10 +1337,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata: AttentionMetaData,
         ub_slice,
         padded_bs: int,
+        ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         """
         Split prefill AttentionMetaData for MLA.
         """
+        del ubatch_idx  # MLA has no per-ubatch pooled buffers to disambiguate
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
