@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]  # Triggers on PRs targeting `main`
+    branches: [main, Jasen/atom_mesh]  # Triggers on PRs targeting these branches
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - '**/*.md'
