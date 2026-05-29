@@ -326,21 +326,20 @@ class Eagle3LlamaModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (hidden_for_logits, hidden_for_next_step).
+    ) -> torch.Tensor:
+        """Return the single hidden state carried to the next speculative step.
 
-        EAGLE 3 (default): both are the pre-norm hidden state (legacy behavior).
-        EAGLE 3.1 (norm_output=True): the second is the post-norm hidden state,
-        which is what the drafter consumes on the next speculative step.
+        EAGLE 3.1 (norm_output=True): post-norm hidden state.
+        EAGLE 3   (default):          pre-norm hidden state (legacy behavior).
+        compute_logits() is norm-aware, so EagleProposer only sees one tensor.
         """
         embeds = self.embed_tokens(input_ids)
         hidden_states = self.midlayer(positions, embeds, hidden_states)
-        if self.norm_output:
-            aux_hidden_states = self.norm(hidden_states)
-        else:
-            aux_hidden_states = hidden_states
-        return hidden_states, aux_hidden_states
+        return self.norm(hidden_states) if self.norm_output else hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.norm(hidden_states)
+        # Only norm the legacy pre-norm path; norm_output already normed in
+        # forward(). Avoids double-norm and stays byte-equivalent to EAGLE 3.
+        if not self.norm_output:
+            hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)

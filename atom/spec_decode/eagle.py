@@ -383,30 +383,21 @@ class EagleProposer:
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
-                model_out = self.model(
+                ret_hidden_states = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     hidden_states=hidden_states,
                 )
-                # EAGLE 3.1: drafter returns (hidden_for_logits, hidden_for_next_step).
-                # EAGLE 3: drafter returns a single tensor (legacy MTP/Eagle3); both
-                # roles are the same pre-norm tensor.
-                if isinstance(model_out, tuple):
-                    ret_hidden_states, ret_aux_hidden_states = model_out
-                else:
-                    ret_hidden_states = model_out
-                    ret_aux_hidden_states = model_out
-
+                # The drafter returns a single hidden state: it is both fed to
+                # compute_logits (norm-aware) and carried to the next step.
+                # Whether it is pre- or post-norm is the model's own business
+                # (norm_output), so the proposer stays norm-agnostic.
                 if i == 0:
                     sample_hidden_states = torch.index_select(
                         ret_hidden_states, 0, last_token_indices
                     )
-                    sample_aux_hidden_states = torch.index_select(
-                        ret_aux_hidden_states, 0, last_token_indices
-                    )
                 else:
                     sample_hidden_states = ret_hidden_states
-                    sample_aux_hidden_states = ret_aux_hidden_states
                 logits = self.model.compute_logits(sample_hidden_states)
                 new_draft_ids = logits.argmax(dim=-1)
                 draft_token_ids[:, i] = new_draft_ids
@@ -476,9 +467,9 @@ class EagleProposer:
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
-                    # EAGLE 3.1 post-norm feedback: feed aux (post-norm) when
-                    # the drafter exposes it; legacy path uses pre-norm.
-                    hidden_states = sample_aux_hidden_states
+                    # Carry the single hidden forward; pre-/post-norm is decided
+                    # inside the drafter model, not here.
+                    hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]

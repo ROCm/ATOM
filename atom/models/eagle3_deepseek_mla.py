@@ -363,15 +363,22 @@ class Eagle3DeepseekMLAModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        """Return the single hidden state carried to the next speculative step.
+
+        EAGLE 3.1 (norm_output=True): post-norm hidden state.
+        EAGLE 3   (norm_output=False): pre-norm hidden state (legacy behavior).
+        compute_logits() is norm-aware and consumes whichever this returns, so
+        EagleProposer only ever sees one tensor (no pre/post-norm bookkeeping).
+        """
         embeds = self.embed_tokens(input_ids)
         hidden_states = self.layers[0](positions, embeds, hidden_states)
-        if self.norm_output:
-            aux_hidden_states = self.norm(hidden_states)
-        else:
-            aux_hidden_states = hidden_states
-        return hidden_states, aux_hidden_states
+        return self.norm(hidden_states) if self.norm_output else hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.norm(hidden_states)
+        # forward() already applied the final norm when norm_output is set;
+        # only norm here for the legacy pre-norm path, so logits are never
+        # double-normed and stay byte-equivalent to EAGLE 3.
+        if not self.norm_output:
+            hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
