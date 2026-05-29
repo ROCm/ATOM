@@ -277,11 +277,11 @@ def _a8w4_fused_experts(
               moe_gemm_a8w4 (G2). No apply_swiglu fold, no out_mx_quant fold,
               no residual fold — those are later steps.
     """
-    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4, recommend_block_m
+    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
     from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
     M, K = hidden_states.shape[-2:]
-    BLOCK_M = recommend_block_m(M)
+    BLOCK_M = 64 if M >= 256 else 16
 
     # Pre-MoE quant: bf16 -> fp8 e4m3 + ue8m0 per-1x32.
     if x_scale is None:

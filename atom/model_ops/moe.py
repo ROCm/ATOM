@@ -1027,7 +1027,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     # Detection: custom_routing_function is the bound method of a
                     # MoeLayer whose gate has the tid2eid lookup table.
                     from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
-                    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
                     from aiter.ops.triton.moe.moe_routing.routing import (
                         routing_a8w4,
                         routing_a8w4_from_hash,
@@ -1042,7 +1041,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         )
                     )
                     M = x.shape[-2]
-                    block_m = recommend_block_m(M)
+                    block_m = 64 if M >= 256 else 16
                     n_expts_tot = router_logits.shape[-1]
                     if global_num_experts > 0:
                         n_expts_tot = global_num_experts
