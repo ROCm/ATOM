@@ -1,14 +1,8 @@
 name: ATOM Test
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "LICENSE"
-      - ".gitignore"
+  # MMStar is nightly-only — too heavy (4h timeout, MI35x runner) to run
+  # on every PR. Manual reruns via workflow_dispatch.
   schedule:
     # Daily at 03:00 Beijing time (19:00 UTC on the previous day).
     - cron: "0 19 * * *"
@@ -67,9 +61,18 @@ jobs:
               },
           ]
 
+          # Whitelist enable: schedule = all models; workflow_dispatch =
+          # only models whose toggle was explicitly checked. Any other
+          # trigger (pull_request, push, ...) yields an empty matrix
+          # rather than silently kicking off a 4h MMStar run.
           selected = []
           for model in models:
-              enabled = event != "workflow_dispatch" or os.environ.get(model["toggle_env"], "").lower() == "true"
+              if event == "schedule":
+                  enabled = True
+              elif event == "workflow_dispatch":
+                  enabled = os.environ.get(model["toggle_env"], "").lower() == "true"
+              else:
+                  enabled = False
               if enabled:
                   selected.append({k: v for k, v in model.items() if k != "toggle_env"})
 
