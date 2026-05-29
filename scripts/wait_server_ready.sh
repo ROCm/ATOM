@@ -29,6 +29,14 @@ for ((i=1; i<=ITERS; i++)); do
     sleep "$POLL"
     READY=$(curl -s -m 3 "http://localhost:${PORT}/v1/models" 2>/dev/null | head -c 60)
     if [ -f "$LOG_FILE" ]; then
+        # Detect truncation/recreation: if current size < snapshot, the file
+        # was rewritten (e.g. start_atom_server.sh `tee` truncates). Reset
+        # offset to 0 so we scan the new content.
+        CUR_BYTES=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$CUR_BYTES" -lt "$LOG_START_BYTES" ]; then
+            echo "[t=$((i*POLL))s] log truncated (cur=$CUR_BYTES < snapshot=$LOG_START_BYTES), scanning from offset 0"
+            LOG_START_BYTES=0
+        fi
         ERR=$(tail -c "+$((LOG_START_BYTES + 1))" "$LOG_FILE" 2>/dev/null \
             | grep -c "cluster_dims\|InductorError\|SHUTDOWN signal\|proc died")
     else

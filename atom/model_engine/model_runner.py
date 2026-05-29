@@ -974,7 +974,7 @@ class ModelRunner:
         mtp_factor = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
         num_tokens_original = mtp_factor
 
-        seq = Sequence([0] * num_tokens_original, block_size=self.block_size)
+        seq = Sequence([0] * num_tokens_original, block_size=self.block_size, id=-1)
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
         seq.block_table = [0]

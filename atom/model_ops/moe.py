@@ -204,7 +204,11 @@ def pad_for_all_gather(x: torch.Tensor):
 
 def all_gather_with_padding(x: torch.Tensor):
     padded_x, original_batch_size = pad_for_all_gather(x)
-    gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=0)
+    # use_custom=True routes through CA IPC (outplace_all_gather). Default
+    # use_custom=False falls back to torch.distributed.all_gather_into_tensor
+    # (NCCL), whose WorkNCCL end-event recorded inside CUDAGraph capture is
+    # later queried by the watchdog thread -> hipErrorCapturedEvent crash.
+    gathered_hidden_states = get_dp_group().all_gather(padded_x, use_custom=True, dim=0)
     return gathered_hidden_states, original_batch_size
 
 

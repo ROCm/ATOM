@@ -48,6 +48,9 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
     batched_gemm_afp4wfp4_pre_quant,
 )
+from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
+    batched_gemm_a16wfp4,
+)
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
@@ -336,6 +339,26 @@ def mla_v_up_proj(
     effective_weight_scale = (
         weight_scale_k if weight_scale_k is not None else weight_scale
     )
+    if _is_hip and _use_aiter_gfx95 and weight.dtype == torch.uint8:
+        x = inp.transpose(0, 1)
+        out = torch.empty(
+            (inp.shape[0], attn.num_local_heads * out_dim),
+            device=inp.device,
+            dtype=torch.bfloat16,
+        )
+        out_3d = out.view(inp.shape[0], attn.num_local_heads, out_dim)
+        batched_gemm_a16wfp4(
+            x,
+            weight.transpose(-2, -1),
+            weight_scale_k.transpose(-2, -1),
+            dtype=torch.bfloat16,
+            y=out_3d,
+            transpose_bm=True,
+            prequant=True,
+            y_scale=None,
+        )
+        return out
+
     if _is_hip and (
         (_use_aiter_gfx95 and weight.dtype == torch.float8_e4m3fn)
         or (get_is_capture_mode() and weight.dtype == torch.float8_e4m3fnuz)

@@ -878,12 +878,31 @@ class Scheduler:
             # Register prefix-cache hashes for blocks the prefill step just
             # finalized. Deferred from BlockManager.allocate() so a hash is
             # only published after the block's KV has actually been computed
-            # by the forward. Must run before any seq state update so
-            # num_cached_tokens and block_table still reflect the pre-step view.
-            if seq.type == SequenceType.PREFILL:
-                self.block_manager.hash_blocks(
-                    seq, seq.num_tokens - seq.num_cached_tokens
-                )
+            # by the forward — keeps the block manager correct under future
+            # chunked-prefill scheduling where one block may span multiple
+            # steps. Must run before any seq state update so num_cached_tokens
+            # and block_table still reflect the pre-step view.
+            #
+            # Gate is `not prefix_hashes_published`, not `seq.type ==
+            # PREFILL`: ModelRunner runs in deferred-output mode by default
+            # (tokenIDProcessor.is_deferred_out), so the prefill step's
+            # postprocess sees idx=None and skips this seq (above). By the
+            # time the prefill output surfaces, the next step's schedule
+            # has already flipped seq.type to DECODE — the old PREFILL
+            # gate never fires and `hash_to_block_id` stays empty for
+            # prompt blocks (HBM prefix cache silently dead). The flag
+            # gate fires once per seq at the first postprocess with idx.
+            #
+            # `num_new` subtracts `num_placeholder` when deferred-output is
+            # active: those slots are filled with the real prefill output
+            # later in this loop, so they're not part of the prompt hash
+            # chain — leaving them in would mint a stale partial-block hash.
+            if not seq.prefix_hashes_published:
+                _num_new = seq.num_tokens - seq.num_cached_tokens
+                if need_placeholder:
+                    _num_new -= num_placeholder
+                self.block_manager.hash_blocks(seq, _num_new)
+                seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
             if is_deferred_out or self.use_spec:

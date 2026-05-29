@@ -428,7 +428,17 @@ class EagleProposer:
                             kv_indptr[1 : bs + 1] -= torch.cumsum(
                                 num_reject_tokens, dim=0
                             )
-                        positions = torch.gather(positions, 0, last_token_indices)
+                        if positions.ndim == 1:
+                            positions = torch.index_select(
+                                positions, 0, last_token_indices
+                            )
+                        else:
+                            # MRoPE positions keep the token axis last (e.g.
+                            # [3, num_tokens] for Qwen3.5), so select columns
+                            # instead of indexing dim 0.
+                            positions = torch.index_select(
+                                positions, positions.ndim - 1, last_token_indices
+                            )
                         context.is_prefill = False
 
                     # update metadata
