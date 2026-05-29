@@ -192,15 +192,24 @@ class EngineCore:
                     self._process_engine_step()
         finally:
             # Teardown runs even on exceptions so the sender thread/socket
-            # don't leak.
-            self.scheduler.publish_kv_events()
+            # don't leak. Isolate the final publish so a publisher hiccup
+            # cannot skip shutdown_kv_events().
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
 
     def _process_engine_step(self):
         try:
             return self._process_engine_step_inner()
         finally:
-            self.scheduler.publish_kv_events()
+            # Swallow publisher errors so they cannot mask an exception from
+            # the engine step itself.
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish in engine-step finally failed")
 
     def _process_engine_step_inner(self):
         result = self.scheduler.schedule()
@@ -467,7 +476,12 @@ class DPEngineCoreProc(EngineCore):
 
                 self.engines_running = global_has_unfinished
         finally:
-            self.scheduler.publish_kv_events()
+            # Isolate the final publish so a publisher hiccup cannot skip
+            # shutdown_kv_events() (which closes the sender thread/socket).
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish during DP shutdown failed")
             self.scheduler.shutdown_kv_events()
 
     def _execute_dummy_batch(self):

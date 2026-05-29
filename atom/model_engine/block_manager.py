@@ -39,6 +39,7 @@ def _make_block_stored(
     tokens: list[int],
     parent: int | None,
     block_size: int,
+    medium: str = MEDIUM_GPU,
 ) -> BlockStored:
     """Construct a BlockStored event from a coalesced run of new blocks."""
     return BlockStored(
@@ -46,7 +47,7 @@ def _make_block_stored(
         parent_block_hash=parent,
         token_ids=tokens,
         block_size=block_size,
-        medium=MEDIUM_GPU,
+        medium=medium,
     )
 
 
@@ -333,11 +334,11 @@ class BlockManager:
         if self._event_log is None or not block_hashes:
             return
         self._event_log.append(
-            BlockStored(
-                block_hashes=block_hashes,
-                parent_block_hash=parent_block_hash,
-                token_ids=token_ids,
-                block_size=self.block_size,
+            _make_block_stored(
+                block_hashes,
+                token_ids,
+                parent_block_hash,
+                self.block_size,
                 medium=MEDIUM_REMOTE,
             )
         )

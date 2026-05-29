@@ -293,3 +293,40 @@ class TestPublisher:
         finally:
             sub.close(linger=0)
             pub.shutdown()
+
+    def test_publish_drops_oldest_on_overflow(self):
+        # buffer_steps=1 + stopped sender => every publish past the first must
+        # drop the oldest queued item and tick stats["dropped"].
+        pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(endpoint="inproc://test-kv-events-drop", buffer_steps=1)
+        # Stop the sender so the queue stays at capacity.
+        pub._queue.put_nowait(None)
+        pub._sender.join(timeout=2.0)
+        try:
+            for i in range(5):
+                pub.publish([BlockRemoved(block_hashes=[i])])
+            assert pub.stats["dropped"] >= 4
+        finally:
+            try:
+                pub._socket.close(linger=0)
+            except Exception:
+                pass
+
+    def test_publish_counts_encode_errors_without_raising(self):
+        pytest.importorskip("zmq")
+        pub = ZmqEventPublisher(
+            endpoint="inproc://test-kv-events-encode-error", buffer_steps=4
+        )
+
+        class _BadEncoder:
+            def encode(self, _):
+                raise RuntimeError("boom")
+
+        pub._encoder = _BadEncoder()
+        try:
+            pub.publish([BlockRemoved(block_hashes=[1])])
+            pub.publish([BlockRemoved(block_hashes=[2])])
+            assert pub.stats["encode_errors"] == 2
+            assert pub.stats["sent"] == 0
+        finally:
+            pub.shutdown()
