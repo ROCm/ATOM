@@ -1,5 +1,6 @@
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -53,6 +54,65 @@ if is_vllm():
 def get_qwen3_5_text_config(atom_config: Config):
     hf_config = atom_config.hf_config
     return hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
+
+
+def build_qwen3_5_mrope_input_positions(
+    input_tokens: list[int],
+    image_grid_thw,
+    video_grid_thw,
+    image_token_id: int,
+    video_token_id: int,
+    vision_start_token_id: int,
+    vision_end_token_id: int,
+    spatial_merge_size: int,
+) -> tuple[np.ndarray, int]:
+    """Build request-level Qwen3.5-VL MRoPE positions for prompt tokens."""
+    from aiter.rotary_embedding import MRotaryEmbedding
+
+    positions, delta = MRotaryEmbedding.get_input_positions(
+        input_tokens,
+        image_grid_thw,
+        video_grid_thw if video_grid_thw is not None else [],
+        image_token_id,
+        video_token_id,
+        vision_start_token_id,
+        vision_end_token_id,
+        spatial_merge_size,
+    )
+    return np.asarray(positions, dtype=np.int64), int(delta)
+
+
+def _get_qwen3_5_mrope_input_positions(
+    atom_config: Config,
+    input_tokens: list[int],
+    multimodal_data: dict,
+) -> tuple[np.ndarray | None, int]:
+    """Return Qwen3.5 request-level MRoPE positions when applicable."""
+
+    multimodal_config = atom_config.multimodal_config
+    if multimodal_config is None:
+        return None, 0
+
+    model_type = getattr(multimodal_config, "model_type", None)
+    if model_type not in {"qwen3_5", "qwen3_5_moe"}:
+        return None, 0
+
+    vision_config = getattr(multimodal_config, "vision_config", None)
+    if vision_config is None or "image_grid_thw" not in multimodal_data:
+        return None, 0
+
+    return build_qwen3_5_mrope_input_positions(
+        input_tokens,
+        multimodal_data.get("image_grid_thw"),
+        multimodal_data.get("video_grid_thw"),
+        image_token_id=getattr(multimodal_config, "image_token_id", 248056),
+        video_token_id=getattr(multimodal_config, "video_token_id", 248057),
+        vision_start_token_id=getattr(
+            multimodal_config, "vision_start_token_id", 248053
+        ),
+        vision_end_token_id=getattr(multimodal_config, "vision_end_token_id", 248054),
+        spatial_merge_size=getattr(vision_config, "spatial_merge_size", 2),
+    )
 
 
 # Qwen3.5 MoE models have some checkpoints where expert weights are fused together in BF16 format, so we need special handling to load those weights into our per-expert parameters.
@@ -372,7 +432,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         "input_ids": 0,
         # positions is of shape (3, seq_len) if mrope is enabled for qwen2-vl,
         # otherwise (seq_len, ).
-        "positions": -1,
+        "positions": [0, -1],
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
     }
@@ -559,6 +619,8 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
     ):
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -618,6 +680,147 @@ class Qwen3_5MoeForConditionalGenerationTextOnly(
         Returns:
             True if weights were loaded successfully
         """
+        return load_fused_expert_weights(
+            original_name,
+            name,
+            params_dict,
+            loaded_weight,
+            shard_id,
+            num_experts,
+        )
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return self.language_model.get_expert_mapping()
+
+
+class _Qwen3_5MultimodalBase(nn.Module):
+    packed_modules_mapping = (
+        Qwen3_5ForConditionalGenerationTextOnly.packed_modules_mapping.copy()
+    )
+
+    # Weight name mapping: checkpoint -> native ATOM module names.
+    hf_to_atom_mapper = {
+        "model.visual.": "visual.",
+        "lm_head.": "language_model.lm_head.",
+        "model.language_model.": "language_model.model.",
+    }
+
+    # Remap quant exclude layer names from checkpoint format to native names.
+    quant_exclude_name_mapping = {
+        "model.visual.": "visual.",
+        "lm_head.": "language_model.lm_head.",
+        "model.language_model.": "language_model.model.",
+    }
+
+    language_model_cls = Qwen3_5ForCausalLM
+
+    @staticmethod
+    def get_mrope_input_positions(
+        atom_config: Config,
+        input_tokens: list[int],
+        multimodal_data: dict,
+    ) -> tuple[np.ndarray | None, int]:
+        return _get_qwen3_5_mrope_input_positions(
+            atom_config, input_tokens, multimodal_data
+        )
+
+    def __init__(self, atom_config: Config, prefix: str = ""):
+        super().__init__()
+        from atom.models.qwen3_5_vl import Qwen3VisionTransformer
+
+        self.config = atom_config.hf_config
+        multimodal_config = atom_config.multimodal_config
+        if multimodal_config is None:
+            raise ValueError("Qwen3.5 multimodal models require multimodal_config")
+
+        self._prepare_text_config(atom_config)
+        self.visual = Qwen3VisionTransformer(
+            multimodal_config.vision_config,
+            norm_eps=getattr(multimodal_config, "rms_norm_eps", 1e-6),
+        )
+        self.language_model = self.language_model_cls(
+            atom_config=atom_config,
+            prefix=maybe_prefix("", "language_model"),
+        )
+        self.image_token_id = getattr(multimodal_config, "image_token_id", 248056)
+        self.video_token_id = getattr(multimodal_config, "video_token_id", 248057)
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    def _prepare_text_config(self, atom_config: Config) -> None:
+        pass
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.model.get_input_embeddings(input_ids)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.embed_input_ids(input_ids)
+
+    def get_vision_embeddings(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        return self.visual(pixel_values, grid_thw)
+
+    def merge_multimodal_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        vision_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = input_ids == self.image_token_id
+        inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
+        return inputs_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **_: object,
+    ):
+        # Keep the compiled language model on the inputs_embeds path so vision
+        # embeddings are not dropped after text-only warmup.
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.language_model.compute_logits(hidden_states)
+
+
+class Qwen3_5MultimodalModel(_Qwen3_5MultimodalBase):
+    pass
+
+
+class Qwen3_5MoeMultimodalModel(_Qwen3_5MultimodalBase):
+    language_model_cls = Qwen3_5MoeForCausalLM
+
+    def _prepare_text_config(self, atom_config: Config) -> None:
+        text_config = atom_config.hf_config.text_config
+        if not hasattr(text_config, "n_shared_experts"):
+            text_config.n_shared_experts = 1
+        if not hasattr(text_config, "n_routed_experts"):
+            text_config.n_routed_experts = text_config.num_experts
+
+    def detect_fused_expert_format(self, weight_name: str) -> bool:
+        return detect_fused_expert_format(weight_name)
+
+    def get_fused_expert_mapping(self) -> list[tuple[str, str, str]]:
+        return get_fused_expert_mapping()
+
+    def load_fused_expert_weights(
+        self,
+        original_name: str,
+        name: str,
+        params_dict: dict,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        num_experts: int,
+    ) -> bool:
         return load_fused_expert_weights(
             original_name,
             name,

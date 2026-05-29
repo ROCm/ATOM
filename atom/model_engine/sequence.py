@@ -47,6 +47,9 @@ class Sequence:
         needs_independent_noise: bool = False,
         parent_request_id: Optional[str] = None,
         sibling_index: int = 0,
+        multimodal_data: Optional[dict] = None,
+        mrope_positions: Optional[np.ndarray] = None,
+        mrope_position_delta: int = 0,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
@@ -61,6 +64,9 @@ class Sequence:
         # Triggers BlockManager to allocate a per-req cache slot in
         # allocate() / free it in deallocate().
         self.has_per_req_cache = has_per_req_cache
+        self.multimodal_data = multimodal_data
+        self.mrope_positions = mrope_positions
+        self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
@@ -78,6 +84,14 @@ class Sequence:
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
         self.is_first_decode = False
+        # Set to True by Scheduler.postprocess after BlockManager.hash_blocks
+        # has registered the prompt blocks for prefix caching. The trigger has
+        # to be per-seq because in deferred-output mode the prefill step's
+        # postprocess has no fwd_output entry for the seq (idx is None) — the
+        # prefill output surfaces one step later, at which point seq.type has
+        # already been flipped to DECODE. A seq.type / len(output_tokens) gate
+        # would never fire for the prefill blocks; this flag does.
+        self.prefix_hashes_published = False
         # stream callback
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens
