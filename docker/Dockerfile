@@ -431,22 +431,20 @@ RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
 RUN pip install rocm-trace-lite && \
     rtl --version || true
 
-# ATOM: Python install (editable) + atom-mesh Rust binary
+# ATOM: Python package install (editable) with the atom-mesh build hook enabled.
 # CACHEBUST invalidates only this layer so parallel stages stay cached
 ARG CACHEBUST=1
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
-    pip install -e .
+    ATOM_MESH_BUILD=1 python -m pip install -e .
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
 
-# atom-mesh: build Rust binary, strip, install to /usr/local/bin
-RUN echo "========== Build atom-mesh ==========" && \
-    rustup update stable && rustup default stable && \
+# atom-mesh: install the binary produced by the ATOM package build hook to /usr/local/bin
+RUN echo "========== Install atom-mesh binary ==========" && \
     cd /app/ATOM/atom/mesh && \
-    cargo build --release && \
     strip target/release/atom-mesh && \
     cp target/release/atom-mesh /usr/local/bin/atom-mesh && \
     atom-mesh --version
