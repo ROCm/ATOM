@@ -19,6 +19,7 @@ docker run -d --name "${CONTAINER}" \
     --device /dev/kfd --device /dev/dri \
     --group-add video \
     --cap-add IPC_LOCK --cap-add NET_ADMIN \
+    --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \
     -v /mnt:/mnt -v /it-share:/it-share \
     "${DOCKER_IMAGE}" sleep infinity
 
