@@ -1190,20 +1190,20 @@ class Scheduler:
             return
 
         for req_id in kv_connector_output.finished_recving or ():
-            assert not self.kv_connector.is_producer, (
-                "Only consumer should update recving KV status"
-            )
+            assert (
+                not self.kv_connector.is_producer
+            ), "Only consumer should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.finished_sending or ():
-            assert self.kv_connector.is_producer, (
-                "Only producer should free blocks after sending KV"
-            )
+            assert (
+                self.kv_connector.is_producer
+            ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.deferred_free_blocks, (
-                f"req_id={req_id} not found in deferred_free_blocks"
-            )
+            assert (
+                req_id in self.deferred_free_blocks
+            ), f"req_id={req_id} not found in deferred_free_blocks"
             self.block_manager.deallocate(self.deferred_free_blocks.pop(req_id))
 
     def get_request_counts(self) -> tuple[int, int]:
