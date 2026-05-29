@@ -346,7 +346,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # seqs = seqs[:bs]
         for i in range(bs):
             seqlen = batch.context_lens[i]
-            cached_seqlen = batch.num_kv_computed[i]
+            cached_seqlen = batch.num_cached_tokens[i]
             if cached_seqlen > 0:
                 has_cached = True
             positions.extend(list(range(cached_seqlen, seqlen)))
@@ -408,7 +408,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         num_cached_tokens = None
         if has_cached:
             num_cached_tokens = torch.tensor(
-                batch.num_kv_computed[:bs], dtype=torch.int32, pin_memory=True
+                batch.num_cached_tokens[:bs], dtype=torch.int32, pin_memory=True
             ).cuda(non_blocking=True)
             total_tokens = sum(batch.context_lens[:bs])
         total_kv = total_tokens if has_cached else sum_scheduled_tokens

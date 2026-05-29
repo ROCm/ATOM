@@ -70,7 +70,7 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
-        self.num_kv_computed = 0
+        self.num_cached_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
         # set in postprocess when an advance leaves prompt tokens remaining,
