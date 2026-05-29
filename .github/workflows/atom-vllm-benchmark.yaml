@@ -894,29 +894,28 @@ jobs:
               ]
 
           AWS_P0 = {
+              "gpt-oss-120b TP1 (AW)",
+              "DeepSeek-V3.2 FP8 TP4 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
+              "GLM-4.7-FP8 TP4 (AW)",
+              "GLM-4.7-FP8 MTP TP4 (AW)",
+              "Kimi-K2.5-MXFP4 TP4 (AW)",
               "MiniMax-M2.5 TP2 (AW)",
-              "MiniMax-M2.5 TP4 (AW)",
-              "DeepSeek-V3.2 FP8 TP8 (AW)",
-              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
-              "gpt-oss-120b TP2 (AW)",
-              "gpt-oss-120b TP8 (AW)",
           }
           AWS_P1 = {
-              "GLM-4.7-FP8 TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP8 (AW)",
-              "GLM-4.7-FP8 MTP TP4 (AW)",
+              "MiniMax-M2.5 TP4 (AW)",
+              "DeepSeek-V3.2 FP8 TP8 (AW)",
+              "gpt-oss-120b TP2 (AW)",
+              "gpt-oss-120b TP8 (AW)",
               "GLM-4.7-FP8 MTP TP8 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)",
           }
           AWS_P2 = {
-              "DeepSeek-V3.2 FP8 TP4 (AW)",
               "GLM-4.7-FP8 TP8 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Kimi-K2.5-MXFP4 TP8 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)",
-              "gpt-oss-120b TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)",
           }
           META_P0 = {
               "Kimi-K2.5-MXFP4 TP4 (MET)",
