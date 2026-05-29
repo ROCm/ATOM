@@ -7,8 +7,9 @@ concurrency:
 
 on:
   schedule:
-    # Mon-Sat 21:00 Beijing (13:00 UTC): Mon/Wed AWS P0; Tue/Thu AWS P0+Meta P0; Fri AWS all; Sat AWS P0+OOB.
-    - cron: '0 13 * * 1-6'
+    # Tue-Sun 00:30 Beijing (Mon-Sat 16:30 UTC): delayed previous-evening slot.
+    # Effective Mon/Wed AWS P0; Tue/Thu AWS P0+Meta P0; Fri AWS all; Sat AWS P0+OOB.
+    - cron: '30 16 * * 1-6'
     # Sat/Sun 10:00 Beijing (02:00 UTC): Sat AWS P1+P2+Meta P0; Sun AWS all+Meta P1.
     - cron: '0 2 * * 0,6'
   workflow_dispatch:
@@ -945,12 +946,21 @@ jobs:
               beijing_tz = timezone(timedelta(hours=8))
               run_date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
               beijing_dt = run_date.astimezone(beijing_tz)
-              beijing_weekday = beijing_dt.weekday()
               beijing_hour = beijing_dt.hour
 
-              # Beijing weekday: Mon=0 .. Sun=6. Hour buckets use 15:00 to split
-              # ~10:00 daytime vs ~21:00 evening scheduled runs.
-              is_daytime_slot = beijing_hour < 15
+              # Beijing weekday: Mon=0 .. Sun=6. The evening slot now runs just
+              # after midnight, so attribute it to the previous Beijing day.
+              is_delayed_evening_slot = beijing_hour < 3
+              effective_beijing_dt = (
+                  beijing_dt - timedelta(days=1)
+                  if is_delayed_evening_slot
+                  else beijing_dt
+              )
+              beijing_weekday = effective_beijing_dt.weekday()
+
+              # Hour buckets use 15:00 to split ~10:00 daytime vs delayed
+              # previous-evening scheduled runs.
+              is_daytime_slot = (not is_delayed_evening_slot) and beijing_hour < 15
               aws_all = AWS_P0 | AWS_P1 | AWS_P2
 
               if beijing_weekday == 5:  # Saturday
