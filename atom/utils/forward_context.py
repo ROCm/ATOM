@@ -181,7 +181,6 @@ class Context:
     # that need the token ids but cannot receive them as a function arg
     # (the op signature is fixed by the consumer's plugin contract).
     input_ids: Optional[torch.Tensor] = None
-    is_partial_prefill: bool = False
 
     def __init__(
         self,
@@ -193,7 +192,6 @@ class Context:
         is_draft: bool = False,
         dp_uniform_decode: bool = True,
         input_ids: Optional[torch.Tensor] = None,
-        is_partial_prefill: bool = False,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -203,7 +201,6 @@ class Context:
         self.is_draft = is_draft
         self.dp_uniform_decode = dp_uniform_decode
         self.input_ids = input_ids
-        self.is_partial_prefill = is_partial_prefill
 
 
 @dataclass

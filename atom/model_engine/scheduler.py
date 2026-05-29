@@ -227,7 +227,6 @@ class ScheduledBatch:
         remote_kv_block_ids: list[int] | None = None,
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
-        is_partial_prefill: bool = False,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -288,7 +287,6 @@ class ScheduledBatch:
             if num_cached_tokens is not None
             else [seq.num_cached_tokens for seq in seqs.values()]
         )
-        self.is_partial_prefill = is_partial_prefill
 
         # context_lens: for prefill seqs, use num_cached_tokens + num_scheduled_tokens
         self.context_lens = np.asarray(
@@ -802,11 +800,6 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
-            # Determine if all prefill seqs are intermediate chunks (not final)
-            is_partial_prefill = all(
-                seq.num_cached_tokens + num_scheduled_tokens[i] < seq.num_prompt_tokens
-                for i, seq in enumerate(scheduled_seqs.values())
-            )
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
@@ -815,7 +808,7 @@ class Scheduler:
                 f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
                 f"{total_tokens_num_prefill} new tokens "
                 f"(cached: {cached_per_req}, new: {num_scheduled_tokens}), "
-                f"req_ids: {tuple(scheduled_seqs.keys())}, partial: {is_partial_prefill}"
+                f"req_ids: {tuple(scheduled_seqs.keys())}"
             )
             self.prev_prompt = True
             # lip: TODO for prefill/decode mixed batch
@@ -833,7 +826,6 @@ class Scheduler:
                     total_seqs_num_prefill=num_seqs_prefill,
                     connector_meta_output=connector_meta_output,
                     num_cached_tokens=num_cached_tokens_list,
-                    is_partial_prefill=is_partial_prefill,
                 ),
                 scheduled_seqs,
             )
