@@ -178,6 +178,8 @@ jobs:
       CONC: ${{ matrix.config.concurrency }}
       RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
       RESULT_FILENAME: ${{ matrix.model.prefix }}${{ matrix.model.suffix }}-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}-${{ matrix.config.random_range_ratio }}
+      USE_ATOMESH_ENTRYPOINTS: 1
+      ATOM_SERVER_PORT: 8000
 
     steps:
       - name: Kill all Docker containers
@@ -220,6 +222,8 @@ jobs:
             -e ATOM_DISABLE_MMAP=true \
             -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} \
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
+            -e USE_ATOMESH_ENTRYPOINTS="${USE_ATOMESH_ENTRYPOINTS}" \
+            -e ATOM_SERVER_PORT="${ATOM_SERVER_PORT}" \
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
             -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
             --env-file /tmp/atom_benchmark_env.txt \
@@ -266,7 +270,7 @@ jobs:
           docker exec atom-mesh-benchmark bash -lc "set -euo pipefail
             ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
               ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
-              USE_ATOMESH_ENTRYPOINTS=1 .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
+              .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
             echo '========== Running benchmark =========='
             ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
               RESULT_FILENAME=${{ env.RESULT_FILENAME }} \
@@ -557,6 +561,9 @@ jobs:
         cell: ${{ fromJson(needs.generate-regression-matrix.outputs.matrix_json) }}
     runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.cell.runner }}
     timeout-minutes: 60
+    env:
+      USE_ATOMESH_ENTRYPOINTS: 1
+      ATOM_SERVER_PORT: 8000
     steps:
       - name: Kill all Docker containers
         run: |
@@ -593,6 +600,8 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
             -e ATOM_DISABLE_MMAP=true \
+            -e USE_ATOMESH_ENTRYPOINTS="${USE_ATOMESH_ENTRYPOINTS}" \
+            -e ATOM_SERVER_PORT="${ATOM_SERVER_PORT}" \
             --env-file /tmp/atom_regression_env.txt \
             --name atom-mesh-regression \
             ${{ inputs.image || 'rocm/atom-dev:latest' }}
@@ -621,7 +630,7 @@ jobs:
           # a literal newline).
           docker exec atom-mesh-regression bash -lc "set -euo pipefail
             ENABLE_TORCH_PROFILER=1 \
-            USE_ATOMESH_ENTRYPOINTS=1 .github/scripts/atom_test.sh launch $MODEL_DIR ${{ matrix.cell.server_args }}"
+            .github/scripts/atom_test.sh launch $MODEL_DIR ${{ matrix.cell.server_args }}"
 
       - name: Run regression configs with profiler
         run: |
