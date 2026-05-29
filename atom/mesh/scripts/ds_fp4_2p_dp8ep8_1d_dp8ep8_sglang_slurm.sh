@@ -32,7 +32,7 @@ set -euo pipefail
 
 # ======================== configuration ========================
 MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:sglang-v0.5.10-nightly_20260528-mesh-sglang}"
 CONTAINER="${CONTAINER:-atom_sglang_mesh_${SLURM_JOB_ID}}"
 
 PREFILL_TP="${PREFILL_TP:-8}"
@@ -50,8 +50,8 @@ BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 PREFILL_MEM_FRACTION="${PREFILL_MEM_FRACTION:-0.80}"
 DECODE_MEM_FRACTION="${DECODE_MEM_FRACTION:-0.85}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
-PREFILL_MAX_RUNNING_REQUESTS="${PREFILL_MAX_RUNNING_REQUESTS:-24}"
-DECODE_MAX_RUNNING_REQUESTS="${DECODE_MAX_RUNNING_REQUESTS:-1280}"
+PREFILL_MAX_RUNNING_REQUESTS="${PREFILL_MAX_RUNNING_REQUESTS:-4096}"
+DECODE_MAX_RUNNING_REQUESTS="${DECODE_MAX_RUNNING_REQUESTS:-4096}"
 PREFILL_CHUNKED_PREFILL_SIZE="${PREFILL_CHUNKED_PREFILL_SIZE:-65536}"
 CUDA_GRAPH_BS_START="${CUDA_GRAPH_BS_START:-1}"
 CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-160}"
@@ -164,10 +164,6 @@ set -euo pipefail
 echo "[prefill${idx}] IP=${P_IP} TP=${PREFILL_TP} DP=${PREFILL_DP} EP=${PREFILL_EP} port=${P_PORT}"
 
 mkdir -p /workspace/logs
-cat > /workspace/mooncake_prefill.json <<MC
-{"prefill_url": "${P_IP}:${P_PORT}", "protocol": "rdma"}
-MC
-
 export HIP_VISIBLE_DEVICES=${PREFILL_GPU_IDS}
 export HF_HUB_CACHE=/mnt/hf_hub_cache
 export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
@@ -176,13 +172,12 @@ export SGLANG_AITER_FP8_PREFILL_ATTN=0
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
 export SGLANG_HOST_IP=${P_IP}
-export MOONCAKE_CONFIG_PATH=/workspace/mooncake_prefill.json
 export SGLANG_MOONCAKE_SEND_AUX_TCP=1
 export MC_TCP_ENABLE_CONNECTION_POOL=true
 export MORI_SHMEM_MODE=${MORI_SHMEM_MODE}
 export SGLANG_MORI_DISPATCH_DTYPE=${MORI_DISPATCH_DTYPE}
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
 
 python3 -m sglang.launch_server \\
     --model-path "${MODEL_PATH}" \\
@@ -231,7 +226,7 @@ export MC_TCP_ENABLE_CONNECTION_POOL=true
 export MORI_SHMEM_MODE=${MORI_SHMEM_MODE}
 export SGLANG_MORI_DISPATCH_DTYPE=${MORI_DISPATCH_DTYPE}
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
 
 TORCHINDUCTOR_COMPILE_THREADS=128 python3 -m sglang.launch_server \\
     --model-path "${MODEL_PATH}" \\
@@ -451,7 +446,7 @@ launch_container() {
             --device /dev/kfd --device /dev/dri \
             --group-add video \
             --cap-add IPC_LOCK --cap-add NET_ADMIN \
-            --ulimit memlock=-1 --ulimit stack=67108864 \
+            --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \
             --shm-size 128G \
             -v /mnt:/mnt \
             -v /it-share:/it-share \
