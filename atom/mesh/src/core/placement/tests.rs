@@ -1494,6 +1494,42 @@ mod f_atom_adapter {
     }
 
     #[test]
+    fn test_atom_enrich_decode_kv_maps_dp_rank_to_remote_dp_rank() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut kv = json!({
+            "do_remote_prefill": true,
+            "dp_rank": 3,
+            "transfer_id": 7,
+        });
+        adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
+        // The owning producer DP rank must be propagated so the decode side
+        // sends its write_request to the correct side-channel port.
+        assert_eq!(kv["remote_dp_rank"], json!(3));
+        assert_eq!(kv["remote_dp_size"], json!(1));
+        assert_eq!(kv["remote_tp_size"], json!(8));
+    }
+
+    #[test]
+    fn test_atom_enrich_decode_kv_no_dp_rank_leaves_remote_dp_rank_unset() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut kv = json!({ "transfer_id": 1 });
+        adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
+        // Absent dp_rank: decode's ReqMeta default (0) applies, matching the
+        // single-DP case; we must not invent a rank.
+        assert!(kv.get("remote_dp_rank").is_none());
+    }
+
+    #[test]
+    fn test_atom_enrich_decode_kv_null_dp_rank_leaves_remote_dp_rank_unset() {
+        let (adapter, ctx) = atom_pair_for("http://p:8000", 8);
+        let mut kv = json!({ "dp_rank": serde_json::Value::Null });
+        adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
+        // A null dp_rank must not be propagated: decode would default to 0,
+        // whereas copying null verbatim would crash its integer port math.
+        assert!(kv.get("remote_dp_rank").is_none());
+    }
+
+    #[test]
     fn test_atom_enrich_decode_kv_missing_tp_size_errors() {
         let info = atom_info_with("http://other:8000", 8);
         let adapter = AtomAdapter::new(info);
