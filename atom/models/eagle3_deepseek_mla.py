@@ -80,7 +80,7 @@ class Eagle3DeepseekMLAAttention(nn.Module):
         assert self.num_heads % tp_size == 0
         self.num_local_heads = self.num_heads // tp_size
 
-        self.scaling = self.qk_head_dim ** -0.5
+        self.scaling = self.qk_head_dim**-0.5
 
         attn_input_size = self.hidden_size * 2  # dual input: cat(embed, fc_out)
 
@@ -194,9 +194,7 @@ class Eagle3DeepseekMLAAttention(nn.Module):
         q_c = self.q_a_proj(hidden_states)
         q_c = self.q_a_layernorm(q_c)
         kv = self.kv_a_proj_with_mqa(hidden_states)
-        kv_c, k_pe = torch.split(
-            kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
+        kv_c, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
         return self.mla_attn(q_c, kv_c_normed, k_pe, positions, None)
 
