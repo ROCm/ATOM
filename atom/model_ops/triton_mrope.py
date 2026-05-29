@@ -199,6 +199,7 @@ def _mrope_qk_tiled_kernel(
     tl.store(k_out_ptr + out_offsets_k, out, mask=mask & ~is_q)
 
 
+@torch.compiler.disable
 def try_mrope_qk_fused(
     rotary_emb: nn.Module,
     positions: torch.Tensor,
@@ -212,6 +213,15 @@ def try_mrope_qk_fused(
 
     Returns ``None`` for unsupported shapes so callers can fall back to the
     generic rotary embedding module.
+
+    Decorated with ``@torch.compiler.disable`` so the shape branches below
+    (``positions.shape[0] != 3``, ``q.shape[1] != num_q_heads * head_size``,
+    ...) never reach Dynamo. Otherwise Dynamo specializes the symbolic dims
+    these branches read, which conflicts with dims the runner marked dynamic
+    (e.g. MMStar CI fails with ConstraintViolationError on
+    ``L['positions'].size()[0]`` and ``L['inputs_embeds'].size()[0]``).
+    Matches the convention used by ``chunk_gated_delta_rule`` in
+    ``atom/model_ops/fla_ops/chunk.py``.
     """
     mrope_section = getattr(rotary_emb, "mrope_section", None)
     if (
