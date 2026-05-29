@@ -1932,34 +1932,43 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         # be precomputed here. The kernel switches to the persistent
         # work-stealing path automatically when work_meta_data is non-None.
         #
-        # Pure-decode skip-cache: when every request has a single query token
-        # (max_query_len == 1, i.e. num_tokens == num_reqs) the work-split
-        # schedule is a deterministic function of the decode shape only --
-        # (num_tokens, padded_num_heads, per-request min(seq_len, topk_tokens));
-        # topk_tokens, page_size and the qo layout are constant. Fingerprint
-        # those CPU-side and skip the get_mla_metadata_v1 launch when unchanged.
-        # For steady-state long-context decode (seq_len >= topk_tokens) the
-        # fingerprint is shape-determined, so the hit rate is ~100%.
+        # Pure-decode skip-cache: only valid when every request contributes
+        # exactly one query token. max_query_len == 1 alone is NOT enough --
+        # it allows empty/padded request slots (q_len == 0), where
+        # num_actual_tokens < num_reqs and the per-token sparse stream no longer
+        # lines up with the per-request clamped seq_lens used as the key. We
+        # therefore also require num_tokens == num_reqs; together they imply
+        # exactly one token per request, so clamped_seq_lens[:num_reqs] IS the
+        # per-token sparse stream and the work-split schedule is a deterministic
+        # function of (num_tokens, padded_num_heads, per-request
+        # min(seq_len, topk_tokens)) -- topk_tokens, page_size and the qo layout
+        # are constant. Fingerprint those CPU-side and skip the launch when
+        # unchanged; for long-context decode (seq_len >= topk_tokens) the key is
+        # shape-determined, so the hit rate is ~100%.
         #
-        # For spec-decode / MTP batches (max_query_len > 1) the per-request
-        # clamped seq_len does NOT uniquely determine the per-token sparse
-        # schedule near the topk boundary (seq_len in [topk, topk + q_len)), so
-        # the cache is disabled there: we always recompute and invalidate the
-        # key, matching the pre-cache behaviour with no regression.
-        decode_only = int(common_attn_metadata.max_query_len) == 1
+        # MTP/spec or padded batches always recompute and invalidate the key.
+        # The fingerprint is only built on the cacheable path, so the slow path
+        # adds no extra CPU work.
         num_reqs = common_attn_metadata.num_reqs
-        seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
-        if seq_lens_cpu is None:
-            seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
-        if seq_lens_cpu is None:
-            seq_lens_cpu = seq_lens.cpu()
-        clamped_seq_lens = torch.clamp(seq_lens_cpu[:num_reqs], max=self.topk_tokens)
-        metadata_key = (
-            num_tokens,
-            self.padded_num_heads,
-            clamped_seq_lens.to(torch.int32).numpy().tobytes(),
+        decode_only = (
+            int(common_attn_metadata.max_query_len) == 1 and num_tokens == num_reqs
         )
-        if not (decode_only and metadata_key == self._prev_metadata_key):
+        metadata_key = None
+        if decode_only:
+            seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                seq_lens_cpu = seq_lens.cpu()
+            clamped_seq_lens = torch.clamp(
+                seq_lens_cpu[:num_reqs], max=self.topk_tokens
+            )
+            metadata_key = (
+                num_tokens,
+                self.padded_num_heads,
+                clamped_seq_lens.to(torch.int32).numpy().tobytes(),
+            )
+        if metadata_key is None or metadata_key != self._prev_metadata_key:
             get_mla_metadata_v1(
                 qo_indptr,
                 paged_kv_indptr,
@@ -1981,9 +1990,10 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
                 dtype_q=_get_aiter_kv_cache_dtype(self.vllm_config),
                 dtype_kv=_get_aiter_kv_cache_dtype(self.vllm_config),
             )
-            # Only remember the key when it fully determines the schedule;
-            # invalidate for MTP/spec batches so the next decode step recomputes.
-            self._prev_metadata_key = metadata_key if decode_only else None
+            # metadata_key is the exact fingerprint on the cacheable path and
+            # None for MTP/spec/padded batches -- storing it as-is records a
+            # hittable key on decode and invalidates the cache otherwise.
+            self._prev_metadata_key = metadata_key
 
         attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
             num_reqs=common_attn_metadata.num_reqs,
