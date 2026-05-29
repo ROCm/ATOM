@@ -137,6 +137,27 @@ if [[ -n "${SERVER_EXTRA_ARGS}" ]]; then
   shlex_split_to_array "${SERVER_EXTRA_ARGS}" server_args
 fi
 
+declare -a filtered_server_args=()
+for ((i = 0; i < ${#server_args[@]}; i++)); do
+  case "${server_args[$i]}" in
+    --chunked-prefill-size)
+      if (( i + 1 >= ${#server_args[@]} )); then
+        echo "ERROR: --chunked-prefill-size requires a value."
+        exit 2
+      fi
+      prefill_size="${server_args[$((i + 1))]}"
+      i=$((i + 1))
+      ;;
+    --chunked-prefill-size=*)
+      prefill_size="${server_args[$i]#--chunked-prefill-size=}"
+      ;;
+    *)
+      filtered_server_args+=("${server_args[$i]}")
+      ;;
+  esac
+done
+server_args=("${filtered_server_args[@]}")
+
 if [[ "${SPEC_MODE}" == "mtp" ]]; then
   export SGLANG_ENABLE_SPEC_V2="${SGLANG_ENABLE_SPEC_V2:-1}"
   if [[ "${SERVER_EXTRA_ARGS}" != *"--speculative-algorithm"* ]]; then
