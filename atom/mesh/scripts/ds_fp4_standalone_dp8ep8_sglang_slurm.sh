@@ -25,7 +25,7 @@ set -euo pipefail
 
 # ======================== configuration ========================
 MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:sglang-v0.5.10-nightly_20260528-mesh-sglang}"
 CONTAINER="${CONTAINER:-atom_sglang_standalone_dp8ep8_${SLURM_JOB_ID}}"
 
 TP="${TP:-8}"
@@ -365,7 +365,7 @@ launch_container() {
             --device /dev/kfd --device /dev/dri \
             --group-add video \
             --cap-add IPC_LOCK --cap-add NET_ADMIN \
-            --ulimit memlock=-1 --ulimit stack=67108864 \
+            --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \
             --shm-size 128G \
             -v /mnt:/mnt \
             -v /it-share:/it-share \

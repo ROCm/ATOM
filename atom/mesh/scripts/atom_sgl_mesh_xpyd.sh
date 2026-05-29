@@ -164,15 +164,11 @@ launch_prefill() {
     local gpu_list="$2"
     local port="$3"
     local bootstrap_port="$4"
-    local mooncake_config="${LOG_DIR}/mooncake_prefill_${idx}.json"
     local ib_args=()
 
     echo "[prefill:${idx}] GPUs=${gpu_list} TP=${PREFILL_TP} port=${port} bootstrap=${bootstrap_port}"
 
     mkdir -p "${LOG_DIR}"
-    cat >"${mooncake_config}" <<MCEOF
-{"prefill_url": "${NODE_IP}:${port}", "protocol": "rdma"}
-MCEOF
 
     if [[ -n "${IB_DEVICE}" ]]; then
         ib_args+=(--disaggregation-ib-device "${IB_DEVICE}")
@@ -182,10 +178,9 @@ MCEOF
     SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models \
     ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0 \
     SGLANG_HOST_IP="${NODE_IP}" \
-    MOONCAKE_CONFIG_PATH="${mooncake_config}" \
     SGLANG_MOONCAKE_SEND_AUX_TCP=1 \
     MC_TCP_ENABLE_CONNECTION_POOL=true \
-    LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}" \
     python3 -m sglang.launch_server \
         --model-path "${MODEL_PATH}" \
         --host 0.0.0.0 --port "${port}" \
@@ -225,7 +220,7 @@ launch_decode() {
     SGLANG_HOST_IP="${NODE_IP}" \
     SGLANG_MOONCAKE_SEND_AUX_TCP=1 \
     MC_TCP_ENABLE_CONNECTION_POOL=true \
-    LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}" \
     TORCHINDUCTOR_COMPILE_THREADS=128 \
     python3 -m sglang.launch_server \
         --model-path "${MODEL_PATH}" \
