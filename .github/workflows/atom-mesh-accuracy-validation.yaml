@@ -334,6 +334,19 @@ jobs:
           RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
           RUN pip uninstall -y atom
           RUN rm -rf /app/ATOM
+          ARG RUST_VERSION="1.94.0"
+          RUN if ! command -v cargo >/dev/null 2>&1; then \\
+                echo "=== Installing Rust toolchain for atom-mesh build ===" && \\
+                apt-get update && \\
+                apt --fix-broken install -y && \\
+                apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev protobuf-compiler libprotobuf-dev && \\
+                rm -rf /var/lib/apt/lists/* && \\
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\
+                  | sh -s -- -y --default-toolchain "\${RUST_VERSION}" --profile minimal && \\
+                . "\$HOME/.cargo/env" && \\
+                rustc --version && cargo --version; \\
+              fi
+          ENV PATH="/root/.cargo/bin:\$PATH"
           RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
               cd /app/ATOM && \\
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
@@ -450,6 +463,20 @@ jobs:
             pip install --timeout 60 --retries 10 -U 'lm-eval[api]'
             pip install --timeout 60 --retries 10 hf_transfer
             pip install --timeout 60 --retries 10 --upgrade 'pybind11>=3.0.1'
+            if ! command -v cargo >/dev/null 2>&1; then
+              echo '=== Installing Rust toolchain for atom-mesh build ==='
+              RUST_VERSION='1.94.0'
+              apt-get update
+              apt --fix-broken install -y
+              apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev protobuf-compiler libprotobuf-dev
+              rm -rf /var/lib/apt/lists/*
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain \"\$RUST_VERSION\" --profile minimal
+              . \"\$HOME/.cargo/env\"
+            fi
+            export PATH=\"\$HOME/.cargo/bin:\$PATH\"
+            rustc --version
+            cargo --version
 
             echo '=== Installing ATOM ==='
             cd /workspace
