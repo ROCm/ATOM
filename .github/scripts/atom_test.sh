@@ -198,7 +198,13 @@ PY
   # kernel asserts mid-prefill or a GPU faults — lm_eval just keeps
   # retrying against a dead engine for 30 min.
   echo "========== Supervising client with wait_infer_drain.sh =========="
-  bash scripts/wait_infer_drain.sh 8000 30 10 "$ATOM_CLIENT_LOG"
+  # STUCK_POLLS=18 (×10s = 3 min) keeps drain patient through:
+  #   - benchmark warmup phases (tqdm rarely flushes during the initial
+  #     concurrency burst on short ISL configs)
+  #   - DP-attention SHM coordination warnings (`shared memory broadcast
+  #     block found in 60.0 seconds` is CPU-idle waiting, not a hang)
+  # Real GPU hangs / faults still surface in <=30 min (MAX_MIN unchanged).
+  bash scripts/wait_infer_drain.sh 8000 30 10 "$ATOM_CLIENT_LOG" 18
   DRAIN_RC=$?
   if [ "$DRAIN_RC" -ne 0 ]; then
     echo "wait_infer_drain.sh exit=$DRAIN_RC — killing client pgid $CLIENT_PID"
@@ -403,7 +409,8 @@ if [ "$TYPE" == "benchmark" ]; then
   set +m
 
   echo "========== Supervising benchmark with wait_infer_drain.sh =========="
-  bash scripts/wait_infer_drain.sh 8000 30 10 "$ATOM_CLIENT_LOG"
+  # See accuracy block above for STUCK_POLLS=18 rationale.
+  bash scripts/wait_infer_drain.sh 8000 30 10 "$ATOM_CLIENT_LOG" 18
   DRAIN_RC=$?
   if [ "$DRAIN_RC" -ne 0 ]; then
     echo "wait_infer_drain.sh exit=$DRAIN_RC — killing benchmark pgid $CLIENT_PID"

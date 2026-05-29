@@ -13,6 +13,7 @@
 
 ## 📢 News
 
+- **[2026/05]** ATOM now supports **Qwen3.5 multimodal image+text inference** on the native engine and OpenAI-compatible chat API. See [Qwen3.5 multimodal recipe](recipes/Qwen3.5_multimodel.md).
 - **[2026/05]** [Dissecting DeepSeek V4 Compressor](https://rocm.github.io/ATOM/dissecting_dsv4_compressor) — interactive animation visualizing how the CSA/HCA compressor state cache works (overlap mechanism, prefill vs decode, bulk compression vs sequential accumulation).
 - **[2026/05]** **DeepSeek V4-Pro PD disaggregation** — Prefill/Decode separation now supports DeepSeek V4-Pro with Mooncake RDMA KV cache transfer. See [V4 recipe](recipes/DeepSeek-V4.md#pd-disaggregation-with-mooncake-prefill-decode-separation) and [PD guide](recipes/pd_disaggregation_guide.md).
 - **[2026/05]** ATOM now supports **Prefill/Decode (P/D) disaggregation** with [Mooncake](https://github.com/kvcache-ai/Mooncake) RDMA push-mode KV cache transfer. See [PD disaggregation guide](recipes/pd_disaggregation_guide.md).

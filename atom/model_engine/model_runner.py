@@ -461,12 +461,16 @@ class tokenIDProcessor:
             else:
                 # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
                 if num_new_tokens > 0:
-                    new_token_ids = scheduled_tokens[new_curr_indices].reshape(
+                    # Convert seq-level indices to token-level indices
+                    new_token_indices = (
+                        new_curr_indices[:, None] * tokens_per_seq
+                        + np.arange(tokens_per_seq)
+                    ).flatten()
+                    new_token_ids = scheduled_tokens[new_token_indices].reshape(
                         num_new_seqs, tokens_per_seq
                     )
                     if self.use_spec:
                         # MTP mode: combine scheduled_tokens and draft_tokens
-                        # For new_decode_front=False, use new_curr_indices to get the right sequences
                         draft_tokens = batch.scheduled_spec_decode_tokens[
                             new_curr_indices
                         ]
