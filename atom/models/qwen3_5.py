@@ -742,6 +742,9 @@ class _Qwen3_5MultimodalBase(nn.Module):
             atom_config=atom_config,
             prefix=maybe_prefix("", "language_model"),
         )
+        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+            dict(self.packed_modules_mapping), atom_config
+        )
         self.image_token_id = getattr(multimodal_config, "image_token_id", 248056)
         self.video_token_id = getattr(multimodal_config, "video_token_id", 248057)
         self.make_empty_intermediate_tensors = (
