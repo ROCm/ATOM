@@ -329,9 +329,9 @@ def gdn_decode_update_lossy_fast_fwd_kernel(
         cache_modifier=".ca",
     ).to(tl.float32)
 
-    x = tl.load(a + i_n * HV + i_hv).to(tl.float32) + tl.load(
-        dt_bias + i_hv
-    ).to(tl.float32)
+    x = tl.load(a + i_n * HV + i_hv).to(tl.float32) + tl.load(dt_bias + i_hv).to(
+        tl.float32
+    )
     softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
     gate = -tl.exp(tl.load(A_log + i_hv).to(tl.float32)) * softplus_x
     beta_val = tl.sigmoid(tl.load(b + i_n * HV + i_hv).to(tl.float32))
@@ -377,7 +377,9 @@ def gdn_decode_update_lossy_fast(
     ``[slot, value_head, key_dim, value_dim]``.
     """
     if beta != 1.0 or threshold != 20.0:
-        raise ValueError("gdn_decode_update_lossy_fast supports beta=1.0 and threshold=20.0")
+        raise ValueError(
+            "gdn_decode_update_lossy_fast supports beta=1.0 and threshold=20.0"
+        )
     if not use_qk_l2norm_in_kernel:
         raise ValueError("gdn_decode_update_lossy_fast requires QK L2 norm in kernel")
     if scale is None:
@@ -400,7 +402,9 @@ def gdn_decode_update_lossy_fast(
     assert a.shape == (T, HV), "decode fast path expects a shaped [T, HV]"
     assert b.shape == (T, HV), "decode fast path expects b shaped [T, HV]"
     if HV < H or HV % H != 0:
-        raise ValueError("decode fast path expects value heads to be a multiple of heads")
+        raise ValueError(
+            "decode fast path expects value heads to be a multiple of heads"
+        )
     if initial_state.ndim != 4 or initial_state.shape[1:] != (HV, K, V):
         raise ValueError(
             "decode fast path expects initial_state shaped "
