@@ -19,7 +19,6 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
 )
-from atom.utils.forward_context import Context
 
 logger = logging.getLogger("atom")
 
@@ -113,8 +112,6 @@ class AiterMhaMetadataForVllm:
     use_cascade: bool = False
     common_prefix_len: int = 0
     total_tokens: int = 0
-
-    context: Optional[Context] = None
 
 
 @dataclass
@@ -685,21 +682,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
 
         use_cascade = False
 
-        context_batch_size = 0
-        has_prefill = bool(num_prefills > 0 or num_extends > 0)
-        if has_prefill:
-            context_batch_size = num_prefills + num_extends
-        else:
-            context_batch_size = num_decodes
-        context_graph_bs = context_batch_size
-
         num_actual_tokens = common_attn_metadata.num_actual_tokens
-        context = Context(
-            positions=None,
-            is_prefill=has_prefill,
-            batch_size=context_batch_size,
-            graph_bs=context_graph_bs,
-        )
 
         attn_metadata = AiterMhaMetadataForVllm(
             num_actual_tokens=num_actual_tokens,
@@ -723,7 +706,6 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
             total_tokens=self.total_tokens,
-            context=context,
         )
 
         return attn_metadata
@@ -732,7 +714,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self,
         common_attn_metadata,
         draft_index: int,
-    ) -> AttentionMetaData:
+    ) -> AiterMhaMetadataForVllm:
         """
         Build attention metadata for draft model without CPU-GPU sync.
 
@@ -756,7 +738,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             max_seq_len=common_attn_metadata.max_seq_len,
             query_start_loc=common_attn_metadata.query_start_loc,
         )
-        attn_metadata_for_plugin_mode = AiterMhaMetadataForPluginMode(
+        return AiterMhaMetadataForVllm(
             num_actual_tokens=num_tokens,
             num_actual_kv_tokens=0,
             max_query_len=common_attn_metadata.max_query_len,
@@ -778,14 +760,6 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             common_prefix_len=0,
             total_tokens=self.total_tokens,
         )
-
-        attn_metadata = AttentionMetaData(
-            max_seqlen_q=common_attn_metadata.max_query_len,
-            block_tables=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            plugin_metadata=attn_metadata_for_plugin_mode,
-        )
-        return attn_metadata
 
     # this method will be called by vllm, so it follows the vllm's interface convention
     def build_for_cudagraph_capture(
