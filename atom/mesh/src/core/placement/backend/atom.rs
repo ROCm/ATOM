@@ -31,9 +31,9 @@ impl AtomAdapter {
         Self { prefill_info }
     }
 
-    /// Add the two fields that ATOM's prefill response omits but the decode side requires
-    /// (mooncake_connector kv_transfer_params_output drops remote_dp_size/remote_tp_size;
-    /// decode's ReqMeta reads them, defaulting to 1 — wrong for multi-DP clusters).
+    /// Fill in fields the prefill response omits but decode's ReqMeta needs:
+    /// remote_dp_size/remote_tp_size, and remote_dp_rank (renamed from the
+    /// prefill's `dp_rank`). Mirrors proxy.py.
     pub fn enrich_decode_kv(&self, kv: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
         let ctx = downcast(ctx)?;
         let obj = kv.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
@@ -47,6 +47,10 @@ impl AtomAdapter {
             })?;
         obj.insert("remote_dp_size".to_string(), json!(ctx.prefill_dp_size));
         obj.insert("remote_tp_size".to_string(), json!(tp_size));
+        // Only a numeric rank; else leave unset so decode defaults to 0.
+        if let Some(dp_rank) = obj.get("dp_rank").filter(|v| v.is_number()).cloned() {
+            obj.insert("remote_dp_rank".to_string(), dp_rank);
+        }
         Ok(())
     }
 }
