@@ -927,7 +927,6 @@ jobs:
               "Kimi-K2-Thinking-MXFP4 TP8 (MET)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)",
-              "Qwen3.5-397B-A17B-FP8 TP4 (OOB)",
               "DeepSeek-R1 FP8 TP8 (MET)",
               "DeepSeek-R1 MXFP4 TP8 (MET)",
           }
