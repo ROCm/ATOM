@@ -1664,9 +1664,10 @@ class ModelRunner:
             if hasattr(self, "drafter"):
                 mtp_step = self.drafter.mtp_k + 1
                 padded_scheduled_bs = (padded_scheduled_bs + mtp_step - 1) // mtp_step
+            runs_eager = self.enforce_eager or not dp_uniform_decode
             bs = (
                 padded_scheduled_bs
-                if self.enforce_eager
+                if runs_eager
                 else next(
                     (x for x in self.graph_bs if x >= padded_scheduled_bs),
                     padded_scheduled_bs,
