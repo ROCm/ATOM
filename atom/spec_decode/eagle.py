@@ -388,16 +388,12 @@ class EagleProposer:
                     positions=positions,
                     hidden_states=hidden_states,
                 )
-                # The drafter returns a single hidden state: it is both fed to
-                # compute_logits (norm-aware) and carried to the next step.
-                # Whether it is pre- or post-norm is the model's own business
-                # (norm_output), so the proposer stays norm-agnostic.
-                if i == 0:
-                    sample_hidden_states = torch.index_select(
-                        ret_hidden_states, 0, last_token_indices
-                    )
-                else:
-                    sample_hidden_states = ret_hidden_states
+
+                sample_hidden_states = (
+                    torch.index_select(ret_hidden_states, 0, last_token_indices)
+                    if i == 0
+                    else ret_hidden_states
+                )
                 logits = self.model.compute_logits(sample_hidden_states)
                 new_draft_ids = logits.argmax(dim=-1)
                 draft_token_ids[:, i] = new_draft_ids
@@ -467,8 +463,6 @@ class EagleProposer:
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
-                    # Carry the single hidden forward; pre-/post-norm is decided
-                    # inside the drafter model, not here.
                     hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
