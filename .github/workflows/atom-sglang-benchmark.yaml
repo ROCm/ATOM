@@ -973,6 +973,12 @@ jobs:
           if [[ -n "${CASE_EXTRA_ARGS}" ]]; then
             EFFECTIVE_SGLANG_EXTRA_ARGS="${EFFECTIVE_SGLANG_EXTRA_ARGS} ${CASE_EXTRA_ARGS}"
           fi
+          BENCH_NUM_PROMPTS="$(( CONC * 10 ))"
+          BENCH_NUM_WARMUPS="$(( 2 * CONC ))"
+          if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && "${MESH_DP_SIZE:-1}" -gt 1 && "${MESH_EP_SIZE:-1}" -gt 1 ]]; then
+            BENCH_NUM_PROMPTS="$(( CONC * 3 ))"
+            BENCH_NUM_WARMUPS="${CONC}"
+          fi
           if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && "${MESH_SERVER_MODE}" == "sglang-mori" ]]; then
             case "${SGLANG_IMAGE_TAG}" in
               lmsysorg/sglang-rocm*|docker.io/lmsysorg/sglang-rocm*) ;;
@@ -1105,10 +1111,10 @@ jobs:
                   --random-input-len=\"${ISL}\" \
                   --random-output-len=\"${OSL}\" \
                   --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
-                  --num-prompts=\"$(( CONC * 10 ))\" \
+                  --num-prompts=\"${BENCH_NUM_PROMPTS}\" \
                   --max-concurrency=\"${CONC}\" \
                   ${TRUST_REMOTE_CODE_ARG} \
-                  --num-warmups=\"$(( 2 * CONC ))\" \
+                  --num-warmups=\"${BENCH_NUM_WARMUPS}\" \
                   --request-rate=inf \
                   --ignore-eos \
                   --save-result \
