@@ -719,14 +719,28 @@ jobs:
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
           )"
+          printf '%s' "${BENCHMARK_MATRIX}" > benchmark_matrix.json
           echo "benchmark_matrix=${BENCHMARK_MATRIX}" >> "$GITHUB_OUTPUT"
           if [ "${BENCHMARK_MATRIX}" = '{"include":[]}' ]; then
             echo "has_benchmark_cells=false" >> "$GITHUB_OUTPUT"
             echo "No eligible benchmark cases remain after model-specific parameter filtering."
           else
             echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
-            echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
+            python3 - <<'PY'
+          import json
+
+          with open("benchmark_matrix.json", encoding="utf-8") as f:
+              payload = json.load(f)
+          print(f"Benchmark matrix cells: {len(payload.get('include', []))}")
+          PY
           fi
+
+      - name: Upload benchmark matrix payload
+        if: steps.build.outputs.has_benchmark_cells == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: oot-benchmark-matrix
+          path: benchmark_matrix.json
 
   build-oot-image:
     name: Build custom OOT benchmark image
@@ -1489,14 +1503,19 @@ jobs:
               "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Download benchmark matrix payload
+        uses: actions/download-artifact@v8
+        with:
+          name: oot-benchmark-matrix
+          path: benchmark-matrix
+
       - name: Generate OOT benchmark summary table
         env:
-          BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 .github/scripts/plugin_benchmark_summary.py \
             --result-dir . \
-            --matrix-json "${BENCHMARK_MATRIX}" \
+            --matrix-json-file benchmark-matrix/benchmark_matrix.json \
             --run-url "${RUN_URL}" \
             --output-json oot_benchmark_summary.json \
             --title "ATOM-vLLM Benchmark Summary" \
