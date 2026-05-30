@@ -296,9 +296,11 @@ class GatedDeltaNet(nn.Module):
         leading decode-only prefix; the prologue does the rebase
         internally under `@tensor_cache`, avoiding a per-call D2H sync.
         """
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import flydsl_gdr_prefill
+
         initial_state = ssm_state[non_spec_state_indices].contiguous()
         initial_state[~has_initial_state, ...] = 0
-        core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+        core_attn_out, last_recurrent_state = flydsl_gdr_prefill(
             q=q,
             k=k,
             v=v,
