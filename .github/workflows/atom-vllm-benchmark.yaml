@@ -663,9 +663,22 @@ jobs:
           params = json.loads(os.environ["PARAMS_JSON"])
 
           include = []
+          aws_p0_displays = {
+              "gpt-oss-120b TP1 (AW)",
+              "DeepSeek-V3.2 FP8 TP4 (AW)",
+              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
+              "GLM-4.7-FP8 TP4 (AW)",
+              "GLM-4.7-FP8 MTP TP4 (AW)",
+              "Kimi-K2.5-MXFP4 TP4 (AW)",
+              "MiniMax-M2.5 TP2 (AW)",
+          }
           for model in models:
               prefix = str(model.get("prefix", ""))
+              display = str(model.get("display", ""))
               is_aw_model = "-aw-" in prefix
+              is_aws_p0_model = display in aws_p0_displays
               aw_pairs = (
                   (1000, 100),
                   (5000, 500),
@@ -713,6 +726,8 @@ jobs:
                   if supported_pairs and pair not in supported_pairs:
                       continue
                   if pair in excluded_pairs:
+                      continue
+                  if is_aws_p0_model and int(param["concurrency"]) in (128, 256, 512):
                       continue
                   include.append({"model": model, "params": param})
 
