@@ -219,7 +219,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.matrix_json_file:
-        matrix_payload = json.loads(Path(args.matrix_json_file).read_text(encoding="utf-8"))
+        matrix_payload = json.loads(
+            Path(args.matrix_json_file).read_text(encoding="utf-8")
+        )
     elif args.matrix_json:
         matrix_payload = json.loads(args.matrix_json)
     else:
