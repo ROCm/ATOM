@@ -234,15 +234,27 @@ class PagedAttentionImplPluginModeMethods:
         v_cache: torch.Tensor,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
+        num_decodes: int,
         out: torch.Tensor,
         attn_metadata: "AttentionMetaData",
         ps: bool = True,
     ):
-        o = out
-        num_seqs, num_q_heads_total, head_size = q.shape
+        # q.shape[0] == num_decodes * max_query_len for MTP (one row per decode
+        # token, query_len > 1). For non-MTP it equals num_decodes (query_len = 1).
+        # pa_decode_gluon handles multi-token causal masking internally when
+        # `query_length > 1` is passed; intermediate buffers must be sized
+        # `num_decodes` (not q.shape[0]) and `query_group_size` must include
+        # the max_qlen multiplier — mirroring server-mode `paged_attention_triton`.
+        _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-        query_group_size = num_q_heads_total // num_kv_heads
+        decode_metadata = attn_metadata.plugin_metadata.decode_metadata
+        max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
         assert num_q_heads_total % num_kv_heads == 0
+
+        seq_lens = attn_metadata.plugin_metadata.seq_lens[:num_decodes]
+        block_tables = attn_metadata.plugin_metadata.block_table[:num_decodes]
+
+        query_group_size = max_qlen * (num_q_heads_total // num_kv_heads)
         context_partition_size = 256
 
         # use_ps = self.adopt_persistent_kernel(
@@ -250,7 +262,9 @@ class PagedAttentionImplPluginModeMethods:
         # )
         use_ps = True
         if use_ps:
-            max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+            max_context_partition_num = get_recommended_splits(
+                num_decodes, num_kv_heads
+            )
         else:
             max_context_partition_num = _NO_PS_FIXED_SPLITS
 
@@ -258,9 +272,8 @@ class PagedAttentionImplPluginModeMethods:
             max_context_partition_num = 1
             context_partition_size = 128
 
-        # Output buffers (same as Triton)
         intermediate_shape = (
-            num_seqs,
+            num_decodes,
             num_kv_heads,
             max_context_partition_num,
             query_group_size,
@@ -283,21 +296,19 @@ class PagedAttentionImplPluginModeMethods:
             k_scale = k_scale.unsqueeze(-1)
             v_scale = v_scale.unsqueeze(-1)
 
-        num_decode_seqs = q.shape[0]
-        seq_lens_decode = attn_metadata.plugin_metadata.seq_lens[:num_decode_seqs]
-        block_tables_decode = attn_metadata.plugin_metadata.block_table[
-            :num_decode_seqs
-        ]
-
+        # Kernel takes natural q layout [batch * query_length, num_q_heads, head_size].
+        # Internally it derives batch_size = q.shape[0] // query_length and reshapes
+        # to [batch, query_length, num_kv_heads, group, head_size]. See
+        # aiter/aiter/ops/triton/gluon/pa_decode_gluon.py:5371-5377 and 5542-5544.
         torch.ops.aiter.pa_decode_gluon(
-            o,
+            out,
             q,
             k_cache,
             v_cache,
-            seq_lens_decode,
-            block_tables_decode,
+            seq_lens,
+            block_tables,
             self.scale,
-            1,  # query_lenth
+            max_qlen,  # query_length — handles multi-token causal mask internally
             max_context_partition_num,
             context_partition_size,
             compute_type,
@@ -312,8 +323,7 @@ class PagedAttentionImplPluginModeMethods:
             sliding_window=self.sliding_window,
             ps=use_ps,
         )
-
-        return o
+        return out
 
     def paged_attention_asm_plugin_mode(
         self,
@@ -327,6 +337,11 @@ class PagedAttentionImplPluginModeMethods:
         attn_metadata: "AttentionMetaData",
         out: torch.Tensor,
     ):
+        decode_metadata = attn_metadata.plugin_metadata.decode_metadata
+        max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
+        qo_indptr = (
+            decode_metadata.query_start_loc if decode_metadata is not None else None
+        )
         aiter.pa_fwd_asm(
             Q=q,
             K=k_cache,
@@ -336,9 +351,11 @@ class PagedAttentionImplPluginModeMethods:
             block_tables_stride0=attn_metadata.plugin_metadata.block_table[
                 :num_decodes
             ].stride(0),
+            max_qlen=max_qlen,
             K_QScale=k_scale,
             V_QScale=v_scale,
             out_=out[:num_decode_tokens],
+            qo_indptr=qo_indptr,
             high_precision=0,
         )
 
@@ -706,12 +723,13 @@ class PagedAttentionImplPluginModeMethods:
             extend_tokens_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_extend_tokens
             )
+            extend_reqs_slice = slice(num_decodes, num_decodes + num_extends)
             extend_querys = query[extend_tokens_slice]
             extend_keys = key[extend_tokens_slice]
             extend_values = value[extend_tokens_slice]
             extend_outputs = output[extend_tokens_slice]
             extend_block_table = attn_metadata.plugin_metadata.block_table[
-                extend_tokens_slice
+                extend_reqs_slice
             ]
             extend_slot_mapping = attn_metadata.plugin_metadata.slot_mapping[
                 extend_tokens_slice
@@ -745,6 +763,7 @@ class PagedAttentionImplPluginModeMethods:
                     v_cache=new_value_cache,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    num_decodes=num_decodes,
                     out=output_actual_tokens[:num_decode_tokens],
                     attn_metadata=attn_metadata,
                 )
@@ -757,6 +776,7 @@ class PagedAttentionImplPluginModeMethods:
                         v_cache=new_value_cache,
                         k_scale=k_scale,
                         v_scale=v_scale,
+                        num_decodes=num_decodes,
                         out=output_actual_tokens[:num_decode_tokens],
                         attn_metadata=attn_metadata,
                     )

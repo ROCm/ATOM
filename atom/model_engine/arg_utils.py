@@ -3,6 +3,7 @@
 
 import argparse
 import logging
+import json
 from dataclasses import dataclass, fields
 from typing import List, Optional
 
@@ -31,12 +32,13 @@ class EngineArgs:
     tensor_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
+    attn_prefill_chunk_size: int = 16384
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -53,6 +55,7 @@ class EngineArgs:
     kv_transfer_config: str = "{}"
     draft_model: Optional[str] = None
     mark_trace: bool = False
+    online_quant_config: Optional[dict] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -87,8 +90,10 @@ class EngineArgs:
         )
         parser.add_argument(
             "--enable_prefix_caching",
-            action="store_true",
-            help="Enable prefix caching.",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Enable prefix caching (default: enabled). "
+            "Use --no-enable_prefix_caching to disable.",
         )
         parser.add_argument(
             "--port",
@@ -186,6 +191,15 @@ class EngineArgs:
             help="Maximum number of tokens to batch together in async engine",
         )
         parser.add_argument(
+            "--attn-prefill-chunk-size",
+            type=int,
+            default=16384,
+            help=(
+                "MLA chunked-prefill budget in tokens. Default uses "
+                "max_num_batched_tokens."
+            ),
+        )
+        parser.add_argument(
             "--max-num-seqs",
             type=int,
             default=512,
@@ -216,6 +230,28 @@ class EngineArgs:
             "--mark-trace",
             action="store_true",
             help="Enable graph_marker nodes for tracing/profile instrumentation.",
+        )
+        parser.add_argument(
+            "--online_quant_config",
+            type=json.loads,
+            default=None,
+            help=(
+                "Online quantization config as a JSON string. "
+                "Supported quantization formats: ptpc_fp8, mxfp4. "
+                "The JSON object has three fields "
+                "(at least one must be provided):\n"
+                '  - "global_quant_config": str, default quantization '
+                "format applied to all layers.\n"
+                '  - "layer_quant_config": dict, per-layer overrides '
+                "using glob patterns as keys. "
+                "Overrides global_quant_config for matched layers.\n"
+                '  - "exclude_layer": str or list[str], layer name '
+                "patterns to exclude from quantization.\n"
+                "Example:\n"
+                """  '{"global_quant_config": "ptpc_fp8", """
+                """"layer_quant_config": {"*expert*": "mxfp4"}, """
+                """"exclude_layer": "lm_head"}'"""
+            ),
         )
 
         return parser

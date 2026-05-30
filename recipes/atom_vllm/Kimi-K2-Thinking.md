@@ -14,12 +14,13 @@ docker pull rocm/atom-dev:vllm-latest
 ## Step 2: Launch vLLM Server
 
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
+We adopt [amd/Kimi-K2-Thinking-MXFP4-AttnFP8](https://huggingface.co/amd/Kimi-K2-Thinking-MXFP4-AttnFP8) for better performance by leveraging FP8 weights for attention layers.
 
 ```bash
 # use quick allreduce to reduce TTFT
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
-vllm serve amd/Kimi-K2-Thinking-MXFP4 \
+vllm serve amd/Kimi-K2-Thinking-MXFP4-AttnFP8 \
     --host localhost \
     --port 8000 \
     --trust-remote-code \
@@ -28,6 +29,8 @@ vllm serve amd/Kimi-K2-Thinking-MXFP4 \
     --gpu_memory_utilization 0.9 \
     --async-scheduling \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
     --no-enable-prefix-caching
 ```
 
@@ -37,7 +40,7 @@ Users can use the default vllm bench command for performance benchmarking.
 vllm bench serve \
     --host localhost \
     --port 8000 \
-    --model amd/Kimi-K2-Thinking-MXFP4 \
+    --model amd/Kimi-K2-Thinking-MXFP4-AttnFP8 \
     --dataset-name random \
     --random-input-len 8000 \
     --random-output-len 1000 \
@@ -52,7 +55,15 @@ vllm bench serve \
 
 ```bash
 lm_eval --model local-completions \
-        --model_args model=amd/Kimi-K2-Thinking-MXFP4,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+        --model_args model=amd/Kimi-K2-Thinking-MXFP4-AttnFP8,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
         --tasks gsm8k \
         --num_fewshot 3
+```
+The reference values of corresponding metrics:
+```bash
+local-completions ({'model': 'amd/Kimi-K2-Thinking-MXFP4-AttnFP8', 'base_url': 'http://localhost:8000/v1/completions', 'num_concurrent': 16, 'max_retries': 3, 'tokenized_requests': False}), gen_kwargs: ({}), limit: None, num_fewshot: 3, batch_size: 1
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     3|exact_match|↑  |0.9340|±  |0.0068|
+|     |       |strict-match    |     3|exact_match|↑  |0.9325|±  |0.0069|
 ```

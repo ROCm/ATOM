@@ -8,13 +8,12 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_softplus
+from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_weight, shuffle_scale
-from aiter.utility import fp4_utils
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -57,6 +56,7 @@ from atom.utils.decorators import mark_trace
 from torch import nn
 from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
+from atom.quantization.quark.utils import weight_dequant_fp8
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -204,7 +204,11 @@ def pad_for_all_gather(x: torch.Tensor):
 
 def all_gather_with_padding(x: torch.Tensor):
     padded_x, original_batch_size = pad_for_all_gather(x)
-    gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=0)
+    # use_custom=True routes through CA IPC (outplace_all_gather). Default
+    # use_custom=False falls back to torch.distributed.all_gather_into_tensor
+    # (NCCL), whose WorkNCCL end-event recorded inside CUDAGraph capture is
+    # later queried by the watchdog thread -> hipErrorCapturedEvent crash.
+    gathered_hidden_states = get_dp_group().all_gather(padded_x, use_custom=True, dim=0)
     return gathered_hidden_states, original_batch_size
 
 
@@ -223,6 +227,63 @@ def reduce_scatter_with_unpadding(
         scattered_output = scattered_output[slices]
 
     return scattered_output
+
+
+def all_gatherv(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
+    return group.device_communicator.all_gatherv(x, dim=0, sizes=list(sizes))
+
+
+def reduce_scatterv(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
+    return group.device_communicator.reduce_scatterv(x, dim=0, sizes=list(sizes))
+
+
+def dp_gather_hidden_and_router(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    dp_eager_mode: bool,
+    ctx,
+    dp_group,
+):
+    """All-gather ``hidden_states`` + ``router_logits`` across DP ranks.
+
+    - **Eager (variable-length) mode**: per-rank token counts may differ, so
+      we ``all_gatherv`` with per-rank sizes. Both tensors are concatenated
+      along the last dim and gathered in a single collective to avoid the
+      cost of two separate rounds (caller splits them back out).
+    - **Uniform mode** (DP-decode-only / CUDAGraph path): every rank has the
+      same token count, so a plain padded ``all_gather`` per tensor is
+      enough.
+
+    Returns ``(hidden_states, router_logits, original_hidden_size, sizes)``;
+    ``sizes`` is non-None only in eager mode (needed later for
+    ``reduce_scatterv``).
+    """
+    if dp_eager_mode:
+        sizes = ctx.dp_metadata.get_sizes_across_dp()
+        original_hidden_size = hidden_states.shape[0]
+        h_dim = hidden_states.shape[-1]
+        r_dim = router_logits.shape[-1]
+        r_dtype = router_logits.dtype
+        # Cast router_logits to hidden_states.dtype for the single fused
+        # gather; cast back after split. (all_gatherv requires uniform dtype.)
+        r_for_gather = (
+            router_logits
+            if r_dtype == hidden_states.dtype
+            else router_logits.to(hidden_states.dtype)
+        )
+        combined = torch.cat([hidden_states, r_for_gather], dim=-1)
+        combined = all_gatherv(combined, sizes, dp_group)
+        hidden_states, router_logits = combined.split([h_dim, r_dim], dim=-1)
+        hidden_states = hidden_states.contiguous()
+        if router_logits.dtype != r_dtype:
+            router_logits = router_logits.to(r_dtype)
+        else:
+            router_logits = router_logits.contiguous()
+        return hidden_states, router_logits, original_hidden_size, sizes
+
+    hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
+    router_logits, _ = all_gather_with_padding(router_logits)
+    return hidden_states, router_logits, original_hidden_size, None
 
 
 @torch_compile_guard()
@@ -757,7 +818,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if layer.has_bias:
             w13_bias = atom_parameter(
-                torch.empty(
+                torch.zeros(
                     num_experts,
                     2 * intermediate_size_per_partition_after_pad,
                     dtype=torch.bfloat16,
@@ -794,7 +855,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if layer.has_bias:
             w2_bias = atom_parameter(
-                torch.empty(
+                torch.zeros(
                     num_experts,
                     hidden_size,
                     dtype=torch.bfloat16,
@@ -859,51 +920,32 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale = None
             return
 
-        # quark method for moe, split it out?
-        elif self.quant_method == "quark":
-            shuffle_weights(layer.w13_weight, layer.w2_weight)
-            s0, s1, _ = layer.w13_weight_scale.shape
-            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-            w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
-            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+        # shuffle weight
+        layer.w13_weight.data = shuffle_weight(
+            layer.w13_weight,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=True,
+        )
+        layer.w2_weight.data = shuffle_weight(
+            layer.w2_weight,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=False,
+        )
+        layer.w13_weight.is_shuffled = True
+        layer.w2_weight.is_shuffled = True
 
-            s0, s1, _ = layer.w2_weight_scale.shape
-            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-            w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
-            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
-            return
-        else:
-            # shuffle weight
-            layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight,
-                is_guinterleave=self.is_guinterleave,
-                gate_up=True,
-            )
-            layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight,
-                is_guinterleave=self.is_guinterleave,
-                gate_up=False,
-            )
+        # shuffle scale
+        w13_scale_2d = layer.w13_weight_scale.reshape(
+            -1, layer.w13_weight_scale.shape[-1]
+        )
+        w2_scale_2d = layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1])
 
-            # shuffle scale
-            if self.is_guinterleave:
-                w13_scale_2d = layer.w13_weight_scale.view(
-                    -1, layer.w13_weight_scale.shape[-1]
-                )
-                w2_scale_2d = layer.w2_weight_scale.view(
-                    -1, layer.w2_weight_scale.shape[-1]
-                )
-            else:
-                w13_scale_2d = layer.w13_weight_scale.view(self.num_experts, -1)
-                w2_scale_2d = layer.w2_weight_scale.view(self.num_experts, -1)
-
-            shuffled_w13_scale = shuffle_scale(
-                w13_scale_2d, self.num_experts, self.is_guinterleave, True
-            )
-            shuffled_w2_scale = shuffle_scale(
-                w2_scale_2d, self.num_experts, self.is_guinterleave, False
-            )
-
+        shuffled_w13_scale = shuffle_scale(
+            w13_scale_2d, self.num_experts, self.is_guinterleave, True
+        )
+        shuffled_w2_scale = shuffle_scale(
+            w2_scale_2d, self.num_experts, self.is_guinterleave, False
+        )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
@@ -1050,7 +1092,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=expert_map,
+                expert_mask=layer.expert_mask,
                 activation=activation,
                 quant_type=self.quant_type,
                 w1_scale=layer.w13_weight_scale,
@@ -1356,21 +1398,12 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale = atom_parameter(max_w13_scales)
 
         # Shuffle weights for asm moe (moved from inference to load time for better performance).
-        # For per_1x128 blockscale (block_quant), only shuffle when the preshuffle GEMM
-        # path is enabled — the non-preshuffle kernel expects the un-shuffled layout.
-        skip_shuffle_for_block = (
-            self.block_quant and not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-        )
-        if (
-            w13.dtype
-            in [
-                torch.int8,
-                torch.uint8,
-                torch.float8_e4m3fnuz,
-                torch.float8_e4m3fn,
-            ]
-            and not skip_shuffle_for_block
-        ):
+        if w13.dtype in [
+            torch.int8,
+            torch.uint8,
+            torch.float8_e4m3fnuz,
+            torch.float8_e4m3fn,
+        ]:
             from aiter.ops.shuffle import shuffle_weight
 
             w13.data = shuffle_weight(w13.data)
@@ -1447,8 +1480,9 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
 
-        # Use modular kernel if available (for EP/DP setups)
-        # Otherwise fall back to direct kernel call
+        # Use modular kernel if available (for EP/DP setups).
+        # Otherwise route through the standard AITER fused_moe path so
+        # compressed-tensors FP8 shares the same tuned-kernel dispatch.
         if self.fused_experts is not None:
             return self.fused_experts(
                 hidden_states=x,
@@ -1468,8 +1502,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
         else:
-            # Direct kernel call for non-EP/DP cases
-            return rocm_asm_moe_impl(
+            return torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -1680,11 +1713,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = atom_parameter(layer.w2_weight.data)
             layer.w2_weight_scale = atom_parameter(layer.w2_weight_scale.data)
 
-        # per_1x128 blockscale MoE only needs weight bpreshuffle when the
-        # preshuffle GEMM path is enabled. Skip it to match the non-preshuffle
-        # kernel's expected weight layout.
-        if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
-            shuffle_weights(layer.w13_weight, layer.w2_weight)
+        shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_channel_quant(self, layer: nn.Module) -> None:
         """PTPTC"""
@@ -1979,6 +2008,8 @@ class FusedMoE(torch.nn.Module):
             tp_size, dp_size, atom_config
         )
         self.global_num_experts = num_experts
+        self.register_buffer("expert_map", None, persistent=False)
+        self.register_buffer("expert_mask", None, persistent=False)
         if self.use_ep:
             self.local_num_experts, self.expert_map = determine_expert_map(
                 ep_size=self.ep_size,
@@ -1987,7 +2018,6 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             self.local_num_experts = self.global_num_experts
-            self.expert_map = None
         self.top_k = top_k
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
@@ -2005,11 +2035,11 @@ class FusedMoE(torch.nn.Module):
             if config is not None and atom_config.torch_dtype != torch.float16
             else 1.0
         )
-        self.expert_mask = None
         if self.use_ep:
             expert_mask = torch.ones(
                 (self.global_num_experts + self.num_fused_shared_experts + 1,),
                 dtype=torch.int32,
+                device=self.expert_map.device,
             )
             expert_mask[-1] = 0
             expert_mask[: self.global_num_experts] = self.expert_map > -1
@@ -2059,8 +2089,6 @@ class FusedMoE(torch.nn.Module):
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
 
-        self.use_chunked = get_dp_group().world_size > 1
-
         moe = FusedMoEConfig(
             num_experts=self.global_num_experts,
             experts_per_token=self.top_k,
@@ -2074,9 +2102,8 @@ class FusedMoE(torch.nn.Module):
             is_lora_enabled=False,
         )
         self.moe_config = moe
-
-        # Note: get_quant_method will look at the layer's local_num_experts
-        # for heuristic purposes, so it must be initialized first.
+        self.quant_config = quant_config
+        self.online_quant = quant_config is not None and quant_config.online_quant
 
         quant_method_str = (
             layer_quant_config.quant_method if layer_quant_config else None
@@ -2103,19 +2130,194 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         self.apply_router_weight_on_input = apply_router_weight_on_input
-        moe_quant_params = {
+        self.moe_quant_params = {
             "num_experts": self.local_num_experts,
             "hidden_size": hidden_size,
             "intermediate_size_per_partition": self.intermediate_size_per_partition,
             "params_dtype": self.params_dtype,
             "weight_loader": self.weight_loader,
         }
-        self.quant_method.create_weights(layer=self, **moe_quant_params)
+        self.quant_method.create_weights(layer=self, **self.moe_quant_params)
         compilation_config = atom_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError("Duplicate layer name: {}".format(prefix))
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+
+    def process_weights_after_loading(self):
+        self._online_quant()
+
+    def _online_quant(self):
+        """Handle online quantization: (optionally dequant →) quantize weights,
+        then switch quant_method.
+
+        Called by the loader BEFORE quant_method.process_weights_after_loading().
+        Flow:
+          1. If source is already quantized (e.g. per_1x128 FP8), dequant → bf16
+          2. Switch quant_method and allocate target quantized buffers
+          3. Per-expert: quantize bf16 → write into buffers via
+             _load_model_weight_or_group_weight_scale (reuses TP-shard + padding)
+          4. Loader then calls target method's process_weights_after_loading
+             which does fn→fnuz normalization and shuffle on the already-FP8 weights.
+        """
+        if not self.online_quant:
+            return
+
+        online_quant_config = self.quant_config.get_layer_quant_config(
+            self.layer_name, use_online_quant=True
+        )
+        online_quant_type = online_quant_config.quant_type
+        online_quant_dtype = online_quant_config.quant_dtype
+        quant_func = get_hip_quant(online_quant_type)
+
+        source_quant_type = self.layer_quant_config.quant_type
+        assert source_quant_type in (QuantType.No, QuantType.per_1x128), (
+            f"Unsupported source quant_type for MoE online quantization: "
+            f"{source_quant_type} (layer={self.layer_name})"
+        )
+        need_dequant = source_quant_type == QuantType.per_1x128
+
+        # Determine whether each weight needs all_gather to match offline quantization.
+        # w13 (column parallel): (E, (2*intermediate/tp, hidden)) — TP dim 0
+        # w2  (row parallel):    (E, (hidden, intermediate/tp)) — TP dim 1
+        # w13 [e, m, n]->[e, m//tp, n//2]->[e, m//tp, n//32]
+        def check_need_allgather():
+            if self.use_ep:
+                assert self.tp_size == 1, "EP MoE should not TP-shard expert weights"
+                return False
+
+            need_gather_w2 = False
+            if self.tp_size > 1:
+                # self.intermediate_size_per_partition = intermediate_size // self.tp_size
+                w2_in = self.intermediate_size_per_partition
+                if online_quant_type == QuantType.per_Token:
+                    need_gather_w2 = True
+                elif online_quant_type == QuantType.per_1x32:
+                    need_gather_w2 = w2_in % 32 != 0
+            return need_gather_w2
+
+        need_gather_w2 = check_need_allgather()
+        tp_group = get_tp_group() if need_gather_w2 else None
+        load_full_w2 = not need_gather_w2
+
+        # Save references to old weights before create_weights overwrites them.
+        # For per_1x128 source we also need the old scales for dequantization.
+        old_w13_data = self.w13_weight.data
+        old_w2_data = self.w2_weight.data
+        old_w13_scale = self.w13_weight_scale.data if need_dequant else None
+        old_w2_scale = self.w2_weight_scale.data if need_dequant else None
+        device = old_w13_data.device
+
+        # Switch quant_method and allocate target quantized-type buffers.
+        if online_quant_dtype == dtypes.fp8:
+            self.quant_method = Fp8MoEMethod(online_quant_config, self.moe_config)
+        elif online_quant_dtype == dtypes.fp4x2:
+            self.quant_method = Mxfp4MoEMethod(online_quant_config, self.moe_config)
+        else:
+            raise ValueError(
+                f"Unsupported online quant_dtype for MoE: {online_quant_dtype}"
+            )
+        self.moe_quant_params["params_dtype"] = online_quant_dtype
+        with torch.device(device):
+            self.quant_method.create_weights(layer=self, **self.moe_quant_params)
+
+        self.w13_input_scale = None
+        self.w2_input_scale = None
+
+        for expert_id in range(self.local_num_experts):
+            # --- w13 column-parallel ---
+            w13_local = old_w13_data[expert_id]
+            w1_size = w13_local.shape[0] // 2
+
+            if need_dequant:
+                w13_scale = old_w13_scale[expert_id]
+                s1_size = w13_scale.shape[0] // 2
+                w1_bf16 = weight_dequant_fp8(
+                    w13_local[:w1_size].contiguous(),
+                    w13_scale[:s1_size].contiguous(),
+                )
+                w3_bf16 = weight_dequant_fp8(
+                    w13_local[w1_size:].contiguous(),
+                    w13_scale[s1_size:].contiguous(),
+                )
+            else:
+                w1_bf16 = w13_local[:w1_size]
+                w3_bf16 = w13_local[w1_size:]
+
+            w1_q, w1_s = quant_func(w1_bf16, quant_dtype=online_quant_dtype)
+            w3_q, w3_s = quant_func(w3_bf16, quant_dtype=online_quant_dtype)
+            del w1_bf16, w3_bf16
+
+            w13_expert = self.w13_weight.data[expert_id]
+            w13_scale_expert = self.w13_weight_scale.data[expert_id]
+            for shard_id, wq, ws in (("w1", w1_q, w1_s), ("w3", w3_q, w3_s)):
+                self._load_model_weight_or_group_weight_scale(
+                    shard_dim=0,
+                    expert_data=w13_expert,
+                    shard_id=shard_id,
+                    loaded_weight=wq,
+                    tp_rank=self.tp_rank,
+                    load_full=True,
+                )
+                self._load_quant_weight_scale(
+                    expert_data=w13_scale_expert,
+                    shard_dim=0,
+                    shard_id=shard_id,
+                    loaded_weight=ws,
+                    tp_rank=self.tp_rank,
+                    quant_type=online_quant_type,
+                    load_full=True,
+                )
+            del w1_q, w3_q, w1_s, w3_s
+
+            # w2 row-parallel: optionally gather before quantization
+            # w2 mxfp4    [e, m, n]->[e, m, n//2//tp]->[e, m, n//32//tp]
+            # w2 ptpc_fp8 [e, m, n]->[e, m, n//tp]->[e, m, 1]
+            w2_local = old_w2_data[expert_id]
+            if need_dequant:
+                w2_local = weight_dequant_fp8(
+                    w2_local.contiguous(),
+                    old_w2_scale[expert_id].contiguous(),
+                )
+            if need_gather_w2:
+                w2_full = tp_group.all_gather(w2_local, dim=1)
+                w2_q, w2_s = quant_func(w2_full, quant_dtype=online_quant_dtype)
+                del w2_full
+            else:
+                w2_q, w2_s = quant_func(w2_local, quant_dtype=online_quant_dtype)
+
+            self._load_model_weight_or_group_weight_scale(
+                shard_dim=1,
+                expert_data=self.w2_weight.data[expert_id],
+                shard_id="w2",
+                loaded_weight=w2_q,
+                tp_rank=self.tp_rank,
+                load_full=load_full_w2,
+            )
+            # per_Token scale is along output dim (not TP-split), never needs shard
+            w2_scale_load_full = (
+                False if online_quant_type == QuantType.per_Token else load_full_w2
+            )
+            self._load_quant_weight_scale(
+                expert_data=self.w2_weight_scale.data[expert_id],
+                shard_dim=1,
+                shard_id="w2",
+                loaded_weight=w2_s,
+                tp_rank=self.tp_rank,
+                quant_type=online_quant_type,
+                load_full=w2_scale_load_full,
+            )
+            del w2_q, w2_s
+
+        del old_w13_data, old_w2_data
+        if need_dequant:
+            del old_w13_scale, old_w2_scale
+
+        self._online_quant_info = {
+            "layer": self.layer_name,
+            "quant_type": online_quant_type.name,
+            "quant_dtype": str(online_quant_dtype),
+        }
 
     @property
     def tp_size(self):
@@ -2170,7 +2372,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         tp_rank: int,
-        load_full_w2: bool = False,
+        load_full: bool = False,
     ):
         """
         Load grouped weight scales for group quantization or model weights
@@ -2189,7 +2391,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
-                load_full=load_full_w2,
+                load_full=load_full,
             )
         elif shard_id in ("w1", "w3"):
             self._load_w13(
@@ -2198,6 +2400,38 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                load_full=load_full,
+            )
+
+    def _load_quant_weight_scale(
+        self,
+        expert_data: torch.Tensor,
+        shard_dim: int,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        quant_type,
+        load_full: bool = False,
+    ):
+        """Dispatch weight-scale loading by quant_type."""
+        if quant_type == QuantType.per_Token:
+            self._load_per_channel_weight_scale(
+                expert_data=expert_data,
+                shard_dim=shard_dim,
+                shard_id=shard_id,
+                loaded_weight=loaded_weight.squeeze(-1),
+                tp_rank=tp_rank,
+                load_full=load_full,
+            )
+        else:
+            # The Aiter FP4 quantization function returns a value of type FP4*2
+            self._load_model_weight_or_group_weight_scale(
+                shard_dim=shard_dim,
+                expert_data=expert_data,
+                shard_id=shard_id,
+                loaded_weight=loaded_weight.view(torch.uint8),
+                tp_rank=tp_rank,
+                load_full=load_full,
             )
 
     def _load_per_channel_weight_scale(
@@ -2207,8 +2441,25 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         tp_rank: int,
+        load_full: bool = False,
     ):
         # for per channel weight quantization
+        if load_full:
+            if shard_id == "w2":
+                load_size = loaded_weight.shape[shard_dim]
+                if load_size != expert_data.shape[shard_dim]:
+                    expert_data = expert_data.narrow(shard_dim, 0, load_size)
+                expert_data.copy_(loaded_weight)
+            elif shard_id in ("w1", "w3"):
+                self._load_w13(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=tp_rank,
+                    load_full=True,
+                )
+            return
         if shard_id == "w2":
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):
@@ -2227,7 +2478,26 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         tp_rank: int,
+        load_full: bool = False,
     ):
+        # for online local quantizaiton
+        if load_full:
+            expert_shard_size = expert_data.shape[shard_dim] // 2
+            if shard_id == "w1":
+                expert_data = expert_data.narrow(shard_dim, 0, expert_shard_size)
+            else:
+                assert shard_id == "w3"
+                expert_data = expert_data.narrow(
+                    shard_dim, expert_shard_size, expert_shard_size
+                )
+            load_size = loaded_weight.shape[shard_dim]
+            if load_size != expert_shard_size:
+                expert_data = expert_data.narrow(shard_dim, 0, load_size)
+            if expert_data.dtype != dtypes.fp4x2:
+                expert_data.copy_(loaded_weight)
+            else:
+                expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+            return
 
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
@@ -2274,20 +2544,28 @@ class FusedMoE(torch.nn.Module):
         tp_rank: int,
         load_full: bool = False,
     ):
+        # # for online local quantizaiton
+        if load_full:
+            shard_size = expert_data.shape[shard_dim]
+            load_size = loaded_weight.shape[shard_dim]
+            if load_size != shard_size:
+                expert_data = expert_data.narrow(shard_dim, 0, load_size)
+            if expert_data.dtype != dtypes.fp4x2:
+                expert_data.copy_(loaded_weight)
+            else:
+                expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+            return
 
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
-        if not load_full:
-            # Derive shard size from loaded_weight (unpadded checkpoint) to
-            # avoid out-of-bounds when expert_data is padded (e.g. MXFP4).
-            load_shard_size = loaded_weight.shape[shard_dim] // self.tp_size
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, load_shard_size * tp_rank, load_shard_size
-            )
-            if load_shard_size != shard_size:
-                expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
+        load_shard_size = loaded_weight.shape[shard_dim] // self.tp_size
+        loaded_weight = loaded_weight.narrow(
+            shard_dim, load_shard_size * tp_rank, load_shard_size
+        )
+        if load_shard_size != shard_size:
+            expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
         if expert_data.dtype == dtypes.fp4x2:
             expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
@@ -2550,7 +2828,7 @@ class FusedMoE(torch.nn.Module):
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=self.tp_rank,
-                    load_full_w2=getattr(param, "load_full_w2", False),
+                    load_full=getattr(param, "load_full_w2", False),
                 )
             elif quant_method == QuantType.per_Tensor:
                 self._load_per_tensor_weight_scale(
@@ -2664,13 +2942,14 @@ class FusedMoE(torch.nn.Module):
                 topk_weights = torch.empty(
                     tokens_num, top_k, dtype=torch.float32, device=router_logits.device
                 )
-                topk_softplus(
+                topk_gating(
                     topk_weights,
                     topk_ids,
                     router_logits,
                     e_score_correction_bias,
                     renormalize,
                     routed_scaling_factor,
+                    score_func="sqrtsoftplus",
                 )
             else:
                 raise ValueError(
@@ -2692,6 +2971,7 @@ class FusedMoE(torch.nn.Module):
         # 2. DP attention + EP mori Moe
         # 3. DP attention + TP All_gahter/reduce Moe
         original_hidden_size = None
+        sizes = None
         # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
         use_dp_gather_scatter = (
             self.dp_size > 1
@@ -2699,6 +2979,10 @@ class FusedMoE(torch.nn.Module):
             and get_current_atom_config().enable_dp_attention
         )
         if use_dp_gather_scatter:
+            ctx = get_forward_context()
+            dp_group = get_dp_group()
+            dp_eager_mode = not ctx.context.dp_uniform_decode
+
             from atom.utils.tbo.ubatching import tbo_active
 
             _tbo = tbo_active()
@@ -2710,8 +2994,16 @@ class FusedMoE(torch.nn.Module):
                 )
 
                 tbo_yield_and_switch_from_compute_to_comm()
-            hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
-            router_logits, _ = all_gather_with_padding(router_logits)
+
+            (
+                hidden_states,
+                router_logits,
+                original_hidden_size,
+                sizes,
+            ) = dp_gather_hidden_and_router(
+                hidden_states, router_logits, dp_eager_mode, ctx, dp_group
+            )
+
             if _tbo:
                 tbo_switch_to_compute_sync()
 
@@ -2739,9 +3031,14 @@ class FusedMoE(torch.nn.Module):
         if use_dp_gather_scatter:
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
-            final_hidden_states = reduce_scatter_with_unpadding(
-                final_hidden_states, original_hidden_size
-            )
+            if dp_eager_mode:
+                final_hidden_states = reduce_scatterv(
+                    final_hidden_states, sizes, dp_group
+                )
+            else:
+                final_hidden_states = reduce_scatter_with_unpadding(
+                    final_hidden_states, original_hidden_size
+                )
             if _tbo:
                 tbo_yield_and_switch_from_comm_to_compute()
 
@@ -2755,10 +3052,9 @@ class FusedMoE(torch.nn.Module):
 
     def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
-        # cuda graph not supported forward with combine and dispatch
-        if self.use_chunked:
+
+        if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
-            # return self.forward_impl_chunked(hidden_states, router_logits)
 
         dp_group = get_dp_group()
         if dp_group.world_size > 1:

@@ -13,7 +13,10 @@
 
 ## 📢 News
 
+- **[2026/05]** ATOM now supports **Qwen3.5 multimodal image+text inference** on the native engine and OpenAI-compatible chat API. See [Qwen3.5 multimodal recipe](recipes/Qwen3.5_multimodel.md).
 - **[2026/05]** [Dissecting DeepSeek V4 Compressor](https://rocm.github.io/ATOM/dissecting_dsv4_compressor) — interactive animation visualizing how the CSA/HCA compressor state cache works (overlap mechanism, prefill vs decode, bulk compression vs sequential accumulation).
+- **[2026/05]** **DeepSeek V4-Pro PD disaggregation** — Prefill/Decode separation now supports DeepSeek V4-Pro with Mooncake RDMA KV cache transfer. See [V4 recipe](recipes/DeepSeek-V4.md#pd-disaggregation-with-mooncake-prefill-decode-separation) and [PD guide](recipes/pd_disaggregation_guide.md).
+- **[2026/05]** ATOM now supports **Prefill/Decode (P/D) disaggregation** with [Mooncake](https://github.com/kvcache-ai/Mooncake) RDMA push-mode KV cache transfer. See [PD disaggregation guide](recipes/pd_disaggregation_guide.md).
 - **[2026/03]** ATOM now supports **Prefill/Decode (P/D) disaggregation** — run prefill and decode on separate GPU nodes with RDMA-based KV cache transfer via [MORI-IO](https://github.com/ROCm/mori). See [disaggregation docs](atom/kv_transfer/disaggregation/README.md).
 
 ## 🚀 Features
@@ -254,6 +257,7 @@ lm_eval --model local-completions \
 - [GLM-5](recipes/GLM-5.md) — FP8 MoE with MLA on 8 GPUs
 - [GPT-OSS-120B](recipes/GPT-OSS.md) — Single GPU or DP+EP on 2 GPUs
 - [TBO (Two-Batch Overlap)](recipes/TBO.md) — Compute-communication overlap for MoE models with DP attention
+- [PD Disaggregation (Mooncake)](recipes/pd_disaggregation_guide.md) — Prefill/Decode separation with RDMA KV cache transfer (DeepSeek-R1, DeepSeek-V4-Pro)
 
 **Framework Integration:**
 

@@ -16,8 +16,8 @@ from atom.models.utils import IntermediateTensors
 from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
-from .deepseek_v2 import DeepseekV2DecoderLayer
-from .utils import maybe_prefix
+from .deepseek_v2 import DeepseekV2DecoderLayer, _can_fuse_indexer_wk_weights_proj
+from .utils import ckpt_has_tensor_suffix, maybe_prefix
 
 
 class SharedHead(nn.Module):
@@ -46,7 +46,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         atom_config: Config,
         prefix: str,
         layer_idx: int,
-        topk_indices_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
 
@@ -76,7 +75,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             layer_num=layer_idx,
             is_mtp_block=True,
-            topk_indices_buffer=topk_indices_buffer,
         )
 
     def forward(
@@ -88,9 +86,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        # masked_inputs_embeds = torch.where(
-        #     positions.unsqueeze(-1) == 0, 0, inputs_embeds
-        # )
         masked_inputs_embeds = inputs_embeds
         inputs_embeds = self.enorm(masked_inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
@@ -114,7 +109,6 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         *,
         atom_config: Config,
         prefix: str = "",
-        topk_indices_buffer: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         config = atom_config.hf_config
@@ -127,7 +121,6 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                     atom_config,
                     f"{prefix}.layers.{idx}",
                     layer_idx=idx,
-                    topk_indices_buffer=topk_indices_buffer,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -177,6 +170,20 @@ class DeepSeekMTP(nn.Module):
         super().__init__()
         self.config = atom_config.hf_config
 
+        # Several MTP checkpoints (DeepSeek R1/V3/V3.2 FP8 + the Quark mixed
+        # MXFP4/FP8 variants) store eh_proj as BF16 with no weight_scale even
+        # though their HF quantization_config does not list eh_proj in the
+        # exclude set. Without this guard ReplicatedLinear is built with the
+        # global FP8/MXFP4 spec, the BF16 weight is cast into the FP8 slot
+        # against an uninitialized weight_scale, and MTP accept rate collapses.
+        # GLM-FP8 ckpts already list eh_proj explicitly (this becomes a no-op);
+        # GLM-5.1-MXFP4 truly quantizes eh_proj and ships weight_scale on disk
+        # so the check below leaves the global spec in effect.
+        if atom_config.quant_config is not None and not ckpt_has_tensor_suffix(
+            atom_config.model, "eh_proj.weight_scale"
+        ):
+            atom_config.quant_config.apply_default_exclude_layers(["*.eh_proj"])
+
         if hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None:
             self.packed_modules_mapping = {
                 "q_a_proj": ("fused_qkv_a_proj", 0),
@@ -190,20 +197,31 @@ class DeepSeekMTP(nn.Module):
                 "up_proj": ("gate_up_proj", 1),
             }
 
+        model_prefix = maybe_prefix(prefix, "model")
         if hasattr(self.config, "index_topk"):
-            topk_indices_buffer = torch.empty(
-                atom_config.max_num_batched_tokens,
-                self.config.index_topk,
-                dtype=torch.int32,
-                device="cuda",
-            )
-        else:
-            topk_indices_buffer = None
+            indexer_prefixes = [
+                f"{model_prefix}.layers.{idx}.self_attn.indexer"
+                for idx in range(
+                    self.config.num_hidden_layers,
+                    self.config.num_hidden_layers
+                    + self.config.num_nextn_predict_layers,
+                )
+            ]
+            if _can_fuse_indexer_wk_weights_proj(
+                self.config,
+                atom_config.quant_config,
+                indexer_prefixes,
+            ):
+                self.packed_modules_mapping.update(
+                    {
+                        "indexer.wk": ("indexer.wk_weights_proj", 0),
+                        "indexer.weights_proj": ("indexer.wk_weights_proj", 1),
+                    }
+                )
 
         self.model = DeepSeekMultiTokenPredictor(
             atom_config=atom_config,
-            prefix=maybe_prefix(prefix, "model"),
-            topk_indices_buffer=topk_indices_buffer,
+            prefix=model_prefix,
         )
 
     def remap_mtp_weight_name(self, name: str) -> str | None:

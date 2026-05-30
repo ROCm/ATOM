@@ -62,7 +62,6 @@ class KimiK25Model(DeepseekV2Model):
             lambda prefix, layer_num=None: DeepseekV2DecoderLayer(
                 config,
                 prefix,
-                topk_indices_buffer=None,
                 cache_config=cache_config,
                 quant_config=quant_config,
                 layer_num=layer_num,
@@ -80,6 +79,7 @@ class KimiK25Model(DeepseekV2Model):
             )
         else:
             self.norm = PPMissingLayer()
+        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -191,7 +191,11 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
     def __init__(self, atom_config: Config, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__
         nn.Module.__init__(self)
-        config: KimiK25Config = atom_config.hf_config
+        hf_config = getattr(atom_config, "hf_config", None)
+        assert hf_config is not None, "hf_config is not found in atom_config"
+        vision_config = getattr(hf_config, "vision_config", None)
+        text_config = getattr(hf_config, "text_config", None)
+        config = KimiK25Config(vision_config, text_config)
 
         vllm_config = atom_config.plugin_config.vllm_config
         # quant_config from vLLM ignores exclude_layers in model's quantization config

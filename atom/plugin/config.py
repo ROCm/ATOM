@@ -1,3 +1,4 @@
+import copy
 from typing import Any, Optional
 from dataclasses import dataclass
 
@@ -31,6 +32,7 @@ class PluginConfig:
     sglang_enable_torch_compile: bool = False
     sglang_disable_cuda_graph: bool = False
     sglang_enable_dp_attention: bool = False
+    sglang_aiter_rank_id: int = 0
     sglang_dist_init_addr: Optional[str] = None
     sglang_port_args: Any = None
 
@@ -69,6 +71,45 @@ def _normalize_sglang_parallel_config(
     # ATOM/aiter on the per-worker TP world and do not create an internal DP
     # communication group.
     return tp_size, 1, 0, tp_rank
+
+
+def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
+    """Translate vLLM's SpeculativeConfig into ATOM's SpeculativeConfig.
+
+    Reuses vLLM's already-loaded draft hf_config (skips a second disk fetch
+    in ATOM SpeculativeConfig.__post_init__) but still runs ATOM's
+    hf_config_override on it — so MTP model_type remap, n_routed_experts
+    backfill (Qwen families), and architecture rewrite all land on the
+    draft config in one place. Mirrors how standalone ATOM MTP exposes
+    the draft hf_config via atom_config.speculative_config.
+
+    The draft hf_config is deepcopied first because hf_config_override
+    mutates `architectures` to ATOM's standalone naming (e.g.
+    "Qwen3NextMTPModel"), which differs from vLLM's registry name
+    ("Qwen3NextMTP"). Mutating in place would make vLLM's later draft
+    architecture lookup fail.
+    """
+    if vllm_spec_config is None:
+        return None
+
+    from atom.config import SpeculativeConfig
+
+    draft_model_config = getattr(vllm_spec_config, "draft_model_config", None)
+    draft_hf_config = getattr(draft_model_config, "hf_config", None)
+    if draft_hf_config is not None:
+        draft_hf_config = copy.deepcopy(draft_hf_config)
+    model_path = getattr(draft_model_config, "model", None) or getattr(
+        vllm_spec_config, "model", None
+    )
+
+    return SpeculativeConfig(
+        method=getattr(vllm_spec_config, "method", "") or "",
+        model=model_path,
+        num_speculative_tokens=getattr(
+            vllm_spec_config, "num_speculative_tokens", None
+        ),
+        draft_model_hf_config=draft_hf_config,
+    )
 
 
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
@@ -117,6 +158,10 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
     max_num_batched_tokens = vllm_scheduler_config.max_num_batched_tokens
 
+    atom_speculative_config = _build_atom_speculative_config_from_vllm(
+        getattr(config, "speculative_config", None)
+    )
+
     return Config(
         model=vllm_model_config.model,
         trust_remote_code=getattr(vllm_model_config, "trust_remote_code", False),
@@ -140,6 +185,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         master_addr=None,
         enable_dp_attention=False,
         plugin_config=plugin_config,
+        speculative_config=atom_speculative_config,
     )
 
 
@@ -148,6 +194,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.server_args import (
         get_global_server_args,
         PortArgs,
+        ZMQ_TCP_PORT_DELTA,
     )
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from sglang.srt.configs.modelopt_config import ModelOptConfig
@@ -212,7 +259,9 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # sglang uses the atom parallel config
     sgl_parallel_config = ParallelConfig(
         data_parallel_size=atom_data_parallel_size,
+        data_parallel_size_local=atom_data_parallel_size,
         data_parallel_rank=atom_data_parallel_rank,
+        data_parallel_rank_local=atom_data_parallel_rank,
     )
 
     # use sglang torch compile policy and cuda graph policy
@@ -223,6 +272,26 @@ def _generate_atom_config_from_sglang_config(config: Any):
         use_cudagraph=False,
         cudagraph_mode=None,
     )
+
+    sglang_dist_init_addr = server_args.dist_init_addr
+    # In single-node DP attention, synthesize the same TCP base address that
+    # SGLang uses for its DP-attention TCP port family. The primary purpose is
+    # to avoid calling PortArgs.init_new() again in ATOM plugin mode, because a
+    # second call would probe that fixed TCP range again and conflict with
+    # SGLang's existing allocation. In the current plugin path, this value
+    # should be treated as a compatibility/fallback hint rather than a
+    # guaranteed representation of the runtime default torch.distributed world
+    # rendezvous endpoint.
+    if (
+        sglang_dist_init_addr is None
+        and server_args.enable_dp_attention
+        and server_args.nnodes == 1
+    ):
+        sglang_dist_init_addr = f"127.0.0.1:{server_args.port + ZMQ_TCP_PORT_DELTA}"
+
+    sglang_port_args = None
+    if sglang_dist_init_addr is None:
+        sglang_port_args = PortArgs.init_new(server_args)
 
     plugin_config = PluginConfig(
         # common config
@@ -237,8 +306,9 @@ def _generate_atom_config_from_sglang_config(config: Any):
         sglang_enable_torch_compile=server_args.enable_torch_compile,
         sglang_disable_cuda_graph=server_args.disable_cuda_graph,
         sglang_enable_dp_attention=server_args.enable_dp_attention,
-        sglang_dist_init_addr=server_args.dist_init_addr,
-        sglang_port_args=PortArgs.init_new(server_args),
+        sglang_aiter_rank_id=sglang_aiter_rank_id,
+        sglang_dist_init_addr=sglang_dist_init_addr,
+        sglang_port_args=sglang_port_args,
     )
 
     # force max num batched tokens to 16K because sgl doesn't have

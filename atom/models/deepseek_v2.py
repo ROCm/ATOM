@@ -35,6 +35,7 @@ from aiter import (
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
+    indexer_qk_rope_quant_and_cache,
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
@@ -51,7 +52,13 @@ from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.activation import SiluAndMul
-from atom.model_ops.attention_mla import MLAModules, is_rocm_aiter_fp4bmm_enabled
+from atom.model_ops.attention_mla import (
+    MLAModules,
+    is_rocm_aiter_fp4bmm_enabled,
+    triton_convert_req_index_to_global_index,
+    triton_convert_req_index_to_global_index_dsa_prefill,
+    triton_gather_kv_indices_sparse,
+)
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
@@ -116,6 +123,50 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_DS_QKNORM_FUSION = envs.ATOM_ENABLE_DS_QKNORM_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
+ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = (
+    envs.ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
+)
+_FP8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+    )
+    if dtype is not None
+)
+
+
+def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
+    if not hasattr(config, "index_topk"):
+        return False
+    if getattr(config, "model_type", None) == "glm_moe_dsa":
+        return False
+    return (
+        getattr(config, "index_head_dim", None) == 128
+        and getattr(config, "qk_rope_head_dim", None) == 64
+    )
+
+
+def _can_fuse_indexer_wk_weights_proj(
+    config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
+    indexer_prefixes: list[str],
+) -> bool:
+    if not ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION:
+        return False
+    if not _supports_fused_indexer_kernel_config(config):
+        return False
+    if quant_config is None:
+        return True
+
+    for indexer_prefix in indexer_prefixes:
+        wk_quant_config = quant_config.get_layer_quant_config(f"{indexer_prefix}.wk")
+        if (
+            wk_quant_config.quant_type != QuantType.No
+            and wk_quant_config.quant_dtype != dtypes.fp8
+        ):
+            return False
+    return True
 
 
 def _fuse_rmsnorm_fp4_quant_fake(
@@ -722,7 +773,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
 
 
 class DeepseekV2MLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -750,8 +800,7 @@ class DeepseekV2MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -763,7 +812,6 @@ class DeepseekV2MLP(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -932,7 +980,6 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 @DeepseekV32IndexerCacheDecoratorForPluginMode
 class DeepseekV32IndexerCache(nn.Module):
-
     def __init__(
         self, head_dim: int, dtype: torch.dtype, prefix: str, cache_config: str
     ):
@@ -948,7 +995,7 @@ def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
     kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
+    q_input: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
@@ -957,8 +1004,23 @@ def sparse_attn_indexer(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
+    sparse_kv_indices_buffer: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    k_norm_eps: float,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    weights_scale: float,
+    is_neox_style: bool,
+    use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
+    topk_indices = torch.empty(
+        hidden_states.shape[0],
+        topk_tokens,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
     attn_metadata = forward_context.attn_metadata
@@ -967,23 +1029,52 @@ def sparse_attn_indexer(
     # Skip for dummy runs to avoid corrupting KV cache
     if forward_context.context.is_dummy_run:
         # dummy runner
-        return weights
+        return torch.zeros_like(weights, dtype=torch.float32)
     # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
     num_decode_tokens = (
         context.batch_size * attn_metadata.max_seqlen_q if not context.is_prefill else 0
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
-    indexer_k_quant_and_cache(
-        k,
-        kv_cache,
-        slot_mapping,
-        quant_block_size,
-        scale_fmt,
-        preshuffle=True,
-    )
+    if use_qk_rope_cache_fusion:
+        q_bf16 = q_input
+        q_fp8 = torch.empty_like(q_bf16, dtype=dtypes.fp8)
+        weights_out = torch.empty(
+            weights.shape, device=weights.device, dtype=torch.float32
+        )
+        indexer_qk_rope_quant_and_cache(
+            q_bf16,
+            q_fp8,
+            weights,
+            weights_out,
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            quant_block_size,
+            scale_fmt,
+            weights_scale,
+            preshuffle=True,
+            is_neox=is_neox_style,
+        )
+        weights = weights_out
+    else:
+        q_fp8 = q_input
+        indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+            preshuffle=True,
+        )
     if context.is_prefill:
-        if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
+        if attn_metadata.max_seqlen_k <= topk_tokens:
             return weights
         prefill_metadata = attn_metadata
         num_prefills = context.batch_size
@@ -1028,16 +1119,27 @@ def sparse_attn_indexer(
 
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices = topk_indices_buffer[num_decode_tokens:num_tokens, :topk_tokens]
+        topk_indices_prefill = topk_indices[num_decode_tokens:num_tokens, :topk_tokens]
         top_k_per_row_prefill(
             logits=logits,
             rowStarts=cu_seqlen_ks,
             rowEnds=cu_seqlen_ke,
-            indices=topk_indices,
+            indices=topk_indices_prefill,
             values=None,
             numRows=num_rows,
             stride0=logits.stride(0),
             stride1=logits.stride(1),
+        )
+        triton_convert_req_index_to_global_index_dsa_prefill(
+            attn_metadata.sparse_cu_seqlens_q,
+            attn_metadata.sparse_kv_indptr,
+            attn_metadata.token_to_seq_idxs,
+            topk_indices,
+            attn_metadata.block_tables,
+            attn_metadata.cu_seqlens_k,
+            NUM_TOPK_TOKENS=topk_tokens,
+            PAGE_SIZE=runner_block_size,
+            out=sparse_kv_indices_buffer,
         )
     else:
         decode_metadata = attn_metadata
@@ -1069,16 +1171,36 @@ def sparse_attn_indexer(
         )
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
+        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         top_k_per_row_decode(
             logits,
             next_n,
             decode_metadata.context_lens,
-            topk_indices,
+            topk_indices_decode,
             num_rows,
             logits.stride(0),
             logits.stride(1),
         )
+        if attn_metadata.max_seqlen_q > 1:
+            triton_gather_kv_indices_sparse(
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.token_to_seq_idxs,
+                topk_indices,
+                attn_metadata.kv_indices,
+                attn_metadata.kv_indptr,
+                NUM_TOPK_TOKENS=topk_tokens,
+                out=sparse_kv_indices_buffer,
+            )
+        else:
+            triton_convert_req_index_to_global_index(
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.kv_indptr,
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.kv_indices,
+                topk_indices,
+                NUM_TOPK_TOKENS=topk_tokens,
+                out=sparse_kv_indices_buffer,
+            )
     return weights
 
 
@@ -1086,7 +1208,7 @@ def sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
     kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
+    q_input: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
@@ -1095,7 +1217,16 @@ def sparse_attn_indexer_fake(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
+    sparse_kv_indices_buffer: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    k_norm_eps: float,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    weights_scale: float,
+    is_neox_style: bool,
+    use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
@@ -1105,20 +1236,131 @@ def sparse_attn_indexer_fake(
     )
     _k_fp8 = _flattened_kv[..., :head_dim].view(torch.float8_e4m3fn).contiguous()
     _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
-    return weights
+    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 
 
 direct_register_custom_op(
     op_name="sparse_attn_indexer",
     op_func=sparse_attn_indexer,
-    mutates_args=["topk_indices_buffer"],
+    mutates_args=["sparse_kv_indices_buffer"],
     fake_impl=sparse_attn_indexer_fake,
 )
 
 
+def _dequant_fp8_block_to_bf16(
+    weight_fp8: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Dequantize block-scaled FP8 weights to BF16 for BF16-only fused GEMMs."""
+    out_dim, in_dim = weight_fp8.shape
+    if out_dim % block_size != 0 or in_dim % block_size != 0:
+        raise ValueError(
+            "FP8 block dequant expects dimensions divisible by "
+            f"{block_size}, got {tuple(weight_fp8.shape)}"
+        )
+    weight = (
+        weight_fp8.unflatten(0, (-1, block_size))
+        .unflatten(-1, (-1, block_size))
+        .float()
+    )
+    scale = scale.float()
+    return (weight * scale[:, None, :, None]).flatten(2, 3).flatten(0, 1).bfloat16()
+
+
+class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
+    """Fused Indexer wk + weights projection with FP8 wk load support."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_dim: int,
+        n_head: int,
+        prefix: str = "",
+    ):
+        self._wk_pending_weight: Optional[torch.Tensor] = None
+        self._wk_pending_scale: Optional[torch.Tensor] = None
+        self._wk_loaded = False
+        super().__init__(
+            hidden_size,
+            [head_dim, n_head],
+            bias=False,
+            quant_config=None,
+            prefix=prefix,
+        )
+        # Checkpoints may store indexer.wk as FP8 plus weight_scale_inv.  The
+        # fused GEMM runs in BF16, so this parameter only receives the scale
+        # during loading and is not consumed in forward.
+        self.weight_scale = atom_parameter(
+            torch.empty(
+                ((head_dim + 127) // 128, (hidden_size + 127) // 128),
+                dtype=torch.float32,
+            )
+        )
+        self.weight_scale.weight_loader_process = self.weight_loader_process
+        self.weight_scale.weight_loader = self.weight_loader
+
+    def _maybe_load_pending_wk(self) -> None:
+        if self._wk_pending_weight is None or self._wk_pending_scale is None:
+            return
+        wk_weight_fp8 = self._wk_pending_weight
+        if wk_weight_fp8.device != self._wk_pending_scale.device:
+            wk_weight_fp8 = wk_weight_fp8.to(self._wk_pending_scale.device)
+        wk_weight = _dequant_fp8_block_to_bf16(
+            wk_weight_fp8,
+            self._wk_pending_scale,
+        )
+        super().weight_loader(self.weight, wk_weight, 0)
+        self._wk_pending_weight = None
+        self._wk_pending_scale = None
+        self._wk_loaded = True
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: Optional[int] = None,
+    ):
+        if param is self.weight_scale:
+            if loaded_shard_id == 0:
+                param.weight_loader_process(param.data, loaded_weight)
+                self._wk_pending_scale = param.data.detach().clone()
+                self._maybe_load_pending_wk()
+            return
+
+        if (
+            param is self.weight
+            and loaded_shard_id == 0
+            and loaded_weight.dtype in _FP8_DTYPES
+        ):
+            self._wk_pending_weight = loaded_weight.detach().clone()
+            self._maybe_load_pending_wk()
+            return
+
+        if param is self.weight and loaded_shard_id == 0:
+            self._wk_pending_weight = None
+            self._wk_pending_scale = None
+            self._wk_loaded = True
+
+        super().weight_loader(param, loaded_weight, loaded_shard_id)
+
+    def process_weights_after_loading(self):
+        if self._wk_pending_weight is not None or (
+            self._wk_pending_scale is not None and not self._wk_loaded
+        ):
+            raise RuntimeError(
+                "Incomplete FP8 indexer.wk load: both weight and weight_scale "
+                "are required before building wk_weights_proj."
+            )
+        if not self._wk_loaded:
+            raise RuntimeError(
+                "Missing indexer.wk load before building wk_weights_proj."
+            )
+        super().process_weights_after_loading()
+
+
 @IndexerDecoratorForPluginMode
 class Indexer(nn.Module):
-
     def __init__(
         self,
         atom_config: Config,
@@ -1127,7 +1369,7 @@ class Indexer(nn.Module):
         q_lora_rank: int,
         quant_config: Optional[QuantizationConfig],
         cache_config: str,
-        topk_indices_buffer: Optional[torch.Tensor],
+        use_wk_weights_proj_fusion: bool = True,
         prefix: str = "",
     ):
         super().__init__()
@@ -1147,26 +1389,42 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        self.wk = ReplicatedLinear(
-            hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wk",
-        )
-        self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
-        self.weights_proj = ReplicatedLinear(
-            hidden_size,
-            self.n_head,
-            quant_config=None,
-            prefix=f"{prefix}.weights_proj",
-        )
-        self.softmax_scale = self.head_dim**-0.5
-
         self.scale_fmt = "ue8m0"
         self.quant_func = get_hip_quant(QuantType.per_1x128)
         self.quant_block_size = 128  # TODO: get from config
-        self.topk_indices_buffer = topk_indices_buffer
+        self.use_qk_rope_cache_fusion = (
+            ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
+            and _supports_fused_indexer_kernel_config(config)
+            and self.head_dim == self.quant_block_size
+            and self.rope_dim == self.head_dim // 2
+        )
+        self.use_wk_weights_proj_fusion = (
+            use_wk_weights_proj_fusion and self.use_qk_rope_cache_fusion
+        )
+        if self.use_wk_weights_proj_fusion:
+            self.wk_weights_proj = IndexerWkWeightsProjLinear(
+                hidden_size,
+                self.head_dim,
+                self.n_head,
+                prefix=f"{prefix}.wk_weights_proj",
+            )
+        else:
+            self.wk = ReplicatedLinear(
+                hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wk",
+            )
+            self.weights_proj = ReplicatedLinear(
+                hidden_size,
+                self.n_head,
+                quant_config=None,
+                prefix=f"{prefix}.weights_proj",
+            )
+        self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
+        self.softmax_scale = self.head_dim**-0.5
+        self._weights_scale = self.softmax_scale * self.n_head**-0.5
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)
         self.k_cache = DeepseekV32IndexerCache(
@@ -1180,6 +1438,9 @@ class Indexer(nn.Module):
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
+        self.sparse_kv_indices_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
+        atom_config.compilation_config.static_forward_context[prefix] = self
+
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
 
     def forward(
@@ -1192,36 +1453,43 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
 
-        k = self.wk(hidden_states)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
+        if self.use_wk_weights_proj_fusion:
+            k, weights = torch.split(
+                self.wk_weights_proj(hidden_states),
+                [self.head_dim, self.n_head],
+                dim=-1,
+            )
+        else:
+            k = self.wk(hidden_states)
+            weights = self.weights_proj(hidden_states)
 
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
+        if not self.use_qk_rope_cache_fusion:
+            q_pe, _ = torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            k = self.k_norm(k)
+            k_pe, _ = torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
 
-        # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
-
-        q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
-
-        weights = self.weights_proj(hidden_states)
-        weights = (
-            weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
-        )
-        weights = weights.squeeze(-1)
+            q = q.view(-1, self.head_dim)
+            q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
+            weights = (weights.unsqueeze(-1) * q_scale * self._weights_scale).squeeze(
+                -1
+            )
+            q_input = q_fp8
+        else:
+            q_input = q
 
         return self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
-            q_fp8,
+            q_input,
             k,
             weights,
             self.quant_block_size,
@@ -1230,7 +1498,16 @@ class Indexer(nn.Module):
             self.head_dim,
             self.max_model_len,
             self.max_total_seq_len,
-            self.topk_indices_buffer,
+            self.sparse_kv_indices_buffer,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.eps,
+            positions,
+            rotary_emb.cos_cache.squeeze(-2).squeeze(-2),
+            rotary_emb.sin_cache.squeeze(-2).squeeze(-2),
+            self._weights_scale,
+            rotary_emb.is_neox_style,
+            self.use_qk_rope_cache_fusion,
         )
 
 
@@ -1257,7 +1534,7 @@ class DeepseekV2MLAAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         layer_num: int = 0,
-        topk_indices_buffer: Optional[torch.Tensor] = None,
+        use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1268,6 +1545,7 @@ class DeepseekV2MLAAttention(nn.Module):
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        model_quant_config = quant_config
 
         self.num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
@@ -1428,7 +1706,15 @@ class DeepseekV2MLAAttention(nn.Module):
                 q_lora_rank,
                 base_quant_config,
                 cache_config,
-                topk_indices_buffer,
+                (
+                    _can_fuse_indexer_wk_weights_proj(
+                        config,
+                        model_quant_config,
+                        [f"{prefix}.indexer"],
+                    )
+                    if use_indexer_wk_weights_proj_fusion is None
+                    else use_indexer_wk_weights_proj_fusion
+                ),
                 f"{prefix}.indexer",
             )
         else:
@@ -1558,7 +1844,7 @@ class DeepseekV2MLAAttention(nn.Module):
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
         if self.is_v32 and self.indexer is not None:
-            _topk_indices = self.indexer(
+            self.indexer(
                 hidden_states,
                 hidden_states_or_q_c,
                 hidden_states_or_q_c_scale,
@@ -1576,17 +1862,16 @@ class DeepseekV2MLAAttention(nn.Module):
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
         prefix: str,
-        topk_indices_buffer: Optional[torch.Tensor] = None,
         cache_config: str = "bf16",
         quant_config: Optional[QuantizationConfig] = None,
         layer_num: int = 0,
         is_mtp_block: bool = False,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1610,7 +1895,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             layer_num=layer_num,
-            topk_indices_buffer=topk_indices_buffer,
+            use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
 
         # When ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on self.fuse_input_norm_quant is turned on only if use_triton_gemm and (FP8 or FP4),
@@ -1782,6 +2067,7 @@ class DeepseekV2Model(nn.Module):
         atom_config: Config,
         prefix: str = "",
         layer_type: type[nn.Module] = DeepseekV2DecoderLayer,
+        use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -1792,16 +2078,6 @@ class DeepseekV2Model(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
-        if self.is_v32:
-            topk_tokens = config.index_topk
-            topk_indices_buffer = torch.empty(
-                atom_config.max_num_batched_tokens,
-                topk_tokens,
-                dtype=torch.int32,
-                device="cuda",
-            )
-        else:
-            topk_indices_buffer = None
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1821,11 +2097,11 @@ class DeepseekV2Model(nn.Module):
             lambda prefix, layer_num=None: DeepseekV2DecoderLayer(
                 config,
                 prefix,
-                topk_indices_buffer=topk_indices_buffer,
                 cache_config=cache_config,
                 quant_config=quant_config,
                 layer_num=layer_num,
                 alt_stream=_alt_stream,
+                use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
@@ -1906,7 +2182,6 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
-
     def __init__(
         self,
         atom_config: Config,
@@ -1919,6 +2194,23 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
+        model_prefix = maybe_prefix(prefix, "model")
+        attn_module_list_cfg = getattr(config, "attn_module_list_cfg", None)
+        indexer_prefixes = []
+        if isinstance(attn_module_list_cfg, (list, tuple)):
+            indexer_prefixes = [
+                f"{model_prefix}.layers.{layer_idx}.self_attn.indexer"
+                for layer_idx, layer_cfg in enumerate(attn_module_list_cfg)
+                if isinstance(layer_cfg, dict)
+                and layer_cfg.get("attn_index") is not None
+            ]
+        if not indexer_prefixes:
+            indexer_prefixes = [f"{model_prefix}.layers.0.self_attn.indexer"]
+        use_indexer_wk_weights_proj_fusion = _can_fuse_indexer_wk_weights_proj(
+            config,
+            quant_config,
+            indexer_prefixes,
+        )
         if hasattr(config, "q_lora_rank") and config.q_lora_rank is not None:
             self.packed_modules_mapping = {
                 "q_a_proj": ("fused_qkv_a_proj", 0),
@@ -1931,11 +2223,19 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "gate_proj": ("gate_up_proj", 0),
                 "up_proj": ("gate_up_proj", 1),
             }
+        if use_indexer_wk_weights_proj_fusion:
+            self.packed_modules_mapping.update(
+                {
+                    "indexer.wk": ("indexer.wk_weights_proj", 0),
+                    "indexer.weights_proj": ("indexer.wk_weights_proj", 1),
+                }
+            )
 
         self.model = DeepseekV2Model(
             atom_config=atom_config,
-            prefix=maybe_prefix(prefix, "model"),
+            prefix=model_prefix,
             layer_type=layer_type,
+            use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -2003,17 +2303,20 @@ class DeepseekV2ForCausalLM(nn.Module):
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
-    # DeepSeek-V3.2's indexer weights_proj are not quantized, but they are not listed in
-    # model's quant exclude mapping. So we add it to quant_default_exclude_layers.
-    quant_default_exclude_layers: list[str] = ["*.indexer.weights_proj"]
+    # DeepSeek-V3.2's indexer weights projection is BF16.  Keep the original
+    # checkpoint path and the fused ATOM path excluded from default quantization.
+    quant_default_exclude_layers: list[str] = [
+        "*.indexer.weights_proj",
+        "*.indexer.wk_weights_proj",
+    ]
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     """GLM 5.0 MoE (structurally similar to DeepSeek v3.2). Reuses DeepseekV2 implementation."""
 
     # GLM-5's HF quant config uses `indexers_proj` in modules_to_not_convert, but
-    # the ATOM module path is `indexer.weights_proj`.  Declaring the mapping here
-    # keeps the translation co-located with the model and out of config.py.
+    # the unfused ATOM module path is `indexer.weights_proj`.  Keep that path
+    # excluded so FP4/MXFP4 fallback does not quantize the BF16 projection.
     quant_exclude_name_mapping: dict[str, str] = {
         # HF quant config uses "indexers_proj" but the ATOM module path is
         # "indexer.weights_proj".  str.replace translates each exclude entry.

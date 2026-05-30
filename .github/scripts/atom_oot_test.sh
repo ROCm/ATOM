@@ -2,7 +2,9 @@
 set -euo pipefail
 
 # Usage:
+#   .github/scripts/atom_oot_test.sh start <mode> [model_name]
 #   .github/scripts/atom_oot_test.sh launch <mode> [model_name]
+#   .github/scripts/atom_oot_test.sh client <mode> [model_name]
 #   .github/scripts/atom_oot_test.sh accuracy <mode> [model_name]
 #
 # Alternatively, pass a single model explicitly through environment variables:
@@ -12,8 +14,10 @@ set -euo pipefail
 #   LM_EVAL_NUM_FEWSHOT
 #
 # TYPE:
+#   start    - launch vLLM server in the background and return immediately
 #   launch   - launch vLLM server and wait until ready
-#   accuracy - run gsm8k accuracy test and save result JSON
+#   client   - run gsm8k accuracy against an existing server
+#   accuracy - launch server, run gsm8k accuracy, and save result JSON
 #
 # MODE:
 #   ci    - workflow-provided OOT CI model entry
@@ -26,8 +30,8 @@ TYPE=${1:-launch}
 MODE=${2:-ci}
 SELECTED_MODEL=${3:-}
 
-if [[ "$TYPE" != "launch" && "$TYPE" != "accuracy" ]]; then
-  echo "Invalid TYPE: $TYPE. Expected: launch or accuracy"
+if [[ "$TYPE" != "start" && "$TYPE" != "launch" && "$TYPE" != "client" && "$TYPE" != "accuracy" ]]; then
+  echo "Invalid TYPE: $TYPE. Expected: start, launch, client, or accuracy"
   exit 2
 fi
 
@@ -50,18 +54,12 @@ EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
 EXPLICIT_CLIENT_COMMAND=${OOT_CLIENT_COMMAND:-}
-OOT_GPU_MEMORY_UTILIZATION=${OOT_GPU_MEMORY_UTILIZATION:-0.9}
 OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LAST_VLLM_LOG_LINE=0
 
 if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
   echo "Invalid LM_EVAL_NUM_FEWSHOT: ${LM_EVAL_NUM_FEWSHOT}. Expected a non-negative integer."
-  exit 2
-fi
-
-if ! [[ "${OOT_GPU_MEMORY_UTILIZATION}" =~ ^[0-9]*\.?[0-9]+$ ]]; then
-  echo "Invalid OOT_GPU_MEMORY_UTILIZATION: ${OOT_GPU_MEMORY_UTILIZATION}. Expected a numeric value."
   exit 2
 fi
 
@@ -86,14 +84,6 @@ resolve_model_path() {
   else
     echo "${model_path}"
   fi
-}
-
-# gpt-oss OpenAI weights require Chat Completions (messages); local-completions sends "prompt" and vLLM returns 400.
-is_gpt_oss_model() {
-  local name_lc path_lc
-  name_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  path_lc="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
-  [[ "${name_lc}" == *gpt-oss* || "${path_lc}" == *gpt-oss* ]]
 }
 
 emit_new_vllm_logs() {
@@ -160,6 +150,7 @@ launch_one_model() {
   local model_name="$1"
   local model_path="$2"
   local extra_args="$3"
+  local wait_for_ready="${4:-1}"
   local -a extra_arg_array=()
 
   local resolved_model_path
@@ -186,7 +177,6 @@ PY
   echo "Model name: ${model_name}"
   echo "Model path: ${resolved_model_path}"
   echo "Extra args: ${extra_args}"
-  echo "GPU memory utilization: ${OOT_GPU_MEMORY_UTILIZATION}"
 
   export SAFETENSORS_FAST_GPU=1
   export VLLM_RPC_TIMEOUT=1800000
@@ -213,13 +203,14 @@ PY
     --trust-remote-code \
     --kv-cache-dtype fp8 \
     "${extra_arg_array[@]}" \
-    --gpu-memory-utilization "${OOT_GPU_MEMORY_UTILIZATION}" \
     --no-enable-prefix-caching \
     > "${VLLM_LOG_FILE}" 2>&1 &
   echo $! > "${VLLM_PID_FILE}"
   echo "Server PID: $(cat "${VLLM_PID_FILE}")"
 
-  wait_server_ready "${model_name}"
+  if [[ "${wait_for_ready}" == "1" ]]; then
+    wait_server_ready "${model_name}"
+  fi
 }
 
 accuracy_one_model() {
@@ -247,6 +238,10 @@ accuracy_one_model() {
   echo "========== Running OOT gsm8k accuracy =========="
   echo "Model name: ${model_name}"
   echo "Few-shot count: ${LM_EVAL_NUM_FEWSHOT}"
+
+  if [[ "${client_command}" == "null" ]]; then
+    client_command=""
+  fi
 
   if [[ -n "${client_command}" ]]; then
     local -a client_command_args=()
@@ -298,29 +293,16 @@ PY
     echo "Using custom lm-eval command from client_command: ${client_command}"
     "${client_command_args[@]}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
   else
+    echo "Using default lm-eval command."
     local lm_args=(
       --model_args
       model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
     )
-    if is_gpt_oss_model "${model_name}" "${model_path}"; then
-      echo "Using chat completions + apply_chat_template for gpt-oss (OpenAI-compatible messages API)."
-      lm_args=(
-        --model_args
-        model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/chat/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
-      )
-      lm_eval --model local-chat-completions \
-        --apply_chat_template \
-        "${lm_args[@]}" \
-        --tasks gsm8k \
-        --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
-        --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
-    else
-      lm_eval --model local-completions \
-        "${lm_args[@]}" \
-        --tasks gsm8k \
-        --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
-        --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
-    fi
+    lm_eval --model local-completions \
+      "${lm_args[@]}" \
+      --tasks gsm8k \
+      --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+      --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
   fi
 
   # lm-eval output layout differs across versions: output_path may be a file
@@ -421,8 +403,18 @@ run_for_models() {
     fi
     matched=1
 
+    if [[ "${action}" == "start" ]]; then
+      launch_one_model "${model_name}" "${model_path}" "${extra_args}" "0"
+      break
+    fi
+
     if [[ "${action}" == "launch" ]]; then
       launch_one_model "${model_name}" "${model_path}" "${extra_args}"
+      break
+    fi
+
+    if [[ "${action}" == "client" ]]; then
+      accuracy_one_model "${model_name}" "${model_path}" "${extra_args}" "${client_command}"
       break
     fi
 
@@ -439,7 +431,7 @@ run_for_models() {
 }
 
 cleanup_on_exit() {
-  if [[ "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ]]; then
+  if [[ "${TYPE}" == "start" || ( "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ) ]]; then
     echo "Keeping vLLM server alive for follow-up steps."
     return 0
   fi
@@ -448,8 +440,12 @@ cleanup_on_exit() {
 
 trap 'cleanup_on_exit' EXIT
 
-if [[ "${TYPE}" == "launch" ]]; then
+if [[ "${TYPE}" == "start" ]]; then
+  run_for_models "start"
+elif [[ "${TYPE}" == "launch" ]]; then
   run_for_models "launch"
+elif [[ "${TYPE}" == "client" ]]; then
+  run_for_models "client"
 else
   run_for_models "accuracy"
 fi

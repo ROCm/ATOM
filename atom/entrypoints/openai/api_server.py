@@ -14,9 +14,13 @@ Usage:
 
 import argparse
 import asyncio
+import base64
+import binascii
+import io
 import json
 import logging
 import time
+import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
 from contextlib import asynccontextmanager
@@ -29,8 +33,10 @@ from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from transformers import AutoTokenizer
+from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
 
+from .chat_encoders import apply_chat_template, load_custom_message_encoder
 from .protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -64,8 +70,10 @@ DEFAULT_PORT = 8000
 
 engine = None
 tokenizer: Optional[AutoTokenizer] = None
+processor: Optional[Any] = None
 model_name: str = ""
 default_chat_template_kwargs: Dict[str, Any] = {}
+custom_message_encoder: Optional[Any] = None
 _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
@@ -155,6 +163,115 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
         )
         n = 1
     return n
+
+
+def _has_multimodal_content(messages: List[Any]) -> bool:
+    for message in messages:
+        content = getattr(message, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in {"image", "image_url"}:
+                return True
+    return False
+
+
+def _load_image_from_url(url: str) -> Image.Image:
+    if url.startswith("data:"):
+        try:
+            _, encoded = url.split(",", 1)
+            image_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Invalid base64 data URL for image_url") from exc
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    if url.startswith(("http://", "https://")):
+        with urllib.request.urlopen(url, timeout=30) as response:
+            image_bytes = response.read()
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    if url.startswith("file://"):
+        url = url[len("file://") :]
+    return Image.open(url).convert("RGB")
+
+
+def _get_multimodal_processor():
+    global processor, model_name
+    if processor is None:
+        logger.info(f"Loading multimodal processor from {model_name}...")
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    return processor
+
+
+def _prepare_multimodal_inputs(
+    messages: List[Any],
+    chat_template_kwargs: Dict[str, Any],
+) -> Tuple[List[int], Dict[str, Any]]:
+    mm_processor = _get_multimodal_processor()
+    processor_messages: List[Dict[str, Any]] = []
+    images: List[Image.Image] = []
+
+    for message in messages:
+        content = getattr(message, "content", None)
+        if isinstance(content, str) or content is None:
+            processor_messages.append({"role": message.role, "content": content or ""})
+            continue
+
+        image_parts: List[Dict[str, Any]] = []
+        text_parts: List[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                text_parts.append(part.get("text", ""))
+            elif part_type == "image_url":
+                image_url = part.get("image_url", {})
+                url = image_url.get("url") if isinstance(image_url, dict) else None
+                if not url:
+                    raise ValueError(
+                        "image_url content part must include image_url.url"
+                    )
+                image = _load_image_from_url(url)
+                images.append(image)
+                image_parts.append({"type": "image", "image": image})
+            elif part_type == "image":
+                url = part.get("image")
+                if not isinstance(url, str):
+                    raise ValueError(
+                        "image content part must include an image URL/path"
+                    )
+                image = _load_image_from_url(url)
+                images.append(image)
+                image_parts.append({"type": "image", "image": image})
+
+        # Qwen3.5's template reliably emits <|image_pad|> when image entries
+        # precede the text, matching the native offline multimodal example.
+        parts = image_parts
+        if text_parts:
+            parts.append({"type": "text", "text": "\n".join(text_parts)})
+        processor_messages.append({"role": message.role, "content": parts})
+
+    if not images:
+        raise ValueError("Multimodal request did not contain any images")
+
+    template_kwargs = dict(chat_template_kwargs)
+    template_kwargs.pop("tokenize", None)
+    template_kwargs.pop("add_generation_prompt", None)
+    text = mm_processor.apply_chat_template(
+        processor_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )
+    if images and "<|image_pad|>" not in text:
+        raise ValueError("Multimodal chat template did not emit image placeholders")
+    inputs = mm_processor(text=[text], images=images, return_tensors="pt")
+    multimodal_data = {
+        "pixel_values": inputs["pixel_values"],
+        "image_grid_thw": inputs["image_grid_thw"],
+    }
+    return inputs["input_ids"][0].tolist(), multimodal_data
 
 
 def _send_stream_chunk_direct(
@@ -297,11 +414,92 @@ async def generate_async(
     yield response
 
 
+async def generate_async_multimodal(
+    token_ids: List[int],
+    multimodal_data: Dict[str, Any],
+    sampling_params: SamplingParams,
+    request_id: str,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Generate text asynchronously for one multimodal request."""
+    global engine, tokenizer
+
+    token_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    started_at = time.time()
+    first_token_at: Optional[float] = None
+    last_token_at: Optional[float] = None
+    all_token_ids: List[int] = []
+    finish_reason: Optional[str] = None
+    seq = None
+
+    def completion_callback(request_output: RequestOutput):
+        now = time.time()
+        loop.call_soon_threadsafe(
+            token_queue.put_nowait,
+            {
+                "token_ids": request_output.output_tokens,
+                "finished": request_output.finished,
+                "finish_reason": request_output.finish_reason,
+                "ts": now,
+            },
+        )
+
+    def do_preprocess():
+        return engine.io_processor.preprocess(
+            token_ids,
+            sampling_params,
+            stream_callback=completion_callback,
+            multimodal_data=multimodal_data,
+        )
+
+    seq = await loop.run_in_executor(None, do_preprocess)
+    engine.core_mgr.add_request([seq])
+
+    while True:
+        item = await token_queue.get()
+        token_ids_out = item.get("token_ids") or []
+        if token_ids_out:
+            if first_token_at is None:
+                first_token_at = item.get("ts", time.time())
+            last_token_at = item.get("ts", time.time())
+            all_token_ids.extend(token_ids_out)
+        if item.get("finished", False):
+            finish_reason = item.get("finish_reason")
+            break
+
+    text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
+    num_tokens_output = len(all_token_ids)
+    finished_at = time.time()
+    ttft = (first_token_at - started_at) if first_token_at is not None else 0.0
+    tpot = (
+        (last_token_at - first_token_at) / (num_tokens_output - 1)
+        if first_token_at is not None
+        and last_token_at is not None
+        and num_tokens_output > 1
+        else 0.0
+    )
+
+    yield {
+        "text": text,
+        "token_ids": all_token_ids,
+        "finish_reason": finish_reason,
+        "num_tokens_input": (
+            seq.num_prompt_tokens if seq is not None else len(token_ids)
+        ),
+        "num_tokens_output": num_tokens_output,
+        "ttft": ttft,
+        "tpot": tpot,
+        "latency": finished_at - started_at,
+    }
+
+
 async def generate_async_fanout(
-    prompt: str,
+    prompt_or_tokens: str | List[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    multimodal_data: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
@@ -346,10 +544,11 @@ async def generate_async_fanout(
 
     def do_preprocess():
         return engine.io_processor.preprocess_fanout(
-            prompt,
+            prompt_or_tokens,
             sampling_params,
             stream_callbacks=stream_callbacks,
             kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
             parent_request_id=request_id,
         )
 
@@ -404,7 +603,12 @@ async def generate_async_fanout(
 
 def validate_model(requested_model: Optional[str]) -> None:
     """Validate that the requested model matches the server's model."""
-    if requested_model is not None and requested_model != model_name:
+    if requested_model is None:
+        return
+
+    normalized_requested = requested_model.rstrip("/")
+    normalized_served = model_name.rstrip("/")
+    if normalized_requested != normalized_served:
         raise HTTPException(
             status_code=400,
             detail=f"Requested model '{requested_model}' does not match "
@@ -413,10 +617,11 @@ def validate_model(requested_model: Optional[str]) -> None:
 
 
 async def setup_streaming_request(
-    prompt: str,
+    prompt_or_tokens: str | List[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    multimodal_data: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, asyncio.Queue]:
     """Set up a streaming request with the engine."""
     global engine, _stream_queues, _seq_id_to_request_id
@@ -435,10 +640,11 @@ async def setup_streaming_request(
 
     def do_preprocess():
         seq = engine.io_processor.preprocess(
-            prompt,
+            prompt_or_tokens,
             sampling_params,
             stream_callback=stream_callback,
             kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -470,10 +676,11 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
 
 
 async def setup_streaming_request_fanout(
-    prompt: str,
+    prompt_or_tokens: str | List[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    multimodal_data: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[int], asyncio.Queue]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
@@ -505,10 +712,11 @@ async def setup_streaming_request_fanout(
 
     def do_preprocess():
         seqs = engine.io_processor.preprocess_fanout(
-            prompt,
+            prompt_or_tokens,
             sampling_params,
             stream_callbacks=stream_callbacks,
             kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
             parent_request_id=request_id,
         )
         for seq in seqs:
@@ -590,16 +798,6 @@ async def chat_completions(request: ChatCompletionRequest):
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
             merged_kwargs.update(request.chat_template_kwargs)
-        merged_kwargs["tokenize"] = False
-        merged_kwargs["add_generation_prompt"] = True
-        # Pass tools so the chat template can inject tool declarations
-        if request.tools:
-            merged_kwargs["tools"] = request.tools
-
-        prompt = tokenizer.apply_chat_template(
-            [msg.to_template_dict() for msg in messages],
-            **merged_kwargs,
-        )
 
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
@@ -616,16 +814,36 @@ async def chat_completions(request: ChatCompletionRequest):
 
         _log_request_event("request", request_id, request.model_dump())
 
+        is_multimodal = _has_multimodal_content(messages)
+        if is_multimodal:
+            token_ids, multimodal_data = _prepare_multimodal_inputs(
+                messages,
+                merged_kwargs,
+            )
+        else:
+            prompt = apply_chat_template(
+                tokenizer,
+                custom_message_encoder,
+                [msg.to_template_dict() for msg in messages],
+                tools=request.tools,
+                **merged_kwargs,
+            )
+
         # Streaming
         if request.stream:
+            stream_input = token_ids if is_multimodal else prompt
+            stream_multimodal_data = multimodal_data if is_multimodal else None
             if effective_n > 1:
                 seq_ids, stream_queue = await setup_streaming_request_fanout(
-                    prompt, sampling_params, request_id
+                    stream_input,
+                    sampling_params,
+                    request_id,
+                    multimodal_data=stream_multimodal_data,
                 )
                 gen = stream_chat_response_fanout(
                     request_id,
                     model_name,
-                    prompt,
+                    stream_input,
                     stream_queue,
                     seq_ids,
                     tokenizer,
@@ -633,12 +851,15 @@ async def chat_completions(request: ChatCompletionRequest):
                 )
             else:
                 seq_id, stream_queue = await setup_streaming_request(
-                    prompt, sampling_params, request_id
+                    stream_input,
+                    sampling_params,
+                    request_id,
+                    multimodal_data=stream_multimodal_data,
                 )
                 gen = stream_chat_response(
                     request_id,
                     model_name,
-                    prompt,
+                    stream_input,
                     stream_queue,
                     seq_id,
                     tokenizer,
@@ -650,7 +871,31 @@ async def chat_completions(request: ChatCompletionRequest):
             )
 
         # Non-streaming
-        if effective_n > 1:
+        if is_multimodal and effective_n > 1:
+            outputs = await generate_async_fanout(
+                token_ids,
+                sampling_params,
+                request_id,
+                multimodal_data=multimodal_data,
+            )
+            if not outputs:
+                raise RuntimeError("No output generated")
+            resp = build_chat_response_multi(request_id, model_name, outputs)
+        elif is_multimodal:
+            final_output = None
+            async for output in generate_async_multimodal(
+                token_ids,
+                multimodal_data,
+                sampling_params,
+                request_id,
+            ):
+                final_output = output
+            if final_output is None:
+                raise RuntimeError("No output generated")
+            resp = build_chat_response(
+                request_id, model_name, final_output["text"], final_output
+            )
+        elif effective_n > 1:
             outputs = await generate_async_fanout(prompt, sampling_params, request_id)
             if not outputs:
                 raise RuntimeError("No output generated")
@@ -825,6 +1070,7 @@ async def stop_profile():
 def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
+    global custom_message_encoder
 
     parser = argparse.ArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -869,6 +1115,7 @@ def main():
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
     model_name = args.model
+    custom_message_encoder = load_custom_message_encoder(args.model)
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)

@@ -22,6 +22,10 @@ on:
         description: "Benchmark GLM-5-FP8"
         type: boolean
         default: true
+      glm-5.1-fp4:
+        description: "Benchmark GLM-5.1-MXFP4"
+        type: boolean
+        default: true
       deepseek-r1-0528-mxfp4:
         description: "Benchmark DeepSeek-R1-0528 MXFP4 (+ MXFP4-MTP3)"
         type: boolean
@@ -34,8 +38,12 @@ on:
         description: "Benchmark Kimi-K2.5-MXFP4"
         type: boolean
         default: true
-      MiniMax-M2.5:
-        description: "Benchmark MiniMax-M2.5"
+      MiniMax-M2.7:
+        description: "Benchmark MiniMax-M2.7"
+        type: boolean
+        default: true
+      MiniMax-M2.7-MXFP4:
+        description: "Benchmark MiniMax-M2.7-MXFP4"
         type: boolean
         default: true
       qwen35-397b-fp8:
@@ -78,6 +86,10 @@ on:
           Example (multiple sets): 1024,1024,128,0.8;2048,1024,256,0.7"
         type: string
         default: "1024,1024,128,0.8"
+      atom_commit:
+        description: "ATOM commit SHA to checkout; leave empty to use the workflow ref"
+        type: string
+        default: ""
 
 jobs:
   parse-param-lists:
@@ -87,6 +99,8 @@ jobs:
       matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Parse parameter lists
         id: parse-param-lists
@@ -118,6 +132,8 @@ jobs:
       models_json: ${{ steps.load.outputs.models_json }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
       - id: load
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -131,7 +147,20 @@ jobs:
           if event == "schedule":
               filtered = models
           else:
-              filtered = [m for m in models if inputs.get(m["prefix"], True)]
+              # Default False: a model whose `prefix` has no matching
+              # workflow_dispatch input must be opted in explicitly,
+              # otherwise an unchecked box silently still ran it (the old
+              # `.get(prefix, True)` returned True for missing keys).
+              filtered = []
+              missing = set()
+              for m in models:
+                  if m["prefix"] in inputs:
+                      if inputs[m["prefix"]]:
+                          filtered.append(m)
+                  else:
+                      missing.add(m["prefix"])
+              if missing:
+                  print(f"WARN: prefixes with no workflow input (skipped): {sorted(missing)}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event}: {len(filtered)}/{len(models)} models enabled")
@@ -155,6 +184,15 @@ jobs:
             config: { concurrency: 1 }
           - model: { suffix: "-mtp3" }
             config: { concurrency: 2 }
+          # Skip low-concurrency DP-attention runs (only run c>=64)
+          - model: { suffix: "-dp" }
+            config: { concurrency: 4 }
+          - model: { suffix: "-dp" }
+            config: { concurrency: 8 }
+          - model: { suffix: "-dp" }
+            config: { concurrency: 16 }
+          - model: { suffix: "-dp" }
+            config: { concurrency: 32 }
 
     runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}
 
@@ -182,6 +220,8 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Start CI container
         run: |
@@ -217,6 +257,9 @@ jobs:
 
       - name: Collect GPU info (inside container)
         id: gpu-info
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           RUNNER_HINT="${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}"
           bash .github/scripts/collect_gpu_info.sh atom-benchmark docker "$RUNNER_HINT"
@@ -233,11 +276,33 @@ jobs:
           echo "Docker: ${DOCKER_IMAGE}"
 
       - name: Download models
+        timeout-minutes: 150
         run: |
+          set -euo pipefail
           if [ -d "/models" ]; then
-            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc \
-              "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}" || exit 1
+            model_dir="/models/${MODEL_PATH}"
+            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            if ! docker exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${MODEL_PATH}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+              atom-benchmark bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+              echo "Model download failed for '${MODEL_PATH}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
           fi
+        env:
+          HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
+          MODEL_DOWNLOAD_TIMEOUT: "30m"
+          MODEL_LOCK_WAIT_SECONDS: "1800"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Run benchmark
         timeout-minutes: 60
@@ -345,6 +410,8 @@ jobs:
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Download all benchmark results
         uses: actions/download-artifact@v8
@@ -493,6 +560,8 @@ jobs:
       has_matrix: ${{ steps.gen.outputs.has_matrix }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - uses: actions/download-artifact@v8
         with:
@@ -548,6 +617,8 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Docker Login
         run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
@@ -578,13 +649,32 @@ jobs:
           CELL_ENV_VARS: ${{ matrix.cell.env_vars }}
 
       - name: Download model
+        timeout-minutes: 150
         run: |
+          set -euo pipefail
           if [ -d "/models" ]; then
-            echo "=== Downloading ${{ matrix.cell.model_path }} ==="
-            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-regression bash -lc \
-              "hf download ${{ matrix.cell.model_path }} --local-dir /models/${{ matrix.cell.model_path }}" \
-              || echo "::warning::Failed to download ${{ matrix.cell.model_path }}, will use HF online"
+            model_dir="/models/${{ matrix.cell.model_path }}"
+            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            if ! docker exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${{ matrix.cell.model_path }}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+              atom-regression bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+              echo "::warning::Failed to download ${{ matrix.cell.model_path }}, will use HF online"
+            fi
+          else
+            echo "/models directory not found, skipping model download"
           fi
+        env:
+          HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
+          MODEL_DOWNLOAD_TIMEOUT: "30m"
+          MODEL_LOCK_WAIT_SECONDS: "1800"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Launch server
         run: |
@@ -740,6 +830,8 @@ jobs:
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
 
       - name: Download regression traces
         if: needs.collect-regression-traces.result == 'success'

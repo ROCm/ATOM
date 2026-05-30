@@ -36,10 +36,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # --- Kernel Fusion Toggles ---
+    # fused_compress_attn: switch between Triton (default historical) and a
+    # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
+    # "auto" picks flydsl when shape matches the supported configs (D ∈
+    # {128, 512}, RD=64, OVERLAP=1, RATIO=4); "always" forces it (errors on
+    # unsupported); "never" pins Triton. flydsl pure-GPU time beats Triton
+    # across the full range on V4-Pro (1.1x small N → 2-3x at N≥4096).
+    "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
+        "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
+    ).lower(),
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
-        os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "1") == "1"
+        os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
     ),
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1") == "1"
@@ -49,6 +58,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_QKNORM_FUSION", "1") == "1"
+    ),
+    "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
+        os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
@@ -73,12 +85,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use a thread pool for weight loading instead of main-process sequential I/O.
     # Set to 0 to disable if the thread pool causes hangs (e.g. on gfx1250).
-    "ATOM_LOADER_USE_THREADPOOL": lambda: os.getenv("ATOM_LOADER_USE_THREADPOOL", "1")
-    == "1",
+    "ATOM_LOADER_USE_THREADPOOL": lambda: (
+        os.getenv("ATOM_LOADER_USE_THREADPOOL", "1") == "1"
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
     "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
+    # Force the Triton path for V4 sparse-paged-prefill attention; default backend
+    # is aiter's OPUS kernel (gfx950 fast path). Set to 1 to fall back to Triton
+    # (e.g. for debugging or on non-gfx950 builds).
+    "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
@@ -108,10 +125,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_REQUIRES_GRAD": lambda: os.getenv("ATOM_REQUIRES_GRAD", "0") == "1",
     # --- Bpreshuffle for weight ---
     # Preshuffle weight.  Default "1" (enabled)
-    "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE": lambda: os.getenv(
-        "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1"
-    )
-    == "1",
+    "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE": lambda: (
+        os.getenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1") == "1"
+    ),
     # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
     # `legacy` (default) keeps the per-seq Python dispatch loop with .item()
     # syncs in deepseek_v4.py. `new` routes through V4AttentionBackend with
@@ -146,6 +162,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sampler top-K logits log — int K, 0/empty disables.
     "ATOM_DEBUG_TOPK": lambda: int(os.getenv("ATOM_DEBUG_TOPK", "0") or "0"),
     "ATOM_DEBUG_TOPK_PATH": lambda: os.getenv("ATOM_DEBUG_TOPK_PATH", ""),
+    # Force-skip the draft-model forward in eagle/MTP propose() and return
+    # sentinel draft token ids (int max) so rejection_sampler rejects all
+    # speculative tokens. Used to reproduce 100% rejection behavior — the
+    # worst case for ring-buffer aliasing in compressor state caches.
+    # Default: False (run the draft model normally).
+    "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
+        os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
+    ),
+    # --- PrefillDelayer (cross-DP prefill alignment) ---
+    # Master switch; default on. Set "0" to disable construction.
+    "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
+        os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1"
+    ),
+    # Max consecutive scheduler passes the delayer is allowed to suppress
+    # prefill admission while waiting for cross-DP alignment.
+    "ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES", "30")
+    ),
+    # Wall-clock cap (milliseconds) on a single delay window.
+    "ATOM_PREFILL_DELAYER_MAX_DELAY_MS": lambda: float(
+        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_MS", "5000")
+    ),
+    # Optional KV-usage low watermark below which delaying is allowed.
+    # Empty string => None (use PrefillDelayer's internal default).
+    "ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": lambda: (
+        None
+        if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
+        else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
+    ),
 }
 
 

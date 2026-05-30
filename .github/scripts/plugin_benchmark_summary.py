@@ -199,7 +199,7 @@ def main() -> int:
     parser.add_argument(
         "--matrix-json-file",
         default=None,
-        help="Path to a benchmark matrix JSON file. Prefer this for large matrices.",
+        help="Path to a file containing benchmark matrix JSON",
     )
     parser.add_argument(
         "--run-url",
@@ -218,12 +218,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    matrix_json_text = None
     if args.matrix_json_file:
-        matrix_payload = json.loads(Path(args.matrix_json_file).read_text(encoding="utf-8"))
+        matrix_json_text = Path(args.matrix_json_file).read_text(encoding="utf-8")
     elif args.matrix_json:
-        matrix_payload = json.loads(args.matrix_json)
+        matrix_json_text = args.matrix_json
     else:
-        parser.error("one of --matrix-json or --matrix-json-file is required")
+        raise ValueError("Either --matrix-json or --matrix-json-file must be provided")
+
+    matrix_payload = json.loads(matrix_json_text)
     rows = _build_rows(Path(args.result_dir), matrix_payload)
 
     _print_markdown_table(rows, args.run_url, args.title)

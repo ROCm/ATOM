@@ -20,7 +20,11 @@ import triton.language as tl
 
 import sglang.srt.layers.attention.aiter_backend as _sglang_aiter
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    launch_reshape_and_cache_flash,
+    pad_sequence_with_mask,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_bool_env_var
 
@@ -35,8 +39,10 @@ try:
         dtypes,
         get_pa_metadata_info_v1,
         get_pa_metadata_v1,
+        mha_batch_prefill_func,
         pa_fwd_asm,
         pa_persistent_fwd,
+        paged_attention_ragged,
     )
 except ImportError as e:
     raise ImportError(
@@ -190,6 +196,7 @@ class ForwardMetadata:
     reduce_partial_map: Optional[torch.Tensor] = None
     fp8_prefill_kv_indices: Optional[torch.Tensor] = None
     num_kv_splits: Optional[int] = None
+    run_graph: Optional[bool] = True
     # PA metadata for pa_persistent_fwd (only used in decode mode, non-MLA)
     pa_metadata_qo_indptr: Optional[torch.Tensor] = None
     pa_metadata_pages_kv_indptr: Optional[torch.Tensor] = None
@@ -212,8 +219,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
+        topk: int = 1,
     ):
-        super().__init__(model_runner, skip_prefill, kv_indptr_buf)
+        super().__init__(model_runner, skip_prefill, kv_indptr_buf, topk)
         mapping = getattr(
             model_runner.token_to_kv_pool, "full_attention_layer_id_mapping", None
         )
@@ -283,6 +291,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         """Init auxiliary variables for triton attention backend."""
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_forward_metadata_decode(forward_batch)
+        elif self.use_mla and forward_batch.forward_mode.is_draft_extend_v2():
+            self._init_draft_extend_v2_mla(forward_batch.batch_size, forward_batch)
+        elif self.use_mla and forward_batch.forward_mode.is_draft_extend():
+            self._init_draft_extend_mla(forward_batch.batch_size, forward_batch)
+        elif self.use_mla and forward_batch.forward_mode.is_target_verify():
+            self._init_target_verify_mla(forward_batch.batch_size, forward_batch)
         else:
             self._init_forward_metadata_extend(forward_batch)
         self._fixup_page_table(forward_batch)
@@ -380,20 +394,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             if seq_lens_cpu is None:
                 seq_lens_cpu = forward_batch.seq_lens.cpu()
 
-            page_table_persistent = self.page_table
-            seq_lens_persistent = self.seq_lens
-            seq_lens_persistent.fill_(0)
-            page_table_persistent.fill_(0)
-            seq_lens_persistent[:bs].copy_(forward_batch.seq_lens, non_blocking=True)
-            max_seq_pages = (
-                seq_lens_cpu.max().item() + self.page_size - 1
-            ) // self.page_size + 1
-            page_table = self.req_to_token[
-                forward_batch.req_pool_indices[:, None],
-                self.strided_indices[:max_seq_pages][None, :],
-            ]
-            page_table_persistent[:bs, :max_seq_pages].copy_(
-                page_table // self.page_size, non_blocking=True
+            page_table, seq_lens = self._update_decode_page_table(
+                bs,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
             )
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
@@ -402,8 +407,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 None,
                 1,
                 None,
-                page_table_persistent[:bs, :max_seq_pages],
-                seq_lens_persistent[:bs],
+                page_table,
+                seq_lens,
             )
             self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
         else:
@@ -428,6 +433,278 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             self._init_extend_mla(bs, forward_batch)
         else:
             self._init_extend_mha(bs, forward_batch)
+
+    def _init_draft_extend_mla(self, bs, forward_batch):
+        """Init MLA metadata for speculative draft_extend."""
+        spec_info = forward_batch.spec_info
+        if spec_info is None:
+            raise RuntimeError("MLA draft_extend requires speculative metadata")
+
+        kv_indices, kv_indptr, qo_indptr, _ = spec_info.generate_attn_arg_prefill(
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.seq_lens_sum,
+            self.req_to_token,
+        )
+
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if extend_seq_lens_cpu is not None:
+            max_q_len = (
+                int(extend_seq_lens_cpu.max().item())
+                if isinstance(extend_seq_lens_cpu, torch.Tensor)
+                else max(extend_seq_lens_cpu)
+            )
+        elif forward_batch.extend_seq_lens is not None:
+            max_q_len = int(forward_batch.extend_seq_lens.max().item())
+        elif getattr(spec_info, "accept_length", None) is not None:
+            max_q_len = int(spec_info.accept_length.max().item())
+        else:
+            raise RuntimeError("MLA draft_extend is missing extend sequence lengths")
+
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        max_kv_len = (
+            (
+                int(seq_lens_cpu.max().item())
+                if isinstance(seq_lens_cpu, torch.Tensor)
+                else max(seq_lens_cpu)
+            )
+            if seq_lens_cpu is not None
+            else int(forward_batch.seq_lens.max().item())
+        )
+
+        work_metadata = None
+        work_indptr = None
+        work_info_set = None
+        reduce_indptr = None
+        reduce_final_map = None
+        reduce_partial_map = None
+        num_kv_splits = None
+
+        if _sglang_aiter._use_mla_ps_kernel:
+            (
+                work_metadata,
+                work_indptr,
+                work_info_set,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+            ) = self.make_mla_decode_meta_data_buffer(max_q_len, bs)
+            num_kv_splits = self.max_split_per_batch
+            self.make_mla_meta_data(
+                qo_indptr,
+                kv_indptr,
+                self.kv_last_page_len[:bs],
+                work_metadata,
+                work_info_set,
+                work_indptr,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                max_q_len,
+                fast_mode=_sglang_aiter.fast_mode,
+                max_split_per_batch=num_kv_splits,
+                intra_batch_mode=_sglang_aiter.intra_batch_mode,
+            )
+
+        self.forward_metadata = ForwardMetadata(
+            kv_indptr,
+            kv_indices,
+            qo_indptr,
+            self.kv_last_page_len[:bs],
+            max_q_len,
+            max_kv_len,
+            None,
+            None,
+            work_metadata=work_metadata,
+            work_info_set=work_info_set,
+            work_indptr=work_indptr,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            num_kv_splits=num_kv_splits,
+            run_graph=False,
+        )
+
+    def _init_draft_extend_v2_mla(self, bs, forward_batch):
+        """Init MLA metadata for speculative DRAFT_EXTEND_V2.
+
+        SpecV2 draft-extend uses a fixed number of draft tokens per request,
+        unlike V1 where each request can have a different accepted length.
+        """
+        spec_info = forward_batch.spec_info
+        if spec_info is None:
+            raise RuntimeError("MLA draft_extend_v2 requires speculative metadata")
+
+        self._ensure_spec_v2_topk_supported()
+        num_draft_tokens = self._resolve_v2_num_draft_tokens(
+            forward_batch.extend_seq_lens,
+            forward_batch.extend_seq_lens_cpu,
+        )
+        device = forward_batch.seq_lens.device
+        qo_indptr = self._set_uniform_qo_indptr(bs, num_draft_tokens, device)
+
+        kv_indptr = self.kv_indptr[: bs + 1]
+        kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+        kv_indices = torch.empty(
+            forward_batch.seq_lens_sum, dtype=torch.int32, device=device
+        )
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+        )
+
+        max_kv_len = (
+            int(forward_batch.seq_lens_cpu.max().item())
+            if forward_batch.seq_lens_cpu is not None
+            else int(forward_batch.seq_lens.max().item())
+        )
+
+        work_metadata = None
+        work_indptr = None
+        work_info_set = None
+        reduce_indptr = None
+        reduce_final_map = None
+        reduce_partial_map = None
+        num_kv_splits = None
+
+        if _sglang_aiter._use_mla_ps_kernel:
+            (
+                work_metadata,
+                work_indptr,
+                work_info_set,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+            ) = self.make_mla_decode_meta_data_buffer(num_draft_tokens, bs)
+            num_kv_splits = self.max_split_per_batch
+            self.make_mla_meta_data(
+                qo_indptr,
+                kv_indptr,
+                self.kv_last_page_len[:bs],
+                work_metadata,
+                work_info_set,
+                work_indptr,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                num_draft_tokens,
+                fast_mode=_sglang_aiter.fast_mode,
+                max_split_per_batch=num_kv_splits,
+                intra_batch_mode=_sglang_aiter.intra_batch_mode,
+            )
+
+        self.forward_metadata = ForwardMetadata(
+            kv_indptr,
+            kv_indices,
+            qo_indptr,
+            self.kv_last_page_len[:bs],
+            num_draft_tokens,
+            max_kv_len,
+            None,
+            None,
+            work_metadata=work_metadata,
+            work_info_set=work_info_set,
+            work_indptr=work_indptr,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            num_kv_splits=num_kv_splits,
+            run_graph=False,
+        )
+
+    def _init_target_verify_mla(self, bs, forward_batch):
+        """Init MLA metadata for speculative target_verify."""
+        spec_info = forward_batch.spec_info
+        if spec_info is None:
+            raise RuntimeError("MLA target_verify requires speculative metadata")
+
+        draft_num = spec_info.draft_token_num
+        kv_lens = forward_batch.seq_lens + draft_num
+        kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
+        device = forward_batch.seq_lens.device
+
+        qo_indptr = torch.arange(
+            0,
+            (1 + bs) * draft_num,
+            step=draft_num,
+            dtype=torch.int32,
+            device=device,
+        )
+        kv_indptr = self.kv_indptr
+        kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+        kv_indptr = kv_indptr[: bs + 1]
+        kv_indices = torch.empty(
+            kv_lens_sum,
+            dtype=torch.int32,
+            device=device,
+        )
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            kv_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+        )
+
+        work_metadata = None
+        work_indptr = None
+        work_info_set = None
+        reduce_indptr = None
+        reduce_final_map = None
+        reduce_partial_map = None
+        num_kv_splits = None
+
+        if _sglang_aiter._use_mla_ps_kernel:
+            (
+                work_metadata,
+                work_indptr,
+                work_info_set,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+            ) = self.make_mla_decode_meta_data_buffer(draft_num, bs)
+            num_kv_splits = self.max_split_per_batch
+            self.make_mla_meta_data(
+                qo_indptr,
+                kv_indptr,
+                self.kv_last_page_len[:bs],
+                work_metadata,
+                work_info_set,
+                work_indptr,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                draft_num,
+                fast_mode=_sglang_aiter.fast_mode,
+                max_split_per_batch=num_kv_splits,
+                intra_batch_mode=_sglang_aiter.intra_batch_mode,
+            )
+
+        self.forward_metadata = ForwardMetadata(
+            kv_indptr,
+            kv_indices,
+            qo_indptr,
+            self.kv_last_page_len[:bs],
+            draft_num,
+            None,
+            None,
+            None,
+            work_metadata=work_metadata,
+            work_info_set=work_info_set,
+            work_indptr=work_indptr,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            num_kv_splits=num_kv_splits,
+            run_graph=False,
+        )
 
     def _init_extend_mla(self, bs, forward_batch):
         self.mla_indices_updater_prefill.update(
@@ -519,8 +796,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             self.indices_updater_prefill.kv_indices,
             self.qo_indptr[: bs + 1],
             None,
-            self.indices_updater_prefill.max_q_len,
-            self.indices_updater_prefill.max_kv_len,
+            self._max_len(
+                forward_batch.extend_seq_lens_cpu,
+                forward_batch.extend_seq_lens,
+            ),
+            self._max_len(forward_batch.seq_lens_cpu, forward_batch.seq_lens),
             None,
             forward_batch.seq_lens,
         )
@@ -711,6 +991,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         self.cuda_graph_kv_last_page_len = torch.ones(
             max_bs, dtype=torch.int, device=self.device
         )
+        assert self.cuda_graph_kv_last_page_len.is_cuda, (
+            "ATOMAttnBackendForSgl.init_cuda_graph_state created "
+            f"non-CUDA cuda_graph_kv_last_page_len on {self.cuda_graph_kv_last_page_len.device}, "
+            f"backend={type(self)}"
+        )
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
                 (max_bs * self.max_context_len),
@@ -838,27 +1123,327 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        if not forward_mode.is_decode_or_idle():
-            raise ValueError(f"Invalid mode: {forward_mode=}")
+        num_kv_splits = None
+        work_metadata = None
+        work_info_set = None
+        work_indptr = None
+        reduce_indptr = None
+        reduce_final_map = None
+        reduce_partial_map = None
 
-        if self.use_mla:
-            self._init_mla_cuda_graph_metadata(bs, req_pool_indices, seq_lens)
-        else:
-            page_table = self.page_table[:bs, :]
-            self.seq_lens[:bs].copy_(seq_lens, non_blocking=True)
-            seq_lens_persistent = self.seq_lens[:bs]
-            self.forward_metadata = ForwardMetadata(
-                None,
-                None,
-                None,
-                None,
-                1,
-                None,
-                page_table,
-                seq_lens_persistent,
+        if forward_mode.is_decode_or_idle():
+            if self.use_mla:
+                self._init_mla_cuda_graph_metadata(bs, req_pool_indices, seq_lens)
+            else:
+                kv_indptr = self.kv_indptr
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+                page_table, seq_lens_persistent = self._update_decode_page_table(
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    static_columns=True,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    None,
+                    None,
+                    1,
+                    None,
+                    page_table,
+                    seq_lens_persistent,
+                )
+                if self.decode_using_pa_ps:
+                    self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
+        elif forward_mode.is_target_verify():
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * self.num_draft_tokens,
+                step=self.num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
             )
-            if self.decode_using_pa_ps:
-                self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
+            kv_lens = seq_lens + self.num_draft_tokens if self.use_mla else seq_lens
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                kv_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+            max_q_len = self.num_draft_tokens
+
+            if self.use_mla:
+                if _sglang_aiter._use_mla_ps_kernel:
+                    num_kv_splits = self.max_split_per_batch
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        kv_last_page_len,
+                        self.work_metadata,
+                        self.work_info_set,
+                        self.work_indptr,
+                        self.reduce_indptr,
+                        self.reduce_final_map,
+                        self.reduce_partial_map,
+                        max_q_len,
+                        fast_mode=_sglang_aiter.fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=_sglang_aiter.intra_batch_mode,
+                    )
+                    work_metadata = self.work_metadata
+                    work_info_set = self.work_info_set
+                    work_indptr = self.work_indptr
+                    reduce_indptr = self.reduce_indptr
+                    reduce_final_map = self.reduce_final_map
+                    reduce_partial_map = self.reduce_partial_map
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
+                    None,
+                    None,
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                )
+                assert (
+                    self.forward_metadata.kv_last_page_len is None
+                    or self.forward_metadata.kv_last_page_len.is_cuda
+                ), (
+                    "capture_cuda_graph TARGET_VERIFY produced non-CUDA kv_last_page_len: "
+                    f"{self.forward_metadata.kv_last_page_len.device}, "
+                    f"backend={type(self)}, metadata_backend={type(self.forward_metadata)}"
+                )
+            else:
+                custom_mask = self.cuda_graph_custom_mask
+                assert spec_info is not None and spec_info.custom_mask is not None
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+                seq_mask_len = max_q_len * (seq_lens + max_q_len)
+                mask_indptr = self.mask_indptr
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+                mask_indptr = mask_indptr[: bs + 1]
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
+                    None,
+                    None,
+                    custom_mask=custom_mask,
+                    mask_indptr=mask_indptr,
+                    max_extend_len=max_q_len,
+                )
+                assert (
+                    self.forward_metadata.kv_last_page_len is None
+                    or self.forward_metadata.kv_last_page_len.is_cuda
+                ), (
+                    "capture_cuda_graph TARGET_VERIFY(non-MLA) produced non-CUDA kv_last_page_len: "
+                    f"{self.forward_metadata.kv_last_page_len.device}, "
+                    f"backend={type(self)}"
+                )
+        elif forward_mode.is_draft_extend_v2():
+            self._ensure_spec_v2_topk_supported()
+            num_tokens_per_bs = self._resolve_v2_num_draft_tokens()
+            qo_indptr = self._set_uniform_qo_indptr(bs, num_tokens_per_bs, self.device)
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            if self.use_mla:
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+                max_q_len = num_tokens_per_bs
+                if _sglang_aiter._use_mla_ps_kernel:
+                    num_kv_splits = self.max_split_per_batch
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        kv_last_page_len,
+                        self.work_metadata,
+                        self.work_info_set,
+                        self.work_indptr,
+                        self.reduce_indptr,
+                        self.reduce_final_map,
+                        self.reduce_partial_map,
+                        max_q_len,
+                        fast_mode=_sglang_aiter.fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=_sglang_aiter.intra_batch_mode,
+                    )
+                    work_metadata = self.work_metadata
+                    work_info_set = self.work_info_set
+                    work_indptr = self.work_indptr
+                    reduce_indptr = self.reduce_indptr
+                    reduce_final_map = self.reduce_final_map
+                    reduce_partial_map = self.reduce_partial_map
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
+                    None,
+                    None,
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                )
+                assert (
+                    self.forward_metadata.kv_last_page_len is None
+                    or self.forward_metadata.kv_last_page_len.is_cuda
+                ), (
+                    "capture_cuda_graph DRAFT_EXTEND_V2 produced non-CUDA kv_last_page_len: "
+                    f"{self.forward_metadata.kv_last_page_len.device}, "
+                    f"backend={type(self)}"
+                )
+            else:
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    None,
+                    num_tokens_per_bs,
+                    None,
+                    None,
+                    None,
+                    custom_mask=None,
+                    mask_indptr=None,
+                    max_extend_len=num_tokens_per_bs,
+                )
+        elif forward_mode.is_draft_extend():
+            num_tokens_per_bs = self.speculative_num_steps + 1
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                step=num_tokens_per_bs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            if self.use_mla:
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+                max_q_len = num_tokens_per_bs
+                if _sglang_aiter._use_mla_ps_kernel:
+                    num_kv_splits = self.max_split_per_batch
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        kv_last_page_len,
+                        self.work_metadata,
+                        self.work_info_set,
+                        self.work_indptr,
+                        self.reduce_indptr,
+                        self.reduce_final_map,
+                        self.reduce_partial_map,
+                        max_q_len,
+                        fast_mode=_sglang_aiter.fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=_sglang_aiter.intra_batch_mode,
+                    )
+                    work_metadata = self.work_metadata
+                    work_info_set = self.work_info_set
+                    work_indptr = self.work_indptr
+                    reduce_indptr = self.reduce_indptr
+                    reduce_final_map = self.reduce_final_map
+                    reduce_partial_map = self.reduce_partial_map
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
+                    None,
+                    None,
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                )
+                assert (
+                    self.forward_metadata.kv_last_page_len is None
+                    or self.forward_metadata.kv_last_page_len.is_cuda
+                ), (
+                    "capture_cuda_graph DRAFT_EXTEND produced non-CUDA kv_last_page_len: "
+                    f"{self.forward_metadata.kv_last_page_len.device}, "
+                    f"backend={type(self)}"
+                )
+            else:
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    None,
+                    num_tokens_per_bs,
+                    None,
+                    None,
+                    None,
+                    custom_mask=None,
+                    mask_indptr=None,
+                    max_extend_len=num_tokens_per_bs,
+                )
+        else:
+            raise ValueError(f"Invalid mode: {forward_mode=}")
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -872,40 +1457,416 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
-        if not forward_mode.is_decode_or_idle():
-            raise ValueError("Invalid forward mode")
+        num_kv_splits = None
+        work_metadata = None
+        work_info_set = None
+        work_indptr = None
+        reduce_indptr = None
+        reduce_final_map = None
+        reduce_partial_map = None
 
-        if self.use_mla:
-            self._init_mla_cuda_graph_metadata(bs, req_pool_indices, seq_lens)
+        if forward_mode.is_decode_or_idle():
+            if self.use_mla:
+                self._init_mla_cuda_graph_metadata(bs, req_pool_indices, seq_lens)
+            else:
+                kv_indptr = self.kv_indptr
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+                page_table, seq_lens_persistent = self._update_decode_page_table(
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    static_columns=True,
+                )
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    None,
+                    None,
+                    1,
+                    None,
+                    page_table,
+                    seq_lens_persistent[:bs],
+                )
+                if self.decode_using_pa_ps:
+                    self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
+        elif forward_mode.is_target_verify():
+            bs = len(req_pool_indices)
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * self.num_draft_tokens,
+                step=self.num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_lens = seq_lens + self.num_draft_tokens if self.use_mla else seq_lens
+            target_verify_kv_len_sum = seq_lens_sum + self.num_draft_tokens * bs
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                kv_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+            max_q_len = self.num_draft_tokens
+
+            if self.use_mla:
+                if _sglang_aiter._use_mla_ps_kernel:
+                    num_kv_splits = self.max_split_per_batch
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        kv_last_page_len,
+                        self.work_metadata,
+                        self.work_info_set,
+                        self.work_indptr,
+                        self.reduce_indptr,
+                        self.reduce_final_map,
+                        self.reduce_partial_map,
+                        max_q_len,
+                        fast_mode=_sglang_aiter.fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=_sglang_aiter.intra_batch_mode,
+                    )
+                    work_metadata = self.work_metadata
+                    work_info_set = self.work_info_set
+                    work_indptr = self.work_indptr
+                    reduce_indptr = self.reduce_indptr
+                    reduce_final_map = self.reduce_final_map
+                    reduce_partial_map = self.reduce_partial_map
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    target_verify_kv_len_sum,
+                    None,
+                    None,
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                )
+                assert (
+                    self.forward_metadata.kv_last_page_len is None
+                    or self.forward_metadata.kv_last_page_len.is_cuda
+                ), (
+                    "replay_cuda_graph TARGET_VERIFY produced non-CUDA kv_last_page_len: "
+                    f"{self.forward_metadata.kv_last_page_len.device}, "
+                    f"backend={type(self)}, metadata_backend={type(self.forward_metadata)}"
+                )
+            else:
+                custom_mask = self.cuda_graph_custom_mask
+                assert spec_info is not None and spec_info.custom_mask is not None
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+                seq_mask_len = max_q_len * (seq_lens + max_q_len)
+                mask_indptr = self.mask_indptr
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+                mask_indptr = mask_indptr[: bs + 1]
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    target_verify_kv_len_sum,
+                    None,
+                    None,
+                    custom_mask=custom_mask,
+                    mask_indptr=mask_indptr,
+                    max_extend_len=max_q_len,
+                )
+                assert (
+                    self.forward_metadata.kv_last_page_len is None
+                    or self.forward_metadata.kv_last_page_len.is_cuda
+                ), (
+                    "replay_cuda_graph TARGET_VERIFY(non-MLA) produced non-CUDA kv_last_page_len: "
+                    f"{self.forward_metadata.kv_last_page_len.device}, "
+                    f"backend={type(self)}"
+                )
+        elif forward_mode.is_draft_extend_v2():
+            self._ensure_spec_v2_topk_supported()
+            num_tokens_per_bs = self._resolve_v2_num_draft_tokens()
+            qo_indptr = self._set_uniform_qo_indptr(bs, num_tokens_per_bs, self.device)
+            seq_lens = seq_lens[:bs]
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            if self.use_mla:
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+                max_q_len = num_tokens_per_bs
+                if _sglang_aiter._use_mla_ps_kernel:
+                    num_kv_splits = self.max_split_per_batch
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        kv_last_page_len,
+                        self.work_metadata,
+                        self.work_info_set,
+                        self.work_indptr,
+                        self.reduce_indptr,
+                        self.reduce_final_map,
+                        self.reduce_partial_map,
+                        max_q_len,
+                        fast_mode=_sglang_aiter.fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=_sglang_aiter.intra_batch_mode,
+                    )
+                    work_metadata = self.work_metadata
+                    work_info_set = self.work_info_set
+                    work_indptr = self.work_indptr
+                    reduce_indptr = self.reduce_indptr
+                    reduce_final_map = self.reduce_final_map
+                    reduce_partial_map = self.reduce_partial_map
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    seq_lens_sum,
+                    None,
+                    None,
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                )
+                assert (
+                    self.forward_metadata.kv_last_page_len is None
+                    or self.forward_metadata.kv_last_page_len.is_cuda
+                ), (
+                    "replay_cuda_graph DRAFT_EXTEND_V2 produced non-CUDA kv_last_page_len: "
+                    f"{self.forward_metadata.kv_last_page_len.device}, "
+                    f"backend={type(self)}"
+                )
+            else:
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    None,
+                    num_tokens_per_bs,
+                    None,
+                    None,
+                    None,
+                    custom_mask=None,
+                    mask_indptr=None,
+                    max_extend_len=num_tokens_per_bs,
+                )
+        elif forward_mode.is_draft_extend():
+            num_tokens_per_bs = self.speculative_num_steps + 1
+            seq_lens = seq_lens[:bs]
+            accept_lens = spec_info.accept_length[:bs]
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            if self.use_mla:
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+                max_q_len = num_tokens_per_bs
+                if _sglang_aiter._use_mla_ps_kernel:
+                    num_kv_splits = self.max_split_per_batch
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        kv_last_page_len,
+                        self.work_metadata,
+                        self.work_info_set,
+                        self.work_indptr,
+                        self.reduce_indptr,
+                        self.reduce_final_map,
+                        self.reduce_partial_map,
+                        max_q_len,
+                        fast_mode=_sglang_aiter.fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=_sglang_aiter.intra_batch_mode,
+                    )
+                    work_metadata = self.work_metadata
+                    work_info_set = self.work_info_set
+                    work_indptr = self.work_indptr
+                    reduce_indptr = self.reduce_indptr
+                    reduce_final_map = self.reduce_final_map
+                    reduce_partial_map = self.reduce_partial_map
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    seq_lens_sum,
+                    None,
+                    None,
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                )
+                assert (
+                    self.forward_metadata.kv_last_page_len is None
+                    or self.forward_metadata.kv_last_page_len.is_cuda
+                ), (
+                    "replay_cuda_graph DRAFT_EXTEND produced non-CUDA kv_last_page_len: "
+                    f"{self.forward_metadata.kv_last_page_len.device}, "
+                    f"backend={type(self)}"
+                )
+            else:
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    None,
+                    num_tokens_per_bs,
+                    None,
+                    None,
+                    None,
+                    custom_mask=None,
+                    mask_indptr=None,
+                    max_extend_len=num_tokens_per_bs,
+                )
         else:
-            page_table_persistent = self.page_table
-            seq_lens_persistent = self.seq_lens
-            seq_lens_persistent.fill_(0)
-            page_table_persistent.fill_(0)
-            seq_lens_persistent[:bs].copy_(seq_lens, non_blocking=True)
-            max_seq_pages = (
-                seq_lens_cpu.max().item() + self.page_size - 1
-            ) // self.page_size + 1
-            page_table = self.req_to_token[
-                req_pool_indices[:, None],
-                self.strided_indices[:max_seq_pages][None, :],
-            ]
-            page_table_persistent[:bs, :max_seq_pages].copy_(
-                page_table // self.page_size, non_blocking=True
-            )
+            raise ValueError(f"Invalid mode: {forward_mode=}")
 
-            self.forward_metadata = ForwardMetadata(
-                None,
-                None,
-                None,
-                None,
-                1,
-                None,
-                page_table_persistent[:bs, :max_seq_pages],
-                seq_lens_persistent[:bs],
+    @staticmethod
+    def _max_len(cpu_values, device_values) -> int:
+        values = cpu_values if cpu_values is not None else device_values
+        if isinstance(values, torch.Tensor):
+            return int(values.max().item())
+        return int(max(values))
+
+    def _update_decode_page_table(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
+        static_columns: bool = False,
+    ):
+        page_table_persistent = self.page_table
+        seq_lens_persistent = self.seq_lens
+        seq_lens_persistent.fill_(0)
+        page_table_persistent.fill_(0)
+        seq_lens_persistent[:bs].copy_(seq_lens, non_blocking=True)
+
+        if seq_lens_cpu is None:
+            max_seq_len = int(seq_lens.max().item())
+        elif isinstance(seq_lens_cpu, torch.Tensor):
+            max_seq_len = int(seq_lens_cpu.max().item())
+        else:
+            max_seq_len = int(max(seq_lens_cpu))
+
+        max_seq_pages = (max_seq_len + self.page_size - 1) // self.page_size + 1
+        max_seq_pages = min(max_seq_pages, page_table_persistent.shape[1])
+        page_table = self.req_to_token[
+            req_pool_indices[:, None],
+            self.strided_indices[:max_seq_pages][None, :],
+        ]
+        page_table_persistent[:bs, :max_seq_pages].copy_(
+            page_table // self.page_size, non_blocking=True
+        )
+
+        if static_columns:
+            return page_table_persistent[:bs, :], seq_lens_persistent[:bs]
+        return page_table_persistent[:bs, :max_seq_pages], seq_lens_persistent[:bs]
+
+    def _should_use_native_dense_mha(self, layer) -> bool:
+        sliding_window_size = getattr(layer, "sliding_window_size", None)
+        return (
+            not self.use_mla
+            and not layer.is_cross_attention
+            and layer.head_dim == 256
+            and layer.qk_head_dim == 256
+            and layer.v_head_dim == 256
+            and (sliding_window_size is None or sliding_window_size <= -1)
+        )
+
+    def _kv_descales(self, layer):
+        if self.kv_cache_dtype != dtypes.fp8:
+            return None, None
+        k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+        v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
+        return k_descale, v_descale
+
+    def _get_aiter_paged_ragged_kv_cache_dtype(self) -> str:
+        if self.kv_cache_dtype != dtypes.fp8:
+            return "auto"
+        return "fp8_e4m3"
+
+    def _set_kv_buffer_native_dense(self, layer, cache_loc, k, v, forward_batch):
+        k_descale, v_descale = self._kv_descales(layer)
+        if self.kv_cache_dtype == dtypes.fp8:
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
             )
-            if self.decode_using_pa_ps:
-                self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
+            launch_reshape_and_cache_flash(
+                k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                ),
+                v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+                cache_loc,
+                k_scale=k_descale,
+                v_scale=v_descale,
+            )
+            return
+
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            layer, cache_loc, k, v, k_descale, v_descale
+        )
 
     def set_kv_buffer_with_layout_shuffle(
         self,
@@ -947,11 +1908,16 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        use_native_dense_mha = self._should_use_native_dense_mha(layer)
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if self.use_mla:
+                if use_native_dense_mha:
+                    self._set_kv_buffer_native_dense(
+                        layer, cache_loc, k, v, forward_batch
+                    )
+                elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
                     k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
@@ -970,8 +1936,43 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         if self.use_mla:
             return self._forward_extend_mla(q, k, v, layer, forward_batch)
+        if use_native_dense_mha:
+            return self._forward_extend_native_dense_mha(q, layer, forward_batch)
         else:
             return self._forward_extend_mha(q, k, v, layer, forward_batch)
+
+    def _forward_extend_native_dense_mha(self, q, layer, forward_batch):
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        q_descale, k_descale, v_descale = None, None, None
+
+        if self.kv_cache_dtype == dtypes.fp8:
+            q = q.to(dtypes.fp8)
+            q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+            k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+            v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
+
+        bs0 = forward_batch.batch_size + 1
+        o = mha_batch_prefill_func(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            k_cache,
+            v_cache,
+            self.forward_metadata.qo_indptr[:bs0],
+            self.forward_metadata.kv_indptr[:bs0],
+            self.forward_metadata.kv_indices,
+            self.forward_metadata.max_q_len,
+            self.forward_metadata.max_kv_len,
+            causal=True,
+            logits_soft_cap=layer.logit_cap,
+            alibi_slopes=None,
+            return_lse=False,
+            return_attn_probs=False,
+            window_size=(-1, -1),
+            sink_ptr=None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _forward_extend_mha(self, q, k, v, layer, forward_batch):
         """Non-MLA extend path: standard MHA with flash_attn_varlen_func."""
@@ -1010,17 +2011,28 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         assert len(q.shape) == 3
 
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+        if forward_batch.forward_mode.is_target_verify():
+            return self._forward_extend_mla_speculative(
+                q,
+                layer,
+                K_Buffer,
+                qo_indptr,
+                forward_batch,
+            )
+        if forward_batch.forward_mode.is_draft_extend(include_v2=True) and (
+            k is None or v is None or layer.qk_head_dim == K_Buffer.shape[-1]
         ):
             return self._forward_extend_mla_speculative(
                 q,
                 layer,
                 K_Buffer,
                 qo_indptr,
+                forward_batch,
             )
-        if not forward_batch.forward_mode.is_extend():
+        if (
+            not forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
             raise ValueError(
                 f"Invalid forward mode for MLA extend: {forward_batch.forward_mode=}"
             )
@@ -1070,8 +2082,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         kv_indices,
         qo_indptr,
     ):
-        """Normal MLA extend (not target_verify, not draft_extend)."""
-        extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+        """MLA prefill/extend using explicit q/k/v instead of absorbed decode."""
+        extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        extend_no_prefix = (
+            False if extend_prefix_lens_cpu is None else not any(extend_prefix_lens_cpu)
+        )
 
         if kv_indices.shape[0] == 0 or extend_no_prefix:
             return self._extend_mla_no_prefix(
@@ -1277,10 +2292,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             dim=-1,
         )
 
-        assert (
-            forward_batch.extend_prefix_lens.shape
-            == forward_batch.extend_seq_lens.shape
-        )
+        extend_prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
+        if extend_prefix_lens is not None:
+            assert extend_prefix_lens.shape == forward_batch.extend_seq_lens.shape
 
         return flash_attn_varlen_func(
             q,
@@ -1356,14 +2370,51 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             num_kv_splits=md.num_kv_splits,
         )
 
-    def _forward_extend_mla_speculative(self, q, layer, K_Buffer, qo_indptr):
+    def _forward_extend_mla_speculative(
+        self, q, layer, K_Buffer, qo_indptr, forward_batch
+    ):
         """MLA speculative path (target_verify / draft_extend)."""
-        o = q.new_empty(
-            (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-            dtype=self.input_dtype,
+        md = self.forward_metadata
+
+        if forward_batch.forward_mode.is_target_verify():
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            self._call_mla_decode_fwd(q, K_Buffer, o, layer)
+            return o
+
+        if forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            if md.run_graph is not True:
+                bs, q_pad, _ = pad_sequence_with_mask(
+                    q.view(q.shape[0], -1),
+                    qo_indptr[:-1],
+                    forward_batch.extend_seq_lens,
+                    md.max_q_len,
+                )
+                o = q.new_empty(
+                    (bs * md.max_q_len, layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=self.input_dtype,
+                )
+                self._call_mla_decode_fwd(
+                    q_pad.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    K_Buffer,
+                    o,
+                    layer,
+                )
+                total_valid_q = int(qo_indptr[-1].item())
+                return o[:total_valid_q]
+
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            self._call_mla_decode_fwd(q, K_Buffer, o, layer)
+            return o
+
+        raise ValueError(
+            f"Invalid forward mode for MLA speculative path: {forward_batch.forward_mode=}"
         )
-        self._call_mla_decode_fwd(q, K_Buffer, o, layer)
-        return o
 
     def forward_decode(
         self,
@@ -1401,6 +2452,14 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             return o
 
         # Non-MLA decode paths
+        use_native_dense_mha = self._should_use_native_dense_mha(layer)
+        if use_native_dense_mha:
+            if save_kv_cache:
+                self._set_kv_buffer_native_dense(
+                    layer, forward_batch.out_cache_loc, k, v, forward_batch
+                )
+            return self._forward_decode_native_dense_mha(q, layer, forward_batch)
+
         o = q.new_empty((batch_size, layer.tp_q_head_num, head_dim_out))
 
         if save_kv_cache:
@@ -1476,3 +2535,31 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
 
         return o.view(-1, layer.tp_q_head_num * head_dim_out)
+
+    def _forward_decode_native_dense_mha(self, q, layer, forward_batch):
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        aiter_kv_str = self._get_aiter_paged_ragged_kv_cache_dtype()
+
+        o = torch.empty_like(q, dtype=self.input_dtype)
+        paged_attention_ragged(
+            o.view(-1, layer.tp_q_head_num, layer.head_dim),
+            self.workspace_buffer,
+            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            k_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
+            v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+            layer.scaling,
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.kv_indices,
+            self.kv_last_page_len,
+            1,
+            self.max_num_partitions,
+            None,
+            aiter_kv_str,
+            "NHD",
+            layer.logit_cap,
+            self.k_scale,
+            self.v_scale,
+            None,
+            getattr(_sglang_aiter, "_AITER_PARTITION_SIZE_ROCM", 256),
+        )
+        return o

@@ -23,11 +23,20 @@ def separate_reasoning(text: str) -> Tuple[Optional[str], str]:
         Tuple of (reasoning_content, content). reasoning_content is None if
         no thinking block was found.
     """
-    # Check for closed thinking block
+    # Check for closed thinking block: <think>...</think>
     match = re.match(r"<think>(.*?)</think>\s*(.*)", text, flags=re.DOTALL)
     if match:
         reasoning = match.group(1).strip()
         content = match.group(2).strip()
+        return (reasoning if reasoning else None, content)
+
+    # Check for </think> without <think> — models like MiniMax M2.7 don't
+    # generate <think> (the chat template injects it as part of the prompt),
+    # so the model output starts with reasoning text directly.
+    if "</think>" in text:
+        reasoning, _, content = text.partition("</think>")
+        reasoning = reasoning.strip()
+        content = content.strip()
         return (reasoning if reasoning else None, content)
 
     # Check for unclosed thinking block (truncated response)
@@ -89,7 +98,23 @@ class ReasoningFilter:
                 elif self.buf:
                     results.append(("reasoning_content", self.buf))
                     self.buf = ""
+            elif "</think>" in self.buf:
+                # No <think> but </think> found — model started reasoning
+                # without <think> tag (e.g., MiniMax M2.7 where the chat
+                # template injects <think> as part of the prompt).
+                reasoning = self.buf.split("</think>", 1)[0]
+                after = self.buf.split("</think>", 1)[1].lstrip("\n")
+                if reasoning:
+                    results.append(("reasoning_content", reasoning))
+                self.state = 2
+                self.buf = ""
+                if after:
+                    results.extend(self._process_content(after))
             elif len(self.buf) > 7 and "<" not in self.buf:
+                # No <think> tag found — emit as content. For models that
+                # don't emit <think> (MiniMax), streaming reasoning separation
+                # requires buffering the entire response, which is impractical.
+                # Non-streaming path handles this correctly via separate_reasoning().
                 results.append(("content", self.buf))
                 self.buf = ""
 

@@ -22,6 +22,7 @@ def per_req_cache_config(**overrides):
         enable_prefix_caching=False,
         max_num_seqs=8,
         max_num_batched_tokens=256,
+        max_model_len=256,
         bos_token_id=1,
         eos_token_id=2,
         stop_token_ids=[],
@@ -91,7 +92,7 @@ class TestBlockManagerPerReqCacheSlots:
         """can_allocate must check KV blocks AND per-req cache slots."""
         bm = BlockManager(per_req_cache_config(num_kvcache_blocks=100))
         seq = stateful_seq([1, 2, 3, 4])
-        assert bm.can_allocate(seq) is True
+        assert bm.can_allocate(seq) >= 0
 
     def test_can_allocate_fails_not_enough_blocks(self):
         """Not enough free blocks for KV + per-req cache equiv."""
@@ -105,7 +106,7 @@ class TestBlockManagerPerReqCacheSlots:
         seq1 = stateful_seq([1, 2, 3, 4])
         bm.allocate(seq1)
         seq2 = stateful_seq([5, 6, 7, 8])
-        assert bm.can_allocate(seq2) is False
+        assert bm.can_allocate(seq2) < 0
 
     def test_plain_seq_ignores_per_req_cache(self):
         """Stateless sequence should not consume per-req cache slots."""
@@ -164,13 +165,13 @@ class TestBlockManagerPerReqCacheSlots:
         bm.allocate(long_seq)
         # 20 - 4 = 16 free blocks
         # stateful seq needs 1 KV + 5 equiv = 6 blocks
-        assert bm.can_allocate(stateful_seq([1, 2, 3, 4]))
+        assert bm.can_allocate(stateful_seq([1, 2, 3, 4])) >= 0
         s1 = stateful_seq([1, 2, 3, 4])
         bm.allocate(s1)  # 16 - 6 = 10 free
         s2 = stateful_seq([1, 2, 3, 4])
         bm.allocate(s2)  # 10 - 6 = 4 free
         s3 = stateful_seq([1, 2, 3, 4])
-        assert bm.can_allocate(s3) is False  # 4 < 6
+        assert bm.can_allocate(s3) < 0  # 4 < 6
 
 
 # ── Sequence: per_req_cache_group field ──────────────────────────────────────

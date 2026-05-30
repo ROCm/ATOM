@@ -234,6 +234,8 @@ class MLPBlock(torch.nn.Module):
             self.moe_hidden_pad = 0
 
     def process_weights_after_loading(self):
+        if getattr(self.experts.quant_method, "use_triton", False):
+            return
         _interleave_swiglu_weights(self.experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

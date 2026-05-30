@@ -58,6 +58,28 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.v4_kernels.compress_plan import CompressPlan
+from atom.utils import envs
+
+# Optional flydsl path (aiter ROCm kernels). Falls back to Triton when
+# unavailable. HCA = compress + norm_rope_scatter 2-kernel split for
+# D=512 ratio=128 overlap=False.
+try:
+    from aiter.ops.flydsl.kernels.fused_compress_attn import flydsl_fused_compress_attn
+    from aiter.ops.flydsl.kernels.fused_compress_attn_hca import (
+        flydsl_hca_compress_attn,
+    )
+except Exception:
+    flydsl_fused_compress_attn = None
+    flydsl_hca_compress_attn = None
+
+# Supported (head_dim, rope_head_dim, ratio, overlap) tuples for the flydsl
+# kernel — matches V4-Pro Main (D=512) and Indexer-inner (D=128) compressors.
+# Extend as more configs are validated.
+_FLYDSL_SUPPORTED = {
+    (512, 64, 4, True),  # V4-Pro CSA Main BF16   (ratio=4, OVERLAP)
+    (128, 64, 4, True),  # V4-Pro CSA Indexer FP8 (ratio=4, OVERLAP)
+    (512, 64, 128, False),  # V4-Pro HCA Main BF16  (ratio=128, no overlap)
+}
 
 
 @triton.jit
@@ -103,8 +125,12 @@ def _fused_compress_attn_kernel(
     HALF_ROPE: tl.constexpr,  # = rope_head_dim // 2
     OVERLAP: tl.constexpr,
     RATIO: tl.constexpr,
-    STATE_SIZE: tl.constexpr,  # = 2*RATIO if OVERLAP else RATIO
-    K: tl.constexpr,  # = STATE_SIZE (softmax-pool reduce dim)
+    STATE_SIZE: tl.constexpr,  # ring buffer modulo = kv_state.shape[1] (≥ K_pool;
+    #   spec decode: K_pool + max_spec_steps so R's rejected writes fall outside
+    #   R+1's K_pool-wide read window; non-spec decode: K_pool exactly — no
+    #   rejection ever happens and causal writes preclude any read-before-overwrite)
+    K: tl.constexpr,  # pool-window reduce dim (= 2*RATIO if OVERLAP else RATIO);
+    #   ≤ STATE_SIZE; used for `s = position - K + 1 + k_static` loop bound
     HAS_BLOCK_TABLE: tl.constexpr,
     QUANT: tl.constexpr,  # 0 = raw BF16 (CSA/HCA Main), 1 = FP8 e4m3 + ue8m0 scale (Indexer)
     USE_UE8M0: tl.constexpr,  # round scale to power-of-2 (only when QUANT == 1)
@@ -207,13 +233,13 @@ def _fused_compress_attn_kernel(
             mask=d_mask,
             other=0.0,
             eviction_policy="evict_first",
-        )
+        ).to(tl.float32)
         score_a = tl.load(
             score_in_ptr + in_row * score_in_row_stride + col_off + d,
             mask=d_mask,
             other=0.0,
             eviction_policy="evict_first",
-        )
+        ).to(tl.float32)
         ape_v = tl.load(
             ape_ptr + ape_row * dim_full + col_off + d,
             mask=d_mask,
@@ -407,14 +433,95 @@ def fused_compress_attn(
     if plan_capacity == 0:
         return  # nothing to do — no plan rows ever populated.
 
+    # ------------------------------------------------------------------
+    # flydsl dispatch. Pure-GPU time on V4-Pro beats Triton 0.9x→2.9x
+    # across the relevant N_compress range; the small-N gap is bridged
+    # by the kernel doing both BF16 and FP8 paths through a single
+    # launcher (less per-call Python overhead at the boundary).
+    # ------------------------------------------------------------------
+    _flydsl_mode = envs.ATOM_FUSED_COMPRESS_USE_FLYDSL
+    _shape_key = (head_dim, rope_head_dim, ratio, overlap)
+    _flydsl_shape_ok = _shape_key in _FLYDSL_SUPPORTED
+    _flydsl_use = (
+        flydsl_fused_compress_attn is not None
+        and _flydsl_mode in ("auto", "always")
+        and _flydsl_shape_ok
+    )
+    if _flydsl_mode == "always" and not _flydsl_shape_ok:
+        raise RuntimeError(
+            f"ATOM_FUSED_COMPRESS_USE_FLYDSL=always but shape "
+            f"{_shape_key} is not in supported set {_FLYDSL_SUPPORTED}"
+        )
+    # HCA 2-kernel-split: BF16-only on V4-Pro HCA Main shape
+    # (D=512 ratio=128 overlap=False). HCA wins single-kernel at all N
+    # (1.06-3.7×) post slice_size + VEC=8 refactor.
+    _hca_use = (
+        _flydsl_use
+        and flydsl_hca_compress_attn is not None
+        and not quant
+        and _shape_key == (512, 64, 128, False)
+    )
+    if _hca_use:
+        flydsl_hca_compress_attn(
+            kv_in=kv_in,
+            score_in=score_in,
+            kv_state=kv_state,
+            score_state=score_state,
+            state_slot_mapping=state_slot_mapping,
+            plan_gpu=plan.compress_plan_gpu,
+            ape=ape,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            k_per_block=k_per_block,
+            ratio=ratio,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+        )
+        return
+    if _flydsl_use:
+        flydsl_fused_compress_attn(
+            kv_in=kv_in,
+            score_in=score_in,
+            kv_state=kv_state,
+            score_state=score_state,
+            plan_gpu=plan.compress_plan_gpu,
+            state_slot_mapping=state_slot_mapping,
+            ape=ape,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            k_per_block=k_per_block,
+            overlap=overlap,
+            ratio=ratio,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            quant=quant,
+            cache_scale=cache_scale,
+            use_ue8m0=use_ue8m0,
+            preshuffle=preshuffle,
+        )
+        return
+
     # Validate shapes
     dim_full = (2 if overlap else 1) * head_dim
-    state_size = (2 if overlap else 1) * ratio
+    K_pool = (2 if overlap else 1) * ratio  # pool window size (algorithm-defined)
+    state_size = kv_state.shape[
+        1
+    ]  # ring buffer modulo (≥ K_pool; V4-Pro: K_pool + max_spec_steps spec / K_pool non-spec)
     assert (
         kv_in.dim() == 2 and kv_in.shape[1] == dim_full
     ), f"kv_in {kv_in.shape}, expected [*, {dim_full}]"
     assert score_in.shape == kv_in.shape
-    assert kv_state.shape[1] == state_size and kv_state.shape[2] == dim_full
+    assert (
+        state_size >= K_pool and kv_state.shape[2] == dim_full
+    ), f"kv_state {kv_state.shape}, expected [*, ≥{K_pool}, {dim_full}]"
     assert score_state.shape == kv_state.shape
     assert ape.shape == (ratio, dim_full)
     assert rms_weight.shape == (head_dim,)
@@ -470,7 +577,7 @@ def fused_compress_attn(
 
     BLOCK_D = triton.next_power_of_2(head_dim)
     HALF_ROPE = rope_head_dim // 2
-    K = state_size
+    K = K_pool  # pool window reduce-dim (constexpr; not equal to ring modulo)
 
     # Cache-scale args (only consumed by the quant path; pass placeholders
     # otherwise so the constexpr branch is never taken).
@@ -559,8 +666,8 @@ def fused_compress_attn_reference(
     if plan.num_compress == 0:
         return None
     device = kv_in.device
-    K = (2 if overlap else 1) * ratio
-    state_size = K
+    K = (2 if overlap else 1) * ratio  # pool window
+    state_size = kv_state.shape[1]  # ring buffer modulo (≥ K)
     plan_cpu = plan.compress_plan_gpu.detach().cpu()
     slot_map_cpu = state_slot_mapping.detach().cpu()
     if block_tables is not None:

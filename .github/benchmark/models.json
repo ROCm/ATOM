@@ -20,6 +20,26 @@
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
   },
   {
+    "display": "DeepSeek-V4-Pro MTP3",
+    "path": "deepseek-ai/DeepSeek-V4-Pro",
+    "prefix": "deepseek-v4-pro",
+    "args": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3",
+    "bench_args": "--use-chat-template",
+    "suffix": "-mtp3",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
+  },
+  {
+    "display": "DeepSeek-V4-Pro DP",
+    "path": "deepseek-ai/DeepSeek-V4-Pro",
+    "prefix": "deepseek-v4-pro",
+    "args": "--kv_cache_dtype fp8 -tp 8 --enable-dp-attention",
+    "bench_args": "",
+    "suffix": "-dp",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
+  },
+  {
     "display": "DeepSeek-R1-0528 MTP3",
     "path": "deepseek-ai/DeepSeek-R1-0528",
     "prefix": "deepseek-r1-0528",
@@ -73,7 +93,7 @@
     "display": "gpt-oss-120b",
     "path": "openai/gpt-oss-120b",
     "prefix": "gpt-oss-120b",
-    "args": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5",
+    "args": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.9",
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
@@ -90,9 +110,9 @@
     "env_vars": ""
   },
   {
-    "display": "MiniMax-M2.5",
-    "path": "MiniMaxAI/MiniMax-M2.5",
-    "prefix": "MiniMax-M2.5",
+    "display": "MiniMax-M2.7",
+    "path": "MiniMaxAI/MiniMax-M2.7",
+    "prefix": "MiniMax-M2.7",
     "args": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
     "bench_args": "",
     "suffix": "",
@@ -100,9 +120,9 @@
     "env_vars": ""
   },
   {
-    "display": "MiniMax-M2.5-MXFP4",
-    "path": "amd/MiniMax-M2.5-MXFP4",
-    "prefix": "MiniMax-M2.5-MXFP4",
+    "display": "MiniMax-M2.7-MXFP4",
+    "path": "amd/MiniMax-M2.7-MXFP4",
+    "prefix": "MiniMax-M2.7-MXFP4",
     "args": "--kv_cache_dtype fp8 -tp 1 --trust-remote-code",
     "bench_args": "",
     "suffix": "",

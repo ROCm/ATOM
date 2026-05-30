@@ -40,8 +40,13 @@ def _register_custom_attention_to_sglang() -> None:
     sglang only accepts pre-registered backend names, so we reuse the "aiter"
     name to inject ATOMAttnBackendForSgl without modifying sglang source.
     """
+    import sglang.srt.layers.attention.aiter_backend as sglang_aiter_backend
+
     from sglang.srt.layers.attention.attention_registry import (
         register_attention_backend,
+    )
+    from atom.plugin.sglang.attention_backend.sgl_attn_backend import (
+        ATOMAttnBackendForSgl,
     )
 
     # here register the custom attention backend with the name "aiter"
@@ -49,12 +54,14 @@ def _register_custom_attention_to_sglang() -> None:
     # in-tree
     logger.info("Register custom attention backend ATOMAttnBackendForSgl to SGLang")
 
+    # Speculative draft paths instantiate AiterAttnBackend directly inside
+    # AiterMultiStepDraftBackend, bypassing the attention registry. Rebind the
+    # module symbol as well so both registry lookup and direct construction use
+    # the plugin backend.
+    sglang_aiter_backend.AiterAttnBackend = ATOMAttnBackendForSgl
+
     @register_attention_backend("aiter")
     def create_atom_backend(runner):
-        from atom.plugin.sglang.attention_backend.sgl_attn_backend import (
-            ATOMAttnBackendForSgl,
-        )
-
         return ATOMAttnBackendForSgl(runner)
 
 
@@ -94,6 +101,8 @@ def init_aiter_dist(config: Config) -> None:
     )
 
     rank = config.plugin_config.rank
+    if getattr(config.plugin_config, "is_sglang", False):
+        rank = getattr(config.plugin_config, "sglang_aiter_rank_id", rank)
     tensor_parallel_size = config.tensor_parallel_size
 
     assert (
