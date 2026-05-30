@@ -33,9 +33,9 @@
     "display": "DeepSeek-V4-Pro DP",
     "path": "deepseek-ai/DeepSeek-V4-Pro",
     "prefix": "deepseek-v4-pro",
-    "args": "--kv_cache_dtype fp8 -tp 8 --enable-dp-attention",
+    "args": "--kv_cache_dtype fp8 -tp 8 --enable-dp-attention --gpu-memory-utilization 0.85",
     "bench_args": "",
-    "suffix": "-dp",
+    "suffix": "-dpa",
     "runner": "atom-mi355-8gpu.predownload",
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
   },
