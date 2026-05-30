@@ -39,6 +39,7 @@ class EngineArgs:
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
     attn_prefill_chunk_size: int = 16384
+    enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -198,6 +199,14 @@ class EngineArgs:
                 "MLA chunked-prefill budget in tokens. Default uses "
                 "max_num_batched_tokens."
             ),
+        )
+        parser.add_argument(
+            "--enable_chunked_prefill",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Enable chunked prefill (default: enabled). "
+            "Use --no-enable_chunked_prefill to disable. "
+            "Note: DeepSeek-V4 auto-disables this (unsupported).",
         )
         parser.add_argument(
             "--max-num-seqs",
