@@ -58,6 +58,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_2:
         description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
@@ -95,6 +96,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_3:
         description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
@@ -132,6 +134,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_4:
         description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
@@ -169,6 +172,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_5:
         description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
@@ -206,6 +210,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_6:
         description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
@@ -243,6 +248,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_7:
         description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
@@ -280,6 +286,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_8:
         description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
@@ -317,6 +324,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -1096,9 +1104,22 @@ jobs:
           params = json.loads(os.environ["PARAMS_JSON"])
 
           include = []
+          aws_p0_displays = {
+              "gpt-oss-120b TP1 (AW)",
+              "DeepSeek-V3.2 FP8 TP4 (AW)",
+              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
+              "GLM-4.7-FP8 TP4 (AW)",
+              "GLM-4.7-FP8 MTP TP4 (AW)",
+              "Kimi-K2.5-MXFP4 TP4 (AW)",
+              "MiniMax-M2.5 TP2 (AW)",
+          }
           for model in models:
               prefix = str(model.get("prefix", ""))
+              display = str(model.get("display", ""))
               is_aw_model = "-aw-" in prefix
+              is_aws_p0_model = display in aws_p0_displays
               aw_pairs = (
                   (1000, 100),
                   (5000, 500),
