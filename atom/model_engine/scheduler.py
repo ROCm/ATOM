@@ -716,8 +716,42 @@ class Scheduler:
                     skipped_waiting_requests.append(seq)
                     continue
 
+            # OFFLOAD fresh-wake: a seq whose CPU/NVMe prefix just finished
+            # loading into its GPU blocks. Unlike P/D (which jumps straight to
+            # decode with an injected first token), offload must resume as a
+            # PREFILL of only the un-loaded SUFFIX: bump num_cached_tokens to the
+            # loaded count and fall through to admission WITHOUT re-matching or
+            # re-allocating (blocks were allocated for the whole seq before it
+            # parked). `offload_resume` also covers the case where a woken
+            # offload seq did not fit this step and was re-parked as plain
+            # WAITING -- it prevents re-running get_num_new_matched_tokens and,
+            # critically, re-calling block_manager.allocate() onto an already
+            # populated block_table (005's `assert not seq.block_table` crash).
+            is_offload = self._is_offload_connector()
+            if waiting_remote_to_waiting_ready and is_offload:
+                loaded = getattr(seq, "offload_loaded_tokens", None)
+                logger.debug(
+                    "[OFFLOAD-WAKE] seq %s: loaded=%s prev_cached=%d num_tokens=%d",
+                    seq.id, loaded, seq.num_cached_tokens, seq.num_tokens,
+                )
+                if loaded is not None and loaded > seq.num_cached_tokens:
+                    seq.num_cached_tokens = loaded
+                seq.offload_loaded = True
+                waiting_remote_to_waiting_ready = False  # not the P/D decode jump
+
+            offload_resume = (
+                is_offload
+                and getattr(seq, "offload_loaded", False)
+                and len(seq.block_table) > 0
+                and seq.num_cached_tokens > 0
+            )
+
             need_to_remove_to_load_kv_async_queue = False
-            if self.kv_connector is not None and not waiting_remote_to_waiting_ready:
+            if (
+                self.kv_connector is not None
+                and not waiting_remote_to_waiting_ready
+                and not offload_resume
+            ):
                 _ext_tokens, need_to_remove_to_load_kv_async_queue = (
                     self.kv_connector.get_num_new_matched_tokens(seq)
                 )
@@ -743,43 +777,53 @@ class Scheduler:
                 self.running.append(seq)
                 continue
 
-            # Probe cache hits FIRST so budget check sees the real
-            # (post-prefix-cache) remaining token count. `can_allocate`
-            # excludes the last block from cache hits (prefill must forward
-            # at least one block to produce logits), so num_new_tokens ≥ 1
-            # is guaranteed.
-            num_cached_blocks = self.block_manager.can_allocate(seq)
-            if num_cached_blocks < 0:
-                self.waiting.appendleft(seq)
-                break
-
-            num_new_tokens = (
-                seq.num_prompt_tokens
-                - num_cached_blocks * self.block_manager.block_size
-            )
-            budget_remaining = self.max_num_batched_tokens - num_batched_tokens
-            if self.enable_chunked_prefill:
-                chunk = min(num_new_tokens, budget_remaining)
+            if offload_resume:
+                # Blocks already held from the pre-park allocate; only re-check
+                # the batch budget. No re-match / re-allocate / re-park.
+                num_new_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
+                budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+                if self.enable_chunked_prefill:
+                    chunk = min(num_new_tokens, budget_remaining)
+                else:
+                    if num_new_tokens > budget_remaining and num_batched_tokens > 0:
+                        self.waiting.appendleft(seq)
+                        break
+                    chunk = num_new_tokens
             else:
-                if num_new_tokens > budget_remaining and num_batched_tokens > 0:
+                # Probe cache hits FIRST so budget check sees the real
+                # (post-prefix-cache) remaining token count.
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks < 0:
                     self.waiting.appendleft(seq)
                     break
-                chunk = num_new_tokens
+
+                num_new_tokens = (
+                    seq.num_prompt_tokens
+                    - num_cached_blocks * self.block_manager.block_size
+                )
+                budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+                if self.enable_chunked_prefill:
+                    chunk = min(num_new_tokens, budget_remaining)
+                else:
+                    if num_new_tokens > budget_remaining and num_batched_tokens > 0:
+                        self.waiting.appendleft(seq)
+                        break
+                    chunk = num_new_tokens
+
+                self.block_manager.allocate(seq, num_cached_blocks)
+
+                if self.kv_connector is not None:
+                    self.kv_connector.update_state_after_alloc(seq)
+
+                if need_to_remove_to_load_kv_async_queue:
+                    skipped_waiting_requests.append(seq)
+                    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                    continue
+
             assert chunk > 0, (
                 f"chunk must be positive: {chunk=}, "
                 f"{num_new_tokens=}, {budget_remaining=}"
             )
-
-            self.block_manager.allocate(seq, num_cached_blocks)
-
-            if self.kv_connector is not None:
-                self.kv_connector.update_state_after_alloc(seq)
-
-            if need_to_remove_to_load_kv_async_queue:
-                skipped_waiting_requests.append(seq)
-                seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-                continue
-
             if self.cache_stats:
                 self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
             num_batched_tokens += chunk
@@ -1210,6 +1254,14 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
+
+    def _is_offload_connector(self) -> bool:
+        """True when the active KV connector is the CPU/NVMe offload backend.
+
+        Offload wakes a parked seq into a SUFFIX prefill (not the P/D decode
+        jump). Connectors set ``is_offload = True`` to opt into this path.
+        """
+        return getattr(self.kv_connector, "is_offload", False)
 
     def _update_waiting_for_remote_kv(self, seq: Sequence) -> bool:
         """Check whether a remote KV transfer for *seq* has completed.
