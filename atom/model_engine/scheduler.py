@@ -507,9 +507,8 @@ class Scheduler:
     def set_prefill_delayer(self, delayer) -> None:
         self.prefill_delayer = delayer
 
-    def _can_admit_head_prefill(self) -> bool:
-        """Match SGL's `local_prefillable=True` semantics: report True iff
-        this rank would *actually* admit a new prefill this tick.
+    def _count_admittable_head_prefills(self, limit: int) -> int:
+        """Count how many head prefills this rank can admit this tick.
 
         Just having `self.waiting` non-empty is too coarse — during a
         concurrent-burst workload (e.g. 1k/1k @ high concurrency) every
@@ -521,10 +520,13 @@ class Scheduler:
 
         We peek the front of `waiting` (skipping a few unschedulable
         entries) and check `can_allocate` + token-budget, mirroring the
-        same checks the admission while-loop runs below.
+        same checks the admission while-loop runs below. The count is capped
+        at ``limit`` so the helper stays cheap for the delayer gate.
         """
-        if not self.waiting:
-            return False
+        if limit <= 0 or not self.waiting:
+            return 0
+        count = 0
+        num_batched_tokens = 0
         for i, seq in enumerate(self.waiting):
             if i >= 4:
                 break
@@ -536,9 +538,26 @@ class Scheduler:
             if num_new_tokens > self.max_num_batched_tokens:
                 continue
             if self.block_manager.can_allocate(seq) < 0:
-                return False  # KV-pressured: definitely cannot prefill
-            return True
-        return False
+                break  # KV-pressured: definitely cannot prefill more now.
+            if num_batched_tokens + num_new_tokens > self.max_num_batched_tokens:
+                break
+            count += 1
+            if count >= limit:
+                break
+            num_batched_tokens += num_new_tokens
+        return count
+
+    def _prefill_delayer_readiness(self) -> tuple[bool, bool]:
+        """Return the local presence and alignment bits for PrefillDelayer.
+
+        TBO prefill splitting needs at least two local prefill requests.
+        When TBO is enabled, wait for each DP rank to be able to admit two
+        requests before reporting "ready"; otherwise keep the legacy one
+        request threshold.
+        """
+        required = 2 if self.config.enable_tbo else 1
+        count = self._count_admittable_head_prefills(required)
+        return count > 0, count >= required
 
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
@@ -700,9 +719,13 @@ class Scheduler:
         # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
         _delayer_allows_prefill = True
         if self.prefill_delayer is not None:
+            _local_prefillable, _local_alignment_ready = (
+                self._prefill_delayer_readiness()
+            )
             _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
-                local_prefillable=self._can_admit_head_prefill(),
+                local_prefillable=_local_prefillable,
                 token_usage=self._kv_usage(),
+                local_alignment_ready=_local_alignment_ready,
             )
 
         if not self.running and not self.waiting:

@@ -7,11 +7,12 @@ the "mixed prefillable status → delay" core that fixes our 1k/1k workload's
 
 Mechanism (per scheduler tick):
   1. Each DP rank reports its local state via cpu all_gather:
-       (local_prefillable, watermark_force_allow)
+       (local_prefillable, local_alignment_ready, watermark_force_allow)
   2. Compute `prefillable_status` ∈ {all, none, mixed}:
-       - "all"   → every rank has a new prefill ready  → allow (8-way aligned)
+       - "all"   → every rank has enough prefill ready → allow (8-way aligned)
        - "none"  → no rank has any prefill             → allow (vacuous)
-       - "mixed" → only some ranks have prefill ready  → DELAY
+       - "mixed" → at least one rank has prefill, but
+                   not all ranks are alignment-ready    → DELAY
   3. In "mixed", refuse the prefill (return False from `should_allow_prefill`)
      for up to `max_delay_passes` consecutive ticks (default 30, ≈ 255ms at
      8.5ms/decode-tick) OR `max_delay_ms` wall-clock (default 5000ms),
@@ -87,7 +88,7 @@ class PrefillDelayer:
         self.max_delay_ms = max_delay_ms
         self.token_usage_low_watermark = token_usage_low_watermark
 
-        # 3-slot MAX-reduce buffer (gloo-friendly; mirrors the proven
+        # 4-slot MAX-reduce buffer (gloo-friendly; mirrors the proven
         # `_sync_dp_state` all_reduce path in engine_core.py rather than
         # relying on all_gather_into_tensor — the stateless gloo group's
         # docstring warns broadcast-like ops are unreliable, and the
@@ -97,13 +98,14 @@ class PrefillDelayer:
         # Encoding:
         #   slot 0 = local_prefillable          (MAX → "any rank prefillable")
         #   slot 1 = local_force                (MAX → "any rank forces allow")
-        #   slot 2 = NOT local_prefillable      (MAX → "any rank lacks prefill")
+        #   slot 2 = local_alignment_ready      (MAX → "any rank ready")
+        #   slot 3 = NOT local_alignment_ready  (MAX → "any rank not ready")
         # Then prefillable_status:
-        #   any_prefillable AND any_not_prefillable → "mixed"
-        #   any_prefillable AND NOT any_not_prefillable → "all"
+        #   any_prefillable AND any_not_ready → "mixed"
+        #   any_prefillable AND any_ready AND NOT any_not_ready → "all"
         #   NOT any_prefillable → "none"
-        # Single all_reduce, 3 int64s on cpu — negligible overhead.
-        self._reduce_buf = torch.zeros(3, dtype=torch.int64, device="cpu")
+        # Single all_reduce, 4 int64s on cpu — negligible overhead.
+        self._reduce_buf = torch.zeros(4, dtype=torch.int64, device="cpu")
 
         self._delayed_count: int = 0
         self._delay_start_ts: float = 0.0
@@ -132,6 +134,7 @@ class PrefillDelayer:
         self,
         local_prefillable: bool,
         token_usage: float,
+        local_alignment_ready: Optional[bool] = None,
     ) -> bool:
         """
         Returns True iff this rank is allowed to admit new prefills this tick.
@@ -142,7 +145,13 @@ class PrefillDelayer:
             token_usage: fraction of KV cache blocks currently in use
                 (used_blocks / total_blocks ∈ [0, 1]). Used by the
                 low-watermark safety valve.
+            local_alignment_ready: this rank meets the current alignment
+                threshold. Defaults to ``local_prefillable`` for the legacy
+                one-request policy; TBO prefill passes ``>= 2`` here.
         """
+        if local_alignment_ready is None:
+            local_alignment_ready = local_prefillable
+
         # Local "force allow" if KV cache is underutilized — don't delay
         # when GPU is starving. Only meaningful if this rank actually has
         # a prefill to push through (otherwise force_allow is a no-op).
@@ -154,10 +163,11 @@ class PrefillDelayer:
         ):
             force = True
 
-        # Cross-DP MAX-reduce: 3 booleans encoded as int64.
+        # Cross-DP MAX-reduce: 4 booleans encoded as int64.
         self._reduce_buf[0] = 1 if local_prefillable else 0
         self._reduce_buf[1] = 1 if force else 0
-        self._reduce_buf[2] = 0 if local_prefillable else 1
+        self._reduce_buf[2] = 1 if local_alignment_ready else 0
+        self._reduce_buf[3] = 0 if local_alignment_ready else 1
         torch.distributed.all_reduce(
             self._reduce_buf,
             op=torch.distributed.ReduceOp.MAX,
@@ -165,11 +175,11 @@ class PrefillDelayer:
         )
         any_prefillable = int(self._reduce_buf[0].item()) > 0
         force_max = int(self._reduce_buf[1].item())
-        any_not_prefillable = int(self._reduce_buf[2].item()) > 0
+        any_ready = int(self._reduce_buf[2].item()) > 0
+        any_not_ready = int(self._reduce_buf[3].item()) > 0
 
         # Derive 3-way status: all / none / mixed.
-        prefillable_max = 1 if any_prefillable else 0
-        prefillable_min = 0 if any_not_prefillable else 1
+        all_ready = any_ready and not any_not_ready
 
         # Watermark short-circuit: ANY rank below the watermark forces all
         # ranks to allow this tick. Without this the delayer can stall a
@@ -189,7 +199,7 @@ class PrefillDelayer:
             return True
 
         # status = "all" or "none" → no skew, just allow
-        if prefillable_min == prefillable_max:
+        if not any_prefillable or all_ready:
             self._reset_delay()
             self._stat_allow += 1
             self._maybe_log()
@@ -211,7 +221,7 @@ class PrefillDelayer:
                     f"[PrefillDelayer] DELAY: count={self._delayed_count} "
                     f"elapsed={elapsed_ms:.1f}ms "
                     f"any_prefillable={any_prefillable} "
-                    f"any_not_prefillable={any_not_prefillable}"
+                    f"any_ready={any_ready} any_not_ready={any_not_ready}"
                 )
             self._maybe_log()
             return False
