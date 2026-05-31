@@ -1168,7 +1168,7 @@ jobs:
                       continue
                   if pair in excluded_pairs:
                       continue
-                  if str(model.get("display", "")) in AWS_P0 and int(param["concurrency"]) in (128, 256, 512):
+                  if is_aws_p0_model and int(param["concurrency"]) in (128, 256, 512):
                       continue
                   include.append({"model": model, "params": param})
 
