@@ -7,9 +7,11 @@ Design (see ../../../../PLAN_impl_lmcache_offload_v5.md + 005 LEARN notes):
 
 * **Reuse real LMCache as a storage tier only** — per-rank ``LMCacheEngine`` for its
   ``StorageManager`` (CPU LRU + NVMe L3) + ``ChunkedTokenDatabase`` (chunk-256 keys).
-  We bypass ``engine.store/retrieve`` (token-major GPU path can't represent AITER's
-  swizzle) and instead move **opaque per-block bytes** via :class:`ATOMKVByteCodec`
-  into pinned ``KV_2LTD``-as-uint8 ``MemoryObj``s.
+  We bypass ``engine.store/retrieve`` (its token-major GPU path can't represent ATOM's
+  x-packed KV storage layout — ``K=(nb,H,D//x,bs,x)``, see ``ATOMKVByteCodec`` docstring;
+  loosely "swizzle", but a persistent storage layout, not LDS bank-swizzle) and instead
+  move **opaque per-block bytes** via :class:`ATOMKVByteCodec` into pinned
+  ``KV_2LTD``-as-uint8 ``MemoryObj``s.
 * **Daemon-after-forward copies** — ``start_load_kv`` only ``submit``s to a single
   serial copy daemon (ThreadPoolExecutor max_workers=1) and returns immediately, so
   the worker RPC thread is free for ``forward``; completions are polled in
@@ -24,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -32,6 +35,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput, ReqId
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.gpu_connector import ATOMKVByteCodec
 from atom.kv_transfer.offload.metadata import (
@@ -103,8 +107,10 @@ class LMCacheOffloadConnector(KVConnectorBase):
         )
         self._tls = threading.local()  # per-thread copy stream
         self._lock = threading.Lock()
-        self._done_load: set[str] = set()
-        self._done_save: set[str] = set()
+        self._done_load: set[ReqId] = set()
+        self._done_save: set[ReqId] = set()
+        self._failed_load: set[ReqId] = set()
+        self._load_active = threading.Event()
 
         self._engine = None
         self._sm = None
@@ -142,9 +148,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
         def _logged_lookup(*a, **k):
             r = _orig_lookup(*a, **k)
             h = k.get("hashes")
-            logger.info("[ENGINE.LOOKUP] rank=%s lookup_id=%s nhashes=%s first3=%s -> %s",
-                        _rk, k.get("lookup_id"), (len(h) if h is not None else None),
-                        (list(h[:3]) if h else None), r)
+            logger.debug("[ENGINE.LOOKUP] rank=%s lookup_id=%s nhashes=%s first3=%s -> %s",
+                         _rk, k.get("lookup_id"), (len(h) if h is not None else None),
+                         (list(h[:3]) if h else None), r)
             return r
         self._engine.lookup = _logged_lookup
 
@@ -158,8 +164,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
             logger.warning("LMCache offload: lookup server not started: %s", e)
 
         logger.info(
-            "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d save=%s load=%s",
-            rank, self._codec.bytes_per_block, self.chunk_size,
+            "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d "
+            "codec_layout=%s save=%s load=%s",
+            rank, self._codec.bytes_per_block, self.chunk_size, self._codec.layout,
             self._do_save, self._do_load,
         )
 
@@ -169,21 +176,41 @@ class LMCacheOffloadConnector(KVConnectorBase):
             return
         for req in metadata.requests:
             if req.load_spec is not None and self._do_load:
-                self._load_executor.submit(self._guard, self._do_load_req, req)
+                self._load_executor.submit(self._guard, "load", self._do_load_req, req)
             if req.save_spec is not None and self._do_save:
-                self._save_executor.submit(self._guard, self._do_save_req, req)
+                self._save_executor.submit(self._guard, "save", self._do_save_req, req)
 
-    def _guard(self, fn, req) -> None:
+    def _guard(self, kind: str, fn, req) -> None:
+        load_active = getattr(self, "_load_active", None)
+        if kind == "load" and load_active is None:
+            load_active = threading.Event()
+            self._load_active = load_active
+        if kind == "load":
+            load_active.set()
         try:
             fn(req)
         except Exception:
             logger.exception("LMCache offload: %s failed for %s", fn.__name__, req.req_id)
-            # Wake the seq anyway so it is not stuck parked; scheduler re-derives
-            # how much is actually cached (load) / proceeds (save).
+            if kind == "load":
+                self._lookup_unpin(req.req_id)
             with self._lock:
-                (self._done_load if fn is self._do_load_req else self._done_save).add(
-                    req.req_id
-                )
+                if kind == "load":
+                    self._failed_load.add(req.req_id)
+                else:
+                    # A failed save should not keep blocks pinned forever. The
+                    # request simply loses this offload opportunity.
+                    self._done_save.add(req.req_id)
+        finally:
+            if kind == "load":
+                load_active.clear()
+
+    def _lookup_unpin(self, req_id) -> None:
+        if getattr(self, "_engine", None) is None:
+            return
+        try:
+            self._engine.lookup_unpin([str(req_id)])  # LMCache pin keyed by str id
+        except Exception:
+            pass
 
     def _stream(self) -> torch.cuda.Stream:
         """A CUDA stream owned by the calling copy-daemon thread (lazily made)."""
@@ -193,49 +220,194 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._tls.stream = s
         return s
 
+    def _host_tmp(self, nbytes: int) -> torch.Tensor:
+        """Pinned CPU scratch buffer owned by the calling copy-daemon thread."""
+        buf = getattr(self._tls, "host_tmp", None)
+        if buf is None or int(buf.numel()) < int(nbytes):
+            try:
+                buf = torch.empty((int(nbytes),), dtype=torch.uint8, pin_memory=True)
+            except RuntimeError:
+                logger.warning(
+                    "LMCache offload: pinned host scratch allocation failed; "
+                    "falling back to pageable CPU memory",
+                    exc_info=True,
+                )
+                buf = torch.empty((int(nbytes),), dtype=torch.uint8)
+            self._tls.host_tmp = buf
+        return buf[: int(nbytes)]
+
+    def _pause_save_for_load(self, stream: torch.cuda.Stream) -> None:
+        """Let critical-path loads drain before fire-and-forget save copies."""
+        load_active = getattr(self, "_load_active", None)
+        if load_active is None or not load_active.is_set():
+            return
+        stream.synchronize()
+        while load_active.is_set():
+            time.sleep(0.001)
+
     def _block_ids(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
         return req.block_ids[start // self.block_size : _cdiv(end, self.block_size)]
+
+    def _profile_enabled(self) -> bool:
+        return os.environ.get("OFFLOAD_PROFILE", "1").lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
 
     # -- copy daemon thread ----------------------------------------------
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
         assert ls is not None
         stream = self._stream()
-        hbm = (ls.hbm_cached_tokens // self.chunk_size) * self.chunk_size
+        hbm = int(ls.hbm_cached_tokens)
         toks = req.token_ids[: ls.lmcache_cached_tokens]
+        t_total0 = time.perf_counter()
+        if int(ls.lmcache_cached_tokens) <= hbm:
+            self._lookup_unpin(req.req_id)
+            with self._lock:
+                self._done_load.add(req.req_id)
+            return
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:hbm] = False
+        t0 = time.perf_counter()
         chunks = list(self._tdb.process_tokens(torch.tensor(toks), mask=mask))
+        process_ms = (time.perf_counter() - t0) * 1000
         logger.debug("offload _do_load req=%s hbm=%d lmc=%d chunks=%d",
                      req.req_id, hbm, ls.lmcache_cached_tokens, len(chunks))
 
-        # All-or-nothing: a partial load would let attention read uninitialized
-        # blocks. If any chunk is gone (evicted between lookup and load), skip the
-        # whole load — the seq wakes and re-prefills the suffix (loaded 0).
+        # All-or-nothing above the HBM prefix: a partial load would let attention
+        # read uninitialized blocks, and a chunk that overlaps an HBM-cache hit
+        # could overwrite shared prefix-cache blocks. In either case the seq
+        # wakes and re-prefills from its HBM floor.
+        if not chunks:
+            logger.warning("LMCache offload: no loadable chunks req=%s; re-prefill",
+                           req.req_id)
+            self._lookup_unpin(req.req_id)
+            with self._lock:
+                self._failed_load.add(req.req_id)
+            return
+        for (s, _e, _key) in chunks:
+            if s < hbm:
+                logger.warning(
+                    "LMCache offload: chunk overlaps HBM prefix req=%s hbm=%d "
+                    "chunk_start=%d; re-prefill",
+                    req.req_id, hbm, s,
+                )
+                self._lookup_unpin(req.req_id)
+                with self._lock:
+                    self._failed_load.add(req.req_id)
+                return
+        contains_ms = 0.0
         for (_s, _e, key) in chunks:
+            t0 = time.perf_counter()
             if not self._sm.contains(key):
+                contains_ms += (time.perf_counter() - t0) * 1000
                 logger.warning("LMCache offload: load miss req=%s; re-prefill", req.req_id)
+                self._lookup_unpin(req.req_id)
                 with self._lock:
-                    self._done_load.add(req.req_id)
+                    self._failed_load.add(req.req_id)
                 return
+            contains_ms += (time.perf_counter() - t0) * 1000
 
-        for (s, e, key) in chunks:
-            mo = self._sm.get(key)
-            if mo is None:
-                with self._lock:
-                    self._done_load.add(req.req_id)
-                return
-            self._codec.host_to_gpu(mo.tensor, self._block_ids(req, s, e), stream)
+        loaded_objs = []
+        get_ms = 0.0
+        host_alloc_ms = 0.0
+        stitch_ms = 0.0
+        h2d_submit_ms = 0.0
+        sync_ms = 0.0
+        nblocks = 0
+        nbytes = 0
+        copy_calls = 0
+        chunk_bids: list[list[int]] = []
+        try:
+            for (s, e, key) in chunks:
+                t0 = time.perf_counter()
+                mo = self._sm.get(key)
+                get_ms += (time.perf_counter() - t0) * 1000
+                if mo is None:
+                    t0 = time.perf_counter()
+                    stream.synchronize()
+                    sync_ms += (time.perf_counter() - t0) * 1000
+                    for loaded_mo in loaded_objs:
+                        loaded_mo.ref_count_down()
+                    self._lookup_unpin(req.req_id)
+                    with self._lock:
+                        self._failed_load.add(req.req_id)
+                    return
+                loaded_objs.append(mo)
+                bids = self._block_ids(req, s, e)
+                chunk_bids.append(bids)
+                nblocks += len(bids)
+                nbytes += len(bids) * self._codec.bytes_per_block
+                if self._codec.layout != "segment_indexed":
+                    copy_calls += self._codec.copy_calls_for_block_ids(bids)
+                    t0 = time.perf_counter()
+                    self._codec.host_to_gpu(mo.tensor, bids, stream)
+                    h2d_submit_ms += (time.perf_counter() - t0) * 1000
+            if self._codec.layout == "segment_indexed":
+                all_bids = [bid for bids in chunk_bids for bid in bids]
+                copy_calls = self._codec.copy_calls_for_block_ids(all_bids)
+                t0 = time.perf_counter()
+                req_buf = self._host_tmp(nbytes)
+                host_alloc_ms += (time.perf_counter() - t0) * 1000
+                t0 = time.perf_counter()
+                self._codec.stitch_chunk_buffers(
+                    req_buf,
+                    [mo.tensor for mo in loaded_objs],
+                    [len(bids) for bids in chunk_bids],
+                )
+                stitch_ms += (time.perf_counter() - t0) * 1000
+                t0 = time.perf_counter()
+                self._codec.host_to_gpu(req_buf, all_bids, stream)
+                h2d_submit_ms += (time.perf_counter() - t0) * 1000
+            t0 = time.perf_counter()
+            stream.synchronize()
+            sync_ms += (time.perf_counter() - t0) * 1000
+        except Exception:
+            try:
+                t0 = time.perf_counter()
+                stream.synchronize()
+                sync_ms += (time.perf_counter() - t0) * 1000
+            finally:
+                for loaded_mo in loaded_objs:
+                    loaded_mo.ref_count_down()
+                self._lookup_unpin(req.req_id)
+            raise
+        for mo in loaded_objs:
             mo.ref_count_down()
-        stream.synchronize()
         # Release the lookup pin (taken by the scheduler's LookupClient.lookup)
         # now that the chunks are safely in GPU; lets the pool evict them later.
-        try:
-            self._engine.lookup_unpin([str(req.req_id)])  # LMCache pin keyed by str id
-        except Exception:
-            pass
+        self._lookup_unpin(req.req_id)
         with self._lock:
             self._done_load.add(req.req_id)
+        if self._profile_enabled():
+            total_ms = (time.perf_counter() - t_total0) * 1000
+            logger.info(
+                "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d "
+                "chunks=%d blocks=%d bytes=%.3fGiB copy_calls=%d "
+                "layout=%s process_ms=%.2f contains_ms=%.2f get_ms=%.2f "
+                "host_alloc_ms=%.2f stitch_ms=%.2f h2d_submit_ms=%.2f "
+                "sync_ms=%.2f total_ms=%.2f",
+                getattr(self, "_rank", "?"),
+                req.req_id,
+                hbm,
+                ls.lmcache_cached_tokens,
+                len(chunks),
+                nblocks,
+                nbytes / 1024**3,
+                copy_calls,
+                self._codec.layout,
+                process_ms,
+                contains_ms,
+                get_ms,
+                host_alloc_ms,
+                stitch_ms,
+                h2d_submit_ms,
+                sync_ms,
+                total_ms,
+            )
         logger.info("offload _do_load DONE req=%s", req.req_id)
 
     def _do_save_req(self, req: LMCacheReqMeta) -> None:
@@ -253,48 +425,122 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 self._done_save.add(req.req_id)
             return
 
+        t_total0 = time.perf_counter()
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:skip] = False
+        t0 = time.perf_counter()
         chunks = list(self._tdb.process_tokens(torch.tensor(toks), mask=mask))
+        process_ms = (time.perf_counter() - t0) * 1000
 
         keys, objs, already = [], [], 0
-        for (s, e, key) in chunks:
-            if self._sm.contains(key):  # already offloaded → skip wasted D2H
-                already += 1
-                continue
-            bids = self._block_ids(req, s, e)
-            nbytes = len(bids) * self._codec.bytes_per_block
-            mo = self._sm.allocate(torch.Size((nbytes,)), torch.uint8,
-                                   fmt=MemoryFormat.KV_2LTD)
-            if mo is None:  # pool under pressure; stop here
-                break
-            # D2H on this thread's dedicated copy stream (off the compute stream).
-            self._codec.gpu_to_host(mo.tensor, bids, stream)
-            keys.append(key)
-            objs.append(mo)
+        put_started = False
+        contains_ms = 0.0
+        alloc_ms = 0.0
+        d2h_submit_ms = 0.0
+        sync_ms = 0.0
+        put_ms = 0.0
+        nblocks = 0
+        total_nbytes = 0
+        copy_calls = 0
+        try:
+            for (s, e, key) in chunks:
+                self._pause_save_for_load(stream)
+                t0 = time.perf_counter()
+                if self._sm.contains(key):  # already offloaded → skip wasted D2H
+                    contains_ms += (time.perf_counter() - t0) * 1000
+                    already += 1
+                    continue
+                contains_ms += (time.perf_counter() - t0) * 1000
+                bids = self._block_ids(req, s, e)
+                chunk_nbytes = len(bids) * self._codec.bytes_per_block
+                t0 = time.perf_counter()
+                mo = self._sm.allocate(torch.Size((chunk_nbytes,)), torch.uint8,
+                                       fmt=MemoryFormat.KV_2LTD)
+                alloc_ms += (time.perf_counter() - t0) * 1000
+                if mo is None:  # pool under pressure; stop here
+                    break
+                keys.append(key)
+                objs.append(mo)
+                nblocks += len(bids)
+                total_nbytes += chunk_nbytes
+                copy_calls += self._codec.copy_calls_for_block_ids(bids)
+                # D2H on this thread's dedicated copy stream (off the compute stream).
+                t0 = time.perf_counter()
+                self._codec.gpu_to_host(mo.tensor, bids, stream)
+                d2h_submit_ms += (time.perf_counter() - t0) * 1000
 
-        if keys:
-            stream.synchronize()  # stream-specific
-            self._sm.batched_put(keys, objs)
+            if keys:
+                t0 = time.perf_counter()
+                stream.synchronize()  # stream-specific
+                sync_ms += (time.perf_counter() - t0) * 1000
+                put_started = True
+                t0 = time.perf_counter()
+                self._sm.batched_put(keys, objs)
+                put_ms += (time.perf_counter() - t0) * 1000
+        except Exception:
+            if not put_started:
+                try:
+                    t0 = time.perf_counter()
+                    stream.synchronize()
+                    sync_ms += (time.perf_counter() - t0) * 1000
+                finally:
+                    for mo in objs:
+                        mo.ref_count_down()
+            raise
         with self._lock:
             self._done_save.add(req.req_id)
-        _kh = [getattr(k, "chunk_hash", None) for k in keys[:2]]
-        _contains = [bool(self._sm.contains(k)) for k in keys[:2]]
-        logger.info("[OFFLOAD-SAVE] rank=%s req=%s toks=%d chunks=%d stored=%d already=%d "
-                    "chunkhash2=%s contains=%s",
-                    self._rank, req.req_id, len(toks), len(chunks), len(keys),
-                    already, _kh, _contains)
+        if self._profile_enabled():
+            total_ms = (time.perf_counter() - t_total0) * 1000
+            logger.info(
+                "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d chunks=%d "
+                "stored=%d already=%d blocks=%d bytes=%.3fGiB copy_calls=%d "
+                "layout=%s process_ms=%.2f contains_ms=%.2f alloc_ms=%.2f "
+                "d2h_submit_ms=%.2f sync_ms=%.2f put_ms=%.2f total_ms=%.2f",
+                getattr(self, "_rank", "?"),
+                req.req_id,
+                len(toks),
+                len(chunks),
+                len(keys),
+                already,
+                nblocks,
+                total_nbytes / 1024**3,
+                copy_calls,
+                self._codec.layout,
+                process_ms,
+                contains_ms,
+                alloc_ms,
+                d2h_submit_ms,
+                sync_ms,
+                put_ms,
+                total_ms,
+            )
+        if logger.isEnabledFor(logging.DEBUG):
+            _kh = [getattr(k, "chunk_hash", None) for k in keys[:2]]
+            _contains = [bool(self._sm.contains(k)) for k in keys[:2]]
+            logger.debug("[OFFLOAD-SAVE] rank=%s req=%s toks=%d chunks=%d stored=%d already=%d "
+                         "chunkhash2=%s contains=%s",
+                         self._rank, req.req_id, len(toks), len(chunks), len(keys),
+                         already, _kh, _contains)
 
     # -- per-step (RPC thread, post-forward): poll completions ------------
-    def get_finished(self) -> tuple[set, set]:
-        # (finished_sending, finished_recving). Offload SAVES are fire-and-forget
-        # (they don't free blocks), so finished_sending is ALWAYS empty; only
-        # completed LOADS are reported, to wake parked seqs for suffix prefill.
+    def get_finished(self) -> KVConnectorOutput:
+        # Offload uses extended completion states:
+        # - finished_recving wakes successfully loaded requests.
+        # - failed_recving wakes them for recompute using already allocated blocks.
+        # - finished_saving releases blocks whose free was deferred during save.
         with self._lock:
             dl = set(self._done_load)
+            fl = set(self._failed_load)
+            ds = set(self._done_save)
             self._done_save.clear()
             self._done_load.clear()
-        return set(), dl
+            self._failed_load.clear()
+        return KVConnectorOutput(
+            finished_sending=set(),
+            finished_recving=dl,
+            failed_recving=fl,
+            finished_saving=ds,
+        )
 
     def get_finished_recv_blocks(self) -> list[int]:
         # Local CUDA copies are ordered by the copy stream + synchronize() before
@@ -329,6 +575,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # prefix is stored to LMCache once prefill computes it
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
+        self._save_inflight: set[str] = set()
         self._lookup_in_step: list[str] = []
 
         try:
@@ -353,27 +600,35 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         except Exception:
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
             return 0, False
-        _lh = None
-        try:
-            tdb = getattr(self._lookup_client, "token_database", None)
-            if tdb is not None:
-                _lh = [k for (_s, _e, k) in list(
-                    tdb.process_tokens(token_ids, make_key=False))[:3]]
-        except Exception as e:
-            _lh = f"err:{e}"
-        logger.info("[OFFLOAD-LOOKUP] seq=%s num_prompt=%d hbm_cached=%d hit=%s lookuphash3=%s",
-                    seq.id, num_prompt, int(seq.num_cached_tokens), hit, _lh)
+        if logger.isEnabledFor(logging.DEBUG):
+            _lh = None
+            try:
+                tdb = getattr(self._lookup_client, "token_database", None)
+                if tdb is not None:
+                    _lh = [k for (_s, _e, k) in list(
+                        tdb.process_tokens(token_ids, make_key=False))[:3]]
+            except Exception as e:
+                _lh = f"err:{e}"
+            logger.debug("[OFFLOAD-LOOKUP] seq=%s num_prompt=%d hbm_cached=%d hit=%s lookuphash3=%s",
+                         seq.id, num_prompt, int(seq.num_cached_tokens), hit, _lh)
         if not hit:
             return 0, False
-        self._lookup_in_step.append(str(seq.id))
-        need = int(hit) - int(seq.num_cached_tokens)
-        if int(hit) == num_prompt:  # full-prompt hit → recompute last token
-            need -= 1
+        sid = str(seq.id)
+        hit = int(hit)
+        if hit == num_prompt:  # full-prompt hit → recompute last token
+            hit -= 1
+        need = hit - int(seq.num_cached_tokens)
         if need <= 0:
+            if self._lookup_client is not None:
+                try:
+                    self._lookup_client.clear_lookup_status(sid)
+                except Exception:
+                    pass
             return 0, False
-        self._load_specs[str(seq.id)] = LoadSpec(
+        self._lookup_in_step.append(sid)
+        self._load_specs[sid] = LoadSpec(
             hbm_cached_tokens=int(seq.num_cached_tokens),
-            lmcache_cached_tokens=int(hit),
+            lmcache_cached_tokens=hit,
             can_load=False,
         )
         return need, True  # True => park in WAITING_FOR_REMOTE_KVS
@@ -381,8 +636,8 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def update_state_after_alloc(self, seq) -> None:
         sid = str(seq.id)
         ls = self._load_specs.get(sid)
-        logger.info("[OFFLOAD-ALLOC] seq=%s ls_found=%s num_cached_now=%s",
-                    seq.id, ls is not None, int(getattr(seq, "num_cached_tokens", -1)))
+        logger.debug("[OFFLOAD-ALLOC] seq=%s ls_found=%s num_cached_now=%s",
+                     seq.id, ls is not None, int(getattr(seq, "num_cached_tokens", -1)))
         if ls is not None:
             ls.can_load = True
             self._reqs_need_recv[sid] = seq
@@ -397,12 +652,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._lookup_in_step = []
 
         # Loads
-        logger.info("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))
+        logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))
         for sid, seq in self._reqs_need_recv.items():
             ls = self._load_specs.pop(sid, None)
             if ls is None or not ls.can_load:
-                logger.info("[OFFLOAD-LOAD-SKIP] seq=%s ls=%s can_load=%s",
-                            sid, ls is not None, getattr(ls, "can_load", None))
+                logger.debug("[OFFLOAD-LOAD-SKIP] seq=%s ls=%s can_load=%s",
+                             sid, ls is not None, getattr(ls, "can_load", None))
                 continue
             # ★ Use the REAL HBM-cached count as the load floor.
             # get_num_new_matched_tokens runs BEFORE the prefix-cache match in
@@ -442,8 +697,8 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             aligned = (int(seq.num_prompt_tokens) // chunk) * chunk
             if aligned <= saved:
                 continue
-            logger.info("[OFFLOAD-SAVE-EMIT] seq=%s num_prompt=%d aligned=%d saved=%d",
-                        seq.id, int(seq.num_prompt_tokens), aligned, saved)
+            logger.debug("[OFFLOAD-SAVE-EMIT] seq=%s num_prompt=%d aligned=%d saved=%d",
+                         seq.id, int(seq.num_prompt_tokens), aligned, saved)
             meta.add_request(LMCacheReqMeta(
                 req_id=seq.id,
                 token_ids=list(seq.token_ids[:aligned]),
@@ -451,8 +706,19 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                 save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             ))
             entry[1] = aligned
+            self._save_inflight.add(sid)
         self._reqs_need_recv.clear()
         return meta
+
+    def should_defer_free(self, seq) -> bool:
+        return str(seq.id) in self._save_inflight
+
+    def save_finished(self, req_id) -> None:
+        self._save_inflight.discard(str(req_id))
+
+    def load_failed(self, req_id) -> None:
+        self._load_specs.pop(str(req_id), None)
+        self._reqs_need_recv.pop(str(req_id), None)
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)

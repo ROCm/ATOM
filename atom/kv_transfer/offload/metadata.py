@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata, ReqId
 
 
 @dataclass
@@ -45,7 +45,7 @@ class SaveSpec:
 class LMCacheReqMeta:
     """Everything the worker needs to load/save one request's KV this step."""
 
-    req_id: str
+    req_id: ReqId
     # Token ids covering the prefix being moved (used to derive chunk-256 keys via
     # LMCache's ChunkedTokenDatabase). For load: prompt[:lmcache_cached_tokens];
     # for save: computed token ids.

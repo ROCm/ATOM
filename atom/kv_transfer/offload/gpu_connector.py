@@ -6,8 +6,13 @@ pinned host buffer (an LMCache ``MemoryObj``'s ``uint8`` tensor).
 
 Why a byte codec instead of an LMCache ``GPUConnectorInterface`` subclass:
 LMCache's ``engine.store/retrieve`` GPU path only emits token-major formats
-(``KV_2LTD`` etc.) via ``normalize_kv_and_discover_format``, which rejects
-AITER's swizzled K layout ``(nb, H, D//x, bs, x)`` and strided V ``(nb, H, D, bs)``.
+(``KV_2LTD`` etc.) via ``normalize_kv_and_discover_format``, which only accepts the
+clean NHD/HND family and rejects ATOM's **x-packed, head-major** K layout
+``(nb, H, D//x, bs, x)`` and strided V ``(nb, H, D, bs)`` (``x = 16 // elem``; verified
+``atom/model_ops/attentions/aiter_attention.py:488-502``). NB: this is a *persistent
+HBM storage layout*, NOT the transient LDS bank-conflict "swizzle"; we call it "swizzle"
+only as loose shorthand. It is also specific to this ATOM aiter path — stock vLLM's aiter
+FA backend (``rocm_aiter_fa``) uses the clean token-major ``(2,nb,bs,H,D)`` LMCache handles.
 We therefore bypass that path: we store **opaque per-block bytes** (byte-identical
 round-trip — the attention kernel reads back its own layout) and drive LMCache only
 as a storage tier (``StorageManager`` + ``ChunkedTokenDatabase``).
@@ -23,7 +28,13 @@ which is self-consistent for store and load (we never reinterpret it).
 
 from __future__ import annotations
 
+import logging
+import os
+import threading
+
 import torch
+
+logger = logging.getLogger("atom")
 
 
 class ATOMKVByteCodec:
@@ -61,6 +72,40 @@ class ATOMKVByteCodec:
             acc += nb
         self.bytes_per_block: int = acc
         self.num_blocks: int = int(self._segments[0].shape[0])
+        self.layout = os.environ.get("OFFLOAD_CODEC_LAYOUT", "block").lower()
+        if self.layout not in ("block", "segment", "segment_indexed"):
+            self.layout = "block"
+        self._tls = threading.local()
+        self._native_stitch = None
+        if (
+            self.layout == "segment_indexed"
+            and os.environ.get("OFFLOAD_NATIVE_STITCH", "0").lower()
+            not in ("0", "false", "no", "off")
+        ):
+            try:
+                from atom.kv_transfer.offload import native_stitch
+
+                native_stitch.load_extension()
+                self._native_stitch = native_stitch.stitch_chunk_buffers
+            except Exception:
+                logger.warning(
+                    "ATOMKVByteCodec: native stitch unavailable; using torch stitch",
+                    exc_info=True,
+                )
+
+    @property
+    def segments_per_block(self) -> int:
+        return len(self._segments)
+
+    def copy_calls_for_blocks(self, nblocks: int) -> int:
+        return int(nblocks) * len(self._segments)
+
+    def copy_calls_for_block_ids(self, block_ids: list[int]) -> int:
+        if self.layout == "block":
+            return self.copy_calls_for_blocks(len(block_ids))
+        if self.layout == "segment_indexed":
+            return len(self._segments) * 2
+        return len(self._segments) * len(list(self._contiguous_runs(block_ids)))
 
     # -- helpers ----------------------------------------------------------
     @staticmethod
@@ -73,6 +118,109 @@ class ATOMKVByteCodec:
             raise RuntimeError("ATOMKVByteCodec: block slice not contiguous")
         return blk.reshape(-1).view(torch.uint8)
 
+    @staticmethod
+    def _blocks_bytes_view(
+        seg: torch.Tensor,
+        block_id: int,
+        nblocks: int,
+    ) -> torch.Tensor:
+        """Flat ``uint8`` view of a contiguous block range (no copy)."""
+        blk = seg[block_id : block_id + nblocks]
+        if not blk.is_contiguous():
+            raise RuntimeError("ATOMKVByteCodec: block range not contiguous")
+        return blk.reshape(-1).view(torch.uint8)
+
+    @staticmethod
+    def _contiguous_runs(block_ids: list[int]):
+        """Yield ``(logical_start, physical_start, run_len)`` for increasing
+        physical block-id runs in logical order."""
+        if not block_ids:
+            return
+        logical_start = 0
+        physical_start = block_ids[0]
+        prev = block_ids[0]
+        run_len = 1
+        for logical_idx, bid in enumerate(block_ids[1:], start=1):
+            if bid == prev + 1:
+                prev = bid
+                run_len += 1
+                continue
+            yield logical_start, physical_start, run_len
+            logical_start = logical_idx
+            physical_start = bid
+            prev = bid
+            run_len = 1
+        yield logical_start, physical_start, run_len
+
+    def _segment_bases(self, nblocks: int) -> list[int]:
+        bases = []
+        acc = 0
+        for nb in self._seg_block_bytes:
+            bases.append(acc)
+            acc += nb * nblocks
+        return bases
+
+    def stitch_chunk_buffers(
+        self,
+        dst: torch.Tensor,
+        chunk_buffers: list[torch.Tensor],
+        chunk_block_counts: list[int],
+    ) -> None:
+        """CPU-side stitch from per-LMCache-chunk segment-major buffers into one
+        request-level segment-major buffer.
+
+        Each stored chunk is laid out as ``[seg0 chunk_blocks | seg1 ...]``. A
+        single request-level indexed H2D scatter expects
+        ``[seg0 all_blocks | seg1 all_blocks | ...]``.
+        """
+        if self._native_stitch is not None:
+            self._native_stitch(
+                dst,
+                chunk_buffers,
+                chunk_block_counts,
+                self._seg_block_bytes,
+            )
+            return
+        total_blocks = sum(chunk_block_counts)
+        dst_bases = self._segment_bases(total_blocks)
+        src_bases_by_chunk = [
+            self._segment_bases(nblocks) for nblocks in chunk_block_counts
+        ]
+        for seg_idx, (dst_base, nb) in enumerate(
+            zip(dst_bases, self._seg_block_bytes)
+        ):
+            parts = [
+                src[
+                    bases[seg_idx] : bases[seg_idx] + nblocks * nb
+                ]
+                for src, bases, nblocks in zip(
+                    chunk_buffers, src_bases_by_chunk, chunk_block_counts
+                )
+            ]
+            torch.cat(
+                parts,
+                out=dst[dst_base : dst_base + total_blocks * nb],
+            )
+
+    def _tmp_bytes(self, seg: torch.Tensor, nblocks: int) -> torch.Tensor:
+        elems = int(seg[0].numel()) * seg.element_size()
+        key = (str(seg.device), "uint8", elems, int(nblocks))
+        cache = getattr(self._tls, "tmp", None)
+        if cache is None:
+            cache = {}
+            self._tls.tmp = cache
+        tmp = cache.get(key)
+        if tmp is None:
+            tmp = torch.empty((nblocks, elems), dtype=torch.uint8, device=seg.device)
+            cache[key] = tmp
+        return tmp
+
+    @staticmethod
+    def _segment_bytes_matrix(seg: torch.Tensor) -> torch.Tensor:
+        if not seg.is_contiguous():
+            raise RuntimeError("ATOMKVByteCodec: segment tensor not contiguous")
+        return seg.reshape(seg.shape[0], -1).view(torch.uint8)
+
     # -- public API -------------------------------------------------------
     def gpu_to_host(
         self,
@@ -84,6 +232,36 @@ class ATOMKVByteCodec:
         pinned ``host_buf`` (uint8, length == len(block_ids) * bytes_per_block)."""
         ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
         with ctx:
+            if self.layout == "segment_indexed":
+                idx = torch.tensor(
+                    block_ids, dtype=torch.long, device=self._segments[0].device
+                )
+                bases = self._segment_bases(len(block_ids))
+                for seg, base, nb in zip(
+                    self._segments, bases, self._seg_block_bytes
+                ):
+                    mat = self._segment_bytes_matrix(seg)
+                    tmp = self._tmp_bytes(seg, len(block_ids))
+                    torch.index_select(mat, 0, idx, out=tmp)
+                    host_buf[base : base + len(block_ids) * nb].copy_(
+                        tmp.reshape(-1), non_blocking=True
+                    )
+                return
+
+            if self.layout == "segment":
+                bases = self._segment_bases(len(block_ids))
+                runs = list(self._contiguous_runs(block_ids))
+                for seg, base, nb in zip(
+                    self._segments, bases, self._seg_block_bytes
+                ):
+                    for logical_start, physical_start, run_len in runs:
+                        src = self._blocks_bytes_view(seg, physical_start, run_len)
+                        dst = base + logical_start * nb
+                        host_buf[dst : dst + run_len * nb].copy_(
+                            src, non_blocking=True
+                        )
+                return
+
             for i, bid in enumerate(block_ids):
                 base = i * self.bytes_per_block
                 for seg, off, nb in zip(
@@ -102,6 +280,38 @@ class ATOMKVByteCodec:
         cache at ``block_ids`` (in-place into the real KV tensors)."""
         ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
         with ctx:
+            if self.layout == "segment_indexed":
+                idx = torch.tensor(
+                    block_ids, dtype=torch.long, device=self._segments[0].device
+                )
+                bases = self._segment_bases(len(block_ids))
+                for seg, base, nb in zip(
+                    self._segments, bases, self._seg_block_bytes
+                ):
+                    mat = self._segment_bytes_matrix(seg)
+                    tmp = self._tmp_bytes(seg, len(block_ids))
+                    tmp.copy_(
+                        host_buf[base : base + len(block_ids) * nb].reshape_as(tmp),
+                        non_blocking=True,
+                    )
+                    mat.index_copy_(0, idx, tmp)
+                return
+
+            if self.layout == "segment":
+                bases = self._segment_bases(len(block_ids))
+                runs = list(self._contiguous_runs(block_ids))
+                for seg, base, nb in zip(
+                    self._segments, bases, self._seg_block_bytes
+                ):
+                    for logical_start, physical_start, run_len in runs:
+                        dst = self._blocks_bytes_view(seg, physical_start, run_len)
+                        src = base + logical_start * nb
+                        dst.copy_(
+                            host_buf[src : src + run_len * nb],
+                            non_blocking=True,
+                        )
+                return
+
             for i, bid in enumerate(block_ids):
                 base = i * self.bytes_per_block
                 for seg, off, nb in zip(

@@ -428,6 +428,7 @@ class Scheduler:
 
         # KV transfer bookkeeping
         self.finished_recving_kv_req_ids: list[int] = []
+        self.failed_recving_kv_req_ids: list[int] = []
         self.deferred_free_blocks: dict[int, Sequence] = {}
 
         # Scheduling delay for batching efficiency
@@ -707,14 +708,24 @@ class Scheduler:
             # KV Transfer: skip request if still waiting for remote KVs
             waiting_remote_to_waiting_ready = False
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                waiting_remote_to_waiting_ready = self._update_waiting_for_remote_kv(
-                    seq
-                )
-                if waiting_remote_to_waiting_ready:
+                if self._pop_req_id(self.failed_recving_kv_req_ids, seq.id):
+                    if self.kv_connector is not None and hasattr(
+                        self.kv_connector, "load_failed"
+                    ):
+                        self.kv_connector.load_failed(seq.id)
                     seq.status = SequenceStatus.WAITING
+                    seq.offload_loaded = False
+                    seq.offload_loaded_tokens = seq.num_cached_tokens
+                    seq.offload_load_failed = True
                 else:
-                    skipped_waiting_requests.append(seq)
-                    continue
+                    waiting_remote_to_waiting_ready = self._update_waiting_for_remote_kv(
+                        seq
+                    )
+                    if waiting_remote_to_waiting_ready:
+                        seq.status = SequenceStatus.WAITING
+                    else:
+                        skipped_waiting_requests.append(seq)
+                        continue
 
             # OFFLOAD fresh-wake: a seq whose CPU/NVMe prefix just finished
             # loading into its GPU blocks. Unlike P/D (which jumps straight to
@@ -741,9 +752,11 @@ class Scheduler:
 
             offload_resume = (
                 is_offload
-                and getattr(seq, "offload_loaded", False)
+                and (
+                    getattr(seq, "offload_loaded", False)
+                    or getattr(seq, "offload_load_failed", False)
+                )
                 and len(seq.block_table) > 0
-                and seq.num_cached_tokens > 0
             )
 
             need_to_remove_to_load_kv_async_queue = False
@@ -1243,7 +1256,16 @@ class Scheduler:
                 self._partial_prefill_count -= 1
             if self.kv_connector is not None:
                 if not self.kv_connector.is_producer:
-                    self.block_manager.deallocate(seq)
+                    if hasattr(self.kv_connector, "should_defer_free") and (
+                        self.kv_connector.should_defer_free(seq)
+                    ):
+                        logger.debug(
+                            "Deferring block free for seq %s until KV save completes.",
+                            seq.id,
+                        )
+                        self.deferred_free_blocks[seq.id] = seq
+                    else:
+                        self.block_manager.deallocate(seq)
                 else:
                     logger.debug(
                         "Deferring block free for seq %s until KV send completes.",
@@ -1263,6 +1285,22 @@ class Scheduler:
         """
         return getattr(self.kv_connector, "is_offload", False)
 
+    @staticmethod
+    def _pop_req_id(req_ids: list, seq_id) -> bool:
+        candidates = (seq_id, str(seq_id))
+        for candidate in candidates:
+            if candidate in req_ids:
+                req_ids.remove(candidate)
+                return True
+        try:
+            int_id = int(seq_id)
+        except (TypeError, ValueError):
+            return False
+        if int_id in req_ids:
+            req_ids.remove(int_id)
+            return True
+        return False
+
     def _update_waiting_for_remote_kv(self, seq: Sequence) -> bool:
         """Check whether a remote KV transfer for *seq* has completed.
 
@@ -1271,10 +1309,9 @@ class Scheduler:
         scheduling step.  When ready, the sequence transitions back
         from ``WAITING_FOR_REMOTE_KVS`` to ``WAITING``.
         """
-        if seq.id not in self.finished_recving_kv_req_ids:
+        if not self._pop_req_id(self.finished_recving_kv_req_ids, seq.id):
             return False
 
-        self.finished_recving_kv_req_ids.remove(seq.id)
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
         return True
 
@@ -1288,6 +1325,15 @@ class Scheduler:
         if kv_connector_output is None:
             return
 
+        def _pop_deferred(req_id):
+            seq = self.deferred_free_blocks.pop(req_id, None)
+            if seq is not None:
+                return seq
+            try:
+                return self.deferred_free_blocks.pop(int(req_id), None)
+            except (TypeError, ValueError):
+                return None
+
         for req_id in kv_connector_output.finished_recving or ():
             assert (
                 not self.kv_connector.is_producer
@@ -1295,15 +1341,36 @@ class Scheduler:
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
+        for req_id in kv_connector_output.failed_recving or ():
+            assert (
+                not self.kv_connector.is_producer
+            ), "Only consumer should update failed KV recv status"
+            logger.warning("KV receive failed for request %s; falling back to prefill.", req_id)
+            self.failed_recving_kv_req_ids.append(req_id)
+
         for req_id in kv_connector_output.finished_sending or ():
             assert (
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert (
-                req_id in self.deferred_free_blocks
-            ), f"req_id={req_id} not found in deferred_free_blocks"
-            self.block_manager.deallocate(self.deferred_free_blocks.pop(req_id))
+            seq = _pop_deferred(req_id)
+            assert seq is not None, f"req_id={req_id} not found in deferred_free_blocks"
+            self.block_manager.deallocate(seq)
+
+        for req_id in kv_connector_output.finished_saving or ():
+            if hasattr(self.kv_connector, "save_finished"):
+                self.kv_connector.save_finished(req_id)
+            seq = self.deferred_free_blocks.get(req_id)
+            if seq is None:
+                try:
+                    seq = self.deferred_free_blocks.get(int(req_id))
+                except (TypeError, ValueError):
+                    seq = None
+            if seq is not None and not (
+                hasattr(self.kv_connector, "should_defer_free")
+                and self.kv_connector.should_defer_free(seq)
+            ):
+                self.block_manager.deallocate(_pop_deferred(req_id))
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

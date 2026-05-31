@@ -2044,8 +2044,13 @@ class ModelRunner:
         """Collect finished send/recv status from the KV connector."""
         connector = get_kvconnector()
         if connector is None:
-            return KVConnectorOutput(finished_sending=[], finished_recving=[])
-        done_sending, done_recving = connector.get_finished()
+            return KVConnectorOutput()
+
+        finished = connector.get_finished()
+        if isinstance(finished, KVConnectorOutput):
+            return finished
+
+        done_sending, done_recving = finished
 
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
