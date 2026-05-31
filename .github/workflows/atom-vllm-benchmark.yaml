@@ -1181,11 +1181,11 @@ jobs:
             echo "No eligible benchmark cases remain after model-specific parameter filtering."
           else
             echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
-            python3 - <<'PY'
+            BENCHMARK_MATRIX="${BENCHMARK_MATRIX}" python3 - <<'PY'
           import json
+          import os
 
-          with open("benchmark_matrix.json", encoding="utf-8") as f:
-              payload = json.load(f)
+          payload = json.loads(os.environ["BENCHMARK_MATRIX"])
           print(f"Benchmark matrix cells: {len(payload.get('include', []))}")
           PY
           fi
