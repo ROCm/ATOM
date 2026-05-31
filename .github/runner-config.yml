@@ -21,3 +21,20 @@ runners:
   linux-atom-mi355-8:
     gpu_arch: MI355
     gpu_count: 8
+
+  # AITER devops MI350X runner pool (used by the vLLM Kimi-K2.5 CI job)
+  linux-aiter-do-mi350x-1:
+    gpu_arch: MI350X
+    gpu_count: 1
+
+  linux-aiter-do-mi350x-2:
+    gpu_arch: MI350X
+    gpu_count: 2
+
+  linux-aiter-do-mi350x-4:
+    gpu_arch: MI350X
+    gpu_count: 4
+
+  linux-aiter-do-mi350x-8:
+    gpu_arch: MI350X
+    gpu_count: 8

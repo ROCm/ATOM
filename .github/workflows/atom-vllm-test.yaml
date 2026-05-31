@@ -224,6 +224,18 @@ jobs:
             env_vars: ""
             accuracy_test_threshold: 0.90
             runner: linux-atom-mi35x-4
+          # Verified on MI355X 2026-05-30: vllm serve TP8 (atom-dev:vllm-latest,
+          # aiter ef114b0d4) -> gsm8k flexible-extract 0.9409, matching the
+          # amd/Kimi-K2.5-MXFP4 reference baseline. Default OOT serve args
+          # (async-scheduling, fastsafetensors, FULL_AND_PIECEWISE cudagraph,
+          # kv-cache fp8, no prefix caching) match the verified config.
+          - display_name: "Kimi-K2.5-MXFP4 TP8"
+            model_name: "Kimi-K2.5-MXFP4"
+            model_path: "amd/Kimi-K2.5-MXFP4"
+            extra_args: "--tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384"
+            env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+            accuracy_test_threshold: 0.92
+            runner: linux-aiter-do-mi350x-8
           - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
             model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
