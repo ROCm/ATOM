@@ -1,0 +1,916 @@
+name: ATOM Mesh Benchmark
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+on:
+  schedule:
+    # Nightly at 01:00 Beijing time (17:00 UTC)
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+    inputs:
+      deepseek-r1-0528:
+        description: "Benchmark DeepSeek-R1-0528 (+ MTP3)"
+        type: boolean
+        default: true
+      deepseek-v4-pro:
+        description: "Benchmark DeepSeek-V4-Pro"
+        type: boolean
+        default: true
+      glm-5-fp8:
+        description: "Benchmark GLM-5-FP8"
+        type: boolean
+        default: true
+      glm-5.1-fp4:
+        description: "Benchmark GLM-5.1-MXFP4"
+        type: boolean
+        default: true
+      deepseek-r1-0528-mxfp4:
+        description: "Benchmark DeepSeek-R1-0528 MXFP4 (+ MXFP4-MTP3)"
+        type: boolean
+        default: true
+      gpt-oss-120b:
+        description: "Benchmark gpt-oss-120b"
+        type: boolean
+        default: true
+      kimi-k25-mxfp4:
+        description: "Benchmark Kimi-K2.5-MXFP4"
+        type: boolean
+        default: true
+      MiniMax-M2.7:
+        description: "Benchmark MiniMax-M2.7 (+ MXFP4)"
+        type: boolean
+        default: true
+      qwen35-397b-fp8:
+        description: "Benchmark Qwen3.5-397B-A17B-FP8"
+        type: boolean
+        default: true
+      qwen35-397b-mxfp4:
+        description: "Benchmark Qwen3.5-397B-A17B-MXFP4"
+        type: boolean
+        default: true
+      llama-3-3-70b-instruct-mxfp4:
+        description: "Benchmark Llama-3.3-70B-Instruct-MXFP4"
+        type: boolean
+        default: true
+      extra_args:
+        description: "Extra arguments to pass to the ATOM server"
+        type: string
+      image:
+        description: "Image to use for the benchmark"
+        type: string
+        default: "rocm/atom-dev:latest"
+      runner:
+        description: "Optional runner label override for manual runs; leave empty to use model defaults"
+        type: string
+        default: ""
+      enable_profiler:
+        description: "Enable torch profiler to collect trace for performance debugging"
+        type: boolean
+        default: false
+      enable_rtl:
+        description: "Enable RTL (rocm-trace-lite) GPU kernel tracing for prefill/decode analysis"
+        type: boolean
+        default: false
+      param_lists:
+        description: |
+          "Benchmark parameter lists. 
+          Input as a single or multiple sets (comma-separated, semicolon between sets), 
+          format: input_length,output_length,concurrency,random_range_ratio.
+          Example (single set): 1024,1024,128,0.8
+          Example (multiple sets): 1024,1024,128,0.8;2048,1024,256,0.7"
+        type: string
+        default: "1024,1024,128,0.8"
+      atom_commit:
+        description: "ATOM commit SHA to checkout; leave empty to use the workflow ref"
+        type: string
+        default: ""
+
+jobs:
+  parse-param-lists:
+    name: Parse parameter lists
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+
+      - name: Parse parameter lists
+        id: parse-param-lists
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "Using nightly param lists from .github/benchmark/nightly_params.json"
+            # Expand grouped format (isl/osl + concurrency array) into flat matrix
+            MATRIX_JSON=$(jq -c '[.[] | . as $group | .concurrency[] | {input_length: $group.isl, output_length: $group.osl, concurrency: ., random_range_ratio: $group.random_range_ratio}]' .github/benchmark/nightly_params.json)
+          else
+            PARAM_LISTS="${{ inputs.param_lists || '1024,1024,128,0.8' }}"
+            echo "Using param_lists: ${PARAM_LISTS}"
+            IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
+            MATRIX_JSON="["
+            SEP=""
+            for SET in "${SETS[@]}"; do
+              IFS=',' read -ra PARAMS <<< "$SET"
+              MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${PARAMS[0]},\"output_length\":${PARAMS[1]},\"concurrency\":${PARAMS[2]},\"random_range_ratio\":${PARAMS[3]}}"
+              SEP=","
+            done
+            MATRIX_JSON="${MATRIX_JSON}]"
+          fi
+          echo "Matrix JSON: ${MATRIX_JSON}"
+          echo "matrix_json=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+
+  load-models:
+    name: Load model configs
+    runs-on: ubuntu-latest
+    outputs:
+      models_json: ${{ steps.load.outputs.models_json }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+      - id: load
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUTS_JSON: ${{ toJson(inputs) }}
+        run: |
+          python3 << 'PY'
+          import json, os
+          event = os.environ["EVENT_NAME"]
+          inputs = json.loads(os.environ.get("INPUTS_JSON", "{}"))
+          models = json.load(open(".github/benchmark/models.json", encoding="utf-8"))
+          if event == "schedule":
+              filtered = models
+          else:
+              filtered = [m for m in models if inputs.get(m["prefix"], True)]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"models_json={json.dumps(filtered)}\n")
+          print(f"Event={event}: {len(filtered)}/{len(models)} models enabled")
+          PY
+
+  benchmark:
+    name: ${{ matrix.model.display }} (isl=${{ matrix.config.input_length }} osl=${{ matrix.config.output_length }} c=${{ matrix.config.concurrency }})
+    needs: [parse-param-lists, load-models]
+    if: >-
+      !cancelled()
+      && needs.parse-param-lists.result == 'success'
+      && needs.load-models.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJson(needs.load-models.outputs.models_json) }}
+        config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
+        exclude:
+          # Skip low-concurrency MTP runs to limit CI time
+          - model: { suffix: "-mtp3" }
+            config: { concurrency: 1 }
+          - model: { suffix: "-mtp3" }
+            config: { concurrency: 2 }
+
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}
+
+    env:
+      MODEL_PATH: ${{ matrix.model.path }}
+      ARGS: ${{ matrix.model.args }}
+      ISL: ${{ matrix.config.input_length }}
+      OSL: ${{ matrix.config.output_length }}
+      CONC: ${{ matrix.config.concurrency }}
+      RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
+      RESULT_FILENAME: ${{ matrix.model.prefix }}${{ matrix.model.suffix }}-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}-${{ matrix.config.random_range_ratio }}
+      USE_ATOMESH_ENTRYPOINTS: 1
+      ATOM_SERVER_PORT: 8000
+
+    steps:
+      - name: Kill all Docker containers
+        run: |
+          echo "=== Cleaning up containers on $(hostname) ==="
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
+
+      - name: Show ROCm status (host)
+        run: docker ps -a && rocm-smi --showmemuse 2>/dev/null || true
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+
+      - name: Start CI container
+        run: |
+          docker ps -aq -f name=atom-mesh-benchmark | xargs -r docker stop | xargs -r docker rm
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          MODEL_MOUNT=""
+          [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
+
+          # Write env_vars via env block (avoids expression injection — newlines
+          # in `matrix.model.env_vars` would otherwise break the host bash).
+          # Empty file when MODEL_ENV_VARS unset is fine — docker --env-file
+          # accepts it.
+          printenv MODEL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_benchmark_env.txt || true
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
+            -w /workspace --ipc=host --group-add video \
+            --shm-size=16G --privileged --cap-add=SYS_PTRACE \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
+            -e ATOM_DISABLE_MMAP=true \
+            -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} \
+            -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
+            -e USE_ATOMESH_ENTRYPOINTS="${USE_ATOMESH_ENTRYPOINTS}" \
+            -e ATOM_SERVER_PORT="${ATOM_SERVER_PORT}" \
+            -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+            -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
+            --env-file /tmp/atom_benchmark_env.txt \
+            --name atom-mesh-benchmark \
+            ${{ inputs.image || 'rocm/atom-dev:latest' }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          MODEL_ENV_VARS: ${{ matrix.model.env_vars }}
+
+      - name: Collect GPU info (inside container)
+        id: gpu-info
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          RUNNER_HINT="${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}"
+          bash .github/scripts/collect_gpu_info.sh atom-mesh-benchmark docker "$RUNNER_HINT"
+          # Resolve latest → nightly_YYYYMMDDHHMMSS for dashboard display
+          DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}"
+          if [ "$DOCKER_IMAGE" = "rocm/atom-dev:latest" ]; then
+            RESOLVED_IMAGE=""
+            if RESOLUTION_JSON="$(python3 .github/scripts/resolve_atom_image.py --repository rocm/atom-dev --reference-tag latest --image-family native 2>/dev/null)"; then
+              RESOLVED_IMAGE="$(echo "$RESOLUTION_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("resolved_image",""))')" || true
+            fi
+            DOCKER_IMAGE="${RESOLVED_IMAGE:-$DOCKER_IMAGE}"
+          fi
+          echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
+          echo "Docker: ${DOCKER_IMAGE}"
+
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-mesh-benchmark bash -lc \
+              "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}" || exit 1
+          fi
+
+      - name: Run benchmark
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
+          else model_path="${{ env.MODEL_PATH }}"; fi
+
+          docker exec atom-mesh-benchmark bash -lc "set -euo pipefail
+            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+              ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
+              .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
+            echo '========== Running benchmark =========='
+            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+              RESULT_FILENAME=${{ env.RESULT_FILENAME }} \
+              SERVER_ARGS='${{ env.ARGS }}' \
+              BENCH_EXTRA_ARGS='${{ matrix.model.bench_args }}' \
+              .github/scripts/atom_test.sh benchmark $model_path
+          "
+
+      - name: Dump server log
+        if: always()
+        run: |
+          docker exec atom-mesh-benchmark cat /tmp/atom_server.log 2>/dev/null || true
+
+      - name: Dump client log
+        if: always()
+        run: |
+          docker exec atom-mesh-benchmark cat /tmp/atom_client.log 2>/dev/null || true
+
+      - name: Inject GPU metadata into benchmark result
+        run: |
+          docker exec \
+            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            -e DOCKER_IMAGE="${{ steps.gpu-info.outputs.docker_image }}" \
+            -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
+            -e DISPLAY_NAME="${{ matrix.model.display }}" \
+            atom-mesh-benchmark python3 -c "
+          import json, os
+          p = os.environ['RESULT_PATH']
+          if not os.path.exists(p):
+              print(f'{p} not found, skipping GPU metadata injection')
+          else:
+              with open(p) as f:
+                  d = json.load(f)
+              d['gpu_name'] = os.environ.get('GPU_NAME', '')
+              d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
+              d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
+              d['docker_image'] = os.environ.get('DOCKER_IMAGE', '')
+              display_name = os.environ.get('DISPLAY_NAME', '')
+              if display_name:
+                  d['benchmark_model_name'] = display_name
+              with open(p, 'w') as f:
+                  json.dump(d, f, indent=2)
+          "
+
+      - name: Copy profiler traces
+        if: inputs.enable_profiler
+        run: docker cp atom-mesh-benchmark:/app/trace ./profiler-traces 2>/dev/null || true
+
+      - name: Upload profiler traces
+        if: inputs.enable_profiler
+        uses: actions/upload-artifact@v7
+        with:
+          name: profiler-traces-${{ env.RESULT_FILENAME }}
+          path: profiler-traces/
+
+      - name: Stop server and collect RTL traces
+        if: inputs.enable_rtl
+        run: |
+          docker exec atom-mesh-benchmark bash -lc \
+            "ENABLE_RTL_PROFILER=1 .github/scripts/atom_test.sh stop" || true
+          docker cp atom-mesh-benchmark:/app/rtl_traces ./rtl-traces 2>/dev/null || true
+
+      - name: Upload RTL traces
+        if: inputs.enable_rtl
+        uses: actions/upload-artifact@v7
+        with:
+          name: rtl-traces-${{ env.RESULT_FILENAME }}
+          path: rtl-traces/
+
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-${{ env.RESULT_FILENAME }}
+          path: ${{ env.RESULT_FILENAME }}.json
+
+      - name: Clean Up
+        if: always()
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
+            ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker stop atom-mesh-benchmark || true
+          docker rm atom-mesh-benchmark || true
+
+  summarize-benchmark-result:
+    if: always()
+    name: Summarize benchmark result
+    needs: [benchmark]
+    runs-on: ubuntu-latest
+    outputs:
+      has_regression: ${{ steps.check-regression.outputs.has_regression }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: 'benchmark-*'
+          merge-multiple: true
+          path: .
+
+      - name: Download baseline from previous nightly run
+        id: baseline
+        run: |
+          # Use the most recent completed nightly run (regardless of success/failure)
+          # because even failed runs have valid per-model benchmark artifacts.
+          # Only requiring --status=success misses baselines when any single job fails.
+          PREV_RUN_ID=$(gh run list \
+            --workflow="ATOM Mesh Benchmark" \
+            --branch=main \
+            --event=schedule \
+            --limit=5 \
+            --json databaseId,status \
+            --jq '[.[] | select(.status == "completed")][0].databaseId // empty')
+
+          if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "${{ github.run_id }}" ]; then
+            echo "Downloading baseline from run #$PREV_RUN_ID"
+            mkdir -p /tmp/baseline
+            # Only download benchmark result artifacts (prefix: benchmark-),
+            # not profiler/regression traces which can be multi-GB.
+            gh run download "$PREV_RUN_ID" --dir /tmp/baseline --pattern 'benchmark-*' || echo "::warning::Failed to download baseline artifacts"
+            BASELINE_COUNT=$(find /tmp/baseline -name '*.json' | wc -l)
+            echo "Downloaded $BASELINE_COUNT baseline files"
+            echo "baseline_dir=/tmp/baseline" >> $GITHUB_OUTPUT
+          else
+            echo "No previous completed nightly run found"
+            echo "baseline_dir=" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: List all benchmark results
+        run: |
+          echo "=== Current results ==="
+          ls -la *.json 2>/dev/null || echo "No JSON files in current dir"
+          if [ -d "/tmp/baseline" ]; then
+            echo "=== Baseline results ==="
+            find /tmp/baseline -name '*.json' | head -20
+          fi
+
+      - name: Summarize benchmark result
+        id: check-regression
+        run: |
+          BASELINE_ARG=""
+          if [ -n "${{ steps.baseline.outputs.baseline_dir }}" ]; then
+            BASELINE_ARG="--baseline-dir ${{ steps.baseline.outputs.baseline_dir }}"
+          fi
+          .github/scripts/summarize.py . $BASELINE_ARG \
+            --output-json regression_report.json \
+            >> $GITHUB_STEP_SUMMARY || true
+
+          # Check if regression was detected (exit code 2)
+          if [ -f regression_report.json ]; then
+            REG_COUNT=$(python3 -c "import json; print(json.load(open('regression_report.json'))['regression_count'])")
+            if [ "$REG_COUNT" -gt 0 ]; then
+              echo "has_regression=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_regression=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "has_regression=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload regression report
+        if: steps.check-regression.outputs.has_regression == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-report
+          path: regression_report.json
+
+      - name: Transform results for benchmark dashboard
+        run: |
+          python3 .github/scripts/plugin_benchmark_to_dashboard.py \
+            . \
+            --output benchmark-action-input.json \
+            --default-backend ATOM-Mesh \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Store benchmark result to dashboard
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: customBiggerIsBetter
+          output-file-path: benchmark-action-input.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmark-dashboard
+          auto-push: false
+          alert-threshold: "80%"
+          comment-on-alert: true
+          fail-on-alert: false
+          max-items-in-chart: 90
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy custom dashboard to gh-pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          CURRENT_SHA=$(git rev-parse HEAD)
+          # Generate prefix→display name mapping from models.json
+          python3 -c "
+          import json
+          models = json.loads(open('.github/benchmark/models.json').read())
+          mapping = {}
+          for m in models:
+              display = m.get('display','')
+              path = m.get('path','')
+              suffix = m.get('suffix','')
+              if not display or not path: continue
+              hf_name = path.split('/')[-1].lower()
+              # HF path-derived key (old data used model_id last segment + optional suffix)
+              hf_key = hf_name + suffix.lower() if suffix else hf_name
+              mapping[hf_key] = display
+          with open('/tmp/dashboard_models_map.js','w') as f:
+              f.write('window.MODELS_DISPLAY_MAP = ' + json.dumps(mapping) + ';')
+          "
+          # Save dashboard assets before switching branches
+          cp .github/dashboard/index.html /tmp/dashboard_index.html
+          cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
+          cp docs/assets/atom_logo_mini.png /tmp/dashboard_logo_mini.png
+          git fetch origin gh-pages
+          git checkout gh-pages
+          # Replace auto-generated index.html with custom dashboard + logo
+          cp /tmp/dashboard_index.html benchmark-dashboard/index.html
+          cp /tmp/dashboard_models_map.js benchmark-dashboard/models_map.js
+          cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
+          cp /tmp/dashboard_logo_mini.png benchmark-dashboard/atom_logo_mini.png
+          git add benchmark-dashboard/
+          git diff --cached --quiet || git commit -m "Update benchmark data and dashboard"
+          git push origin gh-pages
+          git checkout "$CURRENT_SHA"
+
+  # ---------- Generate regression matrix (lightweight, ubuntu) ----------
+  generate-regression-matrix:
+    if: always() && needs.summarize-benchmark-result.outputs.has_regression == 'true'
+    name: Generate regression rerun matrix
+    needs: [summarize-benchmark-result]
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.gen.outputs.matrix_json }}
+      has_matrix: ${{ steps.gen.outputs.has_matrix }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: regression-report
+
+      - name: Generate matrix from regression report
+        id: gen
+        run: |
+          python3 .github/scripts/regression_rerun.py \
+            regression_report.json \
+            .github/benchmark/models.json \
+            --output-matrix /tmp/matrix.json
+
+          if [ -s /tmp/matrix.json ] && [ "$(cat /tmp/matrix.json)" != "[]" ]; then
+            echo "matrix_json=$(cat /tmp/matrix.json)" >> $GITHUB_OUTPUT
+            echo "has_matrix=true" >> $GITHUB_OUTPUT
+            echo "=== Matrix cells ==="
+            python3 -c "
+          import json
+          cells = json.load(open('/tmp/matrix.json'))
+          for c in cells:
+              configs = json.loads(c['configs'])
+              print(f\"  {c['prefix']}: {len(configs)} config(s) on {c['runner']}\")
+          "
+          else
+            echo "matrix_json=[]" >> $GITHUB_OUTPUT
+            echo "has_matrix=false" >> $GITHUB_OUTPUT
+            echo "No regression configs generated"
+          fi
+
+  # ---------- Regression re-run (GPU, matrix by model) ----------
+  regression-rerun:
+    if: >-
+      !cancelled()
+      && needs.generate-regression-matrix.outputs.has_matrix == 'true'
+    name: Rerun ${{ matrix.cell.prefix }}
+    needs: [generate-regression-matrix]
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJson(needs.generate-regression-matrix.outputs.matrix_json) }}
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.cell.runner }}
+    timeout-minutes: 60
+    env:
+      USE_ATOMESH_ENTRYPOINTS: 1
+      ATOM_SERVER_PORT: 8000
+    steps:
+      - name: Kill all Docker containers
+        run: |
+          echo "=== Cleaning up containers on $(hostname) ==="
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "find /workspace -mindepth 1 -delete" || true
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+
+      - name: Docker Login
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+      - name: Start CI container
+        run: |
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          MODEL_MOUNT=""
+          [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
+
+          # Write env_vars via env block (avoids expression injection — newlines
+          # in `matrix.cell.env_vars` would otherwise break the host bash).
+          printenv CELL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_regression_env.txt || true
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
+            -w /workspace --ipc=host --group-add video \
+            --shm-size=16G --privileged --cap-add=SYS_PTRACE \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
+            -e ATOM_DISABLE_MMAP=true \
+            -e USE_ATOMESH_ENTRYPOINTS="${USE_ATOMESH_ENTRYPOINTS}" \
+            -e ATOM_SERVER_PORT="${ATOM_SERVER_PORT}" \
+            --env-file /tmp/atom_regression_env.txt \
+            --name atom-mesh-regression \
+            ${{ inputs.image || 'rocm/atom-dev:latest' }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          CELL_ENV_VARS: ${{ matrix.cell.env_vars }}
+
+      - name: Download model
+        run: |
+          if [ -d "/models" ]; then
+            echo "=== Downloading ${{ matrix.cell.model_path }} ==="
+            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-mesh-regression bash -lc \
+              "hf download ${{ matrix.cell.model_path }} --local-dir /models/${{ matrix.cell.model_path }}" \
+              || echo "::warning::Failed to download ${{ matrix.cell.model_path }}, will use HF online"
+          fi
+
+      - name: Launch server
+        run: |
+          if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
+          else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
+
+          # cell.env_vars are already injected into the container env via
+          # --env-file in "Start CI container" — `docker exec` inherits them,
+          # so no need to re-prefix them on the command line (the previous
+          # inline form silently dropped the first var when env_vars contained
+          # a literal newline).
+          docker exec atom-mesh-regression bash -lc "set -euo pipefail
+            ENABLE_TORCH_PROFILER=1 \
+            .github/scripts/atom_test.sh launch $MODEL_DIR ${{ matrix.cell.server_args }}"
+
+      - name: Run regression configs with profiler
+        run: |
+          set -uo pipefail  # no -e: allow per-config failure without aborting loop
+
+          if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
+          else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
+
+          FAIL_COUNT=0
+          TOTAL_COUNT=0
+
+          # Parse configs JSON into pipe-delimited lines for shell loop
+          echo '${{ matrix.cell.configs }}' | python3 -c "
+          import json, sys
+          for c in json.load(sys.stdin):
+              print('{isl}|{osl}|{conc}|{bench_args}|{prefix}'.format(**c))
+          " > /tmp/regression_configs.txt
+
+          while IFS='|' read -r ISL OSL CONC BENCH_ARGS PREFIX; do
+            TOTAL_COUNT=$((TOTAL_COUNT + 1))
+            TRACE_SUBDIR="${PREFIX}-${ISL}-${OSL}-${CONC}"
+
+            docker exec atom-mesh-regression bash -lc "mkdir -p /app/trace/$TRACE_SUBDIR"
+
+            # Record profiler stop count before benchmark (to detect new completions)
+            STOP_COUNT_BEFORE=$(docker exec atom-mesh-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null) || STOP_COUNT_BEFORE=0
+
+            echo "=== Profiling: $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC ==="
+            if ! docker exec atom-mesh-regression bash -lc "
+              ${{ matrix.cell.env_vars }} \
+              ENABLE_TORCH_PROFILER=1 \
+              ISL=$ISL OSL=$OSL CONC=$CONC \
+              RANDOM_RANGE_RATIO=0.8 \
+              NUM_PROMPTS_OVERRIDE=$((CONC*2)) \
+              RESULT_FILENAME=regression-${PREFIX}-${ISL}-${OSL}-${CONC} \
+              BENCH_EXTRA_ARGS='$BENCH_ARGS' \
+              SERVER_ARGS='${{ matrix.cell.server_args }}' \
+              .github/scripts/atom_test.sh benchmark $MODEL_DIR"; then
+              echo "::warning::Benchmark failed for $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              continue
+            fi
+
+            # Wait for engine core to finish exporting profiler trace (blocks inference)
+            # See .claude/plan/profiler-async-refactor.md for long-term fix
+            for i in $(seq 1 300); do
+              STOP_COUNT=$(docker exec atom-mesh-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null) || STOP_COUNT=0
+              [ "$STOP_COUNT" -gt "$STOP_COUNT_BEFORE" ] && echo "Profiler trace export done after ${i}s" && break
+              [ "$i" -eq 1 ] && echo "Waiting for profiler trace export..."
+              [ "$i" -eq 300 ] && echo "WARNING: Profiler did not finish after 300s, proceeding anyway"
+              sleep 1
+            done
+
+            # Move trace files into per-config subdir
+            docker exec atom-mesh-regression bash -lc "
+              for d in /app/trace/rank_*; do
+                [ -d \"\$d\" ] && mv \"\$d\" /app/trace/$TRACE_SUBDIR/ 2>/dev/null || true
+              done"
+          done < /tmp/regression_configs.txt
+
+          echo "=== Regression re-run complete: $((TOTAL_COUNT - FAIL_COUNT))/$TOTAL_COUNT succeeded ==="
+          if [ "$FAIL_COUNT" -gt 0 ]; then
+            echo "::warning::$FAIL_COUNT/$TOTAL_COUNT configs failed"
+          fi
+
+      - name: Stop server
+        if: always()
+        run: |
+          docker exec atom-mesh-regression bash -lc \
+            "TORCH_PROFILER_DIR=/app/trace .github/scripts/atom_test.sh stop" || true
+
+      - name: Copy profiler traces from container
+        id: copy-traces
+        if: always()
+        run: |
+          docker cp atom-mesh-regression:/app/trace ./regression-traces 2>/dev/null || echo "No traces found"
+          TRACE_COUNT=$(find ./regression-traces -type f \( -name "*.json.gz" -o -name "*.pt.trace.*" \) 2>/dev/null | wc -l | tr -d ' ')
+          echo "trace_count=$TRACE_COUNT" >> $GITHUB_OUTPUT
+          if [ "$TRACE_COUNT" -gt 0 ]; then
+            echo "Found $TRACE_COUNT trace files"
+            ls -lhR ./regression-traces/
+          else
+            echo "::warning::No trace files found in container — profiler may not have produced output"
+          fi
+
+      - name: Upload regression traces
+        if: always() && fromJSON(steps.copy-traces.outputs.trace_count) > 0
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-traces-${{ github.run_id }}-${{ matrix.cell.prefix }}
+          path: regression-traces/
+
+      - name: Upload regression results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-results-${{ github.run_id }}-${{ matrix.cell.prefix }}
+          path: regression-*.json
+          if-no-files-found: ignore
+
+      - name: Clean Up
+        if: always()
+        run: |
+          docker stop atom-mesh-regression || true
+          docker rm atom-mesh-regression || true
+
+  # ---------- Collect regression traces from all matrix cells ----------
+  collect-regression-traces:
+    if: always() && needs.regression-rerun.result != 'skipped'
+    name: Collect regression traces
+    needs: [regression-rerun]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all regression trace artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: regression-traces-${{ github.run_id }}-*
+          merge-multiple: true
+          path: regression-traces/
+        continue-on-error: true
+
+      - name: Upload combined regression traces
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-traces-${{ github.run_id }}
+          path: regression-traces/
+          if-no-files-found: ignore
+
+  # ---------- Profiler analysis (lightweight, runs on regression OR manual profiler) ----------
+  profiler-analysis:
+    if: >-
+      always()
+      && (needs.collect-regression-traces.result != 'cancelled'
+          && needs.collect-regression-traces.result != 'skipped'
+          || inputs.enable_profiler == true)
+    name: Profiler trace analysis
+    needs: [benchmark, summarize-benchmark-result, generate-regression-matrix, regression-rerun, collect-regression-traces]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+
+      - name: Download regression traces
+        if: needs.collect-regression-traces.result == 'success'
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: regression-traces-${{ github.run_id }}
+          path: profiler-traces/
+
+      - name: Download benchmark profiler traces
+        if: needs.collect-regression-traces.result != 'success'
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: profiler-traces-*
+          merge-multiple: true
+          path: profiler-traces/
+
+      - name: Analyze traces
+        run: |
+          mkdir -p profiler-analysis
+          pip install -q openpyxl 2>/dev/null || true
+
+          # Find all config subdirectories containing rank_* dirs
+          # Structure: profiler-traces/<config-name>/rank_0/*.gz
+          CONFIG_DIRS=$(find profiler-traces -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
+          if [ -z "$CONFIG_DIRS" ]; then
+            echo "No config directories found in profiler-traces/"
+            ls -lhR profiler-traces/ 2>/dev/null || true
+            exit 0
+          fi
+
+          for config_dir in $CONFIG_DIRS; do
+            config=$(basename "$config_dir")
+            echo ""
+            echo "========== Config: $config =========="
+            mkdir -p "profiler-analysis/$config"
+
+            # Analyze rank_0 trace (representative for kernel breakdown + summary)
+            RANK0_TRACE=$(find "$config_dir/rank_0" -name "*.pt.trace.json.gz" ! -name "capture_graph_*" 2>/dev/null | sort | tail -1)
+            if [ -z "$RANK0_TRACE" ]; then
+              echo "No rank_0 trace found for $config, skipping"
+              continue
+            fi
+
+            echo "=== Analyzing: $RANK0_TRACE ==="
+            cd "profiler-analysis/$config"
+            python ../../tools/parse_trace.py "../../$RANK0_TRACE" --layer 3 2>&1 | tee analysis.log || true
+            python ../../tools/analyze_trace_summary.py "../../$RANK0_TRACE" \
+              --output performance_summary.md 2>&1 || true
+            if [ -f performance_summary.md ]; then
+              echo "=== Performance Summary ($config) ==="
+              cat performance_summary.md
+            fi
+            cd ../..
+          done
+          ls -laR profiler-analysis/ 2>/dev/null || true
+
+      - name: Upload analysis results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: profiler-analysis-${{ github.run_id }}
+          path: profiler-analysis/
+
+      - name: Download regression report
+        if: needs.summarize-benchmark-result.outputs.has_regression == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: regression-report
+        continue-on-error: true
+
+      - name: Create GitHub Issue for regression
+        if: needs.summarize-benchmark-result.outputs.has_regression == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let report;
+            try {
+              report = JSON.parse(fs.readFileSync('regression_report.json', 'utf8'));
+            } catch (e) {
+              console.log('No regression report found, skipping issue creation');
+              return;
+            }
+            if (!report.regressions || report.regressions.length === 0) return;
+
+            const regs = report.regressions.map(r => {
+              const throughput = r.metrics.output_throughput || {};
+              const tpot = r.metrics.mean_tpot_ms || {};
+              return `| ${r.model} | ${r.isl}/${r.osl} | ${r.conc} | ${throughput.current?.toFixed(1) || 'N/A'} | ${throughput.baseline?.toFixed(1) || 'N/A'} | ${throughput.pct?.toFixed(1) || 'N/A'}% | ${tpot.current?.toFixed(2) || 'N/A'} | ${tpot.baseline?.toFixed(2) || 'N/A'} | ${tpot.pct?.toFixed(1) || 'N/A'}% |`;
+            }).join('\n');
+
+            let summary = 'Summary not available';
+            try {
+              const dirs = fs.readdirSync('profiler-analysis').filter(d =>
+                fs.statSync(`profiler-analysis/${d}`).isDirectory());
+              for (const d of dirs) {
+                const p = `profiler-analysis/${d}/performance_summary.md`;
+                if (fs.existsSync(p)) { summary = fs.readFileSync(p, 'utf8'); break; }
+              }
+            } catch(e) { /* ignore */ }
+
+            const body = `## Performance Regression Detected
+
+            **Commit:** \`${context.sha.substring(0, 8)}\`
+            **Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}
+            **Date:** ${report.timestamp}
+
+            ### Regressed Configurations
+
+            | Model | ISL/OSL | Conc | Tput (cur) | Tput (base) | Δ% | TPOT (cur) | TPOT (base) | Δ% |
+            |-------|---------|------|-----------|------------|-----|-----------|------------|-----|
+            ${regs}
+
+            ### Performance Summary
+
+            \`\`\`
+            ${summary}
+            \`\`\`
+
+            ### Profiler Traces
+
+            Download from [workflow artifacts](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).
+            Open in [Perfetto UI](https://ui.perfetto.dev/) or Chrome \`chrome://tracing\` for analysis.
+
+            ### Next Steps
+            1. Download \`profiler-analysis-${context.runId}\` artifact
+            2. Open trace files in Perfetto UI
+            3. Compare kernel durations against previous traces
+            4. Identify bottleneck changes
+            `.replace(/^            /gm, '');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Perf Regression] ${report.regressions.length} config(s) regressed @ ${context.sha.substring(0, 8)}`,
+              body: body,
+              labels: ['performance', 'regression']
+            });

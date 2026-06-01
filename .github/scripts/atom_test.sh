@@ -5,6 +5,7 @@ TYPE=${1:-launch}
 MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
 ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
+ATOM_SERVER_PORT=${ATOM_SERVER_PORT:-8000}
 
 
 if [ "$TYPE" == "launch" ]; then
@@ -33,7 +34,12 @@ if [ "$TYPE" == "launch" ]; then
   fi
 
   ATOM_SERVER_LOG="/tmp/atom_server.log"
-  PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
+  if [ "${USE_ATOMESH_ENTRYPOINTS:-0}" == "1" ]; then
+    SERVER_PORT_ARGS=("--port" "$ATOM_SERVER_PORT")
+  else
+    SERVER_PORT_ARGS=("--server-port" "$ATOM_SERVER_PORT")
+  fi
+  PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${SERVER_PORT_ARGS[@]}" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
   tail -f "$ATOM_SERVER_LOG" &
   _tail_launch_pid=$!
@@ -52,7 +58,7 @@ if [ "$TYPE" == "launch" ]; then
           tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
           exit 1
       fi
-      if curl -sf http://localhost:8000/health -o /dev/null; then
+      if curl -sf "http://localhost:${ATOM_SERVER_PORT}/health" -o /dev/null; then
           echo "ATOM server HTTP endpoint is up."
           server_up=true
           break
@@ -79,7 +85,7 @@ if [ "$TYPE" == "launch" ]; then
           tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
           exit 1
       fi
-      if curl -sf http://localhost:8000/v1/completions \
+      if curl -sf "http://localhost:${ATOM_SERVER_PORT}/v1/completions" \
           -H "Content-Type: application/json" \
           -d '{"model":"'"$MODEL_PATH"'","prompt":"hi","max_tokens":1}' \
           -o /dev/null --max-time 120; then
@@ -172,7 +178,7 @@ PY
   else
     echo "Using default lm-eval command."
     lm_eval --model local-completions \
-            --model_args "model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+            --model_args "model=${MODEL_PATH},base_url=http://localhost:${ATOM_SERVER_PORT}/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
             --tasks gsm8k \
             --num_fewshot 3 \
             --output_path "${OUTPUT_PATH}" \
@@ -343,7 +349,7 @@ if [ "$TYPE" == "benchmark" ]; then
     echo "Profiling enabled via --profile flag"
   fi
   python -m atom.benchmarks.benchmark_serving \
-    --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
+    --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:${ATOM_SERVER_PORT}" \
     --dataset-name=random \
     --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
     --max-concurrency=$CONC \

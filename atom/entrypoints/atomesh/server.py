@@ -95,13 +95,29 @@ def initialize_standalone_service(args: argparse.Namespace) -> Any:
     )
 
 
+def split_standalone_args(raw_args: list[str]) -> tuple[list[str], list[str]]:
+    """Keep mesh router --port from being consumed by EngineArgs.
+
+    EngineArgs also defines --port for internal engine communication. In
+    Atomesh standalone mode, the user-facing --port should configure the mesh
+    HTTP router, matching the Rust CLI behavior.
+    """
+    mesh_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    mesh_parser.add_argument("--port")
+    mesh_args, engine_args = mesh_parser.parse_known_args(raw_args)
+    if mesh_args.port is None:
+        return engine_args, []
+    return engine_args, ["--port", mesh_args.port]
+
+
 def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
     from atom.model_engine.arg_utils import EngineArgs
 
     parser = argparse.ArgumentParser(description="ATOM Mesh Python interface")
     EngineArgs.add_cli_args(parser)
-    engine_args, mesh_args = parser.parse_known_args(raw_args)
-    parsed_args = atomesh_runner.parse_from(mesh_args)
+    engine_raw_args, mesh_port_args = split_standalone_args(raw_args)
+    engine_args, mesh_args = parser.parse_known_args(engine_raw_args)
+    parsed_args = atomesh_runner.parse_from(mesh_args + mesh_port_args)
     cli_args = parsed_args["cli_args"]
     initialize_engine(engine_args)
     standalone_service = initialize_standalone_service(engine_args)
