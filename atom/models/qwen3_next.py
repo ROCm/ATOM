@@ -715,6 +715,7 @@ if is_vllm():
         MambaStateDtypeCalculator,
         MambaStateShapeCalculator,
     )
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
     class Qwen3NextGatedDeltaNetVllm(Qwen3NextGatedDeltaNet, MambaBase):
         def __init__(
@@ -757,8 +758,8 @@ if is_vllm():
             )
 
         @property
-        def mamba_type(self) -> str:
-            return "gdn_attention"
+        def mamba_type(self) -> MambaAttentionBackendEnum:
+            return MambaAttentionBackendEnum.GDN_ATTN
 
     # If oot case, override the Qwen3NextGatedDeltaNet with the VLLM version which inherits from MambaBase to ensure it gets registered in the static_forward_context for vLLM compilation.
     Qwen3NextGatedDeltaNet = Qwen3NextGatedDeltaNetVllm
