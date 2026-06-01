@@ -199,7 +199,6 @@ def _mrope_qk_tiled_kernel(
     tl.store(k_out_ptr + out_offsets_k, out, mask=mask & ~is_q)
 
 
-@torch.compiler.disable
 def try_mrope_qk_fused(
     rotary_emb: nn.Module,
     positions: torch.Tensor,
@@ -211,18 +210,24 @@ def try_mrope_qk_fused(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Try the specialized Qwen3.5 MRoPE Triton path.
 
-    Returns ``None`` for unsupported shapes so callers can fall back to the
-    generic rotary embedding module.
+    Returns ``None`` for unsupported shapes (or whenever invoked under
+    ``torch.compile``) so callers fall back to the generic rotary embedding.
 
-    Decorated with ``@torch.compiler.disable`` so the shape branches below
-    (``positions.shape[0] != 3``, ``q.shape[1] != num_q_heads * head_size``,
-    ...) never reach Dynamo. Otherwise Dynamo specializes the symbolic dims
-    these branches read, which conflicts with dims the runner marked dynamic
-    (e.g. MMStar CI fails with ConstraintViolationError on
-    ``L['positions'].size()[0]`` and ``L['inputs_embeds'].size()[0]``).
-    Matches the convention used by ``chunk_gated_delta_rule`` in
-    ``atom/model_ops/fla_ops/chunk.py``.
+    The Python-level shape branches below (``positions.shape[0] != 3``,
+    ``q.shape[1] != num_q_heads * head_size``, ...) would otherwise force
+    Dynamo to specialize symbolic dims, conflicting with dims marked dynamic
+    by the runner (MMStar fails with ConstraintViolationError on
+    ``L['positions'].size()[0]``). We previously tried
+    ``@torch.compiler.disable`` here, but the resulting graph break inside
+    the compiled Qwen3NextAttention forward re-enters ATOM's VllmBackend and
+    trips ``AssertionError: VllmBackend can only be called once``. Skipping
+    the fused path under compile (eager fallback to ``self.rotary_emb``) is
+    the safe option: SGLang eager mode keeps the perf gain, compile mode
+    behaves identically to ``main``.
     """
+    if torch.compiler.is_compiling():
+        return None
+
     mrope_section = getattr(rotary_emb, "mrope_section", None)
     if (
         positions.ndim != 2
