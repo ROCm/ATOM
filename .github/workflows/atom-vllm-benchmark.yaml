@@ -7,9 +7,10 @@ concurrency:
 
 on:
   schedule:
-    # Mon–Sat 21:00 Beijing (13:00 UTC): Mon/Wed/Fri AWS P0; Tue/Thu AWS P1+Meta P0; Sat AWS P2+OOB (see load-models).
-    - cron: '0 13 * * 1-6'
-    # Sat/Sun 10:00 Beijing (02:00 UTC): Sat AWS P1+Meta P0; Sun Meta P1
+    # Tue-Sun 00:30 Beijing (Mon-Sat 16:30 UTC): delayed previous-evening slot.
+    # Effective Mon/Wed AW P0; Tue/Thu AW P0+Met P0; Fri AW all; Sat AW P0+OOB.
+    - cron: '30 16 * * 1-6'
+    # Sat/Sun 10:00 Beijing (02:00 UTC): Sat AW P1+P2+Met P0; Sun AW all+Met P1.
     - cron: '0 2 * * 0,6'
   workflow_dispatch:
     inputs:
@@ -57,6 +58,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_2:
         description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
@@ -94,6 +96,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_3:
         description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
@@ -131,6 +134,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_4:
         description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
@@ -168,6 +172,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_5:
         description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
@@ -205,6 +210,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_6:
         description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
@@ -242,6 +248,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_7:
         description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
@@ -279,6 +286,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       model_slot_8:
         description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
@@ -316,6 +324,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
+          - MiniMax-M2.5 TP8 (AW)
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -519,7 +528,7 @@ jobs:
 
           BENCHMARK_CLIENT="${INPUT_BENCHMARK_CLIENT:-InferenceMax bench}"
 
-          mapfile -t VLLM_META < <(python3 - <<'PY'
+          mapfile -t VLLM_MET < <(python3 - <<'PY'
           import re
           from pathlib import Path
 
@@ -535,8 +544,8 @@ jobs:
           PY
           )
 
-          SELECTED_VLLM_COMMIT="${VLLM_META[0]}"
-          SELECTED_VLLM_VERSION="${VLLM_META[1]}"
+          SELECTED_VLLM_COMMIT="${VLLM_MET[0]}"
+          SELECTED_VLLM_VERSION="${VLLM_MET[1]}"
 
           if [[ -n "${INPUT_OOT_IMAGE}" ]]; then
             PREBUILT_OOT_IMAGE="${INPUT_OOT_IMAGE}"
@@ -549,7 +558,7 @@ jobs:
                 --reference-tag vllm-latest \
                 --preferred-version "${SELECTED_VLLM_VERSION}"
             )"; then
-              mapfile -t RESOLVED_IMAGE_META < <(
+              mapfile -t RESOLVED_IMAGE_MET < <(
                 RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
           import json
           import os
@@ -562,11 +571,11 @@ jobs:
           print(resolution.get("matched_tag", ""))
           PY
               )
-              PREBUILT_OOT_IMAGE="${RESOLVED_IMAGE_META[0]}"
-              RESOLVED_PREBUILT_ALIAS="${RESOLVED_IMAGE_META[1]}"
-              RESOLVED_PREBUILT_DIGEST="${RESOLVED_IMAGE_META[2]}"
-              PREBUILT_RESOLUTION_TYPE="${RESOLVED_IMAGE_META[3]}"
-              RESOLVED_NIGHTLY_TAG="${RESOLVED_IMAGE_META[4]}"
+              PREBUILT_OOT_IMAGE="${RESOLVED_IMAGE_MET[0]}"
+              RESOLVED_PREBUILT_ALIAS="${RESOLVED_IMAGE_MET[1]}"
+              RESOLVED_PREBUILT_DIGEST="${RESOLVED_IMAGE_MET[2]}"
+              PREBUILT_RESOLUTION_TYPE="${RESOLVED_IMAGE_MET[3]}"
+              RESOLVED_NIGHTLY_TAG="${RESOLVED_IMAGE_MET[4]}"
             else
               echo "::warning::Failed to resolve or digest-pin rocm/atom-dev:vllm-latest; falling back to the floating tag."
               PREBUILT_OOT_IMAGE="rocm/atom-dev:vllm-latest"
@@ -834,16 +843,16 @@ jobs:
           except HTTPError as exc:
               detail = exc.read().decode("utf-8", errors="replace").strip()
               raise RuntimeError(
-                  f"Failed to fetch workflow run metadata: HTTP {exc.code} {detail}"
+                  f"Failed to fetch workflow run METdata: HTTP {exc.code} {detail}"
               ) from exc
           except URLError as exc:
               raise RuntimeError(
-                  f"Failed to reach GitHub API for workflow run metadata: {exc}"
+                  f"Failed to reach GitHub API for workflow run METdata: {exc}"
               ) from exc
 
           created_at = payload.get("created_at")
           if not created_at:
-              raise RuntimeError("Workflow run metadata did not include created_at")
+              raise RuntimeError("Workflow run METdata did not include created_at")
           print(created_at)
           PY
             )"
@@ -893,41 +902,40 @@ jobs:
                   m for m in variants if str(m.get("display", "")) in displays
               ]
 
-          AWS_P0 = {
+          AW_P0 = {
+              "gpt-oss-120b TP1 (AW)",
+              "DeepSeek-V3.2 FP8 TP4 (AW)",
+              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
+              "GLM-4.7-FP8 TP4 (AW)",
+              "GLM-4.7-FP8 MTP TP4 (AW)",
+              "Kimi-K2.5-MXFP4 TP4 (AW)",
               "MiniMax-M2.5 TP2 (AW)",
+          }
+          AW_P1 = {
               "MiniMax-M2.5 TP4 (AW)",
               "DeepSeek-V3.2 FP8 TP8 (AW)",
-              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
               "gpt-oss-120b TP2 (AW)",
               "gpt-oss-120b TP8 (AW)",
-          }
-          AWS_P1 = {
-              "GLM-4.7-FP8 TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP8 (AW)",
-              "GLM-4.7-FP8 MTP TP4 (AW)",
               "GLM-4.7-FP8 MTP TP8 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)",
           }
-          AWS_P2 = {
-              "DeepSeek-V3.2 FP8 TP4 (AW)",
+          AW_P2 = {
               "GLM-4.7-FP8 TP8 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Kimi-K2.5-MXFP4 TP8 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)",
-              "gpt-oss-120b TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)",
           }
-          META_P0 = {
+          MET_P0 = {
               "Kimi-K2.5-MXFP4 TP4 (MET)",
               "gpt-oss-120b TP1 (MET)",
           }
-          META_P1 = {
+          MET_P1 = {
               "Kimi-K2-Thinking-MXFP4 TP4 (MET)",
               "Kimi-K2-Thinking-MXFP4 TP8 (MET)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)",
-              "Qwen3.5-397B-A17B-FP8 TP4 (OOB)",
               "DeepSeek-R1 FP8 TP8 (MET)",
               "DeepSeek-R1 MXFP4 TP8 (MET)",
           }
@@ -946,44 +954,58 @@ jobs:
               beijing_tz = timezone(timedelta(hours=8))
               run_date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
               beijing_dt = run_date.astimezone(beijing_tz)
-              beijing_weekday = beijing_dt.weekday()
               beijing_hour = beijing_dt.hour
 
-              # Beijing weekday: Mon=0 .. Sun=6. Hour buckets use 15:00 to split
-              # ~10:00 daytime vs ~21:00 evening scheduled runs.
-              # Mon/Wed/Fri evening: AWS P0. Tue/Thu evening: AWS P1 + Meta P0.
-              # Fri evening: AWS P0. Sat daytime (~10:00): AWS P1 + Meta P0.
-              # Sat evening (~21:00): AWS P2 + OOB. Sun daytime (~10:00): Meta P1.
-              is_daytime_slot = beijing_hour < 15
+              # Beijing weekday: Mon=0 .. Sun=6. The evening slot now runs just
+              # after midnight, so attribute it to the previous Beijing day.
+              is_delayed_evening_slot = beijing_hour < 3
+              effective_beijing_dt = (
+                  beijing_dt - timedelta(days=1)
+                  if is_delayed_evening_slot
+                  else beijing_dt
+              )
+              beijing_weekday = effective_beijing_dt.weekday()
+
+              # Hour buckets use 15:00 to split ~10:00 daytime vs delayed
+              # previous-evening scheduled runs.
+              is_daytime_slot = (not is_delayed_evening_slot) and beijing_hour < 15
+              aw_all = AW_P0 | AW_P1 | AW_P2
 
               if beijing_weekday == 5:  # Saturday
                   if is_daytime_slot:
-                      selected_group = "AWS-P1+META-P0"
-                      target_displays = AWS_P1 | META_P0
+                      selected_group = "AW-P1+P2+MET-P0"
+                      target_displays = AW_P1 | AW_P2 | MET_P0
                   else:
-                      selected_group = "AWS-P2+OOB"
-                      target_displays = AWS_P2 | OOB_DISPLAYS
+                      selected_group = "AW-P0+OOB"
+                      target_displays = AW_P0 | OOB_DISPLAYS
               elif beijing_weekday == 6:  # Sunday
                   if is_daytime_slot:
-                      selected_group = "META-P1"
-                      target_displays = META_P1
+                      selected_group = "AW-ALL+MET-P1"
+                      target_displays = aw_all | MET_P1
                   else:
                       selected_group = "SKIP"
                       target_displays = set()
-              elif beijing_weekday in (0, 2, 4):  # Mon / Wed / Fri
+              elif beijing_weekday in (0, 2):  # Mon / Wed
                   if is_daytime_slot:
                       selected_group = "SKIP"
                       target_displays = set()
                   else:
-                      selected_group = "AWS-P0"
-                      target_displays = AWS_P0
+                      selected_group = "AW-P0"
+                      target_displays = AW_P0
               elif beijing_weekday in (1, 3):  # Tue / Thu
                   if is_daytime_slot:
                       selected_group = "SKIP"
                       target_displays = set()
                   else:
-                      selected_group = "AWS-P1+META-P0"
-                      target_displays = AWS_P1 | META_P0
+                      selected_group = "AW-P0+MET-P0"
+                      target_displays = AW_P0 | MET_P0
+              elif beijing_weekday == 4:  # Friday
+                  if is_daytime_slot:
+                      selected_group = "SKIP"
+                      target_displays = set()
+                  else:
+                      selected_group = "AW-ALL"
+                      target_displays = aw_all
               else:
                   selected_group = "SKIP"
                   target_displays = set()
@@ -1082,9 +1104,22 @@ jobs:
           params = json.loads(os.environ["PARAMS_JSON"])
 
           include = []
+          aw_p0_displays = {
+              "gpt-oss-120b TP1 (AW)",
+              "DeepSeek-V3.2 FP8 TP4 (AW)",
+              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
+              "GLM-4.7-FP8 TP4 (AW)",
+              "GLM-4.7-FP8 MTP TP4 (AW)",
+              "Kimi-K2.5-MXFP4 TP4 (AW)",
+              "MiniMax-M2.5 TP2 (AW)",
+          }
           for model in models:
               prefix = str(model.get("prefix", ""))
+              display = str(model.get("display", ""))
               is_aw_model = "-aw-" in prefix
+              is_aw_p0_model = display in aw_p0_displays
               aw_pairs = (
                   (1000, 100),
                   (5000, 500),
@@ -1101,11 +1136,11 @@ jobs:
                   if is_aw_model:
                       base_params = []
                       for input_length, output_length in aw_pairs:
-                          aws_param = dict(param)
-                          aws_param["input_length"] = input_length
-                          aws_param["output_length"] = output_length
-                          aws_param["random_range_ratio"] = ""
-                          base_params.append(aws_param)
+                          aw_param = dict(param)
+                          aw_param["input_length"] = input_length
+                          aw_param["output_length"] = output_length
+                          aw_param["random_range_ratio"] = ""
+                          base_params.append(aw_param)
 
                   variants = []
                   for base_param in base_params:
@@ -1133,6 +1168,8 @@ jobs:
                       continue
                   if pair in excluded_pairs:
                       continue
+                  if is_aw_p0_model and int(param["concurrency"]) in (128, 256, 512):
+                      continue
                   include.append({"model": model, "params": param})
 
           print(json.dumps({"include": include}, separators=(",", ":")))
@@ -1144,14 +1181,20 @@ jobs:
             echo "No eligible benchmark cases remain after model-specific parameter filtering."
           else
             echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
-            echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
+            BENCHMARK_MATRIX="${BENCHMARK_MATRIX}" python3 - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["BENCHMARK_MATRIX"])
+          print(f"Benchmark matrix cells: {len(payload.get('include', []))}")
+          PY
           fi
 
       - name: Persist benchmark matrix payload
-        env:
-          BENCHMARK_MATRIX: ${{ steps.build.outputs.benchmark_matrix }}
         run: |
-          printf '%s' "${BENCHMARK_MATRIX}" > benchmark_matrix.json
+          cat > benchmark_matrix.json <<'EOF'
+          ${{ steps.build.outputs.benchmark_matrix }}
+          EOF
 
       - name: Upload benchmark matrix payload
         uses: actions/upload-artifact@v7
@@ -1168,8 +1211,8 @@ jobs:
       && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     runs-on: build-only-atom
     outputs:
-      oot_image_tag: ${{ steps.image-meta.outputs.oot_image_tag }}
-      atom_source_sha: ${{ steps.source-meta.outputs.atom_source_sha }}
+      oot_image_tag: ${{ steps.image-met.outputs.oot_image_tag }}
+      atom_source_sha: ${{ steps.source-met.outputs.atom_source_sha }}
     env:
       ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
       ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
@@ -1185,8 +1228,8 @@ jobs:
           ref: ${{ env.ATOM_SOURCE_REF }}
           fetch-depth: 1
 
-      - name: Record source metadata
-        id: source-meta
+      - name: Record source METdata
+        id: source-met
         run: |
           ATOM_SOURCE_SHA="$(git rev-parse HEAD)"
           echo "atom_source_sha=${ATOM_SOURCE_SHA}" >> "$GITHUB_OUTPUT"
@@ -1237,7 +1280,7 @@ jobs:
             -f Dockerfile.oot-base .
 
       - name: Build custom OOT vLLM image
-        id: image-meta
+        id: image-met
         run: |
           SHORT_SHA="$(git rev-parse --short HEAD)"
           SHORT_VLLM="$(printf '%s' "${VLLM_COMMIT}" | cut -c1-12)"
@@ -1257,12 +1300,12 @@ jobs:
 
       - name: Push custom OOT image
         run: |
-          docker push "${{ steps.image-meta.outputs.oot_image_tag }}"
+          docker push "${{ steps.image-met.outputs.oot_image_tag }}"
 
       - name: Clean up build images
         if: always()
         run: |
-          docker rmi "${{ steps.image-meta.outputs.oot_image_tag }}" || true
+          docker rmi "${{ steps.image-met.outputs.oot_image_tag }}" || true
           docker rmi atom_oot_base:ci || true
 
   benchmark:
@@ -1766,7 +1809,7 @@ jobs:
           fi
           echo "::endgroup::"
 
-      - name: Inject GPU metadata into benchmark results
+      - name: Inject GPU METdata into benchmark results
         run: |
           shopt -s nullglob
           for f in "${RESULT_PREFIX}"-*.json; do

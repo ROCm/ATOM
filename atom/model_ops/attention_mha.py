@@ -197,7 +197,9 @@ class PagedAttentionImpl(nn.Module):
                 else:
                     v_cache_shuffle = v_cache
                 fused_qk_norm_rope_cache_quant_shuffle(
-                    qkv,
+                    q=q,
+                    k=k,
+                    v=v,
                     num_heads_q=self.num_heads,
                     num_heads_k=self.num_kv_heads,
                     num_heads_v=self.num_kv_heads,
@@ -218,10 +220,9 @@ class PagedAttentionImpl(nn.Module):
                     v_scale=v_scale,
                 )
 
-                qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
-                q, k, v = qkv.split(
-                    [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
-                )
+                q = q.view(-1, self.num_heads, self.head_dim)
+                k = k.view(-1, self.num_kv_heads, self.head_dim)
+                v = v.view(-1, self.num_kv_heads, self.head_dim)
             self._cache_format = "SHUFFLE"
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
