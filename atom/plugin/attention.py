@@ -107,6 +107,7 @@ class AiterFlashAttentionMetadataForPluginMode:
     decode_metadata: Optional[AiterFlashAttentionDecodeMetadata] = None
     prefill_metadata: Optional[AiterFlashAttentionPrefillMetadata] = None
     extend_metadata: Optional[AiterFlashAttentionChunkPrefillMetadata] = None
+    seq_lens_cpu: Optional[torch.Tensor] = None
 
     use_cascade: bool = False
     common_prefix_len: int = 0
@@ -589,6 +590,7 @@ class vllmAttentionMetadataBuilderMethods:
             query_start_loc=common_attn_metadata.query_start_loc,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
+            seq_lens_cpu=seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
             num_decodes=num_decodes,

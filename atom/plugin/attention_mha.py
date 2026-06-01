@@ -566,6 +566,20 @@ class PagedAttentionImplPluginModeMethods:
             return False
         return True
 
+    def _dispatch_decode_backend(self, num_decodes, context_lens_cpu):
+        # return (use_triton_attn, backend_func)
+        if self.use_triton_attn or num_decodes == _QWEN_GLUON_PA_DECODE_BS:
+            print("line 572", flush=True)
+            return (True, self.paged_attention_triton_plugin_mode)
+        else:
+            max_context_len = context_lens_cpu.max().item()
+            if num_decodes <= 32 and max_context_len > 1024:
+                print(f"line 578, num_decodes: {num_decodes}, max_context_len: {max_context_len}", flush=True)
+                return (True, self.paged_attention_triton_plugin_mode)
+            else:
+                print(f"line 580, num_decodes: {num_decodes}, max_context_len: {max_context_len}", flush=True)
+                return (False, self.paged_attention_asm_plugin_mode)
+
     def forward_impl_plugin_mode(
         self,
         layer: torch.nn.Module,
@@ -756,6 +770,33 @@ class PagedAttentionImplPluginModeMethods:
         if num_decodes > 0:
             assert attn_metadata.plugin_metadata.decode_metadata is not None
 
+            # use_triton_attn, decode_backend_func = self._dispatch_decode_backend(num_decodes, attn_metadata.plugin_metadata.seq_lens_cpu)
+            # if use_triton_attn:
+            #     print("call triton decode backend", flush=True)
+            #     decode_backend_func(
+            #         q=query[:num_decode_tokens],
+            #         k_cache=new_key_cache,
+            #         v_cache=new_value_cache,
+            #         k_scale=k_scale,
+            #         v_scale=v_scale,
+            #         num_decodes=num_decodes,
+            #         out=output_actual_tokens[:num_decode_tokens],
+            #         attn_metadata=attn_metadata,
+            #     )
+            # else:
+            #     print("call asm decode backend", flush=True)
+            #     decode_backend_func(
+            #         q=query[:num_decode_tokens],
+            #         k_cache=new_key_cache,
+            #         v_cache=new_value_cache,
+            #         k_scale=k_scale,
+            #         v_scale=v_scale,
+            #         num_decodes=num_decodes,
+            #         num_decode_tokens=num_decode_tokens,
+            #         out=output_actual_tokens[:num_decode_tokens],
+            #         attn_metadata=attn_metadata,
+            #     )
+
             if self.use_triton_attn:
                 self.paged_attention_triton_plugin_mode(
                     q=query[:num_decode_tokens],
@@ -768,8 +809,9 @@ class PagedAttentionImplPluginModeMethods:
                     attn_metadata=attn_metadata,
                 )
             else:
+                # max_context_len = attn_metadata.plugin_metadata.seq_lens_cpu.max().item()
                 # Qwen only uses gluon pa decode when bs=64
-                if num_decodes == _QWEN_GLUON_PA_DECODE_BS:
+                if (num_decodes == _QWEN_GLUON_PA_DECODE_BS) or (num_decodes <= 32):
                     self.paged_attention_triton_plugin_mode(
                         q=query[:num_decode_tokens],
                         k_cache=new_key_cache,
@@ -808,6 +850,7 @@ def PagedAttentionImplDecoratorForPluginMode(cls):
         "extend_forward",
         "forward_impl_plugin_mode",
         "adopt_persistent_kernel",
+        "_dispatch_decode_backend",
     ]
 
     logger.info(
