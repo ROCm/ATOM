@@ -410,7 +410,11 @@ if [ "$TYPE" == "benchmark" ]; then
 
   echo "========== Supervising benchmark with wait_infer_drain.sh =========="
   # See accuracy block above for STUCK_POLLS=18 rationale.
-  bash scripts/wait_infer_drain.sh 8000 30 10 "$ATOM_CLIENT_LOG" 18
+  # MAX_MIN=60: high-concurrency long-context runs (e.g. DP-attention 8k/1k
+  # c=1024 with num_prompts=conc*10) take ~48 min wall (warmup + 10240 reqs);
+  # 30 min cut them off mid-run (drain exit 4). Real hangs/faults still
+  # surface fast via STUCK_POLLS / fault detection, not MAX_MIN.
+  bash scripts/wait_infer_drain.sh 8000 60 10 "$ATOM_CLIENT_LOG" 18
   DRAIN_RC=$?
   if [ "$DRAIN_RC" -ne 0 ]; then
     echo "wait_infer_drain.sh exit=$DRAIN_RC — killing benchmark pgid $CLIENT_PID"
