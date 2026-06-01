@@ -307,14 +307,15 @@ class SGLangDeepseekMLAAttention(nn.Module):
                 )
             )
 
-            use_non_absorbed = forward_batch.forward_mode.is_extend_without_speculative()
+            use_non_absorbed = (
+                forward_batch.forward_mode.is_extend_without_speculative()
+            )
             if not use_non_absorbed and forward_batch.forward_mode.is_draft_extend():
                 extend_prefix_lens_cpu = getattr(
                     forward_batch, "extend_prefix_lens_cpu", None
                 )
-                use_non_absorbed = (
-                    extend_prefix_lens_cpu is not None
-                    and not any(extend_prefix_lens_cpu)
+                use_non_absorbed = extend_prefix_lens_cpu is not None and not any(
+                    extend_prefix_lens_cpu
                 )
 
             if use_non_absorbed:

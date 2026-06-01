@@ -404,6 +404,29 @@ def _set_mla_kv_buffer_for_non_absorbed(
     )
 
 
+def _is_mxfp4_kv_b_proj(attn: DeepseekV2MLAAttention) -> bool:
+    kv_b_proj = attn.kv_b_proj
+    params_dtype = getattr(kv_b_proj, "params_dtype", None)
+    if params_dtype == dtypes.fp4x2 or params_dtype == getattr(
+        torch, "float4_e2m1fn_x2", None
+    ):
+        return True
+
+    quant_type = getattr(kv_b_proj, "quant_type", None)
+    if getattr(quant_type, "name", "") == "per_1x32" or str(quant_type).endswith(
+        "per_1x32"
+    ):
+        return True
+
+    quant_method = getattr(kv_b_proj, "quant_method", None)
+    quant_config = getattr(quant_method, "quant_config", None)
+    return bool(
+        quant_config is not None
+        and quant_config.get_name() == "quark"
+        and kv_b_proj.weight.dtype == torch.uint8
+    )
+
+
 def _can_run_non_absorbed_mla_now(
     attn: DeepseekV2MLAAttention,
     forward_batch,
