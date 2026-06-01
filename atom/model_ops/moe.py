@@ -83,6 +83,21 @@ def _log_moe_shuffle(fn_name: str, **kwargs) -> None:
     )
 
 
+def _log_call_args(fn_name: str, **kwargs) -> None:
+    """ATOM log of a call's args: tensors as (shape, dtype, device), else repr."""
+    lines = [f"[MoE-ARGS] {fn_name}("]
+    for key, val in kwargs.items():
+        if isinstance(val, torch.Tensor):
+            lines.append(
+                f"    {key} = Tensor(shape={tuple(val.shape)}, dtype={val.dtype}, "
+                f"device={val.device}, contig={val.is_contiguous()})"
+            )
+        else:
+            lines.append(f"    {key} = {val!r}")
+    lines.append(")")
+    logger.info("\n".join(lines))
+
+
 class FusedMoeWeightScaleSupported(Enum):
     """Supported quantization strategies for MoE weight scales."""
 
@@ -767,7 +782,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_dtype = quant_config.quant_dtype
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
-        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV
+        # self.is_guinterleave = envs.ATOM_MOE_GU_ITLV
+        self.is_guinterleave = False
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -908,27 +924,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer):
-        if os.environ.get("MOCK_MOE_WEIGHT"):
-            # Debug: discard the loaded weights and substitute known constants so
-            # the GEMM / layout / shuffle paths can be validated independently of
-            # the checkpoint. Runs before any clone / swizzle / shuffle below, so
-            # both the triton golden and aiter paths see the same mocked values.
-            #   weight: mxfp4 e2m1 1.0 = 0b0010 = 0x2  -> packed byte 0x22
-            #   scale : e8m0 1.0 (2^0)                  -> byte 127 (0x7f)
-            # Constant weights are layout-invariant, so interleave / GU mode does
-            # not affect the result — handy for isolating routing vs GEMM bugs.
-            for w in (layer.w13_weight, layer.w2_weight):
-                w.data.view(torch.uint8).fill_(0x22)
-            for s in (layer.w13_weight_scale, layer.w2_weight_scale):
-                s.data.view(torch.uint8).fill_(127)
-            logger.info(
-                "[MOCK_MOE_WEIGHT] layer=%s w13=%s w2=%s -> weight=1.0 (0x22), "
-                "scale=1.0 (e8m0 127)",
-                getattr(layer, "layer_name", "?"),
-                tuple(layer.w13_weight.shape),
-                tuple(layer.w2_weight.shape),
-            )
-
         if layer.w13_bias is not None:
             layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
         if layer.w2_bias is not None:
@@ -938,7 +933,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         # Compare-mode: build both triton-swizzled and aiter-shuffled weights
-        # so we can run both kernels in apply() and diff their outputs.
+        # so we can run both kernels in apply() and diff their outputs. This
+        # nearly DOUBLES per-layer MoE weight memory (one clone for triton +
+        # the .contiguous() of the de-interleaved permute), which can OOM on
+        # large models. It is only needed when (a) the apply() path actually
+        # uses the triton swizzled buffers (self.use_triton=True) or (b) the
+        # operator is explicitly asked to diff triton vs aiter outputs via
+        # ATOM_MOE_TRITON_COMPARE=1. Default to OFF.
+        #
         # IMPORTANT: _swizzle_mxfp4 with StridedLayout does NOT copy — it just
         # wraps the underlying storage. The subsequent aiter shuffle_weight /
         # shuffle_scale calls would then mutate that same storage and silently
@@ -953,47 +955,69 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # expects the NON-interleaved gate-up layout, so de-interleave a clone
         # (invert _interleave_swiglu_weights) before swizzling for triton. w2
         # (down-proj) is never interleaved, so it is cloned as-is.
-        from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
-        from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+        _enable_triton_compare = (
+            os.environ.get("ATOM_MOE_TRITON_COMPARE", "0") == "1"
+        )
+        _build_triton_buffers = self.use_triton or _enable_triton_compare
 
-        w13_u8 = layer.w13_weight.view(torch.uint8).clone()
-        e, n, k = w13_u8.shape
-        w13_deint = (
-            w13_u8.view(e, 2, n // 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
-        )
-        w13_scale_deint = (
-            layer.w13_weight_scale.clone()
-            .view(e, 2, n // 2, -1)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-            .view(e, n, -1)
-        )
-        w13_tri, w13_flex, w13_scale_tri = _swizzle_mxfp4(w13_deint, w13_scale_deint)
-        w2_tri, w2_flex, w2_scale_tri = _swizzle_mxfp4(
-            layer.w2_weight.view(torch.uint8).clone(),
-            layer.w2_weight_scale.clone(),
-        )
-        self.w13_precision_config = PrecisionConfig(
-            weight_scale=w13_scale_tri, flex_ctx=FlexCtx(rhs_data=w13_flex)
-        )
-        self.w2_precision_config = PrecisionConfig(
-            weight_scale=w2_scale_tri, flex_ctx=FlexCtx(rhs_data=w2_flex)
-        )
-        self._triton_w13_weight = w13_tri
-        self._triton_w2_weight = w2_tri
+        if _build_triton_buffers:
+            from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
+            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
-        # Triton needs its own de-interleaved w13 bias; aiter keeps the
-        # interleaved layer.w13_bias. w2 bias is never interleaved.
-        if layer.w13_bias is not None:
-            self._triton_w13_bias = (
-                layer.w13_bias.data.view(-1, 2, n // 2)
-                .permute(0, 2, 1)
+            w13_u8 = layer.w13_weight.view(torch.uint8).clone()
+            e, n, k = w13_u8.shape
+            w13_deint = (
+                w13_u8.view(e, 2, n // 2, k)
+                .permute(0, 2, 1, 3)
                 .contiguous()
-                .view(-1, n)
+                .view(e, n, k)
             )
+            w13_scale_deint = (
+                layer.w13_weight_scale.clone()
+                .view(e, 2, n // 2, -1)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .view(e, n, -1)
+            )
+            w13_tri, w13_flex, w13_scale_tri = _swizzle_mxfp4(
+                w13_deint, w13_scale_deint
+            )
+            w2_tri, w2_flex, w2_scale_tri = _swizzle_mxfp4(
+                layer.w2_weight.view(torch.uint8).clone(),
+                layer.w2_weight_scale.clone(),
+            )
+            self.w13_precision_config = PrecisionConfig(
+                weight_scale=w13_scale_tri, flex_ctx=FlexCtx(rhs_data=w13_flex)
+            )
+            self.w2_precision_config = PrecisionConfig(
+                weight_scale=w2_scale_tri, flex_ctx=FlexCtx(rhs_data=w2_flex)
+            )
+            self._triton_w13_weight = w13_tri
+            self._triton_w2_weight = w2_tri
+
+            # Triton needs its own de-interleaved w13 bias; aiter keeps the
+            # interleaved layer.w13_bias. w2 bias is never interleaved.
+            if layer.w13_bias is not None:
+                self._triton_w13_bias = (
+                    layer.w13_bias.data.view(-1, 2, n // 2)
+                    .permute(0, 2, 1)
+                    .contiguous()
+                    .view(-1, n)
+                )
+            else:
+                self._triton_w13_bias = None
+            self._triton_w2_bias = layer.w2_bias
         else:
+            # Default path: aiter-only. Skip the triton swizzled buffers to
+            # avoid a ~2x MoE weight memory blow-up. Any code that still
+            # touches these attributes will get a clear AttributeError instead
+            # of silently using stale tensors.
+            self.w13_precision_config = None
+            self.w2_precision_config = None
+            self._triton_w13_weight = None
+            self._triton_w2_weight = None
             self._triton_w13_bias = None
-        self._triton_w2_bias = layer.w2_bias
+            self._triton_w2_bias = None
 
         # shuffle weight (aiter path; this mutates layer.w13_weight/w2_weight)
         _log_moe_shuffle(
@@ -1021,34 +1045,80 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w13_weight.is_shuffled = True
         layer.w2_weight.is_shuffled = True
 
-        # shuffle scale
-        w13_scale_2d = layer.w13_weight_scale.reshape(
-            -1, layer.w13_weight_scale.shape[-1]
-        )
-        w2_scale_2d = layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1])
+        # Keep the raw scales as the input to the grouped scale preshuffle.
+        self._raw_w13_weight_scale = layer.w13_weight_scale.data.clone()
+        self._raw_w2_weight_scale = layer.w2_weight_scale.data.clone()
 
+        # --- OLD: aiter shuffle_scale layout (wrong for the FlyDSL grouped
+        #     gfx1250 kernel, which expects the e8m0 scale already preshuffled
+        #     by _grouped_a8w4_prepare_scale_batch and then merely reshaped) ---
+        # w13_scale_2d = layer.w13_weight_scale.reshape(
+        #     -1, layer.w13_weight_scale.shape[-1]
+        # )
+        # w2_scale_2d = layer.w2_weight_scale.reshape(
+        #     -1, layer.w2_weight_scale.shape[-1]
+        # )
+        # _log_moe_shuffle(
+        #     "shuffle_scale(w13)", src=w13_scale_2d, experts_cnt=self.num_experts,
+        #     is_guinterleave=self.is_guinterleave, gate_up=True,
+        # )
+        # shuffled_w13_scale = shuffle_scale(
+        #     w13_scale_2d, self.num_experts, self.is_guinterleave, True
+        # )
+        # _log_moe_shuffle(
+        #     "shuffle_scale(w2)", src=w2_scale_2d, experts_cnt=self.num_experts,
+        #     is_guinterleave=self.is_guinterleave, gate_up=False,
+        # )
+        # shuffled_w2_scale = shuffle_scale(
+        #     w2_scale_2d, self.num_experts, self.is_guinterleave, False
+        # )
+        # layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
+        # layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
+        # --- NEW: preshuffle scale with the grouped helper used by the kernel ---
+        # Ref op_tests/test_flydsl_grouped_gemm_gfx1250.py / production grouped
+        # path: warp_tile = tile_n // n_warp = 64 // 2 = 32, tile_k = 128. w13 is
+        # the (gate|up) operand: rows = 2*inter, k_dim = model_dim; w2 (down):
+        # rows = model_dim, k_dim = inter.
+        from aiter.fused_moe import _grouped_a8w4_prepare_scale_batch
+
+        _GROUPED_WARP_TILE_N = 32
+        _GROUPED_TILE_K = 128
+        layer.w13_weight_scale = atom_parameter(
+            _grouped_a8w4_prepare_scale_batch(
+                self._raw_w13_weight_scale,
+                experts=self.num_experts,
+                rows=2 * self.intermediate_size,
+                k_dim=self.hidden_size,
+                warp_tile=_GROUPED_WARP_TILE_N,
+                tile_k=_GROUPED_TILE_K,
+                device=self._raw_w13_weight_scale.device,
+            )
+        )
+        layer.w2_weight_scale = atom_parameter(
+            _grouped_a8w4_prepare_scale_batch(
+                self._raw_w2_weight_scale,
+                experts=self.num_experts,
+                rows=self.hidden_size,
+                k_dim=self.intermediate_size,
+                warp_tile=_GROUPED_WARP_TILE_N,
+                tile_k=_GROUPED_TILE_K,
+                device=self._raw_w2_weight_scale.device,
+            )
+        )
         _log_moe_shuffle(
-            "shuffle_scale(w13)",
-            src=w13_scale_2d,
+            "prepare_scale_batch(w13)",
+            src=layer.w13_weight_scale,
             experts_cnt=self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=True,
         )
-        shuffled_w13_scale = shuffle_scale(
-            w13_scale_2d, self.num_experts, self.is_guinterleave, True
-        )
         _log_moe_shuffle(
-            "shuffle_scale(w2)",
-            src=w2_scale_2d,
+            "prepare_scale_batch(w2)",
+            src=layer.w2_weight_scale,
             experts_cnt=self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=False,
         )
-        shuffled_w2_scale = shuffle_scale(
-            w2_scale_2d, self.num_experts, self.is_guinterleave, False
-        )
-        layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
-        layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1174,13 +1244,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
-        if os.environ.get("MOCK_MOE_HIDDEN"):
-            # Debug: replace the MoE input hidden states with all-1.0 bf16 so the
-            # aiter and triton golden paths run on identical, known input. Set
-            # before any routing / GEMM so both paths (and select_experts) see it.
-            x = torch.ones_like(x, dtype=torch.bfloat16)
-            logger.info("[MOCK_MOE_HIDDEN] x -> ones(bf16) shape=%s", tuple(x.shape))
-
         if self.use_triton:
             # NOTE: compare-mode change moved the swizzled triton tensors off
             # layer.w13_weight (now aiter-shuffled) onto self._triton_w13_weight.
@@ -1250,10 +1313,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         if self.fused_experts is None:
+            _gate_mode = (
+                GateMode.INTERLEAVE.value
+                if self.is_guinterleave
+                else GateMode.SEPARATED.value
+            )
+            _log_call_args(
+                "fused_moe",
+                hidden_states=x,
+                w1=layer.w13_weight.data,
+                w2=layer.w2_weight.data,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                expert_mask=layer.expert_mask,
+                activation=activation,
+                quant_type=self.quant_type,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                # a1_scale=a1_scale,
+                # a2_scale=a2_scale,
+                doweight_stage1=apply_router_weight_on_input,
+                hidden_pad=self.hidden_pad,
+                intermediate_pad=self.intermediate_pad,
+                bias1=layer.w13_bias,
+                bias2=layer.w2_bias,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                gate_mode=_gate_mode,
+            )
             aiter_out = fused_moe(
                 x,
-                layer.w13_weight,
-                layer.w2_weight,
+                layer.w13_weight.data,
+                layer.w2_weight.data,
                 topk_weights,
                 topk_ids,
                 expert_mask=layer.expert_mask,
@@ -1261,19 +1351,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 quant_type=self.quant_type,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                a1_scale=a1_scale,
-                a2_scale=a2_scale,
+                # a1_scale=a1_scale,
+                # a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
                 swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
-                gate_mode=(
-                    GateMode.INTERLEAVE.value
-                    if self.is_guinterleave
-                    else GateMode.SEPARATED.value
-                ),
+                gate_mode=_gate_mode,
             )
         else:
             aiter_out = self.fused_experts(
@@ -1297,6 +1383,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
             )
+
+        # Runtime compare-mode: compute triton "golden" and print [MoE-DIFF].
+        # Gated by ATOM_MOE_TRITON_COMPARE=1 because (a) it doubles forward
+        # latency, (b) it requires the triton swizzled buffers which are only
+        # built when the same env is set in process_weights_after_loading, and
+        # (c) it produces large per-layer print spam unsuitable for production.
+        if os.environ.get("ATOM_MOE_TRITON_COMPARE", "0") != "1":
+            return aiter_out
 
         # Golden = triton (use_triton=True). Compare aiter against it and
         # return the golden so downstream layers see the use_triton=True numerics.
@@ -1397,7 +1491,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
                 flush=True,
             )
-        return golden
+        # Return the aiter result (golden/triton is still computed above only for
+        # the [MoE-DIFF] comparison print).
+        return aiter_out
 
 
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm

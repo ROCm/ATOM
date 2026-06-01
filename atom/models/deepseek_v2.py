@@ -24,6 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -2145,6 +2146,33 @@ class DeepseekV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        # ATOM_NUMERIC_DEBUG: per-layer NaN/Inf/range probe to localize numerical
+        # blow-up to a specific decoder layer. Enabled via env so it can be left
+        # in tree without perf hit when off. Prints to stderr (uses flush=True
+        # so output survives a subsequent crash). Set ATOM_NUMERIC_DEBUG=1.
+        _numeric_debug = os.environ.get("ATOM_NUMERIC_DEBUG", "0") == "1"
+
+        def _probe(tag: str, t):
+            if t is None:
+                print(f"[NUMERIC] {tag}: None", flush=True)
+                return
+            tf = t.detach().float()
+            has_nan = bool(torch.isnan(tf).any().item())
+            has_inf = bool(torch.isinf(tf).any().item())
+            mn = tf.min().item() if tf.numel() > 0 else 0.0
+            mx = tf.max().item() if tf.numel() > 0 else 0.0
+            mean = tf.mean().item() if tf.numel() > 0 else 0.0
+            std = tf.std().item() if tf.numel() > 0 else 0.0
+            print(
+                f"[NUMERIC] {tag}: shape={tuple(t.shape)} dtype={t.dtype} "
+                f"min={mn:+.3e} max={mx:+.3e} mean={mean:+.3e} std={std:+.3e} "
+                f"nan={has_nan} inf={has_inf}",
+                flush=True,
+            )
+
+        if _numeric_debug:
+            _probe("embed", hidden_states)
+
         aux_hidden_states = []
         for idx in range(self.start_layer, self.end_layer):
             layer = self.layers[idx]
@@ -2153,6 +2181,9 @@ class DeepseekV2Model(nn.Module):
                     hidden_states if residual is None else hidden_states + residual
                 )
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if _numeric_debug:
+                _probe(f"layer{idx}.h", hidden_states)
+                _probe(f"layer{idx}.r", residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -2160,6 +2191,8 @@ class DeepseekV2Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if _numeric_debug:
+            _probe("final_norm", hidden_states)
 
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
