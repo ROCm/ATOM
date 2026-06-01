@@ -118,7 +118,7 @@ def _mrope_qk_tiled_kernel(
     pos_stride_row: tl.constexpr,
     cos_stride_pos: tl.constexpr,
     sin_stride_pos: tl.constexpr,
-    num_tokens: tl.constexpr,
+    num_tokens,
     num_q_heads: tl.constexpr,
     num_k_heads: tl.constexpr,
     head_size: tl.constexpr,
