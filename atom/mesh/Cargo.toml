@@ -75,6 +75,7 @@ prost-types = "0.14.1"
 tonic-prost = "0.14.2"
 once_cell = "1.21.3"
 pyo3 = { version = "0.28.2", features = ["auto-initialize"] }
+portpicker = "0.1"
 
 
 [build-dependencies]
@@ -84,7 +85,6 @@ toml = "0.9"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
 tonic-v12 = { version = "0.12.3", package = "tonic" }

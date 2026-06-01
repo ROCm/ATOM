@@ -7,6 +7,7 @@
 
 use std::{
     convert::Infallible,
+    net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
@@ -24,7 +25,7 @@ use futures_util::stream;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
-use super::{mock_test_case::MockTestCase, ReplayCaseStore};
+use super::{MockCase, ReplayCaseStore};
 
 #[derive(Clone)]
 struct VirtualWorkerState {
@@ -42,7 +43,7 @@ pub struct VirtualWorker {
 
 impl VirtualWorker {
     /// Create a worker that can replay a single fixture case.
-    pub fn new(case: MockTestCase) -> Self {
+    pub fn new(case: MockCase) -> Self {
         Self::with_replay_case_store(ReplayCaseStore::new(vec![case]))
     }
 
@@ -59,8 +60,32 @@ impl VirtualWorker {
 
     /// Start the HTTP worker on a random local port and wait for readiness.
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        self.start_with_bind_addr(("127.0.0.1", 0)).await
+    }
+
+    /// Start the HTTP worker on a deterministic host and port.
+    pub async fn start_on(
+        &mut self,
+        host: &str,
+        port: u16,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        self.start_with_bind_addr((host, port)).await
+    }
+
+    async fn start_with_bind_addr(
+        &mut self,
+        bind_addr: (&str, u16),
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
+        self.start_with_listener(listener, addr).await
+    }
+
+    async fn start_with_listener(
+        &mut self,
+        listener: tokio::net::TcpListener,
+        addr: SocketAddr,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("http://{}", addr);
         let state = VirtualWorkerState {
             replay_case_store: Arc::clone(&self.replay_case_store),
@@ -254,7 +279,7 @@ async fn replay(endpoint: &str, state: VirtualWorkerState, body: Value) -> Respo
     (status, Json(case.expected_response.body.clone())).into_response()
 }
 
-fn streaming_response(case: &MockTestCase) -> Response {
+fn streaming_response(case: &MockCase) -> Response {
     let body = case.expected_response.body.clone();
     let mut events = match body {
         Value::Array(items) => items

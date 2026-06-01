@@ -1,9 +1,6 @@
-//! End-to-end harness for fixture-driven Atomesh tests.
-//!
-//! `TestHarness` starts virtual backend workers, registers them through the
-//! normal worker initialization path, builds the real Axum app, sends a
-//! fixture-generated client request, and returns the observed response plus the
-//! worker path for assertions.
+//! End-to-end harness for fixture-driven Atomesh mocker tests.
+
+use std::sync::Arc;
 
 use http_body_util::BodyExt;
 use mesh::{
@@ -13,15 +10,15 @@ use mesh::{
     tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry},
 };
 use serde_json::Value;
-use std::sync::Arc;
 use tower::ServiceExt;
 
-use crate::common::{create_test_context, create_test_context_with_parsers, test_app};
-
-use super::{
-    golden_assert::{assert_any_json_contains, GoldenAssert},
-    mock_test_case::{BackendFixture, ConnectionModeFixture, MockTestCase, WorkerKindFixture},
-    VirtualGrpcWorker, VirtualRequest, VirtualWorker,
+use crate::{
+    app_helpers::{
+        create_mocker_app_with_context, create_mocker_context,
+        create_mocker_context_with_parsers,
+    },
+    BackendFixture, ConnectionModeFixture, MockCase, VirtualRequest, VirtualResponse,
+    VirtualWorkerPool, VirtualWorkerPoolConfig, VirtualWorkerSpec, WorkerKindFixture,
 };
 
 /// Result observed after one fixture has gone through Atomesh.
@@ -30,6 +27,7 @@ pub struct TestHarnessResult {
     pub status: u16,
     pub body: Value,
     pub stream_events: Vec<Value>,
+    pub response: VirtualResponse,
     pub worker_path: Vec<String>,
     pub router_mode: String,
     pub connection_mode: String,
@@ -41,18 +39,8 @@ pub struct TestHarnessResult {
 
 impl TestHarnessResult {
     /// Assert HTTP status and stable response fields against the fixture.
-    pub fn assert_response(&self, case: &MockTestCase) {
-        if case.is_streaming() {
-            assert_eq!(self.status, case.expected_response.status);
-            assert_any_json_contains(&self.stream_events, &case.expected_response.body);
-            return;
-        }
-
-        GoldenAssert {
-            expected_status: case.expected_response.status,
-            expected_body: case.expected_response.body.clone(),
-        }
-        .assert_response(self.status, &self.body);
+    pub fn assert_response(&self, case: &MockCase) {
+        self.response.assert_matches(case).unwrap();
     }
 
     /// Assert Atomesh actually routed to the expected virtual worker endpoint.
@@ -83,13 +71,7 @@ impl TestHarnessResult {
     }
 
     /// Assert the runtime router and worker-pool state implied by the fixture.
-    ///
-    /// These checks protect the harness from silently exercising the wrong
-    /// Atomesh branch. A response can be correct even if the fixture accidentally
-    /// built a regular router instead of PD, or HTTP instead of gRPC; this
-    /// assertion ties the observed runtime config and registry state back to the
-    /// route metadata.
-    pub fn assert_runtime_state(&self, case: &MockTestCase) {
+    pub fn assert_runtime_state(&self, case: &MockCase) {
         let expected_worker_count = match case.route.worker_kind {
             WorkerKindFixture::Regular => 1,
             WorkerKindFixture::PrefillDecode => 2,
@@ -131,7 +113,7 @@ impl TestHarnessResult {
         assert_eq!(
             self.registered_workers, expected_worker_count,
             "fixture {} registered unexpected worker count",
-            case.name
+            case.name,
         );
         assert_eq!(
             self.healthy_workers, expected_worker_count,
@@ -143,73 +125,43 @@ impl TestHarnessResult {
 
 /// Runs one fixture case through a real Atomesh app and virtual backend pool.
 pub struct TestHarness {
-    case: MockTestCase,
-}
-
-enum StartedVirtualWorker {
-    Http(VirtualWorker),
-    Grpc(VirtualGrpcWorker),
-}
-
-impl StartedVirtualWorker {
-    fn url(&self) -> String {
-        match self {
-            Self::Http(worker) => worker.url.clone().unwrap(),
-            Self::Grpc(worker) => worker.url.clone().unwrap(),
-        }
-    }
-
-    fn request_log(&self) -> Vec<String> {
-        match self {
-            Self::Http(worker) => worker.request_log(),
-            Self::Grpc(worker) => worker.request_log(),
-        }
-    }
-
-    async fn stop(&mut self) {
-        match self {
-            Self::Http(worker) => worker.stop().await,
-            Self::Grpc(worker) => worker.stop().await,
-        }
-    }
+    case: MockCase,
 }
 
 impl TestHarness {
-    pub fn new(case: MockTestCase) -> Self {
+    pub fn new(case: MockCase) -> Self {
         Self { case }
     }
 
-    pub fn case(&self) -> &MockTestCase {
+    pub fn case(&self) -> &MockCase {
         &self.case
     }
 
     /// Execute the full fixture flow through Atomesh and virtual workers.
     pub async fn run(&self) -> Result<TestHarnessResult, Box<dyn std::error::Error>> {
-        // Stage 1: start virtual backend workers from fixture route metadata.
-        // Regular mode starts one worker; PD mode starts a prefill/decode pair.
-        let mut workers = self.start_virtual_workers().await?;
-        let worker_urls = workers
-            .iter()
-            .map(StartedVirtualWorker::url)
-            .collect::<Vec<_>>();
+        let mut workers = self.start_virtual_worker_pool().await?;
+        let result = self.run_with_worker_pool(&workers).await;
+        workers.stop().await;
+        result
+    }
 
-        // Stage 2: build the same app context pieces Atomesh uses at runtime,
-        // then submit the production worker-initialization job. This is what
-        // triggers Atomesh's own worker health/model-info probes and registry
-        // insertion instead of manually registering fake workers.
+    async fn run_with_worker_pool(
+        &self,
+        workers: &VirtualWorkerPool,
+    ) -> Result<TestHarnessResult, Box<dyn std::error::Error>> {
+        let worker_urls = workers.urls();
+
         let config = self.router_config(&worker_urls);
         let app_context = match self.case.route.connection_mode {
-            ConnectionModeFixture::Http => create_test_context(config.clone()).await,
+            ConnectionModeFixture::Http => create_mocker_context(config.clone()).await,
             ConnectionModeFixture::Grpc => {
-                let app_context = create_test_context_with_parsers(config.clone()).await;
+                let app_context = create_mocker_context_with_parsers(config.clone()).await;
                 register_mock_tokenizer(&app_context.tokenizer_registry, &self.case.model).await?;
                 app_context
             }
         };
         initialize_workers(&app_context, &config, worker_urls.len()).await?;
 
-        // Capture runtime router state from the actual config/context used by
-        // RouterFactory, not from the fixture declaration.
         let router_mode = format!("{:?}", config.mode);
         let connection_mode = format!("{:?}", config.connection_mode);
         let policy = format!("{:?}", config.policy);
@@ -221,47 +173,24 @@ impl TestHarness {
             .filter(|worker| worker.is_healthy())
             .count();
 
-        // Stage 3: create the real router and Axum app from the initialized
-        // context. Requests below enter through `server::build_app`, not by
-        // directly calling router internals.
         let router = RouterFactory::create_router(&app_context).await?;
         let router: Arc<dyn RouterTrait> = Arc::from(router);
-        let app = test_app::create_test_app_with_context(router, app_context);
+        let app = create_mocker_app_with_context(router, app_context);
 
-        // Stage 4: convert the fixture into a real Atomesh API request and send
-        // it through the app. Atomesh will select workers and forward the
-        // request to the virtual backend using the fixture's connection mode.
         let request = VirtualRequest::from_case(&self.case).into_axum_request();
         let response = app.oneshot(request).await?;
 
-        // Stage 5: collect the response into assertion-friendly forms. For
-        // streaming responses we keep parsed SSE JSON events in addition to the
-        // raw response body fallback.
         let status = response.status().as_u16();
         let bytes = response.into_body().collect().await?.to_bytes();
         let response_text = String::from_utf8_lossy(&bytes).to_string();
-        let stream_events = parse_sse_events(&response_text);
-        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(response_text));
-
-        // Stage 6: collect the worker-side request log. This includes startup
-        // and registration probes (`/health`, `/get_model_info`) plus the
-        // business endpoint, so tests can assert routing shape when needed.
-        let worker_path = workers
-            .iter()
-            .flat_map(StartedVirtualWorker::request_log)
-            .collect::<Vec<_>>();
-
-        // Stage 7: stop virtual workers before returning the result. Keeping
-        // teardown inside the harness keeps individual fixture tests small.
-        for worker in &mut workers {
-            worker.stop().await;
-        }
+        let response = VirtualResponse::from_parts(status, response_text);
 
         Ok(TestHarnessResult {
             status,
-            body,
-            stream_events,
-            worker_path,
+            body: response.body.clone(),
+            stream_events: response.stream_events.clone(),
+            response,
+            worker_path: workers.request_logs(),
             router_mode,
             connection_mode,
             policy,
@@ -271,38 +200,26 @@ impl TestHarness {
         })
     }
 
-    async fn start_virtual_workers(
+    async fn start_virtual_worker_pool(
         &self,
-    ) -> Result<Vec<StartedVirtualWorker>, Box<dyn std::error::Error>> {
-        // The fixture's worker kind decides the topology under test.
+    ) -> Result<VirtualWorkerPool, Box<dyn std::error::Error>> {
         let worker_count = match self.case.route.worker_kind {
             WorkerKindFixture::Regular => 1,
             WorkerKindFixture::PrefillDecode => 2,
         };
-        let mut workers = Vec::with_capacity(worker_count);
+        let base_port = pick_base_port(worker_count).expect("no free base port for worker pool");
+        let specs = (0..worker_count)
+            .map(|_| VirtualWorkerSpec::from_case(self.case.clone()))
+            .collect();
 
-        for _ in 0..worker_count {
-            let worker = match self.case.route.connection_mode {
-                ConnectionModeFixture::Http => {
-                    let mut worker = VirtualWorker::new(self.case.clone());
-                    worker.start().await?;
-                    StartedVirtualWorker::Http(worker)
-                }
-                ConnectionModeFixture::Grpc => {
-                    let mut worker = VirtualGrpcWorker::new(self.case.clone())?;
-                    worker.start().await?;
-                    StartedVirtualWorker::Grpc(worker)
-                }
-            };
-            workers.push(worker);
-        }
-
-        Ok(workers)
+        VirtualWorkerPool::start(
+            VirtualWorkerPoolConfig::new("127.0.0.1", base_port),
+            specs,
+        )
+        .await
     }
 
     fn router_config(&self, worker_urls: &[String]) -> RouterConfig {
-        // Keep the harness config minimal and deterministic: HTTP transport,
-        // round-robin policy, no retries, and random local router port.
         let mut builder = RouterConfig::builder()
             .backend(match self.case.route.backend {
                 BackendFixture::Sglang => BackendType::Sglang,
@@ -336,15 +253,19 @@ impl TestHarness {
     }
 }
 
-fn parse_sse_events(response_text: &str) -> Vec<Value> {
-    // Axum's collected SSE body is line-oriented (`data: ...`). Ignore
-    // terminal `[DONE]` markers and keep only JSON payloads for golden asserts.
-    response_text
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
-        .collect()
+fn pick_base_port(worker_count: usize) -> Option<u16> {
+    for _ in 0..32 {
+        let base_port = portpicker::pick_unused_port()?;
+        let last_port =
+            base_port.checked_add(u16::try_from(worker_count.saturating_sub(1)).ok()?)?;
+        let listeners = (base_port..=last_port)
+            .map(|port| std::net::TcpListener::bind(("127.0.0.1", port)))
+            .collect::<Result<Vec<_>, _>>();
+        if listeners.is_ok() {
+            return Some(base_port);
+        }
+    }
+    None
 }
 
 async fn register_mock_tokenizer(
@@ -369,8 +290,6 @@ async fn initialize_workers(
         return Ok(());
     }
 
-    // Worker initialization is intentionally performed through the job queue so
-    // tests exercise the same registration workflow as server startup.
     let job_queue = app_context
         .worker_job_queue
         .get()
@@ -381,8 +300,6 @@ async fn initialize_workers(
         })
         .await?;
 
-    // Use the same registry readiness signal as production startup instead of
-    // sleeping for a fixed duration.
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
     loop {
         let healthy_workers = app_context
@@ -405,5 +322,152 @@ async fn initialize_workers(
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{MockCase, TestHarness, TestHarnessResult};
+
+    fn fixture_path(file_name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(file_name)
+    }
+
+    fn load_fixture_case(file_name: &str) -> MockCase {
+        MockCase::from_fixture(fixture_path(file_name)).unwrap()
+    }
+
+    fn log_case_result(case: &MockCase, result: &TestHarnessResult) {
+        println!(
+            concat!(
+                "fixture_case={} endpoint={} status={} ",
+                "router_mode={} connection_mode={} policy={} ",
+                "worker_urls={:?} registered_workers={} healthy_workers={} ",
+                "worker_path={:?} stream_events={}"
+            ),
+            case.name,
+            case.endpoint,
+            result.status,
+            result.router_mode,
+            result.connection_mode,
+            result.policy,
+            result.worker_urls,
+            result.registered_workers,
+            result.healthy_workers,
+            result.worker_path,
+            result.stream_events.len()
+        );
+    }
+
+    fn assert_harness_runtime(case: &MockCase, result: &TestHarnessResult) {
+        result.assert_runtime_state(case);
+    }
+
+    #[tokio::test]
+    async fn test_atomesh_harness_http_regular_chat() {
+        let case = load_fixture_case("http_regular_chat.json");
+        let harness = TestHarness::new(case.clone());
+
+        let result = harness.run().await.unwrap();
+        log_case_result(&case, &result);
+
+        assert_harness_runtime(&case, &result);
+        result.assert_response(&case);
+        result.assert_worker_path_contains("/v1/chat/completions");
+    }
+
+    #[tokio::test]
+    async fn test_atomesh_harness_http_regular_generate() {
+        let case = load_fixture_case("http_regular_generate.json");
+        let harness = TestHarness::new(case.clone());
+
+        let result = harness.run().await.unwrap();
+        log_case_result(&case, &result);
+
+        assert_harness_runtime(&case, &result);
+        result.assert_response(&case);
+        result.assert_worker_path_contains("/generate");
+    }
+
+    #[tokio::test]
+    async fn test_atomesh_harness_http_regular_chat_streaming() {
+        let case = load_fixture_case("http_regular_chat_streaming.json");
+        let harness = TestHarness::new(case.clone());
+
+        let result = harness.run().await.unwrap();
+        log_case_result(&case, &result);
+
+        assert_harness_runtime(&case, &result);
+        result.assert_response(&case);
+        result.assert_worker_path_contains("/v1/chat/completions");
+    }
+
+    #[tokio::test]
+    async fn test_atomesh_harness_http_regular_completion() {
+        let case = load_fixture_case("http_regular_completion.json");
+        let harness = TestHarness::new(case.clone());
+
+        let result = harness.run().await.unwrap();
+        log_case_result(&case, &result);
+
+        assert_harness_runtime(&case, &result);
+        result.assert_response(&case);
+        result.assert_worker_path_contains("/v1/completions");
+    }
+
+    #[tokio::test]
+    async fn test_atomesh_harness_http_pd_chat() {
+        let case = load_fixture_case("http_pd_chat.json");
+        let harness = TestHarness::new(case.clone());
+
+        let result = harness.run().await.unwrap();
+        log_case_result(&case, &result);
+
+        assert_harness_runtime(&case, &result);
+        result.assert_response(&case);
+        result.assert_worker_path_count_at_least("/v1/chat/completions", 2);
+    }
+
+    #[tokio::test]
+    async fn test_atomesh_harness_grpc_regular_generate() {
+        let case = load_fixture_case("grpc_regular_generate.json");
+        let harness = TestHarness::new(case.clone());
+
+        let result = harness.run().await.unwrap();
+        log_case_result(&case, &result);
+
+        assert_harness_runtime(&case, &result);
+        result.assert_response(&case);
+        result.assert_worker_path_contains("generate");
+    }
+
+    #[tokio::test]
+    async fn test_atomesh_harness_grpc_regular_generate_vllm() {
+        let case = load_fixture_case("grpc_regular_generate_vllm.json");
+        let harness = TestHarness::new(case.clone());
+
+        let result = harness.run().await.unwrap();
+        log_case_result(&case, &result);
+
+        assert_harness_runtime(&case, &result);
+        result.assert_response(&case);
+        result.assert_worker_path_contains("generate");
+    }
+
+    #[tokio::test]
+    async fn test_atomesh_harness_grpc_pd_generate() {
+        let case = load_fixture_case("grpc_pd_generate.json");
+        let harness = TestHarness::new(case.clone());
+
+        let result = harness.run().await.unwrap();
+        log_case_result(&case, &result);
+
+        assert_harness_runtime(&case, &result);
+        result.assert_response(&case);
+        result.assert_worker_path_count_at_least("generate", 2);
     }
 }

@@ -8,35 +8,34 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::mock_test_case::MockTestCase;
+use super::MockCase;
 
 /// Collection of fixture cases a virtual worker can replay.
 #[derive(Clone, Debug)]
 pub struct ReplayCaseStore {
-    cases: Vec<MockTestCase>,
+    cases: Vec<MockCase>,
 }
 
 impl ReplayCaseStore {
-    pub fn new(cases: Vec<MockTestCase>) -> Self {
+    pub fn new(cases: Vec<MockCase>) -> Self {
         Self { cases }
     }
 
     /// Convenience loader for tests that only need one fixture.
     pub fn from_fixture(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self::new(vec![MockTestCase::from_fixture(path)?]))
+        Ok(Self::new(vec![MockCase::from_fixture(path)?]))
     }
 
     /// Find the fixture that corresponds to a request forwarded by Atomesh.
-    pub fn match_request(&self, endpoint: &str, body: &Value) -> Option<&MockTestCase> {
+    pub fn match_request(&self, endpoint: &str, body: &Value) -> Option<&MockCase> {
         self.cases.iter().find(|case| {
             case.endpoint == endpoint
-                && prompt_text(&case.request).is_none_or(|expected| {
-                    prompt_text(body).is_some_and(|actual| actual == expected)
-                })
+                && prompt_text(&case.request)
+                    .is_none_or(|expected| prompt_text(body).is_some_and(|actual| actual == expected))
         })
     }
 
-    pub fn first(&self) -> Option<&MockTestCase> {
+    pub fn first(&self) -> Option<&MockCase> {
         self.cases.first()
     }
 }
