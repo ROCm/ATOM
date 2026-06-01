@@ -82,6 +82,7 @@ class LLMEngine:
         prompt_or_tokens_list: List[Union[str, List[int]]],
         sampling_params_list: SamplingParams | List[SamplingParams],
         stream_callback=None,
+        multimodal_data_list: List[dict] | None = None,
         request_ids: Optional[list[str]] = None,
     ):
         # if sampling params is not list, use it for all prompts
@@ -109,6 +110,17 @@ class LLMEngine:
         else:
             stream_callback_iter = itertools.repeat(None)
 
+        # Handle multimodal data
+        if multimodal_data_list is not None:
+            if len(prompt_or_tokens_list) != len(multimodal_data_list):
+                raise ValueError(
+                    f"number of elements in prompt_or_tokens_list and multimodal_data_list is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(multimodal_data_list)=}"
+                )
+            mm_data_iter = multimodal_data_list
+        else:
+            mm_data_iter = itertools.repeat(None)
+
         # Handle request_ids
         if request_ids is not None:
             if len(request_ids) != len(prompt_or_tokens_list):
@@ -121,16 +133,18 @@ class LLMEngine:
             request_id_iter = itertools.repeat(None)
 
         reqs = []
-        for prompt, sampling_param, callback, request_id in zip(
+        for prompt, sampling_param, callback, mm_data, request_id in zip(
             prompt_or_tokens_list,
             sampling_params_iter,
             stream_callback_iter,
+            mm_data_iter,
             request_id_iter,
         ):
             req = self.io_processor.preprocess(
                 prompt,
                 sampling_param,
                 stream_callback=callback,
+                multimodal_data=mm_data,
                 request_id=request_id,
             )
             reqs.append(req)
@@ -286,6 +300,7 @@ class InputOutputProcessor:
         sampling_params: SamplingParams,
         stream_callback=None,
         kv_transfer_params=None,
+        multimodal_data=None,
         request_id: Optional[str] = None,
     ):
         """responsible for:
@@ -306,6 +321,7 @@ class InputOutputProcessor:
             sampling_params,
             stream_callback=stream_callback,
             kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
             parent_request_id=request_id,
         )
         return seqs[0]

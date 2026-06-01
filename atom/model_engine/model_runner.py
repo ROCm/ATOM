@@ -1571,7 +1571,7 @@ class ModelRunner:
         return True
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
-        dp_size = self.config.parallel_config.data_parallel_size
+        dp_size = get_dp_group().world_size
         dp_rank = self.config.parallel_config.data_parallel_rank
 
         # For DP: Don't pad when setting enforce_eager.
@@ -1640,7 +1640,7 @@ class ModelRunner:
         num_input_tokens = batch.total_tokens_num
         is_prefill = batch.total_tokens_num_prefill > 0
         tbo_on = self.config.enable_tbo
-        dp_size = self.config.parallel_config.data_parallel_size
+        dp_size = get_dp_group().world_size
 
         # Rank-local TBO precompute (needed for both dp==1 fast path and
         # the cross-DP packed gather below).

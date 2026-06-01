@@ -48,6 +48,9 @@ class Sequence:
         parent_request_id: Optional[str] = None,
         sibling_index: int = 0,
         request_id: Optional[str] = None,
+        multimodal_data: Optional[dict] = None,
+        mrope_positions: Optional[np.ndarray] = None,
+        mrope_position_delta: int = 0,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
@@ -90,6 +93,7 @@ class Sequence:
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
         self.is_first_decode = False
+        self.prefix_hashes_published = False
         self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
         self.logprobs: list[float] = []
         # stream callback
