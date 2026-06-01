@@ -606,27 +606,25 @@
 │     └─ return &quot;atom.plugin.vllm.platform.ATOMPlatform&quot;
 │
 ├─ 2. register_model()
-│     ├─ Override ModelRegistry for supported architectures
-│     ├─ patch_vllm_mla_attention()
-│     └─ Patch Attention.process_weights_after_loading
+│     └─ Override ModelRegistry for supported architectures
 │
 ├─ 3. vLLM loads model → ATOMModelBase.__init__()
 │     ├─ generate_atom_config_for_plugin_mode(vllm_config)
 │     │     └─ _generate_atom_config_from_vllm_config()
 │     │           ├─ Build PluginConfig (vLLM-specific fields)
 │     │           └─ Build ATOM Config (model, TP, KV cache, etc.)
-│     ├─ set_attn_cls() → ops.Attention = PagedAttention
+│     ├─ Attention dispatcher selects AttentionForVllm
 │     ├─ init_aiter_dist() → initialize AITER distributed env
 │     └─ Construct ATOM model (e.g., DeepseekV3ForCausalLM)
 │
-├─ 4. ATOMPlatform.get_attn_backend_cls()
-│     ├─ MLA model → AiterMLABackend
-│     └─ MHA model → AiterBackend
+├─ 4. AttentionForVllm layer construction
+│     ├─ MLA model → AiterMlaBackendForVllm
+│     └─ MHA model → AiterMhaBackendForVllm
 │
 └─ 5. Forward pass
       ├─ vLLM calls ATOMModelBase.forward()
       ├─ Delegates to self.model(input_ids, positions, ...)
-      └─ Attention uses ATOM&#39;s AITER kernels via plugin decorators
+      └─ AttentionForVllm uses ATOM&#39;s AITER kernels
 </pre></div>
 </div>
 </section>
@@ -648,11 +646,8 @@
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom.plugin.vllm.model_wrapper</span></code></p></td>
 <td><p>ATOM model wrappers used by vLLM model construction</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom.model_ops.attentions.aiter_attention</span></code></p></td>
-<td><p>ATOM MHA attention backend for vLLM plugin mode</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom.model_ops.attentions.aiter_mla</span></code></p></td>
-<td><p>ATOM MLA attention backend for vLLM plugin mode</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom.plugin.vllm.attention</span></code></p></td>
+<td><p>vLLM-specific ATOM attention layers, backends, metadata, and impls</p></td>
 </tr>
 </tbody>
 </table>
@@ -664,16 +659,13 @@
 ├── prepare.py               # Framework detection and state management
 ├── config.py                # PluginConfig + vLLM-to-ATOM config translation
 ├── register.py              # set_attn_cls, init_aiter_dist
-├── attention.py             # vLLM attention metadata builders and backend decorators
-├── attention_mha.py         # MHA (PagedAttention) plugin-mode decorator
-├── attention_mla.py         # MLA plugin-mode methods and decorator
-├── moe.py                   # FusedMoE decorator for plugin mode
 └── vllm/
     ├── __init__.py           # vLLM sub-package exports
     ├── register.py           # register_platform(), register_model()
     ├── platform.py           # ATOMPlatform (RocmPlatform subclass)
     ├── model_wrapper.py      # ATOMModelBase, ATOMForCausalLM, ATOMMoEForCausalLM
-    └── mla_patch.py          # Patches vLLM MLAAttention for ATOM MLA integration
+    ├── moe.py                # vLLM-specific FusedMoE name adaptation
+    └── attention/            # vLLM-specific ATOM attention stack
 </pre></div>
 </div>
 </section>
@@ -730,11 +722,6 @@ compilation and plugin settings.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">Any</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
 <td><p>vLLM quantization config</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vllm_use_atom_attention</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
-<td><p>Whether ATOM attention is active</p></td>
 </tr>
 </tbody>
 </table>
@@ -818,15 +805,13 @@ independent of vLLM’s compilation backend.</p>
 <hr class="docutils" />
 <section id="attention-integration">
 <h2>3. Attention Integration<a class="headerlink" href="#attention-integration" title="Link to this heading"></a></h2>
-<p>vLLM’s OOT plugin interface allows an external platform to supply its own
-attention backend. ATOM hooks into this by overriding
-<code class="docutils literal notranslate"><span class="pre">ATOMPlatform.get_attn_backend_cls()</span></code> — the only contract point between vLLM and
-the plugin for attention dispatch.</p>
+<p>ATOM’s vLLM plugin constructs ATOM-owned attention layers directly from the
+ATOM model implementation. These layers implement vLLM’s <code class="docutils literal notranslate"><span class="pre">AttentionLayerBase</span></code>
+contract and return their ATOM-vLLM backend via <code class="docutils literal notranslate"><span class="pre">get_attn_backend()</span></code>.</p>
 <section id="how-the-backend-is-selected">
 <h3>3.1 How the Backend Is Selected<a class="headerlink" href="#how-the-backend-is-selected" title="Link to this heading"></a></h3>
-<p>When vLLM resolves the attention backend for a model, it calls the platform’s
-<code class="docutils literal notranslate"><span class="pre">get_attn_backend_cls()</span></code>. ATOM’s implementation returns one of two backends based
-on the model’s attention type:</p>
+<p>When vLLM discovers attention-like layers through <code class="docutils literal notranslate"><span class="pre">static_forward_context</span></code>, each
+ATOM-vLLM attention layer returns its backend based on the model’s attention type:</p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Model Attention Type</p></th>
@@ -836,18 +821,18 @@ on the model’s attention type:</p>
 </thead>
 <tbody>
 <tr class="row-even"><td><p>MLA (<code class="docutils literal notranslate"><span class="pre">use_mla</span> <span class="pre">==</span> <span class="pre">True</span></code>)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">AiterMLABackend</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AiterMlaBackendForVllm</span></code></p></td>
 <td><p>DeepSeek-R1, Kimi-K2</p></td>
 </tr>
 <tr class="row-odd"><td><p>Standard MHA</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">AiterBackend</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AiterMhaBackendForVllm</span></code></p></td>
 <td><p>Qwen3, Llama</p></td>
 </tr>
 </tbody>
 </table>
-<p>Setting <code class="docutils literal notranslate"><span class="pre">ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1</span></code> causes <code class="docutils literal notranslate"><span class="pre">ATOMPlatform</span></code> to delegate
-back to the parent <code class="docutils literal notranslate"><span class="pre">RocmPlatform.get_attn_backend_cls()</span></code>, restoring vLLM’s
-built-in ROCm attention path.</p>
+<p>ATOM-vLLM no longer constructs vLLM’s standard <code class="docutils literal notranslate"><span class="pre">Attention</span></code> / <code class="docutils literal notranslate"><span class="pre">MLAAttention</span></code>, so
+there is no supported mode to disable only ATOM attention while keeping ATOM
+models active. Use <code class="docutils literal notranslate"><span class="pre">ATOM_DISABLE_VLLM_PLUGIN=1</span></code> for pure vLLM.</p>
 </section>
 </section>
 <section id="supported-models">
@@ -966,9 +951,6 @@ with the AITER library bundled in the environment. To run pure vLLM without ATOM
 set environment variables before launching:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Disable the entire ATOM plugin (platform + models)</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">ATOM_DISABLE_VLLM_PLUGIN</span><span class="o">=</span><span class="m">1</span>
-
-<span class="c1"># Or disable only ATOM attention (keep ATOM models but use vLLM attention)</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">ATOM_DISABLE_VLLM_PLUGIN_ATTENTION</span><span class="o">=</span><span class="m">1</span>
 </pre></div>
 </div>
 </section>
@@ -990,12 +972,7 @@ set environment variables before launching:</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (false)</p></td>
 <td><p>Set to <code class="docutils literal notranslate"><span class="pre">1</span></code> to disable the entire ATOM vLLM plugin (platform + model registration). vLLM runs in pure ROCm mode.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_DISABLE_VLLM_PLUGIN_ATTENTION</span></code></p></td>
-<td><p>bool</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (false)</p></td>
-<td><p>Set to <code class="docutils literal notranslate"><span class="pre">1</span></code> to disable only ATOM’s attention backends. ATOM models are still used, but attention falls back to vLLM’s default ROCm backend.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION</span></code></p></td>
 <td><p>bool</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (false)</p></td>
 <td><p>Enable QK-norm + RoPE + cache + quant fusion in attention. Recommended for Qwen3-MoE models.</p></td>
