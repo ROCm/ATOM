@@ -16,6 +16,7 @@ The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 
 vllm serve zai-org/GLM-4.7-FP8 \
     --host localhost \
@@ -35,6 +36,7 @@ vllm serve zai-org/GLM-4.7-FP8 \
 
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 
 vllm serve zai-org/GLM-4.7-FP8 \
     --host localhost \

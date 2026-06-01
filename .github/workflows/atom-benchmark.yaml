@@ -39,7 +39,11 @@ on:
         type: boolean
         default: true
       MiniMax-M2.7:
-        description: "Benchmark MiniMax-M2.7 (+ MXFP4)"
+        description: "Benchmark MiniMax-M2.7"
+        type: boolean
+        default: true
+      MiniMax-M2.7-MXFP4:
+        description: "Benchmark MiniMax-M2.7-MXFP4"
         type: boolean
         default: true
       qwen35-397b-fp8:
@@ -143,7 +147,20 @@ jobs:
           if event == "schedule":
               filtered = models
           else:
-              filtered = [m for m in models if inputs.get(m["prefix"], True)]
+              # Default False: a model whose `prefix` has no matching
+              # workflow_dispatch input must be opted in explicitly,
+              # otherwise an unchecked box silently still ran it (the old
+              # `.get(prefix, True)` returned True for missing keys).
+              filtered = []
+              missing = set()
+              for m in models:
+                  if m["prefix"] in inputs:
+                      if inputs[m["prefix"]]:
+                          filtered.append(m)
+                  else:
+                      missing.add(m["prefix"])
+              if missing:
+                  print(f"WARN: prefixes with no workflow input (skipped): {sorted(missing)}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event}: {len(filtered)}/{len(models)} models enabled")
@@ -168,14 +185,25 @@ jobs:
           - model: { suffix: "-mtp3" }
             config: { concurrency: 2 }
           # Skip low-concurrency DP-attention runs (only run c>=64)
-          - model: { suffix: "-dp" }
+          - model: { suffix: "-dpa" }
+            config: { concurrency: 2 }
+          - model: { suffix: "-dpa" }
             config: { concurrency: 4 }
-          - model: { suffix: "-dp" }
+          - model: { suffix: "-dpa" }
             config: { concurrency: 8 }
-          - model: { suffix: "-dp" }
+          - model: { suffix: "-dpa" }
             config: { concurrency: 16 }
-          - model: { suffix: "-dp" }
+          - model: { suffix: "-dpa" }
             config: { concurrency: 32 }
+          # High-concurrency (512/1024) only for DP-attention; cap others at 256
+          - model: { suffix: "" }
+            config: { concurrency: 512 }
+          - model: { suffix: "" }
+            config: { concurrency: 1024 }
+          - model: { suffix: "-mtp3" }
+            config: { concurrency: 512 }
+          - model: { suffix: "-mtp3" }
+            config: { concurrency: 1024 }
 
     runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}
 
