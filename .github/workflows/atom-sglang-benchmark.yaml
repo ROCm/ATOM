@@ -685,6 +685,7 @@ jobs:
       contents: write
     env:
       MODEL_NAME: ${{ matrix.model.display }}
+      CI_RUNNER: ${{ matrix.model.runner }}
       DASHBOARD_MODEL_NAME: ${{ matrix.model.dashboard_model || '' }}
       MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
       MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
@@ -1164,6 +1165,7 @@ jobs:
             GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            CI_RUNNER="${CI_RUNNER}" \
             RESULT_PATH="$f" \
             python3 -c "
           import json, os
@@ -1173,6 +1175,7 @@ jobs:
           d['gpu_name'] = os.environ.get('GPU_NAME', '')
           d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
           d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
+          d['ci_runner'] = os.environ.get('CI_RUNNER', '')
           with open(p, 'w') as f:
               json.dump(d, f, indent=2)
           "
@@ -1350,6 +1353,25 @@ jobs:
           def slugify(text: str) -> str:
               return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "unknown"
 
+          def hardware_from_payload(payload: dict) -> str:
+              text = " ".join(
+                  str(payload.get(key, ""))
+                  for key in ("gpu_name", "ci_runner", "benchmark_runner")
+              ).lower()
+              if "mi355" in text or "mi35x" in text:
+                  return "mi355x"
+              if "mi325" in text:
+                  return "mi325x"
+              if "mi308" in text:
+                  return "mi308x"
+              if "mi300" in text:
+                  return "mi300x"
+              if "mi250" in text:
+                  return "mi250x"
+              if "mi210" in text:
+                  return "mi210"
+              return "unknown"
+
           def precision_from_model(model: str):
               upper = model.upper()
               if "MXFP4" in upper or "FP4" in upper:
@@ -1403,12 +1425,13 @@ jobs:
               atom_source_sha = str(payload.get("atom_source_sha", "")) or "unknown"
               sha7 = atom_source_sha[:7] if atom_source_sha else "unknown"
               day = time.strftime("%Y-%m-%d", time.gmtime())
-              grouped[(day, sha7, backend, model, isl, osl)].append(
+              hardware = hardware_from_payload(payload)
+              grouped[(day, sha7, hardware, backend, model, isl, osl)].append(
                   (path, payload, precision, concurrency, ratio)
               )
 
           written_files = set()
-          for (day, sha7, backend, model, isl, osl), entries in sorted(grouped.items()):
+          for (day, sha7, hardware, backend, model, isl, osl), entries in sorted(grouped.items()):
               entries.sort(key=lambda item: (item[3], item[4]))
               timestamp_ms = int(time.time() * 1000)
               precision = entries[0][2]
@@ -1434,7 +1457,7 @@ jobs:
               model_slug = slugify(model)
               backend_slug = slugify(backend)
               run_id = (
-                  f"atom_sglang_{backend_slug}_{day.replace('-', '')}_{model_slug}_"
+                  f"atom_sglang_{hardware}_{backend_slug}_{day.replace('-', '')}_{model_slug}_"
                   f"isl{isl}_osl{osl}_{sha7}_{os.environ['GITHUB_RUN_ID']}"
               )
               config_label = f"atom-sglang_{backend_slug}_{model_slug}"
@@ -1490,7 +1513,7 @@ jobs:
                           "model_path": payload.get("model_id"),
                           "point_date": day,
                           "precision": precision,
-                          "hardware": "mi355x",
+                          "hardware": hardware,
                       }
                   )
 
@@ -1504,7 +1527,7 @@ jobs:
                   "precision": precision,
                   "source": "ATOM SGLang Benchmark",
                   "client_bench": "sglang bench_serving",
-                  "hardware": "mi355x",
+                  "hardware": hardware,
                   "commit": {
                       "id": first_payload.get("atom_source_sha"),
                       "message": f"ATOM benchmark run {os.environ['GITHUB_RUN_ID']}",
