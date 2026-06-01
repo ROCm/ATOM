@@ -34,7 +34,11 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 #     plugin path's decode kernels — included here as a developer-only
 #     escape hatch (e.g. for A/B layout experiments). Selecting it on the
 #     plugin path will corrupt the prefill→decode ssm_state round-trip.
-from atom.model_ops.fla_ops.chunk_vk import chunk_gated_delta_rule_vk
+from atom.model_ops.fla_ops.chunk_vk import (
+    chunk_gated_delta_rule_vk,
+    chunk_gated_delta_rule_fwd_vk,
+)
+from atom.model_ops.fla_ops.l2norm import l2norm_fwd
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -407,8 +411,6 @@ class GatedDeltaNet(nn.Module):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-            initial_state[~has_initial_state, ...] = 0
             # When spec_sequence_masks is None, T_nonspec == num_actual_tokens
             # and core_attn_out[:num_actual_tokens] is contiguous, so the
             # prefill kernel can write its output directly into that slice —
@@ -421,24 +423,42 @@ class GatedDeltaNet(nn.Module):
                 o_buf = core_attn_out[:num_actual_tokens].unsqueeze(0)
             else:
                 o_buf = None
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
+            # Fused SSM-state gather + scatter: kernel reads/writes the
+            # initial and final state directly through `ssm_state` via the
+            # slot table, replacing a prior Python gather + masked-fill +
+            # scatter.
+            #
+            # We also bypass `chunk_gated_delta_rule_vk` (the public wrapper)
+            # and its autograd Function. The wrapper exists to add docstring
+            # validation, autograd support, an autocast guard, and most
+            # importantly an `@input_guard` decorator that calls
+            # `.contiguous()` on EVERY tensor arg on every call — including
+            # the large `ssm_state` cache buffer. None of that machinery is
+            # needed at inference: the caller below already produces
+            # contiguous q/k/v (via `causal_conv1d_fn` + `.view`), `ssm_state`
+            # is allocated contiguous by vLLM, and there is no backward pass.
+            # The l2norm pre-step and the `scale` default are reproduced
+            # here so the math stays identical to the wrapper path.
+            assert (
+                o_buf is None or o_buf.is_contiguous()
+            ), "GatedDeltaNet prefill: o_buf must be contiguous"
+            q_l2 = l2norm_fwd(query_non_spec)
+            k_l2 = l2norm_fwd(key_non_spec)
+            scale = self.head_k_dim**-0.5
+            _, core_attn_out_non_spec, *_ = chunk_gated_delta_rule_fwd_vk(
+                q=q_l2,
+                k=k_l2,
                 v=value_non_spec,
                 g=g_non_spec,
                 beta=beta_non_spec,
-                initial_state=initial_state,
+                scale=scale,
+                initial_state=ssm_state,
                 output_final_state=True,
                 cu_seqlens=non_spec_query_start_loc,
-                use_qk_l2norm_in_kernel=True,
                 o=o_buf,
-            )
-            # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
+                ssm_state_indices=non_spec_state_indices_tensor,
+                has_initial_state_mask=has_initial_state,
+                inplace_final_state=True,
             )
             # When spec_sequence_masks is None the kernel already wrote into
             # core_attn_out via o_buf — no copy needed here. With spec decode,
@@ -488,7 +508,12 @@ class GatedDeltaNet(nn.Module):
                     )
                 )
         else:
-            core_attn_out_non_spec, last_recurrent_state = None, None
+            # last_recurrent_state was previously bound here for symmetry with
+            # the other branches, but the prefill path now writes the state
+            # back into the cache via the fused kernel (no `_` needed at the
+            # caller), so the name is genuinely unused — drop the binding to
+            # satisfy ruff F841.
+            core_attn_out_non_spec = None
 
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:

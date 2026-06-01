@@ -39,6 +39,9 @@ def chunk_gated_delta_rule_fwd_vk(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     o: torch.Tensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    has_initial_state_mask: torch.Tensor | None = None,
+    inplace_final_state: bool = False,
 ):
     """ATOM-native vk prefill: K1-K6 all run as separate Triton kernels.
 
@@ -66,6 +69,9 @@ def chunk_gated_delta_rule_fwd_vk(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        has_initial_state_mask=has_initial_state_mask,
+        inplace_final_state=inplace_final_state,
     )
     o = chunk_fwd_o_vk(
         q=q,
@@ -100,6 +106,9 @@ class ChunkGatedDeltaRuleFunctionVk(torch.autograd.Function):
         cu_seqlens: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
         o: torch.Tensor | None = None,
+        ssm_state_indices: torch.Tensor | None = None,
+        has_initial_state_mask: torch.Tensor | None = None,
+        inplace_final_state: bool = False,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -120,6 +129,9 @@ class ChunkGatedDeltaRuleFunctionVk(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             o=o,
+            ssm_state_indices=ssm_state_indices,
+            has_initial_state_mask=has_initial_state_mask,
+            inplace_final_state=inplace_final_state,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -143,6 +155,9 @@ def chunk_gated_delta_rule_vk(
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     o: torch.Tensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    inplace_final_state: bool = False,
 ):
     r"""
     Args:
@@ -162,12 +177,19 @@ def chunk_gated_delta_rule_vk(
         initial_state (Optional[torch.Tensor]):
             Initial state of shape `[N, H, V, K]` for `N` input sequences.
             For equal-length input sequences, `N` equals the batch size `B`.
+            When `ssm_state_indices` is provided this is instead the raw
+            per-slot cache buffer of shape `[num_slots, H, V, K]`.
             Default: `None`.
         output_final_state (Optional[bool]):
             Whether to output the final state of shape `[N, H, V, K]`. Default: `False`.
         cu_seqlens (torch.Tensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
+        ssm_state_indices, has_initial_state, inplace_final_state:
+            Continuous-batching path; the kernel fuses the per-slot gather
+            of the initial state and the per-slot scatter of the final
+            state into the cache buffer (passed as `initial_state`). See
+            `chunk_gated_delta_rule_fwd_h_vk` for full semantics.
     Returns:
         o (torch.Tensor):
             Outputs of shape `[B, T, H, V]`.
@@ -221,7 +243,13 @@ def chunk_gated_delta_rule_vk(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+        # Skip the `[N, H, V, K]` shape check when initial_state is the raw
+        # `[num_slots, H, V, K]` cache (continuous-batching path).
+        if (
+            initial_state is not None
+            and ssm_state_indices is None
+            and initial_state.shape[0] != len(cu_seqlens) - 1
+        ):
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
@@ -269,5 +297,8 @@ def chunk_gated_delta_rule_vk(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         o,
+        ssm_state_indices,
+        has_initial_state,
+        inplace_final_state,
     )
     return o, final_state

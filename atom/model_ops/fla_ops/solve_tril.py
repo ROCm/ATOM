@@ -211,7 +211,8 @@ def merge_16x16_to_32x32_inverse_kernel(
         )
         tl.store(
             p_Ai_21,
-            b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
+            b_Ai_21
+            .to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
             boundary_check=(0, 1),
         )
     else:

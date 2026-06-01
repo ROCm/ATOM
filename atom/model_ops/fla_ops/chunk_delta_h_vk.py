@@ -31,6 +31,19 @@ NUM_WARPS = [2, 4, 8, 16]
         "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
         "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        # Continuous-batching mode: when `ssm_state_indices` is provided,
+        # `h0` and `ht` are interpreted as the raw per-slot cache buffer
+        # (shape `[num_slots, H, V, K]`) and per-sequence base pointers are
+        # resolved via a slot lookup, fusing what used to be a Python
+        # `ssm_state.index_select(...)` and `ssm_state[...] = ...` scatter.
+        "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
+        # When IS_CONTINUOUS_BATCHING, `has_initial_state_mask` is an
+        # optional `[N]` bool tensor; sequences with mask=False skip the
+        # initial-state gather (treat prior state as zero) but still write
+        # their final state back to their assigned slot.
+        "USE_HAS_INITIAL_STATE_MASK": lambda args: (
+            args["has_initial_state_mask"] is not None
+        ),
     }
 )
 @triton.autotune(
@@ -56,6 +69,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_vk(
     ht,
     cu_seqlens,
     chunk_offsets,
+    ssm_state_indices,
+    has_initial_state_mask,
+    stride_state_token: tl.constexpr,
+    stride_indices_seq: tl.constexpr,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -69,6 +86,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_vk(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    IS_CONTINUOUS_BATCHING: tl.constexpr,
+    USE_HAS_INITIAL_STATE_MASK: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -105,13 +124,41 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_vk(
     stride_h = H * V * K
     stride_k = Hg * K
     stride_w = H * K
+    # Resolve per-slot base pointers. In continuous-batching mode the
+    # `h0` / `ht` arguments are the raw cache buffer of shape
+    # `[num_slots, H, V, K]` (where slots are addressed by
+    # `ssm_state_indices`), so we replace the packed `i_nh * V * K` offset
+    # with `slot * stride_state_token + i_h * V * K`. This fuses the
+    # Python-side `ssm_state.index_select(...)` gather (for h0) and
+    # `ssm_state[...] = ...` scatter (for ht) into the kernel.
+    if IS_CONTINUOUS_BATCHING:
+        # Per-slot base offset. int64 to avoid int32 overflow on large caches
+        # (num_slots * stride_state_token can exceed 2**31 with big H/V/K).
+        slot = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
+        slot_offset = slot * stride_state_token + i_h * V * K
     if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * V * K
+        if IS_CONTINUOUS_BATCHING:
+            h0 = h0 + slot_offset
+        else:
+            h0 = h0 + i_nh * V * K
     if STORE_FINAL_STATE:
-        ht = ht + i_nh * V * K
+        if IS_CONTINUOUS_BATCHING:
+            ht = ht + slot_offset
+        else:
+            ht = ht + i_nh * V * K
+
+    # Per-sequence `has_initial_state` mask: in continuous-batching mode some
+    # slots correspond to brand-new sequences whose cache slot has stale data
+    # from a previous request. The caller's previous Python-side workaround
+    # was `initial_state[~has_initial_state] = 0`; we instead skip the load
+    # so b_h1..b_h4 stay zero-initialised, matching that semantics without
+    # touching the cache buffer.
+    skip_initial = False
+    if USE_INITIAL_STATE and USE_HAS_INITIAL_STATE_MASK:
+        skip_initial = tl.load(has_initial_state_mask + i_n).to(tl.int32) == 0
 
     # load initial state
-    if USE_INITIAL_STATE:
+    if USE_INITIAL_STATE and not skip_initial:
         p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
@@ -293,6 +340,9 @@ def chunk_gated_delta_rule_fwd_h_vk(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: torch.Tensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    has_initial_state_mask: torch.Tensor | None = None,
+    inplace_final_state: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -317,9 +367,39 @@ def chunk_gated_delta_rule_fwd_h_vk(
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
     h = k.new_empty(B, NT, H, V, K)
-    final_state = (
-        k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
-    )
+
+    # Continuous-batching path: instead of allocating a fresh
+    # `[N, H, V, K]` fp32 buffer for the final state and asking the caller
+    # to scatter it back via `ssm_state[indices] = final_state.to(...)`, the
+    # kernel writes the final state directly into the caller's
+    # `[num_slots, H, V, K]` cache buffer (passed in as `initial_state`)
+    # at the rows pointed to by `ssm_state_indices`. The wrapper still
+    # returns the cache tensor as `final_state` so the caller can keep its
+    # existing return-value plumbing.
+    if ssm_state_indices is not None:
+        assert (
+            initial_state is not None
+        ), "ssm_state_indices requires initial_state (the cache buffer) to be provided"
+        if inplace_final_state and output_final_state:
+            final_state = initial_state
+        else:
+            final_state = (
+                k.new_empty(N, H, V, K, dtype=torch.float32)
+                if output_final_state
+                else None
+            )
+        stride_state_token = initial_state.stride(0)
+        stride_indices_seq = (
+            ssm_state_indices.stride(0) if ssm_state_indices.ndim >= 1 else 1
+        )
+    else:
+        final_state = (
+            k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
+        )
+        # Strides are unused when IS_CONTINUOUS_BATCHING is False, but Triton
+        # still needs concrete constexpr values at launch time.
+        stride_state_token = 0
+        stride_indices_seq = 0
 
     v_new = torch.empty_like(u) if save_new_value else None
 
@@ -338,6 +418,10 @@ def chunk_gated_delta_rule_fwd_h_vk(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        ssm_state_indices=ssm_state_indices,
+        has_initial_state_mask=has_initial_state_mask,
+        stride_state_token=stride_state_token,
+        stride_indices_seq=stride_indices_seq,
         T=T,
         H=H,
         Hg=Hg,
