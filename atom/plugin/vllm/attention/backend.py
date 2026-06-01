@@ -64,6 +64,10 @@ class AiterMhaBackendForVllm:
     def is_mla(cls) -> bool:
         return False
 
+    @classmethod
+    def is_ssm(cls) -> bool:
+        return False
+
     @staticmethod
     def get_required_kv_cache_layout():
         return None
@@ -125,6 +129,10 @@ class AiterMlaBackendForVllm:
     @classmethod
     def is_mla(cls) -> bool:
         return True
+
+    @classmethod
+    def is_ssm(cls) -> bool:
+        return False
 
     @staticmethod
     def get_required_kv_cache_layout():
