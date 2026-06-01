@@ -953,9 +953,7 @@ class ModelRunner:
         if draft_bs is None:
             draft_bs = forward_context.context.graph_bs
         for i in range(self.drafter.mtp_k):
-            self.drafter._refresh_dp_metadata(
-                forward_context, hidden_states.shape[0]
-            )
+            self.drafter._refresh_dp_metadata(forward_context, hidden_states.shape[0])
             hidden_states = self.drafter.model(
                 input_ids=torch.zeros(
                     hidden_states.shape[0],
