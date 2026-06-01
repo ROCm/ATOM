@@ -185,14 +185,25 @@ jobs:
           - model: { suffix: "-mtp3" }
             config: { concurrency: 2 }
           # Skip low-concurrency DP-attention runs (only run c>=64)
-          - model: { suffix: "-dp" }
+          - model: { suffix: "-dpa" }
+            config: { concurrency: 2 }
+          - model: { suffix: "-dpa" }
             config: { concurrency: 4 }
-          - model: { suffix: "-dp" }
+          - model: { suffix: "-dpa" }
             config: { concurrency: 8 }
-          - model: { suffix: "-dp" }
+          - model: { suffix: "-dpa" }
             config: { concurrency: 16 }
-          - model: { suffix: "-dp" }
+          - model: { suffix: "-dpa" }
             config: { concurrency: 32 }
+          # High-concurrency (512/1024) only for DP-attention; cap others at 256
+          - model: { suffix: "" }
+            config: { concurrency: 512 }
+          - model: { suffix: "" }
+            config: { concurrency: 1024 }
+          - model: { suffix: "-mtp3" }
+            config: { concurrency: 512 }
+          - model: { suffix: "-mtp3" }
+            config: { concurrency: 1024 }
 
     runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}
 

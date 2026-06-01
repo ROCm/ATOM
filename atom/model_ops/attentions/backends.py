@@ -358,21 +358,21 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not batch.block_tables:
                 continue
-            num_blocks = (
-                seqlen + self.model_runner.block_size - 1
-            ) // self.model_runner.block_size
-            num_cached_blocks = (
-                cached_seqlen + self.model_runner.block_size - 1
-            ) // self.model_runner.block_size
-            last_block_tokens = batch.last_block_num_tokens[i]
             block_table = batch.block_tables[i]
-            for blk_idx in range(num_cached_blocks, num_blocks):
-                start = block_table[blk_idx] * self.model_runner.block_size
-                if blk_idx != num_blocks - 1:
-                    end = start + self.model_runner.block_size
-                else:
-                    end = start + last_block_tokens
-                slot_mapping.extend(list(range(start, end)))
+            block_size = self.model_runner.block_size
+            first_blk = cached_seqlen // block_size
+            last_blk = (seqlen - 1) // block_size
+            for blk_idx in range(first_blk, last_blk + 1):
+                blk_start = block_table[blk_idx] * block_size
+                # Offset within block: skip already-cached prefix in first block
+                off_start = cached_seqlen % block_size if blk_idx == first_blk else 0
+                # End within block: partial last block
+                off_end = (
+                    ((seqlen - 1) % block_size) + 1
+                    if blk_idx == last_blk
+                    else block_size
+                )
+                slot_mapping.extend(range(blk_start + off_start, blk_start + off_end))
         if has_cached:
             self.prepare_block_tables(batch)
         # Validate metadata consistency
@@ -391,12 +391,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
         var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
         var["cu_seqlens_k"].np[: bs + 1] = cu_seqlens_k
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True)
         var["context_lens"].np[:bs] = batch.context_lens[:bs]
         min_seqlen_q = 0
         dropout_p = 0.0
         vars_used = [
             ("cu_seqlens_q", bs + 1),
+            ("cu_seqlens_k", bs + 1),
             ("slot_mapping", sum_scheduled_tokens),
             ("context_lens", bs),
         ]
@@ -413,7 +413,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             total_tokens = sum(batch.context_lens[:bs])
         total_kv = total_tokens if has_cached else sum_scheduled_tokens
         attn_metadata = AttentionMetaData(
-            cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
             # Cast to python int — numpy.int32 leaks in via batch.context_lens
             # (numpy array) and breaks downstream Triton kernel constexpr
             # binding (`tl.minimum` rejects numpy scalars).

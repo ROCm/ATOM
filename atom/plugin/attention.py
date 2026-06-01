@@ -1875,11 +1875,29 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         req_id_per_token = torch.repeat_interleave(
             torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
         )
-        # Zero-fill for cudagraphs
-        self.req_id_per_token_buffer.fill_(0)
-        self.paged_kv_indices.fill_(0)
-        self.paged_kv_indptr.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
+        # Shrink-tail-only zeroing instead of three full-buffer fill_(0) every
+        # step (the buffers are persistent across decode steps and zeros-init):
+        #   - req_id_per_token_buffer / paged_kv_indices: the kernel only reads
+        #     the ranges defined by paged_kv_indptr / num_tokens, so entries
+        #     past the new extent are never read; we only need to re-zero the
+        #     tail left over from a previous, larger batch.
+        #   - paged_kv_indptr: index 0 stays 0 (never written by the cumsum
+        #     below, which starts at index 1) and indices >= 1 are fully
+        #     rewritten by the cumsum + scalar broadcast, so its fill_(0) is
+        #     redundant and dropped entirely.
+        new_req_extent = int(req_id_per_token.shape[0])
+        new_indices_extent = num_tokens * self.topk_tokens
+        if self._prev_req_extent > new_req_extent:
+            self.req_id_per_token_buffer[new_req_extent : self._prev_req_extent].fill_(
+                0
+            )
+        if self._prev_indices_extent > new_indices_extent:
+            self.paged_kv_indices[new_indices_extent : self._prev_indices_extent].fill_(
+                0
+            )
+        self._prev_req_extent = new_req_extent
+        self._prev_indices_extent = new_indices_extent
+        self.req_id_per_token_buffer[:new_req_extent].copy_(
             req_id_per_token, non_blocking=True
         )
         query_lens = (
@@ -1913,27 +1931,69 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         # treated as its own batch entry), so persistent metadata can always
         # be precomputed here. The kernel switches to the persistent
         # work-stealing path automatically when work_meta_data is non-None.
-        get_mla_metadata_v1(
-            qo_indptr,
-            paged_kv_indptr,
-            paged_kv_last_page_len,
-            self.padded_num_heads,
-            1,
-            True,
-            self._mla_work_meta_data,
-            self._mla_work_info_set,
-            self._mla_work_indptr,
-            self._mla_reduce_indptr,
-            self._mla_reduce_final_map,
-            self._mla_reduce_partial_map,
-            page_size=1,
-            kv_granularity=16,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=True,
-            dtype_q=_get_aiter_kv_cache_dtype(self.vllm_config),
-            dtype_kv=_get_aiter_kv_cache_dtype(self.vllm_config),
+        #
+        # Pure-decode skip-cache: only valid when every request contributes
+        # exactly one query token. max_query_len == 1 alone is NOT enough --
+        # it allows empty/padded request slots (q_len == 0), where
+        # num_actual_tokens < num_reqs and the per-token sparse stream no longer
+        # lines up with the per-request clamped seq_lens used as the key. We
+        # therefore also require num_tokens == num_reqs; together they imply
+        # exactly one token per request, so clamped_seq_lens[:num_reqs] IS the
+        # per-token sparse stream and the work-split schedule is a deterministic
+        # function of (num_tokens, padded_num_heads, per-request
+        # min(seq_len, topk_tokens)) -- topk_tokens, page_size and the qo layout
+        # are constant. Fingerprint those CPU-side and skip the launch when
+        # unchanged; for long-context decode (seq_len >= topk_tokens) the key is
+        # shape-determined, so the hit rate is ~100%.
+        #
+        # MTP/spec or padded batches always recompute and invalidate the key.
+        # The fingerprint is only built on the cacheable path, so the slow path
+        # adds no extra CPU work.
+        num_reqs = common_attn_metadata.num_reqs
+        decode_only = (
+            int(common_attn_metadata.max_query_len) == 1 and num_tokens == num_reqs
         )
+        metadata_key = None
+        if decode_only:
+            seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                seq_lens_cpu = seq_lens.cpu()
+            clamped_seq_lens = torch.clamp(
+                seq_lens_cpu[:num_reqs], max=self.topk_tokens
+            )
+            metadata_key = (
+                num_tokens,
+                self.padded_num_heads,
+                clamped_seq_lens.to(torch.int32).numpy().tobytes(),
+            )
+        if metadata_key is None or metadata_key != self._prev_metadata_key:
+            get_mla_metadata_v1(
+                qo_indptr,
+                paged_kv_indptr,
+                paged_kv_last_page_len,
+                self.padded_num_heads,
+                1,
+                True,
+                self._mla_work_meta_data,
+                self._mla_work_info_set,
+                self._mla_work_indptr,
+                self._mla_reduce_indptr,
+                self._mla_reduce_final_map,
+                self._mla_reduce_partial_map,
+                page_size=1,
+                kv_granularity=16,
+                max_seqlen_qo=1,
+                uni_seqlen_qo=1,
+                fast_mode=True,
+                dtype_q=_get_aiter_kv_cache_dtype(self.vllm_config),
+                dtype_kv=_get_aiter_kv_cache_dtype(self.vllm_config),
+            )
+            # metadata_key is the exact fingerprint on the cacheable path and
+            # None for MTP/spec/padded batches -- storing it as-is records a
+            # hittable key on decode and invalidates the cache otherwise.
+            self._prev_metadata_key = metadata_key
 
         attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
             num_reqs=common_attn_metadata.num_reqs,
@@ -2410,7 +2470,10 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
             (1, 1), dtype=torch.int32, device=self.device
         )
 
-        self.req_id_per_token_buffer = torch.empty(
+        # zeros (not empty) so the shrink-tail fast path in build() can assume
+        # entries past the current extent are already 0 without a full-buffer
+        # fill_(0) every step.
+        self.req_id_per_token_buffer = torch.zeros(
             (max_num_batched_tokens,),
             dtype=torch.int32,
             device=device,
@@ -2511,6 +2574,14 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
             dtype=reduce_partial_map_type,
             device=device,
         )
+
+        # ----- Decode-orchestration caches (see build()) -----
+        # Track the previously-written extents of the persistent buffers so we
+        # only re-zero the shrink tail, and fingerprint the get_mla_metadata_v1
+        # inputs so we can skip recomputing an identical work-split schedule.
+        self._prev_req_extent = 0
+        self._prev_indices_extent = 0
+        self._prev_metadata_key = None
 
     return init_method_under_plugin_mode
 
