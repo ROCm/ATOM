@@ -135,7 +135,7 @@ def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1
     return w1_triton_layout, w1_scale_triton_layout, w1_swizzle_layout, w2_triton_layout, w2_scale_triton_layout, w2_swizzle_layout
 
 
-def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
+def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot, num_tokens, bitmatrix=None):
     """Build matmul_ogs routing data via the AITER fused-routing kernel.
 
     Thin bridge over ``aiter.ops.triton.fused_routing_from_topk``: invokes
@@ -163,7 +163,10 @@ def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
     if n_gates_pad > 4096:
         # Single-CTA design exceeded; fall back rather than degrading
         # silently. Typically only hit during prefill.
-        return routing_from_topk(topk_weights, topk_ids, n_expts_tot)
+        assert (
+            bitmatrix != None
+        ), "fallback to routing from topk in triton only implemented for bitmatrix included in routing call"
+        return routing_from_topk(topk_weights, topk_ids, n_expts_tot, bitmatrix, num_tokens)
 
     hist, topk_indx, gate_indx, gate_scal = _aiter_fused_routing_from_topk(
         topk_weights, topk_ids, n_expts_tot
@@ -199,11 +202,13 @@ def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
         n_expts_tot: total number of experts (global, before EP)
 
     Returns:
-        (RoutingData, GatherIndx, ScatterIndx) compatible with triton_kernel_fused_experts
+        (RoutingData, tensor, tensor) compatible with triton_kernel_fused_experts
     """
     from aiter.ops.triton.moe.moe_routing.routing import (
         routing,
+        routing_a8w4,
         RoutingData,
+        ExptData,
     )
 
     from atom.model_ops.moe_utils import compute_expt_data
@@ -230,11 +235,42 @@ def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
     # Build routing data structures using triton-accelerated compute_expt_data
     m = n_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
-    block_m = max(16, min(next_power_of_2(tokens_per_expt), 128))
-    expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad, block_m)
+    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    if num_tokens <= 16:
+        HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
+        (
+            hist,
+            topk_indx,
+            gate_indx,
+            gate_scal,
+            token_offs_raw,
+            token_offs_pad,
+            block_pid_map,
+        ) = sort_tokens_fused(
+            topk_weights, topk_ids, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
+        )
+    else:
+        (
+            hist,
+            topk_indx,
+            gate_indx,
+            gate_scal,
+            token_offs_raw,
+            token_offs_pad,
+            block_pid_map,
+        ) = sort_tokens(
+            topk_weights, topk_ids, n_expts_tot, bitmatrix, block_m, 32 # hardcoded HIST_BLOCK_M for now
+        )
+    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
 
-    routing_data = RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
-    return routing_data, topk_indx, gate_indx #topk_indx = gather_indx, gate_indx = scatter_indx
+    # pack the matmul data structure
+    gather_indx = topk_indx
+    scatter_indx = gate_indx
+    return (
+        RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data),
+        gather_indx,
+        scatter_indx,
+    )
 
 
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:

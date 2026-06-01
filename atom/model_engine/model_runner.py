@@ -644,12 +644,16 @@ class ModelRunner:
         # See atom/utils/debug_helper/.
         from atom.utils.debug_helper import (
             install_block_forward_hooks,
+            install_moe_isolation_hooks,
             maybe_dump_weights_and_exit,
         )
 
         _n_fwd_hooks = install_block_forward_hooks(self.model)
         if _n_fwd_hooks > 0:
             logger.info(f"[ATOM_FWD_DUMP] {_n_fwd_hooks} Block forward hooks installed")
+        _n_iso = install_moe_isolation_hooks(self.model)
+        if _n_iso > 0:
+            logger.info(f"[ATOM_MOE_ISO] {_n_iso} MoE isolation hooks installed")
         maybe_dump_weights_and_exit(self.model)
 
         if self.config.speculative_config and get_pp_group().is_last_rank:

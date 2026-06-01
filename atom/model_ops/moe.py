@@ -1006,7 +1006,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_moe_forward,
                 triton_kernel_fused_experts,
-                fused_routing_from_topk_triton
+                fused_routing_from_topk_triton,
+                routing_from_topk
             )
 
             # Check if the model needs custom routing that triton routing()
@@ -1021,7 +1022,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if needs_custom_routing:
                 # Use ATOM's full-featured select_experts for routing,
                 # then triton matmul_ogs for the actual MoE computation.
-                # topk_weights, topk_ids = FusedMoE.select_experts(
+
+                # TODO this should be properly integrated
+                # topk_weights, topk_ids, bitmatrix = FusedMoE.select_experts_triton(
                 #     hidden_states=x,
                 #     router_logits=router_logits,
                 #     use_grouped_topk=use_grouped_topk,
@@ -1036,35 +1039,50 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 #     routed_scaling_factor=layer.routed_scaling_factor,
                 # )
 
-                # custom routing
-                n_expts_act = top_k#_weights.shape[1]
+            
+                # custom routing -- set for deepseek routing n expts act, for grouped topk
+                n_expts_act = top_k
 
-                # Convert to triton routing data structures
+                # custom routing
+                from aiter.ops.triton.moe.moe_routing.routing import routing_a8w4
+                # logger.warning(num_expert_group)
+                # logger.warning(topk_group)
+                routing_data, gather_idx, scatter_idx = routing_a8w4(
+                    router_logits,
+                    n_expts_act,
+                    16, # hardcode block m for now TODO change back
+                    score_mode=scoring_func,
+                    bias=e_score_correction_bias.to(torch.float32) if e_score_correction_bias is not None else None,
+                    renorm=renormalize,
+                    routed_scaling_factor=layer.routed_scaling_factor,
+                    use_grouped_topk=use_grouped_topk,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                    # Always-on fused shared expert(s) are appended to every
+                    # token's selection (id n_routed+i, weight 1.0), matching
+                    # the non-triton rocm_aiter_grouped_topk path.
+                    num_fused_shared_experts=layer.num_fused_shared_experts,
+                )
+                # routing_a8w4 widened the per-token gate count by the shared
+                # experts; the GEMM must process all of them.
+                n_expts_act = routing_data.n_expts_act
+                # logger.warning(routing_data)
+                # logger.warning(gather_idx)
+                # logger.warning(scatter_idx)
+
+                # # Convert to triton routing data structures
                 n_expts_tot = router_logits.shape[-1]
+                num_tokens, _ = router_logits.shape # put like this for a sanity check
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
                 
                 n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
-                from aiter.ops.triton.moe.moe_routing.routing import (
-                    routing_a8w4,
-                )
 
-                block_m = 64 if m >= 256 else 16
-
-                routing_data, gather_idx, scatter_idx = routing_a8w4(
-                    router_logits,
-                    n_expts_act=top_k,
-                    block_m=block_m,
-                    score_mode="sqrtsoftplus",
-                    bias=e_score_correction_bias,
-                    renorm=renormalize,
-                    routed_scaling_factor=layer.routed_scaling_factor,
-                )
-
-               
-                # routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
-                #     topk_weights, topk_ids, n_expts_tot
+                # # falls back to routing from topk. TODO need to implement bitmatrix
+                # # removing fused routing from topk to use regular. make sure basic is working
+                # routing_data, gather_idx, scatter_idx = routing_from_topk(
+                #     topk_weights, topk_ids, n_expts_tot, num_tokens, n_expts_act, bitmatrix
                 # )
                 x_q_dtype = self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None
 
@@ -1140,7 +1158,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         if self.fused_experts is None:
-            return fused_moe(
+            out = fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -1165,7 +1183,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     else GateMode.SEPARATED.value
                 ),
             )
-        return self.fused_experts(
+            logger.warning(out)
+            return out
+        out = self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
@@ -1186,6 +1206,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             hidden_pad=self.hidden_pad,
             intermediate_pad=self.intermediate_pad,
         )
+        logger.warning(out)
+        return out
 
 
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm
@@ -3021,6 +3043,118 @@ class FusedMoE(torch.nn.Module):
                 )
 
         return topk_weights, topk_ids
+
+    @staticmethod
+    def select_experts_triton(
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        use_grouped_topk: bool,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        num_routing_experts: int = 0,
+        num_fused_shared_experts: int = 0,
+        fused_shared_experts_scoring_func: Optional[str] = None,
+        routed_scaling_factor: float = 1.0,
+    ):
+
+        # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
+        # in the first 3 layers, where topk_ids are looked up from a per-token
+        # hash table instead of computed from gate logits).
+        if custom_routing_function is not None:
+            topk_weights, topk_ids, bitmatrix = custom_routing_function(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+            )
+            return topk_weights, topk_ids
+
+        # DeekSeekv2 uses grouped_top_k
+        if use_grouped_topk:
+            # TODO implement this in particular
+            assert topk_group is not None
+            assert num_expert_group is not None
+            assert fused_shared_experts_scoring_func is None
+            from atom.model_ops.moe_utils import grouped_topk as triton_grouped_topk
+            topk_weights, topk_ids, bitmatrix = triton_grouped_topk(
+                router_logits,
+                n_expts_act=top_k,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+                apply_softmax=False,
+                HIST_BLOCK_M=32,
+                score_mode=scoring_func,  # or "softmax"
+                bias=e_score_correction_bias,
+                renorm=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                # hidden_states=hidden_states,
+                # gating_output=router_logits,
+                # topk=top_k,
+                # renormalize=renormalize,
+                # num_expert_group=num_expert_group,
+                # topk_group=topk_group,
+                # scoring_func=scoring_func,
+                # e_score_correction_bias=e_score_correction_bias,
+                # routed_scaling_factor=routed_scaling_factor,
+                # num_fused_shared_experts=num_fused_shared_experts,
+            )
+        else:
+            if scoring_func == "softmax":
+                topk_weights, topk_ids, bitmatrix = fused_topk(
+                    gating_output=router_logits,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    num_routing_experts=num_routing_experts,
+                    fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+                )
+            elif scoring_func == "sigmoid":
+                routing_weights = torch.sigmoid(router_logits.float())
+                scores_for_choice = routing_weights
+                if e_score_correction_bias is not None:
+                    scores_for_choice = scores_for_choice + e_score_correction_bias
+
+                topk_ids = torch.topk(
+                    scores_for_choice, top_k, dim=-1, sorted=False
+                ).indices
+                topk_weights = routing_weights.gather(dim=-1, index=topk_ids)
+
+                if renormalize:
+                    topk_weights = topk_weights / topk_weights.sum(
+                        dim=-1, keepdim=True
+                    ).clamp_min(1e-20)
+
+                topk_ids = topk_ids.to(torch.int32)
+            elif scoring_func == "sqrtsoftplus":
+                # # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
+                # # weights gathered from the unbiased sqrt(softplus(.)) values.
+                tokens_num = router_logits.shape[0]
+                topk_ids = torch.empty(
+                    tokens_num, top_k, dtype=torch.int32, device=router_logits.device
+                )
+                topk_weights = torch.empty(
+                    tokens_num, top_k, dtype=torch.float32, device=router_logits.device
+                )
+                topk_gating(
+                    topk_weights,
+                    topk_ids,
+                    router_logits,
+                    e_score_correction_bias,
+                    renormalize,
+                    routed_scaling_factor,
+                    score_func="sqrtsoftplus",
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported scoring function for non-grouped topk: {scoring_func}"
+                )
+
+        return topk_weights, topk_ids, bitmatrix
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         return torch.ops.aiter.moe_forward(
