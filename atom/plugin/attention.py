@@ -2400,7 +2400,7 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
 
         # Pre-allocated buffers for flattening (spec decode).
         self.arange_buffer = torch.arange(
-            config.scheduler_config.max_num_seqs * (1 + self.num_speculative_tokens),
+            max_num_batched_tokens,
             dtype=torch.int32,
             device=self.device,
         )
