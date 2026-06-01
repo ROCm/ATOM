@@ -843,16 +843,16 @@ jobs:
           except HTTPError as exc:
               detail = exc.read().decode("utf-8", errors="replace").strip()
               raise RuntimeError(
-                  f"Failed to fetch workflow run METdata: HTTP {exc.code} {detail}"
+                  f"Failed to fetch workflow run metadata: HTTP {exc.code} {detail}"
               ) from exc
           except URLError as exc:
               raise RuntimeError(
-                  f"Failed to reach GitHub API for workflow run METdata: {exc}"
+                  f"Failed to reach GitHub API for workflow run metadata: {exc}"
               ) from exc
 
           created_at = payload.get("created_at")
           if not created_at:
-              raise RuntimeError("Workflow run METdata did not include created_at")
+              raise RuntimeError("Workflow run metadata did not include created_at")
           print(created_at)
           PY
             )"
@@ -1211,8 +1211,8 @@ jobs:
       && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     runs-on: build-only-atom
     outputs:
-      oot_image_tag: ${{ steps.image-met.outputs.oot_image_tag }}
-      atom_source_sha: ${{ steps.source-met.outputs.atom_source_sha }}
+      oot_image_tag: ${{ steps.image-meta.outputs.oot_image_tag }}
+      atom_source_sha: ${{ steps.source-meta.outputs.atom_source_sha }}
     env:
       ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
       ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
@@ -1228,8 +1228,8 @@ jobs:
           ref: ${{ env.ATOM_SOURCE_REF }}
           fetch-depth: 1
 
-      - name: Record source METdata
-        id: source-met
+      - name: Record source metadata
+        id: source-meta
         run: |
           ATOM_SOURCE_SHA="$(git rev-parse HEAD)"
           echo "atom_source_sha=${ATOM_SOURCE_SHA}" >> "$GITHUB_OUTPUT"
@@ -1280,7 +1280,7 @@ jobs:
             -f Dockerfile.oot-base .
 
       - name: Build custom OOT vLLM image
-        id: image-met
+        id: image-meta
         run: |
           SHORT_SHA="$(git rev-parse --short HEAD)"
           SHORT_VLLM="$(printf '%s' "${VLLM_COMMIT}" | cut -c1-12)"
@@ -1300,12 +1300,12 @@ jobs:
 
       - name: Push custom OOT image
         run: |
-          docker push "${{ steps.image-met.outputs.oot_image_tag }}"
+          docker push "${{ steps.image-meta.outputs.oot_image_tag }}"
 
       - name: Clean up build images
         if: always()
         run: |
-          docker rmi "${{ steps.image-met.outputs.oot_image_tag }}" || true
+          docker rmi "${{ steps.image-meta.outputs.oot_image_tag }}" || true
           docker rmi atom_oot_base:ci || true
 
   benchmark:
@@ -1809,7 +1809,7 @@ jobs:
           fi
           echo "::endgroup::"
 
-      - name: Inject GPU METdata into benchmark results
+      - name: Inject GPU metadata into benchmark results
         run: |
           shopt -s nullglob
           for f in "${RESULT_PREFIX}"-*.json; do
