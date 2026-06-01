@@ -36,6 +36,11 @@
 
 set -uo pipefail
 
+# Resolve script dir to an ABSOLUTE path before any `cd` below. The launch step
+# cd's into $DEBUG_DIR for code-object dumps, so a relative dirname would break
+# the path to the sibling launcher scripts.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 MODE="server"
 if [ "${1:-}" = "--simple" ]; then
   MODE="simple"
@@ -71,7 +76,6 @@ export ROCM_DEBUG_AGENT_OPTIONS="--save-code-objects"
 export AITER_LOG_LEVEL="${AITER_LOG_LEVEL:-WARNING}"
 
 # 5) launch (model-specific env like ATOM_USE_TRITON_MOE must come from caller)
-SCRIPT_DIR="$(dirname "$0")"
 if [ "$MODE" = "server" ]; then
   exec bash "$SCRIPT_DIR/start_atom_server.sh" \
     "$MODEL" "$TP" "$PORT" "$@"

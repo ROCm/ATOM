@@ -108,6 +108,7 @@ FAULT_PATTERN='stopped, reason|MEMORY_VIOLATION|ASSERT_TRAP|proc died unexpected
 
 prev_outputs=0
 prev_mtime=0
+prev_server_mtime=0
 stuck=0
 server_log=""
 # Whether we've ever observed the workload python process. Until this flips
@@ -162,28 +163,36 @@ for ((i=1; i<=ITERS; i++)); do
         exit 0
     fi
 
-    # Engine progress? Two signals — either resets the stuck counter:
+    # Engine progress? Three signals — any one resets the stuck counter:
     #   1. "Engine Core: output send" count rising in server log
-    #      (auto-discovered; authoritative engine progress).
+    #      (auto-discovered; authoritative engine progress — but absent
+    #      during warmup phases when no outputs have shipped yet).
     #   2. Caller LOG_FILE mtime advancing (covers client logs / offline
     #      stdout where engine marker is absent: benchmark tqdm,
-    #      simple_inference, etc.).
+    #      simple_inference, etc. — but tqdm may not flush during warmup).
+    #   3. Server log mtime advancing (universal "server is busy" signal:
+    #      uvicorn HTTP access logs, scheduler trace, request arrival —
+    #      grows during warmup even before any output ships, so it
+    #      prevents false HANG during long warmup phases).
     cur_outputs=$(count_in "Engine Core: output send" "$server_log")
     delta_out=$(( cur_outputs - prev_outputs ))
     cur_mtime=$(mtime_of "$LOG_FILE")
     delta_mtime=$(( cur_mtime - prev_mtime ))
+    cur_server_mtime=$(mtime_of "$server_log")
+    delta_server_mtime=$(( cur_server_mtime - prev_server_mtime ))
 
     # Client still running?
     client_alive=$(pgrep -af "$CLIENT_PATTERN" 2>/dev/null | grep -v grep | wc -l)
 
-    echo "[t=$((i*POLL))s] outputs=${cur_outputs} (+${delta_out}) mtime+${delta_mtime}s clients=${client_alive} stuck=${stuck}/${STUCK_POLLS}"
+    echo "[t=$((i*POLL))s] outputs=${cur_outputs} (+${delta_out}) mtime+${delta_mtime}s srv_mtime+${delta_server_mtime}s clients=${client_alive} stuck=${stuck}/${STUCK_POLLS}"
 
-    if [ "$delta_out" -eq 0 ] && [ "$delta_mtime" -eq 0 ]; then
+    if [ "$delta_out" -eq 0 ] && [ "$delta_mtime" -eq 0 ] && [ "$delta_server_mtime" -eq 0 ]; then
         stuck=$(( stuck + 1 ))
     else
         stuck=0
         prev_outputs=$cur_outputs
         prev_mtime=$cur_mtime
+        prev_server_mtime=$cur_server_mtime
     fi
 
     # Drained cleanly: client gone AND no new output this poll → done.

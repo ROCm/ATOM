@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
@@ -18,6 +18,12 @@ from .reasoning import ReasoningFilter, separate_reasoning
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger("atom")
+
+
+def _prompt_token_count(prompt_or_tokens: Union[str, List[int]], tokenizer) -> int:
+    if isinstance(prompt_or_tokens, str):
+        return len(tokenizer.encode(prompt_or_tokens))
+    return len(prompt_or_tokens)
 
 
 def create_chat_chunk(
@@ -55,7 +61,7 @@ def create_chat_chunk(
 async def stream_chat_response(
     request_id: str,
     model: str,
-    prompt: str,
+    prompt: Union[str, List[int]],
     stream_queue: asyncio.Queue,
     seq_id: int,
     tokenizer,
@@ -68,7 +74,7 @@ async def stream_chat_response(
     - content deltas for the answer
     - tool_calls deltas when model invokes tools
     """
-    num_tokens_input = len(tokenizer.encode(prompt))
+    num_tokens_input = _prompt_token_count(prompt, tokenizer)
     num_tokens_output = 0
     reasoning_filter = ReasoningFilter()
     tool_parser = ToolCallStreamParser()
@@ -251,7 +257,7 @@ def build_chat_response_multi(
 async def stream_chat_response_fanout(
     request_id: str,
     model: str,
-    prompt: str,
+    prompt: Union[str, List[int]],
     shared_queue: asyncio.Queue,
     seq_ids: List[int],
     tokenizer,
@@ -265,7 +271,7 @@ async def stream_chat_response_fanout(
     Reasoning + tool-call state is kept independently per sibling.
     """
     n = len(seq_ids)
-    num_tokens_input = len(tokenizer.encode(prompt))
+    num_tokens_input = _prompt_token_count(prompt, tokenizer)
     num_tokens_output = [0] * n
     reasoning_filters = [ReasoningFilter() for _ in range(n)]
     tool_parsers = [ToolCallStreamParser() for _ in range(n)]

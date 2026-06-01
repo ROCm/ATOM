@@ -71,6 +71,13 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
         self.num_cached_tokens = 0
+        # True iff this seq is mid-prefill (chunked prefill produced KV for
+        # some prompt tokens but not all). Maintained by the scheduler:
+        # set in postprocess when an advance leaves prompt tokens remaining,
+        # cleared when prefill completes or seq is preempted. Used to discard
+        # garbage sampled tokens from intermediate chunks and to skip the
+        # scheduler's Phase 1 scan when no partials exist.
+        self.is_partial_prefill = False
         self.block_table = []
         # Per-request cache slot index (filled by BlockManager.allocate()).
         # -1 = unallocated. The slot indexes into the per-req cache tensors
@@ -157,10 +164,6 @@ class Sequence:
     @property
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens : self.num_tokens]
-
-    @property
-    def num_cached_blocks(self):
-        return self.num_cached_tokens // self.block_size
 
     # @property
     # def num_blocks(self):

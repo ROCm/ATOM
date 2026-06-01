@@ -24,24 +24,23 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Tuple, cast
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
 
+import aiter
 import torch
 import torch.nn.functional as F
-from torch import nn
-
-import aiter
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
     get_hip_quant,
-    silu_and_mul as aiter_silu_and_mul,
+    rope_rotate_activation,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter import silu_and_mul as aiter_silu_and_mul
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -56,9 +55,15 @@ from atom.config import (
     get_current_atom_config,
 )
 from atom.model_loader.loader import WeightsMapper
+
+# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
+# (shared with deepseek_v2) and `torch.ops.aiter.indexer_score_topk` (V4-only).
+# MoE.forward dispatches via the former so torch.compile/Dynamo treats stream
+# code as opaque; Indexer.forward_batched dispatches via the latter to hide
+# its dynamic-shape internals from Dynamo / fake-tensor mode.
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
-from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -67,21 +72,13 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
-from aiter import rope_rotate_activation
 from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
+from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter
-from atom.utils import envs, mark_spliting_op
-
-# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
-# (shared with deepseek_v2) and `torch.ops.aiter.indexer_score_topk` (V4-only).
-# MoE.forward dispatches via the former so torch.compile/Dynamo treats stream
-# code as opaque; Indexer.forward_batched dispatches via the latter to hide
-# its dynamic-shape internals from Dynamo / fake-tensor mode.
-from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.v4_kernels import (
     CompressPlan,
     csa_translate_pack,
@@ -94,8 +91,10 @@ from atom.model_ops.v4_kernels import (
     swa_write,
     update_compressor_states,
 )
-from atom.utils.forward_context import AttnState, get_forward_context
+from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import AttnState, get_forward_context
+from torch import nn
 
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
@@ -2175,6 +2174,8 @@ class Block(nn.Module):
         hc_fn: torch.Tensor,  # [mix_hc, hc*dim]  fp32
         hc_scale: torch.Tensor,  # [3] fp32
         hc_base: torch.Tensor,  # [mix_hc] fp32
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce mHC residual `[num_tokens, hc, dim]` to sub-layer input `[num_tokens, dim]`.
 
@@ -2201,6 +2202,8 @@ class Block(nn.Module):
                 float(self.hc_eps),
                 self.HC_POST_MULT,
                 int(self.hc_sinkhorn_iters),
+                norm_weight,
+                norm_eps,
             )
             return y, post.squeeze(-1), comb
 
@@ -2265,17 +2268,27 @@ class Block(nn.Module):
             post,
             comb,
         ) = self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            x,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            self.attn_norm.weight,
+            self.norm_eps,
         )
-        x = self.attn_norm(x)  # [num_tokens, dim]
+        # x = self.attn_norm(x)  # [num_tokens, dim]
         x = self.attn(x, positions)  # [num_tokens, dim]
         x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
         # ----- FFN sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
         x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            x,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.ffn_norm.weight,
+            self.norm_eps,
         )
-        x = self.ffn_norm(x)  # [num_tokens, dim]
+        # x = self.ffn_norm(x)  # [num_tokens, dim]
         x = self.ffn(
             x
         )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)

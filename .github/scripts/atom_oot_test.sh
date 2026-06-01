@@ -2,7 +2,9 @@
 set -euo pipefail
 
 # Usage:
+#   .github/scripts/atom_oot_test.sh start <mode> [model_name]
 #   .github/scripts/atom_oot_test.sh launch <mode> [model_name]
+#   .github/scripts/atom_oot_test.sh client <mode> [model_name]
 #   .github/scripts/atom_oot_test.sh accuracy <mode> [model_name]
 #
 # Alternatively, pass a single model explicitly through environment variables:
@@ -12,8 +14,10 @@ set -euo pipefail
 #   LM_EVAL_NUM_FEWSHOT
 #
 # TYPE:
+#   start    - launch vLLM server in the background and return immediately
 #   launch   - launch vLLM server and wait until ready
-#   accuracy - run gsm8k accuracy test and save result JSON
+#   client   - run gsm8k accuracy against an existing server
+#   accuracy - launch server, run gsm8k accuracy, and save result JSON
 #
 # MODE:
 #   ci    - workflow-provided OOT CI model entry
@@ -26,8 +30,8 @@ TYPE=${1:-launch}
 MODE=${2:-ci}
 SELECTED_MODEL=${3:-}
 
-if [[ "$TYPE" != "launch" && "$TYPE" != "accuracy" ]]; then
-  echo "Invalid TYPE: $TYPE. Expected: launch or accuracy"
+if [[ "$TYPE" != "start" && "$TYPE" != "launch" && "$TYPE" != "client" && "$TYPE" != "accuracy" ]]; then
+  echo "Invalid TYPE: $TYPE. Expected: start, launch, client, or accuracy"
   exit 2
 fi
 
@@ -50,12 +54,18 @@ EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
 EXPLICIT_CLIENT_COMMAND=${OOT_CLIENT_COMMAND:-}
+OOT_GPU_MEMORY_UTILIZATION=${OOT_GPU_MEMORY_UTILIZATION:-0.9}
 OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LAST_VLLM_LOG_LINE=0
 
 if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
   echo "Invalid LM_EVAL_NUM_FEWSHOT: ${LM_EVAL_NUM_FEWSHOT}. Expected a non-negative integer."
+  exit 2
+fi
+
+if ! [[ "${OOT_GPU_MEMORY_UTILIZATION}" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+  echo "Invalid OOT_GPU_MEMORY_UTILIZATION: ${OOT_GPU_MEMORY_UTILIZATION}. Expected a numeric value."
   exit 2
 fi
 
@@ -146,6 +156,7 @@ launch_one_model() {
   local model_name="$1"
   local model_path="$2"
   local extra_args="$3"
+  local wait_for_ready="${4:-1}"
   local -a extra_arg_array=()
 
   local resolved_model_path
@@ -172,6 +183,7 @@ PY
   echo "Model name: ${model_name}"
   echo "Model path: ${resolved_model_path}"
   echo "Extra args: ${extra_args}"
+  echo "GPU memory utilization: ${OOT_GPU_MEMORY_UTILIZATION}"
 
   export SAFETENSORS_FAST_GPU=1
   export VLLM_RPC_TIMEOUT=1800000
@@ -198,12 +210,15 @@ PY
     --trust-remote-code \
     --kv-cache-dtype fp8 \
     "${extra_arg_array[@]}" \
+    --gpu-memory-utilization "${OOT_GPU_MEMORY_UTILIZATION}" \
     --no-enable-prefix-caching \
     > "${VLLM_LOG_FILE}" 2>&1 &
   echo $! > "${VLLM_PID_FILE}"
   echo "Server PID: $(cat "${VLLM_PID_FILE}")"
 
-  wait_server_ready "${model_name}"
+  if [[ "${wait_for_ready}" == "1" ]]; then
+    wait_server_ready "${model_name}"
+  fi
 }
 
 accuracy_one_model() {
@@ -396,8 +411,18 @@ run_for_models() {
     fi
     matched=1
 
+    if [[ "${action}" == "start" ]]; then
+      launch_one_model "${model_name}" "${model_path}" "${extra_args}" "0"
+      break
+    fi
+
     if [[ "${action}" == "launch" ]]; then
       launch_one_model "${model_name}" "${model_path}" "${extra_args}"
+      break
+    fi
+
+    if [[ "${action}" == "client" ]]; then
+      accuracy_one_model "${model_name}" "${model_path}" "${extra_args}" "${client_command}"
       break
     fi
 
@@ -414,7 +439,7 @@ run_for_models() {
 }
 
 cleanup_on_exit() {
-  if [[ "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ]]; then
+  if [[ "${TYPE}" == "start" || ( "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ) ]]; then
     echo "Keeping vLLM server alive for follow-up steps."
     return 0
   fi
@@ -423,8 +448,12 @@ cleanup_on_exit() {
 
 trap 'cleanup_on_exit' EXIT
 
-if [[ "${TYPE}" == "launch" ]]; then
+if [[ "${TYPE}" == "start" ]]; then
+  run_for_models "start"
+elif [[ "${TYPE}" == "launch" ]]; then
   run_for_models "launch"
+elif [[ "${TYPE}" == "client" ]]; then
+  run_for_models "client"
 else
   run_for_models "accuracy"
 fi
