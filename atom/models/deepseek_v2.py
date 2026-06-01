@@ -1254,8 +1254,8 @@ def _dequant_fp8_block_to_bf16(
 ) -> torch.Tensor:
     """Dequantize FP8 wk weights to BF16 for BF16-only fused GEMMs.
 
-    DeepSeek-V3.2 stores indexer.wk with block scales, while some MTP
-    checkpoints store a per-output-channel scale vector.
+    DeepSeek-V3.2 stores indexer.wk with block scales, while some PTPC
+    quantized checkpoints store a per-output-channel scale vector.
     """
     out_dim, in_dim = weight_fp8.shape
     scale = scale.float()
