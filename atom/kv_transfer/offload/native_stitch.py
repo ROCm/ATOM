@@ -42,3 +42,12 @@ def stitch_chunk_buffers(dst, chunk_buffers, chunk_block_counts, seg_block_bytes
         [int(x) for x in chunk_block_counts],
         [int(x) for x in seg_block_bytes],
     )
+
+
+def split_request_buffer(src, chunk_buffers, chunk_block_counts, seg_block_bytes) -> None:
+    _load_ext().split_request_buffer(
+        src,
+        chunk_buffers,
+        [int(x) for x in chunk_block_counts],
+        [int(x) for x in seg_block_bytes],
+    )

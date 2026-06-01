@@ -50,6 +50,7 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+from atom.kv_transfer.offload.trace import offload_trace
 from atom.utils.selector import get_attn_backend
 from torch.profiler import record_function
 
@@ -2009,6 +2010,15 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        t_forward0 = time.perf_counter()
+        offload_trace(
+            "runner_forward_start",
+            reqs=batch.req_ids,
+            prefill=batch.total_seqs_num_prefill,
+            decode=batch.total_seqs_num_decode,
+            tokens=batch.total_tokens_num,
+            cached=batch.num_cached_tokens,
+        )
         (
             input_ids,
             temperatures,
@@ -2029,6 +2039,15 @@ class ModelRunner:
             needs_independent_noise=needs_independent_noise,
         )
         reset_forward_context()
+        offload_trace(
+            "runner_forward_done",
+            reqs=batch.req_ids,
+            out_reqs=fwd_output.req_ids,
+            prefill=batch.total_seqs_num_prefill,
+            decode=batch.total_seqs_num_decode,
+            tokens=batch.total_tokens_num,
+            total_ms=f"{(time.perf_counter() - t_forward0) * 1000:.2f}",
+        )
         return fwd_output
 
     @torch.inference_mode()
@@ -2037,6 +2056,12 @@ class ModelRunner:
         if connector_meta_output is not None:
             connector = get_kvconnector()
             if connector is not None:
+                reqs = getattr(connector_meta_output, "requests", None)
+                offload_trace(
+                    "runner_connector_dispatch",
+                    requests=[r.req_id for r in reqs] if reqs is not None else None,
+                    nrequests=len(reqs) if reqs is not None else None,
+                )
                 connector.start_load_kv(connector_meta_output)
 
     @torch.inference_mode()
@@ -2048,6 +2073,19 @@ class ModelRunner:
 
         finished = connector.get_finished()
         if isinstance(finished, KVConnectorOutput):
+            if (
+                finished.finished_sending
+                or finished.finished_recving
+                or finished.failed_recving
+                or finished.finished_saving
+            ):
+                offload_trace(
+                    "runner_connector_finished",
+                    sending=sorted(finished.finished_sending or ()),
+                    recving=sorted(finished.finished_recving or ()),
+                    failed=sorted(finished.failed_recving or ()),
+                    saving=sorted(finished.finished_saving or ()),
+                )
             return finished
 
         done_sending, done_recving = finished

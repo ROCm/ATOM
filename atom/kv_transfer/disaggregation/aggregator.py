@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput, ReqId
+from atom.kv_transfer.offload.trace import offload_trace
 
 logger = logging.getLogger("atom")
 
@@ -78,9 +79,23 @@ class KVOutputAggregator:
             if wo.finished_recving:
                 for rid in wo.finished_recving:
                     self._seen_recving.setdefault(rid, set()).add(worker_idx)
+                    offload_trace(
+                        "aggregator_worker_recv_done",
+                        worker=worker_idx,
+                        req=rid,
+                        seen=len(self._seen_recving[rid]),
+                        world=self._world_size,
+                    )
             if wo.failed_recving:
                 for rid in wo.failed_recving:
                     self._seen_recv_failed.setdefault(rid, set()).add(worker_idx)
+                    offload_trace(
+                        "aggregator_worker_recv_failed",
+                        worker=worker_idx,
+                        req=rid,
+                        seen=len(self._seen_recv_failed[rid]),
+                        world=self._world_size,
+                    )
             if wo.finished_saving:
                 for rid in wo.finished_saving:
                     self._seen_saving.setdefault(rid, set()).add(worker_idx)
@@ -118,6 +133,14 @@ class KVOutputAggregator:
             self._seen_recv_failed.pop(rid, None)
         for rid in done_saving:
             del self._seen_saving[rid]
+
+        if done_recving or failed_recving or done_saving:
+            offload_trace(
+                "aggregator_done",
+                recv=sorted(done_recving),
+                failed=sorted(failed_recving),
+                saving=sorted(done_saving),
+            )
 
         return KVConnectorOutput(
             finished_sending=done_sending,

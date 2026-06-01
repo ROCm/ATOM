@@ -44,6 +44,7 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
+from atom.kv_transfer.offload.trace import offload_trace
 
 logger = logging.getLogger("atom")
 
@@ -111,6 +112,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._done_save: set[ReqId] = set()
         self._failed_load: set[ReqId] = set()
         self._load_active = threading.Event()
+        self._request_fastpath = os.environ.get(
+            "OFFLOAD_REQUEST_FASTPATH", "1"
+        ).lower() not in ("0", "false", "no", "off")
 
         self._engine = None
         self._sm = None
@@ -176,8 +180,24 @@ class LMCacheOffloadConnector(KVConnectorBase):
             return
         for req in metadata.requests:
             if req.load_spec is not None and self._do_load:
+                offload_trace(
+                    "worker_load_enqueue",
+                    rank=getattr(self, "_rank", "?"),
+                    req=req.req_id,
+                    hbm=req.load_spec.hbm_cached_tokens,
+                    lmc=req.load_spec.lmcache_cached_tokens,
+                    blocks=len(req.block_ids),
+                )
                 self._load_executor.submit(self._guard, "load", self._do_load_req, req)
             if req.save_spec is not None and self._do_save:
+                offload_trace(
+                    "worker_save_enqueue",
+                    rank=getattr(self, "_rank", "?"),
+                    req=req.req_id,
+                    skip=req.save_spec.skip_leading_tokens,
+                    toks=len(req.token_ids),
+                    blocks=len(req.block_ids),
+                )
                 self._save_executor.submit(self._guard, "save", self._do_save_req, req)
 
     def _guard(self, kind: str, fn, req) -> None:
@@ -212,12 +232,32 @@ class LMCacheOffloadConnector(KVConnectorBase):
         except Exception:
             pass
 
+    def _copy_device(self) -> torch.device | None:
+        codec = getattr(self, "_codec", None)
+        device = getattr(codec, "device", None)
+        if device is None:
+            return None
+        device = torch.device(device)
+        if device.type != "cuda":
+            return None
+        return device
+
     def _stream(self) -> torch.cuda.Stream:
-        """A CUDA stream owned by the calling copy-daemon thread (lazily made)."""
-        s = getattr(self._tls, "stream", None)
+        """A CUDA stream owned by the calling copy-daemon thread and device."""
+        device = self._copy_device()
+        key = str(device) if device is not None else "default"
+        streams = getattr(self._tls, "streams", None)
+        if streams is None:
+            streams = {}
+            self._tls.streams = streams
+        s = streams.get(key)
         if s is None:
-            s = torch.cuda.Stream()
-            self._tls.stream = s
+            if device is None:
+                s = torch.cuda.Stream()
+            else:
+                with torch.cuda.device(device):
+                    s = torch.cuda.Stream()
+            streams[key] = s
         return s
 
     def _host_tmp(self, nbytes: int) -> torch.Tensor:
@@ -256,19 +296,90 @@ class LMCacheOffloadConnector(KVConnectorBase):
             "off",
         )
 
+    def _request_fastpath_enabled(self) -> bool:
+        return (
+            bool(getattr(self, "_request_fastpath", False))
+            and self._codec is not None
+            and self._codec.layout == "segment_indexed"
+        )
+
+    def _request_level_key(self, chunks, token_count: int):
+        """Synthetic key for a whole-prefix segment-major object.
+
+        The normal LMCache chunk keys remain authoritative for lookup. This key
+        is an optional per-rank fast path for exact full-prefix reloads: it uses
+        the last chunk's prefix hash plus tags, so it cannot collide with normal
+        chunk entries and stays stable across scheduler/worker processes.
+        """
+        if not chunks:
+            return None
+        key = chunks[-1][2]
+        request_configs = dict(getattr(key, "request_configs", None) or {})
+        request_configs["lmcache.tag.atom_offload"] = "request"
+        request_configs["lmcache.tag.atom_offload_tokens"] = str(int(token_count))
+        request_configs["lmcache.tag.atom_offload_layout"] = str(
+            getattr(self._codec, "layout", "unknown")
+        )
+        return key.__class__(
+            model_name=key.model_name,
+            world_size=key.world_size,
+            worker_id=key.worker_id,
+            chunk_hash=key.chunk_hash,
+            dtype=key.dtype,
+            request_configs=request_configs,
+        )
+
     # -- copy daemon thread ----------------------------------------------
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
         assert ls is not None
-        stream = self._stream()
         hbm = int(ls.hbm_cached_tokens)
         toks = req.token_ids[: ls.lmcache_cached_tokens]
         t_total0 = time.perf_counter()
+        offload_trace(
+            "worker_load_start",
+            rank=getattr(self, "_rank", "?"),
+            req=req.req_id,
+            hbm=hbm,
+            lmc=ls.lmcache_cached_tokens,
+            toks=len(toks),
+            blocks=len(req.block_ids),
+        )
         if int(ls.lmcache_cached_tokens) <= hbm:
             self._lookup_unpin(req.req_id)
             with self._lock:
                 self._done_load.add(req.req_id)
+            offload_trace(
+                "worker_load_done",
+                rank=getattr(self, "_rank", "?"),
+                req=req.req_id,
+                status="hbm_only",
+                total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
+            )
             return
+        chunk_size = int(self.chunk_size or 256)
+        if hbm % chunk_size != 0:
+            logger.warning(
+                "LMCache offload: HBM prefix is not chunk-aligned req=%s "
+                "hbm=%d chunk=%d; re-prefill",
+                req.req_id,
+                hbm,
+                chunk_size,
+            )
+            self._lookup_unpin(req.req_id)
+            with self._lock:
+                self._failed_load.add(req.req_id)
+            offload_trace(
+                "worker_load_done",
+                rank=getattr(self, "_rank", "?"),
+                req=req.req_id,
+                status="unaligned_hbm",
+                hbm=hbm,
+                chunk=chunk_size,
+                total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
+            )
+            return
+        stream = self._stream()
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:hbm] = False
         t0 = time.perf_counter()
@@ -287,6 +398,13 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._lookup_unpin(req.req_id)
             with self._lock:
                 self._failed_load.add(req.req_id)
+            offload_trace(
+                "worker_load_done",
+                rank=getattr(self, "_rank", "?"),
+                req=req.req_id,
+                status="no_chunks",
+                total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
+            )
             return
         for (s, _e, _key) in chunks:
             if s < hbm:
@@ -298,19 +416,17 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 self._lookup_unpin(req.req_id)
                 with self._lock:
                     self._failed_load.add(req.req_id)
+                offload_trace(
+                    "worker_load_done",
+                    rank=getattr(self, "_rank", "?"),
+                    req=req.req_id,
+                    status="overlap_hbm",
+                    hbm=hbm,
+                    chunk_start=s,
+                    total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
+                )
                 return
         contains_ms = 0.0
-        for (_s, _e, key) in chunks:
-            t0 = time.perf_counter()
-            if not self._sm.contains(key):
-                contains_ms += (time.perf_counter() - t0) * 1000
-                logger.warning("LMCache offload: load miss req=%s; re-prefill", req.req_id)
-                self._lookup_unpin(req.req_id)
-                with self._lock:
-                    self._failed_load.add(req.req_id)
-                return
-            contains_ms += (time.perf_counter() - t0) * 1000
-
         loaded_objs = []
         get_ms = 0.0
         host_alloc_ms = 0.0
@@ -320,7 +436,102 @@ class LMCacheOffloadConnector(KVConnectorBase):
         nblocks = 0
         nbytes = 0
         copy_calls = 0
-        chunk_bids: list[list[int]] = []
+        chunk_bids: list[list[int]] = [
+            self._block_ids(req, s, e) for (s, e, _key) in chunks
+        ]
+        all_bids = [bid for bids in chunk_bids for bid in bids]
+        nblocks = len(all_bids)
+        nbytes = nblocks * self._codec.bytes_per_block
+
+        request_key = None
+        if hbm == 0 and self._request_fastpath_enabled():
+            request_key = self._request_level_key(chunks, len(toks))
+        if request_key is not None:
+            req_mo = None
+            t0 = time.perf_counter()
+            request_location = self._sm.contains(request_key)
+            contains_ms += (time.perf_counter() - t0) * 1000
+            if request_location:
+                try:
+                    t0 = time.perf_counter()
+                    req_mo = self._sm.get(request_key)
+                    get_ms += (time.perf_counter() - t0) * 1000
+                    if req_mo is not None:
+                        copy_calls = self._codec.copy_calls_for_block_ids(all_bids)
+                        t0 = time.perf_counter()
+                        self._codec.host_to_gpu(req_mo.tensor, all_bids, stream)
+                        h2d_submit_ms += (time.perf_counter() - t0) * 1000
+                        t0 = time.perf_counter()
+                        stream.synchronize()
+                        sync_ms += (time.perf_counter() - t0) * 1000
+                        self._lookup_unpin(req.req_id)
+                        with self._lock:
+                            self._done_load.add(req.req_id)
+                        total_ms = (time.perf_counter() - t_total0) * 1000
+                        offload_trace(
+                            "worker_load_done",
+                            rank=getattr(self, "_rank", "?"),
+                            req=req.req_id,
+                            status="ok_request",
+                            chunks=len(chunks),
+                            blocks=nblocks,
+                            bytes_gib=f"{nbytes / 1024**3:.3f}",
+                            stitch_ms=f"{stitch_ms:.2f}",
+                            h2d_submit_ms=f"{h2d_submit_ms:.2f}",
+                            sync_ms=f"{sync_ms:.2f}",
+                            total_ms=f"{total_ms:.2f}",
+                        )
+                        if self._profile_enabled():
+                            logger.info(
+                                "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d "
+                                "chunks=%d blocks=%d bytes=%.3fGiB copy_calls=%d "
+                                "layout=%s fastpath=request process_ms=%.2f "
+                                "contains_ms=%.2f get_ms=%.2f host_alloc_ms=%.2f "
+                                "stitch_ms=%.2f h2d_submit_ms=%.2f sync_ms=%.2f "
+                                "total_ms=%.2f",
+                                getattr(self, "_rank", "?"),
+                                req.req_id,
+                                hbm,
+                                ls.lmcache_cached_tokens,
+                                len(chunks),
+                                nblocks,
+                                nbytes / 1024**3,
+                                copy_calls,
+                                self._codec.layout,
+                                process_ms,
+                                contains_ms,
+                                get_ms,
+                                host_alloc_ms,
+                                stitch_ms,
+                                h2d_submit_ms,
+                                sync_ms,
+                                total_ms,
+                            )
+                        logger.info("offload _do_load DONE req=%s", req.req_id)
+                        return
+                finally:
+                    if req_mo is not None:
+                        req_mo.ref_count_down()
+
+        for (_s, _e, key) in chunks:
+            t0 = time.perf_counter()
+            if not self._sm.contains(key):
+                contains_ms += (time.perf_counter() - t0) * 1000
+                logger.warning("LMCache offload: load miss req=%s; re-prefill", req.req_id)
+                self._lookup_unpin(req.req_id)
+                with self._lock:
+                    self._failed_load.add(req.req_id)
+                offload_trace(
+                    "worker_load_done",
+                    rank=getattr(self, "_rank", "?"),
+                    req=req.req_id,
+                    status="miss",
+                    chunks=len(chunks),
+                    total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
+                )
+                return
+            contains_ms += (time.perf_counter() - t0) * 1000
+
         try:
             for (s, e, key) in chunks:
                 t0 = time.perf_counter()
@@ -335,19 +546,23 @@ class LMCacheOffloadConnector(KVConnectorBase):
                     self._lookup_unpin(req.req_id)
                     with self._lock:
                         self._failed_load.add(req.req_id)
+                    offload_trace(
+                        "worker_load_done",
+                        rank=getattr(self, "_rank", "?"),
+                        req=req.req_id,
+                        status="get_none",
+                        chunks=len(chunks),
+                        total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
+                    )
                     return
                 loaded_objs.append(mo)
-                bids = self._block_ids(req, s, e)
-                chunk_bids.append(bids)
-                nblocks += len(bids)
-                nbytes += len(bids) * self._codec.bytes_per_block
+                bids = chunk_bids[len(loaded_objs) - 1]
                 if self._codec.layout != "segment_indexed":
                     copy_calls += self._codec.copy_calls_for_block_ids(bids)
                     t0 = time.perf_counter()
                     self._codec.host_to_gpu(mo.tensor, bids, stream)
                     h2d_submit_ms += (time.perf_counter() - t0) * 1000
             if self._codec.layout == "segment_indexed":
-                all_bids = [bid for bids in chunk_bids for bid in bids]
                 copy_calls = self._codec.copy_calls_for_block_ids(all_bids)
                 t0 = time.perf_counter()
                 req_buf = self._host_tmp(nbytes)
@@ -382,14 +597,27 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._lookup_unpin(req.req_id)
         with self._lock:
             self._done_load.add(req.req_id)
+        total_ms = (time.perf_counter() - t_total0) * 1000
+        offload_trace(
+            "worker_load_done",
+            rank=getattr(self, "_rank", "?"),
+            req=req.req_id,
+            status="ok",
+            chunks=len(chunks),
+            blocks=nblocks,
+            bytes_gib=f"{nbytes / 1024**3:.3f}",
+            stitch_ms=f"{stitch_ms:.2f}",
+            h2d_submit_ms=f"{h2d_submit_ms:.2f}",
+            sync_ms=f"{sync_ms:.2f}",
+            total_ms=f"{total_ms:.2f}",
+        )
         if self._profile_enabled():
-            total_ms = (time.perf_counter() - t_total0) * 1000
             logger.info(
                 "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d "
                 "chunks=%d blocks=%d bytes=%.3fGiB copy_calls=%d "
-                "layout=%s process_ms=%.2f contains_ms=%.2f get_ms=%.2f "
-                "host_alloc_ms=%.2f stitch_ms=%.2f h2d_submit_ms=%.2f "
-                "sync_ms=%.2f total_ms=%.2f",
+                "layout=%s fastpath=chunk process_ms=%.2f contains_ms=%.2f "
+                "get_ms=%.2f host_alloc_ms=%.2f stitch_ms=%.2f "
+                "h2d_submit_ms=%.2f sync_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
                 req.req_id,
                 hbm,
@@ -423,9 +651,24 @@ class LMCacheOffloadConnector(KVConnectorBase):
         if skip >= len(toks):
             with self._lock:
                 self._done_save.add(req.req_id)
+            offload_trace(
+                "worker_save_done",
+                rank=getattr(self, "_rank", "?"),
+                req=req.req_id,
+                status="skip",
+                toks=len(toks),
+            )
             return
 
         t_total0 = time.perf_counter()
+        offload_trace(
+            "worker_save_start",
+            rank=getattr(self, "_rank", "?"),
+            req=req.req_id,
+            skip=skip,
+            toks=len(toks),
+            blocks=len(req.block_ids),
+        )
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:skip] = False
         t0 = time.perf_counter()
@@ -433,15 +676,30 @@ class LMCacheOffloadConnector(KVConnectorBase):
         process_ms = (time.perf_counter() - t0) * 1000
 
         keys, objs, already = [], [], 0
+        request_key = None
+        request_obj = None
+        request_fastpath = "off"
+        if skip == 0 and self._request_fastpath_enabled() and chunks:
+            request_key = self._request_level_key(chunks, len(toks))
+            request_fastpath = "miss"
+            t0 = time.perf_counter()
+            if self._sm.contains(request_key):
+                request_key = None
+                request_fastpath = "hit"
+            contains_ms = (time.perf_counter() - t0) * 1000
+        else:
+            contains_ms = 0.0
         put_started = False
-        contains_ms = 0.0
         alloc_ms = 0.0
+        host_alloc_ms = 0.0
         d2h_submit_ms = 0.0
         sync_ms = 0.0
+        split_ms = 0.0
         put_ms = 0.0
         nblocks = 0
         total_nbytes = 0
         copy_calls = 0
+        chunk_bids: list[list[int]] = []
         try:
             for (s, e, key) in chunks:
                 self._pause_save_for_load(stream)
@@ -461,21 +719,64 @@ class LMCacheOffloadConnector(KVConnectorBase):
                     break
                 keys.append(key)
                 objs.append(mo)
+                chunk_bids.append(bids)
                 nblocks += len(bids)
                 total_nbytes += chunk_nbytes
-                copy_calls += self._codec.copy_calls_for_block_ids(bids)
-                # D2H on this thread's dedicated copy stream (off the compute stream).
-                t0 = time.perf_counter()
-                self._codec.gpu_to_host(mo.tensor, bids, stream)
-                d2h_submit_ms += (time.perf_counter() - t0) * 1000
+                if self._codec.layout != "segment_indexed":
+                    copy_calls += self._codec.copy_calls_for_block_ids(bids)
+                    # D2H on this thread's dedicated copy stream (off compute stream).
+                    t0 = time.perf_counter()
+                    self._codec.gpu_to_host(mo.tensor, bids, stream)
+                    d2h_submit_ms += (time.perf_counter() - t0) * 1000
 
             if keys:
+                if self._codec.layout == "segment_indexed":
+                    all_bids = [bid for bids in chunk_bids for bid in bids]
+                    copy_calls = self._codec.copy_calls_for_block_ids(all_bids)
+                    if request_key is not None and len(keys) == len(chunks):
+                        t0 = time.perf_counter()
+                        request_obj = self._sm.allocate(
+                            torch.Size((total_nbytes,)),
+                            torch.uint8,
+                            fmt=MemoryFormat.KV_2LTD,
+                        )
+                        alloc_ms += (time.perf_counter() - t0) * 1000
+                        if request_obj is not None:
+                            req_buf = request_obj.tensor
+                            request_fastpath = "stored"
+                        else:
+                            request_key = None
+                            request_fastpath = "alloc_failed"
+                    else:
+                        request_key = None
+                        if request_fastpath == "miss":
+                            request_fastpath = "partial_skip"
+                    if request_obj is None:
+                        t0 = time.perf_counter()
+                        req_buf = self._host_tmp(total_nbytes)
+                        host_alloc_ms += (time.perf_counter() - t0) * 1000
+                    t0 = time.perf_counter()
+                    self._codec.gpu_to_host(req_buf, all_bids, stream)
+                    d2h_submit_ms += (time.perf_counter() - t0) * 1000
                 t0 = time.perf_counter()
                 stream.synchronize()  # stream-specific
                 sync_ms += (time.perf_counter() - t0) * 1000
+                if self._codec.layout == "segment_indexed":
+                    t0 = time.perf_counter()
+                    self._codec.split_request_buffer(
+                        req_buf,
+                        [mo.tensor for mo in objs],
+                        [len(bids) for bids in chunk_bids],
+                    )
+                    split_ms += (time.perf_counter() - t0) * 1000
                 put_started = True
                 t0 = time.perf_counter()
-                self._sm.batched_put(keys, objs)
+                put_keys = list(keys)
+                put_objs = list(objs)
+                if request_key is not None and request_obj is not None:
+                    put_keys.append(request_key)
+                    put_objs.append(request_obj)
+                self._sm.batched_put(put_keys, put_objs)
                 put_ms += (time.perf_counter() - t0) * 1000
         except Exception:
             if not put_started:
@@ -484,18 +785,39 @@ class LMCacheOffloadConnector(KVConnectorBase):
                     stream.synchronize()
                     sync_ms += (time.perf_counter() - t0) * 1000
                 finally:
-                    for mo in objs:
+                    cleanup_objs = list(objs)
+                    if request_obj is not None:
+                        cleanup_objs.append(request_obj)
+                    for mo in cleanup_objs:
                         mo.ref_count_down()
             raise
         with self._lock:
             self._done_save.add(req.req_id)
+        total_ms = (time.perf_counter() - t_total0) * 1000
+        offload_trace(
+            "worker_save_done",
+            rank=getattr(self, "_rank", "?"),
+            req=req.req_id,
+            status="ok",
+            toks=len(toks),
+            chunks=len(chunks),
+            stored=len(keys),
+            blocks=nblocks,
+            bytes_gib=f"{total_nbytes / 1024**3:.3f}",
+            d2h_submit_ms=f"{d2h_submit_ms:.2f}",
+            sync_ms=f"{sync_ms:.2f}",
+            split_ms=f"{split_ms:.2f}",
+            request_fastpath=request_fastpath,
+            total_ms=f"{total_ms:.2f}",
+        )
         if self._profile_enabled():
-            total_ms = (time.perf_counter() - t_total0) * 1000
             logger.info(
                 "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d chunks=%d "
                 "stored=%d already=%d blocks=%d bytes=%.3fGiB copy_calls=%d "
-                "layout=%s process_ms=%.2f contains_ms=%.2f alloc_ms=%.2f "
-                "d2h_submit_ms=%.2f sync_ms=%.2f put_ms=%.2f total_ms=%.2f",
+                "layout=%s request_fastpath=%s process_ms=%.2f "
+                "contains_ms=%.2f alloc_ms=%.2f host_alloc_ms=%.2f "
+                "d2h_submit_ms=%.2f sync_ms=%.2f split_ms=%.2f "
+                "put_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
                 req.req_id,
                 len(toks),
@@ -506,11 +828,14 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 total_nbytes / 1024**3,
                 copy_calls,
                 self._codec.layout,
+                request_fastpath,
                 process_ms,
                 contains_ms,
                 alloc_ms,
+                host_alloc_ms,
                 d2h_submit_ms,
                 sync_ms,
+                split_ms,
                 put_ms,
                 total_ms,
             )
@@ -535,6 +860,14 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._done_save.clear()
             self._done_load.clear()
             self._failed_load.clear()
+        if dl or fl or ds:
+            offload_trace(
+                "worker_get_finished",
+                rank=getattr(self, "_rank", "?"),
+                done_load=sorted(dl),
+                failed_load=sorted(fl),
+                done_save=sorted(ds),
+            )
         return KVConnectorOutput(
             finished_sending=set(),
             finished_recving=dl,
@@ -595,11 +928,25 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             return 0, False
         num_prompt = seq.num_prompt_tokens
         token_ids = list(seq.token_ids[:num_prompt])
+        offload_trace(
+            "scheduler_lookup_start",
+            req=seq.id,
+            prompt=num_prompt,
+            hbm=seq.num_cached_tokens,
+        )
+        t_lookup0 = time.perf_counter()
         try:
             hit = self._lookup_client.lookup(token_ids, lookup_id=str(seq.id))
         except Exception:
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
+            offload_trace(
+                "scheduler_lookup_done",
+                req=seq.id,
+                status="exception",
+                lookup_ms=f"{(time.perf_counter() - t_lookup0) * 1000:.2f}",
+            )
             return 0, False
+        lookup_ms = (time.perf_counter() - t_lookup0) * 1000
         if logger.isEnabledFor(logging.DEBUG):
             _lh = None
             try:
@@ -612,6 +959,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             logger.debug("[OFFLOAD-LOOKUP] seq=%s num_prompt=%d hbm_cached=%d hit=%s lookuphash3=%s",
                          seq.id, num_prompt, int(seq.num_cached_tokens), hit, _lh)
         if not hit:
+            offload_trace(
+                "scheduler_lookup_done",
+                req=seq.id,
+                status="miss",
+                hit=hit,
+                lookup_ms=f"{lookup_ms:.2f}",
+            )
             return 0, False
         sid = str(seq.id)
         hit = int(hit)
@@ -624,12 +978,29 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                     self._lookup_client.clear_lookup_status(sid)
                 except Exception:
                     pass
+            offload_trace(
+                "scheduler_lookup_done",
+                req=seq.id,
+                status="hbm_satisfies",
+                hit=hit,
+                hbm=seq.num_cached_tokens,
+                lookup_ms=f"{lookup_ms:.2f}",
+            )
             return 0, False
         self._lookup_in_step.append(sid)
         self._load_specs[sid] = LoadSpec(
             hbm_cached_tokens=int(seq.num_cached_tokens),
             lmcache_cached_tokens=hit,
             can_load=False,
+        )
+        offload_trace(
+            "scheduler_lookup_done",
+            req=seq.id,
+            status="need_load",
+            hit=hit,
+            hbm=seq.num_cached_tokens,
+            need=need,
+            lookup_ms=f"{lookup_ms:.2f}",
         )
         return need, True  # True => park in WAITING_FOR_REMOTE_KVS
 
@@ -641,8 +1012,15 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if ls is not None:
             ls.can_load = True
             self._reqs_need_recv[sid] = seq
-        # Track for save; the prompt prefix is offloaded later, once prefill has
-        # actually computed it (checked via prefix_hashes_published in build).
+            offload_trace(
+                "scheduler_load_alloc_ready",
+                req=seq.id,
+                hbm=seq.num_cached_tokens,
+                lmc=ls.lmcache_cached_tokens,
+                blocks=len(seq.block_table),
+            )
+        # Track for save; build_connector_meta stores chunks once the scheduler's
+        # computed frontier (seq.num_cached_tokens) has advanced past them.
         if sid not in self._save_tracker:
             self._save_tracker[sid] = [seq, 0]
 
@@ -667,6 +1045,67 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             # prefix-cache blocks (possibly shared with other seqs) -> output
             # corruption. So load only [hbm_cached, offload_hit).
             ls.hbm_cached_tokens = int(seq.num_cached_tokens)
+            if ls.hbm_cached_tokens >= int(ls.lmcache_cached_tokens):
+                seq.offload_loaded_tokens = int(seq.num_cached_tokens)
+                logger.info(
+                    "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
+                    "reason=hbm_satisfies_after_alloc",
+                    seq.id,
+                    ls.hbm_cached_tokens,
+                    ls.lmcache_cached_tokens,
+                )
+                offload_trace(
+                    "scheduler_load_hbm_satisfies_after_alloc",
+                    req=seq.id,
+                    hbm=ls.hbm_cached_tokens,
+                    lmc=ls.lmcache_cached_tokens,
+                    blocks=len(list(seq.block_table)),
+                )
+                # The request may already be parked in WAITING_FOR_REMOTE_KVS.
+                # Emit a no-op load so every worker reports finished_recving via
+                # the normal aggregation path instead of trying to complete it
+                # locally in the scheduler process.
+                meta.add_request(LMCacheReqMeta(
+                    req_id=seq.id,
+                    token_ids=list(seq.token_ids[: ls.lmcache_cached_tokens]),
+                    block_ids=list(seq.block_table),
+                    load_spec=ls,
+                ))
+                continue
+            chunk = self.chunk_size or 256
+            if ls.hbm_cached_tokens % chunk != 0:
+                seq.offload_loaded_tokens = int(seq.num_cached_tokens)
+                logger.info(
+                    "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
+                    "reason=unaligned_hbm chunk=%d",
+                    seq.id,
+                    ls.hbm_cached_tokens,
+                    ls.lmcache_cached_tokens,
+                    chunk,
+                )
+                offload_trace(
+                    "scheduler_load_unaligned_hbm",
+                    req=seq.id,
+                    hbm=ls.hbm_cached_tokens,
+                    lmc=ls.lmcache_cached_tokens,
+                    chunk=chunk,
+                    blocks=len(list(seq.block_table)),
+                )
+                # LMCache chunks can only be loaded from a chunk boundary. Do
+                # not round down and overwrite HBM prefix-cache blocks that may
+                # be shared with other requests; wake the parked request and let
+                # it continue prefill from the HBM floor.
+                meta.add_request(LMCacheReqMeta(
+                    req_id=seq.id,
+                    token_ids=list(seq.token_ids[: ls.hbm_cached_tokens]),
+                    block_ids=list(seq.block_table),
+                    load_spec=LoadSpec(
+                        hbm_cached_tokens=ls.hbm_cached_tokens,
+                        lmcache_cached_tokens=ls.hbm_cached_tokens,
+                        can_load=True,
+                    ),
+                ))
+                continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
             seq.offload_loaded_tokens = max(
                 int(seq.num_cached_tokens), int(ls.lmcache_cached_tokens)
@@ -677,41 +1116,85 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             logger.info("[OFFLOAD-LOAD-EMIT] seq=%s hbm_cached=%d lmc_cached=%d offload_loaded=%d nblocks=%d",
                         seq.id, ls.hbm_cached_tokens, ls.lmcache_cached_tokens,
                         seq.offload_loaded_tokens, len(list(seq.block_table)))
+            offload_trace(
+                "scheduler_load_emit",
+                req=seq.id,
+                hbm=ls.hbm_cached_tokens,
+                lmc=ls.lmcache_cached_tokens,
+                offload_loaded=seq.offload_loaded_tokens,
+                blocks=len(list(seq.block_table)),
+            )
             meta.add_request(LMCacheReqMeta(
                 req_id=seq.id,
                 token_ids=list(seq.token_ids[: ls.lmcache_cached_tokens]),
                 block_ids=list(seq.block_table),
                 load_spec=ls,
             ))
-        # Saves: store the prompt prefix once prefill has computed it. We detect
-        # "computed" via seq.prefix_hashes_published (set in postprocess after the
-        # prefill step), so the blocks we D2H are already written -- no race with
-        # forward. Persistent tracker: each chunk is stored once.
+        # Saves: store fully computed prompt chunks. Under scheduler-side
+        # chunked prefill, seq.num_cached_tokens advances after each prefill
+        # chunk's forward has completed; use it as the D2H-safe frontier.
         chunk = self.chunk_size or 256
         for sid, entry in self._save_tracker.items():
             seq, saved = entry
             if sid in self._reqs_need_recv:
                 continue  # loading this step; defer its save
-            if not getattr(seq, "prefix_hashes_published", False):
-                continue  # prefill not finished computing the prompt yet
-            aligned = (int(seq.num_prompt_tokens) // chunk) * chunk
+            if sid in self._save_inflight:
+                continue  # keep at most one save per request in flight
+            computed = min(
+                int(getattr(seq, "num_cached_tokens", 0)),
+                int(seq.num_prompt_tokens),
+            )
+            is_last_prefill = computed >= int(seq.num_prompt_tokens)
+            aligned = (computed // chunk) * chunk
             if aligned <= saved:
                 continue
-            logger.debug("[OFFLOAD-SAVE-EMIT] seq=%s num_prompt=%d aligned=%d saved=%d",
-                         seq.id, int(seq.num_prompt_tokens), aligned, saved)
+            logger.debug(
+                "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d aligned=%d saved=%d",
+                seq.id,
+                computed,
+                int(seq.num_prompt_tokens),
+                aligned,
+                saved,
+            )
+            offload_trace(
+                "scheduler_save_emit",
+                req=seq.id,
+                prompt=seq.num_prompt_tokens,
+                computed=computed,
+                aligned=aligned,
+                saved=saved,
+                blocks=len(seq.block_table),
+            )
             meta.add_request(LMCacheReqMeta(
                 req_id=seq.id,
                 token_ids=list(seq.token_ids[:aligned]),
                 block_ids=list(seq.block_table),
                 save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
+                is_last_prefill=is_last_prefill,
             ))
             entry[1] = aligned
             self._save_inflight.add(sid)
         self._reqs_need_recv.clear()
         return meta
 
+    def _save_frontier(self, seq) -> int:
+        chunk = self.chunk_size or 256
+        computed = min(
+            int(getattr(seq, "num_cached_tokens", 0)),
+            int(getattr(seq, "num_prompt_tokens", 0)),
+        )
+        return (computed // chunk) * chunk
+
+    def _has_pending_save(self, seq) -> bool:
+        sid = str(seq.id)
+        entry = self._save_tracker.get(sid)
+        if entry is None:
+            return False
+        return self._save_frontier(seq) > int(entry[1])
+
     def should_defer_free(self, seq) -> bool:
-        return str(seq.id) in self._save_inflight
+        sid = str(seq.id)
+        return sid in self._save_inflight or self._has_pending_save(seq)
 
     def save_finished(self, req_id) -> None:
         self._save_inflight.discard(str(req_id))
@@ -724,7 +1207,8 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         sid = str(seq.id)
         self._load_specs.pop(sid, None)
         self._reqs_need_recv.pop(sid, None)
-        self._save_tracker.pop(sid, None)
+        if not self.should_defer_free(seq):
+            self._save_tracker.pop(sid, None)
         if self._lookup_client is not None:
             try:
                 self._lookup_client.clear_lookup_status(sid)

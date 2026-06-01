@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.kv_transfer.offload.trace import offload_trace
 
 logger = logging.getLogger("atom")
 
@@ -486,6 +487,8 @@ class Scheduler:
         entries) and check `can_allocate` + token-budget, mirroring the
         same checks the admission while-loop runs below.
         """
+        if self._partial_prefill_count > 0:
+            return True
         if not self.waiting:
             return False
         for i, seq in enumerate(self.waiting):
@@ -496,7 +499,10 @@ class Scheduler:
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
                 continue
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
-            if num_new_tokens > self.max_num_batched_tokens:
+            if (
+                not self.enable_chunked_prefill
+                and num_new_tokens > self.max_num_batched_tokens
+            ):
                 continue
             if self.block_manager.can_allocate(seq) < 0:
                 return False  # KV-pressured: definitely cannot prefill
@@ -709,6 +715,12 @@ class Scheduler:
             waiting_remote_to_waiting_ready = False
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
                 if self._pop_req_id(self.failed_recving_kv_req_ids, seq.id):
+                    offload_trace(
+                        "scheduler_load_failed_wake",
+                        req=seq.id,
+                        cached=seq.num_cached_tokens,
+                        prompt=seq.num_prompt_tokens,
+                    )
                     if self.kv_connector is not None and hasattr(
                         self.kv_connector, "load_failed"
                     ):
@@ -744,6 +756,13 @@ class Scheduler:
                 logger.debug(
                     "[OFFLOAD-WAKE] seq %s: loaded=%s prev_cached=%d num_tokens=%d",
                     seq.id, loaded, seq.num_cached_tokens, seq.num_tokens,
+                )
+                offload_trace(
+                    "scheduler_offload_wake",
+                    req=seq.id,
+                    loaded=loaded,
+                    prev_cached=seq.num_cached_tokens,
+                    prompt=seq.num_prompt_tokens,
                 )
                 if loaded is not None and loaded > seq.num_cached_tokens:
                     seq.num_cached_tokens = loaded
@@ -822,13 +841,28 @@ class Scheduler:
                         self.waiting.appendleft(seq)
                         break
                     chunk = num_new_tokens
-
+                t_alloc0 = time.perf_counter()
                 self.block_manager.allocate(seq, num_cached_blocks)
+                offload_trace(
+                    "scheduler_alloc_done",
+                    req=seq.id,
+                    cached_blocks=num_cached_blocks,
+                    cached_tokens=seq.num_cached_tokens,
+                    blocks=len(seq.block_table),
+                    alloc_ms=f"{(time.perf_counter() - t_alloc0) * 1000:.2f}",
+                )
 
                 if self.kv_connector is not None:
                     self.kv_connector.update_state_after_alloc(seq)
 
                 if need_to_remove_to_load_kv_async_queue:
+                    offload_trace(
+                        "scheduler_park_for_load",
+                        req=seq.id,
+                        cached=seq.num_cached_tokens,
+                        prompt=seq.num_prompt_tokens,
+                        blocks=len(seq.block_table),
+                    )
                     skipped_waiting_requests.append(seq)
                     seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
                     continue
@@ -837,15 +871,24 @@ class Scheduler:
                 f"chunk must be positive: {chunk=}, "
                 f"{num_new_tokens=}, {budget_remaining=}"
             )
+            num_seqs_prefill += 1
             if self.cache_stats:
                 self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
             num_batched_tokens += chunk
-            num_seqs_prefill += 1
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL
             self.running.append(seq)
             scheduled_seqs[seq.id] = seq
             num_scheduled_tokens.append(chunk)
+            offload_trace(
+                "scheduler_prefill_scheduled",
+                req=seq.id,
+                new_tokens=chunk,
+                cached=seq.num_cached_tokens,
+                prompt=seq.num_prompt_tokens,
+                offload_loaded=getattr(seq, "offload_loaded", False),
+                load_failed=getattr(seq, "offload_load_failed", False),
+            )
 
         if skipped_waiting_requests:
             logger.debug(
@@ -894,10 +937,14 @@ class Scheduler:
         num_new_tokens = self.mtp_k + 1
         remote_kv_blocks: set[int] = set()
         remote_kv_seq_blocks: dict[int, list[int]] = {}
+        skipped_partial_prefills: list[Sequence] = []
         while self.running and num_seqs_decode < self.max_num_seqs:
             if num_decode_tokens + tokens_per_decode_seq > self.max_num_batched_tokens:
                 break
             seq = self.running.popleft()
+            if seq.is_partial_prefill:
+                skipped_partial_prefills.append(seq)
+                continue
             while not self.block_manager.can_append(seq, num_new_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -943,6 +990,8 @@ class Scheduler:
 
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs.values()))
+        if skipped_partial_prefills:
+            self.running.extendleft(reversed(skipped_partial_prefills))
 
         connector_meta_output = None
         if self.kv_connector is not None:
@@ -1076,10 +1125,11 @@ class Scheduler:
             # later in this loop, so they're not part of the prompt hash
             # chain — leaving them in would mint a stale partial-block hash.
             if not seq.prefix_hashes_published:
-                _num_new = seq.num_tokens - seq.num_cached_tokens
-                if need_placeholder:
-                    _num_new -= num_placeholder
-                self.block_manager.hash_blocks(seq, _num_new)
+                if batch is None:
+                    _num_new = seq.num_tokens - seq.num_cached_tokens
+                    if need_placeholder:
+                        _num_new -= num_placeholder
+                    self.block_manager.hash_blocks(seq, max(0, _num_new))
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
@@ -1255,6 +1305,8 @@ class Scheduler:
                 seq.is_partial_prefill = False
                 self._partial_prefill_count -= 1
             if self.kv_connector is not None:
+                if hasattr(self.kv_connector, "request_finished"):
+                    self.kv_connector.request_finished(seq)
                 if not self.kv_connector.is_producer:
                     if hasattr(self.kv_connector, "should_defer_free") and (
                         self.kv_connector.should_defer_free(seq)
@@ -1313,6 +1365,12 @@ class Scheduler:
             return False
 
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
+        offload_trace(
+            "scheduler_recv_ready",
+            req=seq.id,
+            cached=getattr(seq, "num_cached_tokens", None),
+            prompt=getattr(seq, "num_prompt_tokens", None),
+        )
         return True
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
@@ -1339,6 +1397,7 @@ class Scheduler:
                 not self.kv_connector.is_producer
             ), "Only consumer should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
+            offload_trace("scheduler_finished_recving", req=req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.failed_recving or ():
@@ -1346,6 +1405,7 @@ class Scheduler:
                 not self.kv_connector.is_producer
             ), "Only consumer should update failed KV recv status"
             logger.warning("KV receive failed for request %s; falling back to prefill.", req_id)
+            offload_trace("scheduler_failed_recving", req=req_id)
             self.failed_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.finished_sending or ():
@@ -1360,6 +1420,7 @@ class Scheduler:
         for req_id in kv_connector_output.finished_saving or ():
             if hasattr(self.kv_connector, "save_finished"):
                 self.kv_connector.save_finished(req_id)
+            offload_trace("scheduler_finished_saving", req=req_id)
             seq = self.deferred_free_blocks.get(req_id)
             if seq is None:
                 try:
@@ -1370,7 +1431,11 @@ class Scheduler:
                 hasattr(self.kv_connector, "should_defer_free")
                 and self.kv_connector.should_defer_free(seq)
             ):
-                self.block_manager.deallocate(_pop_deferred(req_id))
+                seq = _pop_deferred(req_id)
+                if seq is not None and hasattr(self.kv_connector, "request_finished"):
+                    self.kv_connector.request_finished(seq)
+                if seq is not None:
+                    self.block_manager.deallocate(seq)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
@@ -1392,7 +1457,7 @@ class Scheduler:
     def get_next_batch_info(self) -> tuple[bool, int, int]:
         # Check for partial prefills in running (chunked prefill resume)
         for seq in self.running:
-            if seq.num_cached_tokens < seq.num_prompt_tokens:
+            if seq.is_partial_prefill:
                 remaining = seq.num_prompt_tokens - seq.num_cached_tokens
                 chunk = min(remaining, self.max_num_batched_tokens)
                 return (True, chunk, 1)
@@ -1409,6 +1474,8 @@ class Scheduler:
             total_tokens = 0
             for seq in eligible_waiting:
                 tokens = seq.num_tokens - seq.num_cached_tokens
+                if self.enable_chunked_prefill:
+                    tokens = min(tokens, self.max_num_batched_tokens - total_tokens)
                 if total_tokens + tokens > self.max_num_batched_tokens:
                     break
                 if num_reqs >= self.max_num_seqs:

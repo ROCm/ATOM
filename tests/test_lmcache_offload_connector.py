@@ -20,6 +20,7 @@ from atom.kv_transfer.offload.connector import (
     LMCacheOffloadConnector,
     LMCacheOffloadConnectorScheduler,
 )
+from atom.kv_transfer.offload import connector as offload_connector_mod
 from atom.kv_transfer.offload.gpu_connector import ATOMKVByteCodec
 from atom.model_engine.scheduler import Scheduler
 
@@ -27,9 +28,13 @@ from atom.model_engine.scheduler import Scheduler
 class _LookupClient:
     def __init__(self, hit: int) -> None:
         self.hit = hit
+        self.cleared = []
 
     def lookup(self, token_ids, lookup_id):
         return self.hit
+
+    def clear_lookup_status(self, lookup_id):
+        self.cleared.append(lookup_id)
 
 
 def _scheduler() -> LMCacheOffloadConnectorScheduler:
@@ -44,6 +49,8 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._save_tracker = {}
     sched._save_inflight = set()
     sched._lookup_in_step = []
+    sched._lock = threading.Lock()
+    sched._done_load = set()
     return sched
 
 
@@ -145,6 +152,104 @@ def test_segment_indexed_stitches_chunk_buffers(monkeypatch):
 
     assert torch.equal(stitched, direct)
 
+    split_buffers = [torch.empty_like(buf) for buf in chunk_buffers]
+    codec.split_request_buffer(stitched, split_buffers, [len(b) for b in chunks])
+    for actual, expected in zip(split_buffers, chunk_buffers):
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("layout", ["block", "segment", "segment_indexed"])
+@pytest.mark.parametrize("method_name", ["gpu_to_host", "host_to_gpu"])
+def test_codec_rejects_invalid_block_ids_before_copy(monkeypatch, layout, method_name):
+    import torch
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", layout)
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            k_scale=None,
+            v_scale=None,
+        ),
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    host = torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
+    method = getattr(codec, method_name)
+
+    with pytest.raises(ValueError, match="block id out of range"):
+        method(host, [0, 4])
+
+    with pytest.raises(ValueError, match="block id out of range"):
+        method(host, [-1])
+
+
+def test_codec_rejects_short_host_buffer(monkeypatch):
+    import torch
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            k_scale=None,
+            v_scale=None,
+        ),
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    host = torch.empty(codec.bytes_per_block - 1, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="host_buf is too small"):
+        codec.gpu_to_host(host, [0])
+
+
+def test_copy_stream_is_cached_per_codec_device(monkeypatch):
+    import torch
+    if not hasattr(torch, "device") or not hasattr(torch, "cuda"):
+        pytest.skip("torch cuda API is unavailable")
+
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._tls = threading.local()
+    conn._codec = SimpleNamespace(device=torch.device("cuda:1"))
+    active_devices = []
+    created_on = []
+
+    class _FakeDeviceCtx:
+        def __init__(self, device) -> None:
+            self.device = str(device)
+
+        def __enter__(self):
+            active_devices.append(self.device)
+            return None
+
+        def __exit__(self, *args):
+            active_devices.pop()
+            return False
+
+    class _FakeStream:
+        def __init__(self) -> None:
+            created_on.append(active_devices[-1] if active_devices else "default")
+
+    monkeypatch.setattr(
+        offload_connector_mod.torch.cuda,
+        "device",
+        lambda device: _FakeDeviceCtx(device),
+    )
+    monkeypatch.setattr(offload_connector_mod.torch.cuda, "Stream", _FakeStream)
+
+    rank1_stream = conn._stream()
+    assert conn._stream() is rank1_stream
+    assert created_on == ["cuda:1"]
+
+    conn._codec = SimpleNamespace(device=torch.device("cuda:0"))
+    rank0_stream = conn._stream()
+
+    assert rank0_stream is not rank1_stream
+    assert created_on == ["cuda:1", "cuda:0"]
+
 
 def test_full_prompt_hit_is_clamped_before_load_spec():
     sched = _scheduler()
@@ -161,6 +266,121 @@ def test_full_prompt_hit_is_clamped_before_load_spec():
     assert need == 7
     assert should_park is True
     assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 7
+
+
+def test_load_is_skipped_if_hbm_satisfies_after_allocation():
+    sched = _scheduler()
+    lookup = _LookupClient(hit=8)
+    sched._lookup_client = lookup
+    seq = SimpleNamespace(
+        id=321,
+        num_prompt_tokens=12,
+        token_ids=list(range(12)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3],
+    )
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert need == 8
+    assert should_park is True
+
+    # Prefix-cache allocation can discover a larger HBM hit than the lookup-time
+    # snapshot. In that case the scheduler still emits a no-op load so the
+    # normal worker aggregation path can wake the parked seq.
+    seq.num_cached_tokens = 8
+    sched.update_state_after_alloc(seq)
+    meta = sched.build_connector_meta()
+
+    assert len(meta.requests) == 1
+    req = meta.requests[0]
+    assert req.req_id == 321
+    assert req.token_ids == list(range(8))
+    assert req.block_ids == [1, 2, 3]
+    assert req.load_spec.hbm_cached_tokens == 8
+    assert req.load_spec.lmcache_cached_tokens == 8
+    assert seq.offload_loaded_tokens == 8
+    assert lookup.cleared == []
+
+
+def test_load_is_skipped_if_hbm_floor_is_not_chunk_aligned():
+    sched = _scheduler()
+    lookup = _LookupClient(hit=12)
+    sched._lookup_client = lookup
+    seq = SimpleNamespace(
+        id=654,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+    )
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert need == 12
+    assert should_park is True
+
+    # HBM prefix cache can return block-size granularity, while LMCache chunks
+    # are larger. Loading from a non-chunk boundary would either overlap shared
+    # HBM blocks or leave a gap, so the scheduler wakes the seq with a no-op
+    # load and lets suffix prefill continue from the HBM floor.
+    seq.num_cached_tokens = 6
+    sched.update_state_after_alloc(seq)
+    meta = sched.build_connector_meta()
+
+    assert len(meta.requests) == 1
+    req = meta.requests[0]
+    assert req.req_id == 654
+    assert req.token_ids == list(range(6))
+    assert req.block_ids == [1, 2, 3, 4]
+    assert req.load_spec.hbm_cached_tokens == 6
+    assert req.load_spec.lmcache_cached_tokens == 6
+    assert seq.offload_loaded_tokens == 6
+
+
+def test_worker_completes_noop_load_when_hbm_satisfies():
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_load = set()
+    conn._failed_load = set()
+    conn._done_save = set()
+    conn._engine = SimpleNamespace(unpinned=[])
+    conn._engine.lookup_unpin = lambda ids: conn._engine.unpinned.extend(ids)
+
+    req = SimpleNamespace(
+        req_id=321,
+        token_ids=list(range(8)),
+        block_ids=[1, 2, 3],
+        load_spec=SimpleNamespace(hbm_cached_tokens=8, lmcache_cached_tokens=8),
+    )
+
+    conn._do_load_req(req)
+
+    assert conn._done_load == {321}
+    assert conn._failed_load == set()
+    assert conn._engine.unpinned == ["321"]
+
+
+def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_load = set()
+    conn._failed_load = set()
+    conn._done_save = set()
+    conn.chunk_size = 4
+    conn._engine = SimpleNamespace(unpinned=[])
+    conn._engine.lookup_unpin = lambda ids: conn._engine.unpinned.extend(ids)
+
+    req = SimpleNamespace(
+        req_id=654,
+        token_ids=list(range(12)),
+        block_ids=[1, 2, 3],
+        load_spec=SimpleNamespace(hbm_cached_tokens=6, lmcache_cached_tokens=12),
+    )
+
+    conn._do_load_req(req)
+
+    assert conn._done_load == set()
+    assert conn._failed_load == {654}
+    assert conn._engine.unpinned == ["654"]
 
 
 def test_load_exception_is_reported_as_failed_recving():
@@ -216,6 +436,7 @@ def test_save_inflight_defers_free_until_save_finishes():
         token_ids=list(range(8)),
         block_table=[3, 4],
         num_prompt_tokens=8,
+        num_cached_tokens=8,
         prefix_hashes_published=True,
     )
     sched._save_tracker[str(seq.id)] = [seq, 0]
@@ -229,6 +450,40 @@ def test_save_inflight_defers_free_until_save_finishes():
     sched.save_finished(seq.id)
 
     assert sched.should_defer_free(seq) is False
+
+
+def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=10,
+        token_ids=list(range(12)),
+        block_table=[3, 4, 5],
+        num_prompt_tokens=12,
+        num_cached_tokens=8,
+        is_partial_prefill=True,
+    )
+    sched._save_tracker[str(seq.id)] = [seq, 0]
+
+    meta1 = sched.build_connector_meta()
+
+    assert len(meta1.requests) == 1
+    assert len(meta1.requests[0].token_ids) == 8
+    assert meta1.requests[0].save_spec.skip_leading_tokens == 0
+    assert meta1.requests[0].is_last_prefill is False
+    assert sched.should_defer_free(seq) is True
+
+    seq.num_cached_tokens = 12
+    seq.is_partial_prefill = False
+    meta2 = sched.build_connector_meta()
+    assert len(meta2.requests) == 0
+
+    sched.save_finished(seq.id)
+    meta3 = sched.build_connector_meta()
+
+    assert len(meta3.requests) == 1
+    assert len(meta3.requests[0].token_ids) == 12
+    assert meta3.requests[0].save_spec.skip_leading_tokens == 8
+    assert meta3.requests[0].is_last_prefill is True
 
 
 def test_finished_saving_releases_deferred_free_with_string_req_id():
