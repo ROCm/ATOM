@@ -159,70 +159,6 @@ def test_segment_indexed_stitches_chunk_buffers(monkeypatch):
 
 
 @pytest.mark.parametrize("layout", ["block", "segment", "segment_indexed"])
-def test_codec_h2d_block_subrange(monkeypatch, layout):
-    import torch
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", layout)
-    original = {
-        "l0": SimpleNamespace(
-            k_cache=torch.arange(8 * 2 * 3, dtype=torch.uint8).reshape(8, 2, 3),
-            v_cache=(torch.arange(8 * 4, dtype=torch.uint8).reshape(8, 4) + 51),
-            k_scale=torch.arange(8, dtype=torch.uint8).reshape(8, 1) + 101,
-            v_scale=torch.arange(8, dtype=torch.uint8).reshape(8, 1) + 151,
-        ),
-        "l1": SimpleNamespace(
-            k_cache=(torch.arange(8 * 3, dtype=torch.uint8).reshape(8, 3) + 201),
-            v_cache=(torch.arange(8 * 2, dtype=torch.uint8).reshape(8, 2) + 31),
-            k_scale=None,
-            v_scale=None,
-        ),
-    }
-    kv_caches = {
-        name: SimpleNamespace(
-            k_cache=layer.k_cache.clone(),
-            v_cache=layer.v_cache.clone(),
-            k_scale=layer.k_scale.clone() if layer.k_scale is not None else None,
-            v_scale=layer.v_scale.clone() if layer.v_scale is not None else None,
-        )
-        for name, layer in original.items()
-    }
-    codec = ATOMKVByteCodec(kv_caches)
-    source_ids = [0, 1, 2, 3]
-    host = torch.empty(len(source_ids) * codec.bytes_per_block, dtype=torch.uint8)
-    codec.gpu_to_host(host, source_ids)
-
-    for layer in kv_caches.values():
-        layer.k_cache.zero_()
-        layer.v_cache.zero_()
-        if layer.k_scale is not None:
-            layer.k_scale.zero_()
-        if layer.v_scale is not None:
-            layer.v_scale.zero_()
-
-    codec.host_to_gpu_block_range(
-        host,
-        src_block_start=1,
-        block_ids=[5, 7],
-        src_block_count=len(source_ids),
-    )
-
-    for name, layer in kv_caches.items():
-        src = original[name]
-        assert torch.equal(layer.k_cache[5], src.k_cache[1])
-        assert torch.equal(layer.v_cache[5], src.v_cache[1])
-        assert torch.equal(layer.k_cache[7], src.k_cache[2])
-        assert torch.equal(layer.v_cache[7], src.v_cache[2])
-        assert torch.count_nonzero(layer.k_cache[0]).item() == 0
-        if layer.k_scale is not None:
-            assert torch.equal(layer.k_scale[5], src.k_scale[1])
-            assert torch.equal(layer.v_scale[5], src.v_scale[1])
-            assert torch.equal(layer.k_scale[7], src.k_scale[2])
-            assert torch.equal(layer.v_scale[7], src.v_scale[2])
-
-
-@pytest.mark.parametrize("layout", ["block", "segment", "segment_indexed"])
 @pytest.mark.parametrize("method_name", ["gpu_to_host", "host_to_gpu"])
 def test_codec_rejects_invalid_block_ids_before_copy(monkeypatch, layout, method_name):
     import torch
@@ -349,19 +285,24 @@ def test_load_is_skipped_if_hbm_satisfies_after_allocation():
     assert should_park is True
 
     # Prefix-cache allocation can discover a larger HBM hit than the lookup-time
-    # snapshot. In that case the scheduler should not park the request or emit a
-    # worker no-op; it can continue prefill locally from the HBM floor.
+    # snapshot. In that case the scheduler still emits a no-op load so the
+    # normal worker aggregation path can wake the parked seq.
     seq.num_cached_tokens = 8
     sched.update_state_after_alloc(seq)
-    assert sched.should_park_for_load_after_alloc(seq) is False
     meta = sched.build_connector_meta()
 
-    assert [r for r in meta.requests if r.load_spec is not None] == []
+    assert len(meta.requests) == 1
+    req = meta.requests[0]
+    assert req.req_id == 321
+    assert req.token_ids == list(range(8))
+    assert req.block_ids == [1, 2, 3]
+    assert req.load_spec.hbm_cached_tokens == 8
+    assert req.load_spec.lmcache_cached_tokens == 8
     assert seq.offload_loaded_tokens == 8
-    assert lookup.cleared == ["321"]
+    assert lookup.cleared == []
 
 
-def test_load_is_skipped_if_hbm_floor_is_not_block_aligned():
+def test_load_is_skipped_if_hbm_floor_is_not_chunk_aligned():
     sched = _scheduler()
     lookup = _LookupClient(hit=12)
     sched._lookup_client = lookup
@@ -377,81 +318,22 @@ def test_load_is_skipped_if_hbm_floor_is_not_block_aligned():
     assert need == 12
     assert should_park is True
 
-    # A floor inside an ATOM block cannot be restored with whole-block H2D
-    # copies, so the scheduler keeps the seq local and lets suffix prefill
-    # continue from the HBM floor.
+    # HBM prefix cache can return block-size granularity, while LMCache chunks
+    # are larger. Loading from a non-chunk boundary would either overlap shared
+    # HBM blocks or leave a gap, so the scheduler wakes the seq with a no-op
+    # load and lets suffix prefill continue from the HBM floor.
     seq.num_cached_tokens = 6
     sched.update_state_after_alloc(seq)
-    assert sched.should_park_for_load_after_alloc(seq) is False
-    meta = sched.build_connector_meta()
-
-    assert [r for r in meta.requests if r.load_spec is not None] == []
-    assert seq.offload_loaded_tokens == 6
-
-
-def test_block_aligned_partial_hbm_chunk_still_parks_after_allocation():
-    sched = _scheduler()
-    sched.chunk_size = 8
-    sched.block_size = 4
-    lookup = _LookupClient(hit=16)
-    sched._lookup_client = lookup
-    seq = SimpleNamespace(
-        id=655,
-        num_prompt_tokens=24,
-        token_ids=list(range(24)),
-        num_cached_tokens=0,
-        block_table=[1, 2, 3, 4, 5, 6],
-    )
-
-    need, should_park = sched.get_num_new_matched_tokens(seq)
-    assert need == 16
-    assert should_park is True
-
-    seq.num_cached_tokens = 12
-    sched.update_state_after_alloc(seq)
-    assert sched.should_park_for_load_after_alloc(seq) is True
     meta = sched.build_connector_meta()
 
     assert len(meta.requests) == 1
     req = meta.requests[0]
-    assert req.req_id == 655
-    assert req.token_ids == list(range(16))
-    assert req.block_ids == [1, 2, 3, 4, 5, 6]
-    assert req.load_spec.hbm_cached_tokens == 12
-    assert req.load_spec.lmcache_cached_tokens == 16
-    assert seq.offload_loaded_tokens == 16
-    assert lookup.cleared == []
-
-
-def test_real_aligned_load_still_parks_after_allocation():
-    sched = _scheduler()
-    lookup = _LookupClient(hit=12)
-    sched._lookup_client = lookup
-    seq = SimpleNamespace(
-        id=777,
-        num_prompt_tokens=16,
-        token_ids=list(range(16)),
-        num_cached_tokens=0,
-        block_table=[1, 2, 3, 4],
-    )
-
-    need, should_park = sched.get_num_new_matched_tokens(seq)
-    assert need == 12
-    assert should_park is True
-
-    seq.num_cached_tokens = 4
-    sched.update_state_after_alloc(seq)
-    assert sched.should_park_for_load_after_alloc(seq) is True
-    meta = sched.build_connector_meta()
-
-    assert len(meta.requests) == 1
-    req = meta.requests[0]
-    assert req.req_id == 777
-    assert req.token_ids == list(range(12))
+    assert req.req_id == 654
+    assert req.token_ids == list(range(6))
     assert req.block_ids == [1, 2, 3, 4]
-    assert req.load_spec.hbm_cached_tokens == 4
-    assert req.load_spec.lmcache_cached_tokens == 12
-    assert lookup.cleared == []
+    assert req.load_spec.hbm_cached_tokens == 6
+    assert req.load_spec.lmcache_cached_tokens == 6
+    assert seq.offload_loaded_tokens == 6
 
 
 def test_worker_completes_noop_load_when_hbm_satisfies():
@@ -477,14 +359,13 @@ def test_worker_completes_noop_load_when_hbm_satisfies():
     assert conn._engine.unpinned == ["321"]
 
 
-def test_worker_reports_non_block_aligned_hbm_load_as_failed_without_exception():
+def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
     conn.chunk_size = 4
-    conn.block_size = 4
     conn._engine = SimpleNamespace(unpinned=[])
     conn._engine.lookup_unpin = lambda ids: conn._engine.unpinned.extend(ids)
 
@@ -500,105 +381,6 @@ def test_worker_reports_non_block_aligned_hbm_load_as_failed_without_exception()
     assert conn._done_load == set()
     assert conn._failed_load == {654}
     assert conn._engine.unpinned == ["654"]
-
-
-def test_worker_partial_hbm_chunk_copies_only_missing_tail_blocks():
-    import torch
-    if not hasattr(torch, "ones"):
-        pytest.skip("real torch is unavailable")
-
-    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
-    conn._lock = threading.Lock()
-    conn._done_load = set()
-    conn._failed_load = set()
-    conn._done_save = set()
-    conn.chunk_size = 8
-    conn.block_size = 4
-    conn._request_fastpath = False
-    conn._rank = 0
-    conn._engine = SimpleNamespace(unpinned=[])
-    conn._engine.lookup_unpin = lambda ids: conn._engine.unpinned.extend(ids)
-
-    class _Stream:
-        def __init__(self):
-            self.syncs = 0
-
-        def synchronize(self):
-            self.syncs += 1
-
-    stream = _Stream()
-    conn._stream = lambda: stream
-
-    masks = []
-
-    class _TDB:
-        def process_tokens(self, token_ids, mask=None):
-            masks.append(mask.clone())
-            return [(8, 16, "k1"), (16, 24, "k2")]
-
-    class _MemoryObj:
-        def __init__(self, key):
-            self.key = key
-            self.tensor = torch.empty(2, dtype=torch.uint8)
-            self.refs = 1
-
-        def ref_count_down(self):
-            self.refs -= 1
-
-    class _SM:
-        def __init__(self):
-            self.objs = {"k1": _MemoryObj("k1"), "k2": _MemoryObj("k2")}
-
-        def contains(self, key):
-            return key in self.objs
-
-        def get(self, key):
-            return self.objs[key]
-
-    copy_calls = []
-
-    class _Codec:
-        layout = "segment_indexed"
-        bytes_per_block = 1
-
-        def copy_calls_for_block_ids(self, block_ids):
-            return len(block_ids)
-
-        def host_to_gpu_block_range(
-            self,
-            tensor,
-            src_block_start,
-            block_ids,
-            stream_arg=None,
-            src_block_count=None,
-        ):
-            copy_calls.append(
-                (src_block_start, list(block_ids), stream_arg, src_block_count)
-            )
-
-    conn._tdb = _TDB()
-    conn._sm = _SM()
-    conn._codec = _Codec()
-
-    req = SimpleNamespace(
-        req_id=655,
-        token_ids=list(range(24)),
-        block_ids=[100, 101, 102, 103, 104, 105],
-        load_spec=SimpleNamespace(hbm_cached_tokens=12, lmcache_cached_tokens=24),
-    )
-
-    conn._do_load_req(req)
-
-    assert masks
-    assert masks[0][:8].any().item() is False
-    assert masks[0][8:].all().item() is True
-    assert copy_calls == [
-        (1, [103], stream, 2),
-        (0, [104, 105], stream, 2),
-    ]
-    assert conn._done_load == {655}
-    assert conn._failed_load == set()
-    assert conn._engine.unpinned == ["655"]
 
 
 def test_load_exception_is_reported_as_failed_recving():

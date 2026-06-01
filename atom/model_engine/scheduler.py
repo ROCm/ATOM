@@ -650,8 +650,6 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
-        self._promote_ready_remote_kv_requests()
-
         # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
         _delayer_allows_prefill = True
         if self.prefill_delayer is not None:
@@ -856,12 +854,6 @@ class Scheduler:
 
                 if self.kv_connector is not None:
                     self.kv_connector.update_state_after_alloc(seq)
-
-                if need_to_remove_to_load_kv_async_queue:
-                    if hasattr(self.kv_connector, "should_park_for_load_after_alloc"):
-                        need_to_remove_to_load_kv_async_queue = (
-                            self.kv_connector.should_park_for_load_after_alloc(seq)
-                        )
 
                 if need_to_remove_to_load_kv_async_queue:
                     offload_trace(
@@ -1346,18 +1338,6 @@ class Scheduler:
         return getattr(self.kv_connector, "is_offload", False)
 
     @staticmethod
-    def _has_req_id(req_ids: list, seq_id) -> bool:
-        candidates = (seq_id, str(seq_id))
-        for candidate in candidates:
-            if candidate in req_ids:
-                return True
-        try:
-            int_id = int(seq_id)
-        except (TypeError, ValueError):
-            return False
-        return int_id in req_ids
-
-    @staticmethod
     def _pop_req_id(req_ids: list, seq_id) -> bool:
         candidates = (seq_id, str(seq_id))
         for candidate in candidates:
@@ -1392,44 +1372,6 @@ class Scheduler:
             prompt=getattr(seq, "num_prompt_tokens", None),
         )
         return True
-
-    def _promote_ready_remote_kv_requests(self) -> None:
-        """Move completed remote-KV waiters ahead of fresh admissions.
-
-        Offload/remote-KV waiters already own their allocated block table. If a
-        later fresh request reaches the head of ``waiting`` while HBM is full,
-        ``can_allocate()`` breaks the admission loop before the scheduler can
-        inspect and wake completed remote waiters behind it. The completed
-        waiters then cannot finish and free blocks, so the fresh request also
-        cannot allocate. Keep normal FIFO order otherwise.
-        """
-        if not self.waiting or not (
-            self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
-        ):
-            return
-
-        ready: deque[Sequence] = deque()
-        blocked: deque[Sequence] = deque()
-        while self.waiting:
-            seq = self.waiting.popleft()
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and (
-                self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
-                or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
-            ):
-                ready.append(seq)
-            else:
-                blocked.append(seq)
-
-        if ready:
-            offload_trace(
-                "scheduler_promote_remote_ready",
-                reqs=[seq.id for seq in ready],
-                rest=len(blocked),
-            )
-            self.waiting.extend(ready)
-            self.waiting.extend(blocked)
-        else:
-            self.waiting.extend(blocked)
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """Reconcile scheduler state with completed KV transfers.

@@ -345,20 +345,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
             toks=len(toks),
             blocks=len(req.block_ids),
         )
-
-        def fail_load(status: str, **fields) -> None:
-            self._lookup_unpin(req.req_id)
-            with self._lock:
-                self._failed_load.add(req.req_id)
-            offload_trace(
-                "worker_load_done",
-                rank=getattr(self, "_rank", "?"),
-                req=req.req_id,
-                status=status,
-                total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
-                **fields,
-            )
-
         if int(ls.lmcache_cached_tokens) <= hbm:
             self._lookup_unpin(req.req_id)
             with self._lock:
@@ -372,131 +358,74 @@ class LMCacheOffloadConnector(KVConnectorBase):
             )
             return
         chunk_size = int(self.chunk_size or 256)
-        block_size = int(getattr(self, "block_size", 1) or 1)
-        if hbm % block_size != 0:
+        if hbm % chunk_size != 0:
             logger.warning(
-                "LMCache offload: HBM prefix is not block-aligned req=%s "
-                "hbm=%d block=%d; re-prefill",
+                "LMCache offload: HBM prefix is not chunk-aligned req=%s "
+                "hbm=%d chunk=%d; re-prefill",
                 req.req_id,
                 hbm,
-                block_size,
+                chunk_size,
             )
-            fail_load(
-                "unaligned_hbm",
+            self._lookup_unpin(req.req_id)
+            with self._lock:
+                self._failed_load.add(req.req_id)
+            offload_trace(
+                "worker_load_done",
+                rank=getattr(self, "_rank", "?"),
+                req=req.req_id,
+                status="unaligned_hbm",
                 hbm=hbm,
                 chunk=chunk_size,
-                block=block_size,
+                total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
             )
             return
-        if chunk_size % block_size != 0:
-            logger.warning(
-                "LMCache offload: chunk size is not block-aligned req=%s "
-                "chunk=%d block=%d; re-prefill",
-                req.req_id,
-                chunk_size,
-                block_size,
-            )
-            fail_load(
-                "unaligned_chunk_block",
-                chunk=chunk_size,
-                block=block_size,
-            )
-            return
-        hbm_floor = (hbm // chunk_size) * chunk_size
         stream = self._stream()
         mask = torch.ones(len(toks), dtype=torch.bool)
-        mask[:hbm_floor] = False
+        mask[:hbm] = False
         t0 = time.perf_counter()
-        chunks = [
-            (int(s), int(e), key)
-            for (s, e, key) in self._tdb.process_tokens(torch.tensor(toks), mask=mask)
-            if int(e) > hbm
-        ]
+        chunks = list(self._tdb.process_tokens(torch.tensor(toks), mask=mask))
         process_ms = (time.perf_counter() - t0) * 1000
-        logger.debug(
-            "offload _do_load req=%s hbm=%d floor=%d lmc=%d chunks=%d",
-            req.req_id,
-            hbm,
-            hbm_floor,
-            ls.lmcache_cached_tokens,
-            len(chunks),
-        )
+        logger.debug("offload _do_load req=%s hbm=%d lmc=%d chunks=%d",
+                     req.req_id, hbm, ls.lmcache_cached_tokens, len(chunks))
 
-        # All-or-nothing above the HBM prefix. When HBM lands inside an LMCache
-        # chunk, retrieve the overlapping chunk but copy only the block-aligned
-        # tail; shared HBM-hit blocks are owned by prefix cache and must not be
-        # written by this request's reload.
+        # All-or-nothing above the HBM prefix: a partial load would let attention
+        # read uninitialized blocks, and a chunk that overlaps an HBM-cache hit
+        # could overwrite shared prefix-cache blocks. In either case the seq
+        # wakes and re-prefills from its HBM floor.
         if not chunks:
             logger.warning("LMCache offload: no loadable chunks req=%s; re-prefill",
                            req.req_id)
-            fail_load("no_chunks")
+            self._lookup_unpin(req.req_id)
+            with self._lock:
+                self._failed_load.add(req.req_id)
+            offload_trace(
+                "worker_load_done",
+                rank=getattr(self, "_rank", "?"),
+                req=req.req_id,
+                status="no_chunks",
+                total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
+            )
             return
-        copy_spans = []
-        skipped_shared_blocks = 0
-        partial_first_chunk = 0
-        for (s, e, key) in chunks:
-            copy_start = max(s, hbm)
-            copy_end = e
-            if copy_end <= copy_start:
-                continue
-            if (
-                s % block_size != 0
-                or e % block_size != 0
-                or copy_start % block_size != 0
-                or copy_end % block_size != 0
-            ):
+        for (s, _e, _key) in chunks:
+            if s < hbm:
                 logger.warning(
-                    "LMCache offload: load span is not block-aligned req=%s "
-                    "chunk=[%d,%d) copy=[%d,%d) block=%d; re-prefill",
-                    req.req_id,
-                    s,
-                    e,
-                    copy_start,
-                    copy_end,
-                    block_size,
+                    "LMCache offload: chunk overlaps HBM prefix req=%s hbm=%d "
+                    "chunk_start=%d; re-prefill",
+                    req.req_id, hbm, s,
                 )
-                fail_load(
-                    "unaligned_copy_span",
+                self._lookup_unpin(req.req_id)
+                with self._lock:
+                    self._failed_load.add(req.req_id)
+                offload_trace(
+                    "worker_load_done",
+                    rank=getattr(self, "_rank", "?"),
+                    req=req.req_id,
+                    status="overlap_hbm",
                     hbm=hbm,
                     chunk_start=s,
-                    chunk_end=e,
-                    copy_start=copy_start,
-                    copy_end=copy_end,
-                    block=block_size,
+                    total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
                 )
                 return
-            chunk_block_count = (e - s) // block_size
-            src_skip_blocks = (copy_start - s) // block_size
-            bids = self._block_ids(req, copy_start, copy_end)
-            expected_blocks = (copy_end - copy_start) // block_size
-            if len(bids) != expected_blocks:
-                logger.warning(
-                    "LMCache offload: block table too short req=%s "
-                    "copy=[%d,%d) expected_blocks=%d got=%d; re-prefill",
-                    req.req_id,
-                    copy_start,
-                    copy_end,
-                    expected_blocks,
-                    len(bids),
-                )
-                fail_load(
-                    "bad_block_table",
-                    hbm=hbm,
-                    copy_start=copy_start,
-                    copy_end=copy_end,
-                    expected_blocks=expected_blocks,
-                    got_blocks=len(bids),
-                )
-                return
-            if src_skip_blocks:
-                partial_first_chunk = 1
-                skipped_shared_blocks += src_skip_blocks
-            copy_spans.append((s, e, key, bids, src_skip_blocks, chunk_block_count))
-        if not copy_spans:
-            logger.warning("LMCache offload: no copy spans req=%s; re-prefill",
-                           req.req_id)
-            fail_load("no_copy_spans")
-            return
         contains_ms = 0.0
         loaded_objs = []
         get_ms = 0.0
@@ -507,7 +436,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
         nblocks = 0
         nbytes = 0
         copy_calls = 0
-        chunk_bids: list[list[int]] = [span[3] for span in copy_spans]
+        chunk_bids: list[list[int]] = [
+            self._block_ids(req, s, e) for (s, e, _key) in chunks
+        ]
         all_bids = [bid for bids in chunk_bids for bid in bids]
         nblocks = len(all_bids)
         nbytes = nblocks * self._codec.bytes_per_block
@@ -545,8 +476,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
                             chunks=len(chunks),
                             blocks=nblocks,
                             bytes_gib=f"{nbytes / 1024**3:.3f}",
-                            partial_first_chunk=partial_first_chunk,
-                            skipped_shared_blocks=skipped_shared_blocks,
                             stitch_ms=f"{stitch_ms:.2f}",
                             h2d_submit_ms=f"{h2d_submit_ms:.2f}",
                             sync_ms=f"{sync_ms:.2f}",
@@ -554,10 +483,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
                         )
                         if self._profile_enabled():
                             logger.info(
-                                "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d "
-                                "hbm_floor=%d lmc=%d chunks=%d blocks=%d "
-                                "bytes=%.3fGiB copy_calls=%d partial_first_chunk=%d "
-                                "skipped_shared_blocks=%d "
+                                "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d "
+                                "chunks=%d blocks=%d bytes=%.3fGiB copy_calls=%d "
                                 "layout=%s fastpath=request process_ms=%.2f "
                                 "contains_ms=%.2f get_ms=%.2f host_alloc_ms=%.2f "
                                 "stitch_ms=%.2f h2d_submit_ms=%.2f sync_ms=%.2f "
@@ -565,14 +492,11 @@ class LMCacheOffloadConnector(KVConnectorBase):
                                 getattr(self, "_rank", "?"),
                                 req.req_id,
                                 hbm,
-                                hbm_floor,
                                 ls.lmcache_cached_tokens,
                                 len(chunks),
                                 nblocks,
                                 nbytes / 1024**3,
                                 copy_calls,
-                                partial_first_chunk,
-                                skipped_shared_blocks,
                                 self._codec.layout,
                                 process_ms,
                                 contains_ms,
@@ -609,7 +533,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
             contains_ms += (time.perf_counter() - t0) * 1000
 
         try:
-            for (s, e, key, bids, src_skip_blocks, chunk_block_count) in copy_spans:
+            for (s, e, key) in chunks:
                 t0 = time.perf_counter()
                 mo = self._sm.get(key)
                 get_ms += (time.perf_counter() - t0) * 1000
@@ -632,52 +556,27 @@ class LMCacheOffloadConnector(KVConnectorBase):
                     )
                     return
                 loaded_objs.append(mo)
+                bids = chunk_bids[len(loaded_objs) - 1]
                 if self._codec.layout != "segment_indexed":
                     copy_calls += self._codec.copy_calls_for_block_ids(bids)
                     t0 = time.perf_counter()
-                    self._codec.host_to_gpu_block_range(
-                        mo.tensor,
-                        src_skip_blocks,
-                        bids,
-                        stream,
-                        src_block_count=chunk_block_count,
-                    )
+                    self._codec.host_to_gpu(mo.tensor, bids, stream)
                     h2d_submit_ms += (time.perf_counter() - t0) * 1000
             if self._codec.layout == "segment_indexed":
-                if partial_first_chunk:
-                    for (
-                        _s,
-                        _e,
-                        _key,
-                        bids,
-                        src_skip_blocks,
-                        chunk_block_count,
-                    ), mo in zip(copy_spans, loaded_objs):
-                        copy_calls += self._codec.copy_calls_for_block_ids(bids)
-                        t0 = time.perf_counter()
-                        self._codec.host_to_gpu_block_range(
-                            mo.tensor,
-                            src_skip_blocks,
-                            bids,
-                            stream,
-                            src_block_count=chunk_block_count,
-                        )
-                        h2d_submit_ms += (time.perf_counter() - t0) * 1000
-                else:
-                    copy_calls = self._codec.copy_calls_for_block_ids(all_bids)
-                    t0 = time.perf_counter()
-                    req_buf = self._host_tmp(nbytes)
-                    host_alloc_ms += (time.perf_counter() - t0) * 1000
-                    t0 = time.perf_counter()
-                    self._codec.stitch_chunk_buffers(
-                        req_buf,
-                        [mo.tensor for mo in loaded_objs],
-                        [span[5] for span in copy_spans],
-                    )
-                    stitch_ms += (time.perf_counter() - t0) * 1000
-                    t0 = time.perf_counter()
-                    self._codec.host_to_gpu(req_buf, all_bids, stream)
-                    h2d_submit_ms += (time.perf_counter() - t0) * 1000
+                copy_calls = self._codec.copy_calls_for_block_ids(all_bids)
+                t0 = time.perf_counter()
+                req_buf = self._host_tmp(nbytes)
+                host_alloc_ms += (time.perf_counter() - t0) * 1000
+                t0 = time.perf_counter()
+                self._codec.stitch_chunk_buffers(
+                    req_buf,
+                    [mo.tensor for mo in loaded_objs],
+                    [len(bids) for bids in chunk_bids],
+                )
+                stitch_ms += (time.perf_counter() - t0) * 1000
+                t0 = time.perf_counter()
+                self._codec.host_to_gpu(req_buf, all_bids, stream)
+                h2d_submit_ms += (time.perf_counter() - t0) * 1000
             t0 = time.perf_counter()
             stream.synchronize()
             sync_ms += (time.perf_counter() - t0) * 1000
@@ -707,8 +606,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
             chunks=len(chunks),
             blocks=nblocks,
             bytes_gib=f"{nbytes / 1024**3:.3f}",
-            partial_first_chunk=partial_first_chunk,
-            skipped_shared_blocks=skipped_shared_blocks,
             stitch_ms=f"{stitch_ms:.2f}",
             h2d_submit_ms=f"{h2d_submit_ms:.2f}",
             sync_ms=f"{sync_ms:.2f}",
@@ -716,25 +613,20 @@ class LMCacheOffloadConnector(KVConnectorBase):
         )
         if self._profile_enabled():
             logger.info(
-                "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d hbm_floor=%d "
-                "lmc=%d chunks=%d blocks=%d bytes=%.3fGiB copy_calls=%d "
-                "partial_first_chunk=%d skipped_shared_blocks=%d "
-                "layout=%s fastpath=%s process_ms=%.2f contains_ms=%.2f "
+                "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d "
+                "chunks=%d blocks=%d bytes=%.3fGiB copy_calls=%d "
+                "layout=%s fastpath=chunk process_ms=%.2f contains_ms=%.2f "
                 "get_ms=%.2f host_alloc_ms=%.2f stitch_ms=%.2f "
                 "h2d_submit_ms=%.2f sync_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
                 req.req_id,
                 hbm,
-                hbm_floor,
                 ls.lmcache_cached_tokens,
                 len(chunks),
                 nblocks,
                 nbytes / 1024**3,
                 copy_calls,
-                partial_first_chunk,
-                skipped_shared_blocks,
                 self._codec.layout,
-                "chunk_partial" if partial_first_chunk else "chunk",
                 process_ms,
                 contains_ms,
                 get_ms,
@@ -1132,96 +1024,6 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if sid not in self._save_tracker:
             self._save_tracker[sid] = [seq, 0]
 
-    def _clear_pending_load(self, sid: str) -> None:
-        self._load_specs.pop(sid, None)
-        self._reqs_need_recv.pop(sid, None)
-        self._lookup_in_step = [x for x in self._lookup_in_step if x != sid]
-        if self._lookup_client is not None:
-            try:
-                self._lookup_client.clear_lookup_status(sid)
-            except Exception:
-                pass
-
-    def should_park_for_load_after_alloc(self, seq) -> bool:
-        """Return True only when a real worker-side load is still needed.
-
-        Lookup runs before ATOM's block allocation/prefix-cache match, so the
-        LoadSpec can become stale: allocation may discover an HBM hit that
-        already satisfies the LMCache hit. A chunk-unaligned HBM floor is still
-        loadable when it is block-aligned: the worker retrieves the overlapping
-        LMCache chunk and copies only the missing private tail blocks.
-        """
-        sid = str(seq.id)
-        ls = self._load_specs.get(sid)
-        if ls is None:
-            return False
-
-        ls.hbm_cached_tokens = int(seq.num_cached_tokens)
-        if ls.hbm_cached_tokens >= int(ls.lmcache_cached_tokens):
-            seq.offload_loaded_tokens = int(seq.num_cached_tokens)
-            logger.info(
-                "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
-                "reason=hbm_satisfies_after_alloc",
-                seq.id,
-                ls.hbm_cached_tokens,
-                ls.lmcache_cached_tokens,
-            )
-            offload_trace(
-                "scheduler_load_hbm_satisfies_after_alloc",
-                req=seq.id,
-                hbm=ls.hbm_cached_tokens,
-                lmc=ls.lmcache_cached_tokens,
-                blocks=len(list(seq.block_table)),
-            )
-            self._clear_pending_load(sid)
-            return False
-
-        chunk = self.chunk_size or 256
-        if ls.hbm_cached_tokens % chunk != 0:
-            block = int(getattr(self, "block_size", 1) or 1)
-            if ls.hbm_cached_tokens % block != 0:
-                seq.offload_loaded_tokens = int(seq.num_cached_tokens)
-                logger.info(
-                    "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
-                    "reason=unaligned_hbm chunk=%d block=%d",
-                    seq.id,
-                    ls.hbm_cached_tokens,
-                    ls.lmcache_cached_tokens,
-                    chunk,
-                    block,
-                )
-                offload_trace(
-                    "scheduler_load_unaligned_hbm",
-                    req=seq.id,
-                    hbm=ls.hbm_cached_tokens,
-                    lmc=ls.lmcache_cached_tokens,
-                    chunk=chunk,
-                    block=block,
-                    blocks=len(list(seq.block_table)),
-                )
-                self._clear_pending_load(sid)
-                return False
-            logger.info(
-                "[OFFLOAD-LOAD-PARTIAL] seq=%s hbm_cached=%d lmc_cached=%d "
-                "reason=partial_hbm_chunk chunk=%d block=%d",
-                seq.id,
-                ls.hbm_cached_tokens,
-                ls.lmcache_cached_tokens,
-                chunk,
-                block,
-            )
-            offload_trace(
-                "scheduler_load_partial_hbm_chunk",
-                req=seq.id,
-                hbm=ls.hbm_cached_tokens,
-                lmc=ls.lmcache_cached_tokens,
-                chunk=chunk,
-                block=block,
-                blocks=len(list(seq.block_table)),
-            )
-
-        return True
-
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
         meta.lookup_requests_in_step = self._lookup_in_step
@@ -1239,9 +1041,9 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             # get_num_new_matched_tokens runs BEFORE the prefix-cache match in
             # block_manager.allocate, so seq.num_cached_tokens was stale (often
             # 0) when the LoadSpec was recorded. By now (post-allocate) it is the
-            # true HBM hit. Loading below this floor would write through blocks
-            # owned by prefix cache and possibly shared with other seqs. So load
-            # only [hbm_cached, offload_hit).
+            # true HBM hit. Loading below this floor would overwrite HBM
+            # prefix-cache blocks (possibly shared with other seqs) -> output
+            # corruption. So load only [hbm_cached, offload_hit).
             ls.hbm_cached_tokens = int(seq.num_cached_tokens)
             if ls.hbm_cached_tokens >= int(ls.lmcache_cached_tokens):
                 seq.offload_loaded_tokens = int(seq.num_cached_tokens)
@@ -1259,51 +1061,51 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                     lmc=ls.lmcache_cached_tokens,
                     blocks=len(list(seq.block_table)),
                 )
-                self._clear_pending_load(sid)
+                # The request may already be parked in WAITING_FOR_REMOTE_KVS.
+                # Emit a no-op load so every worker reports finished_recving via
+                # the normal aggregation path instead of trying to complete it
+                # locally in the scheduler process.
+                meta.add_request(LMCacheReqMeta(
+                    req_id=seq.id,
+                    token_ids=list(seq.token_ids[: ls.lmcache_cached_tokens]),
+                    block_ids=list(seq.block_table),
+                    load_spec=ls,
+                ))
                 continue
             chunk = self.chunk_size or 256
             if ls.hbm_cached_tokens % chunk != 0:
-                block = int(getattr(self, "block_size", 1) or 1)
-                if ls.hbm_cached_tokens % block != 0:
-                    seq.offload_loaded_tokens = int(seq.num_cached_tokens)
-                    logger.info(
-                        "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
-                        "reason=unaligned_hbm chunk=%d block=%d",
-                        seq.id,
-                        ls.hbm_cached_tokens,
-                        ls.lmcache_cached_tokens,
-                        chunk,
-                        block,
-                    )
-                    offload_trace(
-                        "scheduler_load_unaligned_hbm",
-                        req=seq.id,
-                        hbm=ls.hbm_cached_tokens,
-                        lmc=ls.lmcache_cached_tokens,
-                        chunk=chunk,
-                        block=block,
-                        blocks=len(list(seq.block_table)),
-                    )
-                    self._clear_pending_load(sid)
-                    continue
+                seq.offload_loaded_tokens = int(seq.num_cached_tokens)
                 logger.info(
-                    "[OFFLOAD-LOAD-PARTIAL] seq=%s hbm_cached=%d lmc_cached=%d "
-                    "reason=partial_hbm_chunk chunk=%d block=%d",
+                    "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
+                    "reason=unaligned_hbm chunk=%d",
                     seq.id,
                     ls.hbm_cached_tokens,
                     ls.lmcache_cached_tokens,
                     chunk,
-                    block,
                 )
                 offload_trace(
-                    "scheduler_load_partial_hbm_chunk",
+                    "scheduler_load_unaligned_hbm",
                     req=seq.id,
                     hbm=ls.hbm_cached_tokens,
                     lmc=ls.lmcache_cached_tokens,
                     chunk=chunk,
-                    block=block,
                     blocks=len(list(seq.block_table)),
                 )
+                # LMCache chunks can only be loaded from a chunk boundary. Do
+                # not round down and overwrite HBM prefix-cache blocks that may
+                # be shared with other requests; wake the parked request and let
+                # it continue prefill from the HBM floor.
+                meta.add_request(LMCacheReqMeta(
+                    req_id=seq.id,
+                    token_ids=list(seq.token_ids[: ls.hbm_cached_tokens]),
+                    block_ids=list(seq.block_table),
+                    load_spec=LoadSpec(
+                        hbm_cached_tokens=ls.hbm_cached_tokens,
+                        lmcache_cached_tokens=ls.hbm_cached_tokens,
+                        can_load=True,
+                    ),
+                ))
+                continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
             seq.offload_loaded_tokens = max(
                 int(seq.num_cached_tokens), int(ls.lmcache_cached_tokens)
@@ -1311,33 +1113,15 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
             # LMCache's lookup/pin API. A str here silently never wakes the seq.
-            block = int(getattr(self, "block_size", 1) or 1)
-            partial_first_chunk = int(ls.hbm_cached_tokens % chunk != 0)
-            skipped_shared_blocks = 0
-            if partial_first_chunk:
-                skipped_shared_blocks = (
-                    ls.hbm_cached_tokens - (ls.hbm_cached_tokens // chunk) * chunk
-                ) // block
-            logger.info(
-                "[OFFLOAD-LOAD-EMIT] seq=%s hbm_cached=%d lmc_cached=%d "
-                "offload_loaded=%d nblocks=%d partial_first_chunk=%d "
-                "skipped_shared_blocks=%d",
-                seq.id,
-                ls.hbm_cached_tokens,
-                ls.lmcache_cached_tokens,
-                seq.offload_loaded_tokens,
-                len(list(seq.block_table)),
-                partial_first_chunk,
-                skipped_shared_blocks,
-            )
+            logger.info("[OFFLOAD-LOAD-EMIT] seq=%s hbm_cached=%d lmc_cached=%d offload_loaded=%d nblocks=%d",
+                        seq.id, ls.hbm_cached_tokens, ls.lmcache_cached_tokens,
+                        seq.offload_loaded_tokens, len(list(seq.block_table)))
             offload_trace(
                 "scheduler_load_emit",
                 req=seq.id,
                 hbm=ls.hbm_cached_tokens,
                 lmc=ls.lmcache_cached_tokens,
                 offload_loaded=seq.offload_loaded_tokens,
-                partial_first_chunk=partial_first_chunk,
-                skipped_shared_blocks=skipped_shared_blocks,
                 blocks=len(list(seq.block_table)),
             )
             meta.add_request(LMCacheReqMeta(

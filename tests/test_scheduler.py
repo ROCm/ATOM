@@ -141,53 +141,6 @@ class TestSchedule:
         batch, _ = sched.schedule()
         assert batch.total_seqs_num_prefill == 1
 
-    def test_ready_remote_kv_waiter_bypasses_blocked_fresh_request(self, seq_factory):
-        class _OffloadConnector:
-            is_offload = True
-            is_producer = False
-
-            def get_num_new_matched_tokens(self, seq):
-                return 0, False
-
-            def build_connector_meta(self):
-                return None
-
-        sched = Scheduler(
-            MockConfig(
-                num_kvcache_blocks=4,
-                kv_cache_block_size=4,
-                max_model_len=64,
-                max_num_batched_tokens=64,
-            )
-        )
-        sched.kv_connector = _OffloadConnector()
-
-        blocked = seq_factory(list(range(12)), block_size=4)
-        remote = seq_factory(list(range(100, 116)), block_size=4)
-        remote.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-        remote.block_table = [0, 1, 2, 3]
-        remote.num_cached_tokens = 4
-        remote.offload_loaded_tokens = 12
-
-        for block_id in remote.block_table:
-            block = sched.block_manager.blocks[block_id]
-            block.ref_count = 1
-        sched.block_manager.used_block_ids = set(remote.block_table)
-        sched.block_manager.free_block_ids.clear()
-        sched.block_manager.free_block_ids_set.clear()
-
-        sched.add(blocked)
-        sched.add(remote)
-        sched.finished_recving_kv_req_ids = [remote.id]
-
-        batch, seqs = sched.schedule()
-
-        assert remote.id in seqs
-        assert blocked.status == SequenceStatus.WAITING
-        assert remote.status == SequenceStatus.RUNNING
-        assert remote.num_cached_tokens == 12
-        assert list(batch.scheduled_tokens) == remote.token_ids[12:16]
-
     def test_decode_after_prefill(self, scheduler, seq_factory):
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
