@@ -3,17 +3,9 @@
 //! This worker implements the backend-specific gRPC services expected by
 //! Atomesh's gRPC routers. It remains fixture-driven like `VirtualWorker`, but
 //! exercises the real gRPC client, worker registration, and router execution path.
-//!
-//! The public harness keeps a single `VirtualGrpcWorker` API. Internally, the
-//! fixture's `route.backend` field selects the concrete tonic service:
-//! `SglangVirtualGrpcService` or `VllmVirtualGrpcService`.
-//!
-//! Note that Atomesh's gRPC `/v1/completions` route is an adapter over the
-//! native backend `Generate` RPC. These fixtures target `/generate` directly so
-//! the harness validates the backend boundary that both generate and completion
-//! flows eventually use.
 
 use std::{
+    net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -34,9 +26,7 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use tonic::{transport::Server, Request, Response, Status};
 
-use super::mock_test_case::{
-    BackendFixture, ConnectionModeFixture, MockTestCase, WorkerKindFixture,
-};
+use super::{BackendFixture, ConnectionModeFixture, MockCase, WorkerKindFixture};
 
 type SglangGenerateStream =
     Pin<Box<dyn Stream<Item = Result<sglang::GenerateResponse, Status>> + Send + 'static>>;
@@ -45,7 +35,7 @@ type VllmGenerateStream =
 
 #[derive(Debug)]
 pub struct VirtualGrpcWorker {
-    case: MockTestCase,
+    case: MockCase,
     case_name: String,
     worker_kind: WorkerKindFixture,
     request_log: Arc<Mutex<Vec<String>>>,
@@ -56,12 +46,7 @@ pub struct VirtualGrpcWorker {
 
 impl VirtualGrpcWorker {
     /// Create a virtual gRPC worker for a single fixture case.
-    ///
-    /// The harness still owns one `VirtualGrpcWorker` regardless of backend.
-    /// This constructor only validates that the fixture targets the gRPC
-    /// connection mode; the concrete SGLang/vLLM service is selected later in
-    /// `start()` so the worker can bind exactly one tonic service to its URL.
-    pub fn new(case: MockTestCase) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(case: MockCase) -> Result<Self, Box<dyn std::error::Error>> {
         if case.route.connection_mode != ConnectionModeFixture::Grpc {
             return Err("VirtualGrpcWorker requires a gRPC fixture".into());
         }
@@ -90,21 +75,28 @@ impl VirtualGrpcWorker {
     }
 
     /// Start the tonic worker on a random local port and wait for readiness.
-    ///
-    /// This mirrors `VirtualWorker::start()` for HTTP, but the route backend
-    /// decides which generated service is registered with tonic:
-    ///
-    /// - `sglang` fixtures expose `SglangSchedulerServer`.
-    /// - `vllm` fixtures expose `VllmEngineServer`.
-    ///
-    /// Atomesh later connects to this URL through its real gRPC client during
-    /// worker initialization, so the test covers transport, metadata discovery,
-    /// health checks, and request execution instead of short-circuiting the
-    /// router internals.
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let port = portpicker::pick_unused_port().expect("no free port for virtual gRPC worker");
-        let addr = format!("127.0.0.1:{}", port).parse()?;
-        let url = format!("grpc://127.0.0.1:{}", port);
+        self.start_on("127.0.0.1", port).await
+    }
+
+    /// Start the tonic worker on a deterministic host and port.
+    pub async fn start_on(
+        &mut self,
+        host: &str,
+        port: u16,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+        self.start_with_addr(host, port, addr).await
+    }
+
+    async fn start_with_addr(
+        &mut self,
+        host: &str,
+        port: u16,
+        addr: SocketAddr,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let url = format!("grpc://{}:{}", host, port);
         let service = VirtualGrpcServiceState {
             case: self.case.clone(),
             request_log: Arc::clone(&self.request_log),
@@ -112,9 +104,6 @@ impl VirtualGrpcWorker {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let backend = self.case.route.backend.clone();
-        // Bind exactly one backend service per worker URL. This mirrors the
-        // production config where `RouterConfig.backend` determines which gRPC
-        // client/proto pair Atomesh uses for a worker pool.
         let handle = match backend {
             BackendFixture::Sglang => tokio::spawn(async move {
                 let server = Server::builder()
@@ -150,10 +139,6 @@ impl VirtualGrpcWorker {
     }
 
     /// Stop the worker and wait briefly for the tonic server task to exit.
-    ///
-    /// Tests call this during harness teardown so random local ports are
-    /// released promptly. `Drop` also sends shutdown as a best-effort fallback
-    /// for panic paths.
     pub async fn stop(&mut self) {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -175,10 +160,7 @@ impl Drop for VirtualGrpcWorker {
 
 #[derive(Clone)]
 struct VirtualGrpcServiceState {
-    // Cloning this small state lets both backend implementations share the same
-    // fixture response data and request log without exposing separate worker
-    // types to the harness.
-    case: MockTestCase,
+    case: MockCase,
     request_log: Arc<Mutex<Vec<String>>>,
 }
 
@@ -196,12 +178,6 @@ struct VllmVirtualGrpcService {
 impl SglangScheduler for SglangVirtualGrpcService {
     type GenerateStream = SglangGenerateStream;
 
-    /// Replay one SGLang generate request from the fixture's expected response.
-    ///
-    /// SGLang's proto streams `GenerateResponse` messages. The harness emits a
-    /// single `Complete` item because these smoke tests only need to verify the
-    /// end-to-end route, tokenizer decode, and response conversion path. More
-    /// detailed chunking behavior belongs in lower-level streaming tests.
     async fn generate(
         &self,
         request: Request<sglang::GenerateRequest>,
@@ -254,9 +230,6 @@ impl SglangScheduler for SglangVirtualGrpcService {
         &self,
         _request: Request<sglang::HealthCheckRequest>,
     ) -> Result<Response<sglang::HealthCheckResponse>, Status> {
-        // Worker registration waits on this probe before adding the worker to
-        // the healthy pool. Logging it lets tests distinguish startup probes
-        // from the actual business request.
         self.state
             .request_log
             .lock()
@@ -287,9 +260,6 @@ impl SglangScheduler for SglangVirtualGrpcService {
         &self,
         _request: Request<sglang::GetModelInfoRequest>,
     ) -> Result<Response<sglang::GetModelInfoResponse>, Status> {
-        // Atomesh uses model info during discovery to populate worker metadata
-        // and tokenizer setup. The values here are minimal but shaped like a
-        // generation-capable backend so the normal registration path succeeds.
         self.state
             .request_log
             .lock()
@@ -320,9 +290,6 @@ impl SglangScheduler for SglangVirtualGrpcService {
         &self,
         _request: Request<sglang::GetServerInfoRequest>,
     ) -> Result<Response<sglang::GetServerInfoResponse>, Status> {
-        // Server info is not central to these fixture assertions, but returning
-        // a valid response keeps the virtual worker close to a real SGLang
-        // scheduler and makes future discovery checks straightforward.
         self.state
             .request_log
             .lock()
@@ -358,13 +325,6 @@ impl SglangScheduler for SglangVirtualGrpcService {
 impl VllmEngine for VllmVirtualGrpcService {
     type GenerateStream = VllmGenerateStream;
 
-    /// Replay one vLLM generate request from the same fixture contract.
-    ///
-    /// vLLM uses a sibling proto with a slightly different request/response
-    /// shape, but the harness still returns a single completed response with
-    /// fixture-derived token ids. This keeps the test focused on Atomesh's
-    /// backend selection and vLLM client path rather than duplicating response
-    /// fixture formats per backend.
     async fn generate(
         &self,
         request: Request<vllm::GenerateRequest>,
@@ -404,7 +364,7 @@ impl VllmEngine for VllmVirtualGrpcService {
             .unwrap()
             .push("embed".to_string());
         Err(Status::unimplemented(
-            "virtual vLLM gRPC embed is not implemented",
+            "virtual vLLM embed is not implemented",
         ))
     }
 
@@ -412,8 +372,6 @@ impl VllmEngine for VllmVirtualGrpcService {
         &self,
         _request: Request<vllm::HealthCheckRequest>,
     ) -> Result<Response<vllm::HealthCheckResponse>, Status> {
-        // vLLM readiness is probed with its own client/proto pair. Keeping this
-        // separate from SGLang catches accidental backend/config mismatches.
         self.state
             .request_log
             .lock()
@@ -441,9 +399,6 @@ impl VllmEngine for VllmVirtualGrpcService {
         &self,
         _request: Request<vllm::GetModelInfoRequest>,
     ) -> Result<Response<vllm::GetModelInfoResponse>, Status> {
-        // The vLLM model-info proto is smaller than SGLang's. These fields are
-        // enough for worker discovery to mark the backend as generative and
-        // route the fixture request through the vLLM gRPC client.
         self.state
             .request_log
             .lock()
@@ -462,9 +417,6 @@ impl VllmEngine for VllmVirtualGrpcService {
         &self,
         _request: Request<vllm::GetServerInfoRequest>,
     ) -> Result<Response<vllm::GetServerInfoResponse>, Status> {
-        // Return stable server metadata for the same reason as SGLang: the
-        // current tests assert request flow, but discovery should still see a
-        // well-formed backend response.
         self.state
             .request_log
             .lock()
@@ -484,9 +436,6 @@ async fn wait_until_ready(
     url: &str,
     backend: &BackendFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Poll with the same backend-specific client Atomesh will use later. A
-    // successful health check proves both the TCP listener and the selected
-    // tonic service are available before worker registration starts.
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
 
     loop {

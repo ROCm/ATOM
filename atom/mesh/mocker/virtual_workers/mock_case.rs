@@ -1,9 +1,9 @@
 //! Fixture schema for data-driven Atomesh integration tests.
 //!
-//! A `MockTestCase` describes the client request, target routing mode, and the
+//! A `MockCase` describes the client request, target routing mode, and the
 //! response that a virtual backend worker should return. Keeping this data in
-//! JSON fixtures lets the same sample drive regular HTTP today and PD/gRPC
-//! scenarios later.
+//! JSON fixtures lets the same sample drive regular HTTP, PD, and gRPC
+//! scenarios.
 
 use std::{fs, path::Path};
 
@@ -79,7 +79,7 @@ pub struct SimulationFixture {
 /// `request` is the client-facing Atomesh payload. `expected_response` is what
 /// the virtual worker returns after Atomesh routes the request to it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct MockTestCase {
+pub struct MockCase {
     pub name: String,
     pub model: String,
     pub endpoint: String,
@@ -92,7 +92,7 @@ pub struct MockTestCase {
     pub simulation: SimulationFixture,
 }
 
-impl MockTestCase {
+impl MockCase {
     /// Load a single JSON fixture from disk.
     pub fn from_fixture(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path)?;
