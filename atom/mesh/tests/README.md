@@ -2,7 +2,7 @@
 
 This directory contains the integration test suite for **atom/mesh**, organized by functional area. All tests run with `cargo test` and do not require a GPU or real inference backend — they use mock workers and in-memory routers.
 
-**Total: ~232 tests across 25 test files.**
+**Total: ~224 tests across 24 mesh test files.**
 
 ## Directory Structure
 
@@ -14,8 +14,6 @@ tests/
 ├── security/                   # Authentication and access control tests
 ├── spec/                       # Protocol contract/spec tests
 ├── common/                     # Shared test utilities (not tests themselves)
-├── test_atomesh/               # Fixture-driven Atomesh test harness
-├── fixtures/atomesh_harness/   # Prompt/request and expected-response samples
 ├── inflight_tracker_test.rs    # Standalone: inflight request tracking
 ├── load_guard_raii_test.rs     # Standalone: RAII load guard lifecycle
 └── metrics_aggregator_test.rs  # Standalone: Prometheus metrics aggregation
@@ -33,33 +31,11 @@ The `common/` directory provides shared test utilities used across all test modu
 | `test_config.rs` | `TestRouterConfig` / `TestWorkerConfig` — helpers for constructing test configurations |
 | `streaming_helpers.rs` | Utilities for testing SSE (Server-Sent Events) streaming responses |
 
-The `test_atomesh/` directory provides a reusable fixture-driven harness:
-
-| File | Purpose |
-|------|---------|
-| `mock_test_case.rs` | Loads prompt/request, route mode, and expected-response fixtures |
-| `virtual_request.rs` | Builds real Atomesh HTTP requests from fixtures |
-| `virtual_worker.rs` | Axum virtual worker that replays matched fixture responses |
-| `test_harness.rs` | Starts virtual workers, builds Atomesh app context, sends requests, and asserts results |
-| `golden_assert.rs` | Shared subset assertions for dynamic response bodies |
-| `virtual_grpc_worker.rs` | Unified tonic-backed virtual worker with internal SGLang/vLLM services |
-
-The `fixtures/atomesh_harness/` directory stores the JSON samples used by the
-harness. These files are test data, not integration test entrypoints. Each
-fixture describes the request payload, expected response, route mode, connection
-mode, backend (`sglang` or `vllm` for gRPC), and virtual worker simulation
-settings for one reusable harness scenario. gRPC harness fixtures target the
-native `/generate` boundary because OpenAI `/v1/completions` is adapted to the
-same backend Generate RPC inside the gRPC router.
-
----
-
 ## API Tests (`api/`)
 
 | File | Tests | Description |
 |------|-------|-------------|
 | `api_endpoints_test.rs` | 35 | Core HTTP endpoint coverage: `/liveness`, `/readiness`, `/health`, `/health_generate`, `/generate`, `/v1/chat/completions`. Tests status codes, response formats, error handling, concurrent requests, and health check behavior with healthy/unhealthy workers. |
-| `atomesh_harness_test.rs` | 8 | Atomesh harness smoke tests driven by `fixtures/atomesh_harness/`. Starts local virtual workers, sends real Atomesh API requests, and verifies regular HTTP, streaming, completions, HTTP PD, SGLang/vLLM gRPC regular, and SGLang gRPC PD worker paths. |
 | `parser_endpoints_test.rs` | 12 | Tests for `/parse/function_call` and `/parse/reasoning` endpoints. Verifies function call extraction from model output and reasoning/thinking block parsing. |
 | `request_formats_test.rs` | 6 | Request format validation for `/generate`, `/v1/chat/completions`, and `/v1/completions`. Tests various payload shapes: text, input_ids, batch requests, sampling params, and special parameters (logprobs, json_schema, ignore_eos). |
 | `responses_api_test.rs` | 11 | Responses API (conversations) CRUD operations. Tests creating, listing, retrieving, and deleting conversation sessions via the conversation handlers. |
@@ -119,13 +95,9 @@ Contract tests that verify serialization/deserialization behavior of protocol ty
 # Run all mesh tests
 cargo test -p atom-mesh
 
-# Run the Atomesh harness smoke tests with router/worker logs
-cargo test -p atom-mesh --test api_tests test_atomesh_harness -- --nocapture
-
 # Run local quick checks used during harness development
 cargo test -p atom-mesh --lib
 cargo test -p atom-mesh --test spec_test
-cargo test -p atom-mesh --test api_tests test_atomesh_harness -- --nocapture
 
 # Run a specific test module
 cargo test -p atom-mesh --test api_tests
@@ -139,16 +111,4 @@ cargo test -p atom-mesh test_list_workers
 
 # Run with output
 cargo test -p atom-mesh -- --nocapture
-```
-
-### Standardized Harness Script
-
-`run_atomesh_harness_test.sh` runs the focused checks used for Atomesh harness and metrics validation:
-
-- Metrics subsystem unit tests: `cargo test -p atom-mesh --lib observability::metrics`
-- Worker `/engine_metrics` aggregation tests: `cargo test -p atom-mesh --test metrics_aggregator_test -- --nocapture`
-- Atomesh harness smoke tests: `cargo test -p atom-mesh --test api_tests test_atomesh_harness -- --nocapture --test-threads=1`
-
-```bash
-bash tests/run_atomesh_harness_test.sh
 ```
