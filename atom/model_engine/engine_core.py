@@ -114,6 +114,7 @@ class EngineCore:
 
             config.num_kvcache_blocks = num_blocks
             if not config.enforce_eager:
+                # Start profiler before cudagraph capture only if mark-trace is enabled.
                 if self.profile_enbaled and self.mark_trace:
                     self.runner_mgr.call_func(
                         "start_profiler", "capture_graph", wait_out=True
@@ -125,6 +126,7 @@ class EngineCore:
                     f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} seconds"
                 )
                 if self.profile_enbaled and self.mark_trace:
+                    # Persist a dedicated capture-graph trace immediately.
                     self.runner_mgr.call_func("stop_profiler", wait_out=True)
             good = True
         finally:
@@ -494,54 +496,20 @@ class DPEngineCoreProc(EngineCore):
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
-    def _gather_local_dp_state(self) -> tuple[bool, int, int, bool, bool]:
-        """Gather local scheduling state, substituting dummy values when
-        weights are offloaded for RL training.
-
-        Offloaded cores must still participate in _sync_dp_state (NCCL
-        all_reduce) to prevent other DP ranks from blocking forever.
-        The offload flag is included in the sync tensor so that ALL cores
-        agree to skip model execution together — MoE expert routing and
-        dummy_execution also contain DP-wide collectives that would hang
-        if only some cores participated.
-        """
-        offloaded = self._is_rl_weights_offloaded
-        if not offloaded:
-            is_prefill, num_tokens, num_reqs = self.scheduler.get_next_batch_info()
-            unfinished = not self.scheduler.is_finished()
-        else:
-            is_prefill, num_tokens, num_reqs, unfinished = False, 0, 0, False
-        return is_prefill, num_tokens, num_reqs, unfinished, offloaded
-
     def busy_loop(self):
         shutdown = False
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
                 shutdown = shutdown or self.pull_and_process_input_queue()
+                local_unfinished = (
+                    not self.scheduler.is_finished() and not self._is_rl_weights_offloaded
+                )
 
-                (
-                    local_is_prefill,
-                    local_num_tokens,
-                    local_num_reqs,
-                    local_unfinished,
-                    local_offloaded,
-                ) = self._gather_local_dp_state()
-
-                (
-                    global_has_prefill,
-                    global_max_tokens,
-                    global_max_reqs,
-                    global_has_unfinished,
-                    global_shutdown,
-                    global_offloaded,
-                ) = self._sync_dp_state(
-                    local_is_prefill,
-                    local_num_tokens,
-                    local_num_reqs,
-                    local_unfinished,
-                    shutdown,
-                    local_offloaded,
+                global_has_unfinished, global_shutdown, global_offloaded = (
+                    self._sync_dp_state(
+                        local_unfinished, shutdown, self._is_rl_weights_offloaded
+                    )
                 )
 
                 if global_shutdown and not global_has_unfinished:
@@ -577,30 +545,16 @@ class DPEngineCoreProc(EngineCore):
 
     def _sync_dp_state(
         self,
-        local_is_prefill: bool,
-        local_num_tokens: int,
-        local_num_reqs: int,
         local_has_unfinished: bool,
         local_shutdown: bool = False,
         local_offloaded: bool = False,
-    ) -> tuple[bool, int, int, bool, bool, bool]:
+    ) -> tuple[bool, bool, bool]:
         if self._shutting_down:
-            return (
-                local_is_prefill,
-                local_num_tokens,
-                local_num_reqs,
-                local_has_unfinished,
-                True,
-                local_offloaded,
-            )
+            return local_has_unfinished, True, local_offloaded
 
         try:
-            # Pack all state: [is_prefill, num_tokens, num_reqs, has_unfinished, shutdown, offloaded]
             state_tensor = torch.tensor(
                 [
-                    1 if local_is_prefill else 0,
-                    local_num_tokens,
-                    local_num_reqs,
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
                     1 if local_offloaded else 0,
@@ -611,31 +565,14 @@ class DPEngineCoreProc(EngineCore):
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
-            global_has_prefill = state_tensor[0].item() == 1
-            global_max_tokens = state_tensor[1].item()
-            global_max_reqs = state_tensor[2].item()
-            global_has_unfinished = state_tensor[3].item() == 1
-            global_shutdown = state_tensor[4].item() == 1
-            global_offloaded = state_tensor[5].item() == 1
-            return (
-                global_has_prefill,
-                global_max_tokens,
-                global_max_reqs,
-                global_has_unfinished,
-                global_shutdown,
-                global_offloaded,
-            )
+            global_has_unfinished = state_tensor[0].item() == 1
+            global_shutdown = state_tensor[1].item() == 1
+            global_offloaded = state_tensor[2].item() == 1
+            return global_has_unfinished, global_shutdown, global_offloaded
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             self._shutting_down = True
-            return (
-                local_is_prefill,
-                local_num_tokens,
-                local_num_reqs,
-                local_has_unfinished,
-                True,
-                local_offloaded,
-            )
+            return local_has_unfinished, True, local_offloaded
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:

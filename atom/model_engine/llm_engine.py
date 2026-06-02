@@ -261,6 +261,11 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
+        # `has_per_req_cache` flags model architectures that need a
+        # per-request stateful buffer outside the paged KV pool. Sequences
+        # constructed for these models trigger BlockManager to reserve a
+        # per-req cache slot. Currently: GDN-based models (Qwen3-Next /
+        # Qwen3.5). Future stateful models (DeepseekV4, etc.) extend the set.
         self._external_to_internal: dict[str, int] = {}
         self._internal_to_external: dict[int, str] = {}
         self.has_per_req_cache = False
@@ -466,8 +471,8 @@ class InputOutputProcessor:
                 "finish_reason": req.leave_reason,
                 "num_tokens_input": req.num_prompt_tokens,
                 "num_tokens_output": req.num_completion_tokens,
-                "ttft": ttft,
-                "tpot": tpot,
+                "ttft": ttft,  # Time to first token in seconds
+                "tpot": tpot,  # Time per output token in seconds
             }
         return outputs
 
