@@ -237,9 +237,9 @@
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "nightly",
     "accuracy_threshold": 0.83,
-    "accuracy_baseline": null,
+    "accuracy_baseline": 0.85,
     "accuracy_baseline_model": "Qwen/Qwen3.5-35B-A3B",
-    "_baseline_note": "Threshold referenced from the sglang nightly entry for the same model; refresh after first CI measurement."
+    "_baseline_note": "Mean of first 4 valid CI runs (0.8226 / 0.8529 / 0.8620 / 0.8628). Threshold 0.83 from sglang nightly retained."
   },
   {
     "model_name": "Qwen3.5-397B-A17B-FP8",
