@@ -41,6 +41,7 @@ def _has_module(module_name: str) -> bool:
     """
     return importlib.util.find_spec(module_name) is not None
 
+
 MXFP4_QUANT_BLOCK_SIZE = 32
 
 

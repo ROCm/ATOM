@@ -60,6 +60,7 @@ from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quantization.quark.utils import weight_dequant_fp8
 
 import logging
+
 logger = logging.getLogger("atom")
 
 
@@ -795,7 +796,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition_after_pad, # TP included
+                2 * intermediate_size_per_partition_after_pad,  # TP included
                 hidden_size // 2,
                 dtype=weight_dtype,
             )
@@ -835,7 +836,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.empty(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition_after_pad // 2, # TP included
+                intermediate_size_per_partition_after_pad // 2,  # TP included
                 dtype=weight_dtype,
             )
         )
@@ -892,28 +893,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
-
         if os.environ.get("ATOM_V4_TORCH_MOE"):
             return
-
 
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
             from atom.config import get_current_atom_config
 
             atom_config = get_current_atom_config()
-            
-            w13_weight, w13_scale, w13_swizzle_layout, w2_weight, w2_scale, w2_swizzle_layout = _swizzle_mxfp4(
+
+            (
+                w13_weight,
+                w13_scale,
+                w13_swizzle_layout,
+                w2_weight,
+                w2_scale,
+                w2_swizzle_layout,
+            ) = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
                 layer.w13_weight_scale,
                 layer.w2_weight.view(torch.uint8),
                 layer.w2_weight_scale,
                 "mx4",
-                self.intermediate_size * 2,#N_1,
-                self.hidden_size,#K_1,
-                self.hidden_size,#N_2,
-                self.intermediate_size,#K_2,
-                atom_config.tensor_parallel_size
+                self.intermediate_size * 2,  # N_1,
+                self.hidden_size,  # K_1,
+                self.hidden_size,  # N_2,
+                self.intermediate_size,  # K_2,
+                atom_config.tensor_parallel_size,
             )
             del layer.w13_weight
             del layer.w2_weight
@@ -963,9 +969,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # if activation scales are specified, check quant dtype
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
-            
+
         # NOTE: implemented for visibility to fp8 moe
-        if (self.moe.a_quant_dtype == "fp8_e4m3"):
+        if self.moe.a_quant_dtype == "fp8_e4m3":
             return mxfp4_w4a8_moe_quant_config(
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
@@ -1021,14 +1027,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_act = top_k
 
                 # custom routing
-                from aiter.ops.triton.moe.moe_routing.routing import routing_a8w4 # grouped topk included
-                
+                from aiter.ops.triton.moe.moe_routing.routing import (
+                    routing_a8w4,
+                )  # grouped topk included
+
                 routing_data, gather_idx, scatter_idx = routing_a8w4(
                     router_logits,
                     n_expts_act,
-                    16, # hardcode block m for now TODO change back
+                    16,  # hardcode block m for now TODO change back
                     score_mode=scoring_func,
-                    bias=e_score_correction_bias.to(torch.float32) if e_score_correction_bias is not None else None,
+                    bias=(
+                        e_score_correction_bias.to(torch.float32)
+                        if e_score_correction_bias is not None
+                        else None
+                    ),
                     renorm=renormalize,
                     routed_scaling_factor=layer.routed_scaling_factor,
                     use_grouped_topk=use_grouped_topk,
@@ -1041,15 +1053,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_act = routing_data.n_expts_act
 
                 # Convert to triton routing data structures
-                num_tokens, n_expts_tot = router_logits.shape 
+                num_tokens, n_expts_tot = router_logits.shape
 
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
-                
+
                 n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
-
-                x_q_dtype = self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None
+                x_q_dtype = (
+                    self.moe.a_quant_dtype
+                    if self.moe.a_quant_dtype == "fp8_e4m3"
+                    else None
+                )
 
                 output = torch.empty_like(x)
                 _moe_result = triton_kernel_fused_experts(
@@ -1080,7 +1095,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 fused_shared_experts_scoring_func is None
             ), "triton kernel does not support fused shared experts func"
 
-            x_q_dtype = self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None
+            x_q_dtype = (
+                self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None
+            )
 
             return triton_kernel_moe_forward(
                 x,
@@ -2166,7 +2183,11 @@ class FusedMoE(torch.nn.Module):
         self.use_chunked = get_dp_group().world_size > 1
 
         try:
-            a_quant_dtype = config.quantization_config.get("global_quant_config", "").get("input_tensors", "").get("dtype", "")
+            a_quant_dtype = (
+                config.quantization_config.get("global_quant_config", "")
+                .get("input_tensors", "")
+                .get("dtype", "")
+            )
         except AttributeError:
             # global quant config does not exist, no activation loaded
             a_quant_dtype = None

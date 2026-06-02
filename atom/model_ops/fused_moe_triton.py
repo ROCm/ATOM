@@ -27,7 +27,6 @@ from atom.model_ops.moe_utils import (
 )
 from atom.utils import envs
 
-
 if envs.ATOM_USE_TRITON_GEMM:
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
@@ -51,12 +50,21 @@ def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1
     w2_triton_layout = w2.transpose(-2, -1)
     w2_scale_triton_layout = w2_scale.transpose(-2, -1)
 
-    w1_scale_triton_layout, w1_swizzle_layout = check_and_swizzle_scales(w1_scale_triton_layout, N_1, K_1)
+    w1_scale_triton_layout, w1_swizzle_layout = check_and_swizzle_scales(
+        w1_scale_triton_layout, N_1, K_1
+    )
     w2_scale_triton_layout, w2_swizzle_layout = check_and_swizzle_scales(
         w2_scale_triton_layout, N_2, K_2
     )
-    
-    return w1_triton_layout, w1_scale_triton_layout, w1_swizzle_layout, w2_triton_layout, w2_scale_triton_layout, w2_swizzle_layout
+
+    return (
+        w1_triton_layout,
+        w1_scale_triton_layout,
+        w1_swizzle_layout,
+        w2_triton_layout,
+        w2_scale_triton_layout,
+        w2_swizzle_layout,
+    )
 
 
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
@@ -98,7 +106,6 @@ def triton_kernel_moe_forward(
 
     output = torch.empty_like(hidden_states)
 
-
     return triton_kernel_fused_experts(
         output,
         hidden_states,
@@ -121,7 +128,7 @@ def triton_kernel_moe_forward(
         global_num_experts=global_num_experts,
         expert_map=expert_map,
         x_q_dtype=x_q_dtype,
-        static_scale=static_scale
+        static_scale=static_scale,
     )
 
 
@@ -164,8 +171,8 @@ def triton_kernel_fused_experts(
     assert hidden_states.ndim == 2
 
     # aiter kernels expect 2d inputs/outputs
-    M, K = hidden_states.shape[-2:] 
-    E, _, N = w1.shape 
+    M, K = hidden_states.shape[-2:]
+    E, _, N = w1.shape
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -178,11 +185,9 @@ def triton_kernel_fused_experts(
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-    
+
     # Add batch_dim to output buffer because matmul_ogs expects 3D output
-    intermediate_cache = _resize_cache(
-        intermediate_cache, (M * topk, half_N)
-    )
+    intermediate_cache = _resize_cache(intermediate_cache, (M * topk, half_N))
 
     output_tensor = _resize_cache(output_tensor, (M, K))
 
@@ -191,7 +196,7 @@ def triton_kernel_fused_experts(
     if activation == ActivationType.Swiglu:
         # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
         x_q_dtype_base = x_q_dtype.split("_")[0] if x_q_dtype else None
-        if (x_q_dtype_base == "fp8"):
+        if x_q_dtype_base == "fp8":
             # If input type is fp8, input scales must be available
             assert a13_scale is not None
             assert a2_scale is not None
@@ -215,10 +220,10 @@ def triton_kernel_fused_experts(
                 swizzle_mx_scale=w13_swizzle_layout,
                 out_dtype=torch.float8_e4m3fn,
                 apply_swiglu=True,
-                alpha=1.702,          # gpt-oss
-                limit=7.0,            # gpt-oss
-                add_residual=True,    # gpt-oss `(up + 1)`
-            ) 
+                alpha=1.702,  # gpt-oss
+                limit=7.0,  # gpt-oss
+                add_residual=True,  # gpt-oss `(up + 1)`
+            )
             output_tensor = moe_gemm_a8w4(
                 interm_cache,
                 w2,
@@ -230,7 +235,7 @@ def triton_kernel_fused_experts(
                 routing_data,
                 scatter_indx=scatter_indx,
                 gammas=None if apply_router_weight_on_input else gammas,
-                swizzle_mx_scale=w2_swizzle_layout, 
+                swizzle_mx_scale=w2_swizzle_layout,
             )
         else:
             interm_cache = moe_gemm_a16w4(
@@ -246,9 +251,9 @@ def triton_kernel_fused_experts(
                 gammas=gammas if apply_router_weight_on_input else None,
                 swizzle_mx_scale=w13_swizzle_layout,
                 apply_swiglu=True,
-                alpha=1.702,          # gpt-oss
-                limit=7.0,            # gpt-oss
-                add_residual=True,    # gpt-oss `(up + 1)`
+                alpha=1.702,  # gpt-oss
+                limit=7.0,  # gpt-oss
+                add_residual=True,  # gpt-oss `(up + 1)`
             )
             output_tensor = moe_gemm_a16w4(
                 interm_cache,
@@ -279,7 +284,7 @@ def triton_kernel_fused_experts(
             swizzle_mx_scale=w13_swizzle_layout,
             apply_swiglu=False,
         )
-        
+
         raw_2d = raw_intermediate.view(M * topk, N)
         intermediate_cache = intermediate_cache.view(M * topk, half_N)
         fused_clamp_act_mul(
@@ -306,5 +311,5 @@ def triton_kernel_fused_experts(
 
         return output_tensor
 
-    output_tensor = output_tensor.view(M, K) 
+    output_tensor = output_tensor.view(M, K)
     return output_tensor

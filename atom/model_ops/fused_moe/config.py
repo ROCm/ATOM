@@ -289,7 +289,7 @@ def mxfp4_w4a8_moe_quant_config(
         w2_bias=w2_bias,
         per_act_token_quant=per_act_token_quant,
         block_shape=block_shape,
-        weight_dtype="mxfp4"
+        weight_dtype="mxfp4",
     )
 
 
