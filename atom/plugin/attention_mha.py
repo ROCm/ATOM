@@ -31,6 +31,7 @@ ATOM_USE_GLUON_PA_DECODE = envs.ATOM_USE_GLUON_PA_DECODE
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _QWEN_GLUON_PA_DECODE_BS = 64
+_GLM47_GLUON_PA_DECODE_BS = 32
 _NO_PS_FIXED_SPLITS = 64  # covers up to 64 * 256 = 16384 context length
 
 
@@ -570,7 +571,7 @@ class PagedAttentionImplPluginModeMethods:
         if self.use_triton_attn or num_decodes == _QWEN_GLUON_PA_DECODE_BS:
             return self.paged_attention_triton_plugin_mode
         else:
-            if ATOM_USE_GLUON_PA_DECODE and num_decodes <= 32:
+            if ATOM_USE_GLUON_PA_DECODE and num_decodes <= _GLM47_GLUON_PA_DECODE_BS:
                 return self.paged_attention_triton_plugin_mode
             else:
                 return self.paged_attention_asm_plugin_mode
