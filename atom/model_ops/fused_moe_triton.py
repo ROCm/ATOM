@@ -318,7 +318,7 @@ def _a8w4_fused_experts(
             apply_swiglu=True,
             alpha=1.0,
             limit=swiglu_limit,
-            add_residual=False,
+            swiglu_add_residual=False,
             out_dtype=torch.bfloat16,  # ignored when out_mx_quant=True
             out_mx_quant=True,
         )
