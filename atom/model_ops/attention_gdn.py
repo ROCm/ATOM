@@ -152,6 +152,109 @@ class GatedDeltaNet(nn.Module):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
+    # ----- Recurrent-attention path helpers -------------------------------
+    # Three call sites for the gated-delta-rule recurrence, one per request
+    # type. Splitting them out (instead of the prior single if/elif/else
+    # block inside `forward`) lets `forward` route a mixed batch — spec +
+    # decode + prefill in the same call — to all three in turn, then
+    # concatenate their outputs token-wise. Each helper handles its own
+    # ssm_state gather/scatter so the dispatcher stays simple.
+
+    def gdr_prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_state: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        non_spec_state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Chunked prefill path. `q/k/v/g/beta` are the prefill-only slice
+        of the non-spec tokens; `non_spec_state_indices` and
+        `has_initial_state` are sliced to match (one entry per prefill seq).
+        """
+        initial_state = ssm_state[non_spec_state_indices].contiguous()
+        initial_state[~has_initial_state, ...] = 0
+        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=query_start_loc,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        # Scatter the per-seq final state back into the cache slot.
+        ssm_state[non_spec_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+        return core_attn_out
+
+    def gdr_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_state: torch.Tensor,
+        non_spec_state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single-token decode path (one token per request, no spec). The
+        recurrent kernel reads/writes ssm_state inplace via the slot table,
+        so no Python-side gather/scatter is needed here.
+        """
+        core_attn_out, _ = fused_recurrent_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=ssm_state,
+            inplace_final_state=True,
+            cu_seqlens=query_start_loc,
+            ssm_state_indices=non_spec_state_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return core_attn_out
+
+    def gdr_spec(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_state: torch.Tensor,
+        spec_state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Multi-query speculative-decode path. The kernel uses
+        `num_accepted_tokens` to walk only the accepted prefix of each
+        candidate, and updates ssm_state inplace at the slot pointed to by
+        column 0 of `spec_state_indices`.
+        """
+        core_attn_out, _ = fused_recurrent_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=ssm_state,
+            inplace_final_state=True,
+            cu_seqlens=query_start_loc,
+            ssm_state_indices=spec_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return core_attn_out
+
     def forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -303,66 +406,87 @@ class GatedDeltaNet(nn.Module):
             g_non_spec = g
             beta_non_spec = beta
 
-        # 2. Recurrent attention
+        # 2. Recurrent attention — dispatch to per-request-type helpers.
+        # The three sub-paths (spec multi-query, single-token decode,
+        # chunked prefill) are independent and may all fire in the same
+        # call when the batch is mixed.
 
-        # 2.1: Process the multi-query part
+        # 2.1: Spec multi-query path.
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
+            core_attn_out_spec = self.gdr_spec(
                 q=query_spec,
                 k=key_spec,
                 v=value_spec,
                 g=g_spec,
                 beta=beta_spec,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=spec_query_start_loc[: gdn_metadata.num_spec_decodes + 1],
-                ssm_state_indices=spec_state_indices_tensor,
+                ssm_state=ssm_state,
+                spec_state_indices=spec_state_indices_tensor,
+                query_start_loc=spec_query_start_loc[
+                    : gdn_metadata.num_spec_decodes + 1
+                ],
                 num_accepted_tokens=num_accepted_tokens,
-                use_qk_l2norm_in_kernel=True,
             )
         else:
-            core_attn_out_spec, last_recurrent_state = None, None
+            core_attn_out_spec = None
 
-        # 2.2: Process the remaining part
-        if gdn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-            initial_state[~has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
+        # 2.2: Non-spec path — split tokens + per-seq metadata into decode
+        # then prefill (vLLM convention: decode tokens come first in the
+        # non-spec slice, one per request, followed by variable-length
+        # prefill tokens).
+        num_decodes = gdn_metadata.num_decodes
+        num_decode_tokens = gdn_metadata.num_decode_tokens
+        num_prefills = gdn_metadata.num_prefills
+
+        core_attn_out_decode = None
+        core_attn_out_prefill = None
+
+        if num_decodes > 0:
+            core_attn_out_decode = self.gdr_decode(
+                q=query_non_spec[:, :num_decode_tokens],
+                k=key_non_spec[:, :num_decode_tokens],
+                v=value_non_spec[:, :num_decode_tokens],
+                g=g_non_spec[:, :num_decode_tokens],
+                beta=beta_non_spec[:, :num_decode_tokens],
+                ssm_state=ssm_state,
+                non_spec_state_indices=non_spec_state_indices_tensor[:num_decodes],
+                query_start_loc=non_spec_query_start_loc[: num_decodes + 1],
             )
-            # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
+
+        if num_prefills > 0:
+            # Re-base prefill cu_seqlens to start at 0 — the prefill slice
+            # of `mixed_qkv` (and therefore q/k/v) begins at token index
+            # `num_decode_tokens`, but the kernel sees its own contiguous
+            # input starting at 0.
+            prefill_qsl = non_spec_query_start_loc[num_decodes:] - num_decode_tokens
+            core_attn_out_prefill = self.gdr_prefill(
+                q=query_non_spec[:, num_decode_tokens:],
+                k=key_non_spec[:, num_decode_tokens:],
+                v=value_non_spec[:, num_decode_tokens:],
+                g=g_non_spec[:, num_decode_tokens:],
+                beta=beta_non_spec[:, num_decode_tokens:],
+                ssm_state=ssm_state,
+                has_initial_state=(
+                    has_initial_state[num_decodes:]
+                    if has_initial_state is not None
+                    else None
+                ),
+                non_spec_state_indices=non_spec_state_indices_tensor[num_decodes:],
+                query_start_loc=prefill_qsl,
             )
-        elif gdn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_recurrent_gated_delta_rule(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[: gdn_metadata.num_decodes + 1],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
-                )
+
+        # Stitch the decode and prefill outputs back into a single
+        # non-spec tensor in the same token order they came in. Skip the
+        # cat when only one of the two ran.
+        if core_attn_out_decode is not None and core_attn_out_prefill is not None:
+            core_attn_out_non_spec = torch.cat(
+                (core_attn_out_decode, core_attn_out_prefill), dim=1
             )
+        elif core_attn_out_decode is not None:
+            core_attn_out_non_spec = core_attn_out_decode
+        elif core_attn_out_prefill is not None:
+            core_attn_out_non_spec = core_attn_out_prefill
         else:
-            core_attn_out_non_spec, last_recurrent_state = None, None
+            core_attn_out_non_spec = None
 
         # 3. Merge core attention output
 

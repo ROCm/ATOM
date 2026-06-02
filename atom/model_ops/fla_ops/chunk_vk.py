@@ -22,7 +22,7 @@ from .chunk_delta_h_vk import chunk_gated_delta_rule_fwd_h_vk
 from .chunk_o_vk import chunk_fwd_o_vk
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
-from .l2norm import l2norm_fwd
+from .l2norm import l2norm_fwd_qk
 from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
@@ -39,17 +39,45 @@ def chunk_gated_delta_rule_fwd_vk(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     o: torch.Tensor | None = None,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ):
     """ATOM-native vk prefill: K1-K6 all run as separate Triton kernels.
 
     See `chunk_gated_delta_rule_fwd_vk_flydsl` for the flydsl-K5 variant.
+
+    When called from the GDN mixed-batch dispatcher, `cu_seqlens` is the
+    ORIGINAL non-spec cumulative sequence lengths (cache-stable across
+    forward calls), and `num_decodes` / `num_decode_tokens` describe the
+    leading decode-only prefix to skip. Every Kx launcher receives the
+    original `cu_seqlens` + the two ints, so the `@tensor_cache` on
+    `prepare_chunk_indices` / `prepare_chunk_offsets` /
+    `prepare_rebased_cu_seqlens` hits across calls.
     """
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    g = chunk_local_cumsum(
+        g,
+        chunk_size=64,
+        cu_seqlens=cu_seqlens,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+    )
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
+        k=k,
+        beta=beta,
+        g=g,
+        cu_seqlens=cu_seqlens,
+        output_dtype=torch.float32,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+    A = solve_tril(
+        A=A,
+        cu_seqlens=cu_seqlens,
+        output_dtype=k.dtype,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+    )
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -57,6 +85,8 @@ def chunk_gated_delta_rule_fwd_vk(
         A=A,
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h_vk(
         k=k,
@@ -66,6 +96,8 @@ def chunk_gated_delta_rule_fwd_vk(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
     o = chunk_fwd_o_vk(
         q=q,
@@ -76,6 +108,8 @@ def chunk_gated_delta_rule_fwd_vk(
         scale=scale,
         cu_seqlens=cu_seqlens,
         o=o,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
@@ -100,10 +134,15 @@ class ChunkGatedDeltaRuleFunctionVk(torch.autograd.Function):
         cu_seqlens: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
         o: torch.Tensor | None = None,
+        num_decodes: int = 0,
+        num_decode_tokens: int = 0,
     ):
         if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
+            # Fused l2norm over both q and k in a single kernel launch
+            # (grid `(cdiv(T*H, MBLOCK), 2)`). Halves the launch count
+            # vs two back-to-back `l2norm_fwd` calls and doubles per-
+            # launch SM occupancy when T*H is small.
+            q, k = l2norm_fwd_qk(q, k)
 
         # NOTE: input_guard calls .contiguous() on every Tensor arg including o.
         # For our intended caller (a contiguous output buffer) that is a no-op
@@ -120,6 +159,8 @@ class ChunkGatedDeltaRuleFunctionVk(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             o=o,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -143,6 +184,8 @@ def chunk_gated_delta_rule_vk(
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     o: torch.Tensor | None = None,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ):
     r"""
     Args:
@@ -221,11 +264,7 @@ def chunk_gated_delta_rule_vk(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
-            raise ValueError(
-                f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
-            )
+
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if o is not None:
@@ -269,5 +308,7 @@ def chunk_gated_delta_rule_vk(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         o,
+        num_decodes,
+        num_decode_tokens,
     )
     return o, final_state
