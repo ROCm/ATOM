@@ -334,12 +334,12 @@
       "variants": [
         {
           "tp_size": 4,
-          "display": "DeepSeek-V3.2 FP8 MTP PTPC TP4 (AW)",
-          "dashboard_model": "DeepSeek-V3.2-FP8-MTP-PTPC-aw-tp4",
-          "prefix": "deepseek-v3-2-fp8-mtp-ptpc-aw-tp4",
+          "display": "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
+          "dashboard_model": "DeepSeek-V3.2-FP8-PTPC-aw-tp4",
+          "prefix": "deepseek-v3-2-fp8-ptpc-aw-tp4",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384 --no-enable-prefix-caching --kv-cache-dtype bfloat16 --gpu-memory-utilization 0.85 --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --block-size 1 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
-          "env_vars": "SAFETENSORS_FAST_GPU=1"
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": ""
         }
       ]
     },

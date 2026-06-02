@@ -47,7 +47,7 @@ on:
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 MTP PTPC TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -86,7 +86,7 @@ on:
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 MTP PTPC TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -125,7 +125,7 @@ on:
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 MTP PTPC TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -164,7 +164,7 @@ on:
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 MTP PTPC TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -203,7 +203,7 @@ on:
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 MTP PTPC TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -242,7 +242,7 @@ on:
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 MTP PTPC TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -281,7 +281,7 @@ on:
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 MTP PTPC TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -320,7 +320,7 @@ on:
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
-          - DeepSeek-V3.2 FP8 MTP PTPC TP4 (AW)
+          - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -914,7 +914,7 @@ jobs:
               "gpt-oss-120b TP1 (AW)",
               "DeepSeek-V3.2 FP8 TP4 (AW)",
               "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
-              "DeepSeek-V3.2 FP8 MTP PTPC TP4 (AW)",
+              "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
               "GLM-4.7-FP8 TP4 (AW)",
