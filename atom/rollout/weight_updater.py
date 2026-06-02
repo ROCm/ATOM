@@ -580,17 +580,10 @@ class WeightUpdaterMixin:
         if not hasattr(self, "_ipc_buffer") or self._ipc_buffer is None:
             from atom.rollout.weight_sync import rebuild_ipc_handle
 
-            # Global index for looking up the correct per-GPU IPC handle
-            # (ATOMHttpServer keys handles by global device index: 0..num_gpus-1)
-            global_device_idx = (
-                self.config.parallel_config.data_parallel_rank_local or 0
-            ) * self.world_size + self.rank
-            # Local index for rebuild_ipc_handle's device_id parameter
-            # (DP subprocess has remapped CUDA_VISIBLE_DEVICES, so it sees cuda:0..tp-1)
+            dp_rank_local = self.config.parallel_config.data_parallel_rank_local or 0
+            global_device_idx = dp_rank_local * self.world_size + self.rank
             local_device_idx = self.device.index
             if ipc_handles is not None and global_device_idx in ipc_handles:
-                # Per-GPU IPC: open the handle for THIS runner's GPU
-                # (same-GPU IPC, safe on ROCm/MI300X).
                 self._ipc_buffer = rebuild_ipc_handle(
                     ipc_handles[global_device_idx], device_id=local_device_idx
                 )
@@ -602,12 +595,6 @@ class WeightUpdaterMixin:
                     f"runner_device={self.device})"
                 )
             else:
-                # Fallback: single IPC handle (original behavior).
-                # Do NOT override device_id: the buffer stays mapped on the
-                # sender's GPU.  Cross-GPU runners access it via D2D copy
-                # (.to(self.device)).  Overriding device_id to this runner's
-                # GPU causes hipIpcOpenMemHandle to fail on ROCm when the
-                # handle belongs to a different GPU.
                 self._ipc_buffer = rebuild_ipc_handle(ipc_handle)
                 logger.info(
                     f"{self.label}: opened IPC buffer mapping "

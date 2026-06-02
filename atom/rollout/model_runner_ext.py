@@ -33,19 +33,20 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
     def _setup_device_and_distributed(self, rank: int, config):
-        """Override to set up DP-isolated NCCL worlds when device map is active.
+        """Override to set up DP-isolated NCCL worlds.
 
-        When ``DP_DEVICE_MAP_ENV`` is set, each DP rank's ModelRunners form
-        an independent NCCL world scoped to TP only.  Otherwise falls back
-        to the base class.
+        Each DP rank's ModelRunners form an independent NCCL world scoped
+        to TP only. Device assignment is derived from config (dp_rank_local
+        and tensor_parallel_size) rather than environment variables, which
+        may not survive multiprocessing spawn boundaries reliably.
         """
-        device_map = os.environ.get(self.DP_DEVICE_MAP_ENV)
-        if device_map is None:
-            return super()._setup_device_and_distributed(rank, config)
+        if config.parallel_config.data_parallel_size <= 1:
+            device_map = os.environ.get(self.DP_DEVICE_MAP_ENV)
+            if device_map is None:
+                return super()._setup_device_and_distributed(rank, config)
 
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
-        device_indices = [int(x) for x in device_map.split(",")]
-        local_device_rank = device_indices[rank]
+        local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
         dp_port = config.parallel_config.data_parallel_base_port + dp_rank_local * 100
         num_gpus = torch.cuda.device_count()
 
@@ -82,6 +83,12 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
             data_parallel_rank=0,
             local_rank=local_device_rank,
         )
+
+        # DP is handled at the EngineCore level (DPEngineCoreProc), not
+        # within ModelRunner. Override so downstream code (get_dp_padding,
+        # _preprocess/sync_dp_for_tbo) sees dp_size=1 and skips cross-DP
+        # collectives that would fail on the isolated process group.
+        config.parallel_config.data_parallel_size = 1
 
         # aiter's init_dist_env creates a signal tensor on device=rankID
         # (TP rank). When DP isolation remaps devices, recreate it on

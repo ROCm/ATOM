@@ -161,6 +161,9 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
+        if not hasattr(self, "runner_mgr"):
+            self._send_engine_dead()
+            return
         self.runner_mgr.keep_monitoring = False
         try:
             self.runner_mgr.call_func("exit")
@@ -503,7 +506,8 @@ class DPEngineCoreProc(EngineCore):
                 self.utility_handler.process_queue(self.utility_queue, self)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 local_unfinished = (
-                    not self.scheduler.is_finished() and not self._is_rl_weights_offloaded
+                    not self.scheduler.is_finished()
+                    and not self._is_rl_weights_offloaded
                 )
 
                 global_has_unfinished, global_shutdown, global_offloaded = (

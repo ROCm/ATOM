@@ -577,13 +577,11 @@ class ModelRunner:
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
-        self._setup_device_and_distributed(rank, config)
-
-        # Initialize profiler for this rank
+        # Initialize profiler for this rank (before _setup_device_and_distributed
+        # so that dp config fields are still at their original values)
         self.profiler = None
         self.profiler_dir = None
         if config.torch_profiler_dir is not None:
-            # Create rank-specific profiler directory
             dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
             if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
                 rank_name = f"dp{dp_rank_local}_tp{rank}"
@@ -591,6 +589,8 @@ class ModelRunner:
                 rank_name = f"rank_{rank}"
             self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
+
+        self._setup_device_and_distributed(rank, config)
 
         self.graph_bs = [0]  # for eager fallback
 
