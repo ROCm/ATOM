@@ -29,7 +29,6 @@ This document describes the environment variables used in the ATOM project.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
-| **ATOM_DISABLE_VLLM_PLUGIN_ATTENTION** | bool | 0 (false) | If set to `1`, disable only the vLLM attention plugin while keeping other plugins active. |
 
 ---
 

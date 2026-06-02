@@ -33,7 +33,4 @@ include = ["atom*"]
 atom = "atom.plugin.vllm.register:register_platform"
 
 [project.entry-points."vllm.general_plugins"]
-# by default the entry-points will be installed anyway
-# but the plugin mode for models can be disabled by 
-# ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
 atom_model_registry = "atom.plugin.vllm.register:register_model"

@@ -73,19 +73,19 @@ def register_ops_to_sglang(atom_config: Config) -> None:
 
 
 def set_attn_cls() -> None:
-    """Swap ``atom.model_ops.Attention`` to the framework-appropriate class.
+    """Keep compatibility with old plugin init hooks.
 
-    ATOM models reference ``ops.Attention`` generically; this function binds
-    it to PagedAttention (vLLM) or RadixAttention (sglang) at plugin init time.
+    FIXME: This is a legacy no-op after attention construction moved to the
+    frontend dispatcher. Remove it once downstream plugin init paths stop
+    calling ``set_attn_cls`` for side effects.
+
+    Attention selection now happens in ``atom.model_ops.base_attention.Attention``
+    at construction time, so plugin init no longer mutates ``atom.model_ops``.
     """
-    import atom.model_ops as ops
-
     if is_vllm():
-        ops.Attention = ops.PagedAttention
-        logger.info("Set Attention to PagedAttention for vLLM")
+        logger.info("Use Attention dispatcher for vLLM")
     elif is_sglang():
-        ops.Attention = ops.RadixAttention
-        logger.info("Set Attention to RadixAttention for SGLang")
+        logger.info("Use Attention dispatcher for SGLang")
 
 
 def init_aiter_dist(config: Config) -> None:

@@ -4,14 +4,12 @@ import logging
 import torch
 from atom.plugin.prepare import _set_framework_backbone
 from atom.utils import envs
-from atom.plugin.vllm.mla_patch import patch_vllm_mla_attention
 from atom.plugin.vllm.spec_decode_patch import apply_vllm_spec_decode_patch
 
 logger = logging.getLogger("atom")
 
 # this flag is used to enable the vllm plugin mode
 disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
-disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 
 # those 2 models are covering most of dense and moe models
 ATOM_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMForCausalLM"
@@ -120,7 +118,6 @@ def register_model() -> None:
         vllm_model_registry._try_load_model_cls.cache_clear()
         vllm_model_registry._try_inspect_model_cls.cache_clear()
 
-    patch_vllm_mla_attention()
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader
     try:
@@ -130,6 +127,9 @@ def register_model() -> None:
 
     _patch_vllm_attention_process_weights_after_loading(Attention)
     _patch_vllm_attention_process_weights_after_loading(MLAAttention)
+    # vLLM's speculative decoder keeps an allow-list of attention metadata
+    # classes. ATOM-vLLM uses its own metadata classes after attention
+    # isolation, so extend that allow-list before MTP/Eagle proposal runs.
     apply_vllm_spec_decode_patch()
 
     # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),

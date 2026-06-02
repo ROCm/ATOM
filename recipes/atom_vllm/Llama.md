@@ -21,8 +21,6 @@ huggingface-cli login
 ### Llama-3.1-8B-Instruct (TP=1)
 
 ```bash
-export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
-
 vllm serve meta-llama/Llama-3.1-8B-Instruct \
     --host localhost \
     --port 8000 \
@@ -80,7 +78,7 @@ lm_eval --model local-completions \
         --num_fewshot 3
 ```
 
-Measured result (2026-04-03, TP=1, `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`):
+Measured result (2026-04-03, TP=1):
 
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
@@ -107,5 +105,5 @@ Measured result (2026-04-07, TP=8, plain vLLM baseline with `VLLM_PLUGINS=''`, `
 
 ## CI Alignment Notes
 
-- `Llama-3.1-8B-Instruct` uses TP=1 in nightly accuracy (`RUN_LLAMA8_TP1`) with `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`.
+- `Llama-3.1-8B-Instruct` uses TP=1 in nightly accuracy (`RUN_LLAMA8_TP1`).
 - `Meta-Llama-3.1-405B-Instruct-FP8/` uses TP=8 in nightly accuracy (`RUN_LLAMA405_FP8_TP8`).
