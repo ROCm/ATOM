@@ -4,6 +4,7 @@
 
 import importlib
 import importlib.util
+import importlib.machinery
 import sys
 import os
 import types
@@ -58,6 +59,16 @@ _atom_config.Config = _StubConfig
 _atom_config.KVCacheTensor = _StubKVCacheTensor
 _atom_config.ParallelConfig = _StubParallelConfig
 sys.modules["atom.config"] = _atom_config
+
+# ── 3b. Stub forward_context; Scheduler only needs get_kvconnector in tests ──
+
+_forward_context = types.ModuleType("atom.utils.forward_context")
+_forward_context.__package__ = "atom.utils"
+_forward_context.__spec__ = importlib.machinery.ModuleSpec(
+    "atom.utils.forward_context", loader=None
+)
+_forward_context.get_kvconnector = lambda *args, **kwargs: None
+sys.modules["atom.utils.forward_context"] = _forward_context
 
 # ── 4. Stub zmq / zmq.asyncio if not installed ────────────────────────────
 
@@ -116,6 +127,7 @@ class MockConfig:
             kv_cache_block_size=4,
             num_kvcache_blocks=10,
             enable_prefix_caching=False,
+            enable_chunked_prefill=True,
             max_num_seqs=4,
             max_num_batched_tokens=64,
             max_model_len=64,
@@ -124,7 +136,6 @@ class MockConfig:
             stop_token_ids=[],
             scheduler_delay_factor=0.0,
             speculative_config=None,
-            enable_chunked_prefill=False,
         )
         defaults.update(overrides)
         for k, v in defaults.items():
