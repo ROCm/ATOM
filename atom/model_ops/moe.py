@@ -330,6 +330,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -757,10 +758,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or gfx.startswith("gfx12")
                 or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
-        if self.use_triton:
-            from atom.model_ops.utils import has_triton_kernels
 
-            assert has_triton_kernels(), "triton_kernels is not installed"
+        self.use_triton_backend = None
+        if self.use_triton:
+            self.use_triton_backend = os.environ.get("ATOM_MOE_BACKEND", "a8w4")
+            assert self.use_triton_backend in (
+                "matmul_ogs",
+                "a8w4",
+            ), f"ATOM_MOE_BACKEND={self.use_triton_backend} is not supported in Mxfp4MoEMethod, set ATOM_MOE_BACKEND to matmul_ogs or a8w4"
+            if self.use_triton_backend == "matmul_ogs":
+                from atom.model_ops.utils import has_triton_kernels
+
+                assert has_triton_kernels(), "triton_kernels is not installed"
 
     def create_weights(
         self,
@@ -891,7 +900,76 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if os.environ.get("ATOM_V4_TORCH_MOE"):
             return
 
-        if self.use_triton:
+        # Step 1: a8w4 MoE backend weight-layout branch. Reorders W13/W2 into
+        # the layout moe_gemm_a8w4 expects and swizzles scales.
+        if self.use_triton_backend == "a8w4":
+            # Step 3: gate/up interleave for apply_swiglu fold. Off by default.
+            from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+                swizzle_scales_gfx950 as swizzle_scales,
+            )
+
+            def _interleave_gateup(t):
+                """t: [E, 2N, *] → reorder dim=1 from [g..u..] to [g,u,g,u,...]"""
+                E, two_N = t.shape[0], t.shape[1]
+                N = two_N // 2
+                tail = t.shape[2:]
+                return (
+                    t.view(E, 2, N, *tail)
+                    .permute(0, 2, 1, *range(3, 3 + len(tail)))
+                    .contiguous()
+                    .view(E, two_N, *tail)
+                )
+
+            # W1 weight: view-transpose to [E, K/2, 2N] (no .contiguous())
+            w1_w = layer.w13_weight.data.view(torch.uint8)  # [E, 2N, K/2]
+            w1_w = _interleave_gateup(w1_w)
+            w1_w_kernel = w1_w.transpose(-1, -2)  # [E, K/2, 2N], view
+            assert (
+                w1_w_kernel.stride(-2) == 1
+            ), "W1: K must be contiguous (do NOT call .contiguous())"
+
+            # W1 scale: transpose + contiguous + swizzle
+            w1_s = layer.w13_weight_scale.data  # [E, 2N, K/32]
+            w1_s = _interleave_gateup(w1_s)
+            w1_s_swz_in = w1_s.transpose(-1, -2).contiguous()  # [E, K/32, 2N]
+            w1_s_E, w1_s_SCALE_K, w1_s_N = w1_s_swz_in.shape
+            w1_s_K = w1_s_SCALE_K * 32
+            if w1_s_N % 32 == 0 and w1_s_K % 256 == 0:
+                w1_s_kernel = swizzle_scales(w1_s_swz_in)
+            else:
+                w1_s_kernel = w1_s_swz_in
+
+            # W2 weight: view-transpose to [E, N_per/2, hidden]
+            w2_w = layer.w2_weight.data.view(torch.uint8)
+            w2_w_kernel = w2_w.transpose(-1, -2)
+            assert (
+                w2_w_kernel.stride(-2) == 1
+            ), "W2: K (=N_per/2 packed) must be contiguous"
+
+            # W2 scale: transpose + contiguous + swizzle
+            w2_s = layer.w2_weight_scale.data
+            w2_s_swz_in = w2_s.transpose(-1, -2).contiguous()
+            w2_s_E, w2_s_SCALE_K, w2_s_N = w2_s_swz_in.shape
+            w2_s_K = w2_s_SCALE_K * 32
+            if w2_s_N % 32 == 0 and w2_s_K % 256 == 0:
+                w2_s_kernel = swizzle_scales(w2_s_swz_in)
+            else:
+                w2_s_kernel = w2_s_swz_in
+
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            layer.w13_weight = w1_w_kernel
+            layer.w2_weight = w2_w_kernel
+            layer.w13_weight_scale = w1_s_kernel
+            layer.w2_weight_scale = w2_s_kernel
+
+            self.w13_precision_config = None
+            self.w2_precision_config = None
+            return
+
+        elif self.use_triton_backend == "matmul_ogs":
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
@@ -978,6 +1056,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import (
@@ -996,6 +1075,100 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             if needs_custom_routing:
+                if self.use_triton_backend == "a8w4":
+                    assert (
+                        layer.num_fused_shared_experts == 0
+                    ), "A8W4 Triton MOE does not support fused_shared_experts mode, please set ATOM_MOE_BACKEND=matmul_ogs or ATOM_USE_TRITON_MOE=0"
+                    # DeepSeek-V4 hash-layer fully-fused fast path: replaces the
+                    # Python `_hash_topk` + multi-kernel `fused_routing_from_topk`
+                    # counting-sort + `compute_expt_data` (with memset) chain with
+                    # ONE Triton kernel (hash_routing) + sort_tokens_fused. Same
+                    # 2-kernel shape as the non-hash routing_a8w4 path.
+                    #
+                    # Detection: custom_routing_function is the bound method of a
+                    # MoeLayer whose gate has the tid2eid lookup table.
+                    from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
+                    from aiter.ops.triton.moe.moe_routing.routing import (
+                        routing_a8w4,
+                        routing_a8w4_from_hash,
+                    )
+
+                    _hash_layer = (
+                        custom_routing_function is not None
+                        and hasattr(custom_routing_function, "__self__")
+                        and hasattr(
+                            getattr(custom_routing_function.__self__, "gate", None),
+                            "tid2eid",
+                        )
+                    )
+                    M = x.shape[-2]
+                    block_m = 64 if M >= 256 else 16
+                    n_expts_tot = router_logits.shape[-1]
+                    if global_num_experts > 0:
+                        n_expts_tot = global_num_experts
+                    n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
+                    if _hash_layer:
+                        moe_layer = custom_routing_function.__self__
+                        tid2eid = moe_layer.gate.tid2eid
+                        fwd_ctx = get_forward_context()
+                        ids = fwd_ctx.context.input_ids.flatten()
+                        num_tokens = router_logits.shape[0]
+                        if ids.shape[0] < num_tokens:
+                            ids_2d = ids.unsqueeze(-1)
+                            ids_2d, _ = pad_for_all_gather(ids_2d)
+                            from aiter.dist.parallel_state import get_dp_group
+
+                            ids_2d = get_dp_group().all_gather(ids_2d, dim=0)
+                            ids = ids_2d[:num_tokens].flatten()
+                        ids = ids.clamp(0, tid2eid.shape[0] - 1)
+
+                        aiter_routing, gather_src, scatter_src = routing_a8w4_from_hash(
+                            router_logits,
+                            tid2eid,
+                            ids,
+                            n_expts_act=top_k,
+                            block_m=block_m,
+                            score_mode="sqrtsoftplus",
+                            renorm=renormalize,
+                            routed_scaling_factor=moe_layer.routed_scaling_factor,
+                        )
+                    else:
+                        aiter_routing, gather_src, scatter_src = routing_a8w4(
+                            router_logits,
+                            n_expts_act=top_k,
+                            block_m=block_m,
+                            score_mode="sqrtsoftplus",
+                            bias=e_score_correction_bias,
+                            renorm=renormalize,
+                            routed_scaling_factor=layer.routed_scaling_factor,
+                        )
+
+                    moe_residual = getattr(layer, "_moe_residual_to_fold", None)
+                    if moe_residual is not None:
+                        layer._moe_residual_was_folded = True
+                    output = torch.empty(
+                        *x.shape, dtype=torch.bfloat16, device=x.device
+                    )
+                    return _a8w4_fused_experts(
+                        output,
+                        x,
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        layer.w13_weight_scale,
+                        layer.w2_weight_scale,
+                        routing_data=None,
+                        gather_indx=gather_src,
+                        scatter_indx=scatter_src,
+                        topk=top_k,
+                        swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                        w1_bias=layer.w13_bias,
+                        w2_bias=layer.w2_bias,
+                        apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                        pre_built_aiter_routing=aiter_routing,
+                        residual=moe_residual,
+                        x_scale=x_scale,
+                    )
+
                 # Use ATOM's full-featured select_experts for routing,
                 # then triton matmul_ogs for the actual MoE computation.
                 topk_weights, topk_ids = FusedMoE.select_experts(
@@ -1456,6 +1629,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply compressed-tensors FP8 MoE computation."""
         # Select top-k experts using router logits
@@ -1808,6 +1982,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -1912,16 +2087,18 @@ def moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    hidden_states_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.forward_impl(hidden_states, router_logits)
+    return self.forward_impl(hidden_states, router_logits, hidden_states_scale)
 
 
 def moe_forward_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    hidden_states_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -2958,13 +3135,24 @@ class FusedMoE(torch.nn.Module):
 
         return topk_weights, topk_ids
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        hidden_states_scale: torch.Tensor = None,
+    ):
         return torch.ops.aiter.moe_forward(
-            hidden_states, router_logits, self.layer_name
+            hidden_states,
+            router_logits,
+            self.layer_name,
+            hidden_states_scale=hidden_states_scale,
         )
 
     def forward_impl_graph(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        hidden_states_scale: torch.Tensor = None,
     ):
         # There are three mode
         # 1. Pure DP mode: only DP is used
@@ -3025,6 +3213,7 @@ class FusedMoE(torch.nn.Module):
             fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            x_scale=hidden_states_scale,
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
@@ -3050,11 +3239,18 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        hidden_states_scale: torch.Tensor = None,
+    ):
         assert self.quant_method is not None
 
         if get_dp_group().world_size > 1:
-            return self.forward_impl_graph(hidden_states, router_logits)
+            return self.forward_impl_graph(
+                hidden_states, router_logits, hidden_states_scale=hidden_states_scale
+            )
 
         dp_group = get_dp_group()
         if dp_group.world_size > 1:
@@ -3083,6 +3279,7 @@ class FusedMoE(torch.nn.Module):
             fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            x_scale=hidden_states_scale,
         )
 
         dp_group = get_dp_group()

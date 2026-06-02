@@ -218,6 +218,165 @@ def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
     return routing_data, gather_indx, scatter_indx
 
 
+def bridge_tk_to_aiter_routing(tk_rd, block_m: int):
+    """Bridge triton_kernels RoutingData -> aiter RoutingData (for moe_gemm_a8w4).
+
+    triton_kernels carries per-block-m specializations of token_offs_pad /
+    block_pid_map as dicts keyed by block_m; the aiter variant is specialized
+    for a single block_m and stores those fields as plain tensors.
+    """
+    from aiter.ops.triton.moe.moe_routing.routing import RoutingData, ExptData
+
+    tk_ed = tk_rd.expt_data
+    if block_m not in tk_ed.token_offs_pad:
+        raise ValueError(
+            f"bridge_tk_to_aiter_routing: block_m={block_m} not present in "
+            f"tk_rd.expt_data.token_offs_pad. Keys: {sorted(tk_ed.token_offs_pad.keys())}"
+        )
+    aiter_expt_data = ExptData(
+        hist=tk_ed.hist,
+        token_offs_raw=tk_ed.token_offs_raw,
+        token_offs_pad=tk_ed.token_offs_pad[block_m],
+        block_pid_map=tk_ed.block_pid_map[block_m],
+    )
+    return RoutingData(
+        block_m=block_m,
+        gate_scal=tk_rd.gate_scal,
+        expt_hist=tk_rd.expt_hist,
+        n_expts_tot=tk_rd.n_expts_tot,
+        n_expts_act=tk_rd.n_expts_act,
+        expt_data=aiter_expt_data,
+    )
+
+
+def _a8w4_fused_experts(
+    output_tensor: torch.Tensor,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,  # a8w4 layout: uint8 [E, K/2, 2N], stride(-2)==1
+    w2: torch.Tensor,  # a8w4 layout: uint8 [E, N/2, K], stride(-2)==1
+    w1_scale: torch.Tensor,  # swizzled ue8m0 uint8
+    w2_scale: torch.Tensor,  # swizzled ue8m0 uint8
+    routing_data,
+    gather_indx,
+    scatter_indx,
+    topk: int,
+    swiglu_limit: float,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    apply_router_weight_on_input: bool,
+    pre_built_aiter_routing=None,  # if set, skip bridge and use this aiter routing directly
+    # Step 9: shared-expert output to fold into GEMM2 reduce_grouped writeback.
+    residual: torch.Tensor | None = None,
+    x_scale: torch.Tensor | None = None,
+    swiglu_fold: bool = True,
+) -> torch.Tensor:
+    """Step 1 minimum a8w4 fused experts.
+
+    Pipeline: downcast_to_mxfp -> moe_gemm_a8w4 (G1, no swiglu) ->
+              fused_clamp_act_mul (silu_mul, no quant) -> downcast_to_mxfp ->
+              moe_gemm_a8w4 (G2). No apply_swiglu fold, no out_mx_quant fold,
+              no residual fold — those are later steps.
+    """
+    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+
+    M, K = hidden_states.shape[-2:]
+    BLOCK_M = 64 if M >= 256 else 16
+
+    # Pre-MoE quant: bf16 -> fp8 e4m3 + ue8m0 per-1x32.
+    if x_scale is None:
+        x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
+    else:
+        x_fp8 = hidden_states
+
+    # Step 4: skip bridge when pre_built_aiter_routing is provided.
+    if pre_built_aiter_routing is not None:
+        aiter_routing = pre_built_aiter_routing
+        gammas = aiter_routing.gate_scal
+        gather_src_indx = gather_indx  # already raw int32 tensor
+        scatter_src_indx = scatter_indx
+    else:
+        aiter_routing = bridge_tk_to_aiter_routing(routing_data, BLOCK_M)
+        gammas = routing_data.gate_scal if routing_data else None
+        gather_src_indx = gather_indx.src_indx
+        scatter_src_indx = scatter_indx.src_indx
+
+    w1_scale = w1_scale.view(torch.uint8)
+    w2_scale = w2_scale.view(torch.uint8)
+
+    if swiglu_fold:
+        inter_fp8, inter_scale = moe_gemm_a8w4(
+            x=x_fp8,
+            w=w1,
+            x_scales=x_scale,
+            w_scales=w1_scale,
+            bias=w1_bias,
+            routing_data=aiter_routing,
+            gather_indx=gather_src_indx,
+            gammas=gammas if apply_router_weight_on_input else None,
+            swizzle_mx_scale="CDNA4_SCALE",
+            apply_swiglu=True,
+            alpha=1.0,
+            limit=swiglu_limit,
+            add_residual=False,
+            out_dtype=torch.bfloat16,  # ignored when out_mx_quant=True
+            out_mx_quant=True,
+        )
+    else:
+        # GEMM1: fp8 act x fp4 weight, bf16 output [M*topk, 2N].
+        raw_intermediate = moe_gemm_a8w4(
+            x=x_fp8,
+            w=w1,
+            x_scales=x_scale,
+            w_scales=w1_scale,
+            bias=w1_bias,
+            routing_data=aiter_routing,
+            gather_indx=gather_src_indx,
+            gammas=gammas if apply_router_weight_on_input else None,
+            swizzle_mx_scale="CDNA4_SCALE",
+            apply_swiglu=False,
+            out_dtype=torch.bfloat16,
+        )
+        raw_2d = raw_intermediate.view(
+            raw_intermediate.shape[-2], raw_intermediate.shape[-1]
+        )
+        two_N = raw_2d.shape[-1]
+        inter_bf16 = torch.empty(
+            (raw_2d.shape[0], two_N // 2),
+            device=raw_2d.device,
+            dtype=torch.bfloat16,
+        )
+        fused_clamp_act_mul(
+            raw_2d,
+            out=inter_bf16,
+            swiglu_limit=swiglu_limit,
+            activation="silu",
+            dtype_quant=None,
+        )
+        inter_fp8, inter_scale = downcast_to_mxfp(
+            inter_bf16, torch.float8_e4m3fn, axis=-1
+        )
+
+    # GEMM2: fp8 act x fp4 weight, scatter+combine.
+    # Step 9: pass `residual` so reduce_grouped folds the routed+shared add
+    # into the writeback (saves the standalone elementwise add launch).
+    y = moe_gemm_a8w4(
+        x=inter_fp8,
+        w=w2,
+        x_scales=inter_scale,
+        w_scales=w2_scale,
+        bias=w2_bias,
+        routing_data=aiter_routing,
+        scatter_indx=scatter_src_indx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale="CDNA4_SCALE",
+        apply_swiglu=False,
+        out_dtype=torch.bfloat16,
+        residual=residual,
+    )
+    return y
+
+
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
     """
     Shrink the given tensor and apply the given view to it.  This is
@@ -299,7 +458,7 @@ def triton_kernel_fused_experts(
     assert w1_bias is None or w1_bias.dtype == torch.float32
     assert w2_bias is None or w2_bias.dtype == torch.float32
 
-    # Shape check, only check non-mxfp4
+    # Shape check for matmul_ogs path (a8w4 has different layout)
     assert hidden_states.ndim == 2
     assert hidden_states.shape[-1] == w1.shape[-2]
     assert w2.shape[-1] == w1.shape[1]

@@ -46,7 +46,13 @@ from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
+from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_quant_x import (
+    fused_gemm_a16w16_quant_x,
+)
+from aiter.ops.triton.quant.fused_mxfp8_quant import fused_flatten_mxfp8_quant
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.tuned_gemm import tgemm
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from atom.config import (
     Config,
     LayerQuantConfig,
@@ -71,7 +77,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, Mxfp4MoEMethod
 from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
@@ -123,6 +129,14 @@ _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
+# MXFP8 a8w8 GEMM path (Task #77). When on, q_norm RMSNorm emits FP8 e4m3fn +
+# uint8 e8m0 1x32 scales directly (via the Triton fused_rms_mxfp8_quant path in
+# atom/model_ops/layernorm.py) so wq_b's MXFP8 GEMM consumes them with no
+# transcode. The helper below is reserved for call sites that need to fuse
+# the Q-side MXFP8 quant with the K-side bf16 RMSNorm in a single launch.
+_V4_USE_MXFP8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
+_V4_DISABLE_FCAM = os.environ.get("ATOM_V4_DISABLE_FCAM", "0") == "1"
+_MXFP8_BYPASS_FCAM = os.environ.get("ATOM_MXFP8_BYPASS_FCAM", "0") == "1"
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -130,6 +144,60 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
+
+
+def _fused_router_gate_a16w16_quant_fake(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, K = x.shape
+    n_routed_experts = gate_weight.shape[0]
+    router_logits = torch.empty(
+        (num_tokens, n_routed_experts), dtype=torch.bfloat16, device=x.device
+    )
+    x_out = torch.empty((num_tokens, K), dtype=dtypes.fp8, device=x.device)
+    x_scales = torch.empty((num_tokens, K // 32), dtype=torch.uint8, device=x.device)
+    return router_logits, x_out, x_scales
+
+
+@torch_compile_guard(gen_fake=_fused_router_gate_a16w16_quant_fake, mutates_args=[])
+def fused_router_gate_a16w16_quant(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A16W16 router-gate GEMM, optionally fused with a BF16->FP8 downcast
+    copy of x.
+
+    For decode-shaped batches (num_tokens <= 64) the GEMM and the activation
+    downcast run in a single triton kernel; the FP8 copy is consumed by the
+    downstream fused_moe kernel, replacing its internal
+    `hidden_states.to(dtypes.fp8)` cast with a copy done inline with the
+    gate GEMM's A-loads. For larger batches the fusion's per-element copy
+    overhead is not worth the savings, so we fall back to tgemm.mm and let
+    aiter re-trigger the `.to(fp8)` cast on its side.
+    """
+    num_tokens = x.shape[0]
+    if num_tokens <= 64:
+        return fused_gemm_a16w16_quant_x(x, gate_weight, quant_dtype=dtypes.fp8)
+    router_logits = tgemm.mm(x, gate_weight, None, otype=torch.bfloat16)
+    x, x_scale = downcast_to_mxfp(x, dtypes.fp8, axis=-1)
+    return router_logits, x, x_scale
+
+
+def _make_weightless_rmsnorm(dim: int, eps: float) -> RMSNorm:
+    """Build an `RMSNorm(dim, eps)` whose `.weight` is `None`.
+
+    Drops the learnable Parameter so `state_dict()` is empty for this
+    submodule and `load_model` doesn't expect a weight from disk (no
+    "unloaded parameter" warning).  `DualRMSNorm` recognizes the
+    sentinel `weight is None` and instructs the fused kernel to skip
+    both the q_weight load and the multiply (Q_HAS_WEIGHT=False),
+    matching the prior `_rmsnorm_nw(x, eps, dim)` behavior.
+    """
+    norm = RMSNorm(dim, eps)
+    del norm.weight  # remove Parameter from `_parameters`
+    norm.weight = None  # sentinel for downstream consumers
+    return norm
 
 
 def _hc_head_reduce_fake(
@@ -1676,6 +1744,9 @@ class DeepseekV4Attention(nn.Module):
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        if _V4_USE_MXFP8:
+            x_fp8, x_scale = fused_flatten_mxfp8_quant(o)
+            return self.wo_b(x_fp8, x_scale=x_scale)
         x = self.wo_b(o.flatten(1))
         return x
 
@@ -1797,7 +1868,9 @@ class Expert(nn.Module):
         # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
         # quant through a single aiter triton kernel. The fused kernel emits
         # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
-        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
+        # ATOM_V4_DISABLE_FCAM=1 forces the unfused eager path for A/B vs the
+        # Triton fused-clamp-act-mul kernel.
+        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION and not _V4_DISABLE_FCAM
 
     def forward(
         self,
@@ -1812,14 +1885,29 @@ class Expert(nn.Module):
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         if self.use_fused_clamp_act_mul:
-            x_fp8, x_scale = fused_clamp_act_mul(
-                combined,
-                swiglu_limit=self.swiglu_limit,
-                activation="silu",
-                weights=weights,
-                dtype_quant=dtypes.fp8,
-                transpose_scale=True,
-            )
+            # When MXFP8 is enabled, ATOM_MXFP8_BYPASS_FCAM=1 forces the
+            # legacy fp32 1x128 emit + linear.py's dequant+requant fallback,
+            # isolating whether fused_clamp_act_mul's MXFP8 emit has a bug.
+            if _V4_USE_MXFP8 and not _MXFP8_BYPASS_FCAM:
+                x_fp8, x_scale = fused_clamp_act_mul(
+                    combined,
+                    swiglu_limit=self.swiglu_limit,
+                    activation="silu",
+                    weights=weights,
+                    dtype_quant=torch.float8_e4m3fn,
+                    quant_block_size=32,
+                    scale_dtype_fmt="ue8m0",
+                    transpose_scale=False,
+                )
+            else:
+                x_fp8, x_scale = fused_clamp_act_mul(
+                    combined,
+                    swiglu_limit=self.swiglu_limit,
+                    activation="silu",
+                    weights=weights,
+                    dtype_quant=dtypes.fp8,
+                    transpose_scale=True,
+                )
             return self.w2(x_fp8, x_scale=x_scale)
         out = torch.empty(
             (combined.shape[0], combined.shape[-1] // 2),
@@ -1969,6 +2057,14 @@ class MoE(nn.Module):
                 prefix
             ] = self
 
+        self._use_a8w4_triton_moe = False
+        if self.experts.quant_method.__class__ is Mxfp4MoEMethod and getattr(
+            self.experts.quant_method, "use_triton", False
+        ):
+            self._use_a8w4_triton_moe = (
+                getattr(self.experts.quant_method, "use_triton_backend", None) == "a8w4"
+            )
+
     def _hash_topk(
         self,
         hidden_states: torch.Tensor,
@@ -2044,6 +2140,15 @@ class MoE(nn.Module):
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
+        if self._use_a8w4_triton_moe:
+            router_logits, x, x_scale = fused_router_gate_a16w16_quant(
+                x, self.gate.weight
+            )
+            return self.experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                hidden_states_scale=x_scale,
+            )
         return self.experts(hidden_states=x, router_logits=router_logits)
 
     def combine_outputs(
@@ -2063,9 +2168,31 @@ class MoE(nn.Module):
     def single_stream_moe_forward(
         self, x: torch.Tensor  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
-        """Sequential: shared_experts → routed_experts → combine."""
+        """Sequential: shared_experts → routed_experts → combine.
+
+        Step 9: when the MoE method supports it (a8w4 triton-routing path),
+        the `routed + shared` add is folded into reduce_grouped's writeback by
+        stashing `shared` on `self.experts` before `routed_expert_forward`.
+        Saves the standalone elementwise add kernel. Gated by
+        ATOM_A8W4_FUSE_RESIDUAL (default 1) for easy A/B.
+        """
         shared = self.shared_experts(x) if self.shared_experts is not None else None
-        routed = self.routed_expert_forward(x)
+        fuse_residual = (
+            shared is not None and os.environ.get("ATOM_A8W4_FUSE_RESIDUAL", "1") == "1"
+        )
+        if fuse_residual:
+            self.experts._moe_residual_to_fold = shared
+        try:
+            routed = self.routed_expert_forward(x)
+        finally:
+            if fuse_residual:
+                self.experts._moe_residual_to_fold = None
+        folded = getattr(self.experts, "_moe_residual_was_folded", False)
+        self.experts._moe_residual_was_folded = False  # one-shot
+        if folded:
+            if self.tp_size > 1:
+                routed = tensor_model_parallel_all_reduce(routed)
+            return routed
         return self.combine_outputs(routed, shared)
 
     def dual_stream_moe_forward(

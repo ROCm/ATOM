@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from typing import Optional, Tuple
 
 import aiter
@@ -17,6 +18,7 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+from aiter.ops.triton.quant.fused_mxfp8_quant import fused_rms_mxfp8_quant
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
@@ -24,6 +26,8 @@ from atom.utils.decorators import mark_trace
 from atom.utils import envs
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
+
+_V4_USE_MXFP8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -318,6 +322,24 @@ class RMSNorm(nn.Module):
                 and x_scale is None
                 and self.quant_type.value in _AITER_RMS_QUANT_TYPE_VALUES
             ):
+                # MXFP8 path: when downstream Linear consumes MXFP8 1x32 e8m0
+                # scales (ATOM_FP8_BLOCKSCALE_USE_MXFP8=1), emit those directly
+                # to skip the dequant+requant cascade. Limited to per_1x128 and
+                # the no-residual case (most q_norm callers).
+                if (
+                    self.quant_type.value == _QV_PER_1X128
+                    and residual is None
+                    and _V4_USE_MXFP8
+                ):
+                    if x.dim() != 2:
+                        x2 = x.reshape(-1, x.shape[-1])
+                    else:
+                        x2 = x
+                    y, s = fused_rms_mxfp8_quant(x2, self.weight, self.eps)
+                    if x.dim() != 2:
+                        y = y.view(*x.shape[:-1], x.shape[-1])
+                        s = s.view(*x.shape[:-1], s.shape[-1])
+                    return y, s
                 # Dynamic-scale fused RMSNorm + quant via aiter HIP kernels.
                 # Static FP8 (x_scale provided) stays on the branch above.
                 x, x_scale, residual_out = _aiter_rms_quant(
