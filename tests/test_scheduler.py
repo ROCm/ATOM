@@ -98,6 +98,42 @@ class TestSchedule:
         assert batch.total_tokens_num_prefill == 6
         assert list(batch.num_scheduled_tokens) == [4, 2]
 
+    def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)))
+        sched.add(seq)
+
+        batch1, _ = sched.schedule()
+        assert batch1.total_tokens_num_prefill == 6
+        assert list(batch1.scheduled_tokens) == list(range(6))
+        assert list(batch1.num_cached_tokens) == [0]
+
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch1,
+        )
+        assert seq.is_partial_prefill is True
+        assert seq.num_cached_tokens == 6
+
+        batch2, _ = sched.schedule()
+        assert batch2.total_tokens_num_prefill == 4
+        assert list(batch2.scheduled_tokens) == list(range(6, 10))
+        assert list(batch2.num_cached_tokens) == [6]
+
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
         sched.add(seq_factory([1, 2, 3, 4]))  # 1 block

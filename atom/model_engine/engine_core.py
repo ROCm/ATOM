@@ -202,6 +202,7 @@ class EngineCore:
             self.output_queue.put_nowait(rejected)
 
         if result is None:
+            self._dispatch_idle_offload_work()
             if self.kv_transfer_enabled:
                 kvoutput = self.runner_mgr.call_func_with_aggregation(
                     "async_proc_aggregation"
@@ -212,6 +213,7 @@ class EngineCore:
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
+            self._dispatch_idle_offload_work()
             if self.kv_transfer_enabled:
                 kvoutput = self.runner_mgr.call_func_with_aggregation(
                     "async_proc_aggregation"
@@ -267,6 +269,17 @@ class EngineCore:
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
         return True
+
+    def _dispatch_idle_offload_work(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        connector = getattr(self.scheduler, "kv_connector", None)
+        if connector is None or not getattr(connector, "is_offload", False):
+            return
+        meta = connector.build_connector_meta()
+        if meta is None or not getattr(meta, "requests", None):
+            return
+        self.runner_mgr.call_func("process_kvconnector_output", meta)
 
     def pull_and_process_input_queue(self):
         recv_reqs = []
