@@ -910,6 +910,21 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._save_tracker: dict[str, list] = {}
         self._save_inflight: set[str] = set()
         self._lookup_in_step: list[str] = []
+        self._handoff_loads: set[str] = set()
+        self._allow_unaligned_handoff = os.environ.get(
+            "OFFLOAD_UNALIGNED_HANDOFF", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        try:
+            self._min_load_tokens = max(
+                0, int(os.environ.get("OFFLOAD_MIN_LOAD_TOKENS", "8192"))
+            )
+        except ValueError:
+            logger.warning(
+                "LMCache offload scheduler: invalid OFFLOAD_MIN_LOAD_TOKENS=%r; "
+                "using 8192",
+                os.environ.get("OFFLOAD_MIN_LOAD_TOKENS"),
+            )
+            self._min_load_tokens = 8192
 
         try:
             cfg = offcfg.build_lmcache_config()
@@ -1024,14 +1039,207 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if sid not in self._save_tracker:
             self._save_tracker[sid] = [seq, 0]
 
+    def _clear_pending_load(self, sid: str) -> None:
+        self._load_specs.pop(sid, None)
+        self._reqs_need_recv.pop(sid, None)
+        self._handoff_loads.discard(sid)
+        self._lookup_in_step = [
+            req_id for req_id in self._lookup_in_step if req_id != sid
+        ]
+        if self._lookup_client is not None:
+            try:
+                self._lookup_client.clear_lookup_status(sid)
+            except Exception:
+                pass
+
+    def _decide_load_after_alloc(
+        self, seq, ls: LoadSpec
+    ) -> tuple[bool, str, int, int, int, int]:
+        hbm = int(getattr(seq, "num_cached_tokens", ls.hbm_cached_tokens))
+        lmc = int(ls.lmcache_cached_tokens)
+        ls.hbm_cached_tokens = hbm
+        chunk = int(self.chunk_size or 256)
+        need = lmc - hbm
+        if lmc <= hbm:
+            return False, "hbm_satisfies_after_alloc", hbm, lmc, need, chunk
+        if hbm % chunk != 0:
+            return False, "unaligned_hbm_prefill", hbm, lmc, need, chunk
+        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        if need < min_load:
+            return False, "too_small", hbm, lmc, need, chunk
+        return True, "aligned_large_hit", hbm, lmc, need, chunk
+
+    def _maybe_start_unaligned_handoff(
+        self,
+        seq,
+        ls: LoadSpec,
+        hbm: int,
+        lmc: int,
+        chunk: int,
+    ) -> bool:
+        if not getattr(self, "_allow_unaligned_handoff", False):
+            return False
+        boundary = ((hbm + chunk - 1) // chunk) * chunk
+        remaining_after_boundary = lmc - boundary
+        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        if boundary <= hbm or remaining_after_boundary < min_load:
+            return False
+
+        sid = str(seq.id)
+        ls.hbm_cached_tokens = boundary
+        ls.can_load = True
+        self._reqs_need_recv.pop(sid, None)
+        self._handoff_loads.add(sid)
+        seq.offload_loaded_tokens = hbm
+        seq.offload_handoff_boundary_tokens = boundary
+        logger.info(
+            "[OFFLOAD-LOAD-HANDOFF] seq=%s hbm_cached=%d boundary=%d "
+            "lmc_cached=%d need_after_boundary=%d min_load=%d chunk=%d",
+            seq.id,
+            hbm,
+            boundary,
+            lmc,
+            remaining_after_boundary,
+            min_load,
+            chunk,
+        )
+        offload_trace(
+            "scheduler_load_handoff_start",
+            req=seq.id,
+            hbm=hbm,
+            boundary=boundary,
+            lmc=lmc,
+            need_after_boundary=remaining_after_boundary,
+            min_load=min_load,
+            chunk=chunk,
+            blocks=len(list(seq.block_table)),
+        )
+        return True
+
+    def adjust_prefill_chunk_after_alloc(self, seq, chunk: int) -> int:
+        sid = str(seq.id)
+        if sid not in self._handoff_loads:
+            return chunk
+        boundary = getattr(seq, "offload_handoff_boundary_tokens", None)
+        if boundary is None:
+            return chunk
+        hbm = int(getattr(seq, "num_cached_tokens", 0))
+        limit = int(boundary) - hbm
+        if limit <= 0:
+            return chunk
+        adjusted = min(int(chunk), limit)
+        offload_trace(
+            "scheduler_load_handoff_prefill_boundary",
+            req=seq.id,
+            hbm=hbm,
+            boundary=int(boundary),
+            original_chunk=int(chunk),
+            adjusted_chunk=adjusted,
+        )
+        return max(1, adjusted)
+
+    def should_park_partial_prefill_for_load(self, seq) -> bool:
+        sid = str(seq.id)
+        if sid not in self._handoff_loads:
+            return False
+        ls = self._load_specs.get(sid)
+        if ls is None:
+            self._handoff_loads.discard(sid)
+            return False
+        boundary = int(getattr(seq, "offload_handoff_boundary_tokens", 0) or 0)
+        hbm = int(getattr(seq, "num_cached_tokens", 0))
+        if boundary > 0 and hbm < boundary:
+            return False
+
+        should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
+            seq, ls
+        )
+        if not should_load:
+            self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
+            self._clear_pending_load(sid)
+            return False
+
+        ls.can_load = True
+        self._reqs_need_recv[sid] = seq
+        self._handoff_loads.discard(sid)
+        seq.offload_loaded_tokens = max(hbm, lmc)
+        logger.info(
+            "[OFFLOAD-LOAD-HANDOFF-READY] seq=%s hbm_cached=%d "
+            "lmc_cached=%d offload_loaded=%d need=%d",
+            seq.id,
+            hbm,
+            lmc,
+            seq.offload_loaded_tokens,
+            need,
+        )
+        offload_trace(
+            "scheduler_load_handoff_ready",
+            req=seq.id,
+            hbm=hbm,
+            lmc=lmc,
+            need=need,
+            blocks=len(list(seq.block_table)),
+        )
+        return True
+
+    def _mark_load_skip(
+        self,
+        seq,
+        reason: str,
+        hbm: int,
+        lmc: int,
+        need: int,
+        chunk: int,
+    ) -> None:
+        seq.offload_loaded_tokens = hbm
+        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        logger.info(
+            "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
+            "need=%d min_load=%d chunk=%d reason=%s",
+            seq.id,
+            hbm,
+            lmc,
+            need,
+            min_load,
+            chunk,
+            reason,
+        )
+        offload_trace(
+            "scheduler_load_skip",
+            req=seq.id,
+            reason=reason,
+            hbm=hbm,
+            lmc=lmc,
+            need=need,
+            min_load=min_load,
+            chunk=chunk,
+            blocks=len(list(seq.block_table)),
+        )
+
+    def should_park_for_load_after_alloc(self, seq) -> bool:
+        sid = str(seq.id)
+        ls = self._load_specs.get(sid)
+        if ls is None:
+            return False
+        should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(seq, ls)
+        if not should_load:
+            if reason == "unaligned_hbm_prefill" and self._maybe_start_unaligned_handoff(
+                seq, ls, hbm, lmc, chunk
+            ):
+                return False
+            self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
+            self._clear_pending_load(sid)
+            return False
+        seq.offload_loaded_tokens = max(hbm, lmc)
+        return True
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
-        meta.lookup_requests_in_step = self._lookup_in_step
-        self._lookup_in_step = []
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))
-        for sid, seq in self._reqs_need_recv.items():
+        loading_sids: set[str] = set()
+        for sid, seq in list(self._reqs_need_recv.items()):
             ls = self._load_specs.pop(sid, None)
             if ls is None or not ls.can_load:
                 logger.debug("[OFFLOAD-LOAD-SKIP] seq=%s ls=%s can_load=%s",
@@ -1044,99 +1252,53 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             # true HBM hit. Loading below this floor would overwrite HBM
             # prefix-cache blocks (possibly shared with other seqs) -> output
             # corruption. So load only [hbm_cached, offload_hit).
-            ls.hbm_cached_tokens = int(seq.num_cached_tokens)
-            if ls.hbm_cached_tokens >= int(ls.lmcache_cached_tokens):
-                seq.offload_loaded_tokens = int(seq.num_cached_tokens)
-                logger.info(
-                    "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
-                    "reason=hbm_satisfies_after_alloc",
-                    seq.id,
-                    ls.hbm_cached_tokens,
-                    ls.lmcache_cached_tokens,
-                )
-                offload_trace(
-                    "scheduler_load_hbm_satisfies_after_alloc",
-                    req=seq.id,
-                    hbm=ls.hbm_cached_tokens,
-                    lmc=ls.lmcache_cached_tokens,
-                    blocks=len(list(seq.block_table)),
-                )
-                # The request may already be parked in WAITING_FOR_REMOTE_KVS.
-                # Emit a no-op load so every worker reports finished_recving via
-                # the normal aggregation path instead of trying to complete it
-                # locally in the scheduler process.
-                meta.add_request(LMCacheReqMeta(
-                    req_id=seq.id,
-                    token_ids=list(seq.token_ids[: ls.lmcache_cached_tokens]),
-                    block_ids=list(seq.block_table),
-                    load_spec=ls,
-                ))
-                continue
-            chunk = self.chunk_size or 256
-            if ls.hbm_cached_tokens % chunk != 0:
-                seq.offload_loaded_tokens = int(seq.num_cached_tokens)
-                logger.info(
-                    "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
-                    "reason=unaligned_hbm chunk=%d",
-                    seq.id,
-                    ls.hbm_cached_tokens,
-                    ls.lmcache_cached_tokens,
-                    chunk,
-                )
-                offload_trace(
-                    "scheduler_load_unaligned_hbm",
-                    req=seq.id,
-                    hbm=ls.hbm_cached_tokens,
-                    lmc=ls.lmcache_cached_tokens,
-                    chunk=chunk,
-                    blocks=len(list(seq.block_table)),
-                )
-                # LMCache chunks can only be loaded from a chunk boundary. Do
-                # not round down and overwrite HBM prefix-cache blocks that may
-                # be shared with other requests; wake the parked request and let
-                # it continue prefill from the HBM floor.
-                meta.add_request(LMCacheReqMeta(
-                    req_id=seq.id,
-                    token_ids=list(seq.token_ids[: ls.hbm_cached_tokens]),
-                    block_ids=list(seq.block_table),
-                    load_spec=LoadSpec(
-                        hbm_cached_tokens=ls.hbm_cached_tokens,
-                        lmcache_cached_tokens=ls.hbm_cached_tokens,
-                        can_load=True,
-                    ),
-                ))
+            should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(seq, ls)
+            if not should_load:
+                self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
+                self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
-            seq.offload_loaded_tokens = max(
-                int(seq.num_cached_tokens), int(ls.lmcache_cached_tokens)
-            )
+            seq.offload_loaded_tokens = max(hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
             # LMCache's lookup/pin API. A str here silently never wakes the seq.
-            logger.info("[OFFLOAD-LOAD-EMIT] seq=%s hbm_cached=%d lmc_cached=%d offload_loaded=%d nblocks=%d",
-                        seq.id, ls.hbm_cached_tokens, ls.lmcache_cached_tokens,
-                        seq.offload_loaded_tokens, len(list(seq.block_table)))
+            logger.info(
+                "[OFFLOAD-LOAD-EMIT] seq=%s hbm_cached=%d lmc_cached=%d "
+                "offload_loaded=%d need=%d min_load=%d nblocks=%d reason=aligned_large_hit",
+                seq.id,
+                hbm,
+                lmc,
+                seq.offload_loaded_tokens,
+                need,
+                int(getattr(self, "_min_load_tokens", 8192)),
+                len(list(seq.block_table)),
+            )
             offload_trace(
                 "scheduler_load_emit",
                 req=seq.id,
-                hbm=ls.hbm_cached_tokens,
-                lmc=ls.lmcache_cached_tokens,
+                hbm=hbm,
+                lmc=lmc,
+                need=need,
+                min_load=int(getattr(self, "_min_load_tokens", 8192)),
                 offload_loaded=seq.offload_loaded_tokens,
                 blocks=len(list(seq.block_table)),
             )
+            loading_sids.add(sid)
             meta.add_request(LMCacheReqMeta(
                 req_id=seq.id,
-                token_ids=list(seq.token_ids[: ls.lmcache_cached_tokens]),
+                token_ids=list(seq.token_ids[: lmc]),
                 block_ids=list(seq.block_table),
                 load_spec=ls,
             ))
+        meta.lookup_requests_in_step = self._lookup_in_step
+        self._lookup_in_step = []
         # Saves: store fully computed prompt chunks. Under scheduler-side
         # chunked prefill, seq.num_cached_tokens advances after each prefill
         # chunk's forward has completed; use it as the D2H-safe frontier.
         chunk = self.chunk_size or 256
         for sid, entry in self._save_tracker.items():
             seq, saved = entry
-            if sid in self._reqs_need_recv:
+            if sid in self._reqs_need_recv or sid in loading_sids:
                 continue  # loading this step; defer its save
             if sid in self._save_inflight:
                 continue  # keep at most one save per request in flight
@@ -1200,17 +1362,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._save_inflight.discard(str(req_id))
 
     def load_failed(self, req_id) -> None:
-        self._load_specs.pop(str(req_id), None)
-        self._reqs_need_recv.pop(str(req_id), None)
+        self._clear_pending_load(str(req_id))
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
-        self._load_specs.pop(sid, None)
-        self._reqs_need_recv.pop(sid, None)
+        self._clear_pending_load(sid)
         if not self.should_defer_free(seq):
             self._save_tracker.pop(sid, None)
-        if self._lookup_client is not None:
-            try:
-                self._lookup_client.clear_lookup_status(sid)
-            except Exception:
-                pass

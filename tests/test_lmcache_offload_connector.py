@@ -49,6 +49,9 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._save_tracker = {}
     sched._save_inflight = set()
     sched._lookup_in_step = []
+    sched._handoff_loads = set()
+    sched._allow_unaligned_handoff = False
+    sched._min_load_tokens = 0
     sched._lock = threading.Lock()
     sched._done_load = set()
     return sched
@@ -285,21 +288,18 @@ def test_load_is_skipped_if_hbm_satisfies_after_allocation():
     assert should_park is True
 
     # Prefix-cache allocation can discover a larger HBM hit than the lookup-time
-    # snapshot. In that case the scheduler still emits a no-op load so the
-    # normal worker aggregation path can wake the parked seq.
+    # snapshot. Scheme A should skip the CPU load before parking instead of
+    # emitting a no-op load.
     seq.num_cached_tokens = 8
     sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is False
     meta = sched.build_connector_meta()
 
-    assert len(meta.requests) == 1
-    req = meta.requests[0]
-    assert req.req_id == 321
-    assert req.token_ids == list(range(8))
-    assert req.block_ids == [1, 2, 3]
-    assert req.load_spec.hbm_cached_tokens == 8
-    assert req.load_spec.lmcache_cached_tokens == 8
+    assert [req for req in meta.requests if req.load_spec is not None] == []
     assert seq.offload_loaded_tokens == 8
-    assert lookup.cleared == []
+    assert lookup.cleared == ["321"]
+    assert str(seq.id) not in sched._load_specs
+    assert str(seq.id) not in sched._reqs_need_recv
 
 
 def test_load_is_skipped_if_hbm_floor_is_not_chunk_aligned():
@@ -320,20 +320,148 @@ def test_load_is_skipped_if_hbm_floor_is_not_chunk_aligned():
 
     # HBM prefix cache can return block-size granularity, while LMCache chunks
     # are larger. Loading from a non-chunk boundary would either overlap shared
-    # HBM blocks or leave a gap, so the scheduler wakes the seq with a no-op
-    # load and lets suffix prefill continue from the HBM floor.
+    # HBM blocks or leave a gap, so Scheme A skips CPU load and suffix-prefills
+    # from the HBM floor.
     seq.num_cached_tokens = 6
     sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is False
     meta = sched.build_connector_meta()
 
-    assert len(meta.requests) == 1
-    req = meta.requests[0]
-    assert req.req_id == 654
-    assert req.token_ids == list(range(6))
-    assert req.block_ids == [1, 2, 3, 4]
-    assert req.load_spec.hbm_cached_tokens == 6
-    assert req.load_spec.lmcache_cached_tokens == 6
+    assert [req for req in meta.requests if req.load_spec is not None] == []
     assert seq.offload_loaded_tokens == 6
+    assert lookup.cleared == ["654"]
+
+
+def test_unaligned_hbm_handoff_prefills_boundary_then_emits_load():
+    sched = _scheduler()
+    sched._allow_unaligned_handoff = True
+    sched._min_load_tokens = 8
+    lookup = _LookupClient(hit=16)
+    sched._lookup_client = lookup
+    seq = SimpleNamespace(
+        id=657,
+        num_prompt_tokens=20,
+        token_ids=list(range(20)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4, 5],
+    )
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert need == 16
+    assert should_park is True
+
+    seq.num_cached_tokens = 6
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is False
+    assert str(seq.id) in sched._handoff_loads
+    assert seq.offload_handoff_boundary_tokens == 8
+    assert seq.offload_loaded_tokens == 6
+    assert sched.adjust_prefill_chunk_after_alloc(seq, 10) == 2
+
+    seq.num_cached_tokens = 8
+    assert sched.should_park_partial_prefill_for_load(seq) is True
+    meta = sched.build_connector_meta()
+    load_reqs = [req for req in meta.requests if req.load_spec is not None]
+
+    assert len(load_reqs) == 1
+    req = load_reqs[0]
+    assert req.req_id == 657
+    assert req.token_ids == list(range(16))
+    assert req.load_spec.hbm_cached_tokens == 8
+    assert req.load_spec.lmcache_cached_tokens == 16
+    assert seq.offload_loaded_tokens == 16
+    assert str(seq.id) not in sched._handoff_loads
+    assert lookup.cleared == []
+
+
+def test_unaligned_handoff_skips_if_boundary_remainder_is_too_small():
+    sched = _scheduler()
+    sched._allow_unaligned_handoff = True
+    sched._min_load_tokens = 8
+    lookup = _LookupClient(hit=12)
+    sched._lookup_client = lookup
+    seq = SimpleNamespace(
+        id=658,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+    )
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert need == 12
+    assert should_park is True
+
+    seq.num_cached_tokens = 6
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is False
+
+    assert str(seq.id) not in sched._handoff_loads
+    assert str(seq.id) not in sched._load_specs
+    assert str(seq.id) not in sched._reqs_need_recv
+    assert seq.offload_loaded_tokens == 6
+    assert lookup.cleared == ["658"]
+
+
+def test_load_is_skipped_if_aligned_hit_is_below_threshold():
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    lookup = _LookupClient(hit=12)
+    sched._lookup_client = lookup
+    seq = SimpleNamespace(
+        id=655,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+    )
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert need == 12
+    assert should_park is True
+
+    seq.num_cached_tokens = 8
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is False
+    meta = sched.build_connector_meta()
+
+    assert [req for req in meta.requests if req.load_spec is not None] == []
+    assert seq.offload_loaded_tokens == 8
+    assert lookup.cleared == ["655"]
+
+
+def test_aligned_large_hit_parks_and_emits_load_metadata():
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    lookup = _LookupClient(hit=12)
+    sched._lookup_client = lookup
+    seq = SimpleNamespace(
+        id=656,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+    )
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert need == 12
+    assert should_park is True
+
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is True
+    meta = sched.build_connector_meta()
+    load_reqs = [req for req in meta.requests if req.load_spec is not None]
+
+    assert len(load_reqs) == 1
+    req = load_reqs[0]
+    assert req.req_id == 656
+    assert req.token_ids == list(range(12))
+    assert req.block_ids == [1, 2, 3, 4]
+    assert req.load_spec.hbm_cached_tokens == 4
+    assert req.load_spec.lmcache_cached_tokens == 12
+    assert seq.offload_loaded_tokens == 12
+    assert lookup.cleared == []
 
 
 def test_worker_completes_noop_load_when_hbm_satisfies():

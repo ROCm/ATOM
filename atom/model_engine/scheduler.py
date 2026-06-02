@@ -650,6 +650,9 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
+        self._promote_ready_remote_kv_requests()
+        self._park_ready_offload_partial_prefills()
+
         # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
         _delayer_allows_prefill = True
         if self.prefill_delayer is not None:
@@ -856,6 +859,12 @@ class Scheduler:
                     self.kv_connector.update_state_after_alloc(seq)
 
                 if need_to_remove_to_load_kv_async_queue:
+                    if hasattr(self.kv_connector, "should_park_for_load_after_alloc"):
+                        need_to_remove_to_load_kv_async_queue = (
+                            self.kv_connector.should_park_for_load_after_alloc(seq)
+                        )
+
+                if need_to_remove_to_load_kv_async_queue:
                     offload_trace(
                         "scheduler_park_for_load",
                         req=seq.id,
@@ -866,6 +875,13 @@ class Scheduler:
                     skipped_waiting_requests.append(seq)
                     seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
                     continue
+
+                if self.kv_connector is not None and hasattr(
+                    self.kv_connector, "adjust_prefill_chunk_after_alloc"
+                ):
+                    chunk = self.kv_connector.adjust_prefill_chunk_after_alloc(
+                        seq, chunk
+                    )
 
             assert chunk > 0, (
                 f"chunk must be positive: {chunk=}, "
@@ -1100,7 +1116,11 @@ class Scheduler:
             # Deferred output from a previous partial prefill step is garbage
             # under deferred-out: drop it once, then let the next step's real
             # first completion token populate the placeholder.
-            if seq.id in prev_partial_ids:
+            discard_deferred_output = False
+            if is_deferred_out and getattr(seq, "_discard_next_deferred_output", False):
+                seq._discard_next_deferred_output = False
+                discard_deferred_output = True
+            if seq.id in prev_partial_ids or discard_deferred_output:
                 continue
             # Register prefix-cache hashes for blocks the prefill step just
             # finalized. Deferred from BlockManager.allocate() so a hash is
@@ -1338,6 +1358,18 @@ class Scheduler:
         return getattr(self.kv_connector, "is_offload", False)
 
     @staticmethod
+    def _has_req_id(req_ids: list, seq_id) -> bool:
+        candidates = (seq_id, str(seq_id))
+        for candidate in candidates:
+            if candidate in req_ids:
+                return True
+        try:
+            int_id = int(seq_id)
+        except (TypeError, ValueError):
+            return False
+        return int_id in req_ids
+
+    @staticmethod
     def _pop_req_id(req_ids: list, seq_id) -> bool:
         candidates = (seq_id, str(seq_id))
         for candidate in candidates:
@@ -1372,6 +1404,71 @@ class Scheduler:
             prompt=getattr(seq, "num_prompt_tokens", None),
         )
         return True
+
+    def _promote_ready_remote_kv_requests(self) -> None:
+        """Move completed remote-KV waiters ahead of fresh admissions.
+
+        Offload waiters already own allocated blocks. If a fresh request at the
+        head cannot allocate while a completed waiter sits behind it, the waiter
+        cannot finish and free blocks. Preserve FIFO order within the ready and
+        blocked groups.
+        """
+        if not self.waiting or not (
+            self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
+        ):
+            return
+
+        ready: deque[Sequence] = deque()
+        blocked: deque[Sequence] = deque()
+        while self.waiting:
+            seq = self.waiting.popleft()
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and (
+                self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
+                or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
+            ):
+                ready.append(seq)
+            else:
+                blocked.append(seq)
+
+        if ready:
+            offload_trace(
+                "scheduler_promote_remote_ready",
+                reqs=[seq.id for seq in ready],
+                rest=len(blocked),
+            )
+            self.waiting.extend(ready)
+            self.waiting.extend(blocked)
+        else:
+            self.waiting.extend(blocked)
+
+    def _park_ready_offload_partial_prefills(self) -> None:
+        if not self.running or self.kv_connector is None or not hasattr(
+            self.kv_connector, "should_park_partial_prefill_for_load"
+        ):
+            return
+
+        ready: deque[Sequence] = deque()
+        keep_running: deque[Sequence] = deque()
+        while self.running:
+            seq = self.running.popleft()
+            should_park = self.kv_connector.should_park_partial_prefill_for_load(seq)
+            if should_park:
+                if seq.is_partial_prefill:
+                    seq._discard_next_deferred_output = True
+                    seq.is_partial_prefill = False
+                    self._partial_prefill_count -= 1
+                seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                ready.append(seq)
+            else:
+                keep_running.append(seq)
+
+        self.running = keep_running
+        if ready:
+            offload_trace(
+                "scheduler_park_partial_prefill_for_load",
+                reqs=[seq.id for seq in ready],
+            )
+            self.waiting.extendleft(reversed(ready))
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """Reconcile scheduler state with completed KV transfers.
