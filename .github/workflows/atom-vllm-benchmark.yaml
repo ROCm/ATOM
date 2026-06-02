@@ -1743,7 +1743,7 @@ jobs:
                       --num-prompts \"$(( CONC * 8 ))\" \
                       --max-concurrency \"${CONC}\" \
                       ${TRUST_REMOTE_CODE_ARG} \
-                      --num-warmups \"${CONC}\" \
+                      --num-warmups \"$(( CONC * 8 ))\" \
                       --request-rate inf \
                       --ignore-eos \
                       --disable-tqdm \
