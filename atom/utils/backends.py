@@ -575,12 +575,15 @@ class VllmBackend:
             hash_content = []
             for filepath in forward_code_files:
                 hash_content.append(filepath)
-                if filepath == "<string>" or filepath == "<frozen os>":
+                if filepath == "<string>" or filepath.startswith("<frozen "):
                     # This means the function was dynamically generated, with
-                    # e.g. exec() or frozen os module. We can't actually check these.
+                    # e.g. exec() or a frozen stdlib module. We can't actually check these.
                     continue
-                with open(filepath) as f:
-                    hash_content.append(f.read())
+                try:
+                    with open(filepath) as f:
+                        hash_content.append(f.read())
+                except (OSError, UnicodeDecodeError):
+                    logger.warning("Failed to read traced file %s", filepath)
             import hashlib
 
             code_hash = hashlib.md5(
