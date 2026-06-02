@@ -29,7 +29,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # --- Compilation & Execution ---
-    "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "1") == "1",
+    "ATOM_TRITON_MOE_MAX_BLOCK_N": lambda: int(os.getenv("ATOM_TRITON_MOE_MAX_BLOCK_N", "256")),
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
