@@ -758,8 +758,7 @@ class Scheduler:
             # the token_ids, so num_tokens > num_prompt_tokens and those tokens
             # still need KV recomputed.
             num_new_tokens = (
-                seq.num_tokens
-                - num_cached_blocks * self.block_manager.block_size
+                seq.num_tokens - num_cached_blocks * self.block_manager.block_size
             )
             budget_remaining = self.max_num_batched_tokens - num_batched_tokens
             if self.enable_chunked_prefill:
