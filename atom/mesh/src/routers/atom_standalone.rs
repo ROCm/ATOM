@@ -1,19 +1,25 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    io,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use pyo3::{
     types::{PyAnyMethods, PyBool, PyDict, PyDictMethods, PyList, PyListMethods, PyTypeMethods},
     Bound, IntoPyObject, Py, PyAny, PyResult, Python,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Number, Value};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::{
     protocols::{
@@ -82,8 +88,143 @@ impl AtomStandaloneRouter {
         self.call_service("chat_completions", body, "chat completion")
     }
 
+    fn run_chat_completion_stream(&self, body: &ChatCompletionRequest) -> Response {
+        self.run_sse_service_stream(
+            body,
+            "start_chat_completions_stream",
+            "drain_chat_completions_stream",
+            "close_chat_completions_stream",
+            "chat completion",
+        )
+    }
+
+    fn close_python_stream(service: &Py<PyAny>, close_method: &'static str, stream_id: &str) {
+        Python::attach(|py| {
+            let _ = service.bind(py).call_method1(close_method, (stream_id,));
+        });
+    }
+
+    fn py_error_status(error: &pyo3::PyErr) -> StatusCode {
+        Python::attach(|py| {
+            error
+                .get_type(py)
+                .name()
+                .map(|name| {
+                    if name == "ValueError" {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                })
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        })
+    }
+
     fn run_completion(&self, body: &CompletionRequest) -> RouterResult<Value> {
         self.call_service("completions", body, "completion")
+    }
+
+    fn run_completion_stream(&self, body: &CompletionRequest) -> Response {
+        self.run_sse_service_stream(
+            body,
+            "start_completions_stream",
+            "drain_completions_stream",
+            "close_completions_stream",
+            "completion",
+        )
+    }
+
+    fn run_sse_service_stream<T: Serialize>(
+        &self,
+        body: &T,
+        start_method: &'static str,
+        drain_method: &'static str,
+        close_method: &'static str,
+        endpoint: &'static str,
+    ) -> Response {
+        let request_value = match serde_json::to_value(body) {
+            Ok(value) => value,
+            Err(e) => {
+                return Self::error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to serialize {endpoint} request: {e}"),
+                )
+            }
+        };
+
+        let stream_id = match Python::attach(|py| -> PyResult<String> {
+            let request = Self::json_to_py(py, &request_value)?;
+            self.service
+                .bind(py)
+                .call_method1(start_method, (request,))?
+                .extract::<String>()
+        }) {
+            Ok(stream_id) => stream_id,
+            Err(e) => {
+                return Self::error_response(
+                    Self::py_error_status(&e),
+                    format!("ATOM standalone {endpoint} stream failed: {e}"),
+                )
+            }
+        };
+
+        let service = Python::attach(|py| self.service.clone_ref(py));
+        let stream_id_for_worker = stream_id.clone();
+        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+        let _ = tokio::task::spawn_blocking(move || {
+            loop {
+                let chunks = Python::attach(|py| -> PyResult<Vec<String>> {
+                    service
+                        .bind(py)
+                        .call_method1(drain_method, (stream_id_for_worker.as_str(), 16usize, 0.05f64))?
+                        .extract::<Vec<String>>()
+                });
+
+                match chunks {
+                    Ok(chunks) => {
+                        if chunks.is_empty() {
+                            continue;
+                        }
+                        for chunk in chunks {
+                            let done = chunk.trim() == "data: [DONE]";
+                            if tx.send(Ok(Bytes::from(chunk))).is_err() {
+                                Self::close_python_stream(&service, close_method, &stream_id_for_worker);
+                                return;
+                            }
+                            if done {
+                                Self::close_python_stream(&service, close_method, &stream_id_for_worker);
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let error_chunk = json!({
+                            "error": {
+                                "message": error.to_string(),
+                                "type": "internal_server_error",
+                            }
+                        });
+                        let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", error_chunk))));
+                        Self::close_python_stream(&service, close_method, &stream_id_for_worker);
+                        return;
+                    }
+                }
+            }
+        });
+
+        let stream = UnboundedReceiverStream::new(rx);
+        let mut response = Response::new(Body::from_stream(stream));
+        *response.status_mut() = StatusCode::OK;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+            .headers_mut()
+            .insert("Cache-Control", HeaderValue::from_static("no-cache"));
+        response
+            .headers_mut()
+            .insert("Connection", HeaderValue::from_static("keep-alive"));
+        response
     }
 
     fn call_service<T: Serialize>(
@@ -106,7 +247,7 @@ impl AtomStandaloneRouter {
         })
         .map_err(|e| {
             Self::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                Self::py_error_status(&e),
                 format!("ATOM standalone {endpoint} failed: {e}"),
             )
         })
@@ -285,6 +426,10 @@ impl RouterTrait for AtomStandaloneRouter {
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        if body.stream {
+            return self.run_chat_completion_stream(body);
+        }
+
         match self.run_chat_completion(body) {
             Ok(body) => (StatusCode::OK, Json(body)).into_response(),
             Err(response) => response,
@@ -297,6 +442,10 @@ impl RouterTrait for AtomStandaloneRouter {
         body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        if body.stream {
+            return self.run_completion_stream(body);
+        }
+
         match self.run_completion(body) {
             Ok(body) => (StatusCode::OK, Json(body)).into_response(),
             Err(response) => response,
