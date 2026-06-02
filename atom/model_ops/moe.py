@@ -55,7 +55,7 @@ from atom.utils.forward_context import get_forward_context
 from atom.utils.decorators import mark_trace
 from torch import nn
 from transformers import PretrainedConfig
-from atom.plugin.moe import FusedMoEDecoratorForPluginMode
+from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quantization.quark.utils import weight_dequant_fp8
 
 
@@ -1485,8 +1485,9 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
 
-        # Use modular kernel if available (for EP/DP setups)
-        # Otherwise fall back to direct kernel call
+        # Use modular kernel if available (for EP/DP setups).
+        # Otherwise route through the standard AITER fused_moe path so
+        # compressed-tensors FP8 shares the same tuned-kernel dispatch.
         if self.fused_experts is not None:
             return self.fused_experts(
                 hidden_states=x,
@@ -1506,8 +1507,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
         else:
-            # Direct kernel call for non-EP/DP cases
-            return rocm_asm_moe_impl(
+            return torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,

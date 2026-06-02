@@ -11,7 +11,11 @@ from atom.config import CompilationLevel, Config, KVCacheTensor
 from atom.model_loader.loader import load_model
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils import envs
-from atom.utils.forward_context import SpecDecodeMetadata, get_forward_context
+from atom.utils.forward_context import (
+    DPMetadata,
+    SpecDecodeMetadata,
+    get_forward_context,
+)
 from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
@@ -313,6 +317,16 @@ class EagleProposer:
             "lm_head",
         )
 
+    def _refresh_dp_metadata(self, forward_context, num_local_tokens: int) -> None:
+        parallel_config = self.config.parallel_config
+        if parallel_config.data_parallel_size <= 1:
+            return
+        forward_context.context.dp_uniform_decode = False
+        forward_context.dp_metadata = DPMetadata.make(
+            parallel_config,
+            num_local_tokens,
+        )
+
     def propose(
         self,
         # [num_tokens]
@@ -376,6 +390,8 @@ class EagleProposer:
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
+                # Re-sync DP token
+                self._refresh_dp_metadata(forward_context, input_ids.shape[0])
                 ret_hidden_states = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -428,7 +444,17 @@ class EagleProposer:
                             kv_indptr[1 : bs + 1] -= torch.cumsum(
                                 num_reject_tokens, dim=0
                             )
-                        positions = torch.gather(positions, 0, last_token_indices)
+                        if positions.ndim == 1:
+                            positions = torch.index_select(
+                                positions, 0, last_token_indices
+                            )
+                        else:
+                            # MRoPE positions keep the token axis last (e.g.
+                            # [3, num_tokens] for Qwen3.5), so select columns
+                            # instead of indexing dim 0.
+                            positions = torch.index_select(
+                                positions, positions.ndim - 1, last_token_indices
+                            )
                         context.is_prefill = False
 
                     # update metadata

@@ -17,15 +17,16 @@ from .attention_mla import MLAModules
 
 import logging
 
-from atom.plugin.prepare import is_plugin_mode, is_vllm
-from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
 from atom.utils.decorators import mark_trace
-from atom.model_ops.base_attention import cp_mha_gather_cache
+from atom.model_ops.base_attention import (
+    cp_mha_gather_cache,
+    run_pa_decode_gluon,
+    run_pa_fwd_asm,
+)
 
 logger = logging.getLogger("atom")
 
 
-@PagedAttentionImplDecoratorForPluginMode
 class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
@@ -82,11 +83,9 @@ class PagedAttentionImpl(nn.Module):
         # for aiter triton unified_attention. AiterBackend keeps this False.
         self.use_flash_layout = False
 
-        # for plugin mode(vllm), the query quant is disabled for now
-        if is_vllm():
-            self.supports_quant_query_input = False
+        self.supports_quant_query_input = False
 
-    def forward_impl_server_mode(
+    def forward_impl(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -197,7 +196,9 @@ class PagedAttentionImpl(nn.Module):
                 else:
                     v_cache_shuffle = v_cache
                 fused_qk_norm_rope_cache_quant_shuffle(
-                    qkv,
+                    q=q,
+                    k=k,
+                    v=v,
                     num_heads_q=self.num_heads,
                     num_heads_k=self.num_kv_heads,
                     num_heads_v=self.num_kv_heads,
@@ -218,10 +219,10 @@ class PagedAttentionImpl(nn.Module):
                     v_scale=v_scale,
                 )
 
-                qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
-                q, k, v = qkv.split(
-                    [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
-                )
+                q = q.view(-1, self.num_heads, self.head_dim)
+                k = k.view(-1, self.num_kv_heads, self.head_dim)
+                v = v.view(-1, self.num_kv_heads, self.head_dim)
+            self._cache_format = "SHUFFLE"
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
@@ -245,6 +246,7 @@ class PagedAttentionImpl(nn.Module):
                 k_out=k,
                 output_zeros=False,
             )
+            self._cache_format = "NHD"
         else:
             # for asm paged attention
             asm_layout = True
@@ -280,6 +282,7 @@ class PagedAttentionImpl(nn.Module):
                     v_scale=None,
                     asm_layout=asm_layout,
                 )
+            self._cache_format = "SHUFFLE" if asm_layout else "NHD"
 
         # Prefix cache hit: gather cached KV from paged cache and concat with new tokens
         if attn_metadata.has_cached:
@@ -328,14 +331,16 @@ class PagedAttentionImpl(nn.Module):
         )
 
         # Convert cache for cp_mha_gather_cache
-        # fused_qk_norm_rope_cache_quant_shuffle: K [n, nh, hd//x, bs, x], V [n, nh, bs//x, hd, x] (SHUFFLE)
-        # fused_qk_rope_reshape_and_cache: K [n, nh, hd//x, bs, x], V [n, nh, hd, bs] -> NHD
+        # The cache format depends on which rope_cache branch wrote the data:
+        # - SHUFFLE: fused_qk_norm_rope_cache_quant_shuffle or reshape_and_cache(asm_layout=True)
+        #   K [n, nh, hd//x, bs, x], V viewed as [n, nh, bs//x, hd, x]
+        # - NHD: fused_qk_rope_reshape_and_cache or reshape_and_cache(asm_layout=False)
+        #   K [n, nh, hd//x, bs, x] -> permute to [n, bs, nh, hd], V [n, nh, hd, bs] -> [n, bs, nh, hd]
+        use_shuffle = getattr(self, "_cache_format", "SHUFFLE") == "SHUFFLE"
         if k_cache.dim() == 5:
             x = 16 // k_cache.element_size()
             n, nh, _, block_size, _ = k_cache.shape
-            if v_cache.dim() == 4:
-                # fused_qk_norm_rope_cache_quant_shuffle: V data in [n, nh, bs//x, hd, x] layout
-                use_shuffle = True
+            if use_shuffle:
                 k_cache_gather = k_cache
                 v_cache_gather = v_cache.view(n, nh, block_size // x, head_dim, x)
             elif v_cache.dim() == 5:
@@ -345,8 +350,7 @@ class PagedAttentionImpl(nn.Module):
                 k_cache_gather = k_cache
                 v_cache_gather = v_cache
             else:
-                # fused_qk_rope_reshape_and_cache: V [n, nh, hd, bs] -> NHD
-                use_shuffle = False
+                # V is in ASM/NHD format [n, nh, hd, bs], convert to [n, bs, nh, hd]
                 k_cache_gather = (
                     k_cache.permute(0, 3, 1, 2, 4)
                     .contiguous()
@@ -467,21 +471,21 @@ class PagedAttentionImpl(nn.Module):
             compute_type = (
                 torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
             )
-            torch.ops.aiter.pa_decode_gluon(
-                o,
-                q,
-                k_cache,
-                v_cache,
-                attn_metadata.context_lens,
-                attn_metadata.block_tables,
-                self.scale,
-                attn_metadata.max_seqlen_q,
-                max_context_partition_num,
-                context_partition_size,
-                compute_type,
-                None,  # q_scale
-                None if self.kv_cache_dtype == "bf16" else k_scale,
-                None if self.kv_cache_dtype == "bf16" else v_scale,
+            run_pa_decode_gluon(
+                output=o,
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                context_lens=attn_metadata.context_lens,
+                block_tables=attn_metadata.block_tables,
+                softmax_scale=self.scale,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_context_partition_num=max_context_partition_num,
+                context_partition_size=context_partition_size,
+                compute_type=compute_type,
+                q_scale=None,
+                k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
+                v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
                 exp_sums=exp_sums,
                 max_logits=max_logits,
                 temporary_output=temporary_output,
@@ -499,19 +503,16 @@ class PagedAttentionImpl(nn.Module):
     ):
 
         attn_metadata = fwd_ctx.attn_metadata
-        o = aiter.pa_fwd_asm(
-            q,
-            k_cache,
-            v_cache,
-            attn_metadata.block_tables,
-            attn_metadata.context_lens,
-            attn_metadata.block_tables.stride(0),
+        o = run_pa_fwd_asm(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=attn_metadata.block_tables,
+            context_lens=attn_metadata.context_lens,
+            k_scale=k_scale,
+            v_scale=v_scale,
             max_qlen=attn_metadata.max_seqlen_q,
-            K_QScale=k_scale,
-            V_QScale=v_scale,
-            out_=None,
             qo_indptr=attn_metadata.cu_seqlens_q,
-            high_precision=0,
         )
 
         return o
@@ -656,7 +657,6 @@ class PagedAttentionImpl(nn.Module):
 
     def forward(
         self,
-        layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -668,24 +668,6 @@ class PagedAttentionImpl(nn.Module):
         output: torch.Tensor = None,
         **kwargs,
     ):
-        if is_plugin_mode():
-            # forward impl method are added by the decorator
-            # PagedAttentionImplDecoratorForPluginMode
-            return self.forward_impl_plugin_mode(
-                layer=layer,
-                query=query,
-                key=key,
-                value=value,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
-                position=position,
-                q_scale=q_scale,
-                qkv=qkv,
-            )
-        else:
-            # only for server mode, keep the original method
-            o = self.forward_impl_server_mode(
-                q=query, k=key, v=value, position=position, q_scale=q_scale, qkv=qkv
-            )
-
-            return o
+        return self.forward_impl(
+            q=query, k=key, v=value, position=position, q_scale=q_scale, qkv=qkv
+        )

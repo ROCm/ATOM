@@ -15,11 +15,6 @@ from aiter import (
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
-from atom.plugin.attention import (
-    AiterBackendDecoratorForPluginMode,
-    AiterMLAAttentionMetadataBuilderDecoratorForPluginMode,
-)
-from atom.plugin.prepare import is_plugin_mode
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
@@ -65,11 +60,10 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
-@AiterBackendDecoratorForPluginMode
 class AiterMLABackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
-        return "ROCM_AITER_MLA" if not is_plugin_mode() else "CUSTOM"
+        return "ROCM_AITER_MLA"
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLAMetadataBuilder"]:
@@ -80,9 +74,6 @@ class AiterMLABackend(AttentionBackend):
         return MLAAttention
 
 
-@AiterMLAAttentionMetadataBuilderDecoratorForPluginMode(
-    default_base_class=CommonAttentionBuilder
-)
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def __init__(self, model_runner):
         self.block_size = 1
