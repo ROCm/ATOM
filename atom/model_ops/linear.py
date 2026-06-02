@@ -563,10 +563,8 @@ class LinearBase(nn.Module):
             # Only quantized 2D GEMM weights use aiter's preshuffle layout.
             # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
             # quantized models must keep that tensor unshuffled here.
-            if self.weight.dim() == 2:
+            if self.weight.dim() == 2 and not use_fp4_non_shuffle_triton_gemm():
                 shuffle_weights(self.weight)
-                if not use_fp4_non_shuffle_triton_gemm():
-                    shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
             is_fp4_blockscale = (
@@ -583,8 +581,6 @@ class LinearBase(nn.Module):
             # per_1x128 only needs shuffle when using the preshuffle GEMM path
             if not need_shuffle and self.quant_type == QuantType.per_1x128:
                 need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-            if self.weight.dim() == 2 and is_fp4_blockscale:
-                self._maybe_preserve_unshuffled_mxfp4_attention_proj()
             if need_shuffle:
                 if self.weight.dim() == 2:
                     shuffle_weights(self.weight)
