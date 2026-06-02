@@ -2237,6 +2237,114 @@ jobs:
               label = "vllm bench" if bc == "vLLM bench" else "inferencemax"
               return slug, label
 
+          def is_gptoss_model(model: str) -> bool:
+              return "gpt-oss" in model.lower()
+
+          def point_score(point: dict) -> float | None:
+              value = point.get("total_tput") or point.get("output_tput")
+              try:
+                  return float(value)
+              except (TypeError, ValueError):
+                  return None
+
+          def comparable_point_key(point: dict) -> tuple[str, int, str] | None:
+              image = str(point.get("image") or "").strip()
+              if not image:
+                  return None
+              try:
+                  concurrency = int(point.get("concurrency"))
+              except (TypeError, ValueError):
+                  return None
+              ratio = str(point.get("ratio", ""))
+              return image, concurrency, ratio
+
+          def load_dashboard_run(path: Path) -> dict | None:
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                  return None
+
+          def save_or_delete_dashboard_run(path: Path, run: dict) -> None:
+              if run.get("points"):
+                  path.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+              else:
+                  path.unlink(missing_ok=True)
+
+          def filter_gptoss_points_for_same_docker(
+              *,
+              model: str,
+              isl: int,
+              osl: int,
+              client_label: str,
+              points: list[dict],
+          ) -> list[dict]:
+              if not is_gptoss_model(model):
+                  return points
+
+              existing: dict[tuple[str, int, str], list[tuple[Path, dict, dict, float]]] = defaultdict(list)
+              for path in sorted(llm_booster_data_dir.glob("*.json")):
+                  run = load_dashboard_run(path)
+                  if not run:
+                      continue
+                  if run.get("model") != model or run.get("client_bench") != client_label:
+                      continue
+                  for point in run.get("points", []) or []:
+                      if int(point.get("isl", -1)) != isl or int(point.get("osl", -1)) != osl:
+                          continue
+                      key = comparable_point_key(point)
+                      score = point_score(point)
+                      if key is not None and score is not None:
+                          existing[key].append((path, run, point, score))
+
+              # Existing duplicates can already exist from multiple workflow runs. Keep
+              # the lowest-throughput point so pareto and summary views use the same
+              # conservative gpt-oss value for a Docker image.
+              for key, items in list(existing.items()):
+                  if len(items) <= 1:
+                      continue
+                  worst = min(items, key=lambda item: item[3])
+                  keep_path, keep_run, keep_point, keep_score = worst
+                  for path, run, point, _ in items:
+                      if path == keep_path and point is keep_point:
+                          continue
+                      run["points"] = [p for p in run.get("points", []) if p is not point]
+                      save_or_delete_dashboard_run(path, run)
+                  existing[key] = [(keep_path, keep_run, keep_point, keep_score)]
+
+              selected: dict[tuple[str, int, str], dict] = {}
+              for point in points:
+                  key = comparable_point_key(point)
+                  score = point_score(point)
+                  if key is None or score is None:
+                      selected[id(point)] = point
+                      continue
+                  current = selected.get(key)
+                  current_score = point_score(current) if current else None
+                  if current is None or current_score is None or score < current_score:
+                      selected[key] = point
+
+              selected_keys = set()
+              kept_points = []
+              for point in selected.values():
+                  key = comparable_point_key(point)
+                  score = point_score(point)
+                  if key is None or score is None:
+                      kept_points.append(point)
+                      continue
+                  existing_items = existing.get(key, [])
+                  existing_worst = min((item[3] for item in existing_items), default=None)
+                  if existing_worst is not None and existing_worst <= score:
+                      continue
+                  selected_keys.add(key)
+                  kept_points.append(point)
+
+              for key in selected_keys:
+                  for path, run, point, _ in existing.get(key, []):
+                      run["points"] = [p for p in run.get("points", []) if p is not point]
+                      save_or_delete_dashboard_run(path, run)
+
+              return sorted(kept_points, key=lambda point: (int(point["concurrency"]), str(point.get("ratio", ""))))
+
           grouped = defaultdict(list)
           for path in sorted(root.glob("*.json")):
               if path.name in {"oot_benchmark_summary.json", "regression_report.json"}:
@@ -2336,6 +2444,16 @@ jobs:
                           "hardware": "mi355x",
                       }
                   )
+
+              points = filter_gptoss_points_for_same_docker(
+                  model=model,
+                  isl=isl,
+                  osl=osl,
+                  client_label=client_label,
+                  points=points,
+              )
+              if not points:
+                  continue
 
               run = {
                   "run_id": run_id,
