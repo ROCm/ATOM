@@ -1,64 +1,197 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+from typing import TYPE_CHECKING, Optional
 
-"""
-Plugin mode extensions for PagedAttentionImpl.
-This module provides additional methods for PagedAttentionImpl when running in plugin mode.
-"""
-
-import torch
 import aiter
+import torch
 from aiter import dtypes, fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
-from typing import TYPE_CHECKING, Optional
 from atom.config import get_current_atom_config
-from atom.utils import envs
-from atom.model_ops.base_attention import cp_mha_gather_cache
-
-import logging
-
-logger = logging.getLogger("atom")
+from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.base_attention import (
+    cp_mha_gather_cache,
+    run_pa_decode_gluon,
+    run_pa_fwd_asm,
+)
+from atom.plugin.vllm.attention.backend import AiterMhaBackendForVllm
+from atom.plugin.vllm.attention.layer_common import (
+    _register_vllm_static_forward_context,
+)
+from torch import nn
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 if TYPE_CHECKING:
-    from atom.utils.forward_context import AttentionMetaData
+    from atom.plugin.vllm.attention.metadata import (
+        AiterMhaMetadataForVllm,
+    )
 
-ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
-    envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
-)
-
-_PARTITION_SIZE_ROCM = 256
-_CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _QWEN_GLUON_PA_DECODE_BS = 64
-_NO_PS_FIXED_SPLITS = 64  # covers up to 64 * 256 = 16384 context length
+_NO_PS_FIXED_SPLITS = 64
 
 
-class PagedAttentionImplPluginModeMethods:
-    """
-    Container class for plugin mode methods.
-    This class cannot be instantiated - it only serves as a namespace for methods
-    that will be added to PagedAttentionImpl via decorator.
-    """
+def _init_vllm_mha_layer_state(
+    layer,
+    *,
+    layer_name: str,
+    kv_cache_dtype: str,
+    calculate_kv_scales: bool,
+    quant_config,
+) -> None:
+    from vllm.model_executor.layers.attention.attention import _init_kv_cache_quant
+    from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
-    def __init__(self):
-        raise TypeError(
-            "PagedAttentionImplPluginModeMethods cannot be instantiated. "
-            "It is only used as a method container for the decorator."
+    atom_config = get_current_atom_config()
+    vllm_config = atom_config.plugin_config.vllm_config
+
+    layer.layer_name = layer_name
+    layer.kv_cache_dtype = kv_cache_dtype
+    layer.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+        kv_cache_dtype, vllm_config.model_config
+    )
+    layer.calculate_kv_scales = calculate_kv_scales
+    layer.quant_config = quant_config
+    layer.kv_cache = torch.tensor([])
+
+    _init_kv_cache_quant(layer, quant_config, layer_name)
+
+
+def _set_default_mha_scales(layer) -> None:
+    from vllm.model_executor.layers.attention.attention import set_default_quant_scales
+
+    set_default_quant_scales(layer, register_buffer=False)
+    if hasattr(layer, "_o_scale_float"):
+        layer._o_scale_float = None
+
+
+class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+        alibi_slopes: list[float] = None,
+        kv_cache_dtype="bf16",
+        layer_num=0,
+        use_mla: bool = False,
+        mla_modules: Optional[MLAModules] = None,
+        sinks: Optional[nn.Parameter] = None,
+        per_layer_sliding_window: Optional[int] = None,
+        rotary_emb: Optional[torch.nn.Module] = None,
+        prefix: Optional[str] = None,
+        q_norm: Optional[torch.nn.Module] = None,
+        k_norm: Optional[torch.nn.Module] = None,
+        **kwargs,
+    ):
+        from vllm.v1.attention.backend import AttentionType
+
+        atom_config = get_current_atom_config()
+        cache_config = atom_config.plugin_config.vllm_cache_config
+        quant_config = atom_config.plugin_config.vllm_quant_config
+
+        layer_name = prefix if prefix is not None else f"MHA_{layer_num}"
+        cache_dtype = (
+            cache_config.cache_dtype if cache_config is not None else kv_cache_dtype
+        )
+        calculate_kv_scales = (
+            cache_config.calculate_kv_scales if cache_config is not None else False
         )
 
-    # this method will just be called by vLLM and there is no logic in this method
-    # as ATOM handles the process after loading weights for all ops by itself
-    def process_weights_after_loading(self, act_dtype: torch.dtype = torch.bfloat16):
-        pass
+        self.head_size_v = head_dim
+        self.attn_type = AttentionType.DECODER
+        self.attn_backend = AiterMhaBackendForVllm
+        self.has_sink = sinks is not None
+        self.dtype = torch.get_default_dtype()
 
-    def rope_cache_plugin_mode(
+        nn.Module.__init__(self)
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.head_size = head_dim
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads
+        self.alibi_slopes = alibi_slopes
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.max_model_len = 0
+        self.k_scale = self.v_scale = None
+        self.device = "cuda:" + str(torch.cuda.current_device())
+        self.layer_num = layer_num
+        self.kv_scale_float = (
+            torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
+            if cache_dtype == "fp8"
+            else 1.0
+        )
+        self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self.per_token_quant = True
+        self.sinks = sinks
+        self.sliding_window = (
+            per_layer_sliding_window if per_layer_sliding_window is not None else -1
+        )
+        self.rotary_emb = rotary_emb
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        self.use_flash_layout = False
+        self.supports_quant_query_input = False
+
+        _init_vllm_mha_layer_state(
+            self,
+            layer_name=layer_name,
+            kv_cache_dtype=cache_dtype,
+            calculate_kv_scales=calculate_kv_scales,
+            quant_config=quant_config,
+        )
+
+        _register_vllm_static_forward_context(self)
+
+    @property
+    def impl(self):
+        return self
+
+    def get_attn_backend(self):
+        return self.attn_backend
+
+    def process_weights_after_loading(
+        self, act_dtype: torch.dtype = torch.bfloat16
+    ) -> None:
+        _set_default_mha_scales(self)
+
+    def calc_kv_scales(self, query, key, value):
+        self._q_scale.copy_(torch.abs(query).max() / self.q_range)
+        self._k_scale.copy_(torch.abs(key).max() / self.k_range)
+        self._v_scale.copy_(torch.abs(value).max() / self.v_range)
+        self._q_scale_float = self._q_scale.item()
+        self._k_scale_float = self._k_scale.item()
+        self._v_scale_float = self._v_scale.item()
+        self.calculate_kv_scales = False
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor = None,
+        q_scale: Optional[torch.Tensor] = None,
+        qkv: torch.Tensor = None,
+        **kwargs,
+    ):
+        if self.calculate_kv_scales and key is not None and value is not None:
+            self.calc_kv_scales(query, key, value)
+        return torch.ops.aiter.atom_vllm_mha_attention(
+            query,
+            key,
+            value,
+            self.layer_name,
+            positions,
+            q_scale,
+            qkv,
+        )
+
+    def rope_cache(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         qkv: torch.Tensor,
         position: torch.Tensor,
-        attention_metadata: "AttentionMetaData",
+        attention_metadata: "AiterMhaMetadataForVllm",
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         k_scale: torch.Tensor,
@@ -227,7 +360,7 @@ class PagedAttentionImplPluginModeMethods:
 
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
-    def paged_attention_triton_plugin_mode(
+    def paged_attention_triton(
         self,
         q: torch.Tensor,
         k_cache: torch.Tensor,
@@ -236,7 +369,7 @@ class PagedAttentionImplPluginModeMethods:
         v_scale: torch.Tensor,
         num_decodes: int,
         out: torch.Tensor,
-        attn_metadata: "AttentionMetaData",
+        attn_metadata: "AiterMhaMetadataForVllm",
         ps: bool = True,
     ):
         # q.shape[0] == num_decodes * max_query_len for MTP (one row per decode
@@ -247,19 +380,16 @@ class PagedAttentionImplPluginModeMethods:
         # the max_qlen multiplier — mirroring server-mode `paged_attention_triton`.
         _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-        decode_metadata = attn_metadata.plugin_metadata.decode_metadata
+        decode_metadata = attn_metadata.decode_metadata
         max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
         assert num_q_heads_total % num_kv_heads == 0
 
-        seq_lens = attn_metadata.plugin_metadata.seq_lens[:num_decodes]
-        block_tables = attn_metadata.plugin_metadata.block_table[:num_decodes]
+        seq_lens = attn_metadata.seq_lens[:num_decodes]
+        block_tables = attn_metadata.block_table[:num_decodes]
 
         query_group_size = max_qlen * (num_q_heads_total // num_kv_heads)
         context_partition_size = 256
 
-        # use_ps = self.adopt_persistent_kernel(
-        #     head_size, num_kv_heads, num_q_heads_total
-        # )
         use_ps = True
         if use_ps:
             max_context_partition_num = get_recommended_splits(
@@ -300,21 +430,21 @@ class PagedAttentionImplPluginModeMethods:
         # Internally it derives batch_size = q.shape[0] // query_length and reshapes
         # to [batch, query_length, num_kv_heads, group, head_size]. See
         # aiter/aiter/ops/triton/gluon/pa_decode_gluon.py:5371-5377 and 5542-5544.
-        torch.ops.aiter.pa_decode_gluon(
-            out,
-            q,
-            k_cache,
-            v_cache,
-            seq_lens,
-            block_tables,
-            self.scale,
-            max_qlen,  # query_length — handles multi-token causal mask internally
-            max_context_partition_num,
-            context_partition_size,
-            compute_type,
-            None,
-            None if self.kv_cache_dtype == "bf16" else k_scale,
-            None if self.kv_cache_dtype == "bf16" else v_scale,
+        run_pa_decode_gluon(
+            output=out,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            context_lens=seq_lens,
+            block_tables=block_tables,
+            softmax_scale=self.scale,
+            max_seqlen_q=max_qlen,  # query_length handles multi-token causal mask.
+            max_context_partition_num=max_context_partition_num,
+            context_partition_size=context_partition_size,
+            compute_type=compute_type,
+            q_scale=None,
+            k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
+            v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
@@ -325,7 +455,7 @@ class PagedAttentionImplPluginModeMethods:
         )
         return out
 
-    def paged_attention_asm_plugin_mode(
+    def paged_attention_asm(
         self,
         q: torch.Tensor,
         k_cache: torch.Tensor,
@@ -334,28 +464,25 @@ class PagedAttentionImplPluginModeMethods:
         v_scale: torch.Tensor,
         num_decodes: int,
         num_decode_tokens: int,
-        attn_metadata: "AttentionMetaData",
+        attn_metadata: "AiterMhaMetadataForVllm",
         out: torch.Tensor,
     ):
-        decode_metadata = attn_metadata.plugin_metadata.decode_metadata
+        decode_metadata = attn_metadata.decode_metadata
         max_qlen = decode_metadata.max_query_len if decode_metadata is not None else 1
         qo_indptr = (
             decode_metadata.query_start_loc if decode_metadata is not None else None
         )
-        aiter.pa_fwd_asm(
-            Q=q,
-            K=k_cache,
-            V=v_cache,
-            block_tables=attn_metadata.plugin_metadata.block_table[:num_decodes],
-            context_lens=attn_metadata.plugin_metadata.seq_lens[:num_decodes],
-            block_tables_stride0=attn_metadata.plugin_metadata.block_table[
-                :num_decodes
-            ].stride(0),
-            max_qlen=max_qlen,
-            K_QScale=k_scale,
-            V_QScale=v_scale,
-            out_=out[:num_decode_tokens],
+        run_pa_fwd_asm(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=attn_metadata.block_table[:num_decodes],
+            context_lens=attn_metadata.seq_lens[:num_decodes],
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out=out[:num_decode_tokens],
             qo_indptr=qo_indptr,
+            max_qlen=max_qlen,
             high_precision=0,
         )
 
@@ -363,7 +490,7 @@ class PagedAttentionImplPluginModeMethods:
 
     def extend_for_sliding_window(
         self,
-        attn_metadata: "AttentionMetaData",
+        attn_metadata: "AiterMhaMetadataForVllm",
         query: torch.Tensor,
         key_cache,
         value_cache,
@@ -374,14 +501,9 @@ class PagedAttentionImplPluginModeMethods:
         k_scale: Optional[torch.Tensor],
         v_scale: Optional[torch.Tensor],
     ):
-        assert attn_metadata.plugin_metadata.extend_metadata is not None
-        assert (
-            attn_metadata.plugin_metadata.extend_metadata.chunk_context_metadata
-            is not None
-        )
-        chunked_metadata = (
-            attn_metadata.plugin_metadata.extend_metadata.chunk_context_metadata
-        )
+        assert attn_metadata.extend_metadata is not None
+        assert attn_metadata.extend_metadata.chunk_context_metadata is not None
+        chunked_metadata = attn_metadata.extend_metadata.chunk_context_metadata
         swa_metadata = chunked_metadata.swa_metadata
         assert swa_metadata is not None
         swa_cu_seqlens = swa_metadata.swa_cu_seqlens
@@ -423,7 +545,7 @@ class PagedAttentionImplPluginModeMethods:
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=swa_cu_seqlens,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=swa_max_seqlens,  # need to confirm
+            max_seqlen_k=swa_max_seqlens,
             min_seqlen_q=1,
             dropout_p=0.0,
             softmax_scale=self.scale,
@@ -437,7 +559,7 @@ class PagedAttentionImplPluginModeMethods:
 
     def extend_forward(
         self,
-        attn_metadata: "AttentionMetaData",
+        attn_metadata: "AiterMhaMetadataForVllm",
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -476,7 +598,7 @@ class PagedAttentionImplPluginModeMethods:
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_q,  # need to confirm
+            max_seqlen_k=max_seqlen_q,
             min_seqlen_q=min_seqlen_q,
             dropout_p=0.0,
             softmax_scale=self.scale,
@@ -485,10 +607,8 @@ class PagedAttentionImplPluginModeMethods:
             alibi_slopes=self.alibi_slopes,
             return_lse=True,
         )
-        assert attn_metadata.plugin_metadata.extend_metadata is not None
-        chunk_context_metadata = (
-            attn_metadata.plugin_metadata.extend_metadata.chunk_context_metadata
-        )
+        assert attn_metadata.extend_metadata is not None
+        chunk_context_metadata = attn_metadata.extend_metadata.chunk_context_metadata
         num_chunks = chunk_context_metadata.num_chunks
         workspace = chunk_context_metadata.workspace
         cu_seqlens_kv = chunk_context_metadata.cu_seq_lens_chunk
@@ -560,20 +680,13 @@ class PagedAttentionImplPluginModeMethods:
             suffix_lse=lse,
         )
 
-    def adopt_persistent_kernel(self, head_size, num_kv_heads, num_q_heads):
-        non_ps_database = {(256, 4, 1)}
-        if (head_size, num_q_heads, num_kv_heads) in non_ps_database:
-            return False
-        return True
-
-    def forward_impl_plugin_mode(
+    def forward_impl(
         self,
-        layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: "AttentionMetaData" = None,
+        attn_metadata: "AiterMhaMetadataForVllm" = None,
         position: torch.Tensor = None,
         q_scale: torch.Tensor = None,
         qkv: torch.Tensor = None,
@@ -610,7 +723,7 @@ class PagedAttentionImplPluginModeMethods:
         value = value.view(-1, self.num_kv_heads, self.head_dim)
         output = output.view(-1, self.num_heads, self.head_dim)
 
-        num_actual_tokens = attn_metadata.plugin_metadata.num_actual_tokens
+        num_actual_tokens = attn_metadata.num_actual_tokens
         k_cache, v_cache = kv_cache.unbind(0)
         num_blocks, block_size, num_kv_heads, _ = k_cache.shape
 
@@ -633,11 +746,8 @@ class PagedAttentionImplPluginModeMethods:
                     dtype=dtypes.fp32,
                     device=self.device,
                 )
-                # update the layer kv scale tensor
                 self.k_scale = self.kv_scale[0]
                 self.v_scale = self.kv_scale[1]
-                layer.k_scale = self.k_scale
-                layer.v_scale = self.v_scale
 
         # as vLLM cuda graph capture padding mechanism, here split the qkvo with
         # the actual tokens
@@ -654,7 +764,7 @@ class PagedAttentionImplPluginModeMethods:
             value = value[:num_actual_tokens]
         output_actual_tokens = output[:num_actual_tokens]
         # rope and cache flush fusion. ATOM always use shuffle layout for kv cache
-        result = self.rope_cache_plugin_mode(
+        result = self.rope_cache(
             q=query,
             k=key,
             v=value,
@@ -669,12 +779,12 @@ class PagedAttentionImplPluginModeMethods:
         )
         query, key, value, k_cache, v_cache, k_scale, v_scale = result
 
-        num_decodes = attn_metadata.plugin_metadata.num_decodes
-        num_prefills = attn_metadata.plugin_metadata.num_prefills
-        num_extends = attn_metadata.plugin_metadata.num_extends
+        num_decodes = attn_metadata.num_decodes
+        num_prefills = attn_metadata.num_prefills
+        num_extends = attn_metadata.num_extends
 
-        num_decode_tokens = attn_metadata.plugin_metadata.num_decode_tokens
-        num_extend_tokens = attn_metadata.plugin_metadata.num_extend_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_extend_tokens = attn_metadata.num_extend_tokens
 
         num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
         x = 16 // k_cache.element_size()
@@ -686,7 +796,7 @@ class PagedAttentionImplPluginModeMethods:
         )
         # calculate for prefills
         if num_prefills > 0:
-            assert attn_metadata.plugin_metadata.prefill_metadata is not None
+            assert attn_metadata.prefill_metadata is not None
 
             # prefill part is after decode and extend
             prefill_query = query[num_decode_tokens + num_extend_tokens :]
@@ -703,10 +813,10 @@ class PagedAttentionImplPluginModeMethods:
                 q=prefill_query,
                 k=prefill_key,
                 v=prefill_value,
-                cu_seqlens_q=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.plugin_metadata.prefill_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.plugin_metadata.prefill_metadata.max_seq_len,
+                cu_seqlens_q=attn_metadata.prefill_metadata.query_start_loc,
+                cu_seqlens_k=attn_metadata.prefill_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.prefill_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.prefill_metadata.max_seq_len,
                 min_seqlen_q=1,
                 dropout_p=attn_metadata.dropout_p,
                 softmax_scale=self.scale,
@@ -719,7 +829,7 @@ class PagedAttentionImplPluginModeMethods:
 
         # calculate for extends
         if num_extends > 0:
-            assert attn_metadata.plugin_metadata.extend_metadata is not None
+            assert attn_metadata.extend_metadata is not None
             extend_tokens_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_extend_tokens
             )
@@ -728,12 +838,8 @@ class PagedAttentionImplPluginModeMethods:
             extend_keys = key[extend_tokens_slice]
             extend_values = value[extend_tokens_slice]
             extend_outputs = output[extend_tokens_slice]
-            extend_block_table = attn_metadata.plugin_metadata.block_table[
-                extend_reqs_slice
-            ]
-            extend_slot_mapping = attn_metadata.plugin_metadata.slot_mapping[
-                extend_tokens_slice
-            ]
+            extend_block_table = attn_metadata.block_table[extend_reqs_slice]
+            extend_slot_mapping = attn_metadata.slot_mapping[extend_tokens_slice]
             self.extend_forward(
                 attn_metadata=attn_metadata,
                 query=extend_querys,
@@ -742,9 +848,9 @@ class PagedAttentionImplPluginModeMethods:
                 key_cache=new_key_cache,
                 value_cache=new_value_cache,
                 output=extend_outputs,
-                cu_seqlens_q=attn_metadata.plugin_metadata.extend_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.plugin_metadata.extend_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.plugin_metadata.extend_metadata.max_seq_len,
+                cu_seqlens_q=attn_metadata.extend_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.extend_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.extend_metadata.max_seq_len,
                 min_seqlen_q=1,
                 block_table=extend_block_table,
                 slot_mapping=extend_slot_mapping,
@@ -754,10 +860,10 @@ class PagedAttentionImplPluginModeMethods:
 
         # calculate for decodes
         if num_decodes > 0:
-            assert attn_metadata.plugin_metadata.decode_metadata is not None
+            assert attn_metadata.decode_metadata is not None
 
             if self.use_triton_attn:
-                self.paged_attention_triton_plugin_mode(
+                self.paged_attention_triton(
                     q=query[:num_decode_tokens],
                     k_cache=new_key_cache,
                     v_cache=new_value_cache,
@@ -770,7 +876,7 @@ class PagedAttentionImplPluginModeMethods:
             else:
                 # Qwen only uses gluon pa decode when bs=64
                 if num_decodes == _QWEN_GLUON_PA_DECODE_BS:
-                    self.paged_attention_triton_plugin_mode(
+                    self.paged_attention_triton(
                         q=query[:num_decode_tokens],
                         k_cache=new_key_cache,
                         v_cache=new_value_cache,
@@ -781,7 +887,7 @@ class PagedAttentionImplPluginModeMethods:
                         attn_metadata=attn_metadata,
                     )
                 else:
-                    self.paged_attention_asm_plugin_mode(
+                    self.paged_attention_asm(
                         q=query[:num_decode_tokens],
                         k_cache=new_key_cache,
                         v_cache=new_value_cache,
@@ -797,26 +903,24 @@ class PagedAttentionImplPluginModeMethods:
 
         return output
 
+    def get_kv_cache_spec(self, vllm_config):
+        from vllm.v1.attention.backend import AttentionType
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
-def PagedAttentionImplDecoratorForPluginMode(cls):
-    method_names = [
-        "process_weights_after_loading",
-        "rope_cache_plugin_mode",
-        "paged_attention_triton_plugin_mode",
-        "paged_attention_asm_plugin_mode",
-        "extend_for_sliding_window",
-        "extend_forward",
-        "forward_impl_plugin_mode",
-        "adopt_persistent_kernel",
-    ]
-
-    logger.info(
-        "Use PagedAttentionImplDecoratorForPluginMode to decorate PagedAttentionImpl"
-    )
-
-    # Add all methods to the target class
-    for method_name in method_names:
-        method = getattr(PagedAttentionImplPluginModeMethods, method_name)
-        setattr(cls, method_name, method)
-
-    return cls
+        assert self.attn_type == AttentionType.DECODER
+        block_size = vllm_config.cache_config.block_size
+        if self.sliding_window is not None:
+            return SlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                sliding_window=self.sliding_window,
+            )
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            head_size_v=self.head_size_v,
+            dtype=self.kv_cache_torch_dtype,
+        )

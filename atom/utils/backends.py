@@ -290,13 +290,6 @@ def _split_judge_func(node: fx.Node) -> bool:
     ):
         return True
 
-    # When plugin mode(vLLM), the attention impl op is registered
-    # as unified_attention
-    from atom.plugin import is_vllm
-
-    if is_vllm() and "unified_attention" in node.name:
-        return True
-
     return False
 
 

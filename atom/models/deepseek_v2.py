@@ -89,7 +89,7 @@ from atom.utils.custom_register import direct_register_custom_op
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.plugin.attention_mla_sparse import (
+from atom.plugin.vllm.attention.layer_sparse_mla import (
     IndexerDecoratorForPluginMode,
     DeepseekV32IndexerCacheDecoratorForPluginMode,
 )

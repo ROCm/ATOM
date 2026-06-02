@@ -33,7 +33,6 @@ def _patch_atom_config_module(monkeypatch):
 
 def test_generate_from_vllm_translates_core_fields(monkeypatch):
     _patch_atom_config_module(monkeypatch)
-    monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0")
 
     vllm_cfg = _Obj(
         model_config=_Obj(model="m1", max_model_len=4096),
@@ -64,7 +63,6 @@ def test_generate_from_vllm_translates_core_fields(monkeypatch):
     assert cfg.plugin_config.is_plugin_mode is True
     assert cfg.plugin_config.is_vllm is True
     assert cfg.plugin_config.is_sglang is False
-    assert cfg.plugin_config.vllm_use_atom_attention is True
 
 
 def test_generate_atom_config_requires_plugin_mode(monkeypatch):

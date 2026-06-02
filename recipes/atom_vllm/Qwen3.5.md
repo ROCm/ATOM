@@ -72,7 +72,9 @@ vllm serve amd/Qwen3.5-397B-A17B-MXFP4 \
     --no-enable-prefix-caching
 ```
 
-**Important**: The following environment variables are required for Qwen3.5:
+**Important**: ATOM-vLLM no longer supports disabling only ATOM attention while keeping ATOM models active. Use `ATOM_DISABLE_VLLM_PLUGIN=1` for a pure vLLM run.
+
+The following environment variables are relevant for Qwen3.5:
 
 - `ATOM_USE_CUSTOM_ALL_GATHER=0`: Disables custom all-gather for compatibility with Qwen3.5 model architecture
 - `ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0`: Disables FP8 blockscale weight preshuffle

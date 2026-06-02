@@ -55,7 +55,7 @@ from atom.utils.forward_context import get_forward_context
 from atom.utils.decorators import mark_trace
 from torch import nn
 from transformers import PretrainedConfig
-from atom.plugin.moe import FusedMoEDecoratorForPluginMode
+from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quantization.quark.utils import weight_dequant_fp8
 
 
