@@ -898,8 +898,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
 
         if self.use_triton:
-            import dataclasses
-
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
             from atom.config import get_current_atom_config
 
@@ -2169,7 +2167,7 @@ class FusedMoE(torch.nn.Module):
 
         try:
             a_quant_dtype = config.quantization_config.get("global_quant_config", "").get("input_tensors", "").get("dtype", "")
-        except:
+        except AttributeError:
             # global quant config does not exist, no activation loaded
             a_quant_dtype = None
 

@@ -19,10 +19,8 @@
 # limitations under the License.
 
 import torch
-import logging
 from math import prod
 from aiter import ActivationType
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from atom.model_ops.moe_utils import (
     check_and_swizzle_scales,
@@ -37,33 +35,7 @@ if envs.ATOM_USE_TRITON_GEMM:
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
-        get_kernel_config,
     )
-    
-    
-    from aiter.ops.triton.moe import moe_op_gemm_a16w4 as _aiter_a16w4
-    import logging
-    logging.getLogger("atom").warning(get_gfx())
-    if get_gfx() == "gfx950":
-        _orig_get_kernel_config = _aiter_a16w4.get_kernel_config
-        _MAX_BLOCK_N = envs.ATOM_TRITON_MOE_MAX_BLOCK_N
-        def _amd_smem_safe_tile(m, n, k, routing_data):
-            cfg = _orig_get_kernel_config(m, n, k, routing_data)
-            # Cap block_n on CDNA4: BLOCK_M=128 * BLOCK_N=512 * 4B FP32 acc = 256 KiB,
-            # which exceeds MI355X's 160 KiB LDS when triton spills the accumulator.
-            # Pinning block_n <= 256 keeps acc <= 128 KiB.
-            # previous safe_mem function to prevent LDS overflow
-            if cfg["block_m"] >= 64 and cfg["block_n"] > _MAX_BLOCK_N:
-                cfg["block_n"] = _MAX_BLOCK_N
-            return cfg
-        _aiter_a16w4.get_kernel_config = _amd_smem_safe_tile
-
-
-        logging.getLogger("atom").warning(
-            "[atom] aiter moe_op_gemm_a16w4.get_kernel_config patched -> %s (max_block_n=%d)",
-            _aiter_a16w4.get_kernel_config.__name__, _MAX_BLOCK_N,
-        )
-    
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 
 
@@ -220,7 +192,6 @@ def triton_kernel_fused_experts(
         # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
         x_q_dtype_base = x_q_dtype.split("_")[0] if x_q_dtype else None
         if (x_q_dtype_base == "fp8"):
-            from aiter.ops.triton.utils._triton.arch_info import get_arch
             # If input type is fp8, input scales must be available
             assert a13_scale is not None
             assert a2_scale is not None
@@ -228,8 +199,6 @@ def triton_kernel_fused_experts(
             # vllm-like processing
             a13_scale = a13_scale.max().to(torch.float32)
             a2_scale = a2_scale.max().to(torch.float32)
-
-            x_dtype = torch.float8_e4m3fn # model is fp8_e4m3 type
 
             hidden_states = downcast_to_static_fp8(hidden_states, a13_scale)
             interm_cache = moe_gemm_a8w4(
