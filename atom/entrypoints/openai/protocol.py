@@ -75,6 +75,7 @@ class ChatCompletionRequest(BaseModel):
     top_k: Optional[int] = DEFAULT_TOP_K
     top_p: Optional[float] = DEFAULT_TOP_P
     max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
+    max_completion_tokens: Optional[int] = None
     stop: Optional[List[str]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
@@ -89,6 +90,14 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
     n: Optional[int] = 1
+
+    def get_max_tokens(self) -> int:
+        """Return the effective generation cap for OpenAI chat requests."""
+        if self.max_completion_tokens is not None:
+            return self.max_completion_tokens
+        if self.max_tokens is not None:
+            return self.max_tokens
+        return DEFAULT_MAX_TOKENS
 
     def get_messages(self) -> List[ChatMessage]:
         """Get messages from either 'messages' or 'prompt' field."""
@@ -111,12 +120,21 @@ class CompletionRequest(BaseModel):
     top_k: Optional[int] = DEFAULT_TOP_K
     top_p: Optional[float] = DEFAULT_TOP_P
     max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
+    max_completion_tokens: Optional[int] = None
     stop: Optional[List[str]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: Optional[Dict[str, Any]] = None
     n: Optional[int] = 1
+
+    def get_max_tokens(self) -> int:
+        """Return the effective generation cap for completion requests."""
+        if self.max_completion_tokens is not None:
+            return self.max_completion_tokens
+        if self.max_tokens is not None:
+            return self.max_tokens
+        return DEFAULT_MAX_TOKENS
 
 
 # ============================================================================
