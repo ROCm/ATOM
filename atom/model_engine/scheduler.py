@@ -733,8 +733,8 @@ class Scheduler:
                     seq.offload_loaded_tokens = seq.num_cached_tokens
                     seq.offload_load_failed = True
                 else:
-                    waiting_remote_to_waiting_ready = self._update_waiting_for_remote_kv(
-                        seq
+                    waiting_remote_to_waiting_ready = (
+                        self._update_waiting_for_remote_kv(seq)
                     )
                     if waiting_remote_to_waiting_ready:
                         seq.status = SequenceStatus.WAITING
@@ -758,7 +758,10 @@ class Scheduler:
                 loaded = getattr(seq, "offload_loaded_tokens", None)
                 logger.debug(
                     "[OFFLOAD-WAKE] seq %s: loaded=%s prev_cached=%d num_tokens=%d",
-                    seq.id, loaded, seq.num_cached_tokens, seq.num_tokens,
+                    seq.id,
+                    loaded,
+                    seq.num_cached_tokens,
+                    seq.num_tokens,
                 )
                 offload_trace(
                     "scheduler_offload_wake",
@@ -903,9 +906,7 @@ class Scheduler:
             if self.kv_connector is not None and hasattr(
                 self.kv_connector, "adjust_prefill_chunk_after_alloc"
             ):
-                chunk = self.kv_connector.adjust_prefill_chunk_after_alloc(
-                    seq, chunk
-                )
+                chunk = self.kv_connector.adjust_prefill_chunk_after_alloc(seq, chunk)
 
             assert chunk > 0, (
                 f"chunk must be positive: {chunk=}, "
@@ -1466,8 +1467,10 @@ class Scheduler:
             self.waiting.extend(blocked)
 
     def _park_ready_offload_partial_prefills(self) -> None:
-        if not self.running or self.kv_connector is None or not hasattr(
-            self.kv_connector, "should_park_partial_prefill_for_load"
+        if (
+            not self.running
+            or self.kv_connector is None
+            or not hasattr(self.kv_connector, "should_park_partial_prefill_for_load")
         ):
             return
 
@@ -1525,7 +1528,9 @@ class Scheduler:
             assert (
                 not self.kv_connector.is_producer
             ), "Only consumer should update failed KV recv status"
-            logger.warning("KV receive failed for request %s; falling back to prefill.", req_id)
+            logger.warning(
+                "KV receive failed for request %s; falling back to prefill.", req_id
+            )
             offload_trace("scheduler_failed_recving", req=req_id)
             self.failed_recving_kv_req_ids.append(req_id)
 
