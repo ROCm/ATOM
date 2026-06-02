@@ -326,7 +326,7 @@
       ]
     },
     {
-      "choice_label": "DeepSeek-V3.2 FP8 MTP PTPC",
+      "choice_label": "DeepSeek-V3.2 FP8 PTPC",
       "source_path": "amd/DeepSeek-V3.2-mtp-ptpc",
       "path": "amd/DeepSeek-V3.2-mtp-ptpc",
       "runner": "atom-mi355-8gpu-oot-benchmark",
