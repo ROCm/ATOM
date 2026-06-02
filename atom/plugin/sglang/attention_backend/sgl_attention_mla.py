@@ -1330,39 +1330,46 @@ def process_mla_kv_b_proj_after_loading(attn: DeepseekV2MLAAttention) -> None:
     _split_and_assign_kc_vc(attn, w, use_deep_gemm_bmm, block_scale, weight_block_size)
 
 
-def _patch_kv_b_proj_for_sglang_mxfp4(attn: DeepseekV2MLAAttention) -> None:
-    """Preserve DeepSeek MLA kv_b_proj's original MXFP4 layout for kc/vc split."""
-    kv_b_proj = attn.kv_b_proj
-    if getattr(kv_b_proj, "_sgl_mxfp4_preserve_patched", False):
+def _is_static_quark_mxfp4_linear(linear: Any) -> bool:
+    layer_quant_config = getattr(linear, "layer_quant_config", None)
+    return (
+        linear.weight.dim() == 2
+        and layer_quant_config is not None
+        and layer_quant_config.quant_method == "quark"
+        and layer_quant_config.quant_dtype == dtypes.fp4x2
+        and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
+        and getattr(linear, "source_quant_dtype", None) is None
+    )
+
+
+def _patch_linear_for_sglang_mxfp4_preserve(linear: Any) -> None:
+    """Preserve a DeepSeek MLA projection's original MXFP4 layout before shuffle."""
+    if getattr(linear, "_sgl_mxfp4_preserve_patched", False):
         return
 
-    orig_process_weights_after_loading = kv_b_proj.process_weights_after_loading
+    orig_process_weights_after_loading = linear.process_weights_after_loading
 
     def process_weights_after_loading_with_mxfp4_preserve():
-        if getattr(kv_b_proj, "_sgl_mxfp4_process_done", False):
+        if getattr(linear, "_sgl_mxfp4_process_done", False):
             return
 
-        layer_quant_config = getattr(kv_b_proj, "layer_quant_config", None)
-        is_quark_static_mxfp4 = (
-            kv_b_proj.weight.dim() == 2
-            and layer_quant_config is not None
-            and layer_quant_config.quant_method == "quark"
-            and layer_quant_config.quant_dtype == dtypes.fp4x2
-            and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
-            and getattr(kv_b_proj, "source_quant_dtype", None) is None
-        )
-        if is_quark_static_mxfp4:
-            kv_b_proj._mxfp4_unshuffled_weight = kv_b_proj.weight.detach().clone()
-            kv_b_proj._mxfp4_unshuffled_weight_scale = (
-                kv_b_proj.weight_scale.detach().clone()
-            )
+        if _is_static_quark_mxfp4_linear(linear):
+            linear._mxfp4_unshuffled_weight = linear.weight.detach().clone()
+            linear._mxfp4_unshuffled_weight_scale = linear.weight_scale.detach().clone()
         orig_process_weights_after_loading()
-        kv_b_proj._sgl_mxfp4_process_done = True
+        linear._sgl_mxfp4_process_done = True
 
-    kv_b_proj.process_weights_after_loading = (
+    linear.process_weights_after_loading = (
         process_weights_after_loading_with_mxfp4_preserve
     )
-    kv_b_proj._sgl_mxfp4_preserve_patched = True
+    linear._sgl_mxfp4_preserve_patched = True
+
+
+def _patch_attention_projs_for_sglang_mxfp4(attn: DeepseekV2MLAAttention) -> None:
+    """Preserve DeepSeek MLA q/kv projections' original MXFP4 layouts."""
+    if hasattr(attn, "q_b_proj"):
+        _patch_linear_for_sglang_mxfp4_preserve(attn.q_b_proj)
+    _patch_linear_for_sglang_mxfp4_preserve(attn.kv_b_proj)
 
 
 # One-time model setup (called from base_model_wrapper.py)
@@ -1409,7 +1416,7 @@ def _patch_mla_attention_for_sglang(attn, config, kv_cache_dtype: str = "bf16") 
     already set via set_attn_cls(); this patch sits above that layer.
     """
     init_sgl_attrs(attn, config, kv_cache_dtype)
-    _patch_kv_b_proj_for_sglang_mxfp4(attn)
+    _patch_attention_projs_for_sglang_mxfp4(attn)
 
     def patched_forward(
         positions: torch.Tensor,
