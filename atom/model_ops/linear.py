@@ -42,11 +42,11 @@ def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
 
-def use_fp4_triton_gemm() -> bool:
-    return envs.ATOM_USE_FP4_TRITON_GEMM
+def use_fp4_non_shuffle_triton_gemm() -> bool:
+    return envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM
 
 
-if use_fp4_triton_gemm():
+if use_fp4_non_shuffle_triton_gemm():
     try:
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4  # noqa: E402
     except ImportError as e:
@@ -112,10 +112,12 @@ def gemm_a4w4_quant(
     input_scale: torch.Tensor,
     output_size: int,
 ) -> torch.Tensor:
-    if params_dtype == dtypes.fp4x2 and use_fp4_triton_gemm():
+    # Non-shuffle FP4 Triton path: keep x/weight/scale in the original MXFP4
+    # layout and call the non-preshuffled gemm_afp4wfp4 kernel.
+    if params_dtype == dtypes.fp4x2 and use_fp4_non_shuffle_triton_gemm():
         if gemm_afp4wfp4 is None:
             raise RuntimeError(
-                "ATOM_USE_FP4_TRITON_GEMM=1 requires aiter.ops.triton.gemm_afp4wfp4"
+                "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1 requires aiter.ops.triton.gemm_afp4wfp4"
             )
         if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
@@ -148,7 +150,14 @@ def gemm_a4w4_quant(
             otype,
             y,
         )
-    elif params_dtype == dtypes.fp4x2 and gemm_afp4wfp4_preshuffle is not None:
+    # Preshuffle FP4 Triton path: used when ATOM_USE_TRITON_GEMM is enabled
+    # and the non-shuffle path is disabled. This expects preshuffled weights.
+    elif (
+        params_dtype == dtypes.fp4x2
+        and use_triton_gemm()
+        and not use_fp4_non_shuffle_triton_gemm()
+        and gemm_afp4wfp4_preshuffle is not None
+    ):
         m, k = x.view(-1, x.size(-1)).shape
 
         y = torch.empty(
@@ -188,6 +197,8 @@ def gemm_a4w4_quant(
             ),
             y=y,
         )
+    # Default AITER path: quantize/shuffle into the layout expected by gemm_a4w4
+    # and use the backend ASM implementation.
     else:
         if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
@@ -554,7 +565,7 @@ class LinearBase(nn.Module):
             # quantized models must keep that tensor unshuffled here.
             if self.weight.dim() == 2:
                 shuffle_weights(self.weight)
-                if not use_fp4_triton_gemm():
+                if not use_fp4_non_shuffle_triton_gemm():
                     shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
@@ -567,7 +578,7 @@ class LinearBase(nn.Module):
                 and self.params_dtype == dtypes.fp8
             ) or (
                 self.quant_type == QuantType.per_1x32
-                and (not is_fp4_blockscale or not use_fp4_triton_gemm())
+                and (not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm())
             )
             # per_1x128 only needs shuffle when using the preshuffle GEMM path
             if not need_shuffle and self.quant_type == QuantType.per_1x128:
@@ -580,7 +591,7 @@ class LinearBase(nn.Module):
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32 and (
-            self.params_dtype != dtypes.fp4x2 or not use_fp4_triton_gemm()
+            self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
