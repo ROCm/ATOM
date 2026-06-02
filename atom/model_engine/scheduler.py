@@ -1474,7 +1474,7 @@ class Scheduler:
         ):
             return
 
-        ready: deque[Sequence] = deque()
+        parked: deque[Sequence] = deque()
         keep_running: deque[Sequence] = deque()
         while self.running:
             seq = self.running.popleft()
@@ -1485,17 +1485,17 @@ class Scheduler:
                     seq.is_partial_prefill = False
                     self._partial_prefill_count -= 1
                 seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-                ready.append(seq)
+                parked.append(seq)
             else:
                 keep_running.append(seq)
 
         self.running = keep_running
-        if ready:
+        if parked:
             offload_trace(
                 "scheduler_park_partial_prefill_for_load",
-                reqs=[seq.id for seq in ready],
+                reqs=[seq.id for seq in parked],
             )
-            self.waiting.extendleft(reversed(ready))
+            self.waiting.extendleft(reversed(parked))
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """Reconcile scheduler state with completed KV transfers.
