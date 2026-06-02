@@ -892,8 +892,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_triton:
+            import dataclasses
+
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
-            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+
+            try:
+                from triton_kernels.matmul import FlexCtx, PrecisionConfig
+            except ImportError:
+                from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
@@ -904,12 +910,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale,
             )
 
-            self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
-            )
-            self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
-            )
+            _pc_field_names = {f.name for f in dataclasses.fields(PrecisionConfig)}
+
+            def _build_precision_config(scale, flex):
+                kwargs = {"flex_ctx": FlexCtx(rhs_data=flex)}
+                if "weight_scale" in _pc_field_names:
+                    kwargs["weight_scale"] = scale
+                else:
+                    # New triton_kernels API renamed `weight_scale` → `b_mx_scale`
+                    # and now requires the microblock size to be set explicitly.
+                    from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
+
+                    kwargs["b_mx_scale"] = scale
+                    kwargs["b_microblock_size"] = int(MXFP_BLOCK_SIZE)
+                return PrecisionConfig(**kwargs)
+
+            self.w13_precision_config = _build_precision_config(w13_scale, w13_flex)
+            self.w2_precision_config = _build_precision_config(w2_scale, w2_flex)
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale

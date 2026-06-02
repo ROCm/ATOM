@@ -1597,8 +1597,20 @@ class DeepseekV2MLAAttention(nn.Module):
         if layer_quant_dtype == dtypes.fp4x2:
             if not use_triton_gemm():
                 source_quant_dtype = None
-                quant_config = None
-                base_quant_config = None
+                # Full-MXFP4 V2 checkpoints store attention weights/scales on disk.
+                # Keep their quant_config only for this narrow static Quark path.
+                q_a_proj_quant_config = quant_config.get_layer_quant_config(
+                    f"{prefix}.{q_a_proj_name}"
+                )
+                is_quark_static_mxfp4 = (
+                    q_a_proj_quant_config.quant_method == "quark"
+                    and layer_quant_type == QuantType.per_1x32
+                )
+                if is_quark_static_mxfp4:
+                    base_quant_config = quant_config
+                else:
+                    quant_config = None
+                    base_quant_config = None
             else:
                 source_quant_dtype = torch.bfloat16
                 base_quant_config = None
