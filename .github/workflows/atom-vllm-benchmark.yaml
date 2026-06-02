@@ -1139,7 +1139,7 @@ jobs:
                           aw_param = dict(param)
                           aw_param["input_length"] = input_length
                           aw_param["output_length"] = output_length
-                          aw_param["random_range_ratio"] = ""
+                          aw_param["random_range_ratio"] = "0.0"
                           base_params.append(aw_param)
 
                   variants = []
@@ -1309,7 +1309,7 @@ jobs:
           docker rmi atom_oot_base:ci || true
 
   benchmark:
-    name: OOT ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
+    name: ${{ contains(matrix.model.display, '(AW)') && format('OOT {0} all AW cases', matrix.model.display) || format('OOT {0} {1}/{2} c={3}', matrix.model.display, matrix.params.input_length, matrix.params.output_length, matrix.params.concurrency) }}
     needs: [resolve-atom-source, build-benchmark-matrix, build-oot-image]
     if: >-
       always()
