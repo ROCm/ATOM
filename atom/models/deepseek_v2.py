@@ -275,10 +275,6 @@ def _fuse_rmsnorm_fp4_quant(
     torch.Tensor,
     torch.Tensor,
 ]:
-    m = x1.shape[0]
-
-    shuffle_bool = shuffle and (m >= MXFP4_QUANT_BLOCK_SIZE)
-
     (out1_quantized, out1_bs), _out1_unquantized, out2, out_res1 = (
         fused_rms_mxfp4_quant(
             x1=x1,
@@ -288,7 +284,7 @@ def _fuse_rmsnorm_fp4_quant(
             x2_weight=x2_weight,
             x2_epsilon=0.0 if x2_epsilon is None else x2_epsilon,
             res1=res1,
-            shuffle=shuffle_bool,
+            shuffle=shuffle,
             scale_shuffle_padding=scale_shuffle_padding,
             output_unquantized_inp1=output_unquantized_inp1,
         )
@@ -1917,11 +1913,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
 
-        # When ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on self.fuse_input_norm_quant is turned on only if use_triton_gemm and (FP8 or FP4),
-        # Because AR_RMS and RMS_Quant cannot co-exist for input_layernorm, this block of codes ensures 3 things when ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on:
-        #   1. RMS_Quant fusion is only used for input_layernorm
-        #   2. The reduce_results variable is re-enabled for feed forward layers (MOE and MLP), because AR_RMS is now disabled in the beginning of the next layer
-        #   3. AR_RMS is turned off for input_layernorm but still enabled for post_attention_layernorm if ENABLE_ALLREDUCE_RMSNORM_FUSION is turned on
+        # When input RMSNorm+quant fusion is enabled, FP4 follows the same
+        # activation/scale layout expected by the GEMM backend selected later
+        # in LinearBase: raw for ATOM_USE_FP4_TRITON_GEMM, Triton preshuffle
+        # layout for ATOM_USE_TRITON_GEMM, and the original AITER shuffled
+        # layout for the fallback gemm_a4w4 path.
         self.quant_dtype = (
             None
             if quant_config is None
@@ -1939,10 +1935,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             can_fuse_input_norm_quant = (
                 self.quant_dtype == dtypes.fp8
                 and use_triton_gemm()
-            ) or (
-                self.quant_dtype == dtypes.fp4x2
-                and (use_triton_gemm() or use_fp4_triton_gemm())
-            )
+            ) or self.quant_dtype == dtypes.fp4x2
             if can_fuse_input_norm_quant:
                 self.fuse_input_norm_quant = True
                 self.input_norm_quant_raw_scale = (
@@ -1957,7 +1950,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 if layer_idx == 0:
                     logger.info(
-                        "Info: Because ATOM_USE_TRITON_GEMM is not turned on in DeepSeek-R1, ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned off automatically"
+                        "Info: Because the required GEMM backend is not turned on in DeepSeek-R1, ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned off automatically"
                     )
 
         if (
@@ -2009,7 +2002,21 @@ class DeepseekV2DecoderLayer(nn.Module):
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
-            shuffle_input_norm_quant = not self.input_norm_quant_raw_scale
+            if self.input_norm_quant_raw_scale:
+                shuffle_input_norm_quant = False
+                scale_shuffle_padding = False
+            elif self.quant_dtype == dtypes.fp4x2 and use_triton_gemm():
+                # Triton preshuffle GEMM quantizes small batches without the
+                # 256x8 shuffled scale padding; match that exact contract.
+                shuffle_input_norm_quant = (
+                    hidden_states.shape[0] >= MXFP4_QUANT_BLOCK_SIZE
+                )
+                scale_shuffle_padding = shuffle_input_norm_quant
+            else:
+                # The original AITER fallback gemm_a4w4 path calls
+                # get_hip_quant(..., shuffle=True) even for decode batch 1.
+                shuffle_input_norm_quant = True
+                scale_shuffle_padding = True
             if residual is None:
                 residual = hidden_states
                 (hidden_states_quant, hidden_states_quant_scale), _, _, _ = (
@@ -2023,7 +2030,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                         None,
                         dtype_quant=self.quant_dtype,
                         shuffle=shuffle_input_norm_quant,
-                        scale_shuffle_padding=shuffle_input_norm_quant,
+                        scale_shuffle_padding=scale_shuffle_padding,
                         group_size=128,
                         quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
@@ -2042,7 +2049,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                         residual,
                         dtype_quant=self.quant_dtype,
                         shuffle=shuffle_input_norm_quant,
-                        scale_shuffle_padding=shuffle_input_norm_quant,
+                        scale_shuffle_padding=scale_shuffle_padding,
                         group_size=128,
                         quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,

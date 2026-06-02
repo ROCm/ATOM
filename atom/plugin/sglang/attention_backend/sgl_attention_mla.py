@@ -707,8 +707,12 @@ def forward_sgl_plugin_mode_mla(
         base_hidden_states = (
             hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
         )
+        dummy_dtype = (
+            torch.bfloat16 if isinstance(hidden_states, tuple) else hidden_states.dtype
+        )
         dummy_output = base_hidden_states.new_empty(
-            (base_hidden_states.shape[0], base_hidden_states.shape[-1])
+            (base_hidden_states.shape[0], attn.hidden_size),
+            dtype=dummy_dtype,
         )
         return dummy_output
     return forward_sgl_core(attn, prepared)
@@ -826,6 +830,7 @@ def forward_sgl_mha_prepare(
     if getattr(attn_mha, "kv_b_proj", None) is None:
         attn_mha.kv_b_proj = attn.kv_b_proj
 
+    kv_a_normed = False
     if attn.q_lora_rank is not None:
         q, latent_cache = (
             get_attn_tp_context()
@@ -854,7 +859,19 @@ def forward_sgl_mha_prepare(
                 dim=-1,
             )
 
-        if _use_aiter_gfx95 and attn.q_b_proj.weight.dtype == torch.float8_e4m3fn:
+        kv_a, _ = latent_cache.split(
+            [attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1
+        )
+        if (
+            getattr(attn, "fuse_qknorm_quant", False)
+            and getattr(attn, "quant_dtype", None) == dtypes.fp4x2
+        ):
+            q, q_scale, _, kv_a = _fuse_qk_rmsnorm_and_q_quant(attn, q, kv_a)
+            kv_a_normed = True
+            q = _q_b_proj_with_optional_scale(attn, q, q_scale).view(
+                -1, attn.num_local_heads, attn.qk_head_dim
+            )
+        elif _use_aiter_gfx95 and attn.q_b_proj.weight.dtype == torch.float8_e4m3fn:
             (q, q_scale), _, _, _ = _fuse_rmsnorm_quant(
                 q,
                 attn.q_a_layernorm.weight,
@@ -884,12 +901,18 @@ def forward_sgl_mha_prepare(
         latent_cache = _unwrap_linear_output(
             attn.kv_a_proj_with_mqa(hidden_states, hidden_states_scale)
         )
+        kv_a, _ = latent_cache.split(
+            [attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1
+        )
 
     _, q_pe = q.split([attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1)
-    kv_a, _ = latent_cache.split([attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1)
     latent_cache = latent_cache.unsqueeze(1)
 
-    if _use_aiter_gfx95 and attn.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+    if (
+        not kv_a_normed
+        and _use_aiter_gfx95
+        and attn.kv_b_proj.weight.dtype == torch.float8_e4m3fn
+    ):
         (kv_a_quanted, kv_a_quanted_scale), kv_a, _, _ = _fuse_rmsnorm_quant(
             kv_a,
             attn.kv_a_layernorm.weight,
@@ -906,7 +929,8 @@ def forward_sgl_mha_prepare(
         )
     else:
         kv_a_quanted = None
-        kv_a = attn.kv_a_layernorm(kv_a)
+        if not kv_a_normed:
+            kv_a = attn.kv_a_layernorm(kv_a)
 
     k_pe = latent_cache[:, :, attn.kv_lora_rank :]
     if attn.rotary_emb is not None:
