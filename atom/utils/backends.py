@@ -575,9 +575,13 @@ class VllmBackend:
             hash_content = []
             for filepath in forward_code_files:
                 hash_content.append(filepath)
-                if filepath == "<string>" or filepath == "<frozen os>":
-                    # This means the function was dynamically generated, with
-                    # e.g. exec() or frozen os module. We can't actually check these.
+                # The file, start with '<', is usually the python temp file
+                # maintained by the python interpreter. It has pseudo filepath
+                # and will be recorded in the forward_code_files as the code
+                # has been traced by Dynamo during the compilation.
+                # Here is computing the hash of the code from the compiled files,
+                # but exclude the pseudo-path files
+                if filepath.startswith("<"):
                     continue
                 with open(filepath) as f:
                     hash_content.append(f.read())
