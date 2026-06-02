@@ -16,7 +16,11 @@ import torch
 import triton
 import triton.language as tl
 
-from .index import prepare_chunk_indices, prepare_chunk_offsets
+from .index import (
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
+    prepare_rebased_cu_seqlens,
+)
 from .op import exp
 from .utils import use_cuda_graph
 
@@ -293,6 +297,8 @@ def chunk_gated_delta_rule_fwd_h_vk(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: torch.Tensor | None = None,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -300,19 +306,29 @@ def chunk_gated_delta_rule_fwd_h_vk(
     H = u.shape[-2]
     BT = chunk_size
 
+    # See `cumsum.chunk_local_cumsum_scalar` for the cache-stable contract:
+    # pass the original `cu_seqlens` to `prepare_chunk_indices`/`offsets`
+    # and the cached rebased tensor to the kernel.
     chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
+        prepare_chunk_indices(cu_seqlens, chunk_size, num_decodes, num_decode_tokens)
         if cu_seqlens is not None
         else None
     )
-    # N: the actual number of sequences in the batch with either equal or variable lengths
+    kernel_cu_seqlens = (
+        prepare_rebased_cu_seqlens(cu_seqlens, num_decodes, num_decode_tokens)
+        if cu_seqlens is not None
+        else None
+    )
+    # N: number of PREFILL sequences (i.e. the original sequence count
+    # minus the leading `num_decodes` decode sequences that are handled
+    # by a different kernel).
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
     else:
         N, NT, chunk_offsets = (
-            len(cu_seqlens) - 1,
+            len(cu_seqlens) - 1 - num_decodes,
             len(chunk_indices),
-            prepare_chunk_offsets(cu_seqlens, BT),
+            prepare_chunk_offsets(cu_seqlens, BT, num_decodes, num_decode_tokens),
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
@@ -336,7 +352,7 @@ def chunk_gated_delta_rule_fwd_h_vk(
         h=h,
         h0=initial_state,
         ht=final_state,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=kernel_cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
         H=H,
