@@ -397,17 +397,17 @@ def triton_kernel_fused_experts(
 
     half_N = N // 2
 
-    # if intermediate_cache is None:
-    #     intermediate_cache = torch.empty(
-    #         (M * topk, half_N),
-    #         device=hidden_states.device,
-    #         dtype=hidden_states.dtype,
-    #     )
+    if intermediate_cache is None:
+        intermediate_cache = torch.empty(
+            (M * topk, half_N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
     
-    # # Add batch_dim to output buffer because matmul_ogs expects 3D output
-    # intermediate_cache = _resize_cache(
-    #     intermediate_cache, (M * topk, half_N)
-    # )
+    # Add batch_dim to output buffer because matmul_ogs expects 3D output
+    intermediate_cache = _resize_cache(
+        intermediate_cache, (M * topk, half_N)
+    )
 
     output_tensor = _resize_cache(output_tensor, (M, K))
 
@@ -514,10 +514,11 @@ def triton_kernel_fused_experts(
             apply_swiglu=False,
         )
         
-        raw_2d = raw_intermediate #.view(M * topk, N)
-        # intermediate_cache = intermediate_cache.view(M * topk, half_N)
-        intermediate_cache = fused_clamp_act_mul(
+        raw_2d = raw_intermediate.view(M * topk, N)
+        intermediate_cache = intermediate_cache.view(M * topk, half_N)
+        fused_clamp_act_mul(
             raw_2d,
+            out=intermediate_cache,
             swiglu_limit=swiglu_limit,
             activation="silu",
             dtype_quant=None,
