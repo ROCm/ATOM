@@ -1056,8 +1056,7 @@ class ModelRunner:
             self.config.max_num_batched_tokens,
             self.config.max_model_len,
         )
-        dp_size = get_dp_group().world_size
-        warmup_max_tokens = max_num_batched_tokens // dp_size
+        warmup_max_tokens = max_num_batched_tokens
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -1067,7 +1066,8 @@ class ModelRunner:
             if seq_len == 0:
                 seq_len = 1
             logger.warning(
-                f"{self.label}: DP size={dp_size} too large, warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
+                f"{self.label}: warmup_max_tokens={warmup_max_tokens} (=max_num_batched_tokens) "
+                f"< max_model_len={max_model_len}. "
                 f"Using {num_seqs} seq with length {seq_len} for warmup."
             )
         else:
