@@ -10,7 +10,7 @@ FROM ${OOT_BASE_IMAGE} AS atom_oot
 ARG MAX_JOBS
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_COMMIT="b31e9326a7d9394aab8c767f8ebe225c65594b60"
+ARG VLLM_COMMIT="0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
 ARG INSTALL_LM_EVAL=1
 ARG INSTALL_FASTSAFETENSORS=1
 # Let PR OOT CI verify whether a pulled prebuilt image still matches this vLLM commit
