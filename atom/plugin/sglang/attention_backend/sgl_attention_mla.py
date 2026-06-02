@@ -988,6 +988,19 @@ def forward_sgl_plugin_mode(
 
 
 # Weight post-processing: decomposed into sub-functions
+def _is_static_quark_mxfp4_kv_b_proj(kv_b_proj) -> bool:
+    layer_quant_config = getattr(kv_b_proj, "layer_quant_config", None)
+    return (
+        getattr(kv_b_proj, "weight", None) is not None
+        and kv_b_proj.weight.dim() == 2
+        and layer_quant_config is not None
+        and layer_quant_config.quant_method == "quark"
+        and layer_quant_config.quant_dtype == dtypes.fp4x2
+        and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
+        and getattr(kv_b_proj, "source_quant_dtype", None) is None
+    )
+
+
 def _read_kv_b_proj_weight(attn: DeepseekV2MLAAttention) -> torch.Tensor:
     """Read kv_b_proj weight, handling AWQ and fnuz dtypes."""
     if hasattr(attn.kv_b_proj, "qweight"):
@@ -1002,14 +1015,7 @@ def _read_kv_b_proj_weight(attn: DeepseekV2MLAAttention) -> torch.Tensor:
             attn.kv_b_proj.qzeros,
         ).T
     else:
-        layer_quant_config = getattr(attn.kv_b_proj, "layer_quant_config", None)
-        is_quark_static_mxfp4 = (
-            layer_quant_config is not None
-            and layer_quant_config.quant_method == "quark"
-            and layer_quant_config.quant_dtype == dtypes.fp4x2
-            and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
-        )
-        if is_quark_static_mxfp4:
+        if _is_static_quark_mxfp4_kv_b_proj(attn.kv_b_proj):
             w = getattr(
                 attn.kv_b_proj,
                 "_mxfp4_unshuffled_weight",
@@ -1253,7 +1259,9 @@ def process_mla_kv_b_proj_after_loading(attn: DeepseekV2MLAAttention) -> None:
     Orchestrates reading, quantization handling, and splitting of
     kv_b_proj into absorbed w_kc / w_vc weights.
     """
-    if not getattr(attn.kv_b_proj, "_sgl_mxfp4_process_done", False):
+    if _is_static_quark_mxfp4_kv_b_proj(attn.kv_b_proj) and not getattr(
+        attn.kv_b_proj, "_sgl_mxfp4_process_done", False
+    ):
         attn.kv_b_proj.process_weights_after_loading()
 
     w = _read_kv_b_proj_weight(attn)
@@ -1288,16 +1296,7 @@ def _patch_kv_b_proj_for_sglang_mxfp4(attn: DeepseekV2MLAAttention) -> None:
         if getattr(kv_b_proj, "_sgl_mxfp4_process_done", False):
             return
 
-        layer_quant_config = getattr(kv_b_proj, "layer_quant_config", None)
-        is_quark_static_mxfp4 = (
-            kv_b_proj.weight.dim() == 2
-            and layer_quant_config is not None
-            and layer_quant_config.quant_method == "quark"
-            and layer_quant_config.quant_dtype == dtypes.fp4x2
-            and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
-            and getattr(kv_b_proj, "source_quant_dtype", None) is None
-        )
-        if is_quark_static_mxfp4:
+        if _is_static_quark_mxfp4_kv_b_proj(kv_b_proj):
             kv_b_proj._mxfp4_unshuffled_weight = kv_b_proj.weight.detach().clone()
             kv_b_proj._mxfp4_unshuffled_weight_scale = (
                 kv_b_proj.weight_scale.detach().clone()
