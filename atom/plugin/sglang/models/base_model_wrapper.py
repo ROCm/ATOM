@@ -64,17 +64,11 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.model_arch = getattr(config, "architectures", [""])[0]
         self.model_arch_spec = get_model_arch_spec(self.model_arch)
 
-        import atom
-
-        # TODO: prepare_model() currently handles model construction, config
-        # generation, attention backend registration, and distributed init.
-        # Refactor so this wrapper only dispatches the attention backend
-        # (register_ops_to_sglang + set_attn_cls), and let sglang handle
-        # model construction directly
         with plugin_runtime_scope(framework="sglang"):
             from atom.config import get_current_atom_config
+            from atom.plugin.sglang.prepare import prepare_model
 
-            self.model = atom.prepare_model(config=config, engine="sglang")
+            self.model = prepare_model(config=config)
             self.atom_config = getattr(self.model, "atom_config", None)
             if self.atom_config is None:
                 self.atom_config = get_current_atom_config()

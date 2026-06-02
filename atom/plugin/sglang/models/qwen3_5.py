@@ -202,13 +202,13 @@ def _get_qwen35_language_model_stack_cls(
             prefix: str = "",
         ) -> None:
             del prefix
-            import atom
+            from atom.plugin.sglang.prepare import prepare_model
 
             nn.Module.__init__(self)
             root_config = type(self)._pending_vlm_root_config
             if root_config is None:
                 root_config = config
-            atom_lm = atom.prepare_model(config=root_config, engine="sglang")
+            atom_lm = prepare_model(config=root_config)
             if atom_lm is None:
                 arch = getattr(root_config, "architectures", ["unknown"])[0]
                 raise ValueError(f"ATOM failed to build language model for {arch}")
