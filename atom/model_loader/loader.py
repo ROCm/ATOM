@@ -316,6 +316,14 @@ def load_model(
     # it is only used in plugin mode for vllm
     loaded_weights_record: set[str] = set()
 
+    # Auto-detect weight mapper from model if not provided explicitly
+    if weights_mapper is None:
+        model_mapper = getattr(model, "hf_to_atom_mapper", None)
+        if isinstance(model_mapper, dict):
+            weights_mapper = WeightsMapper(orig_to_new_prefix=model_mapper)
+        elif isinstance(model_mapper, WeightsMapper):
+            weights_mapper = model_mapper
+
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
     skip_weight_prefixes = getattr(model, "skip_weight_prefixes", [])
@@ -327,13 +335,6 @@ def load_model(
     if weights_mapper is None:
         weights_mapper = getattr(model, "weights_mapper", None)
     params_dict = dict(model.named_parameters())
-    # Load `mtp.*` ckpt entries only when this is a spec-decode draft model
-    # AND it actually carries `mtp.*` params. The two-condition gate handles
-    # both directions: target loads (spec_decode=False) skip mtp regardless,
-    # and spec drafts that don't use the standard `mtp.*` param naming
-    # (e.g. Eagle3 with its own arch) also skip cleanly.
-    need_load_mtp: bool = spec_decode and any("mtp" in n for n in params_dict)
-
     # Pre-index expert_mapping by weight_name_part for O(1) lookup.
     # Original code does O(N) scan of expert_mapping (768 entries) per tensor,
     # causing ~19s of CPU time for 90k expert tensors. This reduces it to O(1).
@@ -390,7 +391,12 @@ def load_model(
                 name = mapped_name
             if load_dummy:
                 continue
-            if "mtp" in name and not need_load_mtp:
+            # Draft models may remap ckpt-side `mtp.*` entries into params
+            # whose names do not themselves contain `mtp` (e.g. Qwen3.5 MTP
+            # rewrites `mtp.*` -> `model.*`). Gate only on `spec_decode`,
+            # otherwise we can drop the entire drafter checkpoint before the
+            # model-specific remap logic has a chance to run.
+            if "mtp" in name and not spec_decode:
                 continue
             if name.endswith("kv_scale") or "inv_freq" in name:
                 continue
@@ -522,7 +528,7 @@ def load_model(
                         ) and name not in params_dict:
                             matched = True
                             break
-                        if "mtp" in name and not need_load_mtp:
+                        if "mtp" in name and not spec_decode:
                             matched = True
                             break
                         try:
@@ -545,7 +551,7 @@ def load_model(
                         matched = True
                         break
                     if not matched:
-                        if "mtp" in name and not need_load_mtp:
+                        if "mtp" in name and not spec_decode:
                             continue
                         if merged_target := extract_expert_target_and_id(name):
                             fused_name, expert_id = merged_target

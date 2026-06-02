@@ -45,6 +45,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -56,7 +57,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_2:
         description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
@@ -82,6 +82,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -93,7 +94,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_3:
         description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
@@ -119,6 +119,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -130,7 +131,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_4:
         description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
@@ -156,6 +156,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -167,7 +168,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_5:
         description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
@@ -193,6 +193,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -204,7 +205,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_6:
         description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
@@ -230,6 +230,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -241,7 +242,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_7:
         description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
@@ -267,6 +267,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -278,7 +279,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       model_slot_8:
         description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
@@ -304,6 +304,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP4 (AW)
           - DeepSeek-V3.2 FP8 TP8 (AW)
+          - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -315,7 +316,6 @@ on:
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP2 (AW)
           - MiniMax-M2.5 TP4 (AW)
-          - MiniMax-M2.5 TP8 (AW)
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -484,6 +484,8 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
           INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
@@ -895,6 +897,7 @@ jobs:
               "MiniMax-M2.5 TP2 (AW)",
               "MiniMax-M2.5 TP4 (AW)",
               "DeepSeek-V3.2 FP8 TP8 (AW)",
+              "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
               "gpt-oss-120b TP2 (AW)",
               "gpt-oss-120b TP8 (AW)",
           }
@@ -1144,6 +1147,18 @@ jobs:
             echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
           fi
 
+      - name: Persist benchmark matrix payload
+        env:
+          BENCHMARK_MATRIX: ${{ steps.build.outputs.benchmark_matrix }}
+        run: |
+          printf '%s' "${BENCHMARK_MATRIX}" > benchmark_matrix.json
+
+      - name: Upload benchmark matrix payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: oot-benchmark-matrix
+          path: benchmark_matrix.json
+
   build-oot-image:
     name: Build custom OOT benchmark image
     needs: [resolve-atom-source, build-benchmark-matrix]
@@ -1294,6 +1309,24 @@ jobs:
       UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
       BENCHMARK_CLIENT: ${{ contains(matrix.model.prefix, '-aw-') && 'vLLM bench' || needs.resolve-atom-source.outputs.benchmark_client }}
     steps:
+      - name: Print runner user
+        run: |
+          echo "=== Container engine diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "docker path: $(command -v docker || true)"
+          echo "podman path: $(command -v podman || true)"
+          echo "docker version:"
+          docker version || true
+          echo "docker info:"
+          docker info || true
+          echo "podman version:"
+          podman version || true
+          echo "podman info:"
+          podman info || true
+          echo "=== End container engine diagnostics ==="
+
       - name: Detect container engine
         run: |
           if docker info > /dev/null 2>&1; then
@@ -1424,7 +1457,9 @@ jobs:
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
 
       - name: Download model if needed
+        timeout-minutes: 150
         run: |
+          set -euo pipefail
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
@@ -1436,14 +1471,27 @@ jobs:
             model_dir="/models/${model_dir}"
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "/models directory found, downloading model to ${model_dir}"
-            if ! $CONTAINER_ENGINE exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download \"${MODEL_SOURCE_PATH}\" --local-dir \"$model_dir\""; then
+            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            if ! $CONTAINER_ENGINE exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${MODEL_SOURCE_PATH}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+              "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
               echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
               exit 1
             fi
           else
             echo "/models directory not mounted; skipping model download"
           fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "2h"
+          MODEL_LOCK_WAIT_SECONDS: "1800"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Resolve OOT model path
         run: |
@@ -1570,11 +1618,10 @@ jobs:
                     --random-input-len \"${ISL}\" \
                     --random-output-len \"${OSL}\" \
                     ${RANDOM_RANGE_RATIO:+--random-range-ratio \"${RANDOM_RANGE_RATIO}\"} \
-                    --temperature 0.0 \
-                    --num-prompts \"$(( CONC * 10 ))\" \
+                    --num-prompts \"$(( CONC * 8 ))\" \
                     --max-concurrency \"${CONC}\" \
                     ${TRUST_REMOTE_CODE_ARG} \
-                    --num-warmups \"$(( 2 * CONC ))\" \
+                    --num-warmups \"${CONC}\" \
                     --request-rate inf \
                     --ignore-eos \
                     --disable-tqdm \
@@ -1851,6 +1898,12 @@ jobs:
           echo "downloaded_count=${#json_files[@]}" >> "$GITHUB_OUTPUT"
           printf 'Downloaded %s benchmark result files\n' "${#json_files[@]}"
 
+      - name: Download benchmark matrix payload
+        uses: actions/download-artifact@v8
+        with:
+          name: oot-benchmark-matrix
+          path: .
+
       - name: Note summary behavior
         run: |
           printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table.\n- Benchmark client: `%s`\n- Upload to dashboard: `%s`\n- Upload to custom dashboard: `%s`\n' \
@@ -1879,12 +1932,11 @@ jobs:
 
       - name: Generate OOT benchmark summary table
         env:
-          BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 .github/scripts/plugin_benchmark_summary.py \
             --result-dir . \
-            --matrix-json "${BENCHMARK_MATRIX}" \
+            --matrix-json-file benchmark_matrix.json \
             --run-url "${RUN_URL}" \
             --output-json oot_benchmark_summary.json \
             --title "ATOM-vLLM Benchmark Summary" \

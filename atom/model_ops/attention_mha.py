@@ -338,6 +338,12 @@ class PagedAttentionImpl(nn.Module):
                 use_shuffle = True
                 k_cache_gather = k_cache
                 v_cache_gather = v_cache.view(n, nh, block_size // x, head_dim, x)
+            elif v_cache.dim() == 5:
+                # MiMo-V2-Flash per-layer allocator (aiter_attention.py:461) emits
+                # v_cache natively as 5D SHUFFLE [n, nh, bs//x, hd, x]; pass through.
+                use_shuffle = True
+                k_cache_gather = k_cache
+                v_cache_gather = v_cache
             else:
                 # fused_qk_rope_reshape_and_cache: V [n, nh, hd, bs] -> NHD
                 use_shuffle = False

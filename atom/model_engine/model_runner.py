@@ -36,7 +36,12 @@ from atom.utils import (
 )
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.utils.forward_context import get_kvconnector
-from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
+from atom.utils.tbo import (
+    UBatchWrapper,
+    local_tbo_precompute,
+    maybe_create_ubatch_slices,
+    sync_dp_for_tbo,
+)
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -62,8 +67,8 @@ support_model_arch_dict = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5ForConditionalGenerationTextOnly",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly",
+    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2_flash.MiMoV2FlashForCausalLM",
@@ -154,18 +159,28 @@ class tokenIDProcessor:
         #   prev acc decode have 0 rej, 1 bonus
         #   prev rej decode have 1 rej, 0 bonus
         # It is clear that only rejected number is not sufficient for all status tracking, bonus number is also needed.
-        self.send_to_cpu_async(num_rejected, self.rejected_tokens_cpu, data_ready)
-        self.send_to_cpu_async(num_bonus, self.bonus_tokens_cpu, data_ready)
+        # Single Event for both copies (vs. per-tensor send_to_cpu_async) so the
+        # consumer pops one queue entry and synchronizes once instead of twice.
+        copy_done = torch.cuda.Event()
+        with torch.cuda.stream(self.async_copy_stream):
+            data_ready.wait(stream=self.async_copy_stream)
+            cpu_num_rejected = num_rejected.to("cpu", non_blocking=True)
+            cpu_num_bonus = num_bonus.to("cpu", non_blocking=True)
+            copy_done.record(self.async_copy_stream)
+        self.pending_mtp_status_copies.append(
+            (cpu_num_rejected, cpu_num_bonus, copy_done)
+        )
 
     def recv_mtp_status_async(
         self,
     ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        if not self.rejected_tokens_cpu:
+        if not self.pending_mtp_status_copies:
             return None, None
-        return (
-            self.recv_async_output(self.rejected_tokens_cpu).numpy(),
-            self.recv_async_output(self.bonus_tokens_cpu).numpy(),
+        cpu_num_rejected, cpu_num_bonus, copy_done = self.pending_mtp_status_copies.pop(
+            0
         )
+        copy_done.synchronize()
+        return cpu_num_rejected.numpy(), cpu_num_bonus.numpy()
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -176,8 +191,12 @@ class tokenIDProcessor:
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: Optional[torch.Tensor] = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
-        self.rejected_tokens_cpu: list[torch.Tensor] = []
-        self.bonus_tokens_cpu: list[torch.Tensor] = []
+        # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event) — async
+        # D2H copies fired by send_mtp_status_to_cpu_async, drained by
+        # recv_mtp_status_async after the event syncs.
+        self.pending_mtp_status_copies: list[
+            tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
+        ] = []
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
@@ -503,6 +522,8 @@ class ModelRunner:
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
         self.use_v4 = self.is_deepseek_v4()
+        rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
+        self.use_mrope = "mrope_section" in rope_parameters
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
@@ -953,7 +974,7 @@ class ModelRunner:
         mtp_factor = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
         num_tokens_original = mtp_factor
 
-        seq = Sequence([0] * num_tokens_original, block_size=self.block_size)
+        seq = Sequence([0] * num_tokens_original, block_size=self.block_size, id=-1)
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
         seq.block_table = [0]
@@ -968,14 +989,7 @@ class ModelRunner:
             is_dummy_run=True,
         )
 
-        bs = self.prepare_inputs(dummy_batch)
-        self.forward_vars["input_ids"].gpu[:bs].zero_()
-        input_ids = self.forward_vars["input_ids"].gpu[:bs]
-
-        logits, hidden_states = self.run_model(input_ids)
-        self._run_dummy_drafter(hidden_states)
-
-        reset_forward_context()
+        self.forward(dummy_batch)
         logger.debug(
             f"{self.label}: dummy batch executed with {dummy_batch.total_tokens_num} tokens"
         )
@@ -1102,6 +1116,10 @@ class ModelRunner:
                 dtype=hidden_type,
             ),
         }
+        if self.use_mrope:
+            self.forward_vars["mrope_positions"] = CpuGpuBuffer(
+                3, self.max_num_batched_tokens, **i64_kwargs
+            )
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
@@ -1117,6 +1135,11 @@ class ModelRunner:
         else:
             assert self.world_size % hf_config.num_key_value_heads == 0
             return 1
+
+    def _mrope_positions_view(self, num_tokens: int) -> torch.Tensor:
+        return self.forward_vars["mrope_positions"].gpu.as_strided(
+            (3, num_tokens), (num_tokens, 1)
+        )
 
     def _get_total_num_layers(self):
         """Return total layer count including draft (MTP) layers.
@@ -1266,6 +1289,39 @@ class ModelRunner:
                 f"equiv_blocks_per_req={per_req_cache_equiv_blocks}, "
                 f"pool_blocks={num_kvcache_blocks}"
             )
+
+        # Concurrent-capacity table: at each context-length percentage of
+        # max_model_len, how many requests can simultaneously hold their
+        # KV in the pool. Per-req block usage = ceil(ctx_len/block_size);
+        # per-req state cache is in its own pre-allocated tensor (already
+        # excluded from `num_kvcache_blocks` at sizing time), so it adds
+        # no per-block cost. Concurrency is also capped by
+        # max_per_req_cache_slots (state buffer slot count).
+        max_model_len = config.max_model_len
+        cap = (
+            max_per_req_cache_slots if per_req_cache_bytes > 0 else config.max_num_seqs
+        )
+        pct_lines = []
+        for pct in (10, 30, 50, 70, 90, 100):
+            ctx = max(1, max_model_len * pct // 100)
+            blocks_per_req = math.ceil(ctx / self.block_size)
+            block_bound = (
+                num_kvcache_blocks // blocks_per_req if blocks_per_req > 0 else 0
+            )
+            max_conc = min(cap, block_bound) if cap > 0 else block_bound
+            bound_label = (
+                "slots" if cap > 0 and max_conc == cap < block_bound else "blocks"
+            )
+            pct_lines.append(
+                f"  {pct:>3}% ({ctx:>7} tok): {blocks_per_req:>6} blk/req "
+                f"→ max_concurrent={max_conc:<5} (bound by {bound_label})"
+            )
+        logger.info(
+            f"Concurrent capacity vs context length "
+            f"(max_model_len={max_model_len}, block_size={self.block_size}, "
+            f"max_slots={cap}, pool_blocks={num_kvcache_blocks}):\n"
+            + "\n".join(pct_lines)
+        )
 
         assert num_kvcache_blocks > 0, (
             f"Not enough memory for KV cache with block size({self.block_size}). "
@@ -1423,8 +1479,8 @@ class ModelRunner:
             f"layer_{i}": kv_cache_tensor
             for i, kv_cache_tensor in enumerate(kv_cache_tensors)
         }
-        # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
-        set_kv_cache_data(kv_cache_data, config)
+        transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
+        set_kv_cache_data(kv_cache_data, config, transfer_tensors)
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -1487,24 +1543,17 @@ class ModelRunner:
         scheduled_bs,
         actual_num_tokens,
         num_scheduled_tokens,
-        reqs_across_dp,
+        tbo_collective_active: bool,
     ):
-        """Create TBO ubatch slices if conditions are met."""
-        if not self.config.enable_tbo:
-            return None
-        if not is_prefill and not self.config.enable_tbo_decode:
-            return None
-        if not is_prefill and batch.is_dummy_run:
+        """Create TBO ubatch slices when the collective DP decision is True.
+
+        With the packed-reduce path the eligibility (local + cross-DP AND)
+        is decided in ``_preprocess``; here we just realise the split.
+        """
+        if not tbo_collective_active:
             return None
 
         tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
-        if reqs_across_dp is not None:
-            can_tbo = int(torch.min(reqs_across_dp).item()) >= 2
-        else:
-            can_tbo = tbo_num_reqs >= 2
-        if not can_tbo:
-            return None
-
         ubatch_slices = maybe_create_ubatch_slices(
             num_reqs=tbo_num_reqs,
             num_tokens=actual_num_tokens,
@@ -1518,43 +1567,92 @@ class ModelRunner:
             )
         return ubatch_slices
 
-    def _preprocess(self, batch: ScheduledBatch):
+    def _preprocess(
+        self,
+        batch: ScheduledBatch,
+        num_scheduled_tokens: Optional[np.ndarray] = None,
+    ):
+        """Per-step DP sync: token padding, prefill fan-out, TBO decision.
+
+        Thin wrapper over :func:`atom.utils.tbo.sync_dp_for_tbo` (the
+        actual collective) and :func:`atom.utils.tbo.local_tbo_precompute`
+        (the rank-local TBO eligibility / per-ubatch token split).
+
+        Returns:
+            (num_input_tokens, num_tokens_across_dp, dp_uniform_decode,
+             max_tokens, tbo_collective_active, ub_max_tokens_across_dp)
+        """
         num_input_tokens = batch.total_tokens_num
         is_prefill = batch.total_tokens_num_prefill > 0
-
+        tbo_on = self.config.enable_tbo
         dp_size = self.config.parallel_config.data_parallel_size
-        dp_rank = self.config.parallel_config.data_parallel_rank
+
+        # Rank-local TBO precompute (needed for both dp==1 fast path and
+        # the cross-DP packed gather below).
+        local_eligible, local_ub0, local_ub1 = False, 0, 0
+        if tbo_on:
+            if num_scheduled_tokens is None:
+                num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
+            local_eligible, local_ub0, local_ub1 = local_tbo_precompute(
+                self.config, batch, is_prefill, num_scheduled_tokens
+            )
 
         if dp_size <= 1:
-            return num_input_tokens, None, None
-
-        reqs_across_dp = None
-        if self.config.enable_tbo:
-            from atom.utils.tbo.ubatching import sync_dp_for_tbo
-
-            sync_reqs = (
-                batch.total_seqs_num_prefill
-                if is_prefill
-                else batch.total_seqs_num_decode
-            )
-            num_tokens_across_dp, reqs_across_dp = sync_dp_for_tbo(
-                dp_size,
-                dp_rank,
+            # Single-rank: TBO decision is purely local; no collective needed.
+            # dp_uniform_decode=True mirrors the DP-disabled case in the
+            # multi-rank branch (`not enable_dp_attention` => True) and the
+            # Context default — otherwise single-GPU/TP-only decode would
+            # be forced into eager and lose the CUDAGraph decode path.
+            return (
                 num_input_tokens,
-                sync_reqs,
+                None,
+                True,
+                num_input_tokens,
+                local_eligible,
+                None,
             )
-        else:
-            _, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
 
-        num_input_tokens = int(torch.max(num_tokens_across_dp).item())
-        return num_input_tokens, num_tokens_across_dp, reqs_across_dp
+        sync = sync_dp_for_tbo(
+            dp_group=get_dp_group().cpu_group,
+            dp_size=dp_size,
+            num_input_tokens=num_input_tokens,
+            is_prefill=is_prefill,
+            tbo_on=tbo_on,
+            local_tbo_eligible=local_eligible,
+            local_ub_tokens=(local_ub0, local_ub1),
+        )
+
+        max_tokens = int(sync.num_tokens_across_dp.max().item())
+        dp_uniform_decode = (not sync.any_rank_has_prefill) or (
+            not self.config.enable_dp_attention
+        )
+        if dp_uniform_decode:
+            # CUDAGraph path: all ranks pad to the same max for fixed-size all_gather.
+            num_input_tokens = max_tokens
+        # else: variable-length path — each rank keeps its own token count.
+
+        return (
+            num_input_tokens,
+            sync.num_tokens_across_dp,
+            dp_uniform_decode,
+            max_tokens,
+            sync.tbo_collective_active,
+            sync.ub_max_tokens_across_dp,
+        )
 
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        num_input_tokens, num_tokens_across_dp, reqs_across_dp = self._preprocess(batch)
+        (
+            num_input_tokens,
+            num_tokens_across_dp,
+            dp_uniform_decode,
+            max_tokens,
+            tbo_collective_active,
+            ub_max_tokens_across_dp,
+        ) = self._preprocess(batch, num_scheduled_tokens=num_scheduled_tokens)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
@@ -1573,7 +1671,6 @@ class ModelRunner:
                     (x for x in self.graph_bs if x >= padded_scheduled_bs),
                     padded_scheduled_bs,
                 )
-                # Use cudagraph and padding to batch_size, if bs > graph_bs, use eager mode
             )
             assert (
                 bs >= padded_scheduled_bs
@@ -1584,7 +1681,6 @@ class ModelRunner:
         attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
 
-        # graph_bs should be batch size (number of sequences), not token count
         graph_bs = num_input_tokens if is_prefill else bs
         context = Context(
             positions=positions,
@@ -1592,7 +1688,9 @@ class ModelRunner:
             is_dummy_run=batch.is_dummy_run,
             batch_size=context_bs,
             graph_bs=graph_bs,
+            dp_uniform_decode=dp_uniform_decode,
         )
+
         actual_num_tokens = batch.total_tokens_num
 
         spec_decode_metadata = None
@@ -1610,7 +1708,7 @@ class ModelRunner:
             scheduled_bs if not is_prefill else 0,
             actual_num_tokens,
             num_scheduled_tokens,
-            reqs_across_dp,
+            tbo_collective_active,
         )
 
         set_forward_context(
@@ -1621,6 +1719,7 @@ class ModelRunner:
             num_tokens_across_dp=num_tokens_across_dp,
             spec_decode_metadata=spec_decode_metadata,
             ubatch_slices=ubatch_slices,
+            ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         )
         return graph_bs
 
@@ -1701,9 +1800,18 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
 
-        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-            # prefill[bs=1 tok=115 ctx=115]
-            label = f"prefill[bs={bs}"
+        if (
+            is_prefill
+            or self.enforce_eager
+            or not context.dp_uniform_decode
+            or bs > self.graph_bs[-1]
+        ):
+            # prefill, or decode forced eager (enforce_eager / DP peer
+            # prefill / bs above the largest captured graph).
+            if is_prefill:
+                label = f"prefill[bs={bs}"
+            else:
+                label = f"eager_decode[bs={bs}"
             if batch is not None:
                 ctx = batch.context_lens
                 if len(ctx) == 1:
@@ -1715,7 +1823,37 @@ class ModelRunner:
                 label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
             label += "]"
             with record_function(label):
-                model_output = self.model(input_ids, positions)
+                # Handle multimodal prefill: compute vision embeddings and merge
+                inputs_embeds = None
+                if (
+                    is_prefill
+                    and hasattr(self.model, "get_vision_embeddings")
+                    and batch is not None
+                    and hasattr(batch, "multimodal_data")
+                    and batch.multimodal_data
+                ):
+                    mm_data_values = list(batch.multimodal_data.values())
+                    pixel_values = torch.cat(
+                        [mm_data["pixel_values"] for mm_data in mm_data_values], dim=0
+                    ).to(device=self.device, dtype=self.config.torch_dtype)
+                    grid_thw = torch.cat(
+                        [mm_data["image_grid_thw"] for mm_data in mm_data_values],
+                        dim=0,
+                    ).to(device=self.device)
+                    vision_embeds = self.model.get_vision_embeddings(
+                        pixel_values, grid_thw
+                    )
+                    text_embeds = self.model.embed_input_ids(input_ids)
+                    inputs_embeds = self.model.merge_multimodal_embeddings(
+                        input_ids, text_embeds, vision_embeds
+                    )
+
+                if inputs_embeds is None:
+                    model_output = self.model(input_ids, positions)
+                else:
+                    model_output = self.model(
+                        input_ids, positions, inputs_embeds=inputs_embeds
+                    )
                 if self.use_aux_hidden_state_outputs:
                     hidden_states, self._aux_hidden_states = model_output
                 else:
@@ -2012,10 +2150,15 @@ class ModelRunner:
                 self.forward_vars["positions"].np[:num_tokens] = (
                     np.arange(num_tokens, dtype=np.int64) % max_q_len
                 )
-
                 attn_metadata, context = (
                     self.attn_metadata_builder.build_for_cudagraph_capture(bs=bs)
                 )
+                if self.use_mrope:
+                    mrope_positions = self._mrope_positions_view(num_tokens)
+                    mrope_positions.copy_(
+                        positions[:num_tokens].unsqueeze(0).expand(3, -1)
+                    )
+                    context.positions = mrope_positions
                 num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
                 num_tokens += num_pad
                 # Create ubatch slices for TBO capture (need >= 2 requests)
@@ -2037,8 +2180,14 @@ class ModelRunner:
                 )
 
                 # Warmup
+                model_positions = (
+                    self._mrope_positions_view(num_tokens)
+                    if self.use_mrope
+                    else positions[:num_tokens]
+                )
                 model_output = self.model(
-                    input_ids[:num_tokens], positions[:num_tokens]
+                    input_ids[:num_tokens],
+                    model_positions,
                 )
                 if self.use_aux_hidden_state_outputs:
                     outputs[:num_tokens] = model_output[0]
@@ -2066,9 +2215,15 @@ class ModelRunner:
                     else:
                         # Standard single-stream capture
                         graph = torch.cuda.CUDAGraph()
+                        model_positions = (
+                            self._mrope_positions_view(num_tokens)
+                            if self.use_mrope
+                            else positions[:num_tokens]
+                        )
                         with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
                             model_output = self.model(
-                                input_ids[:num_tokens], positions[:num_tokens]
+                                input_ids[:num_tokens],
+                                model_positions,
                             )
                             if self.use_aux_hidden_state_outputs:
                                 outputs[:num_tokens] = model_output[0]

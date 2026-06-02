@@ -204,7 +204,11 @@ def pad_for_all_gather(x: torch.Tensor):
 
 def all_gather_with_padding(x: torch.Tensor):
     padded_x, original_batch_size = pad_for_all_gather(x)
-    gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=0)
+    # use_custom=True routes through CA IPC (outplace_all_gather). Default
+    # use_custom=False falls back to torch.distributed.all_gather_into_tensor
+    # (NCCL), whose WorkNCCL end-event recorded inside CUDAGraph capture is
+    # later queried by the watchdog thread -> hipErrorCapturedEvent crash.
+    gathered_hidden_states = get_dp_group().all_gather(padded_x, use_custom=True, dim=0)
     return gathered_hidden_states, original_batch_size
 
 
@@ -223,6 +227,63 @@ def reduce_scatter_with_unpadding(
         scattered_output = scattered_output[slices]
 
     return scattered_output
+
+
+def all_gatherv(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
+    return group.device_communicator.all_gatherv(x, dim=0, sizes=list(sizes))
+
+
+def reduce_scatterv(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
+    return group.device_communicator.reduce_scatterv(x, dim=0, sizes=list(sizes))
+
+
+def dp_gather_hidden_and_router(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    dp_eager_mode: bool,
+    ctx,
+    dp_group,
+):
+    """All-gather ``hidden_states`` + ``router_logits`` across DP ranks.
+
+    - **Eager (variable-length) mode**: per-rank token counts may differ, so
+      we ``all_gatherv`` with per-rank sizes. Both tensors are concatenated
+      along the last dim and gathered in a single collective to avoid the
+      cost of two separate rounds (caller splits them back out).
+    - **Uniform mode** (DP-decode-only / CUDAGraph path): every rank has the
+      same token count, so a plain padded ``all_gather`` per tensor is
+      enough.
+
+    Returns ``(hidden_states, router_logits, original_hidden_size, sizes)``;
+    ``sizes`` is non-None only in eager mode (needed later for
+    ``reduce_scatterv``).
+    """
+    if dp_eager_mode:
+        sizes = ctx.dp_metadata.get_sizes_across_dp()
+        original_hidden_size = hidden_states.shape[0]
+        h_dim = hidden_states.shape[-1]
+        r_dim = router_logits.shape[-1]
+        r_dtype = router_logits.dtype
+        # Cast router_logits to hidden_states.dtype for the single fused
+        # gather; cast back after split. (all_gatherv requires uniform dtype.)
+        r_for_gather = (
+            router_logits
+            if r_dtype == hidden_states.dtype
+            else router_logits.to(hidden_states.dtype)
+        )
+        combined = torch.cat([hidden_states, r_for_gather], dim=-1)
+        combined = all_gatherv(combined, sizes, dp_group)
+        hidden_states, router_logits = combined.split([h_dim, r_dim], dim=-1)
+        hidden_states = hidden_states.contiguous()
+        if router_logits.dtype != r_dtype:
+            router_logits = router_logits.to(r_dtype)
+        else:
+            router_logits = router_logits.contiguous()
+        return hidden_states, router_logits, original_hidden_size, sizes
+
+    hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
+    router_logits, _ = all_gather_with_padding(router_logits)
+    return hidden_states, router_logits, original_hidden_size, None
 
 
 @torch_compile_guard()
@@ -1204,7 +1265,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=expert_map,
+                expert_mask=layer.expert_mask,
                 activation=activation,
                 quant_type=self.quant_type,
                 w1_scale=layer.w13_weight_scale,
@@ -1510,21 +1571,12 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale = atom_parameter(max_w13_scales)
 
         # Shuffle weights for asm moe (moved from inference to load time for better performance).
-        # For per_1x128 blockscale (block_quant), only shuffle when the preshuffle GEMM
-        # path is enabled — the non-preshuffle kernel expects the un-shuffled layout.
-        skip_shuffle_for_block = (
-            self.block_quant and not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-        )
-        if (
-            w13.dtype
-            in [
-                torch.int8,
-                torch.uint8,
-                torch.float8_e4m3fnuz,
-                torch.float8_e4m3fn,
-            ]
-            and not skip_shuffle_for_block
-        ):
+        if w13.dtype in [
+            torch.int8,
+            torch.uint8,
+            torch.float8_e4m3fnuz,
+            torch.float8_e4m3fn,
+        ]:
             from aiter.ops.shuffle import shuffle_weight
 
             w13.data = shuffle_weight(w13.data)
@@ -1835,11 +1887,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = atom_parameter(layer.w2_weight.data)
             layer.w2_weight_scale = atom_parameter(layer.w2_weight_scale.data)
 
-        # per_1x128 blockscale MoE only needs weight bpreshuffle when the
-        # preshuffle GEMM path is enabled. Skip it to match the non-preshuffle
-        # kernel's expected weight layout.
-        if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
-            shuffle_weights(layer.w13_weight, layer.w2_weight)
+        shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_channel_quant(self, layer: nn.Module) -> None:
         """PTPTC"""
@@ -2137,6 +2185,8 @@ class FusedMoE(torch.nn.Module):
             tp_size, dp_size, atom_config
         )
         self.global_num_experts = num_experts
+        self.register_buffer("expert_map", None, persistent=False)
+        self.register_buffer("expert_mask", None, persistent=False)
         if self.use_ep:
             self.local_num_experts, self.expert_map = determine_expert_map(
                 ep_size=self.ep_size,
@@ -2145,7 +2195,6 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             self.local_num_experts = self.global_num_experts
-            self.expert_map = None
         self.top_k = top_k
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
@@ -2163,11 +2212,11 @@ class FusedMoE(torch.nn.Module):
             if config is not None and atom_config.torch_dtype != torch.float16
             else 1.0
         )
-        self.expert_mask = None
         if self.use_ep:
             expert_mask = torch.ones(
                 (self.global_num_experts + self.num_fused_shared_experts + 1,),
                 dtype=torch.int32,
+                device=self.expert_map.device,
             )
             expert_mask[-1] = 0
             expert_mask[: self.global_num_experts] = self.expert_map > -1
@@ -2216,8 +2265,6 @@ class FusedMoE(torch.nn.Module):
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
-
-        self.use_chunked = get_dp_group().world_size > 1
 
         moe = FusedMoEConfig(
             num_experts=self.global_num_experts,
@@ -3112,6 +3159,7 @@ class FusedMoE(torch.nn.Module):
         # 2. DP attention + EP mori Moe
         # 3. DP attention + TP All_gahter/reduce Moe
         original_hidden_size = None
+        sizes = None
         # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
         use_dp_gather_scatter = (
             self.dp_size > 1
@@ -3119,6 +3167,10 @@ class FusedMoE(torch.nn.Module):
             and get_current_atom_config().enable_dp_attention
         )
         if use_dp_gather_scatter:
+            ctx = get_forward_context()
+            dp_group = get_dp_group()
+            dp_eager_mode = not ctx.context.dp_uniform_decode
+
             from atom.utils.tbo.ubatching import tbo_active
 
             _tbo = tbo_active()
@@ -3130,8 +3182,16 @@ class FusedMoE(torch.nn.Module):
                 )
 
                 tbo_yield_and_switch_from_compute_to_comm()
-            hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
-            router_logits, _ = all_gather_with_padding(router_logits)
+
+            (
+                hidden_states,
+                router_logits,
+                original_hidden_size,
+                sizes,
+            ) = dp_gather_hidden_and_router(
+                hidden_states, router_logits, dp_eager_mode, ctx, dp_group
+            )
+
             if _tbo:
                 tbo_switch_to_compute_sync()
 
@@ -3160,9 +3220,14 @@ class FusedMoE(torch.nn.Module):
         if use_dp_gather_scatter:
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
-            final_hidden_states = reduce_scatter_with_unpadding(
-                final_hidden_states, original_hidden_size
-            )
+            if dp_eager_mode:
+                final_hidden_states = reduce_scatterv(
+                    final_hidden_states, sizes, dp_group
+                )
+            else:
+                final_hidden_states = reduce_scatter_with_unpadding(
+                    final_hidden_states, original_hidden_size
+                )
             if _tbo:
                 tbo_yield_and_switch_from_comm_to_compute()
 
@@ -3181,12 +3246,11 @@ class FusedMoE(torch.nn.Module):
         hidden_states_scale: torch.Tensor = None,
     ):
         assert self.quant_method is not None
-        # cuda graph not supported forward with combine and dispatch
-        if self.use_chunked:
+
+        if get_dp_group().world_size > 1:
             return self.forward_impl_graph(
                 hidden_states, router_logits, hidden_states_scale=hidden_states_scale
             )
-            # return self.forward_impl_chunked(hidden_states, router_logits)
 
         dp_group = get_dp_group()
         if dp_group.world_size > 1:

@@ -2,7 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Type
+from dataclasses import dataclass
+from typing import List, Optional, Type
 
 import numpy as np
 import torch
@@ -30,6 +31,36 @@ from .backends import AttentionBackend, CommonAttentionBuilder
 logger = logging.getLogger("atom")
 
 
+@dataclass
+class MLAChunkContextMetadata:
+    """Per-chunk slices of the cached prefix for chunked MLA prefill.
+
+    Built host-side in `AiterMLAMetadataBuilder.prepare_prefill` when the
+    cached prefix exceeds `config.attn_prefill_chunk_size`. The forward iterates
+    these chunks instead of materializing the full `total_kv × heads × dim`
+    k/v tensors (which OOM on long contexts).
+
+    Each list entry [c] holds the chunk-c data:
+      kv_indptr[c]:   [bs+1] cumulative chunk-local block range per seq
+      kv_indices[c]:  [sum_chunk_blocks] physical block ids for this chunk
+      cu_seqlens_k[c]: [bs+1] cumulative chunk-local token counts per seq
+      total_tokens[c]: int — sum of per-seq chunk lengths
+      max_seqlen_k[c]: int — max per-seq chunk length
+
+    `k_workspace` / `v_workspace` are shared across chunks (overwritten each
+    iteration); only `[:total_tokens[c]]` is valid for chunk c.
+    """
+
+    kv_indptr: List[torch.Tensor]
+    kv_indices: List[torch.Tensor]
+    cu_seqlens_k: List[torch.Tensor]
+    total_tokens: List[int]
+    max_seqlen_k: List[int]
+    num_chunks: int
+    k_workspace: torch.Tensor
+    v_workspace: torch.Tensor
+
+
 def cdiv(a, b):
     return (a + b - 1) // b
 
@@ -53,7 +84,6 @@ class AiterMLABackend(AttentionBackend):
     default_base_class=CommonAttentionBuilder
 )
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
-
     def __init__(self, model_runner):
         self.block_size = 1
         CommonAttentionBuilder.__init__(self, model_runner)
@@ -138,6 +168,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             mla_metadata["sparse_kv_last_page_lens"].np[:] = 1
             mla_metadata["sparse_kv_last_page_lens"].copy_to_gpu()
+            self._sparse_kv_indices_gpu = torch.empty(
+                self.max_num_batched_tokens * self.index_topk,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         if self.is_sparse and max_seqlen_qo > 1:
             # Allocate a second set of persistent work buffers for sparse MTP
@@ -180,7 +215,57 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.model_runner.forward_vars.update(mla_metadata)
 
+        # Chunked-context workspaces for the prefill has_cached path. Sized
+        # to config.attn_prefill_chunk_size (defaults to max_num_batched_tokens)
+        # so peak memory is bounded regardless of total context length.
+        # Allocated outside any per-step scope so a single buffer is shared
+        # across all chunks and layers.
+        self.attn_prefill_chunk_size = config.attn_prefill_chunk_size
+        self.k_chunk_workspace: Optional[torch.Tensor] = None
+        self.v_chunk_workspace: Optional[torch.Tensor] = None
+        if self.attn_prefill_chunk_size > 0:
+            qk_head_dim = hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim
+            v_head_dim = hf_config.v_head_dim
+            model_dtype = config.torch_dtype
+            self.k_chunk_workspace = torch.empty(
+                (
+                    self.attn_prefill_chunk_size,
+                    self.num_attention_heads,
+                    qk_head_dim,
+                ),
+                dtype=model_dtype,
+                device=self.device,
+            )
+            self.v_chunk_workspace = torch.empty(
+                (
+                    self.attn_prefill_chunk_size,
+                    self.num_attention_heads,
+                    v_head_dim,
+                ),
+                dtype=model_dtype,
+                device=self.device,
+            )
+            mib = (
+                self.k_chunk_workspace.numel() * self.k_chunk_workspace.element_size()
+                + self.v_chunk_workspace.numel() * self.v_chunk_workspace.element_size()
+            ) / (1024 * 1024)
+            logger.info(
+                "Allocated MLA chunked-prefill workspaces: "
+                "k%s v%s (%.1f MiB total, dtype=%s)",
+                tuple(self.k_chunk_workspace.shape),
+                tuple(self.v_chunk_workspace.shape),
+                mib,
+                model_dtype,
+            )
+
         if self.is_sparse:
+            sfc = config.compilation_config.static_forward_context
+            for module in sfc.values():
+                if hasattr(module, "sparse_kv_indices_buffer"):
+                    module.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
+                impl = getattr(module, "impl", None)
+                if impl is not None and hasattr(impl, "sparse_kv_indices_buffer"):
+                    impl.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
             self._token_to_seq_idxs_gpu = torch.zeros(
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
@@ -249,12 +334,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.max_num_blocks_per_seq // self.block_ratio,
                 **i32_kwargs,
             )
-            if self.block_ratio > 1:
-                var[f"{p}block_tables_converted"] = CpuGpuBuffer(
-                    ub_max_bs,
-                    self.max_num_blocks_per_seq,
-                    **i32_kwargs,
-                )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
                 torch.arange(
@@ -447,6 +526,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         bs: int,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        positions: torch.Tensor,  # [total_tokens] int32
         only_update: bool = False,
         num_reject_tokens: torch.Tensor = None,
     ):
@@ -587,6 +667,47 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             v_scale=None,
         )
 
+    def get_kv_transfer_tensors(self):
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferRegion,
+            KVTransferTensors,
+        )
+
+        runner = self.model_runner
+        if not hasattr(runner, "kv_cache"):
+            return None
+
+        block_regions: list[KVTransferRegion] = []
+        num_layers = runner.kv_cache.shape[0]
+        for layer_id in range(num_layers):
+            t = runner.kv_cache[layer_id]
+            bpb = t.stride(0) * t.element_size()
+            block_regions.append(
+                KVTransferRegion(
+                    base_addr=t.data_ptr(),
+                    total_bytes=t.numel() * t.element_size(),
+                    unit_bytes=bpb,
+                )
+            )
+
+        if hasattr(runner, "index_cache"):
+            for layer_id in range(runner.index_cache.shape[0]):
+                t = runner.index_cache[layer_id]
+                bpb = t.stride(0) * t.element_size()
+                block_regions.append(
+                    KVTransferRegion(
+                        base_addr=t.data_ptr(),
+                        total_bytes=t.numel() * t.element_size(),
+                        unit_bytes=bpb,
+                    )
+                )
+
+        return KVTransferTensors(
+            block_regions=block_regions,
+            slot_regions=[],
+            num_blocks=runner.num_physical_kvcache_blocks,
+        )
+
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
         bs = batch.total_seqs_num_prefill
@@ -662,10 +783,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
 
-            # kv_indices_generate_triton expects RAW block_tables (physical block ids,
-            # one per block_ratio tokens). When is_sparse, attn_metadata.block_tables
-            # may have been overwritten with block_tables_converted (slot per token).
-            # Always use raw block_tables for kv_indices.
+            # kv_indices_generate_triton expects logical block_tables (one entry
+            # per block_ratio tokens). Re-copy from var to get a fresh logical
+            # snapshot independent of attn_metadata.block_tables sharing.
             self.prepare_block_tables(batch)
             block_tables_for_kv = var["block_tables"].copy_to_gpu(bs)
             kv_indices_generate_triton(
@@ -676,8 +796,109 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.max_seqlen_k,
             )
 
+            # Build chunked-context metadata when enabled AND the cached
+            # prefix is large enough to risk OOM in the single-pass path.
+            # The non-cached new-tokens portion is handled separately by the
+            # forward (self-attention via kv_b_proj), so chunks span only the
+            # cached prefix.
+            if (
+                self.attn_prefill_chunk_size > 0
+                and attn_metadata.has_cached
+                and attn_metadata.total_kv > self.attn_prefill_chunk_size
+            ):
+                attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta(batch, bs)
+
         attn_metadata.dtype_q = self.dtype_q
         return attn_metadata, positions
+
+    def _build_mla_chunk_meta(
+        self, batch: ScheduledBatch, bs: int
+    ) -> Optional[MLAChunkContextMetadata]:
+        """Build per-chunk slices of the cached prefix.
+
+        Chunks the cached-prefix tokens along the GLOBAL token axis (not the
+        per-seq axis). Per-chunk total token count ≤ `attn_prefill_chunk_size`,
+        which is what the k/v workspace is sized for. Each chunk c contains a
+        contiguous slice of the concatenated per-seq slot list; per-seq
+        contributions to chunk c are the intersection of seq i's slot range
+        with [c*K, (c+1)*K).
+
+        Seqs with 0 contribution to a chunk emit empty k for that seq —
+        flash_attn returns lse=-inf which merge_attn_states handles correctly
+        (the prefix output for that seq is preserved unchanged).
+        """
+        chunk_size = self.attn_prefill_chunk_size
+        runner_bs = self.model_runner.block_size
+
+        cached_lens = np.asarray(batch.num_cached_tokens[:bs], dtype=np.int64)
+        total_cached = int(cached_lens.sum())
+        if total_cached == 0:
+            return None
+        num_chunks = (total_cached + chunk_size - 1) // chunk_size
+
+        # Per-seq absolute slot id for every cached token, in seq order, then
+        # concatenated into a single global slot array of length total_cached.
+        per_seq_slots: List[np.ndarray] = []
+        for i in range(bs):
+            cached_len = int(cached_lens[i])
+            if cached_len == 0:
+                per_seq_slots.append(np.empty(0, dtype=np.int32))
+                continue
+            block_ids = np.asarray(batch.block_tables[i], dtype=np.int64)
+            needed_blocks = (cached_len + runner_bs - 1) // runner_bs
+            block_ids = block_ids[:needed_blocks]
+            base = block_ids[:, None] * runner_bs
+            offsets = np.arange(runner_bs, dtype=np.int64)[None, :]
+            slots = (base + offsets).reshape(-1)[:cached_len].astype(np.int32)
+            per_seq_slots.append(slots)
+        global_slots = (
+            np.concatenate(per_seq_slots) if bs > 0 else np.empty(0, np.int32)
+        )
+        seq_offsets = np.zeros(bs + 1, dtype=np.int64)
+        np.cumsum(cached_lens, out=seq_offsets[1:])
+
+        kv_indptr_list: List[torch.Tensor] = []
+        kv_indices_list: List[torch.Tensor] = []
+        cu_seqlens_k_list: List[torch.Tensor] = []
+        total_tokens_list: List[int] = []
+        max_seqlen_k_list: List[int] = []
+
+        for c in range(num_chunks):
+            g_start = c * chunk_size
+            g_end = min(g_start + chunk_size, total_cached)
+            # Per-seq contribution: intersect [seq_offsets[i], seq_offsets[i+1])
+            # with [g_start, g_end).
+            seq_lo = np.maximum(seq_offsets[:bs], g_start)
+            seq_hi = np.minimum(seq_offsets[1 : bs + 1], g_end)
+            per_seq_chunk_lens = np.maximum(seq_hi - seq_lo, 0).astype(np.int32)
+            chunk_indices = global_slots[g_start:g_end].astype(np.int32, copy=False)
+            cu = np.zeros(bs + 1, dtype=np.int32)
+            np.cumsum(per_seq_chunk_lens, out=cu[1:])
+            total_tokens = int(cu[-1])
+            # cu doubles as gather_kv_b_proj kv_indptr (block_size=1 → block
+            # indptr == token indptr) and flash_attn cu_seqlens_k.
+            kv_indptr_list.append(
+                torch.from_numpy(cu).pin_memory().to(self.device, non_blocking=True)
+            )
+            kv_indices_list.append(
+                torch.from_numpy(chunk_indices)
+                .pin_memory()
+                .to(self.device, non_blocking=True)
+            )
+            cu_seqlens_k_list.append(kv_indptr_list[-1])  # same tensor
+            total_tokens_list.append(total_tokens)
+            max_seqlen_k_list.append(int(per_seq_chunk_lens.max(initial=0)))
+
+        return MLAChunkContextMetadata(
+            kv_indptr=kv_indptr_list,
+            kv_indices=kv_indices_list,
+            cu_seqlens_k=cu_seqlens_k_list,
+            total_tokens=total_tokens_list,
+            max_seqlen_k=max_seqlen_k_list,
+            num_chunks=num_chunks,
+            k_workspace=self.k_chunk_workspace,
+            v_workspace=self.v_chunk_workspace,
+        )
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
@@ -1101,11 +1322,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if self.is_sparse
                 else None
             ),
-            block_tables_converted=(
-                var[f"{p}block_tables_converted"].gpu[:padded_bs]
-                if f"{p}block_tables_converted" in var
-                else None
-            ),
             work_meta_data=var[f"{p}work_meta_data"],
             work_info_set=var[f"{p}work_info_set"],
             work_indptr=var[f"{p}work_indptr"],
@@ -1121,10 +1337,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata: AttentionMetaData,
         ub_slice,
         padded_bs: int,
+        ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         """
         Split prefill AttentionMetaData for MLA.
         """
+        del ubatch_idx  # MLA has no per-ubatch pooled buffers to disambiguate
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)

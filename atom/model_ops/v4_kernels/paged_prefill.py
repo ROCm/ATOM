@@ -44,11 +44,19 @@ Numerics: identical online-softmax + sink finalization to
 (then equivalent to a decode call with the same prefix indices).
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
+
+from atom.utils import envs
+
+try:
+    from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
+
+    _HAS_OPUS = True
+except ImportError:
+    pa_sparse_prefill_opus = None
+    _HAS_OPUS = False
 
 
 @triton.jit
@@ -361,7 +369,10 @@ def sparse_attn_v4_paged_prefill(
     Returns:
       out: [T, H, D] same dtype as q.
     """
-    if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
+    # Backend selection: OPUS (gfx950) is the default; set
+    # `ATOM_FORCE_ATTN_TRITON=1` to fall back to the Triton kernel. When the
+    # OPUS module isn't importable on this build, we silently use Triton.
+    if envs.ATOM_FORCE_ATTN_TRITON or not _HAS_OPUS:
         return _sparse_attn_v4_paged_prefill_triton(
             q,
             unified_kv,
@@ -373,7 +384,7 @@ def sparse_attn_v4_paged_prefill(
             attn_sink,
             softmax_scale,
         )
-    return sparse_attn_v4_paged_prefill_reference(
+    return pa_sparse_prefill_opus(
         q,
         unified_kv,
         kv_indices_prefix,

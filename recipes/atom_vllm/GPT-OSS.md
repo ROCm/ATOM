@@ -20,8 +20,12 @@ vllm serve openai/gpt-oss-120b \
     --host localhost \
     --port 8000 \
     --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.5 \
     --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --tensor-parallel-size 1 \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --no-enable-prefix-caching
 ```
@@ -30,15 +34,21 @@ vllm serve openai/gpt-oss-120b \
 Users can use the default vllm bench commands for performance benchmarking.
 ```bash
 vllm bench serve \
-    --host localhost \
-    --port 8000 \
+    --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --endpoint /v1/completions \
     --model openai/gpt-oss-120b \
     --dataset-name random \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.8 \
-    --max-concurrency 64 \
-    --num-prompts 640 \
+    --random-input-len 1000 \
+    --random-output-len 100 \
+    --max-concurrency 4 \
+    --num-prompts 40 \
+    --trust_remote_code \
+    --num-warmups 8 \
+    --request-rate inf \
+    --ignore-eos \
+    --disable-tqdm \
+    --save-result \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 
@@ -53,8 +63,16 @@ profiler_config=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_p
 ## Step 4: Accuracy Validation
 
 ```bash
-lm_eval --model local-completions \
-        --model_args model=openai/gpt-oss-120b,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+lm_eval --model local-chat-completions --apply_chat_template \
+        --model_args model=openai/gpt-oss-120b,base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False \
         --tasks gsm8k \
         --num_fewshot 3
+```
+
+Here is the reference value:
+```bash
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value|   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|----:|---|-----:|
+|gsm8k|      3|flexible-extract|     3|exact_match|↑  | 0.88|±  |0.0088|
+|     |       |strict-match    |     3|exact_match|↑  | 0.31|±  |0.0128|
 ```

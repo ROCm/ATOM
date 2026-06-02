@@ -9,96 +9,302 @@ on:
     # from") as the ATOM branch selector, so users do not need to type branch
     # names.
     inputs:
-      run_qwen3_moe_tp8:
-        description: "Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8"
-        required: false
-        type: boolean
-        default: false
-      run_qwen3_next_80b_tp1:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1"
-        required: false
-        type: boolean
-        default: false
-      run_qwen3_next_80b_tp4:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_qwen3_next_80b_mtp_tp4:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_fp8_tp8:
-        description: "Qwen3.5-397B-A17B-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_tp8:
-        description: "Qwen3.5-397B-A17B TP8"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_fp4_tp4:
-        description: "Qwen3.5-397B-A17B-MXFP4 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_llama405_fp8_tp8:
-        description: "Meta-Llama-3.1-405B-Instruct-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_llama8_tp1:
-        description: "Llama-3.1-8B-Instruct TP1"
-        required: false
-        type: boolean
-        default: false
-      run_kimi_k2_tp8:
-        description: "Kimi-K2-Thinking-MXFP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_kimi_k25_tp8:
-        description: "Kimi-K2.5-MXFP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp8_tp8:
-        description: "DeepSeek-R1-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp4_tp8:
-        description: "DeepSeek-R1-0528-MXFP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsv32_fp8_tp8:
-        description: "DeepSeek-V3.2-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_gpt_oss_120b_tp1:
-        description: "gpt-oss-120b TP1"
-        required: false
-        type: boolean
-        default: false
-      run_gpt_oss_120b_tp2:
-        description: "gpt-oss-120b TP2"
-        required: false
-        type: boolean
-        default: false
-      run_glm4_7_fp8_mtp_tp8:
-        description: "GLM-4.7-FP8 MTP TP8"
-        required: false
-        type: boolean
-        default: false
-      run_glm5_1_fp8_tp8:
-        description: "GLM-5.1-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
+      model_slot_1:
+        description: "Manual selection slot 1: choose an accuracy model case."
+        type: choice
+        default: none
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
+      model_slot_2:
+        description: "Manual selection slot 2: choose an accuracy model case."
+        type: choice
+        default: none
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
+      model_slot_3:
+        description: "Manual selection slot 3: choose an accuracy model case."
+        type: choice
+        default: none
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
+      model_slot_4:
+        description: "Manual selection slot 4: choose an accuracy model case."
+        type: choice
+        default: none
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
+      model_slot_5:
+        description: "Manual selection slot 5: choose an accuracy model case."
+        type: choice
+        default: none
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
+      model_slot_6:
+        description: "Manual selection slot 6: choose an accuracy model case."
+        type: choice
+        default: none
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
+      model_slot_7:
+        description: "Manual selection slot 7: choose an accuracy model case."
+        type: choice
+        default: none
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
+      model_slot_8:
+        description: "Manual selection slot 8: choose an accuracy model case."
+        type: choice
+        default: none
+        options:
+          - none
+          - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
+          - Llama-3.1-8B-Instruct TP1
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V3.2-FP8 TP4
+          - DeepSeek-V3.2-FP8 TP8
+          - DeepSeek-V3.2-FP8 MTP TP4
+          - gpt-oss-120b TP1
+          - gpt-oss-120b TP2
+          - gpt-oss-120b TP8
+          - MiniMax-M2.5 TP2
+          - MiniMax-M2.5 TP4
+          - GLM-4.7-FP8 TP4
+          - GLM-4.7-FP8 TP8
+          - GLM-4.7-FP8 MTP TP4
+          - GLM-4.7-FP8 MTP TP8
+          - GLM-5.1-FP8 TP8
       oot_image:
         description: "Optional atom-vLLM image override. Leave empty to keep the existing nightly/manual build behavior."
         required: false
@@ -128,10 +334,19 @@ jobs:
   prepare-oot-image:
     name: Prepare validation image
     runs-on: build-only-atom
+    permissions:
+      actions: read
+      contents: read
     outputs:
       oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
       cleanup_temp_image: ${{ steps.meta.outputs.cleanup_temp_image }}
-      model_matrix: ${{ steps.meta.outputs.model_matrix }}
+      model_matrix_slot_1: ${{ steps.meta.outputs.model_matrix_slot_1 }}
+      model_matrix_slot_2: ${{ steps.meta.outputs.model_matrix_slot_2 }}
+      model_matrix_slot_3: ${{ steps.meta.outputs.model_matrix_slot_3 }}
+      slot_1_has_models: ${{ steps.meta.outputs.slot_1_has_models }}
+      slot_2_has_models: ${{ steps.meta.outputs.slot_2_has_models }}
+      slot_3_has_models: ${{ steps.meta.outputs.slot_3_has_models }}
+      scheduled_beijing_date: ${{ steps.meta.outputs.scheduled_beijing_date }}
     steps:
       - name: Checkout selected ATOM branch
         uses: actions/checkout@v6
@@ -144,27 +359,64 @@ jobs:
       - name: Resolve image source and model matrix
         id: meta
         env:
-          RUN_QWEN3_MOE_TP8: ${{ inputs.run_qwen3_moe_tp8 }}
-          RUN_QWEN3_NEXT_80B_TP1: ${{ inputs.run_qwen3_next_80b_tp1 }}
-          RUN_QWEN3_NEXT_80B_TP4: ${{ inputs.run_qwen3_next_80b_tp4 }}
-          RUN_QWEN3_NEXT_80B_MTP_TP4: ${{ inputs.run_qwen3_next_80b_mtp_tp4 }}
-          RUN_QWEN35_397B_FP8_TP8: ${{ inputs.run_qwen35_397b_fp8_tp8 }}
-          RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
-          RUN_QWEN35_397B_FP4_TP4: ${{ inputs.run_qwen35_397b_fp4_tp4 }}
-          RUN_LLAMA405_FP8_TP8: ${{ inputs.run_llama405_fp8_tp8 }}
-          RUN_LLAMA8_TP1: ${{ inputs.run_llama8_tp1 }}
-          RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
-          RUN_KIMI_K25_TP8: ${{ inputs.run_kimi_k25_tp8 }}
-          RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
-          RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
-          RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
-          RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
-          RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
-          RUN_GLM4_7_FP8_MTP_TP8: ${{ inputs.run_glm4_7_fp8_mtp_tp8 }}
-          RUN_GLM5_1_FP8_TP8: ${{ inputs.run_glm5_1_fp8_tp8 }}
+          MODEL_SLOT_1: ${{ inputs.model_slot_1 || 'none' }}
+          MODEL_SLOT_2: ${{ inputs.model_slot_2 || 'none' }}
+          MODEL_SLOT_3: ${{ inputs.model_slot_3 || 'none' }}
+          MODEL_SLOT_4: ${{ inputs.model_slot_4 || 'none' }}
+          MODEL_SLOT_5: ${{ inputs.model_slot_5 || 'none' }}
+          MODEL_SLOT_6: ${{ inputs.model_slot_6 || 'none' }}
+          MODEL_SLOT_7: ${{ inputs.model_slot_7 || 'none' }}
+          MODEL_SLOT_8: ${{ inputs.model_slot_8 || 'none' }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
         run: |
           set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            SCHEDULE_CREATED_AT="$(
+              python3 - <<'PY'
+          import json
+          import os
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          token = os.environ.get("GITHUB_TOKEN", "")
+          request = Request(
+              f"{api_url}/repos/{repository}/actions/runs/{run_id}",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "User-Agent": "atom-vllm-accuracy-nightly-priority",
+              },
+          )
+          try:
+              with urlopen(request, timeout=30) as response:
+                  payload = json.load(response)
+          except HTTPError as exc:
+              detail = exc.read().decode("utf-8", errors="replace").strip()
+              raise RuntimeError(
+                  f"Failed to fetch workflow run metadata: HTTP {exc.code} {detail}"
+              ) from exc
+          except URLError as exc:
+              raise RuntimeError(
+                  f"Failed to reach GitHub API for workflow run metadata: {exc}"
+              ) from exc
+
+          created_at = payload.get("created_at")
+          if not created_at:
+              raise RuntimeError("Workflow run metadata did not include created_at")
+          print(created_at)
+          PY
+            )"
+            export SCHEDULE_CREATED_AT
+          else
+            export SCHEDULE_CREATED_AT=""
+          fi
 
           # Keep this Python model list as the single source of truth for OOT
           # full-validation coverage and manual checkbox filtering.
@@ -172,6 +424,7 @@ jobs:
           import json
           import os
           import sys
+          from datetime import datetime, timedelta, timezone
 
           event = os.environ["GITHUB_EVENT_NAME"]
           models = [
@@ -182,7 +435,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --enable-expert-parallel",
                   "accuracy_test_threshold": 0.87,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN3_NEXT_80B_TP1",
@@ -191,7 +444,16 @@ jobs:
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-1",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_QWEN3_NEXT_80B_TP2",
+                  "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP2",
+                  "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 32768 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN3_NEXT_80B_TP4",
@@ -199,8 +461,17 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_QWEN3_NEXT_80B_MTP_TP1",
+                  "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1",
+                  "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+                  "extra_args": "--tensor-parallel-size 1 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+                  "accuracy_test_threshold": 0.80,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN3_NEXT_80B_MTP_TP4",
@@ -208,8 +479,8 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 4 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
                   "accuracy_test_threshold": 0.80,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-4",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_FP8_TP8",
@@ -218,7 +489,16 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_QWEN35_397B_FP8_TP4",
+                  "model_name": "Qwen3.5-397B-A17B-FP8 TP4",
+                  "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_TP8",
@@ -227,7 +507,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_FP4_TP4",
@@ -236,16 +516,16 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_LLAMA405_FP8_TP8",
-                  "model_name": "Meta-Llama-3.1-405B-Instruct-FP8/ TP8",
+                  "model_name": "Meta-Llama-3.1-405B-Instruct-FP8 TP8",
                   "model_path": "Meta-Llama-3.1-405B-Instruct-FP8/",
                   "extra_args": "--tensor-parallel-size 8 --load-format safetensors --allow-deprecated-quantization",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_LLAMA8_TP1",
@@ -254,7 +534,16 @@ jobs:
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.73,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-1",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_KIMI_K2_TP4",
+                  "model_name": "Kimi-K2-Thinking-MXFP4 TP4",
+                  "model_path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.90,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_KIMI_K2_TP8",
@@ -263,7 +552,16 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.90,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_KIMI_K25_TP4",
+                  "model_name": "Kimi-K2.5-MXFP4 TP4",
+                  "model_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_KIMI_K25_TP8",
@@ -272,7 +570,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_DSR1_FP8_TP8",
@@ -281,7 +579,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_DSR1_FP4_TP8",
@@ -290,17 +588,37 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_DSV32_FP8_TP4",
+                  "model_name": "DeepSeek-V3.2-FP8 TP4",
+                  "model_path": "deepseek-ai/DeepSeek-V3.2",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_DSV32_FP8_TP8",
                   "model_name": "DeepSeek-V3.2-FP8 TP8",
                   "model_path": "deepseek-ai/DeepSeek-V3.2",
-                  "extra_args": "--tensor-parallel-size 8 --block-size 1",
+                  "extra_args": "--tensor-parallel-size 8",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_DSV32_FP8_MTP_TP4",
+                  "model_name": "DeepSeek-V3.2-FP8 MTP TP4",
+                  "model_path": "deepseek-ai/DeepSeek-V3.2",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_GPT_OSS_120B_TP1",
@@ -310,7 +628,7 @@ jobs:
                   "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
                   "accuracy_test_threshold": 0.88,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-1",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_GPT_OSS_120B_TP2",
@@ -320,7 +638,62 @@ jobs:
                   "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
                   "accuracy_test_threshold": 0.88,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_GPT_OSS_120B_TP8",
+                  "model_name": "gpt-oss-120b TP8",
+                  "model_path": "openai/gpt-oss-120b",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
+                  "accuracy_test_threshold": 0.88,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_MINIMAX_M25_TP2",
+                  "model_name": "MiniMax-M2.5 TP2",
+                  "model_path": "MiniMaxAI/MiniMax-M2.5",
+                  "extra_args": "--tensor-parallel-size 2 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_MINIMAX_M25_TP4",
+                  "model_name": "MiniMax-M2.5 TP4",
+                  "model_path": "MiniMaxAI/MiniMax-M2.5",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_GLM4_7_FP8_TP4",
+                  "model_name": "GLM-4.7-FP8 TP4",
+                  "model_path": "zai-org/GLM-4.7-FP8",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_GLM4_7_FP8_TP8",
+                  "model_name": "GLM-4.7-FP8 TP8",
+                  "model_path": "zai-org/GLM-4.7-FP8",
+                  "extra_args": "--tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_GLM4_7_FP8_MTP_TP4",
+                  "model_name": "GLM-4.7-FP8 MTP TP4",
+                  "model_path": "zai-org/GLM-4.7-FP8",
+                  "extra_args": "--tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_GLM4_7_FP8_MTP_TP8",
@@ -328,8 +701,8 @@ jobs:
                   "model_path": "zai-org/GLM-4.7-FP8",
                   "extra_args": "--tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
                   "accuracy_test_threshold": 0.92,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-8",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_GLM5_1_FP8_TP8",
@@ -339,21 +712,231 @@ jobs:
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.88,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-plugin-acc-validation-runner",
               },
           ]
 
-          selected = []
+          BENCHMARK_OVERRIDES = {
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+              },
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP2": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 32768 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+              },
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+              },
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+              },
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+              },
+              "Qwen3.5-397B-A17B-FP8 TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+              },
+              "Qwen3.5-397B-A17B-FP8 TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+              },
+              "Qwen3.5-397B-A17B TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+              },
+              "Kimi-K2-Thinking-MXFP4 TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+              "Kimi-K2-Thinking-MXFP4 TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+              "Kimi-K2.5-MXFP4 TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+              "Kimi-K2.5-MXFP4 TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+              "DeepSeek-R1-FP8 TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+              "DeepSeek-R1-0528-MXFP4 TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+              "DeepSeek-V3.2-FP8 TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "",
+              },
+              "DeepSeek-V3.2-FP8 TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "",
+              },
+              "DeepSeek-V3.2-FP8 MTP TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
+                  "env_vars": "",
+              },
+              "gpt-oss-120b TP1": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+              },
+              "gpt-oss-120b TP2": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 2 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+              },
+              "gpt-oss-120b TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+              },
+              "MiniMax-M2.5 TP2": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 2 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+              },
+              "MiniMax-M2.5 TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+              },
+              "GLM-4.7-FP8 TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+              "GLM-4.7-FP8 TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+              "GLM-4.7-FP8 MTP TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+              "GLM-4.7-FP8 MTP TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+              "GLM-5.1-FP8 TP8": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}' --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+              },
+          }
+
+          P0_MODELS = {
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4",
+              "Kimi-K2.5-MXFP4 TP4",
+              "gpt-oss-120b TP1",
+              "MiniMax-M2.5 TP2",
+              "DeepSeek-V3.2-FP8 TP4",
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1",
+              "GLM-4.7-FP8 TP8",
+              "GLM-4.7-FP8 MTP TP4",
+              "GLM-4.7-FP8 MTP TP8",
+          }
+          P1_MODELS = {
+              "GLM-4.7-FP8 TP4",
+              "Kimi-K2.5-MXFP4 TP8",
+              "Kimi-K2-Thinking-MXFP4 TP4",
+              "Kimi-K2-Thinking-MXFP4 TP8",
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
+              "DeepSeek-V3.2-FP8 TP8",
+              "DeepSeek-R1-FP8 TP8",
+              "DeepSeek-R1-0528-MXFP4 TP8",
+              "gpt-oss-120b TP2",
+              "gpt-oss-120b TP8",
+              "MiniMax-M2.5 TP4",
+          }
+
+          def priority_for(model_name):
+              if "MTP" in model_name or model_name in P0_MODELS:
+                  return "P0"
+              if model_name in P1_MODELS:
+                  return "P1"
+              return "P2"
+
           for model in models:
-              enabled = event != "workflow_dispatch" or os.environ.get(model["toggle_env"], "").lower() == "true"
-              if enabled:
-                  selected.append({k: v for k, v in model.items() if k != "toggle_env"})
+              model.update(BENCHMARK_OVERRIDES.get(model["model_name"], {}))
+              model["priority"] = priority_for(model["model_name"])
+
+          def matrix_entry(model):
+              return {k: v for k, v in model.items() if k != "toggle_env"}
+
+          selected = []
+          if event == "workflow_dispatch":
+              by_name = {model["model_name"]: model for model in models}
+              seen = set()
+              for slot_idx in range(1, 9):
+                  label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
+                  if not label or label == "none":
+                      continue
+                  if label not in by_name:
+                      print(
+                          f"Unknown model_slot_{slot_idx} selection: {label}",
+                          file=sys.stderr,
+                      )
+                      print("Available model_name values:", file=sys.stderr)
+                      for name in by_name:
+                          print(f" - {name}", file=sys.stderr)
+                      sys.exit(1)
+                  if label in seen:
+                      continue
+                  selected.append(matrix_entry(by_name[label]))
+                  seen.add(label)
+          else:
+              selected = [matrix_entry(model) for model in models]
 
           if event == "workflow_dispatch" and not selected:
-              print("No models selected for manual run.", file=sys.stderr)
+              print(
+                  "No models selected for manual run. Choose at least one model_slot value.",
+                  file=sys.stderr,
+              )
               sys.exit(1)
 
-          print(f"model_matrix={json.dumps({'include': selected})}")
+          beijing_tz = timezone(timedelta(hours=8))
+          validation_beijing_now = os.environ.get("VALIDATION_BEIJING_NOW", "")
+          if validation_beijing_now:
+              beijing_now = datetime.fromisoformat(validation_beijing_now)
+              if beijing_now.tzinfo is None:
+                  beijing_now = beijing_now.replace(tzinfo=beijing_tz)
+              else:
+                  beijing_now = beijing_now.astimezone(beijing_tz)
+          elif event == "schedule":
+              created_at = os.environ.get("SCHEDULE_CREATED_AT", "")
+              if not created_at:
+                  raise SystemExit(
+                      "Scheduled validation requires workflow run created_at metadata."
+                  )
+              beijing_now = datetime.fromisoformat(
+                  created_at.replace("Z", "+00:00")
+              ).astimezone(beijing_tz)
+          else:
+              beijing_now = datetime.now(timezone.utc).astimezone(beijing_tz)
+
+          if event == "schedule":
+              run_date = beijing_now.date().isoformat()
+          else:
+              run_date = ""
+
+          order = ("P1", "P0", "P2")
+          if event != "schedule" or beijing_now.weekday() < 5:
+              order = ("P0", "P1", "P2")
+
+          priority_slots = {priority: [] for priority in ("P0", "P1", "P2")}
+          for model in selected:
+              priority_slots[model["priority"]].append(model)
+
+          for slot_idx, priority in enumerate(order, start=1):
+              matrix = {"include": priority_slots[priority]}
+              print(f"model_matrix_slot_{slot_idx}={json.dumps(matrix, separators=(',', ':'))}")
+              print(f"slot_{slot_idx}_has_models={'true' if priority_slots[priority] else 'false'}")
+              print(f"slot_{slot_idx}_priority={priority}")
+          print(f"scheduled_beijing_date={run_date}")
           PY
 
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
@@ -461,45 +1044,139 @@ jobs:
           docker rmi "${{ steps.meta.outputs.oot_image_tag }}" || true
           docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
 
-  oot-model-accuracy:
-    name: Model Accuracy (${{ matrix.model_name }})
+  oot-model-accuracy-priority-1:
+    name: Model Accuracy ${{ matrix.priority }} (${{ matrix.model_name }})
     needs: [prepare-oot-image]
+    if: ${{ needs.prepare-oot-image.outputs.slot_1_has_models == 'true' }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare-oot-image.outputs.model_matrix) }}
+      matrix: ${{ fromJSON(needs.prepare-oot-image.outputs.model_matrix_slot_1) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     permissions:
       actions: read
       contents: write
     env:
-      CONTAINER_NAME: atom_vllm_oot_validation_${{ strategy.job-index }}
+      CONTAINER_NAME: atom_vllm_oot_validation_${{ matrix.priority }}_${{ strategy.job-index }}
       OOT_IMAGE_TAG: ${{ needs.prepare-oot-image.outputs.oot_image_tag }}
-    steps:
+    steps: &oot-model-accuracy-steps
+      - name: Check validation date window
+        id: validation-window
+        env:
+          SCHEDULED_BEIJING_DATE: ${{ needs.prepare-oot-image.outputs.scheduled_beijing_date }}
+          MIN_REMAINING_MINUTES: "150"
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" != "schedule" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "reason=manual run" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from datetime import datetime, timedelta, timezone
+
+          beijing_tz = timezone(timedelta(hours=8))
+          now = datetime.now(timezone.utc).astimezone(beijing_tz)
+          scheduled_date = os.environ.get("SCHEDULED_BEIJING_DATE", "")
+          min_remaining_minutes = int(os.environ.get("MIN_REMAINING_MINUTES", "150"))
+          current_date = now.date().isoformat()
+          end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
+          remaining_minutes = int((end_of_day - now).total_seconds() // 60)
+
+          should_run = (
+              current_date == scheduled_date
+              and remaining_minutes >= min_remaining_minutes
+          )
+          print(f"should_run={'true' if should_run else 'false'}")
+          print(f"current_beijing_date={current_date}")
+          print(f"remaining_minutes={remaining_minutes}")
+          if current_date != scheduled_date:
+              print(
+                  f"reason=scheduled date {scheduled_date} no longer matches current Beijing date {current_date}"
+              )
+          elif remaining_minutes < min_remaining_minutes:
+              print(
+                  f"reason=only {remaining_minutes} Beijing-day minutes remain, below required {min_remaining_minutes}"
+              )
+          else:
+              print("reason=same Beijing day with enough time remaining")
+          PY
+
+          echo "Validation window check:"
+          echo "- should_run=$(sed -n 's/^should_run=//p' "$GITHUB_OUTPUT")"
+          echo "- reason=$(sed -n 's/^reason=//p' "$GITHUB_OUTPUT")"
+
+      - name: Detect container engine
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
+        run: |
+          if command -v podman > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
+            echo "Container engine: podman"
+          elif docker info > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
+            echo "Container engine: docker"
+          else
+            echo "ERROR: Neither docker nor podman is available on this runner."
+            exit 1
+          fi
+
       - name: Checkout ATOM repo
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         uses: actions/checkout@v6
 
       - name: Docker Login
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+          REG="${OOT_IMAGE_TAG%%/*}"
+          if [[ "$REG" != *.* && "$REG" != localhost* && "$REG" != *:* ]]; then
+            REG="docker.io"
+          fi
+          echo "Logging in to registry: ${REG}"
+          echo "${{ secrets.DOCKER_PASSWORD }}" | $CONTAINER_ENGINE login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
       - name: Set HF_TOKEN
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Pull OOT image
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          docker pull "${OOT_IMAGE_TAG}"
+          set -euo pipefail
+          IMG="${OOT_IMAGE_TAG}"
+          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+            if [[ "${IMG}" != */* ]]; then
+              IMG="docker.io/library/${IMG}"
+            else
+              reg="${IMG%%/*}"
+              if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
+                IMG="docker.io/${IMG}"
+              fi
+            fi
+          fi
+          echo "OOT_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+          echo "Pulling OOT image: ${IMG} (workflow tag: ${OOT_IMAGE_TAG})"
+          $CONTAINER_ENGINE pull "${IMG}"
 
       - name: Prepare model cache mount
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-
-          if [ -d "/models" ]; then
+          if [ -d "/shared/data/amd_int/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared/data/amd_int/models:/models"
+            MODEL_CACHE_DESC="/shared/data/amd_int/models (shared host path)"
+          elif [ -d "/it-share/models" ]; then
+            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
+            MODEL_CACHE_DESC="/it-share/models (shared host path)"
+          elif [ -d "/models" ]; then
             MODEL_CACHE_MOUNT="-v /models:/models"
-            MODEL_CACHE_DESC="/models (host mount)"
+            MODEL_CACHE_DESC="/models (shared host path)"
+          elif [ -d "/data/models" ]; then
+            MODEL_CACHE_MOUNT="-v /data/models:/models"
+            MODEL_CACHE_DESC="/data/models (shared host path)"
           else
-            echo "Warning: /models directory not found on runner; using container-local /models."
+            echo "No shared host model cache found; using container-local /models."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -507,14 +1184,16 @@ jobs:
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
       - name: Clean up old containers
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          containers=$(docker ps -q)
+          containers=$($CONTAINER_ENGINE ps -q)
           if [ -n "$containers" ]; then
-            docker kill $containers || true
+            $CONTAINER_ENGINE kill $containers || true
           fi
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
       - name: Start validation container
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
@@ -525,16 +1204,19 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          cat > /tmp/oot_env_file.txt << 'EOF'
-          ${{ matrix.env_vars }}
-          EOF
+          {
+            printf '%s\n' "${{ matrix.env_vars }}"
+            printf '%s\n' \
+              "AITER_LOG_LEVEL=ERROR" \
+              "AITER_TRITON_LOG_LEVEL=CRITICAL" \
+              "AITER_LOG_MORE=0"
+          } | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//' > /tmp/oot_env_file.txt
 
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
-            --shm-size=16G \
+            --ipc=host --group-add keep-groups \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
@@ -543,21 +1225,162 @@ jobs:
             --env-file /tmp/oot_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${OOT_IMAGE_TAG}"
+            "${OOT_IMAGE_REF:-${OOT_IMAGE_TAG}}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Collect GPU info (inside container)
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         id: gpu-info
-        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.runner }}"
+
+      - name: Resolve local model path
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MODEL_CACHE_MOUNT}" ]; then
+            echo "OOT_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
+            echo "No shared model cache mount; local model resolution skipped."
+            exit 0
+          fi
+
+          if $CONTAINER_ENGINE exec \
+            -e MODEL_PATH="${{ matrix.model_path }}" \
+            "$CONTAINER_NAME" \
+            bash -lc '
+              set -euo pipefail
+              python3 - <<'"'"'PY'"'"'
+          import os
+          from pathlib import Path
+
+          model_path = os.environ["MODEL_PATH"].strip().strip("/")
+          normalized = model_path.rstrip("/")
+          basename = Path(normalized).name
+
+          alias_map = {
+              "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8": [
+                  "/models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
+                  "/models/Qwen3-235B-A22B-Instruct-2507-FP8",
+              ],
+              "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8": [
+                  "/models/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+                  "/models/Qwen3-Next-80B-A3B-Instruct-FP8",
+              ],
+              "Qwen/Qwen3.5-397B-A17B-FP8": [
+                  "/models/Qwen/Qwen3.5-397B-A17B-FP8",
+                  "/models/Qwen3.5-397B-A17B-FP8",
+              ],
+              "Qwen/Qwen3.5-397B-A17B": [
+                  "/models/Qwen/Qwen3.5-397B-A17B",
+                  "/models/Qwen3.5-397B-A17B",
+              ],
+              "amd/Qwen3.5-397B-A17B-MXFP4": [
+                  "/models/amd/Qwen3.5-397B-A17B-MXFP4",
+                  "/models/Qwen/Qwen3.5-397B-A17B-MXFP4",
+                  "/models/Qwen3.5-397B-A17B-MXFP4",
+              ],
+              "Meta-Llama-3.1-405B-Instruct-FP8": [
+                  "/models/Meta-Llama-3.1-405B-Instruct-FP8",
+                  "/models/facebook/Meta-Llama-3.1-405B-Instruct-FP8",
+              ],
+              "meta-llama/Llama-3.1-8B-Instruct": [
+                  "/models/meta-llama/Llama-3.1-8B-Instruct",
+                  "/models/Llama-3.1-8B-Instruct",
+              ],
+              "amd/Kimi-K2-Thinking-MXFP4-AttnFP8": [
+                  "/models/amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
+                  "/models/kimi/Kimi-K2-Thinking-MXFP4-AttnFP8",
+                  "/models/Kimi-K2-Thinking-MXFP4-AttnFP8",
+              ],
+              "amd/Kimi-K2.5-MXFP4-AttnFP8": [
+                  "/models/amd/Kimi-K2.5-MXFP4-AttnFP8",
+                  "/models/kimi/Kimi-K2.5-MXFP4-AttnFP8",
+                  "/models/Kimi-K2.5-MXFP4-AttnFP8",
+              ],
+              "deepseek-ai/DeepSeek-R1-0528": [
+                  "/models/deepseek-ai/DeepSeek-R1-0528",
+                  "/models/DeepSeek-R1-0528",
+              ],
+              "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4": [
+                  "/models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+                  "/models/deepseek-ai/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+                  "/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+              ],
+              "deepseek-ai/DeepSeek-V3.2": [
+                  "/models/deepseek-ai/DeepSeek-V3.2",
+                  "/models/DeepSeek-V3.2",
+              ],
+              "openai/gpt-oss-120b": [
+                  "/models/openai/gpt-oss-120b",
+                  "/models/gpt-oss-120b",
+              ],
+              "MiniMaxAI/MiniMax-M2.5": [
+                  "/models/MiniMaxAI/MiniMax-M2.5",
+                  "/models/MiniMax-M2.5",
+              ],
+              "zai-org/GLM-4.7-FP8": [
+                  "/models/zai-org/GLM-4.7-FP8",
+                  "/models/GLM/GLM-4.7-FP8",
+                  "/models/GLM-4.7-FP8",
+              ],
+              "zai-org/GLM-5.1-FP8": [
+                  "/models/zai-org/GLM-5.1-FP8",
+                  "/models/GLM/GLM-5.1-FP8",
+                  "/models/GLM-5.1-FP8",
+              ],
+          }
+
+          candidates = []
+          if normalized:
+              candidates.append(f"/models/{normalized}")
+          if basename:
+              candidates.append(f"/models/{basename}")
+          candidates.extend(alias_map.get(normalized, []))
+
+          seen = set()
+          for candidate in candidates:
+              if candidate in seen:
+                  continue
+              seen.add(candidate)
+              path = Path(candidate)
+              if (path / "config.json").is_file():
+                  print(f"FOUND_LOCAL_MODEL={candidate}")
+                  raise SystemExit(0)
+
+          print("LOCAL_MODEL_NOT_FOUND")
+          print("Checked candidates:")
+          for candidate in seen:
+              print(f" - {candidate}")
+          raise SystemExit(1)
+          PY
+            ' > /tmp/local_model_resolution.txt; then
+            resolved_model_path="$(sed -n 's/^FOUND_LOCAL_MODEL=//p' /tmp/local_model_resolution.txt | tail -n 1)"
+            if [ -z "${resolved_model_path}" ]; then
+              echo "ERROR: local model resolver succeeded but did not emit a model path."
+              cat /tmp/local_model_resolution.txt
+              exit 1
+            fi
+            echo "Resolved local model path: ${resolved_model_path}"
+            echo "OOT_MODEL_AVAILABLE_LOCALLY=true" >> "$GITHUB_ENV"
+            echo "OOT_RESOLVED_MODEL_PATH=${resolved_model_path}" >> "$GITHUB_ENV"
+          else
+            echo "Local model path not found for ${{ matrix.model_path }}."
+            cat /tmp/local_model_resolution.txt || true
+            echo "OOT_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Download model if needed
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
           set -euo pipefail
           model_dir="/models/${{ matrix.model_path }}"
+          if [ "${OOT_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
+            echo "Using local model path ${OOT_RESOLVED_MODEL_PATH}; skip download."
+            exit 0
+          fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
-            if ! docker exec \
+            if ! $CONTAINER_ENGINE exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
               -e MODEL_PATH="${{ matrix.model_path }}" \
               -e MODEL_DIR="$model_dir" \
@@ -616,8 +1439,12 @@ jobs:
           fi
 
       - name: Resolve OOT model path
-        if: success()
+        if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
         run: |
+          if [ "${OOT_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
+            echo "Using previously resolved local model path: ${OOT_RESOLVED_MODEL_PATH}"
+            exit 0
+          fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: /models/${{ matrix.model_path }}"
@@ -626,40 +1453,121 @@ jobs:
             echo "Using model id: ${{ matrix.model_path }}"
           fi
 
-      - name: Run OOT launch and gsm8k accuracy via script (full mode)
+      - name: Start OOT accuracy server
+        if: ${{ steps.validation-window.outputs.should_run == 'true' }}
+        timeout-minutes: 10
+        env:
+          OOT_MODEL_NAME: ${{ matrix.model_name }}
+          OOT_MODEL_PATH: ${{ matrix.model_path }}
+          OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
+        run: |
+          $CONTAINER_ENGINE exec -d \
+            -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
+            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
+            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              bash .github/scripts/atom_oot_test.sh start full
+            "
+
+      - name: Wait for OOT accuracy server
+        if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
         timeout-minutes: 120
+        env:
+          MAX_WAIT_RETRIES: "120"
+          WAIT_INTERVAL_SEC: "30"
+          STREAM_VLLM_LOGS: "1"
+        run: |
+          last_vllm_log_line=0
+
+          emit_new_vllm_logs() {
+            if [ "${STREAM_VLLM_LOGS}" != "1" ]; then
+              return 0
+            fi
+
+            current_line_count=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'if [ -f /tmp/vllm_oot.log ]; then wc -l < /tmp/vllm_oot.log; else echo 0; fi' 2>/dev/null || echo 0)
+            current_line_count=${current_line_count//$'\r'/}
+            if [ "${current_line_count:-0}" -le "${last_vllm_log_line}" ]; then
+              return 0
+            fi
+
+            echo ""
+            echo "========== New vLLM log output =========="
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "sed -n '$((last_vllm_log_line + 1)),${current_line_count}p' /tmp/vllm_oot.log" || true
+            last_vllm_log_line=${current_line_count}
+          }
+
+          for ((i=1; i<=MAX_WAIT_RETRIES; i++)); do
+            if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'curl -fsS http://127.0.0.1:8000/v1/models >/dev/null 2>&1'; then
+              emit_new_vllm_logs
+              echo "vLLM server is ready."
+              exit 0
+            fi
+
+            emit_new_vllm_logs
+
+            server_status=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '
+              if [ -f /tmp/vllm_oot.pid ]; then
+                pid=$(cat /tmp/vllm_oot.pid)
+                if kill -0 "$pid" 2>/dev/null; then
+                  echo running
+                else
+                  echo dead
+                fi
+              elif pgrep -f "vllm serve" >/dev/null 2>&1; then
+                echo running
+              else
+                echo starting
+              fi
+            ' 2>/dev/null || echo unknown)
+
+            if [ "${server_status}" = "dead" ]; then
+              echo "vLLM server process exited before becoming ready."
+              $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/vllm_oot.log || true' || true
+              exit 1
+            fi
+
+            echo "Waiting for vLLM server... (${i}/${MAX_WAIT_RETRIES}; status=${server_status})"
+            sleep "${WAIT_INTERVAL_SEC}"
+          done
+
+          echo "vLLM server did not become ready in time."
+          emit_new_vllm_logs
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/vllm_oot.log || true' || true
+          exit 1
+
+      - name: Run OOT gsm8k accuracy client
+        id: run_accuracy_client
+        if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
+        timeout-minutes: 120
+        continue-on-error: true
         env:
           OOT_MODEL_NAME: ${{ matrix.model_name }}
           OOT_MODEL_PATH: ${{ matrix.model_path }}
           OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
           OOT_CLIENT_COMMAND: ${{ matrix.client_command || '' }}
-          OOT_ENV_VARS: ${{ matrix.env_vars }}
           LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
-          MAX_WAIT_RETRIES: "120"
-          STREAM_VLLM_LOGS: "1"
         run: |
-          docker exec \
+          set -o pipefail
+          $CONTAINER_ENGINE exec \
             -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
             -e OOT_CLIENT_COMMAND="${OOT_CLIENT_COMMAND}" \
-            -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
             -e OOT_DOCKER_IMAGE="${OOT_IMAGE_TAG}" \
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
             -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
-            -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
-            -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_oot_test.sh accuracy full
-            "
+              bash .github/scripts/atom_oot_test.sh client full
+            " 2>&1 | tee ./oot_accuracy_client.log
 
       - name: Check OOT accuracy test results
-        if: success()
+        if: ${{ steps.validation-window.outputs.should_run == 'true' && success() && steps.run_accuracy_client.outcome == 'success' }}
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
           result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
             echo "ERROR: No results JSON file found in oot_accuracy_results/"
@@ -681,30 +1589,36 @@ jobs:
           fi
 
       - name: Collect summary
-        if: success()
+        if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
         run: |
           echo "OOT gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Collect artifacts
-        if: always()
+        if: ${{ always() && steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          if [ ! -f ./oot_accuracy_client.log ]; then : > ./oot_accuracy_client.log; fi
 
       - name: Upload model artifacts
-        if: always()
+        if: ${{ always() && steps.validation-window.outputs.should_run == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: oot-validation-${{ matrix.model_name }}-${{ github.run_id }}
           path: |
             vllm_oot.log
+            oot_accuracy_client.log
             oot_accuracy_output.txt
             oot_accuracy_results
 
+      - name: Fail if OOT accuracy client failed
+        if: ${{ always() && steps.validation-window.outputs.should_run == 'true' && steps.run_accuracy_client.outcome == 'failure' }}
+        run: exit 1
+
       - name: Upload accuracy results for dashboard
-        if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
+        if: ${{ always() && steps.validation-window.outputs.should_run == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
         uses: actions/upload-artifact@v7
         with:
           name: accuracy-${{ matrix.model_name }}
@@ -712,19 +1626,56 @@ jobs:
           if-no-files-found: ignore
 
       - name: Cleanup
-        if: always()
+        if: ${{ always() && steps.validation-window.outputs.should_run == 'true' }}
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
-          docker stop "$CONTAINER_NAME" || true
-          docker rm "$CONTAINER_NAME" || true
-          docker rmi "${OOT_IMAGE_TAG}" || true
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
+          $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
+          $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
+          $CONTAINER_ENGINE rmi "${OOT_IMAGE_REF:-${OOT_IMAGE_TAG}}" || true
+
+  oot-model-accuracy-priority-2:
+    name: Model Accuracy ${{ matrix.priority }} (${{ matrix.model_name }})
+    needs: [prepare-oot-image, oot-model-accuracy-priority-1]
+    if: ${{ always() && needs.prepare-oot-image.result == 'success' && needs.prepare-oot-image.outputs.slot_2_has_models == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-oot-image.outputs.model_matrix_slot_2) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    permissions:
+      actions: read
+      contents: write
+    env:
+      CONTAINER_NAME: atom_vllm_oot_validation_${{ matrix.priority }}_${{ strategy.job-index }}
+      OOT_IMAGE_TAG: ${{ needs.prepare-oot-image.outputs.oot_image_tag }}
+    steps: *oot-model-accuracy-steps
+
+  oot-model-accuracy-priority-3:
+    name: Model Accuracy ${{ matrix.priority }} (${{ matrix.model_name }})
+    needs: [prepare-oot-image, oot-model-accuracy-priority-2]
+    if: ${{ always() && needs.prepare-oot-image.result == 'success' && needs.prepare-oot-image.outputs.slot_3_has_models == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-oot-image.outputs.model_matrix_slot_3) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    permissions:
+      actions: read
+      contents: write
+    env:
+      CONTAINER_NAME: atom_vllm_oot_validation_${{ matrix.priority }}_${{ strategy.job-index }}
+      OOT_IMAGE_TAG: ${{ needs.prepare-oot-image.outputs.oot_image_tag }}
+    steps: *oot-model-accuracy-steps
 
   # Build the dashboard payload from all uploaded accuracy artifacts after the
   # full matrix completes. This keeps dashboard writes off the GPU runners and
   # ensures each nightly/manual run publishes at most once.
   accuracy-dashboard:
     name: Update accuracy dashboard
-    needs: [oot-model-accuracy]
+    needs:
+      - oot-model-accuracy-priority-1
+      - oot-model-accuracy-priority-2
+      - oot-model-accuracy-priority-3
     if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
     runs-on: ubuntu-latest
     permissions:

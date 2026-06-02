@@ -615,6 +615,64 @@ class vllmAttentionMetadataBuilderMethods:
 
         return attn_metadata
 
+    def build_for_drafting(
+        self,
+        common_attn_metadata,
+        draft_index: int,
+    ) -> AttentionMetaData:
+        """
+        Build attention metadata for draft model without CPU-GPU sync.
+
+        During EAGLE/MTP drafting all requests are uniform decodes, so we can
+        skip split_decodes_prefills_and_extends() and avoid all .cpu() /
+        .item() calls that would otherwise break CUDA graph capture.
+        """
+        query_start_loc = common_attn_metadata.query_start_loc_cpu
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        is_prefill = query_lens > self.reorder_batch_threshold
+
+        if torch.any(is_prefill):
+            return self.build(
+                common_prefix_len=0, common_attn_metadata=common_attn_metadata
+            )
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        decode_metadata = AiterFlashAttentionDecodeMetadata(
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            query_start_loc=common_attn_metadata.query_start_loc,
+        )
+        attn_metadata_for_plugin_mode = AiterFlashAttentionMetadataForPluginMode(
+            num_actual_tokens=num_tokens,
+            num_actual_kv_tokens=0,
+            max_query_len=common_attn_metadata.max_query_len,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            seq_lens=common_attn_metadata.seq_lens,
+            block_table=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            num_decodes=num_reqs,
+            num_decode_tokens=num_tokens,
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_extends=0,
+            num_extend_tokens=0,
+            decode_metadata=decode_metadata,
+            prefill_metadata=None,
+            extend_metadata=None,
+            use_cascade=False,
+            common_prefix_len=0,
+            total_tokens=self.total_tokens,
+        )
+
+        attn_metadata = AttentionMetaData(
+            max_seqlen_q=common_attn_metadata.max_query_len,
+            block_tables=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            plugin_metadata=attn_metadata_for_plugin_mode,
+        )
+        return attn_metadata
+
     # this method will be called by vllm, so it follows the vllm's interface convention
     def build_for_cudagraph_capture(
         self,
@@ -1873,6 +1931,8 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=True,
+            dtype_q=_get_aiter_kv_cache_dtype(self.vllm_config),
+            dtype_kv=_get_aiter_kv_cache_dtype(self.vllm_config),
         )
 
         attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
@@ -2372,6 +2432,39 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
+        default_sfc = (
+            get_current_atom_config().compilation_config.static_forward_context
+        )
+        vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
+        for layer_name in layer_names or []:
+            attention_prefix = (
+                layer_name[: -len(".attn")]
+                if layer_name.endswith(".attn")
+                else layer_name
+            )
+            indexer_cache = vllm_sfc.get(f"{attention_prefix}.indexer.k_cache")
+            owner_atom_config = getattr(indexer_cache, "atom_config", None)
+            sfc = (
+                owner_atom_config.compilation_config.static_forward_context
+                if owner_atom_config is not None
+                else default_sfc
+            )
+            indexer = sfc.get(f"{attention_prefix}.indexer")
+            if indexer is not None:
+                indexer.sparse_kv_indices_buffer = self.paged_kv_indices
+            paged_attn = sfc.get(attention_prefix)
+            impl = getattr(getattr(paged_attn, "attn", None), "impl", None)
+            if impl is not None and hasattr(impl, "sparse_kv_indices_buffer"):
+                impl.sparse_kv_indices_buffer = self.paged_kv_indices
+            if indexer is None or impl is None:
+                logger.warning(
+                    "Sparse MLA buffer binding incomplete for %s "
+                    "(indexer=%s, impl=%s, owner_atom_config=%s)",
+                    attention_prefix,
+                    indexer is not None,
+                    impl is not None,
+                    owner_atom_config is not None,
+                )
 
         # ----- Persistent MLA metadata buffers -----
         # The aiter sparse decode kernel supports a "persistent" path that
@@ -2393,7 +2486,7 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
             max_num_batched_tokens,
             1,
             self.padded_num_heads,
-            torch.bfloat16,
+            _get_aiter_kv_cache_dtype(config),
             _get_aiter_kv_cache_dtype(config),
             is_sparse=True,
             fast_mode=True,
