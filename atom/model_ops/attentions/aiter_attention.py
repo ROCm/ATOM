@@ -10,27 +10,20 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import kv_indices_generate_triton
-import atom.model_ops as ops
-from atom.model_ops.paged_attention import PagedAttention
 from atom.model_ops.attention_mha import PagedAttentionImpl
-from atom.plugin.sglang.attention_backend.radix_attention import RadixAttention
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
-from atom.plugin.prepare import is_plugin_mode
-from atom.plugin.attention import AiterAttentionMetadataBuilderDecoratorForPluginMode
-from atom.plugin.attention import AiterBackendDecoratorForPluginMode
 
 
 def cdiv(a, b):
     return (a + b - 1) // b
 
 
-@AiterBackendDecoratorForPluginMode
 class AiterBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
-        return "ROCM_AITER_ATTENTION" if not is_plugin_mode() else "CUSTOM"
+        return "ATOM_ATTENTION"
 
     @staticmethod
     def get_builder_cls() -> Type["AiterAttentionMetadataBuilder"]:
@@ -38,20 +31,10 @@ class AiterBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls():
-        attn_cls = ops.Attention
-        if attn_cls == PagedAttention:
-            return PagedAttentionImpl
-        elif attn_cls == RadixAttention:
-            raise NotImplementedError("RadixAttention is not supported for now")
-        raise NotImplementedError(
-            f"Unsupported attention class {attn_cls!r} configured in ops.Attention"
-        )
+        return PagedAttentionImpl
 
 
-@AiterAttentionMetadataBuilderDecoratorForPluginMode(
-    default_base_class=CommonAttentionBuilder
-)
-class AiterAttentionMetadataBuilder:
+class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
 
     def __init__(
@@ -63,9 +46,7 @@ class AiterAttentionMetadataBuilder:
         model_runner=None,
     ):
         self.block_size = 1024 if model_runner.block_size == 1024 else 16
-        # Note: Cannot use super() here because the class is dynamically created by decorator
-        # Use explicit parent class call instead
-        CommonAttentionBuilder.__init__(self, model_runner)
+        super().__init__(model_runner)
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.

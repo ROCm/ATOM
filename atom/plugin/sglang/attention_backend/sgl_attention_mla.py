@@ -48,6 +48,7 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
     batched_gemm_afp4wfp4_pre_quant,
 )
+from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
     batched_gemm_a16wfp4,
 )
@@ -1001,7 +1002,21 @@ def _read_kv_b_proj_weight(attn: DeepseekV2MLAAttention) -> torch.Tensor:
             attn.kv_b_proj.qzeros,
         ).T
     else:
-        w = attn.kv_b_proj.weight
+        layer_quant_config = getattr(attn.kv_b_proj, "layer_quant_config", None)
+        is_quark_static_mxfp4 = (
+            layer_quant_config is not None
+            and layer_quant_config.quant_method == "quark"
+            and layer_quant_config.quant_dtype == dtypes.fp4x2
+            and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
+        )
+        if is_quark_static_mxfp4:
+            w = getattr(
+                attn.kv_b_proj,
+                "_mxfp4_unshuffled_weight",
+                attn.kv_b_proj.weight,
+            )
+        else:
+            w = attn.kv_b_proj.weight
 
     # On ROCm, ATOM creates parameters with fnuz dtype but loads fn bytes.
     # View-cast back to fn so the normalize path works correctly.
@@ -1163,21 +1178,35 @@ def _split_and_assign_kc_vc(
         [attn.qk_nope_head_dim, attn.v_head_dim], dim=1
     )
 
-    # quark fp4 special path
+    # Quark MXFP4 LinearBase modules store quantization on layer_quant_config;
+    # there is no kv_b_proj.quant_method object to inspect in this path.
+    layer_quant_config = getattr(attn.kv_b_proj, "layer_quant_config", None)
     quant_method = getattr(attn.kv_b_proj, "quant_method", None)
     quant_config = getattr(quant_method, "quant_config", None)
-    if (
-        _use_aiter_gfx95
-        and quant_config is not None
-        and quant_config.get_name() == "quark"
-    ):
+    is_quark_quant_method = (
+        quant_config is not None and quant_config.get_name() == "quark"
+    )
+    is_quark_mxfp4_linear = (
+        layer_quant_config is not None
+        and layer_quant_config.quant_method == "quark"
+        and layer_quant_config.quant_dtype == dtypes.fp4x2
+        and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
+    )
+    if _use_aiter_gfx95 and (is_quark_quant_method or is_quark_mxfp4_linear):
+        quark_weight = w
+        weight_scale = getattr(attn.kv_b_proj, "_mxfp4_unshuffled_weight_scale", None)
+        if is_quark_mxfp4_linear and weight_scale is not None:
+            quark_weight = mxfp4_to_f32(w.view(torch.uint8)).to(torch.bfloat16)
+            quark_weight = quark_weight * e8m0_to_f32(
+                weight_scale.repeat_interleave(32, dim=-1)
+            ).to(torch.bfloat16)
         w_kc, attn.w_scale_k, w_vc, attn.w_scale_v = quark_post_load_weights(
-            attn, w, "mxfp4"
+            attn, quark_weight, "mxfp4"
         )
 
     if not use_deep_gemm_bmm:
         use_vllm_weight_layout = _is_hip and not (
-            quant_config is not None and quant_config.get_name() == "quark"
+            is_quark_quant_method or is_quark_mxfp4_linear
         )
 
         if use_vllm_weight_layout:
@@ -1224,6 +1253,9 @@ def process_mla_kv_b_proj_after_loading(attn: DeepseekV2MLAAttention) -> None:
     Orchestrates reading, quantization handling, and splitting of
     kv_b_proj into absorbed w_kc / w_vc weights.
     """
+    if not getattr(attn.kv_b_proj, "_sgl_mxfp4_process_done", False):
+        attn.kv_b_proj.process_weights_after_loading()
+
     w = _read_kv_b_proj_weight(attn)
     weight_block_size = _get_weight_block_size(attn)
 
@@ -1242,6 +1274,41 @@ def process_mla_kv_b_proj_after_loading(attn: DeepseekV2MLAAttention) -> None:
 
     # split and assign kc/vc
     _split_and_assign_kc_vc(attn, w, use_deep_gemm_bmm, block_scale, weight_block_size)
+
+
+def _patch_kv_b_proj_for_sglang_mxfp4(attn: DeepseekV2MLAAttention) -> None:
+    """Preserve DeepSeek MLA kv_b_proj's original MXFP4 layout for kc/vc split."""
+    kv_b_proj = attn.kv_b_proj
+    if getattr(kv_b_proj, "_sgl_mxfp4_preserve_patched", False):
+        return
+
+    orig_process_weights_after_loading = kv_b_proj.process_weights_after_loading
+
+    def process_weights_after_loading_with_mxfp4_preserve():
+        if getattr(kv_b_proj, "_sgl_mxfp4_process_done", False):
+            return
+
+        layer_quant_config = getattr(kv_b_proj, "layer_quant_config", None)
+        is_quark_static_mxfp4 = (
+            kv_b_proj.weight.dim() == 2
+            and layer_quant_config is not None
+            and layer_quant_config.quant_method == "quark"
+            and layer_quant_config.quant_dtype == dtypes.fp4x2
+            and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
+            and getattr(kv_b_proj, "source_quant_dtype", None) is None
+        )
+        if is_quark_static_mxfp4:
+            kv_b_proj._mxfp4_unshuffled_weight = kv_b_proj.weight.detach().clone()
+            kv_b_proj._mxfp4_unshuffled_weight_scale = (
+                kv_b_proj.weight_scale.detach().clone()
+            )
+        orig_process_weights_after_loading()
+        kv_b_proj._sgl_mxfp4_process_done = True
+
+    kv_b_proj.process_weights_after_loading = (
+        process_weights_after_loading_with_mxfp4_preserve
+    )
+    kv_b_proj._sgl_mxfp4_preserve_patched = True
 
 
 # One-time model setup (called from base_model_wrapper.py)
@@ -1288,6 +1355,7 @@ def _patch_mla_attention_for_sglang(attn, config, kv_cache_dtype: str = "bf16") 
     already set via set_attn_cls(); this patch sits above that layer.
     """
     init_sgl_attrs(attn, config, kv_cache_dtype)
+    _patch_kv_b_proj_for_sglang_mxfp4(attn)
 
     def patched_forward(
         positions: torch.Tensor,

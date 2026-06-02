@@ -23,11 +23,6 @@ from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.utils import get_and_maybe_dequant_weights
-from atom.plugin import is_plugin_mode
-from atom.plugin.attention_mla import MLAAttentionImplDecoratorForPluginMode
-from atom.plugin.attention_mla_sparse import (
-    MLASparseAttentionImplDecoratorForPluginMode,
-)
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import (
@@ -109,8 +104,6 @@ def dynamic_per_batched_tensor_quant(
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
-@MLASparseAttentionImplDecoratorForPluginMode
-@MLAAttentionImplDecoratorForPluginMode
 class MLAAttention(nn.Module):
     def __init__(
         self,
@@ -842,7 +835,7 @@ class MLAAttention(nn.Module):
 
         return self._v_up_proj_and_o_proj(o)
 
-    def forward_impl_server_mode(
+    def forward_impl(
         self,
         q: torch.Tensor,
         k_nope: torch.Tensor,
@@ -940,7 +933,6 @@ class MLAAttention(nn.Module):
 
     def forward(
         self,
-        layer: torch.nn.Module,
         query: torch.Tensor,  # query in unified attn
         k_nope: torch.Tensor,
         k_rope: torch.Tensor,
@@ -951,27 +943,13 @@ class MLAAttention(nn.Module):
         output: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
-        if is_plugin_mode():
-            # forward impl method are added by the decorator
-            # MLAAttentionImplDecoratorForPluginMode
-            return self.forward_impl_plugin_mode(
-                layer=layer,
-                q=query,
-                k_c_normed=k_nope,
-                k_pe=k_rope,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
-                output=output,
-            )
-        else:
-            # only for server mode, keep the original method
-            return self.forward_impl_server_mode(
-                q=query,
-                k_nope=k_nope,
-                k_rope=k_rope,
-                positions=positions,
-                q_scale=q_scale,
-            )
+        return self.forward_impl(
+            q=query,
+            k_nope=k_nope,
+            k_rope=k_rope,
+            positions=positions,
+            q_scale=q_scale,
+        )
 
 
 @triton.jit

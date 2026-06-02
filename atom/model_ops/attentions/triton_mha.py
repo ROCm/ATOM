@@ -6,11 +6,9 @@ from typing import Type
 
 import torch
 
-import atom.model_ops as ops
 from atom.config import KVCacheTensor
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl
-from atom.model_ops.paged_attention import PagedAttention
 
 from .aiter_attention import AiterAttentionMetadataBuilder
 from .backends import AttentionBackend
@@ -29,12 +27,7 @@ class TritonMHABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls():
-        attn_cls = ops.Attention
-        if attn_cls == PagedAttention:
-            return PagedAttentionImpl
-        raise NotImplementedError(
-            f"TritonMHABackend does not support attention class {attn_cls!r}"
-        )
+        return PagedAttentionImpl
 
 
 class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):

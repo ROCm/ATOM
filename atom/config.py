@@ -252,6 +252,8 @@ class CompilationConfig:
             self.splitting_ops = [
                 "aiter.unified_attention_with_output",
                 "aiter.mla_attention",
+                "aiter.atom_vllm_mha_attention",
+                "aiter.atom_vllm_mla_attention",
             ]
 
 
