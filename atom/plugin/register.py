@@ -95,10 +95,6 @@ def set_attn_cls() -> None:
         logger.info("Use Attention dispatcher for SGLang")
     elif is_rtpllm():
         logger.info("Use Attention dispatcher for rtp-llm")
-        from atom.plugin.rtpllm.attention_backend import RTPAttention
-        ops.RTPAttention = RTPAttention
-        ops.Attention = RTPAttention
-
 
 
 def init_aiter_dist(config: Config) -> None:

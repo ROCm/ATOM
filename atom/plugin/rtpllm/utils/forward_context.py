@@ -9,15 +9,11 @@ import torch
 
 from atom.config import KVCacheTensor, get_current_atom_config
 from atom.model_ops.attention_gdn import GatedDeltaNet
-from atom.model_ops.paged_attention import PagedAttention
+from atom.model_ops.attention_mha import PagedAttentionImpl
+from atom.model_ops.paged_attention import Attention as PagedAttention
 from atom.model_ops.attentions.gdn_attn import (
     GDNAttentionMetadata,
     compute_causal_conv1d_metadata,
-)
-from atom.plugin.attention import (
-    AiterFlashAttentionDecodeMetadata,
-    AiterFlashAttentionMetadataForPluginMode,
-    AiterFlashAttentionPrefillMetadata,
 )
 from atom.utils.forward_context import (
     AttentionMetaData,
@@ -27,6 +23,42 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+
+
+@dataclass
+class AiterFlashAttentionPhaseMetadata:
+    max_query_len: int
+    max_seq_len: int
+    query_start_loc: torch.Tensor
+
+
+AiterFlashAttentionDecodeMetadata = AiterFlashAttentionPhaseMetadata
+AiterFlashAttentionPrefillMetadata = AiterFlashAttentionPhaseMetadata
+
+
+@dataclass
+class AiterFlashAttentionMetadataForPluginMode:
+    num_actual_tokens: int
+    num_actual_kv_tokens: int
+    max_query_len: int
+    query_start_loc: torch.Tensor
+    max_seq_len: int
+    seq_lens: torch.Tensor
+    slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+    num_decodes: int
+    num_decode_tokens: int
+    num_prefills: int
+    num_prefill_tokens: int
+    num_extends: int
+    num_extend_tokens: int
+    decode_metadata: AiterFlashAttentionPhaseMetadata | None = None
+    prefill_metadata: AiterFlashAttentionPhaseMetadata | None = None
+    extend_metadata: Any = None
+    use_cascade: bool = False
+    common_prefix_len: int = 0
+    total_tokens: int = 0
+    context: Any = None
 
 
 @dataclass(frozen=True)
@@ -940,14 +972,15 @@ class RTPForwardContext:
             plugin_md.rtp_has_prefix = bool((prefix_lengths > 0).any().item())
         else:
             plugin_md.rtp_has_prefix = False
-        return AttentionMetaData(
+        attn_metadata = AttentionMetaData(
             max_seqlen_q=max_query_len,
             max_seqlen_k=max_seq_len,
             block_tables=plugin_md.block_table,
             slot_mapping=slot_mapping,
             context_lens=seq_lens,
-            plugin_metadata=plugin_md,
         )
+        attn_metadata.plugin_metadata = plugin_md
+        return attn_metadata
 
     @staticmethod
     def collect_layer_maps(model: Any) -> LayerMaps:
@@ -955,16 +988,16 @@ class RTPForwardContext:
         full_attn_layer_map: Dict[int, Any] = {}
         rtp_attention_cls: type[Any] | None = None
         try:
-            from atom.plugin.rtpllm.attention_backend import RTPAttention
+            from atom.plugin.rtpllm.attention_backend import AttentionForRTPLLM
 
-            rtp_attention_cls = RTPAttention
+            rtp_attention_cls = AttentionForRTPLLM
         except (ImportError, ModuleNotFoundError):
             rtp_attention_cls = None
 
         for module in model.modules():
             if isinstance(module, GatedDeltaNet):
                 gdn_layer_map[int(module.layer_num)] = module
-            elif isinstance(module, PagedAttention) or (
+            elif isinstance(module, (PagedAttention, PagedAttentionImpl)) or (
                 rtp_attention_cls is not None and isinstance(module, rtp_attention_cls)
             ):
                 impl = getattr(module, "impl", None)

@@ -88,7 +88,7 @@ def _write_kv_cache_with_rtp_fused_kernel(
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "RTPAttention fused-write requires a prewarmed qkv_buffer in "
+                "AttentionForRTPLLM fused-write requires a prewarmed qkv_buffer in "
                 "cuda-graph capture mode."
             )
         qkv = torch.empty(
@@ -169,7 +169,9 @@ def _run_nonasm_paged_attention(
     addresses. When None, fall back to fresh allocations (eager path).
     """
     if aiter is None:
-        raise ValueError("RTPAttention requires aiter for nonasm paged attention.")
+        raise ValueError(
+            "AttentionForRTPLLM requires aiter for nonasm paged attention."
+        )
 
     key_cache = paged_kv_cache.select(1, 0)
     value_cache = paged_kv_cache.select(1, 1)
@@ -188,7 +190,7 @@ def _run_nonasm_paged_attention(
         prewarmed_partitions = int(static_bufs["max_num_partitions"])
         if prewarmed_partitions < max_num_partitions:
             raise RuntimeError(
-                "RTPAttention prewarmed max_num_partitions "
+                "AttentionForRTPLLM prewarmed max_num_partitions "
                 f"({prewarmed_partitions}) is smaller than required "
                 f"({max_num_partitions}); recapture with larger max_seq_len."
             )
@@ -339,7 +341,7 @@ class RTPFullAttention(BaseAttention):
         # Buffer missing or too small: in capture mode this is fatal.
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "RTPAttention requires prewarm_for_cuda_graph(...) to allocate "
+                "AttentionForRTPLLM requires prewarm_for_cuda_graph(...) to allocate "
                 "_fused_qkv_buf with sufficient capacity before cuda-graph capture; "
                 f"need=[{num_tokens},{total_dim}], have="
                 f"{None if buf is None else tuple(buf.shape)}."
@@ -541,15 +543,19 @@ class RTPFullAttention(BaseAttention):
         del positions, kwargs
         if not self._backend_ready:
             raise ValueError(
-                "RTPAttention requires aiter and reshape_paged_kv_cache in plugin mode."
+                "AttentionForRTPLLM requires aiter and reshape_paged_kv_cache in plugin mode."
             )
         fwd_ctx = get_forward_context()
         if fwd_ctx is None:
-            raise ValueError("RTPAttention requires forward context in plugin mode.")
+            raise ValueError(
+                "AttentionForRTPLLM requires forward context in plugin mode."
+            )
 
         attn_metadata = fwd_ctx.attn_metadata
         if attn_metadata is None:
-            raise ValueError("RTPAttention requires attn_metadata in forward context.")
+            raise ValueError(
+                "AttentionForRTPLLM requires attn_metadata in forward context."
+            )
 
         # Short-circuit RTP's `initCapture forward for output datatype` probe.
         # When RTP feeds dummy seq_lens=[0,...] / block_tables=[0,...] purely to
@@ -571,15 +577,19 @@ class RTPFullAttention(BaseAttention):
 
         attn_inputs = attn_metadata.rtp_attn_inputs
         if attn_inputs is None:
-            raise ValueError("RTPAttention requires rtp_attn_inputs in attn_metadata.")
+            raise ValueError(
+                "AttentionForRTPLLM requires rtp_attn_inputs in attn_metadata."
+            )
 
         kv_cache_data = fwd_ctx.kv_cache_data
         if kv_cache_data is None:
-            raise ValueError("RTPAttention requires kv_cache_data in forward context.")
+            raise ValueError(
+                "AttentionForRTPLLM requires kv_cache_data in forward context."
+            )
         layer_cache_entry = kv_cache_data.get(f"layer_{self.layer_num}")
         if layer_cache_entry is None or layer_cache_entry.k_cache is None:
             raise ValueError(
-                f"RTPAttention requires layer cache for layer_{self.layer_num}."
+                f"AttentionForRTPLLM requires layer cache for layer_{self.layer_num}."
             )
         layer_cache = layer_cache_entry.k_cache
 
@@ -601,7 +611,7 @@ class RTPFullAttention(BaseAttention):
         raw = getattr(layer_cache, "kv_cache_base", None)
         if raw is None:
             raise ValueError(
-                f"RTPAttention layer_{self.layer_num} missing kv_cache_base."
+                f"AttentionForRTPLLM layer_{self.layer_num} missing kv_cache_base."
             )
         kernel_seq_size_per_block = int(
             getattr(attn_metadata, "rtp_kernel_seq_size_per_block", 0) or 16
@@ -612,7 +622,8 @@ class RTPFullAttention(BaseAttention):
         )
         if paged_kv.dim() != 5 or int(paged_kv.shape[1]) != 2:
             raise ValueError(
-                f"RTPAttention expects paged kv cache [num_blocks,2,H,T,D], got {tuple(paged_kv.shape)}"
+                "AttentionForRTPLLM expects paged kv cache "
+                f"[num_blocks,2,H,T,D], got {tuple(paged_kv.shape)}"
             )
 
         key_cache = paged_kv.select(1, 0)
@@ -625,7 +636,7 @@ class RTPFullAttention(BaseAttention):
             self._effective_num_kv_heads = int(target_kv_heads)
         elif int(self._effective_num_kv_heads) != int(target_kv_heads):
             raise RuntimeError(
-                f"RTPAttention layer_{self.layer_num} effective_num_kv_heads "
+                f"AttentionForRTPLLM layer_{self.layer_num} effective_num_kv_heads "
                 f"changed across forwards: cached={self._effective_num_kv_heads}, "
                 f"current={target_kv_heads}; cuda-graph cannot capture this layer."
             )
@@ -671,12 +682,14 @@ class RTPFullAttention(BaseAttention):
         )
         if block_tables is None or block_tables.numel() == 0:
             raise ValueError(
-                f"RTPAttention requires block table for layer_{self.layer_num}."
+                f"AttentionForRTPLLM requires block table for layer_{self.layer_num}."
             )
         plugin_md = attn_metadata.plugin_metadata
         seq_lens = plugin_md.seq_lens
         if seq_lens is None:
-            raise ValueError("RTPAttention requires block tables and sequence lengths.")
+            raise ValueError(
+                "AttentionForRTPLLM requires block tables and sequence lengths."
+            )
         fused_qkv_dim = int(
             self.num_heads * self.head_dim + 2 * int(k.shape[1]) * self.head_dim
         )
@@ -816,4 +829,4 @@ class RTPFullAttention(BaseAttention):
         )
 
 
-RTPAttention = RTPFullAttention
+AttentionForRTPLLM = RTPFullAttention

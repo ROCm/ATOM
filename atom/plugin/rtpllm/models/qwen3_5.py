@@ -72,7 +72,9 @@ class _ATOMAttnPyObj:
         self.is_cuda_graph = False
         self._rtp_full_attn_layers: list = []
         try:
-            from atom.plugin.rtpllm.attention_backend import RTPAttention as _RTPAttn
+            from atom.plugin.rtpllm.attention_backend import (
+                AttentionForRTPLLM as _RTPAttn,
+            )
 
             self._rtp_attention_cls = _RTPAttn
         except (ImportError, ModuleNotFoundError):
