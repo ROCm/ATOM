@@ -99,6 +99,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is aiter's OPUS kernel (gfx950 fast path). Set to 1 to fall back to Triton
     # (e.g. for debugging or on non-gfx950 builds).
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # Use gluon pa decode for some models
+    "ATOM_USE_GLUON_PA_DECODE": lambda: (
+        os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
+    ),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
