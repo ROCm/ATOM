@@ -824,6 +824,7 @@ const allModels = [...new Set(Object.keys(historyMap).map(k => k.split('|')[1]))
 const allIslOsl = [...new Set(Object.keys(historyMap).map(k => k.split('|')[2]))].sort();
 const allConc = [...new Set(Object.keys(historyMap).map(k => +k.split('|')[3]))].sort((a, b) => a - b);
 const allHardware = [...new Set(Object.values(latestConfigs).map(cfg => cfg.hardware || 'unknown'))].sort(_lc);
+const defaultHardwareFilter = allHardware.includes('mi355x') ? ['mi355x'] : [...allHardware];
 const allTrendModelKeys = [...new Set(Object.values(latestConfigs).map(cfg => `${cfg.backend}|${cfg.model}`))].sort(_lc);
 
 /* ================================================================
@@ -836,7 +837,7 @@ const PERF_METRICS = [
   { key: 'TTFT',        label: 'TTFT',              unit: 'ms',    lower: true },
 ];
 const state = {
-  filters: { backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc], hardware: [...allHardware] }
+  filters: { backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc], hardware: [...defaultHardwareFilter] },
   activeTab: 'performance',
   perfMetric: 'Total Tput',
   trendModelKey: allTrendModelKeys[0] || '',
