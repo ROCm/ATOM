@@ -6,6 +6,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
+import logging
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -57,6 +58,8 @@ from torch import nn
 from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 from atom.quantization.quark.utils import weight_dequant_fp8
+
+logger = logging.getLogger("atom")
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -762,9 +765,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         else:
             self.use_triton = (
                 gfx.startswith("gfx94")
-                or self.is_gfx1250
                 or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
+        logger.info(f"Mxfp4MoEMethod use_triton = {self.use_triton}")
         if self.use_triton:
             from atom.model_ops.utils import has_triton_kernels
 
