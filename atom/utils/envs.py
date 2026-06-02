@@ -29,7 +29,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # --- Compilation & Execution ---
-    "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "1") == "1",
+    "ATOM_TRITON_MOE_MAX_BLOCK_N": lambda: int(os.getenv("ATOM_TRITON_MOE_MAX_BLOCK_N", "256")),
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
@@ -162,6 +163,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sampler top-K logits log — int K, 0/empty disables.
     "ATOM_DEBUG_TOPK": lambda: int(os.getenv("ATOM_DEBUG_TOPK", "0") or "0"),
     "ATOM_DEBUG_TOPK_PATH": lambda: os.getenv("ATOM_DEBUG_TOPK_PATH", ""),
+    # Graph-vs-eager decode diff (CUDA-graph correctness bisect). When enabled,
+    # every graphed decode step with bs >= MIN_BS is ALSO recomputed eagerly and
+    # the two are compared (hidden_states / logits cosine + greedy-token
+    # agreement). Pure diagnostic: the run keeps using the graph output, so
+    # default behavior is unchanged. Use to confirm/localize the bs>1 decode
+    # CUDA-graph divergence (see /debug-guide dump-bisect Phase 8).
+    "ATOM_GRAPH_EAGER_DIFF": lambda: os.getenv("ATOM_GRAPH_EAGER_DIFF", "0") == "1",
+    # Only trigger the diff when the scheduled decode batch size is at least
+    # this (bs=1 graphs are known-good, so default skips them).
+    "ATOM_GRAPH_EAGER_DIFF_MIN_BS": lambda: int(
+        os.getenv("ATOM_GRAPH_EAGER_DIFF_MIN_BS", "2") or "2"
+    ),
+    # Cap how many diagnostic steps get logged (0 = unlimited). Avoids flooding
+    # logs over a long eval; the first divergence is usually enough.
+    "ATOM_GRAPH_EAGER_DIFF_STEPS": lambda: int(
+        os.getenv("ATOM_GRAPH_EAGER_DIFF_STEPS", "0") or "0"
+    ),
+    # Force the MLA paged decode onto the NON-persistent path (no KV-split /
+    # no partial-reduce — the same kernel the dp>1 branch already uses) instead
+    # of the persistent multi-split worker path. Localizer for the bs>1 decode
+    # CUDA-graph divergence: the persistent split writes per-split partials into
+    # graph-pool `torch.empty` buffers and reduces them via reduce_partial_map,
+    # which is the prime suspect for reading stale partials across replays. Pair
+    # with ATOM_GRAPH_EAGER_DIFF=1 — if the divergence collapses to ~0, the
+    # persistent split/reduce is the culprit.
+    "ATOM_MLA_DECODE_FORCE_NON_PERSISTENT": lambda: os.getenv(
+        "ATOM_MLA_DECODE_FORCE_NON_PERSISTENT", "0"
+    )
+    == "1",
     # Force-skip the draft-model forward in eagle/MTP propose() and return
     # sentinel draft token ids (int max) so rejection_sampler rejects all
     # speculative tokens. Used to reproduce 100% rejection behavior — the
