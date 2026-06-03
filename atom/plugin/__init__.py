@@ -1,5 +1,4 @@
 from .prepare import (
-    prepare_model,
     is_sglang,
     is_vllm,
     is_rtpllm,
@@ -7,7 +6,6 @@ from .prepare import (
 )
 
 __all__ = [
-    "prepare_model",
     "is_sglang",
     "is_vllm",
     "is_rtpllm",

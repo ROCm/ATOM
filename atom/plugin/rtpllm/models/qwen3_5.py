@@ -635,8 +635,8 @@ class ATOMQwen35Moe(BaseModel):
                 "ATOMQwen35Moe is only supported as an RTP external plugin."
             )
 
-        import atom
         from atom.model_loader.loader import load_model_in_plugin_mode
+        from atom.plugin.prepare import prepare_model
 
         target_device = torch.device(
             self.device if getattr(self, "device", None) else "cuda"
@@ -757,7 +757,7 @@ class ATOMQwen35Moe(BaseModel):
             apply_attention_gdn_rtpllm_patch()
             apply_attention_mha_rtpllm_patch()
             apply_qwen3_next_rtpllm_patch()
-            atom_model = atom.prepare_model(config=self, engine="rtpllm")
+            atom_model = prepare_model(config=self, engine="rtpllm")
             if atom_model is None:
                 raise ValueError(
                     "ATOM failed to create qwen3.5-moe model for rtp-llm plugin"

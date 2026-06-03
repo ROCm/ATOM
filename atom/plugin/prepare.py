@@ -91,7 +91,7 @@ def prepare_model(config: Any, engine: str):
 
         apply_prepare_model_adaptations(atom_config, model_arch)
 
-    # rtp-llm plugin mode uses atom.prepare_model -> model construction directly.
+    # rtp-llm plugin mode uses this entry point for direct model construction.
     # Ensure quant layer name remap/exclude processing is done BEFORE model init,
     # otherwise layer quant_type gets fixed with stale rules.
     if is_rtpllm():
