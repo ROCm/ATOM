@@ -326,6 +326,24 @@
       ]
     },
     {
+      "choice_label": "DeepSeek-V3.2 FP8 PTPC",
+      "source_path": "amd/DeepSeek-V3.2-mtp-ptpc",
+      "path": "amd/DeepSeek-V3.2-mtp-ptpc",
+      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "nightly_group": "B",
+      "variants": [
+        {
+          "tp_size": 4,
+          "display": "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
+          "dashboard_model": "DeepSeek-V3.2-FP8-PTPC-aw-tp4",
+          "prefix": "deepseek-v3-2-fp8-ptpc-aw-tp4",
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0"
+        }
+      ]
+    },
+    {
       "choice_label": "GLM-4.7-FP8",
       "source_path": "zai-org/GLM-4.7-FP8",
       "path": "zai-org/GLM-4.7-FP8",
