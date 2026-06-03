@@ -1032,13 +1032,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_act = topk_weights.shape[1]
 
                 # Convert to triton routing data structures
-                n_expts_tot = router_logits.shape[-1]
-                if global_num_experts > 0:
-                    n_expts_tot = global_num_experts
-                n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
+                if expert_map is not None:
+                    # local_num_experts already includes fused shared experts
+                    # (added at FusedMoE.__init__ line ~2056).
+                    n_expts_tot = layer.local_num_experts
+                else:
+                    n_expts_tot = router_logits.shape[-1]
+                    if global_num_experts > 0:
+                        n_expts_tot = global_num_experts
+                    n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
                 routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
-                    topk_weights, topk_ids, n_expts_tot
+                    topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
                 )
 
                 output = torch.empty_like(x)
@@ -2071,6 +2076,11 @@ class FusedMoE(torch.nn.Module):
                         ],
                         dtype=torch.int32,
                     ),
+                    # Sentinel entry for the fake expert ID
+                    # (global_num_experts + num_fused_shared_experts) used by
+                    # aiter topK to mark non-local tokens when EP is active.
+                    # Must map to -1 so that EP remapping zeros their weights.
+                    torch.tensor([-1], dtype=torch.int32),
                 ),
                 dim=0,
             )
@@ -3033,7 +3043,7 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            expert_map=self.expert_mask,
+            expert_map=self.expert_map,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
@@ -3091,7 +3101,7 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            expert_map=self.expert_mask,
+            expert_map=self.expert_map,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
