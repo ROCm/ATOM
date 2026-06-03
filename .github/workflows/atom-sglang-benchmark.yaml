@@ -7,9 +7,9 @@ concurrency:
 on:
   schedule:
     # Nightly at 23:00 Beijing time (15:00 UTC).
-    - cron: '0 15 * * 1,3'  # Mon/Wed: SGLang-OOB DeepSeek group A, 6 models x 10 params = 60 cases
-    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB DeepSeek MTP group B, 2 models x 10 params = 20 cases
-    - cron: '0 15 * * 5'    # Fri: SGLang-OOB all, 10 models x 10 params = 100 cases
+    - cron: '0 15 * * 1,3'  # Mon/Wed: SGLang-OOB DeepSeek group A, 12 models x 10 params = 120 cases
+    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB DeepSeek MTP group B, 4 models x 10 params = 40 cases
+    - cron: '0 15 * * 5'    # Fri: SGLang-OOB all, 20 models x 10 params = 200 cases
     - cron: '0 15 * * 6'  # Sat: SGLang-Mesh all, 8 configs = 62 cases
   workflow_dispatch:
     inputs:
@@ -26,18 +26,28 @@ on:
         options:
           - "none (do not run SGLang-OOB models)"
           - "deepseek-r1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp8-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp8-tp4-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp4-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp4-dp4-ep4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp4-dp4-ep4-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp8-ep8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-mtp3 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp8-mtp3-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-mtp1 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp8-mtp1-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-5-397b-a17b-fp8-tp4-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
-          - "all-deepseek (8 DeepSeek configs x 10 default params)"
-          - "all-qwen (2 Qwen configs x 10 default params)"
-          - "all-oob (all SGLang-OOB configs x 10 default params)"
+          - "qwen3-5-397b-a17b-fp8-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "all-deepseek (16 DeepSeek configs x 10 default params)"
+          - "all-qwen (4 Qwen configs x 10 default params)"
+          - "all-oob (all 20 SGLang-OOB configs x 10 default params)"
         default: "none (do not run SGLang-OOB models)"
       mesh_config_preset:
         description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"

@@ -64,6 +64,61 @@ on:
         required: false
         type: boolean
         default: false
+      run_mi308_dsr1_fp8_tp4:
+        description: "MI308 DeepSeek-R1-FP8 TP4"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_qwen35_35b_a3b_fp8_tp2:
+        description: "MI308 Qwen3.5-35B-A3B-FP8 TP2"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_qwen35_35b_a3b_tp2:
+        description: "MI308 Qwen3.5-35B-A3B TP2"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_qwen35_397b_a17b_fp8_tp4:
+        description: "MI308 Qwen3.5-397B-A17B-FP8 TP4"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_qwen35_397b_a17b_fp8_tp8:
+        description: "MI308 Qwen3.5-397B-A17B-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_dsr1_fp8_tp8:
+        description: "MI308 DeepSeek-R1-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_dsr1_fp4_tp4:
+        description: "MI308 DeepSeek-R1-FP4 TP4"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_dsr1_fp4_tp4_dp4_ep4:
+        description: "MI308 DeepSeek-R1-FP4 TP4 DP4 EP4"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_dsr1_fp4_tp8:
+        description: "MI308 DeepSeek-R1-FP4 TP8"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_dsr1_fp4_tp8_mtp3:
+        description: "MI308 DeepSeek-R1-FP4 TP8 MTP3"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_dsr1_fp4_tp8_mtp1:
+        description: "MI308 DeepSeek-R1-FP4 TP8 MTP1"
+        required: false
+        type: boolean
+        default: false
       upload_accuracy_to_dashboard:
         description: "Optional: upload SGLANG accuracy results to dashboard after this manual run"
         required: false
@@ -117,6 +172,17 @@ jobs:
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
           RUN_DSR1_FP4_TP8_MTP3: ${{ inputs.run_dsr1_fp4_tp8_mtp3 }}
           RUN_DSR1_FP4_TP8_MTP1: ${{ inputs.run_dsr1_fp4_tp8_mtp1 }}
+          RUN_MI308_DSR1_FP8_TP4: ${{ inputs.run_mi308_dsr1_fp8_tp4 }}
+          RUN_MI308_QWEN35_35B_A3B_FP8_TP2: ${{ inputs.run_mi308_qwen35_35b_a3b_fp8_tp2 }}
+          RUN_MI308_QWEN35_35B_A3B_TP2: ${{ inputs.run_mi308_qwen35_35b_a3b_tp2 }}
+          RUN_MI308_QWEN35_397B_A17B_FP8_TP4: ${{ inputs.run_mi308_qwen35_397b_a17b_fp8_tp4 }}
+          RUN_MI308_QWEN35_397B_A17B_FP8_TP8: ${{ inputs.run_mi308_qwen35_397b_a17b_fp8_tp8 }}
+          RUN_MI308_DSR1_FP8_TP8: ${{ inputs.run_mi308_dsr1_fp8_tp8 }}
+          RUN_MI308_DSR1_FP4_TP4: ${{ inputs.run_mi308_dsr1_fp4_tp4 }}
+          RUN_MI308_DSR1_FP4_TP4_DP4_EP4: ${{ inputs.run_mi308_dsr1_fp4_tp4_dp4_ep4 }}
+          RUN_MI308_DSR1_FP4_TP8: ${{ inputs.run_mi308_dsr1_fp4_tp8 }}
+          RUN_MI308_DSR1_FP4_TP8_MTP3: ${{ inputs.run_mi308_dsr1_fp4_tp8_mtp3 }}
+          RUN_MI308_DSR1_FP4_TP8_MTP1: ${{ inputs.run_mi308_dsr1_fp4_tp8_mtp1 }}
         run: |
           set -euo pipefail
 
@@ -229,6 +295,17 @@ jobs:
                   "runner": "linux-atom-mi35x-8",
               },
           ]
+
+          mi308_models = []
+          for model in models:
+              mi308_model = dict(model)
+              mi308_model["toggle_env"] = model["toggle_env"].replace("RUN_", "RUN_MI308_", 1)
+              mi308_model["model_name"] = f"MI308 {model['model_name']}"
+              mi308_model["runner"] = "atom-mi308-8gpu-plugins-benchmark"
+              if mi308_model["model_name"].startswith("MI308 DeepSeek-") and "AITER_QUICK_REDUCE_QUANTIZATION=" not in mi308_model["env_vars"]:
+                  mi308_model["env_vars"] = "AITER_QUICK_REDUCE_QUANTIZATION=INT4\n" + mi308_model["env_vars"]
+              mi308_models.append(mi308_model)
+          models.extend(mi308_models)
 
           selected = []
           for model in models:
