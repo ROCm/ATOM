@@ -16,7 +16,9 @@ def _rmsnorm_nw_kernel(
     eps,
     RBLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # int64 row offset: row * stride exceeds INT32_MAX for large token counts
+    # (num_rows * D > 2^31), which would wrap negative and read/write OOB.
+    row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, RBLOCK)
     mask = cols < D
 

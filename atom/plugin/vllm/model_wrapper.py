@@ -2,6 +2,8 @@ from collections.abc import Iterable
 
 import functools
 import importlib
+import json
+import os
 import types
 import torch
 import torch.nn as nn
@@ -42,6 +44,75 @@ _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
     "Glm4MoeMTPModel",
 }
+# DeepSeek-V4 is a native ATOM model whose forward reads ATOM's own forward
+# context (not vLLM's). It needs the V4 proxy-cache bridge wired in the plugin
+# wrapper (register at init, bind + enter context per forward); see `forward`.
+_DEEPSEEK_V4_ARCH = "DeepseekV4ForCausalLM"
+
+
+def _probe_v4_routed_expert_dtype(model_path) -> str | None:
+    """Return ``"fp4"`` / ``"fp8"`` / ``None`` for a DeepSeek-V4 checkpoint's
+    routed-expert weights, read from the actual on-disk tensor dtype.
+
+    V4 stores routed experts (``ffn.experts.*.w{1,2,3}``) as either FP4 e2m1
+    (packed two-per-byte into (u)int8 + per_1x32 UE8M0 scale) or FP8 e4m3
+    (per-block 128x128). The checkpoint's global ``quantization_config`` only
+    describes the FP8 *projection* scheme, so the routed-expert dtype can only
+    be known by reading the weight tensor itself.
+    """
+    if not model_path or not os.path.isdir(model_path):
+        return None
+    idx_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.isfile(idx_path):
+        return None
+    try:
+        with open(idx_path) as f:
+            wmap = json.load(f).get("weight_map", {})
+        probe = next(
+            (k for k in wmap if ".ffn.experts." in k and k.endswith(".w1.weight")),
+            None,
+        )
+        if probe is None:
+            return None
+        from safetensors import safe_open
+
+        with safe_open(os.path.join(model_path, wmap[probe]), framework="pt") as h:
+            dt = str(h.get_slice(probe).get_dtype()).upper()
+    except Exception:
+        return None
+    if dt in ("I8", "U8", "UINT8", "INT8"):
+        return "fp4"  # FP4 e2m1 packed two values per byte
+    if dt in ("F8_E4M3", "F8_E4M3FN", "F8_E4M3FNUZ"):
+        return "fp8"
+    return None
+
+
+def _maybe_set_v4_expert_dtype(atom_config, vllm_config) -> None:
+    """Pin DeepSeek-V4 ``hf_config.expert_dtype`` from the on-disk routed-expert
+    dtype so ``make_v4_quant_config`` selects the correct (FP4 vs FP8) spec.
+
+    Checkpoints like DeepSeek-V4-Flash ship FP4 routed experts + FP8
+    projections, but their global ``quantization_config`` only declares the FP8
+    scheme. The model's parser-based auto-detection therefore mis-classifies the
+    routed experts as FP8-block and dequantizes the FP4 expert weights wrongly,
+    producing garbage output. ``expert_dtype`` is the model's documented
+    override hook; we set it from the real on-disk dtype.
+    """
+    hf_config = getattr(atom_config, "hf_config", None)
+    if hf_config is None or getattr(hf_config, "expert_dtype", None):
+        return  # explicit config / prior setting wins
+    model_path = getattr(getattr(vllm_config, "model_config", None), "model", None)
+    dtype = _probe_v4_routed_expert_dtype(model_path)
+    if dtype:
+        hf_config.expert_dtype = dtype
+        logger.info(
+            "DeepSeek-V4: pinned expert_dtype=%s from on-disk routed-expert "
+            "weights (%s)",
+            dtype,
+            model_path,
+        )
+
+
 _ATOM_MODEL_CLASSES: dict[str, str] = {
     "LlamaForCausalLM": "atom.models.llama:LlamaForCausalLM",
     "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
@@ -59,6 +130,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
+    "DeepseekV4ForCausalLM": "atom.models.deepseek_v4:DeepseekV4ForCausalLM",
 }
 
 
@@ -217,6 +289,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             getattr(self.atom_config.hf_config, "index_topk_freq", None),
             getattr(self.atom_config.hf_config, "index_topk_pattern", None),
         )
+        # DeepSeek-V4's routed-expert quant scheme (FP4 vs FP8-block) is not
+        # described by the checkpoint's global quantization_config, so the
+        # model's auto-detection can pick the wrong spec and emit garbage. Pin
+        # expert_dtype from the on-disk weights before the model (and its
+        # make_v4_quant_config) is constructed.
+        if model_arch == _DEEPSEEK_V4_ARCH:
+            _maybe_set_v4_expert_dtype(self.atom_config, vllm_config)
         _prepare_env(atom_config=self.atom_config)
         model_cls = _get_atom_model_cls(model_arch)
         module_remapping = getattr(model_cls, "packed_modules_mapping", {})
@@ -286,6 +365,20 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # here init aiter dist for using aiter custom collective ops
         self.pp_group = get_pp_group()
         self.tp_group = get_tp_group()
+
+        # DeepSeek-V4 is a native ATOM model: its forward reads ATOM's *own*
+        # forward context (input_ids for hash-MoE routing, indexer/attention
+        # metadata), which vLLM's runner never populates. The plugin bridges
+        # this — register the proxy KV layer now, then per-forward bind the
+        # proxy cache views and enter `atom_deepseek_v4_forward_context`
+        # (see `forward`). Other ATOM models follow vLLM's contract directly.
+        self._is_deepseek_v4 = self.model_arch == _DEEPSEEK_V4_ARCH
+        if self._is_deepseek_v4:
+            from atom.plugin.vllm.deepseek_v4_bridge import (
+                register_deepseek_v4_proxy_layer,
+            )
+
+            register_deepseek_v4_proxy_layer(vllm_config)
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.
@@ -479,13 +572,49 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             ]
             buf[: positions.numel()].copy_(positions)
 
-        hidden_states = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
+        if self._is_deepseek_v4:
+            # DeepSeek-V4 is a native ATOM model: it reads ATOM's own forward
+            # context and takes a native (input_ids, positions) forward — vLLM's
+            # generic call contract (intermediate_tensors/inputs_embeds) does not
+            # apply (V4 is TP-only, text-only). Bind the proxy cache views and
+            # enter `atom_deepseek_v4_forward_context` so ATOM's Context (the
+            # input_ids hash-MoE routing key) and chunk-aware attention metadata
+            # are populated before the (possibly graph-captured) forward runs.
+            from atom.plugin.vllm.deepseek_v4_bridge import (
+                atom_deepseek_v4_forward_context,
+                bind_deepseek_v4_proxy_cache_views,
+            )
+
+            ready = bind_deepseek_v4_proxy_cache_views(self.model, self.vllm_config)
+            # Per-request stable state slots + chunk-aware metadata + selective
+            # reset are driven from the allocator/params stashed at bind time.
+            # Only engage them once the proxy cache is bound (real forwards);
+            # dummy/profile forwards fall back to arange slots with no reset.
+            slot_allocator = (
+                getattr(self.model, "_atom_v4_slot_allocator", None) if ready else None
+            )
+            meta_params = (
+                getattr(self.model, "_atom_v4_meta_params", None) if ready else None
+            )
+            with atom_deepseek_v4_forward_context(
+                atom_config=self.atom_config,
+                input_ids=input_ids,
+                positions=positions,
+                force_dummy=not ready,
+                state_model=self.model if ready else None,
+                meta_params=meta_params,
+                slot_allocator=slot_allocator,
+            ):
+                hidden_states = self.model(input_ids=input_ids, positions=positions)
+        else:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
