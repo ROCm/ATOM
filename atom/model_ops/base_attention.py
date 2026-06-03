@@ -21,9 +21,105 @@ from atom.utils.selector import get_attn_backend
 # op in model file
 class Attention:
     def __new__(cls, *args, **kwargs):
-        from atom.model_ops import Attention
+        from atom.plugin.prepare import is_sglang, is_vllm
 
-        return Attention(*args, **kwargs)
+        if is_vllm():
+            from atom.plugin.vllm.attention.layer import AttentionForVllm
+
+            return AttentionForVllm(*args, **kwargs)
+        if is_sglang():
+            from atom.plugin.sglang.attention import AttentionForSGLang
+
+            return AttentionForSGLang(*args, **kwargs)
+
+        from atom.model_ops.paged_attention import Attention as AttentionForAtom
+
+        return AttentionForAtom(*args, **kwargs)
+
+
+def run_pa_fwd_asm(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    max_qlen: int = 1,
+    high_precision: int = 0,
+):
+    """Run the AITER paged-attention ASM kernel with explicit metadata."""
+
+    import aiter
+
+    return aiter.pa_fwd_asm(
+        Q=q,
+        K=k_cache,
+        V=v_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        block_tables_stride0=block_tables.stride(0),
+        max_qlen=max_qlen,
+        K_QScale=k_scale,
+        V_QScale=v_scale,
+        out_=out,
+        qo_indptr=qo_indptr,
+        high_precision=high_precision,
+    )
+
+
+def run_pa_decode_gluon(
+    output: torch.Tensor,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    max_seqlen_q: int,
+    max_context_partition_num: int,
+    context_partition_size: int,
+    compute_type: torch.dtype,
+    q_scale: Optional[torch.Tensor],
+    k_scale: Optional[torch.Tensor],
+    v_scale: Optional[torch.Tensor],
+    *,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    temporary_output: torch.Tensor,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: int = -1,
+    ps: bool = True,
+):
+    """Run the AITER paged-attention Gluon decode kernel."""
+
+    return torch.ops.aiter.pa_decode_gluon(
+        output,
+        q,
+        k_cache,
+        v_cache,
+        context_lens,
+        block_tables,
+        softmax_scale,
+        max_seqlen_q,
+        max_context_partition_num,
+        context_partition_size,
+        compute_type,
+        q_scale,
+        k_scale,
+        v_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        alibi_slopes=alibi_slopes,
+        sinks=sinks,
+        sliding_window=sliding_window,
+        ps=ps,
+    )
 
 
 # this triton kernel is used to fetch the stored kv in
@@ -257,7 +353,6 @@ def unified_attention_with_output_base(
     self = atom_config.compilation_config.static_forward_context[layer_name]
     if use_mla:
         return self.impl.forward(
-            layer=self,
             query=q,
             k_nope=k,
             k_rope=v,
@@ -266,7 +361,6 @@ def unified_attention_with_output_base(
         )
     else:
         return self.impl.forward(
-            layer=self,
             query=q,
             key=k,
             value=v,

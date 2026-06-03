@@ -78,7 +78,7 @@ on:
 jobs:
   docker-release:
     name: Nightly Docker Release
-    runs-on: ${{ inputs.runner || 'linux-atom-mi355-1' }}
+    runs-on: ${{ inputs.runner || 'linux-atom-mi35x-1' }}
     strategy:
       fail-fast: false
       matrix:

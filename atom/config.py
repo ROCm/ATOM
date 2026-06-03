@@ -252,6 +252,8 @@ class CompilationConfig:
             self.splitting_ops = [
                 "aiter.unified_attention_with_output",
                 "aiter.mla_attention",
+                "aiter.atom_vllm_mha_attention",
+                "aiter.atom_vllm_mla_attention",
             ]
 
 
@@ -1125,19 +1127,6 @@ class Config:
                     "(SWA buffer is not cacheable); disabling automatically."
                 )
                 self.enable_prefix_caching = False
-            # V4's MHC compress-attention / SWA per-request state assumes the whole
-            # prompt is processed in one forward; chunked prefill splits a request
-            # across batches and leaves that per-request state inconsistent, so
-            # disable chunked prefill too.
-            if self.enable_chunked_prefill:
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "DeepSeek-V4 does not support chunked prefill "
-                    "(per-request SWA/compress state is not chunk-safe); "
-                    "disabling automatically."
-                )
-                self.enable_chunked_prefill = False
 
     def compute_hash(self) -> str:
         """

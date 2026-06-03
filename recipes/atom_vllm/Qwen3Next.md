@@ -37,6 +37,9 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
 ```
 
 ### Qwen3-Next-80B-A3B-Instruct-FP8 MTP (TP=1/TP=4, MI355X)
+
+**Important**: ATOM-vLLM no longer supports disabling only ATOM attention while keeping ATOM models active. Use `ATOM_DISABLE_VLLM_PLUGIN=1` for a pure vLLM run.
+
 ```bash
 TP=1
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
@@ -101,6 +104,9 @@ lm_eval --model local-completions \
         --num_fewshot 3
 ```
 
+## Key Environment Variables
+
+- `ATOM_DISABLE_VLLM_PLUGIN=1`: Optional pure-vLLM control when you do not want to use the ATOM vLLM plugin.
 
 ## Architecture Notes
 
