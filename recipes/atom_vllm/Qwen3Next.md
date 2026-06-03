@@ -20,19 +20,20 @@ export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
 export ATOM_USE_FLYDSL_GDR=1
 export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
+export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
 if [ "${TP}" != "1" ]; then export AITER_QUICK_REDUCE_QUANTIZATION=INT4; fi
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size "${TP}" \
-    --kv-cache-dtype fp8 \
     --async-scheduling \
     --load-format fastsafetensors \
     --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
-    --max-model-len 16384 \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size "${TP}" \
     --max-num-batched-tokens 32768 \
+    --max-model-len 16384 \
     --no-enable-prefix-caching
 ```
 
@@ -43,19 +44,20 @@ export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
 export ATOM_USE_FLYDSL_GDR=1
 export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
+export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
 if [ "${TP}" != "1" ]; then export AITER_QUICK_REDUCE_QUANTIZATION=INT4; fi
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size "${TP}" \
-    --kv-cache-dtype fp8 \
     --async-scheduling \
     --load-format fastsafetensors \
     --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
-    --max-model-len 16384 \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size "${TP}" \
     --max-num-batched-tokens 32768 \
+    --max-model-len 16384 \
     --speculative-config '{"num_speculative_tokens":1, "method": "mtp"}' \
     --no-enable-prefix-caching
 ```
@@ -64,18 +66,23 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
 Users can use the default vllm bench commands for performance benchmarking.
 
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
     --backend vllm \
     --base-url http://127.0.0.1:8000 \
     --endpoint /v1/completions \
     --model Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --dataset-name random \
-    --random-input-len 1000 \
-    --random-output-len 100 \
-    --max-concurrency 4 \
-    --num-prompts 40 \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --num-prompts "$(( CONC * 8 ))" \
+    --max-concurrency "${CONC}" \
     --trust_remote_code \
-    --num-warmups 8 \
+    --num-warmups "${CONC}" \
     --request-rate inf \
     --ignore-eos \
     --disable-tqdm \
@@ -96,7 +103,7 @@ profiler_config=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_p
 
 ```bash
 lm_eval --model local-completions \
-        --model_args model=Qwen/Qwen3-Next-80B-A3B-Instruct-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+        --model_args model=Qwen/Qwen3-Next-80B-A3B-Instruct-FP8,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
         --tasks gsm8k \
         --num_fewshot 3
 ```

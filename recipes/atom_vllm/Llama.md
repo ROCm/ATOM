@@ -22,31 +22,37 @@ huggingface-cli login
 
 ```bash
 export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 
 vllm serve meta-llama/Llama-3.1-8B-Instruct \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size 1 \
-    --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 1 \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
     --no-enable-prefix-caching
 ```
 
 ### Meta-Llama-3.1-405B-Instruct-FP8/ (TP=8)
 
 ```bash
-vllm serve meta-llama/Llama-3.1-405B-Instruct-FP8/ \
+vllm serve Meta-Llama-3.1-405B-Instruct-FP8/ \
     --host localhost \
     --port 8000 \
+    --async-scheduling \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
     --tensor-parallel-size 8 \
     --load-format safetensors \
     --allow-deprecated-quantization \
-    --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
-    --async-scheduling \
-    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384 \
     --no-enable-prefix-caching
 ```
 
@@ -55,17 +61,26 @@ vllm serve meta-llama/Llama-3.1-405B-Instruct-FP8/ \
 Users can use the default `vllm bench` command for performance benchmarking:
 
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
-    --host localhost \
-    --port 8000 \
+    --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --endpoint /v1/completions \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --dataset-name random \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.8 \
-    --max-concurrency 64 \
-    --num-prompts 640 \
-    --trust-remote-code \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --num-prompts "$(( CONC * 8 ))" \
+    --max-concurrency "${CONC}" \
+    --num-warmups "${CONC}" \
+    --request-rate inf \
+    --ignore-eos \
+    --disable-tqdm \
+    --save-result \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 
@@ -75,7 +90,7 @@ vllm bench serve \
 
 ```bash
 lm_eval --model local-completions \
-        --model_args model=meta-llama/Llama-3.1-8B-Instruct,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+        --model_args model=meta-llama/Llama-3.1-8B-Instruct,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
         --tasks gsm8k \
         --num_fewshot 3
 ```
@@ -92,7 +107,7 @@ Measured result (2026-04-03, TP=1, `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`):
 
 ```bash
 lm_eval --model local-completions \
-        --model_args model=meta-llama/Llama-3.1-405B-Instruct-FP8/,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+        --model_args model=Meta-Llama-3.1-405B-Instruct-FP8/,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
         --tasks gsm8k \
         --num_fewshot 3
 ```
