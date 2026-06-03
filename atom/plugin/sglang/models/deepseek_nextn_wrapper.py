@@ -21,16 +21,11 @@ from sglang.srt.server_args import get_global_server_args
 from atom.config import QuantizationConfig as AtomQuantizationConfig
 from atom.config import SpeculativeConfig
 from atom.plugin.config import generate_atom_config_for_plugin_mode
-from atom.plugin.sglang.attention_backend.sgl_attention_mla import (
+from atom.plugin.sglang.models.deepseek_mla import (
     setup_deepseek_for_sglang,
 )
-from atom.plugin.sglang.models.base_model_wrapper import (
-    _current_forward_batch,
-    _is_dummy_forward,
-    _materialize_atom_dummy_forward,
-    _reset_sglang_forward_context,
-    _set_sglang_forward_context,
-    _trim_hidden_states_for_output,
+from atom.plugin.sglang.runtime import (
+    SGLangPluginRuntime,
     plugin_runtime_scope,
 )
 
@@ -80,7 +75,7 @@ def _retag_mtp_runtime_layer_ids(model: nn.Module) -> None:
 
         _set_runtime_layer_id(self_attn, local_layer_id)
 
-        for attr_name in ("mla_attn", "attn_mha"):
+        for attr_name in ("mla_attn", "attn_non_absorbed", "attn_mha"):
             attn_obj = getattr(self_attn, attr_name, None)
             if attn_obj is None:
                 continue
@@ -224,54 +219,28 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             raise ValueError("DeepSeek MTP draft forward requires speculative info")
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
-            if _is_dummy_forward(forward_batch):
-                (
-                    model_input_ids,
-                    model_positions,
-                    model_input_embeds,
-                    model_forward_batch,
-                ) = _materialize_atom_dummy_forward(
-                    input_ids,
-                    positions,
-                    input_embeds,
-                    forward_batch,
-                )
-                model_hidden_states = _materialize_dummy_hidden_states(
-                    forward_batch.spec_info.hidden_states,
-                    length=int(model_positions.shape[0]),
-                )
-            else:
-                (
-                    model_input_ids,
-                    model_positions,
-                    model_input_embeds,
-                    model_forward_batch,
-                ) = (
-                    input_ids,
-                    positions,
-                    input_embeds,
-                    forward_batch,
-                )
+            with SGLangPluginRuntime(
+                atom_config=self.atom_config,
+                forward_batch=forward_batch,
+                positions=positions,
+                input_ids=input_ids,
+                input_embeds=input_embeds,
+            ) as runtime:
                 model_hidden_states = forward_batch.spec_info.hidden_states
-
-            token = _current_forward_batch.set(model_forward_batch)
-            try:
-                _set_sglang_forward_context(
-                    self.atom_config, model_forward_batch, model_positions
-                )
+                if runtime.forward_batch is not forward_batch:
+                    model_hidden_states = _materialize_dummy_hidden_states(
+                        model_hidden_states,
+                        length=int(runtime.positions.shape[0]),
+                    )
                 hidden_states = self.model(
-                    input_ids=model_input_ids,
-                    positions=model_positions,
+                    input_ids=runtime.input_ids,
+                    positions=runtime.positions,
                     hidden_states=model_hidden_states,
-                    inputs_embeds=model_input_embeds,
+                    inputs_embeds=runtime.input_embeds,
                 )
-            finally:
-                _reset_sglang_forward_context()
-                _current_forward_batch.reset(token)
 
             if self.pp_group.is_last_rank:
-                if _is_dummy_forward(forward_batch):
-                    hidden_states = _trim_hidden_states_for_output(hidden_states, 0)
+                hidden_states = runtime.trim_output(hidden_states)
                 return self.logits_processor(
                     input_ids,
                     hidden_states,
