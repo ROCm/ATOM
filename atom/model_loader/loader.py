@@ -379,73 +379,92 @@ def load_model(
             fn(*args)
 
     try:
-        disable_mmap = envs.ATOM_DISABLE_MMAP
-        for name, weight_tensor in safetensors_weights_iterator(
-            model_name_or_path, disable_mmap=disable_mmap
-        ):
-            _orig_ckpt_name = name  # preserve for ckpt-side coverage report
-            if weights_mapper is not None:
-                mapped_name = weights_mapper._map_name(name)
-                if mapped_name is None:
-                    continue
-                name = mapped_name
-            if load_dummy:
-                continue
-            # Draft models may remap ckpt-side `mtp.*` entries into params
-            # whose names do not themselves contain `mtp` (e.g. Qwen3.5 MTP
-            # rewrites `mtp.*` -> `model.*`). Gate only on `spec_decode`,
-            # otherwise we can drop the entire drafter checkpoint before the
-            # model-specific remap logic has a chance to run.
-            if "mtp" in name and not spec_decode:
-                continue
-            if name.endswith("kv_scale") or "inv_freq" in name:
-                continue
-            # Skip weights matching model-defined prefixes (e.g. vision encoder
-            # weights in multimodal checkpoints that are not needed for text-only
-            # inference).
-            if skip_weight_prefixes and any(
-                name.startswith(p) for p in skip_weight_prefixes
+        if load_dummy:
+            logger.info("load_dummy=True, skipping all weight loading")
+        else:
+            disable_mmap = envs.ATOM_DISABLE_MMAP
+            for name, weight_tensor in safetensors_weights_iterator(
+                model_name_or_path, disable_mmap=disable_mmap
             ):
-                continue
-            if spec_decode and mtp_remap is not None:
-                remapped = mtp_remap(name)
-                if remapped is None:
+                _orig_ckpt_name = name
+                if weights_mapper is not None:
+                    mapped_name = weights_mapper._map_name(name)
+                    if mapped_name is None:
+                        continue
+                    name = mapped_name
+                # Draft models may remap ckpt-side `mtp.*` entries into params
+                # whose names do not themselves contain `mtp` (e.g. Qwen3.5 MTP
+                # rewrites `mtp.*` -> `model.*`). Gate only on `spec_decode`,
+                # otherwise we can drop the entire drafter checkpoint before the
+                # model-specific remap logic has a chance to run.
+                if "mtp" in name and not spec_decode:
                     continue
-                name = remapped
-            for mapping_part in weights_mapping.keys():
-                if mapping_part in name:
-                    name = name.replace(mapping_part, weights_mapping[mapping_part])
-            if "weight_scale_inv" in name:
-                name = name.replace("weight_scale_inv", "weight_scale")
+                if name.endswith("kv_scale") or "inv_freq" in name:
+                    continue
+                # Skip weights matching model-defined prefixes (e.g. vision encoder
+                # weights in multimodal checkpoints that are not needed for text-only
+                # inference).
+                if skip_weight_prefixes and any(
+                    name.startswith(p) for p in skip_weight_prefixes
+                ):
+                    continue
+                if spec_decode and mtp_remap is not None:
+                    remapped = mtp_remap(name)
+                    if remapped is None:
+                        continue
+                    name = remapped
+                for mapping_part in weights_mapping.keys():
+                    if mapping_part in name:
+                        name = name.replace(mapping_part, weights_mapping[mapping_part])
+                if "weight_scale_inv" in name:
+                    name = name.replace("weight_scale_inv", "weight_scale")
 
-            layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
-            layerId = int(layerId_.group(1)) if layerId_ else 0
-            if (
-                hf_config.num_hidden_layers
-                and layerId >= hf_config.num_hidden_layers
-                and not spec_decode
-            ):
-                continue
-            maybe_matching_name = have_shared_expert(name)
-            if (
-                is_rocm_aiter_fusion_shared_expert_enabled()
-                and maybe_matching_name is not None
-            ):
-                name = name.replace(
-                    maybe_matching_name,
-                    f"mlp.experts.{hf_config.n_routed_experts}.",
-                )
-            for k in packed_modules_mapping:
-                # We handle the experts below in expert_params_mapping
-                if "mlp.experts." in name and name not in params_dict:
+                layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
+                layerId = int(layerId_.group(1)) if layerId_ else 0
+                if (
+                    hf_config.num_hidden_layers
+                    and layerId >= hf_config.num_hidden_layers
+                    and not spec_decode
+                ):
                     continue
-                if k in name:
-                    packed_value = packed_modules_mapping[k]
-                    # Handle both tuple (fuse parameter) and list (shard parameter)
-                    if isinstance(packed_value, list):
-                        # Checkpoint has fused weight, split into separate params
-                        for shard_idx, target_name in enumerate(packed_value):
-                            param_name = name.replace(k, target_name)
+                maybe_matching_name = have_shared_expert(name)
+                if (
+                    is_rocm_aiter_fusion_shared_expert_enabled()
+                    and maybe_matching_name is not None
+                ):
+                    name = name.replace(
+                        maybe_matching_name,
+                        f"mlp.experts.{hf_config.n_routed_experts}.",
+                    )
+                for k in packed_modules_mapping:
+                    # We handle the experts below in expert_params_mapping
+                    if "mlp.experts." in name and name not in params_dict:
+                        continue
+                    if k in name:
+                        packed_value = packed_modules_mapping[k]
+                        # Handle both tuple (fuse parameter) and list (shard parameter)
+                        if isinstance(packed_value, list):
+                            # Checkpoint has fused weight, split into separate params
+                            for shard_idx, target_name in enumerate(packed_value):
+                                param_name = name.replace(k, target_name)
+                                if "output_scale" not in param_name:
+                                    try:
+                                        param = model.get_parameter(param_name)
+                                    except AttributeError:
+                                        dropped_ckpt_keys.append(
+                                            (_orig_ckpt_name, param_name)
+                                        )
+                                        continue
+                                    weight_loader = getattr(param, "weight_loader")
+                                    _submit(
+                                        weight_loader, param, weight_tensor, shard_idx
+                                    )
+                                    loaded_weights_record.add(prefix + param_name)
+                        else:
+                            # Checkpoint has separate weights, load into fused param
+                            v, shard_id = packed_value
+                            param_name = name.replace(k, v)
+                            # FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
                             if "output_scale" not in param_name:
                                 try:
                                     param = model.get_parameter(param_name)
@@ -453,125 +472,125 @@ def load_model(
                                     dropped_ckpt_keys.append(
                                         (_orig_ckpt_name, param_name)
                                     )
-                                    continue
+                                    break
                                 weight_loader = getattr(param, "weight_loader")
-                                _submit(weight_loader, param, weight_tensor, shard_idx)
+                                _submit(weight_loader, param, weight_tensor, shard_id)
                                 loaded_weights_record.add(prefix + param_name)
-                    else:
-                        # Checkpoint has separate weights, load into fused param
-                        v, shard_id = packed_value
-                        param_name = name.replace(k, v)
-                        # FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
-                        if "output_scale" not in param_name:
-                            try:
-                                param = model.get_parameter(param_name)
-                            except AttributeError:
-                                dropped_ckpt_keys.append((_orig_ckpt_name, param_name))
-                                break
-                            weight_loader = getattr(param, "weight_loader")
-                            _submit(weight_loader, param, weight_tensor, shard_id)
-                            loaded_weights_record.add(prefix + param_name)
-                    break
-            else:
-                # Detect fused expert format if model provides detection function
-                if detect_fused_expert_fn is not None and not is_fused_expert:
-                    is_fused_expert = detect_fused_expert_fn(name)
-                    if is_fused_expert and get_fused_expert_mapping_fn is not None:
-                        fused_expert_params_mapping = get_fused_expert_mapping_fn()
+                        break
+                else:
+                    # Detect fused expert format if model provides detection function
+                    if detect_fused_expert_fn is not None and not is_fused_expert:
+                        is_fused_expert = detect_fused_expert_fn(name)
+                        if is_fused_expert and get_fused_expert_mapping_fn is not None:
+                            fused_expert_params_mapping = get_fused_expert_mapping_fn()
 
-                # Check if model has expert mapping before processing
-                if has_expert_mapping:
-                    # Handle fused expert format
-                    # Model-specific detection and handling via callback functions
-                    if (
-                        is_fused_expert
-                        and load_fused_expert_weights_fn is not None
-                        and fused_expert_params_mapping
-                    ):
-                        matched = False
-                        for mapping_entry in fused_expert_params_mapping:
-                            param_name, weight_name, shard_id = mapping_entry[:3]
-                            if weight_name not in name:
-                                continue
-                            name_mapped = name.replace(weight_name, param_name)
-                            if name_mapped not in params_dict:
-                                continue
+                    # Check if model has expert mapping before processing
+                    if has_expert_mapping:
+                        # Handle fused expert format
+                        # Model-specific detection and handling via callback functions
+                        if (
+                            is_fused_expert
+                            and load_fused_expert_weights_fn is not None
+                            and fused_expert_params_mapping
+                        ):
+                            matched = False
+                            for mapping_entry in fused_expert_params_mapping:
+                                param_name, weight_name, shard_id = mapping_entry[:3]
+                                if weight_name not in name:
+                                    continue
+                                name_mapped = name.replace(weight_name, param_name)
+                                if name_mapped not in params_dict:
+                                    continue
 
-                            # Generic call - model provides implementation details
-                            num_experts = getattr(
-                                hf_config, "n_routed_experts", 0
-                            ) or getattr(hf_config, "num_experts", 0)
-                            matched = load_fused_expert_weights_fn(
-                                name,  # Original checkpoint name
-                                name_mapped,  # Mapped parameter name
-                                params_dict,
-                                weight_tensor,
-                                shard_id,
-                                num_experts,
-                            )
+                                # Generic call - model provides implementation details
+                                num_experts = getattr(
+                                    hf_config, "n_routed_experts", 0
+                                ) or getattr(hf_config, "num_experts", 0)
+                                matched = load_fused_expert_weights_fn(
+                                    name,  # Original checkpoint name
+                                    name_mapped,  # Mapped parameter name
+                                    params_dict,
+                                    weight_tensor,
+                                    shard_id,
+                                    num_experts,
+                                )
+
+                                if matched:
+                                    loaded_weights_record.add(prefix + name)
+                                    break
 
                             if matched:
-                                loaded_weights_record.add(prefix + name)
-                                break
-
-                        if matched:
-                            continue
-
-                    matched = False
-                    for wm_name in expert_weight_prefixes:
-                        if wm_name not in name:
-                            continue
-                        pm_name, expert_id, shard_id = expert_index[wm_name]
-                        name = name.replace(wm_name, pm_name)
-                        if (
-                            name.endswith(".bias") or name.endswith("_bias")
-                        ) and name not in params_dict:
-                            matched = True
-                            break
-                        if "mtp" in name and not spec_decode:
-                            matched = True
-                            break
-                        try:
-                            param = model.get_parameter(name)
-                        except AttributeError:
-                            # Parameter absent from model (e.g. weight scales for
-                            # an unquantized drafter MTP block); skip silently.
-                            matched = True
-                            break
-                        weight_loader = getattr(param, "weight_loader")
-                        _submit(
-                            weight_loader,
-                            param,
-                            weight_tensor,
-                            name,
-                            shard_id,
-                            expert_id,
-                        )
-                        loaded_weights_record.add(prefix + name)
-                        matched = True
-                        break
-                    if not matched:
-                        if "mtp" in name and not spec_decode:
-                            continue
-                        if merged_target := extract_expert_target_and_id(name):
-                            fused_name, expert_id = merged_target
-                            try:
-                                param = model.get_parameter(fused_name)
-                            except AttributeError:
-                                dropped_ckpt_keys.append((_orig_ckpt_name, fused_name))
                                 continue
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
+
+                        matched = False
+                        for wm_name in expert_weight_prefixes:
+                            if wm_name not in name:
+                                continue
+                            pm_name, expert_id, shard_id = expert_index[wm_name]
+                            name = name.replace(wm_name, pm_name)
+                            if (
+                                name.endswith(".bias") or name.endswith("_bias")
+                            ) and name not in params_dict:
+                                matched = True
+                                break
+                            if "mtp" in name and not spec_decode:
+                                matched = True
+                                break
+                            try:
+                                param = model.get_parameter(name)
+                            except AttributeError:
+                                # Parameter absent from model (e.g. weight scales for
+                                # an unquantized drafter MTP block); skip silently.
+                                matched = True
+                                break
+                            weight_loader = getattr(param, "weight_loader")
                             _submit(
                                 weight_loader,
                                 param,
                                 weight_tensor,
-                                "",  # use merged moe loader
-                                "",
+                                name,
+                                shard_id,
                                 expert_id,
                             )
                             loaded_weights_record.add(prefix + name)
+                            matched = True
+                            break
+                        if not matched:
+                            if "mtp" in name and not spec_decode:
+                                continue
+                            if merged_target := extract_expert_target_and_id(name):
+                                fused_name, expert_id = merged_target
+                                try:
+                                    param = model.get_parameter(fused_name)
+                                except AttributeError:
+                                    dropped_ckpt_keys.append(
+                                        (_orig_ckpt_name, fused_name)
+                                    )
+                                    continue
+                                weight_loader = getattr(
+                                    param, "weight_loader", default_weight_loader
+                                )
+                                _submit(
+                                    weight_loader,
+                                    param,
+                                    weight_tensor,
+                                    "",  # use merged moe loader
+                                    "",
+                                    expert_id,
+                                )
+                                loaded_weights_record.add(prefix + name)
+                            try:
+                                param = model.get_parameter(name)
+                            except AttributeError:
+                                dropped_ckpt_keys.append((_orig_ckpt_name, name))
+                                continue
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            _submit(weight_loader, param, weight_tensor)
+                            loaded_weights_record.add(prefix + name)
+                    else:
+                        # Model doesn't have expert mapping, use generic loading
                         try:
                             param = model.get_parameter(name)
                         except AttributeError:
@@ -582,18 +601,6 @@ def load_model(
                         )
                         _submit(weight_loader, param, weight_tensor)
                         loaded_weights_record.add(prefix + name)
-                else:
-                    # Model doesn't have expert mapping, use generic loading
-                    try:
-                        param = model.get_parameter(name)
-                    except AttributeError:
-                        dropped_ckpt_keys.append((_orig_ckpt_name, name))
-                        continue
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    _submit(weight_loader, param, weight_tensor)
-                    loaded_weights_record.add(prefix + name)
     finally:
         if executor is not None:
             concurrent.futures.wait(futures)
