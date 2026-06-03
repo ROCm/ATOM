@@ -1056,7 +1056,11 @@ class ModelRunner:
             self.config.max_num_batched_tokens,
             self.config.max_model_len,
         )
-        warmup_max_tokens = max_num_batched_tokens
+        dp_size = get_dp_group().world_size
+        if self.config.enable_dp_attention:
+            warmup_max_tokens = max_num_batched_tokens
+        else:
+            warmup_max_tokens = max_num_batched_tokens // dp_size
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -1066,8 +1070,8 @@ class ModelRunner:
             if seq_len == 0:
                 seq_len = 1
             logger.warning(
-                f"{self.label}: warmup_max_tokens={warmup_max_tokens} (=max_num_batched_tokens) "
-                f"< max_model_len={max_model_len}. "
+                f"{self.label}: dp_size={dp_size}, dp_attn={self.config.enable_dp_attention}, "
+                f"warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
                 f"Using {num_seqs} seq with length {seq_len} for warmup."
             )
         else:
