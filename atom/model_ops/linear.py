@@ -452,7 +452,14 @@ class LinearBase(nn.Module):
             self.prefix, use_online_quant=True
         )
         online_quant_type = online_layer_quant_config.quant_type
+        if online_quant_type == QuantType.No:
+            return
         online_quant_dtype = online_layer_quant_config.quant_dtype
+        if (
+            self.quant_type == online_quant_type
+            and self.params_dtype == online_quant_dtype
+        ):
+            return
         online_quant_func = get_hip_quant(online_quant_type)
         assert online_quant_dtype in [
             torch.float8_e4m3fn,

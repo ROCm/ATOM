@@ -227,6 +227,8 @@ class RMSNorm(nn.Module):
         self.fused_allreduce = fused_allreduce
         self.use_fused_quant = fused_quant
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.quant_config = quant_config
+        self.prefix = prefix
 
         layer_quant_config = (
             LayerQuantConfig()
@@ -245,6 +247,72 @@ class RMSNorm(nn.Module):
             and quant_type.value == _QV_PER_1X128
             and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
+
+    def process_weights_after_loading(self):
+        """Post-load hook invoked by the model loader for every module.
+
+        RMSNorm has no weights to re-quantize, but when online quantization is
+        enabled the fused RMSNorm+quant activation scheme may need to follow the
+        downstream weight's online-quant target -- delegated to
+        ``online_quantize_activation``.
+        """
+        # Only the fused-quant path's output depends on `quant_type`; a plain
+        # RMSNorm emits BF16 regardless, so nothing to realign.
+        if self.use_fused_quant:
+            self.online_quantize_activation()
+
+    def online_quantize_activation(self):
+        """Realign the fused RMSNorm activation quant scheme with online quant.
+
+        The fused RMSNorm+quant path emits a quantized activation that a
+        downstream Linear consumes directly without re-quantizing (e.g.
+        DeepSeek-V4 ``q_norm`` -> ``attn.wq_b`` / ``indexer.wq_b``). The GEMM
+        interprets that activation's dtype/scale layout according to the
+        *weight*'s quant scheme. So when online quantization re-quantizes the
+        consumer's weight to a new scheme (e.g. mxfp4 = per_1x32 + fp4x2), the
+        activation emitted here MUST switch to the same scheme; otherwise the
+        per_1x32 GEMM bit-reinterprets a per_1x128 fp8 activation via
+        ``view(fp4x2)`` / ``view(e8m0)`` and produces garbage.
+
+        Mirrors ``LinearBase.online_quantize_weight``'s quant-state update, but
+        there is no weight to re-quantize here -- only the emitted activation
+        ``quant_type`` / ``params_dtype`` (and the derived scale layout).
+        """
+        if self.quant_config is None or not self.quant_config.online_quant:
+            return
+
+        online_cfg = self.quant_config.get_layer_quant_config(
+            self.prefix, use_online_quant=True
+        )
+        online_quant_type = online_cfg.quant_type
+        if online_quant_type == QuantType.No:
+            return
+        # Already emitting the target scheme; avoid a redundant update.
+        if (
+            self.quant_type == online_quant_type
+            and self.params_dtype == online_cfg.quant_dtype
+        ):
+            return
+        # The fused RMSNorm+quant HIP kernel only emits these activation schemes.
+        assert online_quant_type.value in _AITER_RMS_QUANT_TYPE_VALUES, (
+            f"Unsupported online activation quant for fused RMSNorm: "
+            f"type={online_quant_type}, dtype={online_cfg.quant_dtype} "
+            f"(layer={self.prefix})"
+        )
+
+        self.quant_type = online_quant_type
+        self.params_dtype = online_cfg.quant_dtype
+        self._aiter_transpose_scale = (
+            self.quant_type.value == _QV_PER_1X128
+            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
+        # Surfaced by the loader's online-quant report alongside Linear layers.
+        self._online_quant_info = {
+            "layer": self.prefix,
+            "quant_type": online_quant_type.name,
+            "quant_dtype": str(online_cfg.quant_dtype),
+            "kind": "rmsnorm_activation",
+        }
 
     @mark_trace(prefix="rmsnorm", torch_compile=True)
     def forward(

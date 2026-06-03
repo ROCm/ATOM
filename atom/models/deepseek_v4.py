@@ -367,7 +367,7 @@ def _wo_a_is_bf16_on_disk(model_path):
     return False
 
 
-def make_v4_quant_config(hf_config, model_path=None):
+def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
     """Build a QuantizationConfig that knows V4's per-layer quant scheme.
 
     Two V4 SKUs supported:
@@ -391,9 +391,17 @@ def make_v4_quant_config(hf_config, model_path=None):
       - `Compressor.wkv` / `Compressor.wgate` / `indexer.weights_proj`: BF16
         (or fp32 internally; reference declares dtype= explicitly). Loaded raw.
       - All RMSNorm weights, attn_sink, hc_*: BF16/fp32 raw, no quant.
+
+    The optional ``online_quant_config`` is forwarded to the base
+    QuantizationConfig so V4 models can also be re-quantized at load time
+    (e.g. ``ptpc_fp8`` / ``mxfp4``). V4's hardcoded per-layer overrides
+    (FP4 routed experts, BF16 compressor / indexer.weights_proj) are
+    preserved on BOTH the source lookup AND the online lookup — returning
+    the same spec on the online path triggers the FusedMoE/Linear
+    ``source == online_target`` early-return so those layers stay untouched.
     """
 
-    base = QuantizationConfig(hf_config)
+    base = QuantizationConfig(hf_config, online_quant_config=online_quant_config)
 
     fp4_spec = LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2)
     # FP8 per-block 128x128 — V4-Flash-Base routed path.
@@ -427,12 +435,18 @@ def make_v4_quant_config(hf_config, model_path=None):
 
     orig_lookup = base.get_layer_quant_config
 
-    def overridden(layer_name, *, check_children=False):
+    def overridden(layer_name, use_online_quant=False, *, check_children=False):
         # Routed experts → SKU-detected (FP4 for V4-Pro, FP8-block for V4-Flash).
         # Match both per-expert prefix `layers.N.ffn.experts.M.w{1,2,3}` (used
         # by individual Linear lookups, with trailing `.M.w1`) AND the bare
         # `layers.N.ffn.experts` prefix (used by FusedMoE.__init__ when
         # constructing fused expert params — has NO trailing dot).
+        #
+        # V4 hardcoded specs apply on BOTH source AND online lookups. When
+        # online_quant is enabled, returning the source spec here means
+        # FusedMoE/Linear see `source == online_target` and skip the
+        # dequant→requant round-trip for these layers (which would either
+        # crash on the moe assert or further damage already-quantized weights).
         if ".ffn.experts" in layer_name:
             return routed_spec
         # BF16 / fp32 raw paths
@@ -447,7 +461,16 @@ def make_v4_quant_config(hf_config, model_path=None):
         # as FP8 + scale and DeepseekV4Attention dequants at load time.
         if wo_a_is_bf16 and ".wo_a" in layer_name:
             return no_spec
-        return orig_lookup(layer_name, check_children=check_children)
+        # NOTE: wo_a is FP8 on disk but used as BF16 in forward (aiter has no FP8
+        # grouped einsum). When online_quant is enabled, also keep wo_a BF16 so
+        # the dequant→requant round-trip is skipped for this layer.
+        if use_online_quant and "attn.wo_a" in layer_name:
+            return no_spec
+        return orig_lookup(
+            layer_name,
+            use_online_quant=use_online_quant,
+            check_children=check_children,
+        )
 
     base.get_layer_quant_config = overridden
     return base
@@ -2709,8 +2732,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         # weight + scale params for real-checkpoint loading. When the HF
         # config lacks `quantization_config` (e.g. dummy / toy validation),
         # this still works — base spec is QuantType.No.
+        #
+        # Forward the engine-level `online_quant_config` (set via
+        # `--online_quant_config` CLI) so V4 weights can be re-quantized at
+        # load time. Without this, the engine flag is silently dropped on V4.
         self.args.quant_config = make_v4_quant_config(
-            self.hf_config, model_path=getattr(config, "model", None)
+            self.hf_config,
+            model_path=getattr(config, "model", None),
+            online_quant_config=getattr(config, "online_quant_config", None),
         )
         self.model = DeepseekV4Model(atom_config=config, args=self.args)
         # Tell ModelRunner to size the CG outputs buffer as

@@ -2208,10 +2208,18 @@ class FusedMoE(torch.nn.Module):
             self.layer_name, use_online_quant=True
         )
         online_quant_type = online_quant_config.quant_type
+        if online_quant_type == QuantType.No:
+            return
         online_quant_dtype = online_quant_config.quant_dtype
-        quant_func = get_hip_quant(online_quant_type)
 
         source_quant_type = self.layer_quant_config.quant_type
+        if (
+            source_quant_type == online_quant_type
+            and self.params_dtype == online_quant_dtype
+        ):
+            return
+
+        quant_func = get_hip_quant(online_quant_type)
         assert source_quant_type in (QuantType.No, QuantType.per_1x128), (
             f"Unsupported source quant_type for MoE online quantization: "
             f"{source_quant_type} (layer={self.layer_name})"
