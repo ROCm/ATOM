@@ -1,22 +1,19 @@
 from __future__ import annotations
 
-# sglang-specific attention backend replacing sglang's built-in AiterAttnBackend.
-# Shared by ALL models (DeepSeek, Qwen3, etc.) — handles KV cache writes,
-# page-table fixup, pa_persistent_fwd decode path, and MLA prefill kernels.
-# Sits at the lowest layer of the attention stack: sglang's RadixAttention
-# delegates the actual kernel dispatch here.
+# SGLang full-attention backend replacing sglang's built-in AiterAttnBackend.
+# Shared by ALL full-attention models (DeepSeek, Qwen3, etc.) — handles KV
+# cache writes, page-table fixup, pa_persistent_fwd decode path, and MLA
+# prefill kernels. Sits at the lowest layer of the attention stack:
+# sglang's RadixAttention delegates the actual kernel dispatch here.
 #
 # TODO: rewrite this file once sglang's attention flow is unified into ATOM's
 # attention layer — KV cache management and attention kernel dispatch will then
 # be handled by ATOM's native backend, making sglang-specific overrides
 # unnecessary.
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import triton
-import triton.language as tl
 
 import sglang.srt.layers.attention.aiter_backend as _sglang_aiter
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -28,6 +25,16 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_bool_env_var
 
+from atom.plugin.sglang.attention_backend.full_attention.kv_cache import (
+    set_kv_buffer_with_layout_shuffle as _set_kv_buffer_with_layout_shuffle,
+)
+from atom.plugin.sglang.attention_backend.full_attention.metadata import ForwardMetadata
+from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
+    allocate_pa_metadata_buffers as _allocate_pa_metadata_buffers,
+    build_pa_metadata_for_decode as _build_pa_metadata_for_decode,
+    build_pa_metadata_for_prefill as _build_pa_metadata_for_prefill,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -38,7 +45,6 @@ try:
         flash_attn_varlen_func,
         dtypes,
         get_pa_metadata_info_v1,
-        get_pa_metadata_v1,
         mha_batch_prefill_func,
         pa_fwd_asm,
         pa_persistent_fwd,
@@ -47,7 +53,7 @@ try:
 except ImportError as e:
     raise ImportError(
         "Failed to import 'aiter', which provides AMD-specific attention kernels "
-        "required by sgl_attn_backend. Please ensure 'aiter' is installed and "
+        "required by full_attention_backend. Please ensure 'aiter' is installed and "
         f"available on your AMD system. Original import error: {e}"
     ) from e
 
@@ -69,140 +75,6 @@ try:
     from aiter.mla import mla_decode_fwd
 except ImportError:
     pass
-
-
-@triton.jit
-def reshape_and_cache_shuffle_kernel(
-    key_ptr,  # [num_tokens, num_kv_heads, head_size]
-    value_ptr,  # [num_tokens, num_kv_heads, head_size]
-    key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, block_size, x]
-    value_cache_ptr,  # [num_blocks, num_kv_heads, block_size // x, head_size, x]
-    slot_mapping_ptr,  # [num_tokens]
-    k_scale_ptr,
-    v_scale_ptr,
-    x,
-    k_stride0,
-    v_stride0,
-    block_size,
-    head_size,
-    num_kv_heads,
-    BLOCK_SIZE: tl.constexpr,
-    QUANT: tl.constexpr,
-):
-    tid = tl.program_id(0)
-    head_id = tl.program_id(1)
-    offset = tl.arange(0, BLOCK_SIZE)
-    src_offset_k = tid * k_stride0 + head_id * head_size
-    src_offset_v = tid * v_stride0 + head_id * head_size
-    slot_id = tl.load(slot_mapping_ptr + tid)
-    if slot_id < 0:
-        return
-    block_id = slot_id // block_size
-    block_offset = slot_id % block_size
-    dst_offset = (
-        block_id * num_kv_heads * head_size * block_size
-        + head_id * head_size * block_size
-    )
-    dst_k_shuffle_offset = (
-        dst_offset + offset // x * block_size * x + block_offset * x + offset % x
-    )
-    dst_v_shuffle_offset = (
-        dst_offset + block_offset // x * head_size * x + offset * x + block_offset % x
-    )
-    k_val = tl.load(key_ptr + src_offset_k + offset)
-    v_val = tl.load(value_ptr + src_offset_v + offset)
-    if QUANT:
-        k_scale = tl.load(k_scale_ptr)
-        v_scale = tl.load(v_scale_ptr)
-        k_dtype = key_cache_ptr.type.element_ty
-        v_dtype = value_cache_ptr.type.element_ty
-        k_val = (k_val.to(tl.float32) / k_scale).to(k_dtype)
-        v_val = (v_val.to(tl.float32) / v_scale).to(v_dtype)
-    tl.store(key_cache_ptr + dst_k_shuffle_offset, k_val)
-    tl.store(value_cache_ptr + dst_v_shuffle_offset, v_val)
-
-
-def reshape_and_cache_shuffle_triton(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    kv_cache_dtype: str,
-    k_scales: torch.Tensor,
-    v_scales: torch.Tensor,
-):
-    num_tokens = slot_mapping.shape[0]
-    _, num_kv_heads, head_size = key.shape
-    num_blocks, block_size, _, _ = key_cache.shape
-    x = 16 // key_cache.element_size()
-    k_cache_template = torch.empty(
-        [num_blocks, num_kv_heads, head_size // x, block_size, x],
-        dtype=key_cache.dtype,
-        device="meta",
-    )
-    v_cache_template = torch.empty(
-        [num_blocks, num_kv_heads, block_size // x, head_size, x],
-        dtype=value_cache.dtype,
-        device="meta",
-    )
-    new_key_cache = key_cache.view_as(k_cache_template)
-    new_value_cache = value_cache.view_as(v_cache_template)
-    QUANT = False
-    if kv_cache_dtype.startswith("fp8"):
-        QUANT = True
-    grid = (
-        num_tokens,
-        num_kv_heads,
-    )
-    reshape_and_cache_shuffle_kernel[grid](
-        key,
-        value,
-        new_key_cache,
-        new_value_cache,
-        slot_mapping,
-        k_scales,
-        v_scales,
-        x,
-        key.stride(0),
-        value.stride(0),
-        block_size,
-        head_size,
-        num_kv_heads,
-        BLOCK_SIZE=head_size,
-        QUANT=QUANT,
-    )
-
-
-@dataclass
-class ForwardMetadata:
-    """Per-batch metadata consumed by ATOM's attention kernels (pa_fwd_asm, mla_decode_fwd, etc.)."""
-
-    # kv_indptr and kv_indices are only used in MLA mode, optional for non-MLA mode
-    kv_indptr: Optional[torch.Tensor]
-    kv_indices: Optional[torch.Tensor]
-    qo_indptr: Optional[torch.Tensor]
-    kv_last_page_len: Optional[torch.Tensor]
-    max_q_len: Optional[int]
-    max_kv_len: Optional[int]
-    page_table: Optional[torch.Tensor]
-    kv_lens: Optional[torch.Tensor]
-    # mla
-    work_metadata: Optional[torch.Tensor] = None
-    work_info_set: Optional[torch.Tensor] = None
-    work_indptr: Optional[torch.Tensor] = None
-    reduce_indptr: Optional[torch.Tensor] = None
-    reduce_final_map: Optional[torch.Tensor] = None
-    reduce_partial_map: Optional[torch.Tensor] = None
-    fp8_prefill_kv_indices: Optional[torch.Tensor] = None
-    num_kv_splits: Optional[int] = None
-    run_graph: Optional[bool] = True
-    # PA metadata for pa_persistent_fwd (only used in decode mode, non-MLA)
-    pa_metadata_qo_indptr: Optional[torch.Tensor] = None
-    pa_metadata_pages_kv_indptr: Optional[torch.Tensor] = None
-    pa_metadata_kv_indices: Optional[torch.Tensor] = None
-    pa_metadata_context_lens: Optional[torch.Tensor] = None
-    pa_metadata_max_qlen: Optional[int] = None
 
 
 class ATOMAttnBackendForSgl(AiterAttnBackend):
@@ -410,7 +282,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 page_table,
                 seq_lens,
             )
-            self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
+            _build_pa_metadata_for_decode(self, bs, tp_q_head_num=self.num_head)
         else:
             page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :
@@ -826,7 +698,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     // self.page_size
                 )
             if self.decode_using_pa_ps:
-                self._build_pa_metadata_for_prefill(forward_batch.batch_size)
+                _build_pa_metadata_for_prefill(self, forward_batch.batch_size)
         if (
             not self.decode_using_pa_ps
             and self.page_size > 1
@@ -836,151 +708,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 self.forward_metadata.page_table[:, self.strided_indices]
                 // self.page_size
             )
-
-    def _ensure_buffer(self, name, size, dtype, zero=True):
-        """Allocate or reuse a pa_metadata buffer, growing if needed."""
-        if self.pa_metadata_buffers is None:
-            self.pa_metadata_buffers = {}
-        size_val = size[0] if isinstance(size, (tuple, list)) else size
-        buf = self.pa_metadata_buffers.get(name)
-        needs_alloc = (
-            buf is None
-            or buf.shape[0] < size_val
-            or (isinstance(size, (tuple, list)) and len(buf.shape) < len(size))
-        )
-        if needs_alloc:
-            factory = torch.zeros if zero else torch.empty
-            self.pa_metadata_buffers[name] = factory(
-                size, dtype=dtype, device=self.device
-            )
-        elif zero:
-            self.pa_metadata_buffers[name].zero_()
-
-    def _allocate_pa_metadata_buffers(self, buffer_specs):
-        """Allocate or reuse pa_metadata buffers.
-
-        Args:
-            buffer_specs: sequence of ((size, dtype), ...) tuples from get_pa_metadata_info_v1,
-                          in order: work_metadata_ptrs, work_indptr, work_info,
-                          reduce_indptr, reduce_final_map, reduce_partial_map.
-        """
-        names = [
-            "work_metadata_ptrs",
-            "work_indptr",
-            "work_info",
-            "reduce_indptr",
-            "reduce_final_map",
-            "reduce_partial_map",
-        ]
-        zero_flags = [False, True, True, True, True, True]
-        for name, (size, dtype), zero in zip(names, buffer_specs, zero_flags):
-            self._ensure_buffer(name, size, dtype, zero=zero)
-
-    def _build_pa_metadata_for_decode(
-        self,
-        batch_size: int,
-        tp_q_head_num: Optional[int] = None,
-    ):
-        """Build pa_metadata buffers for pa_persistent_fwd in decode mode.
-
-        This method prepares all metadata buffers needed for pa_persistent_fwd kernel.
-        The metadata can be reused across multiple layers in the same forward pass.
-
-        Args:
-            batch_size: Batch size for the current forward pass
-            tp_q_head_num: Number of Q heads per TP rank. If None, uses self.num_head.
-        """
-        max_qlen = 1
-
-        # Use provided tp_q_head_num or default to self.num_head
-        if tp_q_head_num is None:
-            tp_q_head_num = self.num_head
-
-        buffer_specs = get_pa_metadata_info_v1(batch_size, self.num_kv_head)
-        self._allocate_pa_metadata_buffers(buffer_specs)
-        qo_indptr = self.pa_decode_qo_indptr[: batch_size + 1]
-
-        # Get context_lens (kv_lens is always set before calling _build_pa_metadata_for_decode)
-        # Note: kv_lens comes from self.seq_lens which is already int32
-        context_lens = self.forward_metadata.kv_lens
-
-        kernel_block_size = self.page_size
-        num_blocks_per_seq = (context_lens + kernel_block_size - 1) // kernel_block_size
-        # Use dedicated pa_kv_indptr buffer (similar to self.kv_indptr, but for pa_persistent_fwd)
-        pages_kv_indptr = self.pa_kv_indptr[: batch_size + 1]
-        pages_kv_indptr[1 : batch_size + 1] = torch.cumsum(num_blocks_per_seq, dim=0)
-
-        # Convert page_table to kv_indices (block indices) using Triton kernel to avoid sync
-        # page_table shape: [batch_size, max_num_blocks_per_seq]
-        # Note: page_table comes from self.page_table which is already int32 and always set before this call
-        page_table = self.forward_metadata.page_table
-
-        # Use Triton kernel to gather kv_indices from page_table (avoids high-level indexing sync)
-        create_flashinfer_kv_indices_triton[(batch_size,)](
-            page_table,
-            self.pa_batch_indices[:batch_size],  # [0, 1, 2, ..., batch_size-1]
-            num_blocks_per_seq,
-            pages_kv_indptr,
-            None,  # kv_start_idx
-            self.pa_kv_indices,
-            page_table.stride(0),
-        )
-        # Use the full buffer - pa_persistent_fwd reads only valid elements based on pages_kv_indptr
-        kv_indices = self.pa_kv_indices
-
-        get_pa_metadata_v1(
-            seqlens_qo_indptr=qo_indptr,
-            pages_kv_indptr=pages_kv_indptr,
-            context_lens=context_lens.int(),
-            num_heads_per_head_k=tp_q_head_num // self.num_kv_head,
-            num_heads_k=self.num_kv_head,
-            is_causal=True,
-            work_metadata_ptrs=self.pa_metadata_buffers["work_metadata_ptrs"],
-            work_indptr=self.pa_metadata_buffers["work_indptr"],
-            work_info=self.pa_metadata_buffers["work_info"],
-            reduce_indptr=self.pa_metadata_buffers["reduce_indptr"],
-            reduce_final_map=self.pa_metadata_buffers["reduce_final_map"],
-            reduce_partial_map=self.pa_metadata_buffers["reduce_partial_map"],
-            kv_granularity=max(kernel_block_size, 16),
-            block_size=kernel_block_size,
-            max_seqlen_qo=max_qlen,
-            uni_seqlen_qo=max_qlen,
-            fast_mode=True,
-            topk=-1,
-            max_split_per_batch=-1,
-        )
-        # Store computed values in ForwardMetadata for reuse in forward_decode
-        self.forward_metadata.pa_metadata_qo_indptr = qo_indptr
-        self.forward_metadata.pa_metadata_pages_kv_indptr = pages_kv_indptr
-        self.forward_metadata.pa_metadata_kv_indices = kv_indices
-        self.forward_metadata.pa_metadata_context_lens = context_lens
-        self.forward_metadata.pa_metadata_max_qlen = max_qlen
-
-    def _build_pa_metadata_for_prefill(self, batch_size: int):
-        """Build metadata for mha_batch_prefill_func in prefill mode.
-
-        This method prepares page-level metadata needed for mha_batch_prefill_func.
-        The metadata is computed once per forward pass and reused across all layers.
-        """
-        block_size = self.page_size
-        context_lens = self.forward_metadata.kv_lens
-        num_blocks_per_seq = (context_lens + block_size - 1) // block_size
-
-        # Page-level kv_indptr (reuse pa_kv_indptr buffer)
-        pages_kv_indptr = self.pa_kv_indptr[: batch_size + 1]
-        pages_kv_indptr[1 : batch_size + 1] = torch.cumsum(num_blocks_per_seq, dim=0)
-
-        # Build kv_indices from page_table using triton kernel
-        page_table = self.forward_metadata.page_table
-        create_flashinfer_kv_indices_triton[(batch_size,)](
-            page_table,
-            self.pa_batch_indices[:batch_size],
-            num_blocks_per_seq,
-            pages_kv_indptr,
-            None,  # kv_start_idx
-            self.pa_kv_indices,
-            page_table.stride(0),
-        )
 
     def init_cuda_graph_state(
         self,
@@ -1036,7 +763,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         if self.decode_using_pa_ps and not self.use_mla:
             buffer_specs = get_pa_metadata_info_v1(max_bs, self.num_kv_head)
-            self._allocate_pa_metadata_buffers(buffer_specs)
+            _allocate_pa_metadata_buffers(self, buffer_specs)
 
     def _init_mla_cuda_graph_metadata(self, bs, req_pool_indices, seq_lens):
         """Shared MLA decode metadata setup for CUDA graph capture/replay."""
@@ -1165,7 +892,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     seq_lens_persistent,
                 )
                 if self.decode_using_pa_ps:
-                    self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
+                    _build_pa_metadata_for_decode(self, bs, tp_q_head_num=self.num_head)
         elif forward_mode.is_target_verify():
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -1501,7 +1228,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     seq_lens_persistent[:bs],
                 )
                 if self.decode_using_pa_ps:
-                    self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
+                    _build_pa_metadata_for_decode(self, bs, tp_q_head_num=self.num_head)
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
             qo_indptr = self.qo_indptr[: bs + 1]
@@ -1879,27 +1606,15 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         v_scale,
         block_size,
     ):
-        num_slots, num_kv_heads, head_dim = k_buffer.shape
-        num_blocks = num_slots // block_size
-        num_slots_with_block = num_blocks * block_size
-        k_buffer = k_buffer[:num_slots_with_block].view(
-            num_blocks, block_size, num_kv_heads, head_dim
-        )
-        v_buffer = v_buffer[:num_slots_with_block].view(
-            num_blocks, block_size, num_kv_heads, head_dim
-        )
-        kv_cache_dtype = "auto"
-        if k_buffer.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-            kv_cache_dtype = "fp8"
-        reshape_and_cache_shuffle_triton(
+        _set_kv_buffer_with_layout_shuffle(
+            cache_loc,
             k,
             v,
             k_buffer,
             v_buffer,
-            cache_loc,
-            kv_cache_dtype,
             k_scale,
             v_scale,
+            block_size,
         )
 
     def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):

@@ -183,14 +183,35 @@ class EngineCore:
 
     def busy_loop(self):
         shutdown = False
-        while True:
-            shutdown = shutdown or self.pull_and_process_input_queue()
-            if shutdown:
-                break
-            if not self.scheduler.is_finished():
-                self._process_engine_step()
+        try:
+            while True:
+                shutdown = shutdown or self.pull_and_process_input_queue()
+                if shutdown:
+                    break
+                if not self.scheduler.is_finished():
+                    self._process_engine_step()
+        finally:
+            # Teardown runs even on exceptions so the sender thread/socket
+            # don't leak. Isolate the final publish so a publisher hiccup
+            # cannot skip shutdown_kv_events().
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish during shutdown failed")
+            self.scheduler.shutdown_kv_events()
 
     def _process_engine_step(self):
+        try:
+            return self._process_engine_step_inner()
+        finally:
+            # Swallow publisher errors so they cannot mask an exception from
+            # the engine step itself.
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish in engine-step finally failed")
+
+    def _process_engine_step_inner(self):
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -266,6 +287,7 @@ class EngineCore:
 
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
+
         return True
 
     def pull_and_process_input_queue(self):
@@ -432,29 +454,38 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
-        while True:
-            shutdown = shutdown or self.pull_and_process_input_queue()
-            local_unfinished = not self.scheduler.is_finished()
+        try:
+            while True:
+                shutdown = shutdown or self.pull_and_process_input_queue()
+                local_unfinished = not self.scheduler.is_finished()
 
-            global_has_unfinished, global_shutdown = self._sync_dp_state(
-                local_unfinished, shutdown
-            )
-
-            if global_shutdown and not global_has_unfinished:
-                logger.info(
-                    f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
+                global_has_unfinished, global_shutdown = self._sync_dp_state(
+                    local_unfinished, shutdown
                 )
-                break
 
-            if not global_has_unfinished and not self.engines_running:
-                self.engines_running = False
-                continue
+                if global_shutdown and not global_has_unfinished:
+                    logger.info(
+                        f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
+                    )
+                    break
 
-            executed = self._process_engine_step()
-            if not executed:
-                self._execute_dummy_batch()
+                if not global_has_unfinished and not self.engines_running:
+                    self.engines_running = False
+                    continue
 
-            self.engines_running = global_has_unfinished
+                executed = self._process_engine_step()
+                if not executed:
+                    self._execute_dummy_batch()
+
+                self.engines_running = global_has_unfinished
+        finally:
+            # Isolate the final publish so a publisher hiccup cannot skip
+            # shutdown_kv_events() (which closes the sender thread/socket).
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish during DP shutdown failed")
+            self.scheduler.shutdown_kv_events()
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)

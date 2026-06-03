@@ -597,7 +597,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -607,7 +607,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -775,11 +775,11 @@ jobs:
               },
               "DeepSeek-V3.2-FP8 TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
               },
               "DeepSeek-V3.2-FP8 TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
               },
               "DeepSeek-V3.2-FP8 MTP TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
