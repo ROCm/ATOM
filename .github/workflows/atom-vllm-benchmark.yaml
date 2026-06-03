@@ -1168,7 +1168,7 @@ jobs:
                       continue
                   if pair in excluded_pairs:
                       continue
-                  if is_aw_p0_model and int(param["concurrency"]) in (128, 256, 512):
+                  if is_aw_p0_model and int(param["concurrency"]) == 512:
                       continue
                   include.append({"model": model, "params": param})
 

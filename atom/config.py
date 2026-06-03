@@ -940,6 +940,35 @@ class SpeculativeConfig:
 
 
 @dataclass
+class KVEventsConfig:
+    """Configuration for KV cache event publishing."""
+
+    enable: bool = False
+    publisher: str = "zmq"  # "null" | "zmq"
+    endpoint: str = "tcp://127.0.0.1:5557"
+    topic: str = ""
+    # ZMQ high-water-mark on the PUB socket (0 = unlimited).
+    hwm: int = 0
+    # Bounded in-process queue between scheduler and sender thread. When full,
+    # oldest batch is dropped — KV events are advisory, never stall inference.
+    buffer_steps: int = 10_000
+
+    @classmethod
+    def from_env(cls) -> "KVEventsConfig":
+        """Build a config from `ATOM_KV_EVENTS_*` env vars. Provides an env-only
+        opt-in path so containerized deployments can enable events without a
+        CLI flag (see `atom/utils/envs.py`)."""
+        return cls(
+            enable=envs.ATOM_KV_EVENTS_ENABLE,
+            publisher=envs.ATOM_KV_EVENTS_PUBLISHER,
+            endpoint=envs.ATOM_KV_EVENTS_ENDPOINT,
+            topic=envs.ATOM_KV_EVENTS_TOPIC,
+            hwm=envs.ATOM_KV_EVENTS_HWM,
+            buffer_steps=envs.ATOM_KV_EVENTS_BUFFER_STEPS,
+        )
+
+
+@dataclass
 class Config:
     model: str
     trust_remote_code: bool = False
@@ -978,6 +1007,7 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
+    kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
@@ -1127,19 +1157,6 @@ class Config:
                     "(SWA buffer is not cacheable); disabling automatically."
                 )
                 self.enable_prefix_caching = False
-            # V4's MHC compress-attention / SWA per-request state assumes the whole
-            # prompt is processed in one forward; chunked prefill splits a request
-            # across batches and leaves that per-request state inconsistent, so
-            # disable chunked prefill too.
-            if self.enable_chunked_prefill:
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "DeepSeek-V4 does not support chunked prefill "
-                    "(per-request SWA/compress state is not chunk-safe); "
-                    "disabling automatically."
-                )
-                self.enable_chunked_prefill = False
 
     def compute_hash(self) -> str:
         """
