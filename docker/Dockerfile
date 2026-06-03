@@ -175,7 +175,7 @@ FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGLANG_REF="v0.5.10"
+ARG SGLANG_REF="v0.5.12"
 ARG SGLANG_TRITON_VERSION="3.6.0"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
