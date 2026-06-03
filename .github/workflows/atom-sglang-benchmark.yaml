@@ -726,6 +726,20 @@ jobs:
       PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
     steps:
+      - name: Print runner user
+        run: |
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "PATH=$PATH"
+          command -v docker || true
+          docker version || true
+          docker info || true
+          ls -l /var/run/docker.sock || true
+          groups || true
+          command -v podman || true
+          podman info || true
+          echo "=== End container engine diagnostics ==="
+          
       - name: Detect container engine
         run: |
           if docker info > /dev/null 2>&1; then
