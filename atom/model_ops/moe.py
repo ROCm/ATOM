@@ -55,6 +55,29 @@ from atom.utils.forward_context import get_forward_context
 from atom.utils.decorators import mark_trace
 from torch import nn
 from transformers import PretrainedConfig
+
+
+def _torch_topk_gating_sqrtsoftplus(
+    topk_weights: torch.Tensor,  # [N, k] fp32 out
+    topk_indices: torch.Tensor,  # [N, k] int32 out
+    gating_output: torch.Tensor,  # [N, E]
+    correction_bias: Optional[torch.Tensor],  # [E] or None
+    need_renorm: bool,
+    routed_scaling_factor: float,
+) -> None:
+    """Torch fallback for aiter `topk_gating(score_func='sqrtsoftplus')`.
+    Selection score: sqrt(softplus(logits)) + bias; weights: unbiased sqrt(softplus).
+    """
+    k = topk_indices.shape[-1]
+    scores = torch.sqrt(torch.nn.functional.softplus(gating_output.float()))
+    sel = scores if correction_bias is None else scores + correction_bias.float()
+    _, idx = torch.topk(sel, k, dim=-1)
+    w = scores.gather(-1, idx)
+    if need_renorm:
+        w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+    w = w * routed_scaling_factor
+    topk_indices.copy_(idx.to(topk_indices.dtype))
+    topk_weights.copy_(w.to(topk_weights.dtype))
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 from atom.quantization.quark.utils import weight_dequant_fp8
 
@@ -2938,15 +2961,26 @@ class FusedMoE(torch.nn.Module):
                 topk_weights = torch.empty(
                     tokens_num, top_k, dtype=torch.float32, device=router_logits.device
                 )
-                topk_gating(
-                    topk_weights,
-                    topk_ids,
-                    router_logits,
-                    e_score_correction_bias,
-                    renormalize,
-                    routed_scaling_factor,
-                    score_func="sqrtsoftplus",
-                )
+                from atom.utils import envs as _atom_envs
+                if _atom_envs.ATOM_GFX1250_FALLBACK:
+                    _torch_topk_gating_sqrtsoftplus(
+                        topk_weights,
+                        topk_ids,
+                        router_logits,
+                        e_score_correction_bias,
+                        renormalize,
+                        routed_scaling_factor,
+                    )
+                else:
+                    topk_gating(
+                        topk_weights,
+                        topk_ids,
+                        router_logits,
+                        e_score_correction_bias,
+                        renormalize,
+                        routed_scaling_factor,
+                        score_func="sqrtsoftplus",
+                    )
             else:
                 raise ValueError(
                     f"Unsupported scoring function for non-grouped topk: {scoring_func}"

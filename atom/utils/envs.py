@@ -96,6 +96,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is aiter's OPUS kernel (gfx950 fast path). Set to 1 to fall back to Triton
     # (e.g. for debugging or on non-gfx950 builds).
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # gfx1250 (or other arches where aiter C++ modules are not built):
+    # route mhc / moe_topk / dsv4_rotate_quant / rope_1c_cached_positions_fwd /
+    # top_k_per_row through torch fallbacks. Smoke-only on gfx950; correctness
+    # only, no perf guarantee.
+    "ATOM_GFX1250_FALLBACK": lambda: (os.getenv("ATOM_GFX1250_FALLBACK", "0") == "1"),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"

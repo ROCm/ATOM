@@ -129,8 +129,124 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
     if _V4_USE_TRITON_RMSNORM:
         return rmsnorm_nw(x, eps)
+    if _V4_RMSNORM_BACKEND == "torch":
+        # Pure-torch fallback for gfx1250 (Inductor-wrapped triton rmsnorm_nw
+        # emits NaN; aiter ck path is gfx950-only). Compute the variance in
+        # fp32 from a single upcast, then scale — avoids the extra fp32 temps
+        # a naive `x.float()*rsqrt(...)` would allocate at large-batch prefill.
+        xf = x.float()
+        rms = xf.pow(2).mean(-1, keepdim=True).add_(eps).rsqrt_()
+        return xf.mul_(rms).to(x.dtype)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
+
+
+def _fused_qk_norm_rope_swa_write_fake(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    kv_weight: torch.Tensor,
+    eps: float,
+    win: int,
+    batch_id_per_token: Optional[torch.Tensor] = None,
+    state_slot_mapping: Optional[torch.Tensor] = None,
+    swa_kv: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    M = q.shape[0]
+    return torch.empty(
+        (M, n_local_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+
+
+@torch_compile_guard(gen_fake=_fused_qk_norm_rope_swa_write_fake)
+def fused_qk_norm_rope_swa_write(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    kv_weight: torch.Tensor,
+    eps: float,
+    win: int,
+    batch_id_per_token: Optional[torch.Tensor] = None,
+    state_slot_mapping: Optional[torch.Tensor] = None,
+    swa_kv: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw + RoPE on
+    q/kv tail in a single triton kernel.
+
+    `kv` must already be kv_norm-applied; the kernel does not weight-norm kv.
+    `kv` is RoPE-mutated in place. SWA write is not performed here — callers
+    that need it must invoke the standalone `swa_write` after this call.
+    """
+    num_tokens = q.shape[0]
+    if num_tokens <= 64:
+        q_out = torch.empty(
+            (num_tokens, n_local_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        fused_reduce_qk_norm_rope_swa_write(
+            q,
+            kv,
+            None,
+            kv_weight,
+            eps,
+            eps,
+            rope_head_dim,
+            cos_cache,
+            sin_cache,
+            positions,
+            q_out=q_out,
+            is_neox=False,
+            dtype=torch.bfloat16,
+            write_indices=None,
+            batch_id_per_token=batch_id_per_token,
+            state_slot_mapping=state_slot_mapping,
+            swa_kv=swa_kv,
+            win=win,
+        )
+    else:
+        q = q.view(num_tokens, n_local_heads, head_dim)
+        q_out = _rmsnorm_nw(q, eps, head_dim)
+        kv = rmsnorm2d_fwd_(kv, kv_weight, eps, kv.shape[-1])
+        aiter.rope_cached_positions_2c_fwd_inplace(
+            q_out[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
+            kv[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
+            cos_cache,
+            sin_cache,
+            positions.view(1, num_tokens),
+            1,
+            reuse_freqs_front_part=True,
+            nope_first=False,
+        )
+    return q_out
+
+
+def _make_weightless_rmsnorm(dim: int, eps: float) -> RMSNorm:
+    """Build an `RMSNorm(dim, eps)` whose `.weight` is `None`.
+
+    Drops the learnable Parameter so `state_dict()` is empty for this
+    submodule and `load_model` doesn't expect a weight from disk (no
+    "unloaded parameter" warning).  `DualRMSNorm` recognizes the
+    sentinel `weight is None` and instructs the fused kernel to skip
+    both the q_weight load and the multiply (Q_HAS_WEIGHT=False),
+    matching the prior `_rmsnorm_nw(x, eps, dim)` behavior.
+    """
+    norm = RMSNorm(dim, eps)
+    del norm.weight  # remove Parameter from `_parameters`
+    norm.weight = None  # sentinel for downstream consumers
+    return norm
 
 
 def _hc_head_reduce_fake(
@@ -582,26 +698,61 @@ class _V4RoPE(nn.Module):
         rotate_style = 1
         num_tokens = positions.numel()
         if key is not None:
-            aiter.rope_cached_positions_2c_fwd_inplace(
-                query.view(1, num_tokens, -1, self.rotary_dim),
-                key.view(1, num_tokens, -1, self.rotary_dim),
-                self.cos_cache,
-                self.sin_cache,
-                positions.view(1, num_tokens),
-                rotate_style,
-                reuse_freqs_front_part=True,
-                nope_first=False,
-            )
+            from atom.utils import envs as _atom_envs
+
+            if _atom_envs.ATOM_GFX1250_FALLBACK:
+                from atom.utils.gfx1250_fallback import (
+                    torch_rope_cached_positions_2c_fwd_inplace as _rope2c_fb,
+                )
+
+                _rope2c_fb(
+                    query.view(1, num_tokens, -1, self.rotary_dim),
+                    key.view(1, num_tokens, -1, self.rotary_dim),
+                    self.cos_cache,
+                    self.sin_cache,
+                    positions.view(1, num_tokens),
+                    rotate_style,
+                    True,
+                    False,
+                )
+            else:
+                aiter.rope_cached_positions_2c_fwd_inplace(
+                    query.view(1, num_tokens, -1, self.rotary_dim),
+                    key.view(1, num_tokens, -1, self.rotary_dim),
+                    self.cos_cache,
+                    self.sin_cache,
+                    positions.view(1, num_tokens),
+                    rotate_style,
+                    reuse_freqs_front_part=True,
+                    nope_first=False,
+                )
         else:
-            aiter.rope_cached_positions_fwd_inplace(
-                query.view(1, num_tokens, -1, self.rotary_dim),
-                self.cos_cache,
-                self.sin_cache,
-                positions.view(1, num_tokens),
-                rotate_style,
-                reuse_freqs_front_part=True,
-                nope_first=False,
-            )
+            from atom.utils import envs as _atom_envs
+
+            if _atom_envs.ATOM_GFX1250_FALLBACK:
+                from aiter.ops.triton.rope.rope import (
+                    rope_cached_positions_fwd_inplace as _rope1c_triton,
+                )
+
+                _rope1c_triton(
+                    query.view(1, num_tokens, -1, self.rotary_dim),
+                    self.cos_cache,
+                    self.sin_cache,
+                    positions.view(1, num_tokens),
+                    rotate_style,
+                    True,
+                    False,
+                )
+            else:
+                aiter.rope_cached_positions_fwd_inplace(
+                    query.view(1, num_tokens, -1, self.rotary_dim),
+                    self.cos_cache,
+                    self.sin_cache,
+                    positions.view(1, num_tokens),
+                    rotate_style,
+                    reuse_freqs_front_part=True,
+                    nope_first=False,
+                )
 
     def inverse(self, positions: torch.Tensor, x: torch.Tensor) -> None:
         """In-place inverse RoPE via fused Triton kernel.
@@ -961,9 +1112,30 @@ class Indexer(nn.Module):
         )
         # self.rotary_emb(positions, q[..., -rd:])
         # q = rotate_activation(q)
-        rope_rotate_activation(
-            q, q, self.rotary_emb.cos_cache, self.rotary_emb.sin_cache, positions, rd
-        )
+        from atom.utils import envs as _atom_envs
+
+        if _atom_envs.ATOM_GFX1250_FALLBACK:
+            from atom.utils.gfx1250_fallback import (
+                torch_rope_rotate_activation as _rra_fb,
+            )
+
+            _rra_fb(
+                q,
+                q,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                positions,
+                rd,
+            )
+        else:
+            rope_rotate_activation(
+                q,
+                q,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                positions,
+                rd,
+            )
 
         # FP8 quant Q (still online — Q is recomputed each fwd, no cache).
         # `_fp8_quant_func` / `_weights_scale` precomputed in __init__.
@@ -1080,17 +1252,36 @@ class Indexer(nn.Module):
         topk_global = torch.empty(
             (total_tokens, topk), dtype=torch.int32, device=device
         )
-        top_k_per_row_prefill(
-            logits,
-            cu_starts,
-            cu_ends,
-            topk_global,
-            None,  # values not needed, only indices
-            total_tokens,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
-        )
+        from atom.utils import envs as _atom_envs
+
+        if _atom_envs.ATOM_GFX1250_FALLBACK:
+            from atom.utils.gfx1250_fallback import (
+                torch_top_k_per_row_prefill as _tkprfb,
+            )
+
+            _tkprfb(
+                logits,
+                cu_starts,
+                cu_ends,
+                topk_global,
+                None,
+                total_tokens,
+                logits.stride(0),
+                logits.stride(1),
+                k=topk,
+            )
+        else:
+            top_k_per_row_prefill(
+                logits,
+                cu_starts,
+                cu_ends,
+                topk_global,
+                None,  # values not needed, only indices
+                total_tokens,
+                logits.stride(0),
+                logits.stride(1),
+                k=topk,
+            )
         seq_base = indexer_meta["seq_base_per_token_gpu"].unsqueeze(
             1
         )  # [total_tokens, 1] int32
@@ -1148,33 +1339,68 @@ class Indexer(nn.Module):
             dtype=torch.float32,
             device=q_fp8.device,
         )
-        deepgemm_fp8_paged_mqa_logits(
-            q_4d,
-            kv_cache_4d,
-            weights,
-            logits,
-            n_committed_per_seq_gpu,  # int32, sized [bs] (staged in builder)
-            block_tables,
-            self._max_model_len_idx,
-            KVBlockSize=self.kv_cache.size(1),  # k1_csa = 32
-            Preshuffle=True,
-        )
+        from atom.utils import envs as _atom_envs
+
+        if _atom_envs.ATOM_GFX1250_FALLBACK:
+            from atom.utils.gfx1250_fallback import (
+                torch_deepgemm_fp8_paged_mqa_logits as _dg_fb,
+            )
+
+            _dg_fb(
+                q_4d,
+                kv_cache_4d,
+                weights,
+                logits,
+                n_committed_per_seq_gpu,
+                block_tables,
+                self._max_model_len_idx,
+                KVBlockSize=self.kv_cache.size(1),
+                Preshuffle=True,
+            )
+        else:
+            deepgemm_fp8_paged_mqa_logits(
+                q_4d,
+                kv_cache_4d,
+                weights,
+                logits,
+                n_committed_per_seq_gpu,  # int32, sized [bs] (staged in builder)
+                block_tables,
+                self._max_model_len_idx,
+                KVBlockSize=self.kv_cache.size(1),  # k1_csa = 32
+                Preshuffle=True,
+            )
         # Per-fwd write-once int32 scratch. Kernel writes exactly `index_topk`
         # ints per row (valid seq-local indices then -1 sentinels). CG-safe
         # for the same reason as `logits` above.
         topk_local = torch.empty(
             total_tokens, self.index_topk, dtype=torch.int32, device=q_fp8.device
         )
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            n_committed_per_seq_gpu,
-            topk_local,
-            total_tokens,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
-        )
+        from atom.utils import envs as _atom_envs
+
+        if _atom_envs.ATOM_GFX1250_FALLBACK:
+            from atom.utils.gfx1250_fallback import torch_top_k_per_row_decode as _tkdfb
+
+            _tkdfb(
+                logits,
+                next_n,
+                n_committed_per_seq_gpu,
+                topk_local,
+                total_tokens,
+                logits.stride(0),
+                logits.stride(1),
+                k=topk,
+            )
+        else:
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                n_committed_per_seq_gpu,
+                topk_local,
+                total_tokens,
+                logits.stride(0),
+                logits.stride(1),
+                k=topk,
+            )
         return topk_local  # [total_tokens, index_topk] int32, raw seq-local
 
 
@@ -2160,8 +2386,15 @@ class Block(nn.Module):
         # `x.is_cuda` is implicit here — model lives on GPU post-`.to()`; a CPU tensor
         # would have crashed earlier in DeepseekV4Attention.
         _dim_ok = args.dim % 512 == 0 or args.dim % 256 == 0
-        self._mhc_pre = getattr(aiter, "mhc_pre", None) if _dim_ok else None
-        self._mhc_post = getattr(aiter, "mhc_post", None) if _dim_ok else None
+        from atom.utils import envs as _atom_envs
+
+        _force_fb = _atom_envs.ATOM_GFX1250_FALLBACK
+        self._mhc_pre = (
+            getattr(aiter, "mhc_pre", None) if (_dim_ok and not _force_fb) else None
+        )
+        self._mhc_post = (
+            getattr(aiter, "mhc_post", None) if (_dim_ok and not _force_fb) else None
+        )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
@@ -2243,11 +2476,14 @@ class Block(nn.Module):
 
         # Torch fallback. fp32 (post, comb) × BF16 (x, residual) promotes to
         # fp32 by PyTorch promotion rules — cast back to x.dtype before return.
-        # post.unsqueeze(-1) * x.unsqueeze(-2): [num_tokens, hc, dim] gating
-        # comb.unsqueeze(-1) * residual.unsqueeze(-2): [num_tokens, hc, hc, dim]; sum over hc
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
-            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3
-        )
+        # gating: post[n,i] * x[n,d] broadcast → [n, hc, dim]
+        # mixing: sum_j comb[n,i,j] * residual[n,j,d] is a per-token matmul
+        #   comb @ residual — done via bmm to avoid materializing the
+        #   [num_tokens, hc, hc, dim] 4D intermediate (≈hc× the output, fp32),
+        #   which is the dominant OOM source at large-batch prefill.
+        gate = post.unsqueeze(-1) * x.unsqueeze(-2)  # [n, hc, dim]
+        mix = torch.bmm(comb, residual.float())  # [n, hc, dim]
+        y = gate + mix
         return y.type_as(x)
 
     def forward(
