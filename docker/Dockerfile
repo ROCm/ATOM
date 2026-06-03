@@ -361,17 +361,12 @@ RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
 COPY --from=build_aiter /app/aiter-test /app/aiter-test
 RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
     pip show amd-aiter
+    pip show triton || true
+    pip show amd-triton || true
 
 # RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
 RUN pip install rocm-trace-lite && \
     rtl --version || true
-
-# Qwen3-next encounter accuracy issue with the triton from base image
-# we install verified good version triton==3.6.0 here as a temporary fix
-# this should be removed after the triton issue is resolved
-RUN pip uninstall -y triton amd-triton && \
-    pip install triton==3.6.0
-RUN pip show triton || true
 
 # ATOM: lightweight install (no compilation needed)
 # CACHEBUST invalidates only this layer so parallel stages stay cached
