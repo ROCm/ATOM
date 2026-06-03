@@ -86,7 +86,9 @@ def _swizzle_mxfp4(quant_tensor, scale):
     return quant_tensor, InFlexData(), scale
 
 
-def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
+def fused_routing_from_topk_triton(
+    topk_weights, topk_ids, n_expts_tot, expert_map: torch.Tensor | None = None
+):
     """Build matmul_ogs routing data via the AITER fused-routing kernel.
 
     Thin bridge over ``aiter.ops.triton.fused_routing_from_topk``: invokes
@@ -106,7 +108,9 @@ def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
     so the MoE output is unchanged (up to FP non-associativity).
     """
     if not has_triton_kernels():
-        return routing_from_topk(topk_weights, topk_ids, n_expts_tot)
+        return routing_from_topk(
+            topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+        )
 
     n_tokens, n_expts_act = topk_weights.shape
     n_gates_pad = n_tokens * n_expts_act
@@ -114,10 +118,11 @@ def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
     if n_gates_pad > 4096:
         # Single-CTA design exceeded; fall back rather than degrading
         # silently. Typically only hit during prefill.
-        return routing_from_topk(topk_weights, topk_ids, n_expts_tot)
-
+        return routing_from_topk(
+            topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+        )
     hist, topk_indx, gate_indx, gate_scal = _aiter_fused_routing_from_topk(
-        topk_weights, topk_ids, n_expts_tot
+        topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
     )
 
     # Package as the matmul_ogs routing data structures.
@@ -136,7 +141,9 @@ def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot):
     return routing_data, gather_indx, scatter_indx
 
 
-def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
+def routing_from_topk(
+    topk_weights, topk_ids, n_expts_tot, expert_map: torch.Tensor | None = None
+):
     """Convert FusedMoE.select_experts output to triton routing data structures.
 
     This bridges the gap between ATOM's grouped topk / sigmoid routing
@@ -160,6 +167,12 @@ def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
 
     n_tokens, n_expts_act = topk_weights.shape
     n_gates_pad = n_tokens * n_expts_act
+
+    if expert_map is not None:
+        local_ids = expert_map[topk_ids.long()]
+        invalid = local_ids < 0
+        topk_weights = topk_weights.masked_fill(invalid, 0.0)
+        topk_ids = local_ids.masked_fill(invalid, 0).to(torch.int32)
 
     # Sort each token's selected experts by expert_id (required by triton kernels)
     expt_indx_sorted, sort_indices = torch.sort(topk_ids.int(), dim=1)

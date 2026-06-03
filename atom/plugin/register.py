@@ -45,7 +45,7 @@ def _register_custom_attention_to_sglang() -> None:
     from sglang.srt.layers.attention.attention_registry import (
         register_attention_backend,
     )
-    from atom.plugin.sglang.attention_backend.sgl_attn_backend import (
+    from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
         ATOMAttnBackendForSgl,
     )
 

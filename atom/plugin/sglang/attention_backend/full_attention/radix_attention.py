@@ -129,7 +129,7 @@ class RadixAttention(BaseAttention):
             # for sglang, forward_batch is required
             forward_batch = kwargs.get("forward_batch", None)
             if forward_batch is None:
-                from atom.plugin.sglang.models.base_model_wrapper import (
+                from atom.plugin.sglang.runtime import (
                     get_current_forward_batch,
                 )
 

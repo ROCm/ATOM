@@ -14,6 +14,8 @@ weight loading, tensor parallelism, AITER kernels, KV cache integration, MTP
 spec decode, torch.compile, server) land in PR2-PR6.
 """
 
+import json
+import logging
 import math
 import os
 from dataclasses import dataclass, field
@@ -95,6 +97,8 @@ from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
@@ -315,14 +319,73 @@ _FP4_BLOCK_SIZE = 32  # matches reference's fp4_block_size
 # ---------------------------------------------------------------------------
 
 
-def make_v4_quant_config(hf_config):
+def _wo_a_is_bf16_on_disk(model_path):
+    """Return True iff this ckpt stores ``layers.0.attn.wo_a.weight`` as BF16
+    (already pre-dequantized) with NO companion ``wo_a.scale`` on disk.
+
+    V4-Flash-FP8 ships ``wo_a`` as BF16 directly; V4-Flash-Base / V4-Pro ship
+    it as FP8 + UE8M0 block-scale and rely on
+    ``DeepseekV4Attention.process_weights_after_loading`` to dequant at load
+    time. The ATOM Linear allocator decides FP8 vs BF16 from the quant spec
+    at module-init time, so we have to probe the ckpt here BEFORE building
+    the model — otherwise the FP8 + scale param shapes mismatch the BF16
+    tensor on disk and produce garbage attention output.
+    """
+    if not model_path or not os.path.isdir(model_path):
+        return False
+    idx_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.isfile(idx_path):
+        return False
+    try:
+        with open(idx_path) as f:
+            idx = json.load(f)
+        wmap = idx.get("weight_map", {})
+    except Exception:
+        return False
+    probe = "layers.0.attn.wo_a.weight"
+    if probe not in wmap:
+        return False
+    scale_present_in_idx = "layers.0.attn.wo_a.scale" in wmap
+    # Even when listed in the index, the shard may not actually contain the
+    # scale (V4-Flash-FP8 had a stale index entry). Open the shard and verify.
+    try:
+        from safetensors import safe_open
+
+        with safe_open(os.path.join(model_path, wmap[probe]), framework="pt") as h:
+            w = h.get_slice(probe)
+            if w.dtype == torch.bfloat16:
+                return True  # BF16 weight; no scale needed regardless of index
+            if not scale_present_in_idx:
+                return False
+            if "layers.0.attn.wo_a.scale" not in h.keys():
+                # Index lies. wo_a still FP8 but no scale → loader will fail
+                # anyway; safer to fall back to no_spec, although this case is
+                # unexpected.
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def make_v4_quant_config(hf_config, model_path=None):
     """Build a QuantizationConfig that knows V4's per-layer quant scheme.
 
-    V4 checkpoint layout:
+    Two V4 SKUs supported:
+      - **V4-Pro** (gfx950 / MI355X): routed experts FP4 e2m1 packed +
+        per-1x32 UE8M0 scale (DeepGEMM `gemm_a4w4_quant` path).
+      - **V4-Flash-Base** (gfx942 / MI308 + others): routed experts FP8 e4m3
+        per-block 128x128 + UE8M0 scale (aiter `gemm_a8w8_blockscale` /
+        Triton MoE per_1x128 path).
+
+    The routed-expert spec is auto-detected from the ckpt's quantization
+    layout via :func:`_detect_v4_routed_quant_spec`; SKU-agnostic projections
+    (wq_a/b, wkv, wo_b, indexer.wq_b) all stay FP8 per-block 128x128.
+
+    V4 checkpoint layout (common):
       - Most projections (wq_a/b, wkv, wo_b, indexer.wq_b, etc.): FP8 e4m3 +
-        128x128 ue8m0 block scale. Picked up by ATOM's standard "fp8" parser.
-      - Routed expert weights (`ffn.experts.{N}.w{1,2,3}`): FP4 e2m1 +
-        per-1x32 ue8m0 block scale. Needs explicit per_1x32 override.
+        128x128 ue8m0 block scale. Picked up by ATOM's standard parser.
+      - Routed expert weights (`ffn.experts.{N}.w{1,2,3}`): FP4 (V4-Pro) OR
+        FP8 per-block (V4-Flash-Base) — auto-detected.
       - `wo_a`: FP8 on disk but loaded as BF16 (convert.py:137-141 dequantizes
         because the grouped-LoRA einsum needs BF16; aiter has no FP8 einsum).
       - `Compressor.wkv` / `Compressor.wgate` / `indexer.weights_proj`: BF16
@@ -333,17 +396,45 @@ def make_v4_quant_config(hf_config):
     base = QuantizationConfig(hf_config)
 
     fp4_spec = LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2)
+    # FP8 per-block 128x128 — V4-Flash-Base routed path.
+    # ``dtypes.fp8`` from aiter resolves to ``float8_e4m3fnuz`` on gfx942/gfx94x
+    # (MI308) and ``float8_e4m3fn`` on gfx950 / NV — picked at import time.
+    fp8_block_spec = LayerQuantConfig(
+        quant_type=QuantType.per_1x128,
+        quant_dtype=dtypes.fp8,
+    )
     no_spec = LayerQuantConfig(quant_type=QuantType.No, quant_dtype=torch.bfloat16)
+
+    # Detect which routed-expert quant scheme this ckpt uses (FP4 or FP8-block).
+    # ``base`` is consulted first — if the user's quant_method parser already
+    # produced a per_1x128 fp8 spec for ``ffn.experts``, we honor it; only
+    # when the parser yields no information do we fall back to V4-Pro's FP4.
+    routed_spec = _detect_v4_routed_quant_spec(
+        hf_config, base, fp4_spec, fp8_block_spec
+    )
+
+    # V4-Flash-FP8 ships ``wo_a`` already dequanted to BF16 on disk (no
+    # ``.scale`` companion). Probe the ckpt; when wo_a is BF16, allocate it
+    # as BF16 directly. Other SKUs (V4-Pro / V4-Flash-Base) keep wo_a as
+    # FP8 + UE8M0 scale and rely on the load-time dequant in
+    # ``DeepseekV4Attention.process_weights_after_loading``.
+    wo_a_is_bf16 = _wo_a_is_bf16_on_disk(model_path)
+    if wo_a_is_bf16:
+        logger.info(
+            "ckpt stores wo_a as BF16 on disk; allocating BF16 "
+            "wo_a params (skipping FP8 + scale load-time dequant)."
+        )
+
     orig_lookup = base.get_layer_quant_config
 
     def overridden(layer_name, *, check_children=False):
-        # Routed experts → FP4 (NOT shared_experts, which stay FP8).
+        # Routed experts → SKU-detected (FP4 for V4-Pro, FP8-block for V4-Flash).
         # Match both per-expert prefix `layers.N.ffn.experts.M.w{1,2,3}` (used
         # by individual Linear lookups, with trailing `.M.w1`) AND the bare
         # `layers.N.ffn.experts` prefix (used by FusedMoE.__init__ when
         # constructing fused expert params — has NO trailing dot).
         if ".ffn.experts" in layer_name:
-            return fp4_spec
+            return routed_spec
         # BF16 / fp32 raw paths
         if (
             ".compressor.wkv" in layer_name
@@ -351,14 +442,82 @@ def make_v4_quant_config(hf_config):
             or ".indexer.weights_proj" in layer_name
         ):
             return no_spec
-        # NOTE: wo_a is FP8 on disk but used as BF16 in forward (aiter has no FP8
-        # grouped einsum). It's NOT in no_spec — instead we let it allocate as
-        # FP8 + e8m0 scale so the standard loader fills both, then
-        # DeepseekV4Attention.process_weights_after_loading dequants in place.
+        # V4-Flash-FP8 layout: wo_a is BF16 on disk — allocate as BF16 directly
+        # so the loader receives matching dtype. Other SKUs let wo_a allocate
+        # as FP8 + scale and DeepseekV4Attention dequants at load time.
+        if wo_a_is_bf16 and ".wo_a" in layer_name:
+            return no_spec
         return orig_lookup(layer_name, check_children=check_children)
 
     base.get_layer_quant_config = overridden
     return base
+
+
+def _detect_v4_routed_quant_spec(hf_config, base, fp4_spec, fp8_block_spec):
+    """Detect V4 routed-expert quant scheme from HF config + parser output.
+
+    Resolution order:
+      1. **HF config ``expert_dtype``** — if the model's config.json declares
+         ``expert_dtype`` (e.g. ``"fp8"`` or ``"fp4"``), use it directly.
+      2. **Parser-derived spec for ``ffn.experts``** — if the model's
+         quant_method parser (quark / generic / fp8 / ...) already produced a
+         layer pattern that matches ``ffn.experts.*.w*``, honor it. This is
+         the canonical path: the ckpt's own quantization_config dict declares
+         ``per_1x128`` (fp8 block) or ``per_1x32`` (fp4 microscaling), and
+         the parser turns it into the correct spec.
+      3. **Heuristic from ``quant_method``** — when the parser doesn't carry
+         per-layer detail (some compressed-tensors ckpts only set a global
+         spec), look at ``hf_config.quantization_config.quant_method``:
+         strings containing "fp4"/"mxfp4" → FP4; "fp8" → FP8 block.
+      4. **V4-Pro default fallback** — historical V4 default (FP4 e2m1).
+
+    Returns the chosen ``LayerQuantConfig`` (always either ``fp4_spec`` or
+    ``fp8_block_spec`` — never None).
+    """
+
+    # ── 1. HF config expert_dtype hint ──
+    expert_dtype = getattr(hf_config, "expert_dtype", None) or ""
+    if isinstance(expert_dtype, str):
+        ed = expert_dtype.lower()
+        if "fp4" in ed:
+            return fp4_spec
+        if "fp8" in ed:
+            return fp8_block_spec
+
+    # ── 2. Parser-derived spec ──
+    # Probe a representative routed-expert layer name. The parser's pattern
+    # match (fnmatch) returns whatever was declared in the ckpt's
+    # quantization_config -> layer_quant_config dict.
+    sample = base.get_layer_quant_config("layers.0.ffn.experts.0.w1")
+    if sample.is_quantized:
+        # FP4: ATOM uses per_1x32 + dtypes.fp4x2 (microscaling FP4)
+        if sample.quant_type == QuantType.per_1x32:
+            return fp4_spec
+        # FP8 per-block: per_1x128 + fp8 dtype
+        if sample.quant_type == QuantType.per_1x128:
+            return fp8_block_spec
+        logger.warning(
+            "Routed-expert layer quantized with unsupported quant_type=%s "
+            "(expected per_1x32 or per_1x128). Falling through to heuristic.",
+            sample.quant_type,
+        )
+
+    # ── 3. quant_method heuristic ──
+    qc = getattr(hf_config, "quantization_config", None) or {}
+    method = (qc.get("quant_method") or "").lower() if isinstance(qc, dict) else ""
+    fmt = (qc.get("fmt") or "").lower() if isinstance(qc, dict) else ""
+    method_lower = method + " " + fmt
+    if "fp4" in method_lower or "mxfp4" in method_lower:
+        return fp4_spec
+    if "fp8" in method_lower or "deepseek_fp8" in method_lower:
+        return fp8_block_spec
+
+    # ── 4. V4-Pro default fallback ──
+    logger.info(
+        "routed-expert quant not auto-detected; falling back to FP4 (V4-Pro). "
+        "Set expert_dtype in config.json to override."
+    )
+    return fp4_spec
 
 
 def _dequant_fp8_block_to_bf16(w_fp8, scale, block=128):
@@ -1387,7 +1546,7 @@ class DeepseekV4Attention(nn.Module):
         if w.dtype == torch.bfloat16:
             return  # already dequanted
         scale = getattr(self.wo_a, "weight_scale", None)
-        if w.dtype != torch.float8_e4m3fn or scale is None:
+        if w.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) or scale is None:
             return  # nothing to do
         # Dequant: w (FP8 [out, in]) × scale (e8m0 [out/128, in/128]) → BF16
         bf16 = _dequant_fp8_block_to_bf16(
@@ -1419,6 +1578,7 @@ class DeepseekV4Attention(nn.Module):
         # This avoids the dequant + einsum overhead and reuses the proven MLA
         # batched-FP8 kernel. See attention_mla.py:211 for reference.
         self.wo_a.quant_type = QuantType.No
+        self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
 
     def maybe_compressors_async(
         self, x, plan, state_slot_mapping, block_tables
@@ -1906,11 +2066,33 @@ class MoE(nn.Module):
         # for `.ffn.experts`) and shared=FP8 (=global). The function returns
         # True for V4 because shared matches global, missing the routed-shared
         # mismatch. Direct comparison: get routed and shared specs and compare.
-        routed_dtype = qc.get_layer_quant_config(f"{prefix}.experts").quant_dtype
-        shared_dtype = qc.get_layer_quant_config(f"{prefix}.shared_experts").quant_dtype
+        routed_spec = qc.get_layer_quant_config(f"{prefix}.experts")
+        shared_spec = qc.get_layer_quant_config(f"{prefix}.shared_experts")
+        routed_dtype = routed_spec.quant_dtype
+        shared_dtype = shared_spec.quant_dtype
+        # aiter's fused shared+routed kernel is broken on gfx942 with FP8
+        # per-block routed experts (V4-Flash-Base on MI308 produces garbage
+        # output unless we run shared and routed as 2 separate kernels). Auto-
+        # disable in that combination; explicit env override always wins.
+        env_override = os.environ.get("ATOM_V4_DISABLE_FUSED_SHARED")
+        if env_override is not None:
+            disable_fused = env_override == "1"
+        else:
+            try:
+                from aiter.jit.utils.chip_info import get_gfx
+
+                gfx = get_gfx() or ""
+            except Exception:
+                gfx = ""
+            disable_fused = (
+                gfx.startswith("gfx94")
+                and routed_spec.quant_type == QuantType.per_1x128
+                and routed_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            )
         self._fuse_shared_into_routed = (
             routed_dtype == shared_dtype
             and is_rocm_aiter_fusion_shared_expert_enabled()
+            and not disable_fused
         )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
@@ -2517,7 +2699,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         # weight + scale params for real-checkpoint loading. When the HF
         # config lacks `quantization_config` (e.g. dummy / toy validation),
         # this still works — base spec is QuantType.No.
-        self.args.quant_config = make_v4_quant_config(self.hf_config)
+        self.args.quant_config = make_v4_quant_config(
+            self.hf_config, model_path=getattr(config, "model", None)
+        )
         self.model = DeepseekV4Model(atom_config=config, args=self.args)
         # Tell ModelRunner to size the CG outputs buffer as
         # [max_num_batched_tokens, hc_mult, hidden_size] instead of the

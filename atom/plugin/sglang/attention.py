@@ -1,4 +1,6 @@
-from atom.plugin.sglang.attention_backend.radix_attention import RadixAttention
+from atom.plugin.sglang.attention_backend.full_attention.radix_attention import (
+    RadixAttention,
+)
 
 
 class AttentionForSGLang(RadixAttention):
