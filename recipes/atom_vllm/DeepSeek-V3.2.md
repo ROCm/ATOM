@@ -52,6 +52,22 @@ vllm serve deepseek-ai/DeepSeek-V3.2 \
     --no-enable-prefix-caching
 ```
 
+### DeepSeek-V3.2 PTPC (TP=4, MI355X)
+
+```bash
+TP=4
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0
+
+vllm serve amd/DeepSeek-V3.2-mtp-ptpc \
+    --host localhost \
+    --port 8000 \
+    --tensor-parallel-size "${TP}" \
+    --trust-remote-code \
+    --max-num-batched-tokens 16384 \
+    --max-model-len 16384
+```
+
 ## Step 3: Performance Benchmark
 
 Users can use the default vllm bench commands for performance benchmarking.
