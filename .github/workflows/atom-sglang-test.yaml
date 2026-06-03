@@ -229,6 +229,24 @@ jobs:
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
             accuracy_test_threshold: 0.76
             runner: linux-atom-mi35x-4
+          - model_name: "Kimi-K2-Thinking-MXFP4 TP8"
+            model_path: "amd/Kimi-K2-Thinking-MXFP4"
+            extra_args: "--tensor-parallel-size 8 --trust-remote-code"
+            env_vars: |
+              SGLANG_USE_AITER=1
+            # NOTE: initial threshold mirrors vLLM-OOT Kimi-K2-Thinking baseline (0.90);
+            # recalibrate from the first green SGLang run.
+            accuracy_test_threshold: 0.90
+            runner: linux-atom-mi35x-8
+          - model_name: "Kimi-K2.5-MXFP4 TP8"
+            model_path: "amd/Kimi-K2.5-MXFP4"
+            extra_args: "--tensor-parallel-size 8 --trust-remote-code"
+            env_vars: |
+              SGLANG_USE_AITER=1
+            # NOTE: initial threshold mirrors vLLM Kimi-K2.5 baseline (0.93 -> 0.92 margin);
+            # recalibrate from the first green SGLang run.
+            accuracy_test_threshold: 0.92
+            runner: linux-atom-mi35x-8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:

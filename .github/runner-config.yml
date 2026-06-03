@@ -21,3 +21,22 @@ runners:
   linux-atom-mi355-8:
     gpu_arch: MI355
     gpu_count: 8
+
+  atom-mi355-8gpu-oot-benchmark:
+    gpu_arch: MI355
+    gpu_count: 8
+
+  # mi35x pool schedules onto either MI350 or MI355 hardware.
+  # Reported as MI355; confirm with the devops-dashboard owner whether an
+  # MI35X heterogeneous-pool value is supported before relabeling.
+  linux-atom-mi35x-1:
+    gpu_arch: MI355
+    gpu_count: 1
+
+  linux-atom-mi35x-4:
+    gpu_arch: MI355
+    gpu_count: 4
+
+  linux-atom-mi35x-8:
+    gpu_arch: MI355
+    gpu_count: 8
