@@ -376,3 +376,99 @@ def triton_kernel_fused_experts(
 
     output_tensor = output_tensor.view(M, K)
     return output_tensor
+
+
+# -----------------------------------------------------------------------------
+# AITER moe_op_gemm_a8w4 (fp8 activation x mxfp4 weight) fused experts
+# -----------------------------------------------------------------------------
+
+# gpt-oss swiglu constants. The model config carries swiglu_limit=7.0 and the
+# OAI swiglu uses alpha=1.702; these mirror the defaults the matmul_ogs path
+# uses for gpt-oss (triton_kernel_fused_experts).
+_A8W4_SWIGLU_ALPHA = 1.702
+_A8W4_SWIGLU_LIMIT = 7.0
+
+
+def aiter_a8w4_fused_experts(
+    hidden_states: torch.Tensor,
+    layer,
+    router_logits: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+) -> torch.Tensor:
+    """Two-GEMM MoE using AITER's ``moe_gemm_a8w4`` (fp8 act x mxfp4 weight).
+
+    Replaces the ``matmul_ogs`` (bf16 x mxfp4) path for the gpt-oss swiglu MoE.
+    Activations are quantized to static per-tensor fp8 using the checkpoint's
+    calibrated input scales (the model is ``*-a-fp8``); weights stay as the
+    OCP-MXFP4 tensors the loader produced, with scales pre-swizzled in
+    ``Mxfp4MoEMethod._prepare_a8w4_weights``.
+
+    Mirrors the fused-quant chain in
+    ``op_tests/op_benchmarks/triton/bench_moe_gemm_a8w4.py``: gemm1 fuses swiglu
+    and re-quantizes its output to fp8 (scaled by the down-proj input scale) so
+    gemm2 can consume it directly.
+    """
+    from aiter.ops.triton.moe.moe_routing.routing import routing
+    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
+    from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
+
+    # Routing: gpt-oss uses plain softmax top-k with renormalization (no grouped
+    # topk / scoring bias), so this matches the matmul_ogs path which calls
+    # triton routing with sm_first = not renormalize.
+    routing_data, gather_indx, scatter_indx = routing(
+        router_logits, top_k, sm_first=not renormalize
+    )
+
+    s13 = layer.a8w4_x_scale_13
+    s2 = layer.a8w4_x_scale_2
+
+    # gemm1: gate_up_proj. fp8 activations, fused swiglu, output re-quantized to
+    # fp8 (scaled by the down-proj input scale) for gemm2.
+    # ATOM stores mxfp4 weights as torch's packed float4_e2m1fn_x2; the gluon
+    # kernel (and triton's arg binder) needs a plain uint8 view of the same bytes
+    # (1 byte = two packed e2m1), matching the matmul_ogs path's .view(torch.uint8).
+    w13 = layer.w13_weight.view(torch.uint8)
+    w2 = layer.w2_weight.view(torch.uint8)
+
+    x_fp8 = downcast_to_static_fp8(hidden_states, s13)
+    intermediate = moe_gemm_a8w4(
+        x_fp8,
+        w13.transpose(1, 2),
+        None,  # x_scales: static (not microscaled) fp8 activations
+        layer.w13_weight_scale_swz,
+        x_static_scale=s13,
+        quant_static_scale=s2,
+        bias=layer.w13_bias,
+        routing_data=routing_data,
+        gather_indx=gather_indx,
+        scatter_indx=None,
+        gammas=None,
+        swizzle_mx_scale="GFX1250_SCALE",
+        out_dtype=torch.float8_e4m3fn,
+        apply_swiglu=True,
+        alpha=_A8W4_SWIGLU_ALPHA,
+        limit=_A8W4_SWIGLU_LIMIT,
+        add_residual=True,
+    )
+
+    # gemm2: down_proj. fp8 activations (re-using s2 as the static scale), gate
+    # weights applied in-kernel via gammas, scatter+reduce combines the top-k
+    # expert contributions per token.
+    output = moe_gemm_a8w4(
+        intermediate,
+        w2.transpose(1, 2),
+        None,
+        layer.w2_weight_scale_swz,
+        x_static_scale=s2,
+        quant_static_scale=None,
+        bias=layer.w2_bias,
+        routing_data=routing_data,
+        gather_indx=None,
+        scatter_indx=scatter_indx,
+        gammas=routing_data.gate_scal,
+        swizzle_mx_scale="GFX1250_SCALE",
+        out_dtype=torch.bfloat16,
+        apply_swiglu=False,
+    )
+    return output
