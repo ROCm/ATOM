@@ -233,6 +233,14 @@ def create_attn_metadata_builder_init_method(base_class):
         self.block_ratio = 1
 
         sliding_window_sizes: set[tuple[int, int] | None] = set()
+        # SWA per-layer KV head workaround:
+        # Initialize to 0 (not self.num_heads_kv): self.num_heads_kv comes from
+        # ModelConfig.get_num_kv_heads() which may not match per-layer vllm
+        # Attention.num_kv_heads (e.g. stepfun-Flash-FP8 returns 32 from ModelConfig
+        # but per-layer = 4). Using self.num_heads_kv as a floor would mask the
+        # real per-layer values. We rely on the loop below to populate from each
+        # vllm Attention layer; defensive getattr fallback keeps it 0 if field missing.
+        max_per_layer_num_kv_heads = 0
         layers = get_layers_from_vllm_config(config, Attention)
         for layer in layers.values():
             assert isinstance(layer.impl, PagedAttentionImpl)
@@ -243,6 +251,12 @@ def create_attn_metadata_builder_init_method(base_class):
                 sliding_window_sizes.add(sliding_window)
             else:
                 sliding_window_sizes.add((sliding_window - 1, 0))
+            per_layer_kv = getattr(layer, "num_kv_heads", None)
+            if per_layer_kv is None:
+                per_layer_kv = getattr(layer.impl, "num_kv_heads", 0)
+            if per_layer_kv and per_layer_kv > max_per_layer_num_kv_heads:
+                max_per_layer_num_kv_heads = per_layer_kv
+        self.swa_max_num_heads_kv = max_per_layer_num_kv_heads
 
         while len(sliding_window_sizes) > 0:
             sliding_window_config = sliding_window_sizes.pop()
@@ -427,7 +441,7 @@ class vllmAttentionMetadataBuilderMethods:
                 )
                 fetched_shape = cu_seq_lens[-1].item()
                 swa_workspace = torch.empty(
-                    (2, fetched_shape, self.num_heads_kv, self.head_dim),
+                    (2, fetched_shape, self.swa_max_num_heads_kv, self.head_dim),
                     dtype=self.vllm_config.model_config.dtype,
                     device=self.device,
                 )
