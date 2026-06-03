@@ -1396,7 +1396,9 @@ def _causal_conv1d_fwd_kernel_opt(  # continuous batching - optimized
     block_idx_last_scheduled_token,
     initial_state_idx,
     num_computed_tokens,
-    out_ptr,
+    query_ptr,
+    key_ptr,
+    value_ptr,
     # Matrix dimensions
     dim: tl.constexpr,
     k_dim_size: tl.constexpr,
@@ -1412,7 +1414,12 @@ def _causal_conv1d_fwd_kernel_opt(  # continuous batching - optimized
     stride_istate_dim: tl.constexpr,
     stride_istate_token: tl.constexpr,
     stride_cache_indices: tl.constexpr,
-    out_token_stride: tl.constexpr,
+    query_dim_stride: tl.constexpr,
+    query_token_stride: tl.constexpr,
+    key_dim_stride: tl.constexpr,
+    key_token_stride: tl.constexpr,
+    value_dim_stride: tl.constexpr,
+    value_token_stride: tl.constexpr,
     stride_block_m: tl.constexpr,
     # others
     pad_slot_id: tl.constexpr,
@@ -1426,7 +1433,9 @@ def _causal_conv1d_fwd_kernel_opt(  # continuous batching - optimized
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Optimized version with fused output tensor: single store per token."""
+    """Optimized version with separate q/k/v stores (atom-style)."""
+    k_start_dim = k_dim_size
+    v_start_dim = k_dim_size * 2
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
     stride_conv_state_seq = stride_istate_seq
@@ -1438,6 +1447,13 @@ def _causal_conv1d_fwd_kernel_opt(  # continuous batching - optimized
     chunk_offset = tl.load(token_chunk_offset_ptr + tl.program_id(0))
 
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    q_feat_idx = idx_feats
+    k_feat_idx = idx_feats - k_start_dim
+    v_feat_idx = idx_feats - v_start_dim
+    is_q_block = idx_feats < k_start_dim
+    is_k_block = (idx_feats >= k_start_dim) & (idx_feats < v_start_dim)
+    is_v_block = idx_feats >= v_start_dim
 
     if idx_seq == pad_slot_id:
         return
@@ -1508,11 +1524,11 @@ def _causal_conv1d_fwd_kernel_opt(  # continuous batching - optimized
                 col0 = tl.load(prior_tokens - 2 * stride_conv_state_tok, mask_w, 0.0)
         else:
             if KERNEL_WIDTH >= 2:
-                col0 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
+                col0 = tl.zeros((BLOCK_N,), dtype=tl.bfloat16)
             if KERNEL_WIDTH >= 3:
-                col1 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
+                col1 = tl.zeros((BLOCK_N,), dtype=tl.bfloat16)
             if KERNEL_WIDTH >= 4:
-                col2 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
+                col2 = tl.zeros((BLOCK_N,), dtype=tl.bfloat16)
 
         # Conv state update (same as original)
         if state_len <= seqlen:
@@ -1646,7 +1662,7 @@ def _causal_conv1d_fwd_kernel_opt(  # continuous batching - optimized
             tl.debug_barrier()
             tl.store(conv_states_ptrs_target, loaded_x, mask)
 
-    # --- Main computation loop (optimized) ---
+    # --- Main computation loop ---
     if HAS_BIAS:
         bias = bias_ptr + idx_feats
         mask_bias = idx_feats < dim
@@ -1656,7 +1672,7 @@ def _causal_conv1d_fwd_kernel_opt(  # continuous batching - optimized
 
     x_base_1d = x_base + token_offset * stride_x_token
 
-    # Pre-load weights
+    # Pre-load weights (keep as native dtype, let compiler use bf16 dot path)
     mask_w = idx_feats < dim
     if KERNEL_WIDTH >= 2:
         w_col0 = tl.load(w_base + (0 * stride_w_width), mask_w, other=0.0)
@@ -1668,20 +1684,11 @@ def _causal_conv1d_fwd_kernel_opt(  # continuous batching - optimized
 
     mask_x_1d = idx_feats < dim
 
-    # Software pipelining: pre-load x for first token
-    x_cur = tl.load(x_base_1d, mask=mask_x_1d)
-
     for idx_token in range(segment_len):
         acc = acc_preload
 
-        # The current token's x is already pre-loaded in x_cur
-        cur_x = x_cur
-
-        # Pre-load NEXT token's x (software pipelining)
-        if idx_token < segment_len - 1:
-            x_cur = tl.load(
-                x_base_1d + (idx_token + 1) * stride_x_token, mask=mask_x_1d
-            )
+        # Load current token x (native dtype, no explicit fp32 cast)
+        cur_x = tl.load(x_base_1d + idx_token * stride_x_token, mask=mask_x_1d)
 
         # Convolution: col0, col1, ..., col_{W-2} are prior tokens; cur_x is current
         if KERNEL_WIDTH == 2:
@@ -1704,13 +1711,19 @@ def _causal_conv1d_fwd_kernel_opt(  # continuous batching - optimized
             col2 = cur_x
 
         if SILU_ACTIVATION:
-            acc = acc * tl.sigmoid(acc)
+            acc = acc / (1.0 + tl.exp(-acc))
 
         token_pos = sequence_start_index + token_offset + idx_token
-        mask_store = (idx_token < segment_len) & (idx_feats < dim)
+        mask_token = idx_token < segment_len
 
-        out_ptrs = out_ptr + token_pos * out_token_stride + idx_feats
-        tl.store(out_ptrs, acc, mask=mask_store)
+        q_ptrs = query_ptr + token_pos * query_token_stride + q_feat_idx * query_dim_stride
+        tl.store(q_ptrs, acc, mask=mask_token & is_q_block)
+
+        k_ptrs = key_ptr + token_pos * key_token_stride + k_feat_idx * key_dim_stride
+        tl.store(k_ptrs, acc, mask=mask_token & is_k_block)
+
+        v_ptrs = value_ptr + token_pos * value_token_stride + v_feat_idx * value_dim_stride
+        tl.store(v_ptrs, acc, mask=mask_token & is_v_block)
 
 
 def causal_conv1d_fn_opt(
@@ -1779,12 +1792,10 @@ def causal_conv1d_fn_opt(
     stride_istate_token = 0
     num_cache_lines = 0
 
-    # Fused output tensor: [cu_seqlen, dim] with q/k/v as contiguous views
-    out = torch.empty([cu_seqlen, dim], dtype=x.dtype, device=x.device)
-    out_token_stride = out.stride(0)  # == dim
-    query = out[:, :k_dim_size]
-    key = out[:, k_dim_size : k_dim_size * 2]
-    value = out[:, k_dim_size * 2 :]
+    # Separate q/k/v output tensors (avoids write contention under high concurrency)
+    query = torch.empty([cu_seqlen, k_dim_size], dtype=x.dtype, device=x.device)
+    key = torch.empty([cu_seqlen, k_dim_size], dtype=x.dtype, device=x.device)
+    value = torch.empty([cu_seqlen, v_dim_size], dtype=x.dtype, device=x.device)
 
     # Dynamic BLOCK_M selection
     if block_m is not None:
@@ -1916,7 +1927,9 @@ def causal_conv1d_fn_opt(
         block_idx_last_scheduled_token,
         initial_state_idx,
         num_computed_tokens,
-        out,
+        query,
+        key,
+        value,
         # Matrix dimensions
         dim,
         k_dim_size,
@@ -1932,7 +1945,12 @@ def causal_conv1d_fn_opt(
         stride_istate_dim,
         stride_istate_token,
         stride_cache_indices,
-        out_token_stride,
+        query.stride(1),
+        query.stride(0),
+        key.stride(1),
+        key.stride(0),
+        value.stride(1),
+        value.stride(0),
         block_size_to_align // BLOCK_M,
         # others
         pad_slot_id,
@@ -1946,5 +1964,316 @@ def causal_conv1d_fn_opt(
         BLOCK_M=BLOCK_M,
         BLOCK_N=256,
         num_stages=num_stages,
+    )
+    return query, key, value
+
+
+@triton.jit
+def _causal_conv1d_fwd_kernel_opt2(
+    x_ptr,
+    w_ptr,
+    bias_ptr,
+    initial_states_ptr,
+    cache_indices_ptr,
+    has_initial_states_ptr,
+    query_start_loc_ptr,
+    batch_ptr,
+    token_chunk_offset_ptr,
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    dim,
+    k_dim_size,
+    v_dim_size,
+    cu_seqlen,
+    num_cache_lines,
+    stride_x_dim,
+    stride_x_token: tl.constexpr,
+    stride_w_dim,
+    stride_w_width,
+    stride_istate_seq,
+    stride_istate_dim,
+    stride_istate_token,
+    stride_cache_indices,
+    query_dim_stride,
+    query_token_stride: tl.constexpr,
+    key_dim_stride,
+    key_token_stride: tl.constexpr,
+    value_dim_stride,
+    value_token_stride: tl.constexpr,
+    pad_slot_id,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """2D vectorized causal conv1d: loads tile [BLOCK_N, BLOCK_M] with coalesced
+    access along the token dimension (stride=1), computes all outputs at once."""
+    k_start_dim = k_dim_size
+    v_start_dim = k_dim_size * 2
+
+    idx_seq = tl.load(batch_ptr + tl.program_id(0)).to(tl.int64)
+    chunk_offset = tl.load(token_chunk_offset_ptr + tl.program_id(0))
+
+    if idx_seq == pad_slot_id:
+        return
+
+    idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    q_feat_idx = idx_feats
+    k_feat_idx = idx_feats - k_start_dim
+    v_feat_idx = idx_feats - v_start_dim
+    is_q_block = idx_feats < k_start_dim
+    is_k_block = (idx_feats >= k_start_dim) & (idx_feats < v_start_dim)
+    is_v_block = idx_feats >= v_start_dim
+
+    sequence_start_index = tl.load(query_start_loc_ptr + idx_seq)
+    sequence_end_index = tl.load(query_start_loc_ptr + idx_seq + 1)
+    seqlen = sequence_end_index - sequence_start_index
+
+    token_offset = BLOCK_M * chunk_offset
+    segment_len = tl.minimum(BLOCK_M, seqlen - token_offset)
+
+    if segment_len <= 0:
+        return
+
+    # Token indices within the tile [BLOCK_M]
+    idx_tokens = tl.arange(0, BLOCK_M)
+
+    # Global token positions relative to sequence start
+    token_global = token_offset + idx_tokens
+
+    # Masks
+    valid_feat = idx_feats < dim
+    valid_token = idx_tokens < segment_len
+    valid_2d = valid_feat[:, None] & valid_token[None, :]
+
+    # Base address per feature for x loads
+    x_feat_base = x_ptr + sequence_start_index * stride_x_token + idx_feats * stride_x_dim
+
+    # --- 2D Coalesced Loads [BLOCK_N, BLOCK_M] ---
+    # Token dimension (dim 1) has stride_x_token=1 → contiguous → coalesced
+    x_t = tl.load(
+        x_feat_base[:, None] + token_global[None, :] * stride_x_token,
+        mask=valid_2d, other=0.0,
+    ).to(tl.float32)
+
+    # Shifted loads for convolution (mask to 0 for boundary tokens)
+    if KERNEL_WIDTH >= 2:
+        mask_s1 = valid_2d & (token_global[None, :] >= 1)
+        x_s1 = tl.load(
+            x_feat_base[:, None] + (token_global[None, :] - 1) * stride_x_token,
+            mask=mask_s1, other=0.0,
+        ).to(tl.float32)
+    if KERNEL_WIDTH >= 3:
+        mask_s2 = valid_2d & (token_global[None, :] >= 2)
+        x_s2 = tl.load(
+            x_feat_base[:, None] + (token_global[None, :] - 2) * stride_x_token,
+            mask=mask_s2, other=0.0,
+        ).to(tl.float32)
+    if KERNEL_WIDTH >= 4:
+        mask_s3 = valid_2d & (token_global[None, :] >= 3)
+        x_s3 = tl.load(
+            x_feat_base[:, None] + (token_global[None, :] - 3) * stride_x_token,
+            mask=mask_s3, other=0.0,
+        ).to(tl.float32)
+
+    # --- Weights [BLOCK_N] → broadcast to [BLOCK_N, BLOCK_M] ---
+    w_base = w_ptr + idx_feats * stride_w_dim
+    mask_w = valid_feat
+    if KERNEL_WIDTH == 4:
+        w0 = tl.load(w_base + 0 * stride_w_width, mask=mask_w, other=0.0).to(tl.float32)
+        w1 = tl.load(w_base + 1 * stride_w_width, mask=mask_w, other=0.0).to(tl.float32)
+        w2 = tl.load(w_base + 2 * stride_w_width, mask=mask_w, other=0.0).to(tl.float32)
+        w3 = tl.load(w_base + 3 * stride_w_width, mask=mask_w, other=0.0).to(tl.float32)
+    elif KERNEL_WIDTH == 3:
+        w0 = tl.load(w_base + 0 * stride_w_width, mask=mask_w, other=0.0).to(tl.float32)
+        w1 = tl.load(w_base + 1 * stride_w_width, mask=mask_w, other=0.0).to(tl.float32)
+        w2 = tl.load(w_base + 2 * stride_w_width, mask=mask_w, other=0.0).to(tl.float32)
+    elif KERNEL_WIDTH == 2:
+        w0 = tl.load(w_base + 0 * stride_w_width, mask=mask_w, other=0.0).to(tl.float32)
+        w1 = tl.load(w_base + 1 * stride_w_width, mask=mask_w, other=0.0).to(tl.float32)
+
+    # --- Bias ---
+    if HAS_BIAS:
+        acc = tl.load(bias_ptr + idx_feats, mask=valid_feat, other=0.0).to(tl.float32)
+        acc = acc[:, None] + tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    else:
+        acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+
+    # --- Convolution (fully vectorized, no per-token loop!) ---
+    if KERNEL_WIDTH == 4:
+        acc += w0[:, None] * x_s3 + w1[:, None] * x_s2 + w2[:, None] * x_s1 + w3[:, None] * x_t
+    elif KERNEL_WIDTH == 3:
+        acc += w0[:, None] * x_s2 + w1[:, None] * x_s1 + w2[:, None] * x_t
+    elif KERNEL_WIDTH == 2:
+        acc += w0[:, None] * x_s1 + w1[:, None] * x_t
+
+    # --- SiLU activation ---
+    if SILU_ACTIVATION:
+        exp_neg = tl.math.exp2(acc * (-1.4426950408889634))
+        rcp = tl.inline_asm_elementwise(
+            "v_rcp_f32 $0, $1", "=v,v",
+            args=[1.0 + exp_neg], dtype=tl.float32, is_pure=True, pack=1,
+        )
+        acc = acc * rcp
+
+    # --- Store [BLOCK_N, BLOCK_M] to separate q/k/v tensors ---
+    token_pos = sequence_start_index + token_global
+    valid_token_2d = valid_token[None, :]
+
+    q_ptrs = query_ptr + token_pos[None, :] * query_token_stride + q_feat_idx[:, None] * query_dim_stride
+    tl.store(q_ptrs, acc, mask=valid_token_2d & is_q_block[:, None])
+
+    k_ptrs = key_ptr + token_pos[None, :] * key_token_stride + k_feat_idx[:, None] * key_dim_stride
+    tl.store(k_ptrs, acc, mask=valid_token_2d & is_k_block[:, None])
+
+    v_ptrs = value_ptr + token_pos[None, :] * value_token_stride + v_feat_idx[:, None] * value_dim_stride
+    tl.store(v_ptrs, acc, mask=valid_token_2d & is_v_block[:, None])
+
+
+def causal_conv1d_fn_opt2(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    k_dim_size: int,
+    v_dim_size: int,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    block_m: int = 64,
+    block_n: int = 64,
+    num_warps: int = 4,
+    transpose_weight: bool = False,
+    metadata=None,
+):
+    """Opt2: 2D vectorized causal conv1d with coalesced tile loads.
+
+    Args:
+        num_warps: Number of warps per workgroup (default 4).
+        transpose_weight: If True, transpose weight [dim,W]->[W,dim] for coalesced loads.
+    """
+    if isinstance(activation, bool) and activation:
+        activation = "silu"
+
+    original_x_dtype = x.dtype
+    x = x.to(conv_states.dtype)
+
+    if transpose_weight:
+        weight = weight.T.contiguous()  # [dim, W] → [W, dim]
+
+    dim, cu_seqlen = x.shape
+    if transpose_weight:
+        width = weight.shape[0]  # [W, dim]
+    else:
+        width = weight.shape[1]  # [dim, W]
+
+    BLOCK_M = block_m
+    BLOCK_N = block_n
+
+    if metadata is not None:
+        batch_ptr = metadata.batch_ptr
+        token_chunk_offset_ptr = metadata.token_chunk_offset_ptr
+        tot = metadata.nums_dict[BLOCK_M]["tot"]
+    else:
+        seqlens = query_start_loc.diff().to("cpu")
+
+        MAX_NUM_PROGRAMS = 2048
+        batch_ptr = torch.full(
+            (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
+        )
+        token_chunk_offset_ptr = torch.full(
+            (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
+        )
+
+        mlist = []
+        offsetlist = []
+        for seq_idx, sl in enumerate(seqlens.tolist()):
+            n_chunks = (int(sl) + BLOCK_M - 1) // BLOCK_M
+            for c in range(n_chunks):
+                mlist.append(seq_idx)
+                offsetlist.append(c)
+
+        tot = len(mlist)
+        if tot > MAX_NUM_PROGRAMS:
+            MAX_NUM_PROGRAMS = tot
+            batch_ptr = torch.full(
+                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
+            )
+            token_chunk_offset_ptr = torch.full(
+                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
+            )
+
+        batch_ptr[:tot] = torch.tensor(mlist, dtype=torch.int32, device=x.device)
+        token_chunk_offset_ptr[:tot] = torch.tensor(
+            offsetlist, dtype=torch.int32, device=x.device
+        )
+
+    # Separate q/k/v output tensors (avoids write contention under high concurrency)
+    query = torch.empty([cu_seqlen, k_dim_size], dtype=x.dtype, device=x.device)
+    key = torch.empty([cu_seqlen, k_dim_size], dtype=x.dtype, device=x.device)
+    value = torch.empty([cu_seqlen, v_dim_size], dtype=x.dtype, device=x.device)
+
+    stride_x_dim = x.stride(0)
+    stride_x_token = x.stride(1)
+    if transpose_weight:
+        stride_w_dim = weight.stride(1)    # feat stride = 1 (coalesced)
+        stride_w_width = weight.stride(0)  # tap stride = dim
+    else:
+        stride_w_dim = weight.stride(0)
+        stride_w_width = weight.stride(1)
+
+    num_cache_lines = conv_states.size(0) if conv_states is not None else 0
+    stride_istate_seq = conv_states.stride(0) if conv_states is not None else 0
+    stride_istate_dim = conv_states.stride(1) if conv_states is not None else 0
+    stride_istate_token = conv_states.stride(2) if conv_states is not None else 0
+    stride_cache_indices = cache_indices.stride(0) if cache_indices is not None else 0
+
+    grid = (tot, triton.cdiv(dim, BLOCK_N))
+
+    _causal_conv1d_fwd_kernel_opt2[grid](
+        x,
+        weight,
+        bias,
+        conv_states,
+        cache_indices,
+        has_initial_state,
+        query_start_loc,
+        batch_ptr,
+        token_chunk_offset_ptr,
+        query,
+        key,
+        value,
+        dim,
+        k_dim_size,
+        v_dim_size,
+        cu_seqlen,
+        num_cache_lines,
+        stride_x_dim,
+        stride_x_token,
+        stride_w_dim,
+        stride_w_width,
+        stride_istate_seq,
+        stride_istate_dim,
+        stride_istate_token,
+        stride_cache_indices,
+        query.stride(1),
+        query.stride(0),
+        key.stride(1),
+        key.stride(0),
+        value.stride(1),
+        value.stride(0),
+        pad_slot_id,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=num_warps,
+        num_stages=1,
     )
     return query, key, value
