@@ -81,7 +81,7 @@ env:
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
   AITER_COMMIT: "HEAD"
-  SGLANG_REF: "v0.5.10"
+  SGLANG_REF: "v0.5.12"
 
 jobs:
   # ---------- SGLANG full validation path (schedule / workflow_dispatch) ----------
