@@ -75,6 +75,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
+    # Debug-only: override model depth to fit large MoE models (e.g. DeepSeek R1)
+    # in limited VRAM during bring-up. <=0/unset = no-op. Overrides
+    # num_hidden_layers only (first_k_dense_replace is left intact). For exactly
+    # one MoE layer set it to first_k_dense_replace + 1 (e.g. 4 for R1: 3 dense
+    # + 1 MoE). Applied in config.py:maybe_override_debug_num_layers.
+    "ATOM_DEBUG_NUM_HIDDEN_LAYERS": lambda: int(
+        os.getenv("ATOM_DEBUG_NUM_HIDDEN_LAYERS", "0")
+    ),
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
     # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
     # GPU timestamps for both prefill and decode phases.

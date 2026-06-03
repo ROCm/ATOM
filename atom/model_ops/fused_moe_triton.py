@@ -244,6 +244,7 @@ def triton_kernel_moe_forward(
     apply_router_weight_on_input: bool = False,
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
+    debug_topk_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     routing_data, gather_idx, scatter_idx = routing(
         gating_output, topk, sm_first=not renormalize
@@ -268,6 +269,7 @@ def triton_kernel_moe_forward(
         apply_router_weight_on_input=apply_router_weight_on_input,
         global_num_experts=global_num_experts,
         expert_map=expert_map,
+        debug_topk_ids=debug_topk_ids,
     )
 
 
@@ -293,6 +295,7 @@ def triton_kernel_fused_experts(
     expert_map: torch.Tensor | None = None,
     intermediate_cache: torch.Tensor | None = None,
     a1q_scale: torch.Tensor | None = None,
+    debug_topk_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
@@ -382,6 +385,40 @@ def triton_kernel_fused_experts(
                 dtype_quant=None,
             )
             intermediate_cache = intermediate_cache.view(batch_dim, M * topk, half_N)
+
+        if M > 1:
+            # The token_offs_raw[expert] -> row mapping only holds when each
+            # expert owns exactly one row (single token). For M>1 we'd need the
+            # per-token slot within each expert's block, so skip — same single-
+            # token restriction as aiter's grouped_a2 dump.
+            print(
+                f"[dump] SKIP intermediate_cache dump: M={M} > 1 — dump only "
+                f"supported for single-token (M==1) decode",
+                flush=True,
+            )
+        elif debug_topk_ids is not None:
+            # M == 1 here.
+            # Mirror aiter's grouped_a2 dump (aiter/fused_moe.py): aiter indexes
+            # its expert-laid-out (E, max_m, inter_dim) buffer by topk_ids to get
+            # rows in the model's topk order. Our intermediate_cache is in
+            # gathered/expert-ascending order, so we index by expert id via the
+            # routing histogram offsets — token_offs_raw[e] is the gathered row
+            # of expert e for num_token==1 (one row per active expert). This uses
+            # the ids to index directly; no argsort.
+            routed = debug_topk_ids[0, :topk].to(torch.long)  # topk order
+            offs = routing_data.expt_data.token_offs_raw  # start row per expert
+            rows = offs[routed]
+            print(
+                f"[dump] intermediate_cache (num_token, topk, half_N)="
+                f"({M}, {topk}, {half_N})",
+                flush=True,
+            )
+            for _k in range(topk):
+                _row = intermediate_cache[0, int(rows[_k]), :10].detach().cpu().tolist()
+                print(
+                    f"[dump]   topk={_k} expert={int(routed[_k])} first10={_row}",
+                    flush=True,
+                )
 
         matmul_ogs(
             intermediate_cache.view(M * topk, half_N),

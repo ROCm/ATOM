@@ -685,6 +685,46 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
     return hf_config
 
 
+def maybe_override_debug_num_layers(hf_config: PretrainedConfig) -> None:
+    """Debug-only: shrink model depth so a huge MoE model (e.g. DeepSeek R1,
+    61 layers) fits limited GPU VRAM during kernel / numeric bring-up.
+
+    Guarded by ``ATOM_DEBUG_NUM_HIDDEN_LAYERS`` (int; unset or <= 0 = no-op).
+    When set, overrides ``hf_config.num_hidden_layers`` only.
+
+    IMPORTANT: ``first_k_dense_replace`` is left UNTOUCHED. For DeepSeek a layer
+    is MoE only when ``layer_idx >= first_k_dense_replace``; the first
+    ``first_k_dense_replace`` layers are dense and may also carry checkpoint
+    quirks (e.g. R1 excludes ``model.layers.0.self_attn.*`` from MXFP4 quant,
+    so those projections are bf16). Forcing those early layers to MoE would
+    both miss expert weights and feed fp4-quantized activations into a bf16
+    proj. To keep exactly ONE MoE layer, set the env to
+    ``first_k_dense_replace + 1`` (e.g. 4 for R1: 3 dense + 1 MoE).
+
+    NOTE: ``num_hidden_layers`` / ``first_k_dense_replace`` are folded into the
+    compile-cache key (see ``Config.compute_hash``), so the reduced model gets
+    its own compiled-graph dir and won't silently reuse the full model's.
+    """
+    n = int(os.getenv("ATOM_DEBUG_NUM_HIDDEN_LAYERS", "0"))
+    if n <= 0:
+        return
+    orig = getattr(hf_config, "num_hidden_layers", None)
+    hf_config.num_hidden_layers = n
+    logger.warning("[ATOM_DEBUG_NUM_HIDDEN_LAYERS] num_hidden_layers %s -> %s", orig, n)
+    # Warn (don't mutate) if the truncated model contains no MoE layer, so the
+    # user can bump the env to first_k_dense_replace + 1.
+    fkd = getattr(hf_config, "first_k_dense_replace", None)
+    if fkd is not None and n <= fkd:
+        logger.warning(
+            "[ATOM_DEBUG_NUM_HIDDEN_LAYERS] num_hidden_layers=%s <= "
+            "first_k_dense_replace=%s: NO MoE layer in the truncated model. "
+            "Set the env to %s for exactly one MoE layer.",
+            n,
+            fkd,
+            fkd + 1,
+        )
+
+
 def get_generation_config(model: str) -> GenerationConfig:
     try:
         return GenerationConfig.from_pretrained(
@@ -1004,6 +1044,9 @@ class Config:
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        # Debug-only depth reduction (ATOM_DEBUG_NUM_HIDDEN_LAYERS) for fitting
+        # large MoE models in limited VRAM during bring-up. No-op when unset.
+        maybe_override_debug_num_layers(self.hf_config)
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.

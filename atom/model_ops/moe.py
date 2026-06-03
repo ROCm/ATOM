@@ -955,9 +955,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # expects the NON-interleaved gate-up layout, so de-interleave a clone
         # (invert _interleave_swiglu_weights) before swizzling for triton. w2
         # (down-proj) is never interleaved, so it is cloned as-is.
-        _enable_triton_compare = (
-            os.environ.get("ATOM_MOE_TRITON_COMPARE", "0") == "1"
-        )
+        _enable_triton_compare = os.environ.get("ATOM_MOE_TRITON_COMPARE", "0") == "1"
         _build_triton_buffers = self.use_triton or _enable_triton_compare
 
         if _build_triton_buffers:
@@ -1203,10 +1201,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 global_num_experts=n_expts_tot,
                 expert_map=expert_map,
+                debug_topk_ids=topk_ids,
             )
         assert (
             fused_shared_experts_scoring_func is None
         ), "triton kernel does not support fused shared experts func"
+        # Non-custom-routing path: triton_kernel_moe_forward computes routing
+        # internally via triton_kernels.routing() (softmax-then-topk on raw
+        # logits). Reproduce the same expert selection here so we can (a) show
+        # it in the hint and (b) thread it through as debug_topk_ids so the
+        # intermediate_cache dump still fires on this path.
+        debug_topk_ids = torch.topk(router_logits, top_k, dim=-1).indices.to(
+            torch.int32
+        )
         return triton_kernel_moe_forward(
             x,
             self._triton_w13_weight,
@@ -1222,6 +1229,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             expert_map=expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             global_num_experts=global_num_experts,
+            debug_topk_ids=debug_topk_ids,
         )
 
     @mark_trace(prefix="mxfp4_moe", torch_compile=False)
