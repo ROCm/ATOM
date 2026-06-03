@@ -30,8 +30,13 @@ ATOM_USE_GLUON_PA_DECODE = envs.ATOM_USE_GLUON_PA_DECODE
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
-_QWEN_GLUON_PA_DECODE_BS = 64
-_GLM47_GLUON_PA_DECODE_BS = 32
+# the dispatch rule is based on the kernel benchmark result
+#  of gluon/asm pa with model-specific shapes
+_GLUON_PA_DECODE_BS_MAPPING = {
+    "qwen3_moe": 64,
+    "glm4_moe": 32,
+    "minimax_m2": 16,
+}
 _NO_PS_FIXED_SPLITS = 64  # covers up to 64 * 256 = 16384 context length
 
 
@@ -568,11 +573,21 @@ class PagedAttentionImplPluginModeMethods:
             return False
         return True
 
+    def _set_model_type(self):
+        from atom.config import get_current_atom_config
+
+        hf_config = get_current_atom_config().hf_config
+        if not hasattr(self, "model_type"):
+            self.model_type = getattr(hf_config, "model_type", "")
+
     def _dispatch_decode_backend(self, num_decodes):
-        if self.use_triton_attn or num_decodes == _QWEN_GLUON_PA_DECODE_BS:
+        self._set_model_type()
+        # use asm pa for models without setting gluon pa decode bs
+        gluon_pa_decode_bs = _GLUON_PA_DECODE_BS_MAPPING.get(self.model_type, -1)
+        if self.use_triton_attn:
             return self.paged_attention_triton_plugin_mode
         else:
-            if ATOM_USE_GLUON_PA_DECODE and num_decodes <= _GLM47_GLUON_PA_DECODE_BS:
+            if ATOM_USE_GLUON_PA_DECODE and num_decodes <= gluon_pa_decode_bs:
                 return self.paged_attention_triton_plugin_mode
             else:
                 return self.paged_attention_asm_plugin_mode
@@ -796,6 +811,7 @@ def PagedAttentionImplDecoratorForPluginMode(cls):
         "forward_impl_plugin_mode",
         "adopt_persistent_kernel",
         "_dispatch_decode_backend",
+        "_set_model_type",
     ]
 
     logger.info(
