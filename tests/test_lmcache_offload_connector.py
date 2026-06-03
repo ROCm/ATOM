@@ -22,6 +22,10 @@ from atom.kv_transfer.offload.connector import (
 )
 from atom.kv_transfer.offload import connector as offload_connector_mod
 from atom.kv_transfer.offload.gpu_connector import ATOMKVByteCodec
+from atom.kv_transfer.offload.lmcache_compat import (
+    ATOMLMCacheGPUConnector,
+    ATOMRawBytesLMCacheMetadata,
+)
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -46,6 +50,8 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._lookup_client = _LookupClient(hit=0)
     sched._load_specs = {}
     sched._reqs_need_recv = {}
+    sched._load_save_floors = {}
+    sched._hit_save_floors = {}
     sched._save_tracker = {}
     sched._save_inflight = set()
     sched._lookup_in_step = []
@@ -161,6 +167,144 @@ def test_segment_indexed_stitches_chunk_buffers(monkeypatch):
     codec.split_request_buffer(stitched, split_buffers, [len(b) for b in chunks])
     for actual, expected in zip(split_buffers, chunk_buffers):
         assert torch.equal(actual, expected)
+
+
+def test_raw_bytes_metadata_shapes_are_block_rounded():
+    import torch
+
+    if not hasattr(torch, "Size"):
+        pytest.skip("real torch is unavailable")
+
+    base = SimpleNamespace(chunk_size=8)
+    base.is_first_rank = lambda: True
+    meta = ATOMRawBytesLMCacheMetadata(
+        base,
+        atom_block_size=4,
+        bytes_per_block=32,
+    )
+
+    assert meta.get_dtypes() == [torch.uint8]
+    assert meta.get_shapes(8) == [torch.Size((64,))]
+    assert meta.get_shapes(6) == [torch.Size((64,))]
+    assert meta.get_shapes(4) == [torch.Size((32,))]
+    assert meta.get_shapes() == [torch.Size((64,))]
+
+
+def test_raw_bytes_metadata_rejects_unaligned_chunk_size():
+    import torch
+
+    if not hasattr(torch, "Size"):
+        pytest.skip("real torch is unavailable")
+
+    base = SimpleNamespace(chunk_size=10)
+    with pytest.raises(ValueError, match="chunk size must be divisible"):
+        ATOMRawBytesLMCacheMetadata(
+            base,
+            atom_block_size=4,
+            bytes_per_block=32,
+        )
+
+
+def test_codec_device_buffer_roundtrip_noncontiguous_blocks(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "block")
+    original = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(8 * 2 * 3, dtype=torch.uint8).reshape(8, 2, 3),
+            v_cache=(torch.arange(8 * 4, dtype=torch.uint8).reshape(8, 4) + 51),
+            k_scale=None,
+            v_scale=None,
+        ),
+        "l1": SimpleNamespace(
+            k_cache=(torch.arange(8 * 3, dtype=torch.uint8).reshape(8, 3) + 101),
+            v_cache=(torch.arange(8 * 2, dtype=torch.uint8).reshape(8, 2) + 151),
+            k_scale=None,
+            v_scale=None,
+        ),
+    }
+    kv_caches = {
+        name: SimpleNamespace(k_cache=layer.k_cache.clone(), v_cache=layer.v_cache.clone())
+        for name, layer in original.items()
+    }
+    for layer in kv_caches.values():
+        layer.k_scale = None
+        layer.v_scale = None
+
+    codec = ATOMKVByteCodec(kv_caches)
+    block_ids = [1, 3, 4, 7]
+    device_buf = torch.empty(
+        len(block_ids) * codec.bytes_per_block,
+        dtype=torch.uint8,
+        device=codec.device,
+    )
+
+    codec.gpu_to_device_buffer(device_buf, block_ids)
+    for layer in kv_caches.values():
+        layer.k_cache.zero_()
+        layer.v_cache.zero_()
+    codec.device_buffer_to_gpu(device_buf, block_ids)
+
+    for name, layer in kv_caches.items():
+        src = original[name]
+        for bid in block_ids:
+            assert torch.equal(layer.k_cache[bid], src.k_cache[bid])
+            assert torch.equal(layer.v_cache[bid], src.v_cache[bid])
+
+
+def test_lmcache_connector_maps_token_ranges_to_block_ids(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "block")
+    original = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
+            v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=original["l0"].k_cache.clone(),
+            v_cache=original["l0"].v_cache.clone(),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    connector = ATOMLMCacheGPUConnector(codec, block_size=4)
+    memory_obj = SimpleNamespace(
+        tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
+    )
+
+    connector.batched_from_gpu(
+        [memory_obj],
+        [4],
+        [12],
+        block_ids=[0, 1, 2, 3, 4, 5],
+    )
+
+    kv_caches["l0"].k_cache.zero_()
+    kv_caches["l0"].v_cache.zero_()
+    connector.batched_to_gpu(
+        [memory_obj],
+        [4],
+        [12],
+        block_ids=[0, 1, 2, 3, 4, 5],
+    )
+
+    for bid in [1, 2]:
+        assert torch.equal(kv_caches["l0"].k_cache[bid], original["l0"].k_cache[bid])
+        assert torch.equal(kv_caches["l0"].v_cache[bid], original["l0"].v_cache[bid])
+    assert torch.count_nonzero(kv_caches["l0"].k_cache[0]) == 0
+    assert torch.count_nonzero(kv_caches["l0"].v_cache[0]) == 0
 
 
 @pytest.mark.parametrize("layout", ["block", "segment", "segment_indexed"])
@@ -300,11 +444,45 @@ def test_load_is_skipped_if_hbm_satisfies_after_allocation():
     assert sched.should_park_for_load_after_alloc(seq) is False
     meta = sched.build_connector_meta()
 
+    assert meta.requests == []
     assert [req for req in meta.requests if req.load_spec is not None] == []
     assert seq.offload_loaded_tokens == 8
+    assert sched._save_tracker[str(seq.id)][1] == 8
     assert lookup.cleared == ["321"]
     assert str(seq.id) not in sched._load_specs
     assert str(seq.id) not in sched._reqs_need_recv
+
+
+def test_lookup_time_hbm_satisfies_does_not_resave_hit_prefix():
+    sched = _scheduler()
+    lookup = _LookupClient(hit=8)
+    sched._lookup_client = lookup
+    seq = SimpleNamespace(
+        id=322,
+        num_prompt_tokens=12,
+        token_ids=list(range(12)),
+        num_cached_tokens=8,
+        block_table=[1, 2, 3],
+    )
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert need == 0
+    assert should_park is False
+
+    sched.update_state_after_alloc(seq)
+    meta1 = sched.build_connector_meta()
+
+    assert meta1.requests == []
+    assert sched._save_tracker[str(seq.id)][1] == 8
+    assert lookup.cleared == ["322"]
+
+    seq.num_cached_tokens = 12
+    meta2 = sched.build_connector_meta()
+    save_reqs = [req for req in meta2.requests if req.save_spec is not None]
+
+    assert len(save_reqs) == 1
+    assert save_reqs[0].token_ids == list(range(12))
+    assert save_reqs[0].save_spec.skip_leading_tokens == 8
 
 
 def test_load_is_skipped_if_hbm_floor_is_not_chunk_aligned():
@@ -469,6 +647,71 @@ def test_aligned_large_hit_parks_and_emits_load_metadata():
     assert lookup.cleared == []
 
 
+def test_loaded_prefix_is_not_saved_again_after_success():
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=659,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+    )
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert need == 12
+    assert should_park is True
+
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is True
+
+    load_meta = sched.build_connector_meta()
+    assert len([req for req in load_meta.requests if req.load_spec is not None]) == 1
+    assert [req for req in load_meta.requests if req.save_spec is not None] == []
+    assert sched._save_tracker[str(seq.id)][1] == 12
+
+    seq.num_cached_tokens = 16
+    save_meta = sched.build_connector_meta()
+    save_reqs = [req for req in save_meta.requests if req.save_spec is not None]
+
+    assert len(save_reqs) == 1
+    assert save_reqs[0].token_ids == list(range(16))
+    assert save_reqs[0].save_spec.skip_leading_tokens == 12
+
+
+def test_load_failure_allows_recomputed_hit_range_to_be_saved():
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=660,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+    )
+
+    sched.get_num_new_matched_tokens(seq)
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is True
+    sched.build_connector_meta()
+    assert sched._save_tracker[str(seq.id)][1] == 12
+
+    sched.load_failed(seq.id)
+    assert sched._save_tracker[str(seq.id)][1] == 4
+
+    seq.num_cached_tokens = 12
+    save_meta = sched.build_connector_meta()
+    save_reqs = [req for req in save_meta.requests if req.save_spec is not None]
+
+    assert len(save_reqs) == 1
+    assert save_reqs[0].token_ids == list(range(12))
+    assert save_reqs[0].save_spec.skip_leading_tokens == 4
+
+
 def test_worker_completes_noop_load_when_hbm_satisfies():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
@@ -514,6 +757,127 @@ def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
     assert conn._done_load == set()
     assert conn._failed_load == {654}
     assert conn._engine.unpinned == ["654"]
+
+
+def test_worker_save_uses_lmcache_engine_store():
+    import torch
+
+    if not hasattr(torch, "tensor"):
+        pytest.skip("real torch is unavailable")
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def store(self, tokens, mask=None, **kwargs) -> None:
+            self.calls.append((tokens.tolist(), mask.tolist(), kwargs))
+
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_save = set()
+    conn.chunk_size = 4
+    conn._engine = _Engine()
+
+    req = SimpleNamespace(
+        req_id=987,
+        token_ids=list(range(12)),
+        block_ids=[3, 4, 5],
+        is_last_prefill=True,
+        save_spec=SimpleNamespace(skip_leading_tokens=4),
+    )
+
+    conn._do_save_req(req)
+
+    assert conn._done_save == {987}
+    assert len(conn._engine.calls) == 1
+    tokens, mask, kwargs = conn._engine.calls[0]
+    assert tokens == list(range(12))
+    assert mask == [False, False, False, False] + [True] * 8
+    assert kwargs["block_ids"] == [3, 4, 5]
+    assert kwargs["req_id"] == "987"
+
+
+def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
+    import torch
+
+    if not hasattr(torch, "tensor"):
+        pytest.skip("real torch is unavailable")
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.calls = []
+            self.unpinned = []
+
+        def retrieve(self, tokens, mask=None, **kwargs):
+            self.calls.append((tokens.tolist(), mask.tolist(), kwargs))
+            return torch.tensor([False] * 4 + [True] * 8, dtype=torch.bool)
+
+        def lookup_unpin(self, ids) -> None:
+            self.unpinned.extend(ids)
+
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_load = set()
+    conn._failed_load = set()
+    conn._done_save = set()
+    conn.chunk_size = 4
+    conn._engine = _Engine()
+
+    req = SimpleNamespace(
+        req_id=988,
+        token_ids=list(range(16)),
+        block_ids=[3, 4, 5, 6],
+        load_spec=SimpleNamespace(hbm_cached_tokens=4, lmcache_cached_tokens=12),
+    )
+
+    conn._do_load_req(req)
+
+    assert conn._done_load == {988}
+    assert conn._failed_load == set()
+    assert conn._engine.unpinned == ["988"]
+    tokens, mask, kwargs = conn._engine.calls[0]
+    assert tokens == list(range(12))
+    assert mask == [False, False, False, False] + [True] * 8
+    assert kwargs["block_ids"] == [3, 4, 5, 6]
+    assert kwargs["req_id"] == "988"
+
+
+def test_worker_load_partial_retrieve_marks_failed():
+    import torch
+
+    if not hasattr(torch, "tensor"):
+        pytest.skip("real torch is unavailable")
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.unpinned = []
+
+        def retrieve(self, tokens, mask=None, **kwargs):
+            return torch.tensor([False] * 4 + [True] * 4 + [False] * 4)
+
+        def lookup_unpin(self, ids) -> None:
+            self.unpinned.extend(ids)
+
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_load = set()
+    conn._failed_load = set()
+    conn._done_save = set()
+    conn.chunk_size = 4
+    conn._engine = _Engine()
+
+    req = SimpleNamespace(
+        req_id=989,
+        token_ids=list(range(16)),
+        block_ids=[3, 4, 5, 6],
+        load_spec=SimpleNamespace(hbm_cached_tokens=4, lmcache_cached_tokens=12),
+    )
+
+    conn._do_load_req(req)
+
+    assert conn._done_load == set()
+    assert conn._failed_load == {989}
+    assert conn._engine.unpinned == ["989"]
 
 
 def test_load_exception_is_reported_as_failed_recving():

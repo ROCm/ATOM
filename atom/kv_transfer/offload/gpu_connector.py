@@ -209,6 +209,22 @@ class ATOMKVByteCodec:
                 f"got {int(host_buf.numel())}"
             )
 
+    def _validate_device_buf(self, device_buf: torch.Tensor, nblocks: int) -> None:
+        if device_buf.dtype != torch.uint8:
+            raise TypeError("ATOMKVByteCodec: device_buf must be a uint8 tensor")
+        if device_buf.device != self._device:
+            raise TypeError(
+                "ATOMKVByteCodec: device_buf must be on the KV cache device "
+                f"{self._device}, got {device_buf.device}"
+            )
+        required = int(nblocks) * self.bytes_per_block
+        if int(device_buf.numel()) < required:
+            raise ValueError(
+                "ATOMKVByteCodec: device_buf is too small "
+                f"for {nblocks} blocks; need {required} bytes, "
+                f"got {int(device_buf.numel())}"
+            )
+
     def stitch_chunk_buffers(
         self,
         dst: torch.Tensor,
@@ -418,6 +434,62 @@ class ATOMKVByteCodec:
                             host_buf[base + off : base + off + nb],
                             non_blocking=True,
                         )
+
+    def gpu_to_device_buffer(
+        self,
+        device_buf: torch.Tensor,
+        block_ids: list[int],
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Gather ATOM KV blocks into a flat device staging buffer.
+
+        The staging layout is always segment-major:
+        ``[seg0 blocks | seg1 blocks | ...]``. This is the layout consumed by
+        the LMCache-compatible connector before it copies the bytes to a
+        ``MemoryObj``.
+        """
+        block_ids = self._normalize_block_ids(block_ids)
+        self._validate_device_buf(device_buf, len(block_ids))
+        if not block_ids:
+            return
+        with self._device_ctx():
+            stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
+            with stream_ctx:
+                idx = torch.tensor(block_ids, dtype=torch.long, device=self._device)
+                bases = self._segment_bases(len(block_ids))
+                for seg, base, nb in zip(
+                    self._segments, bases, self._seg_block_bytes
+                ):
+                    mat = self._segment_bytes_matrix(seg)
+                    dst = device_buf[
+                        base : base + len(block_ids) * nb
+                    ].reshape(len(block_ids), nb)
+                    torch.index_select(mat, 0, idx, out=dst)
+
+    def device_buffer_to_gpu(
+        self,
+        device_buf: torch.Tensor,
+        block_ids: list[int],
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Scatter a segment-major device staging buffer into ATOM KV blocks."""
+        block_ids = self._normalize_block_ids(block_ids)
+        self._validate_device_buf(device_buf, len(block_ids))
+        if not block_ids:
+            return
+        with self._device_ctx():
+            stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
+            with stream_ctx:
+                idx = torch.tensor(block_ids, dtype=torch.long, device=self._device)
+                bases = self._segment_bases(len(block_ids))
+                for seg, base, nb in zip(
+                    self._segments, bases, self._seg_block_bytes
+                ):
+                    mat = self._segment_bytes_matrix(seg)
+                    src = device_buf[
+                        base : base + len(block_ids) * nb
+                    ].reshape(len(block_ids), nb)
+                    mat.index_copy_(0, idx, src)
 
 
 class _nullctx:
