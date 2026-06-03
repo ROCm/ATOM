@@ -303,7 +303,7 @@
           "prefix": "deepseek-v3-2-fp8-aw-tp4",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": ""
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0"
         },
         {
           "tp_size": 8,
@@ -312,7 +312,7 @@
           "prefix": "deepseek-v3-2-fp8-aw-tp8",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": ""
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0"
         },
         {
           "tp_size": 4,
