@@ -1803,12 +1803,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 per_act_token_quant=True,
             )
         else:
+            # block_quant (per_1x128 / per_1x32) MUST hand the kernel its block
+            # shape — otherwise fp8_w8a8 broadcasts the [N/128, K/128] scale as
+            # if it were per-tensor / per-channel and produces garbage.
+            # V4-Flash-Base on gfx942 hits this: routed experts are FP8 e4m3
+            # per_1x128 + UE8M0 block-scale.
+            if self.block_quant:
+                if self.quant_type == QuantType.per_1x128:
+                    block_shape = [128, 128]
+                elif self.quant_type == QuantType.per_1x32:
+                    block_shape = [1, 32]
+                else:
+                    block_shape = None
+            else:
+                block_shape = None
             return fp8_w8a8_moe_quant_config(
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
-                block_shape=None,
+                block_shape=block_shape,
             )
 
     @mark_trace(prefix="fp8_moe", torch_compile=False)
