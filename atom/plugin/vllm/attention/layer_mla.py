@@ -1190,13 +1190,14 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 transpose_bm=True,
             )
 
+        fused_q_quant = fp8_attention and kv_cache.numel() > 0
         q_out = torch.empty(
             (
                 ql_nope.shape[0],
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ),
-            dtype=ql_nope.dtype,
+            dtype=dtypes.fp8 if fused_q_quant else ql_nope.dtype,
             device=ql_nope.device,
         )
         if kv_cache.numel() > 0:
@@ -1222,7 +1223,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         if self.head_repeat_factor > 1:
             q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
 
-        if fp8_attention:
+        if fp8_attention and not fused_q_quant:
             from vllm import _custom_ops as ops
 
             # Reshape to 2D for scaled_fp8_quant, then restore

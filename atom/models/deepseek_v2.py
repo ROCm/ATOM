@@ -40,6 +40,12 @@ from aiter import (
     top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+try:
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
+    )
+except ImportError:
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group = None
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -144,6 +150,59 @@ def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
     return (
         getattr(config, "index_head_dim", None) == 128
         and getattr(config, "qk_rope_head_dim", None) == 64
+    )
+
+
+def _as_transposed_scale_layout(scale: torch.Tensor) -> torch.Tensor:
+    return scale.transpose(0, 1).contiguous().view_as(scale)
+
+
+def _tp_fused_ar_rmsnorm_quant_per_group_bf16_fake(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del weight_, eps, prefill_support, transpose_scale
+    scale_shape = input_.shape[:-1] + (input_.shape[-1] // group_size,)
+    return (
+        torch.empty(input_.shape, dtype=dtypes.fp8, device=input_.device),
+        torch.empty_like(residual_inp_),
+        torch.empty(scale_shape, dtype=torch.float32, device=input_.device),
+        torch.empty_like(input_),
+    )
+
+
+def _tp_fused_ar_rmsnorm_quant_per_group_bf16(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        group_size=group_size,
+        prefill_support=prefill_support,
+        emit_bf16=True,
+        transpose_scale=transpose_scale,
+    )
+
+
+if tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group is not None:
+    direct_register_custom_op(
+        op_name="tp_fused_ar_rmsnorm_quant_per_group_bf16",
+        op_func=_tp_fused_ar_rmsnorm_quant_per_group_bf16,
+        mutates_args=[],
+        fake_impl=_tp_fused_ar_rmsnorm_quant_per_group_bf16_fake,
     )
 
 
@@ -462,6 +521,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8_fake(
     hidden_states_quant_scale: Optional[torch.Tensor] = None,
     output_unquantized_inp1: Optional[bool] = False,
     transpose_scale: bool = True,
+    input_scale_transposed: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = hidden_states_quant.shape[0]
     FP8_QUANT_BLOCK_SIZE = 128
@@ -619,6 +679,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
     hidden_states_quant_scale: Optional[torch.Tensor] = None,
     output_unquantized_inp1: Optional[bool] = False,
     transpose_scale: bool = True,
+    input_scale_transposed: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = hidden_states_quant.shape[0]
 
@@ -662,8 +723,13 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
                 hidden_states_quant_scale,
                 weight_scale_qkv_a_proj,
                 skip_reduce=True,
+                is_x_scale_tranposed=input_scale_transposed,
             )
         else:
+            if not input_scale_transposed:
+                hidden_states_quant_scale = _as_transposed_scale_layout(
+                    hidden_states_quant_scale
+                )
             qkv_lora = gemm_a8w8_blockscale_bpreshuffle(
                 hidden_states_quant,
                 weight_qkv_a_proj,
@@ -729,6 +795,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     group_size: Optional[int] = 128,
     output_unquantized_inp1: Optional[bool] = False,
     transpose_scale: Optional[bool] = False,
+    input_scale_transposed: bool = True,
 ):
     if dtype_quant == dtypes.fp4x2:
         q_c, q_c_scale, kv_c_normed, k_pe = _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
@@ -762,6 +829,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
             hidden_states_quant_scale,
             output_unquantized_inp1,
             transpose_scale,
+            input_scale_transposed,
         )
     else:
         raise ValueError(
@@ -1806,8 +1874,24 @@ class DeepseekV2MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states_scale = None
+        indexer_hidden_states = hidden_states
+        hidden_states_scale_transposed = True
         if isinstance(hidden_states, tuple):
-            hidden_states, hidden_states_scale = hidden_states
+            if len(hidden_states) == 2:
+                hidden_states, hidden_states_scale = hidden_states
+                indexer_hidden_states = hidden_states
+            elif len(hidden_states) == 4:
+                (
+                    hidden_states,
+                    hidden_states_scale,
+                    indexer_hidden_states,
+                    hidden_states_scale_transposed,
+                ) = hidden_states
+            else:
+                raise ValueError(
+                    "DeepseekV2MLAAttention expects hidden_states tuple to be "
+                    "(x, scale) or (x, scale, indexer_x, scale_transposed)."
+                )
 
         if self.q_lora_rank is not None:
             if self.fuse_qknorm_quant and use_triton_gemm():
@@ -1830,6 +1914,7 @@ class DeepseekV2MLAAttention(nn.Module):
                         group_size=128,
                         output_unquantized_inp1=False,
                         transpose_scale=True,
+                        input_scale_transposed=hidden_states_scale_transposed,
                     )
                 )
                 hidden_states_or_q_c = q_c
@@ -1879,7 +1964,7 @@ class DeepseekV2MLAAttention(nn.Module):
             hidden_states_or_q_c_scale = None
         if self.is_v32 and self.indexer is not None:
             self.indexer(
-                hidden_states,
+                indexer_hidden_states,
                 hidden_states_or_q_c,
                 hidden_states_or_q_c_scale,
                 positions,
@@ -1932,11 +2017,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
 
-        # When ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on self.fuse_input_norm_quant is turned on only if use_triton_gemm and (FP8 or FP4),
-        # Because AR_RMS and RMS_Quant cannot co-exist for input_layernorm, this block of codes ensures 3 things when ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on:
-        #   1. RMS_Quant fusion is only used for input_layernorm
-        #   2. The reduce_results variable is re-enabled for feed forward layers (MOE and MLP), because AR_RMS is now disabled in the beginning of the next layer
-        #   3. AR_RMS is turned off for input_layernorm but still enabled for post_attention_layernorm if ENABLE_ALLREDUCE_RMSNORM_FUSION is turned on
+        # When ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on,
+        # self.fuse_input_norm_quant is enabled only for use_triton_gemm()
+        # FP8/FP4 paths. If the AITER AR+RMS+per-group quant op is available,
+        # FP8 per_1x128 keeps the previous layer unreduced and consumes it here.
+        # Otherwise RMS_Quant remains local and feed-forward layers reduce first.
         self.quant_dtype = (
             None
             if quant_config is None
@@ -1949,12 +2034,30 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
+        self.fuse_ar_input_norm_quant = False
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
             if (
                 self.quant_dtype == dtypes.fp8 or self.quant_dtype == dtypes.fp4x2
             ) and use_triton_gemm():
                 self.fuse_input_norm_quant = True
-                if self.fuse_ar_input_norm:
+                can_fuse_ar_input_norm_quant = (
+                    self.fuse_ar_input_norm
+                    and (
+                        tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group
+                        is not None
+                    )
+                    and self.quant_dtype == dtypes.fp8
+                    and self.input_norm_quant_type == QuantType.per_1x128.value
+                    and get_tensor_model_parallel_world_size() > 1
+                    and not is_mtp_block
+                )
+                if can_fuse_ar_input_norm_quant:
+                    self.fuse_ar_input_norm_quant = layer_idx > 0
+                    if layer_idx == 0:
+                        logger.info(
+                            "Info: ATOM will use fused AR + RMSNorm + per-group FP8 quant for DeepSeek input_layernorm starting from decoder layer 1"
+                        )
+                elif self.fuse_ar_input_norm:
                     self.fuse_ar_input_norm = False
                     if layer_idx == 0:
                         logger.info(
@@ -2015,9 +2118,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
+            emit_input_norm = (
+                self.self_attn.is_v32 and self.self_attn.indexer is not None
+            )
             if residual is None:
                 residual = hidden_states
-                (hidden_states_quant, hidden_states_quant_scale), _, _, _ = (
+                (
+                    (hidden_states_quant, hidden_states_quant_scale),
+                    input_norm,
+                    _,
+                    _,
+                ) = (
                     _fuse_rmsnorm_quant(
                         hidden_states,
                         weight,
@@ -2031,31 +2142,79 @@ class DeepseekV2DecoderLayer(nn.Module):
                         scale_shuffle_padding=True,
                         group_size=128,
                         quant_type=self.input_norm_quant_type,
-                        output_unquantized_inp1=False,
+                        output_unquantized_inp1=emit_input_norm,
                         transpose_scale=True,
                     )
+                )
+                hidden_states = (
+                    (
+                        hidden_states_quant,
+                        hidden_states_quant_scale,
+                        input_norm,
+                        True,
+                    )
+                    if emit_input_norm
+                    else (hidden_states_quant, hidden_states_quant_scale)
                 )
             else:
-                (hidden_states_quant, hidden_states_quant_scale), _, _, residual = (
-                    _fuse_rmsnorm_quant(
+                if self.fuse_ar_input_norm_quant:
+                    assert (
+                        tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group
+                        is not None
+                    )
+                    (
+                        hidden_states_quant,
+                        residual,
+                        hidden_states_quant_scale,
+                        input_norm,
+                    ) = torch.ops.aiter.tp_fused_ar_rmsnorm_quant_per_group_bf16(
                         hidden_states,
+                        residual,
                         weight,
                         eps,
-                        None,
-                        None,
-                        None,
-                        residual,
-                        dtype_quant=self.quant_dtype,
-                        shuffle=True,
-                        scale_shuffle_padding=True,
                         group_size=128,
-                        quant_type=self.input_norm_quant_type,
-                        output_unquantized_inp1=False,
                         transpose_scale=True,
                     )
-                )
-
-            hidden_states = (hidden_states_quant, hidden_states_quant_scale)
+                    hidden_states = (
+                        hidden_states_quant,
+                        hidden_states_quant_scale,
+                        input_norm,
+                        True,
+                    )
+                else:
+                    (
+                        (hidden_states_quant, hidden_states_quant_scale),
+                        input_norm,
+                        _,
+                        residual,
+                    ) = (
+                        _fuse_rmsnorm_quant(
+                            hidden_states,
+                            weight,
+                            eps,
+                            None,
+                            None,
+                            None,
+                            residual,
+                            dtype_quant=self.quant_dtype,
+                            shuffle=True,
+                            scale_shuffle_padding=True,
+                            group_size=128,
+                            quant_type=self.input_norm_quant_type,
+                            output_unquantized_inp1=emit_input_norm,
+                            transpose_scale=True,
+                        )
+                    )
+                    hidden_states = (
+                        (
+                            hidden_states_quant,
+                            hidden_states_quant_scale,
+                            input_norm,
+                            True,
+                        )
+                        if emit_input_norm
+                        else (hidden_states_quant, hidden_states_quant_scale)
+                    )
 
         else:
             if residual is None:
