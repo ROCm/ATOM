@@ -14,6 +14,8 @@ The vLLM-ATOM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 
 ```bash
 TP=4
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0
 
 vllm serve deepseek-ai/DeepSeek-V3.2 \
     --host localhost \
