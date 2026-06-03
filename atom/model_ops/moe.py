@@ -762,6 +762,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from atom.model_ops.utils import has_triton_kernels
 
             assert has_triton_kernels(), "triton_kernels is not installed"
+        # Opt-in: use AITER's triton/gluon moe_op_gemm_a8w4 (fp8 act x mxfp4 weight) kernel
+        # for the gpt-oss swiglu MoE instead of triton_kernels matmul_ogs. otherwise stays on matmul_ogs.
+        self.use_a8w4 = envs.ATOM_USE_TRITON_A8W4_MOE
 
     def create_weights(
         self,
@@ -883,6 +886,43 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    def _prepare_a8w4_weights(self, layer):
+        """Prepare weights/scales for the AITER moe_op_gemm_a8w4 kernel.
+
+        The checkpoint already stores OCP MXFP4 weights (e2m1 values packed along
+        K, e8m0 per-32 scales) in `(E, N, K//2)` layout with `(E, N, K//32)`
+        scales -- exactly what `moe_gemm_a8w4` consumes once the scales are
+        swizzled. The mxfp4 weight tensors themselves are left untouched (the
+        kernel wrapper takes a `(E, K//2, N)` column-major view via
+        `w.transpose(1, 2)` at call time). Activations are static per-tensor fp8
+        (model is `*-a-fp8`): the per-expert `input_scale` values are uniform
+        within a layer, so we collapse them to a single scalar the kernel's
+        scalar `X_static_scale` expects.
+        """
+        from aiter.ops.triton.moe.moe_op_gemm_a8w4 import swizzle_scales_gfx1250
+
+        # (E, N, K//32) -> (E, K//32, N) view -> swizzle -> (E, K, N//32).
+        # NOTE: pass the transpose *view* (do not .contiguous()); swizzle's
+        # internal transpose(-1, -2) restores contiguity for the reshape, matching
+        # the reference usage in op_tests/.../test_moe_gemm_a8w4.py.
+        w13_scale_swz = swizzle_scales_gfx1250(layer.w13_weight_scale.transpose(1, 2))
+        w2_scale_swz = swizzle_scales_gfx1250(layer.w2_weight_scale.transpose(1, 2))
+        layer.w13_weight_scale = None
+        layer.w2_weight_scale = None
+        layer.w13_weight_scale_swz = w13_scale_swz
+        layer.w2_weight_scale_swz = w2_scale_swz
+
+        # Static per-tensor fp8 activation scales (scalar, uniform across experts).
+        assert (
+            layer.w13_input_scale is not None and layer.w2_input_scale is not None
+        ), "a8w4 requires static fp8 input scales (model must be *-a-fp8)"
+        layer.a8w4_x_scale_13 = (
+            layer.w13_input_scale.float().amax().reshape(1).contiguous()
+        )
+        layer.a8w4_x_scale_2 = (
+            layer.w2_input_scale.float().amax().reshape(1).contiguous()
+        )
+
     def process_weights_after_loading(self, layer):
         if layer.w13_bias is not None:
             layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
@@ -890,6 +930,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
         if os.environ.get("ATOM_V4_TORCH_MOE"):
+            return
+
+        if self.use_a8w4:
+            self._prepare_a8w4_weights(layer)
             return
 
         if self.use_triton:
@@ -997,6 +1041,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
+        if self.use_a8w4:
+            # gpt-oss MXFP4 MoE via AITER fp8-act x mxfp4-weight gluon kernel.
+            from atom.model_ops.fused_moe_triton import aiter_a8w4_fused_experts
+
+            return aiter_a8w4_fused_experts(
+                x,
+                layer,
+                router_logits,
+                top_k,
+                renormalize,
+            )
+
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_moe_forward,
