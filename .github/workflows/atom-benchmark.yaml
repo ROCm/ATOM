@@ -316,7 +316,7 @@ jobs:
           MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Run benchmark
-        timeout-minutes: 60
+        timeout-minutes: 80
         run: |
           set -euo pipefail
           if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
