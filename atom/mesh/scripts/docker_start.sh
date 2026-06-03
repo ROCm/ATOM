@@ -36,7 +36,7 @@ if [[ -n "${HOST_IONIC}" && -f "${HOST_IONIC}" ]]; then
     docker exec "${CONTAINER}" bash -c "
         cd /usr/lib/x86_64-linux-gnu
         ln -sf '${IONIC_NAME}' libionic.so.1
-        cp '${IONIC_NAME}' libibverbs/libionic-rdmav34.so
+        cp -f '${IONIC_NAME}' libibverbs/libionic-rdmav34.so 2>/dev/null || true
     "
     echo "[docker] patched libionic → ${IONIC_NAME}"
 fi
