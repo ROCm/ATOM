@@ -207,6 +207,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         )
         from vllm.model_executor.layers.attention.mla_attention import (
             MLACommonMetadataBuilder,
+            _DecodeConcatQuantFP8,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            GroupShape,
         )
 
         self.supports_quant_query_input = False
@@ -229,6 +233,13 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
         self._pad_v = True
         self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
+        # Intentional vLLM coupling: reuse the native MLA CustomOp so its
+        # compile_native path can fuse decode Q concat + static FP8 quant.
+        self._decode_concat_quant_fp8_op = _DecodeConcatQuantFP8(
+            static=True,
+            group_shape=GroupShape.PER_TENSOR,
+            compile_native=True,
+        )
         if self.rotary_emb is not None:
             rotary_emb_cos_sin_cache = torch.cat(
                 [
