@@ -1028,15 +1028,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
                 # custom routing
                 from aiter.ops.triton.moe.moe_routing.routing import (
-                    routing_ds,
+                    routing,
                 )  # grouped topk included
 
-                block_m = 64 if x.shape[-2] >= 256 else 16
-
-                routing_data, gather_idx, scatter_idx = routing_ds(
+                routing_data, gather_idx, scatter_idx = routing(
                     router_logits,
                     n_expts_act,
-                    block_m,
                     score_mode=scoring_func,
                     bias=(
                         e_score_correction_bias.to(torch.float32)
@@ -1050,7 +1047,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     topk_group=topk_group,
                     num_fused_shared_experts=layer.num_fused_shared_experts,
                 )
-                # routing_ds widened the per-token gate count by the shared
+                # routing widened the per-token gate count by the shared
                 # experts; the GEMM must process all of them.
                 n_expts_act = routing_data.n_expts_act
 
