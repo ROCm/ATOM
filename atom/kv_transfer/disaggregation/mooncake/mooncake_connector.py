@@ -1056,6 +1056,8 @@ class MooncakeConnector(KVConnectorBase):
         if self._gather_slot is not None and consumer_staging_addr:
             producer_pool_idx = self._acquire_staging_slot()
             self._gather_slot(src_slot, producer_pool_idx)
+            # FIX(tbo-hang): wait for gather D2D copy before NIC reads staging buf
+            torch.cuda.current_stream().synchronize()
             slot_src.append(
                 self._staging_base_addr + producer_pool_idx * self._staging_slot_bytes
             )
