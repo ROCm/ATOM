@@ -22,6 +22,7 @@ import torch
 from math import prod
 from aiter import ActivationType
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from atom.model_ops.moe_utils import (
     check_and_swizzle_scales,
 )
@@ -205,6 +206,10 @@ def triton_kernel_fused_experts(
             a13_scale = a13_scale.max().to(torch.float32)
             a2_scale = a2_scale.max().to(torch.float32)
 
+            quant_dtype = torch.float8_e4m3fn
+            if get_arch() == "gfx942":
+                quant_dtype = torch.float8_e4m3fnuz
+
             hidden_states = downcast_to_static_fp8(hidden_states, a13_scale)
             interm_cache = moe_gemm_a8w4(
                 hidden_states,
@@ -218,7 +223,7 @@ def triton_kernel_fused_experts(
                 gather_indx=gather_indx,
                 gammas=gammas if apply_router_weight_on_input else None,
                 swizzle_mx_scale=w13_swizzle_layout,
-                out_dtype=torch.float8_e4m3fn,
+                out_dtype=quant_dtype,
                 apply_swiglu=True,
                 alpha=1.702,  # gpt-oss
                 limit=7.0,  # gpt-oss
