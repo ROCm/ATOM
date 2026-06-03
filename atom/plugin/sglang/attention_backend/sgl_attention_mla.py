@@ -386,6 +386,7 @@ def forward_sgl_prepare(
                 dim=-1,
             )
         )
+        indexer_hidden_states = hidden_states
 
         if (
             q.shape[0] != positions.shape[0]
@@ -404,6 +405,21 @@ def forward_sgl_prepare(
                 [attn.q_lora_rank, attn.kv_lora_rank + attn.qk_rope_head_dim],
                 dim=-1,
             )
+
+        if (
+            indexer_hidden_states.shape[0] != positions.shape[0]
+            and get_tensor_model_parallel_world_size() > 1
+        ):
+            indexer_hidden_states = get_tp_group().all_gather(
+                indexer_hidden_states, dim=0
+            )
+            if indexer_hidden_states.shape[0] < positions.shape[0]:
+                raise RuntimeError(
+                    "indexer hidden_states gather mismatch: "
+                    f"got {indexer_hidden_states.shape[0]}, "
+                    f"expected {positions.shape[0]}"
+                )
+            indexer_hidden_states = indexer_hidden_states[: positions.shape[0]]
 
         k_nope = latent_cache[..., : attn.kv_lora_rank]
         q_scale = None
@@ -445,6 +461,7 @@ def forward_sgl_prepare(
         ):
             current_stream = torch.cuda.current_stream()
             attn.alt_stream.wait_stream(current_stream)
+            indexer_q = q
             with torch.cuda.stream(attn.alt_stream):
                 k_nope = k_nope.unsqueeze(1)
                 q = _unwrap_linear_output(
@@ -452,27 +469,34 @@ def forward_sgl_prepare(
                     if q_scale is not None
                     else attn.q_b_proj(q)
                 ).view(-1, attn.num_local_heads, attn.qk_head_dim)
-            topk_indices = attn.indexer(
-                x=hidden_states,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=attn.layer_num,
+            attn.indexer(
+                indexer_hidden_states,
+                indexer_q,
+                q_scale,
+                positions,
+                attn.indexer_rope_emb,
             )
+            topk_indices = attn.indexer.topk_indices_buffer[
+                : indexer_hidden_states.shape[0]
+            ]
             current_stream.wait_stream(attn.alt_stream)
         else:
             k_nope = k_nope.unsqueeze(1)
+            indexer_q = q
             q = _unwrap_linear_output(
                 attn.q_b_proj(q, q_scale) if q_scale is not None else attn.q_b_proj(q)
             ).view(-1, attn.num_local_heads, attn.qk_head_dim)
             if q_lora is not None:
-                topk_indices = attn.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=attn.layer_num,
+                attn.indexer(
+                    indexer_hidden_states,
+                    indexer_q,
+                    q_scale,
+                    positions,
+                    attn.indexer_rope_emb,
                 )
+                topk_indices = attn.indexer.topk_indices_buffer[
+                    : indexer_hidden_states.shape[0]
+                ]
     else:
         q = _unwrap_linear_output(attn.q_proj(hidden_states)).view(
             -1, attn.num_local_heads, attn.qk_head_dim

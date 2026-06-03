@@ -316,7 +316,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     return Config(
         model=server_args.model_path,
         max_num_batched_tokens=16384,
-        max_num_seqs=server_args.max_running_requests,
+        max_num_seqs=server_args.max_running_requests or 512,
         max_model_len=server_args.context_length,
         gpu_memory_utilization=server_args.mem_fraction_static,
         tensor_parallel_size=atom_tensor_parallel_size,
