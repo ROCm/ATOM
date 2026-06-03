@@ -1097,7 +1097,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 fused_shared_experts_scoring_func is None
             ), "triton kernel does not support fused shared experts func"
 
-    
             # Takes directly from model dtype in config.json
             x_q_dtype = (
                 self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None
