@@ -19,16 +19,17 @@ We adopt [amd/Kimi-K2.5-MXFP4-AttnFP8](https://huggingface.co/amd/Kimi-K2.5-MXFP
 ```bash
 # use quick allreduce to reduce TTFT
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+TP=4
 
 vllm serve amd/Kimi-K2.5-MXFP4-AttnFP8 \
     --host localhost \
     --port 8000 \
     --async-scheduling \
     --load-format fastsafetensors \
-    --tensor-parallel-size 4 \
     --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --kv-cache-dtype fp8 \
+    --tensor-parallel-size "${TP}" \
     --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
     --no-enable-prefix-caching
@@ -122,18 +123,23 @@ The expected response:
 ## Step 4: Performance Benchmark
 Users can use the default vllm bench command for performance benchmarking.
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
     --backend vllm \
     --base-url http://127.0.0.1:8000 \
     --endpoint /v1/completions \
     --model amd/Kimi-K2.5-MXFP4-AttnFP8 \
     --dataset-name random \
-    --random-input-len 1000 \
-    --random-output-len 100 \
-    --max-concurrency 4 \
-    --num-prompts 40 \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --num-prompts "$(( CONC * 8 ))" \
+    --max-concurrency "${CONC}" \
     --trust_remote_code \
-    --num-warmups 8 \
+    --num-warmups "${CONC}" \
     --request-rate inf \
     --ignore-eos \
     --disable-tqdm \
@@ -145,13 +151,13 @@ vllm bench serve \
 The accuracy can be verified on gsm8k dataset with command:
 ```bash
 lm_eval --model local-completions \
-        --model_args model=amd/Kimi-K2.5-MXFP4-AttnFP8,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+        --model_args model=amd/Kimi-K2.5-MXFP4-AttnFP8,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
         --tasks gsm8k \
         --num_fewshot 3
 ```
 The reference values of corresponding metrics:
 ```bash
-local-completions ({'model': 'amd/Kimi-K2.5-MXFP4-AttnFP8', 'base_url': 'http://localhost:8000/v1/completions', 'num_concurrent': 64, 'max_retries': 3, 'tokenized_requests': False}), gen_kwargs: ({}), limit: None, num_fewshot: 3, batch_size: 1
+local-completions ({'model': 'amd/Kimi-K2.5-MXFP4-AttnFP8', 'base_url': 'http://127.0.0.1:8000/v1/completions', 'num_concurrent': 65, 'max_retries': 1, 'tokenized_requests': False, 'trust_remote_code': True}), gen_kwargs: ({}), limit: None, num_fewshot: 3, batch_size: 1
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|     3|exact_match|↑  |0.9325|±  |0.0061|

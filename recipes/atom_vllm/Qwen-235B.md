@@ -14,37 +14,50 @@ The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 
 ```bash
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
 
 vllm serve Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size 8 \
-    --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 8 \
+    --enable-expert-parallel \
+    --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
-    --no-enable-prefix-caching 
+    --no-enable-prefix-caching
 ```
 
 ## Step 3: Performance Benchmark
 Users can use the default vllm bench commands for performance benchmarking.
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
-    --host localhost \
-    --port 8000 \
+    --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --endpoint /v1/completions \
     --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
     --dataset-name random \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.8 \
-    --max-concurrency 64 \
-    --num-prompts 640 \
-    --trust_remote_code \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --num-prompts "$(( CONC * 8 ))" \
+    --max-concurrency "${CONC}" \
+    --num-warmups "${CONC}" \
+    --request-rate inf \
+    --ignore-eos \
+    --disable-tqdm \
+    --save-result \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 
-For expert parallelism, please use it by enable "--enable-expert-parallel".
+This model is validated in CI with `--enable-expert-parallel`.
 
 ### Optional: Enable Profiling
 If you want to collect profiling trace, you can use the same API as default vLLM to add `--profiler-config "$profiler_config"` to the `vllm serve` command above.
@@ -58,7 +71,7 @@ profiler_config=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_p
 
 ```bash
 lm_eval --model local-completions \
-        --model_args model=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+        --model_args model=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
         --tasks gsm8k \
         --num_fewshot 3
 ```
