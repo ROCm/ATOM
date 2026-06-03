@@ -19,6 +19,7 @@ The following matches the internal benchmark entry (`--kv_cache_dtype fp8 -tp 2 
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export ATOM_USE_GLUON_PA_DECODE=1
 
 vllm serve MiniMaxAI/MiniMax-M2.5 \
     --host localhost \

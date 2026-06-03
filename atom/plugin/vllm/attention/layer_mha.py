@@ -28,7 +28,13 @@ if TYPE_CHECKING:
 ATOM_USE_GLUON_PA_DECODE = envs.ATOM_USE_GLUON_PA_DECODE
 
 _QWEN_GLUON_PA_DECODE_BS = 64
-_GLM47_GLUON_PA_DECODE_BS = 32
+# the dispatch rule is based on the kernel benchmark result
+#  of gluon/asm pa with model-specific shapes
+_GLUON_PA_DECODE_BS_MAPPING = {
+    "qwen3_moe": 64,
+    "glm4_moe": 32,
+    "minimax_m2": 16,
+}
 _NO_PS_FIXED_SPLITS = 64
 
 
@@ -134,6 +140,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         self.k_norm = k_norm
         self.use_flash_layout = False
         self.supports_quant_query_input = False
+
+        hf_config = atom_config.hf_config
+        self.model_type = getattr(hf_config, "model_type", "")
 
         _init_vllm_mha_layer_state(
             self,
@@ -685,10 +694,12 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         )
 
     def _dispatch_decode_backend(self, num_decodes):
-        if self.use_triton_attn or num_decodes == _QWEN_GLUON_PA_DECODE_BS:
+        # use asm pa for models without setting gluon pa decode bs
+        gluon_pa_decode_bs = _GLUON_PA_DECODE_BS_MAPPING.get(self.model_type, -1)
+        if self.use_triton_attn:
             return self.paged_attention_triton
         else:
-            if ATOM_USE_GLUON_PA_DECODE and num_decodes <= _GLM47_GLUON_PA_DECODE_BS:
+            if ATOM_USE_GLUON_PA_DECODE and num_decodes <= gluon_pa_decode_bs:
                 return self.paged_attention_triton
             else:
                 return self.paged_attention_asm
