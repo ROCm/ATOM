@@ -13,7 +13,8 @@ import sys
 import pytest
 from unittest.mock import MagicMock, patch
 
-from atom.plugin import prepare as plugin_prepare
+from atom.plugin import prepare as plugin_runtime
+from atom.plugin.sglang import prepare as sglang_prepare
 
 
 class _Obj:
@@ -26,9 +27,9 @@ class _Obj:
 
 @pytest.fixture(autouse=True)
 def _reset_framework_state():
-    plugin_prepare._set_framework_backbone("atom")
+    plugin_runtime._set_framework_backbone("atom")
     yield
-    plugin_prepare._set_framework_backbone("atom")
+    plugin_runtime._set_framework_backbone("atom")
 
 
 def _make_fake_register_module(model_dict=None):
@@ -41,35 +42,37 @@ def _make_fake_register_module(model_dict=None):
     return mod
 
 
+def _make_fake_runtime_module():
+    mod = MagicMock()
+    mod.get_model_arch_spec = MagicMock(return_value=_Obj(prepare_config=None))
+    return mod
+
+
 # ---------------------------------------------------------------------------
 # Engine / architecture validation
 # ---------------------------------------------------------------------------
 
 
-def test_prepare_model_rejects_unsupported_engine():
-    """Unsupported engine should raise ValueError from _set_framework_backbone."""
-    config = _Obj(architectures=["SomeModel"])
-    with pytest.raises(ValueError, match="Unsupported framework"):
-        plugin_prepare.prepare_model(config=config, engine="tensorflow")
-
-
-def test_prepare_model_rejects_non_sglang_engine_gracefully():
-    """vllm engine currently not supported in prepare_model (only sglang path)."""
-    config = _Obj(architectures=["Qwen3ForCausalLM"])
-    with pytest.raises(ValueError, match="does not support engine"):
-        plugin_prepare.prepare_model(config=config, engine="vllm")
-
-
 def test_prepare_model_rejects_unsupported_architecture():
-    """Known engine but unknown arch should raise ValueError."""
+    """Unknown architecture should raise ValueError from the SGLang prepare path."""
     fake_register = _make_fake_register_module(
         model_dict={"DeepseekV3ForCausalLM": MagicMock()}
     )
+    fake_runtime = _make_fake_runtime_module()
 
-    with patch.dict(sys.modules, {"atom.plugin.register": fake_register}):
+    with patch.dict(
+        sys.modules,
+        {
+            "atom.plugin.register": fake_register,
+            "atom.plugin.sglang.runtime": fake_runtime,
+            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+                apply_graph_capture_patch=MagicMock()
+            ),
+        },
+    ):
         config = _Obj(architectures=["TotallyFakeModelArch"])
         with pytest.raises(ValueError, match="does not support"):
-            plugin_prepare.prepare_model(config=config, engine="sglang")
+            sglang_prepare.prepare_model(config=config)
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +89,7 @@ def test_prepare_model_sglang_happy_path():
     fake_register = _make_fake_register_module(
         model_dict={"DeepseekV3ForCausalLM": fake_model_cls}
     )
+    fake_runtime = _make_fake_runtime_module()
 
     mock_gen_config = MagicMock(return_value=fake_atom_config)
     fake_config_mod = MagicMock()
@@ -96,10 +100,14 @@ def test_prepare_model_sglang_happy_path():
         {
             "atom.plugin.register": fake_register,
             "atom.plugin.config": fake_config_mod,
+            "atom.plugin.sglang.runtime": fake_runtime,
+            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+                apply_graph_capture_patch=MagicMock()
+            ),
         },
     ):
         config = _Obj(architectures=["DeepseekV3ForCausalLM"])
-        result = plugin_prepare.prepare_model(config=config, engine="sglang")
+        result = sglang_prepare.prepare_model(config=config)
 
     # Config generation called
     mock_gen_config.assert_called_once_with(config)
@@ -126,6 +134,7 @@ def test_prepare_model_selects_sglang_dict_for_deepseek_v2():
     fake_register = _make_fake_register_module(
         model_dict={"DeepseekV2ForCausalLM": fake_model_cls}
     )
+    fake_runtime = _make_fake_runtime_module()
     fake_config_mod = MagicMock()
     fake_config_mod.generate_atom_config_for_plugin_mode = MagicMock(
         return_value=fake_atom_config
@@ -136,10 +145,14 @@ def test_prepare_model_selects_sglang_dict_for_deepseek_v2():
         {
             "atom.plugin.register": fake_register,
             "atom.plugin.config": fake_config_mod,
+            "atom.plugin.sglang.runtime": fake_runtime,
+            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+                apply_graph_capture_patch=MagicMock()
+            ),
         },
     ):
         config = _Obj(architectures=["DeepseekV2ForCausalLM"])
-        result = plugin_prepare.prepare_model(config=config, engine="sglang")
+        result = sglang_prepare.prepare_model(config=config)
 
     assert result is fake_model
 
@@ -152,6 +165,7 @@ def test_prepare_model_sets_framework_to_sglang():
     fake_register = _make_fake_register_module(
         model_dict={"DeepseekV3ForCausalLM": fake_model_cls}
     )
+    fake_runtime = _make_fake_runtime_module()
     fake_config_mod = MagicMock()
     fake_config_mod.generate_atom_config_for_plugin_mode = MagicMock(
         return_value=fake_atom_config
@@ -162,10 +176,14 @@ def test_prepare_model_sets_framework_to_sglang():
         {
             "atom.plugin.register": fake_register,
             "atom.plugin.config": fake_config_mod,
+            "atom.plugin.sglang.runtime": fake_runtime,
+            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+                apply_graph_capture_patch=MagicMock()
+            ),
         },
     ):
         config = _Obj(architectures=["DeepseekV3ForCausalLM"])
-        plugin_prepare.prepare_model(config=config, engine="sglang")
+        sglang_prepare.prepare_model(config=config)
 
-    assert plugin_prepare.is_sglang() is True
-    assert plugin_prepare.is_plugin_mode() is True
+    assert plugin_runtime.is_sglang() is True
+    assert plugin_runtime.is_plugin_mode() is True

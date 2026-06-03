@@ -57,7 +57,7 @@ def get_attn_backend_cls(
         return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"
     if use_gdn:
         if use_vllm:
-            return "atom.plugin.vllm.attention_backend.gdn_attn.GDNAttentionBackend"
+            return "atom.plugin.vllm.attention.backend.GDNAttentionBackend"
         if use_sglang:
             return (
                 "atom.plugin.sglang.attention_backend.attention_gdn.GDNAttentionBackend"

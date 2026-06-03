@@ -955,6 +955,7 @@ class ModelRunner:
         if draft_bs is None:
             draft_bs = forward_context.context.graph_bs
         for i in range(self.drafter.mtp_k):
+            self.drafter._refresh_dp_metadata(forward_context, hidden_states.shape[0])
             hidden_states = self.drafter.model(
                 input_ids=torch.zeros(
                     hidden_states.shape[0],
@@ -977,7 +978,9 @@ class ModelRunner:
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
         # num_tokens_original = 1
-        mtp_factor = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
+        has_drafter = hasattr(self, "drafter")
+        mtp_k = self.drafter.mtp_k if has_drafter else 0
+        mtp_factor = mtp_k + 1
         num_tokens_original = mtp_factor
 
         seq = Sequence([0] * num_tokens_original, block_size=self.block_size, id=-1)
@@ -985,6 +988,7 @@ class ModelRunner:
         seq.type = SequenceType.DECODE
         seq.block_table = [0]
 
+        spec_tokens = {seq.id: np.zeros(mtp_k, dtype=np.int32)} if mtp_k > 0 else None
         dummy_batch = ScheduledBatch(
             seqs={seq.id: seq},
             num_scheduled_tokens=np.array([num_tokens_original], dtype=np.int32),
@@ -993,6 +997,8 @@ class ModelRunner:
             total_seqs_num=1,
             total_seqs_num_decode=1,
             is_dummy_run=True,
+            num_spec_step=mtp_k,
+            scheduled_spec_decode_tokens=spec_tokens,
         )
 
         self.forward(dummy_batch)
@@ -1053,7 +1059,10 @@ class ModelRunner:
             self.config.max_model_len,
         )
         dp_size = get_dp_group().world_size
-        warmup_max_tokens = max_num_batched_tokens // dp_size
+        if self.config.enable_dp_attention:
+            warmup_max_tokens = max_num_batched_tokens
+        else:
+            warmup_max_tokens = max_num_batched_tokens // dp_size
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -1063,7 +1072,8 @@ class ModelRunner:
             if seq_len == 0:
                 seq_len = 1
             logger.warning(
-                f"{self.label}: DP size={dp_size} too large, warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
+                f"{self.label}: dp_size={dp_size}, dp_attn={self.config.enable_dp_attention}, "
+                f"warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
                 f"Using {num_seqs} seq with length {seq_len} for warmup."
             )
         else:

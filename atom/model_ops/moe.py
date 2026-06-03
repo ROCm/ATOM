@@ -55,7 +55,7 @@ from atom.utils.forward_context import get_forward_context
 from atom.utils.decorators import mark_trace
 from torch import nn
 from transformers import PretrainedConfig
-from atom.plugin.moe import FusedMoEDecoratorForPluginMode
+from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quantization.quark.utils import weight_dequant_fp8
 
 
@@ -892,8 +892,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_triton:
+            import dataclasses
+
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
-            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+
+            try:
+                from triton_kernels.matmul import FlexCtx, PrecisionConfig
+            except ImportError:
+                from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
@@ -904,12 +910,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale,
             )
 
-            self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
-            )
-            self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
-            )
+            _pc_field_names = {f.name for f in dataclasses.fields(PrecisionConfig)}
+
+            def _build_precision_config(scale, flex):
+                kwargs = {"flex_ctx": FlexCtx(rhs_data=flex)}
+                if "weight_scale" in _pc_field_names:
+                    kwargs["weight_scale"] = scale
+                else:
+                    # New triton_kernels API renamed `weight_scale` → `b_mx_scale`
+                    # and now requires the microblock size to be set explicitly.
+                    from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
+
+                    kwargs["b_mx_scale"] = scale
+                    kwargs["b_microblock_size"] = int(MXFP_BLOCK_SIZE)
+                return PrecisionConfig(**kwargs)
+
+            self.w13_precision_config = _build_precision_config(w13_scale, w13_flex)
+            self.w2_precision_config = _build_precision_config(w2_scale, w2_flex)
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale
@@ -1015,13 +1032,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_act = topk_weights.shape[1]
 
                 # Convert to triton routing data structures
-                n_expts_tot = router_logits.shape[-1]
-                if global_num_experts > 0:
-                    n_expts_tot = global_num_experts
-                n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
+                if expert_map is not None:
+                    # local_num_experts already includes fused shared experts
+                    # (added at FusedMoE.__init__ line ~2056).
+                    n_expts_tot = layer.local_num_experts
+                else:
+                    n_expts_tot = router_logits.shape[-1]
+                    if global_num_experts > 0:
+                        n_expts_tot = global_num_experts
+                    n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
                 routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
-                    topk_weights, topk_ids, n_expts_tot
+                    topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
                 )
 
                 output = torch.empty_like(x)
@@ -1781,12 +1803,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 per_act_token_quant=True,
             )
         else:
+            # block_quant (per_1x128 / per_1x32) MUST hand the kernel its block
+            # shape — otherwise fp8_w8a8 broadcasts the [N/128, K/128] scale as
+            # if it were per-tensor / per-channel and produces garbage.
+            # V4-Flash-Base on gfx942 hits this: routed experts are FP8 e4m3
+            # per_1x128 + UE8M0 block-scale.
+            if self.block_quant:
+                if self.quant_type == QuantType.per_1x128:
+                    block_shape = [128, 128]
+                elif self.quant_type == QuantType.per_1x32:
+                    block_shape = [1, 32]
+                else:
+                    block_shape = None
+            else:
+                block_shape = None
             return fp8_w8a8_moe_quant_config(
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
-                block_shape=None,
+                block_shape=block_shape,
             )
 
     @mark_trace(prefix="fp8_moe", torch_compile=False)
@@ -2054,6 +2090,11 @@ class FusedMoE(torch.nn.Module):
                         ],
                         dtype=torch.int32,
                     ),
+                    # Sentinel entry for the fake expert ID
+                    # (global_num_experts + num_fused_shared_experts) used by
+                    # aiter topK to mark non-local tokens when EP is active.
+                    # Must map to -1 so that EP remapping zeros their weights.
+                    torch.tensor([-1], dtype=torch.int32),
                 ),
                 dim=0,
             )
@@ -3016,7 +3057,7 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            expert_map=self.expert_mask,
+            expert_map=self.expert_map,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
@@ -3074,7 +3115,7 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            expert_map=self.expert_mask,
+            expert_map=self.expert_map,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
