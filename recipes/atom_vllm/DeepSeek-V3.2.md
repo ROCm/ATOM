@@ -75,3 +75,20 @@ vllm bench serve \
     --save-result \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
+
+### Optional: Enable Profiling
+If you want to collect profiling trace, you can use the same API as default vLLM to add `--profiler-config "$profiler_config"` to the `vllm serve` command above.
+
+```bash
+profiler_config=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_profiler_with_stack":true,"torch_profiler_record_shapes":true}' \
+    "${your-profiler-dir}")
+```
+
+## Step 4: Accuracy Validation
+
+```bash
+lm_eval --model local-completions \
+        --model_args model=deepseek-ai/DeepSeek-V3.2,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+        --tasks gsm8k \
+        --num_fewshot 20
+```
