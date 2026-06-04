@@ -151,7 +151,7 @@
   {
     "model_name": "DeepSeek-V3.2-FP8 TP8",
     "model_path": "deepseek-ai/DeepSeek-V3.2",
-    "extraArgs": "--tensor-parallel-size 8",
+    "extraArgs": "--tensor-parallel-size 8 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
