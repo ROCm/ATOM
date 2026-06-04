@@ -10,7 +10,7 @@ FROM ${OOT_BASE_IMAGE} AS atom_oot
 ARG MAX_JOBS
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_COMMIT="b31e9326a7d9394aab8c767f8ebe225c65594b60"
+ARG VLLM_COMMIT="0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
 ARG INSTALL_LM_EVAL=1
 ARG INSTALL_FASTSAFETENSORS=1
 # Let PR OOT CI verify whether a pulled prebuilt image still matches this vLLM commit
@@ -68,8 +68,8 @@ RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" 
     ! grep '^transformers' requirements/common.txt && \
     sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt && \
     "${VENV_PYTHON}" -m pip install --no-deps xgrammar==0.1.29 compressed-tensors==0.13.0 loguru && \
-    sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' requirements/rocm.txt && \
-    "${VENV_PYTHON}" -m pip install --no-deps peft tensorizer==2.10.1 runai-model-streamer[s3,gcs]==0.15.3 timm>=1.0.17 && \
+    sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' -e '/tilelang/d' requirements/rocm.txt && \
+    "${VENV_PYTHON}" -m pip install --no-deps peft tensorizer==2.10.1 runai-model-streamer[s3,gcs]==0.15.3 timm>=1.0.17 tilelang==0.1.10 && \
     "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
 
 RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" && \
@@ -87,9 +87,13 @@ RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && 
     cd /app/vllm && \
     "${VENV_PYTHON}" -m pip uninstall -y vllm || true && \
     "${VENV_PYTHON}" -m pip install /tmp/vllm-wheels/*.whl && \
-    "${VENV_PYTHON}" -m pip install uvloop && \
+    "${VENV_PYTHON}" -m pip install \
+      uvloop \
+      "botocore>=1.43.7,<1.44.0" \
+      "s3transfer>=0.17.0,<0.18.0" && \
     if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi && \
     if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi && \
+    "${VENV_PYTHON}" -c "import boto3, botocore, s3transfer; print(f'boto3: {boto3.__version__}'); print(f'botocore: {botocore.__version__}'); print(f's3transfer: {s3transfer.__version__}')" && \
     "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" && \
     "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom mori || true
 

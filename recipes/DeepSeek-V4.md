@@ -28,6 +28,50 @@ Tips on server configuration:
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
 - V4-Pro reuses the DeepSeek-V3 config schema; V4-specific fields (compress ratios, hash layers, index head dims) are read from the HF config automatically.
 
+### FP8 on MI308 / gfx942 (V4-Flash-Base, FP8 per-block routed experts)
+
+[DeepSeek-V4-Flash-Base](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base) ships the same V4 architecture (mHC + CSA + HCA + sparse attn + MTP) as V4-Pro, but **routed experts are FP8 e4m3 per-block 128×128** (instead of V4-Pro's FP4 e2m1 microscaling). This trades a small expert-memory increase for end-to-end ROCm `gfx942` (MI308) compatibility — `aiter`'s FP8 grouped GEMM has been tuned for `gfx942`, while the FP4 path was authored for `gfx950` (MI355X).
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-V4-Flash-Base \
+  --kv_cache_dtype fp8 -tp 8
+```
+
+**The routed-expert quant scheme is auto-detected** from the HF `quantization_config` dict:
+
+| Field | V4-Pro (FP4) | V4-Flash-Base (FP8) |
+|---|---|---|
+| `quant_method` | `quark` (with FP4 layer pattern) | `fp8` |
+| `fmt` | `e2m1` | `e4m3` |
+| `weight_block_size` | (per_1x32, microscaling) | `[128, 128]` |
+| `scale_fmt` | `ue8m0` | `ue8m0` |
+
+Override knobs (escape hatches, normally not needed):
+
+- **`ATOM_V4_ROUTED_QUANT={fp4,fp8_block}`** — forces the routed-expert path. Useful for debugging or when the auto-detection picks the wrong scheme. `fp8` and `fp8_per_block` are valid aliases for `fp8_block`.
+- **`ATOM_V4_DISABLE_FUSED_SHARED=1`** — disables the aiter fused shared+routed expert kernel. On V4-Flash-Base both routed and shared experts are FP8 (matching dtype), so the framework auto-enables fusion. If you hit numerical instabilities or kernel issues on a specific GPU, set this to 1 to keep them as 2 separate kernels.
+- **`ATOM_USE_TRITON_MOE=1`** — `gfx942` defaults to Triton MoE automatically (no need to set), but it doesn't hurt to set explicitly. Required on `gfx950` for V4-Pro (see V4-Pro section above).
+
+#### Auto-detection logic
+
+The routed-expert quant spec is resolved in this priority order (see [`_detect_v4_routed_quant_spec`](../atom/models/deepseek_v4.py)):
+
+1. **`ATOM_V4_ROUTED_QUANT` env override** — explicit forcing.
+2. **Parser-derived layer spec** — if the ckpt's `quantization_config.layer_quant_config` (Quark) or global config (compressed-tensors / generic) directly produces a per-layer spec for `ffn.experts.*.w*`, that wins.
+3. **Heuristic from `quant_method` / `fmt`** — strings containing `fp8` → FP8 block; `fp4` / `mxfp4` → FP4.
+4. **V4-Pro fallback** — historical default.
+
+For V4-Flash-Base's HF `quantization_config = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128], "scale_fmt": "ue8m0"}`, the GenericParser (regex `block|1x128`) extracts `(per_1x128, fp8)` global spec, and step 2 hits → routed expert spec is `(QuantType.per_1x128, dtypes.fp8)`. `dtypes.fp8` from `aiter` resolves to `float8_e4m3fnuz` on `gfx942` and `float8_e4m3fn` on `gfx950` — picked correctly per platform without code changes.
+
+#### MI308 specifics
+
+- KV pool slot sizes are identical to V4-Pro (584 B per token, FP8 NoPE 448 B + BF16 RoPE 128 B + 8 B UE8M0 scales).
+- The CSA indexer's K cache stays FP8 (132 B / token) regardless of routed-expert dtype.
+- Compressor / Indexer Triton kernels (`fused_compress_attn`, `sparse_attn_v4_paged_decode`) are SKU-agnostic.
+- Three-stream concurrency (main / alt / compress) works identically.
+- TP / EP sharding follows V4-Pro layout — `n_routed_experts=256, top-k=6` matches the standard FusedMoE expert-shard math.
+
 ### PD Disaggregation with Mooncake (Prefill/Decode Separation)
 
 Run prefill and decode on separate nodes with Mooncake RDMA KV cache transfer.

@@ -50,6 +50,9 @@ on:
         description: "Skip test step"
         type: boolean
         default: false
+      custom_tag:
+        description: "Custom tag for the native Docker image (e.g. 'my-feature'). Produces rocm/atom-dev:<custom_tag>. When set, branch-based tagging and 'latest' update are skipped."
+        default: ""
       build_oot_image:
         description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT; default enabled so manual releases also publish OOT)"
         type: boolean
@@ -61,16 +64,13 @@ on:
         description: "Build SGLang+ATOM image for manual runs (scheduled nightly runs always build SGLang+ATOM; default enabled so manual releases also publish SGLang+ATOM)"
         type: boolean
         default: true
+      sglang_tag_suffix:
+        description: "Optional suffix appended to the SGLang nightly tag for manual runs. Example: custom -> rocm/atom-dev:sglang-v<version>-nightly_<date>-custom. When set, sglang-latest is not updated."
+        default: ""
       only_release_oot:
         description: "Release the OOT vLLM image (skips native image test/push). If both this and SGLang are checked, both will be released."
         type: boolean
         default: false
-      custom_tag:
-        description: "Custom tag for the native Docker image (e.g. 'my-feature'). Produces rocm/atom-dev:<custom_tag>. When set, branch-based tagging and 'latest' update are skipped."
-        default: ""
-      sglang_tag_suffix:
-        description: "Optional suffix appended to the SGLang nightly tag for manual runs. Example: custom -> rocm/atom-dev:sglang-v<version>-nightly_<date>-custom. When set, sglang-latest is not updated."
-        default: ""
       only_release_sglang:
         description: "Release the SGLang+ATOM image (skips native image test/push). If both this and OOT are checked, both will be released."
         type: boolean
@@ -79,7 +79,7 @@ on:
 jobs:
   docker-release:
     name: Nightly Docker Release
-    runs-on: ${{ inputs.runner || 'linux-atom-mi355-1' }}
+    runs-on: ${{ inputs.runner || 'linux-atom-mi35x-1' }}
     strategy:
       fail-fast: false
       matrix:
@@ -94,8 +94,8 @@ jobs:
       RCCL_REPO: "https://github.com/ROCm/rccl.git"
       RCCL_BRANCH: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
       GPU_ARCH: "gfx942;gfx950"
-      VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
-      VLLM_VERSION: "0.19.0"
+      VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
+      VLLM_VERSION: "0.22.0"
       SGLANG_REPO: "https://github.com/sgl-project/sglang.git"
       SGLANG_REF: "v0.5.10"
       SGLANG_VERSION: "0.5.10"
@@ -121,6 +121,7 @@ jobs:
           echo "RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}"
           echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
           echo "OOT_TAG_SUFFIX: ${{ inputs.oot_tag_suffix || '' }}"
+          echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
           echo "CUSTOM_TAG: ${{ inputs.custom_tag || '' }}"
           echo "SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}"
           echo "SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}"

@@ -123,7 +123,7 @@ class SpecStats:
             f"Accepted tokens distribution: { {k: f'{v / iv_steps:.2%}' for k, v in self._interval_distribution.items()} }"
         )
         logger.info(
-            f"[MTP Stats         ] Average toks/fwd: {1+self.total_accepted / ts:.2f}, "
+            f"[MTP Stats         ] Average toks/fwd: {1 + self.total_accepted / ts:.2f}, "
             f"Accepted/Total Draft tokens: {self.total_accepted}/{self.total_draft_tokens}, "
             f"Acceptance rate: {self.acceptance_rate:.2%}, "
             f"Accepted tokens distribution: { {k: f'{v / ts:.2%}' for k, v in self.distribution.items()} }"
@@ -234,16 +234,13 @@ class ScheduledBatch:
         self.remote_kv_seq_blocks = remote_kv_seq_blocks or {}
 
         self.req_ids = list(seqs.keys())
-        # self.scheduled_tokens = [
-        #     seq.token_ids[-num_tokens:]
-        #     for seq, num_tokens in zip(seqs.values(), num_scheduled_tokens)
-        # ]
-        # logger.info(f"{num_scheduled_tokens=}")
-        # logger.info(f"{self.scheduled_tokens=}")
-        # num_scheduled_tokens for each sequence in the batch
         self.num_scheduled_tokens = np.asarray(num_scheduled_tokens, dtype=np.int32)
         self.temperatures = np.asarray(
             [seq.temperature for seq in seqs.values()], dtype=np.float32
+        )
+        self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
+        self.context_lens = np.asarray(
+            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
         )
         self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
@@ -375,6 +372,8 @@ class ScheduledBatchOutput:
         num_bonus: Optional[np.ndarray],
         draft_token_ids: Optional[np.ndarray],
         is_deferred_out: bool = False,
+        is_prev_prefill=False,
+        logprobs=None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -382,6 +381,9 @@ class ScheduledBatchOutput:
         self.num_rejected = num_rejected
         self.num_bonus = num_bonus
         self.is_deferred_out = is_deferred_out
+        self.is_prev_prefill = is_prev_prefill
+        self.logprobs = logprobs  # Optional[dict[int, float]]
+        # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: Optional[dict[int, int]] = None
 
     def get_idx(self, req_id: int) -> Optional[int]:
@@ -460,6 +462,41 @@ class Scheduler:
 
         self.kv_connector = get_kvconnector("scheduler", config)
 
+        from atom.distributed.kv_events import (
+            EventPublisher as _EventPublisher,
+            make_publisher as _make_publisher,
+        )
+
+        kv_events_cfg = getattr(config, "kv_events_config", None)
+        parallel_cfg = getattr(config, "parallel_config", None)
+        dp_rank = (
+            getattr(parallel_cfg, "data_parallel_rank", None)
+            if parallel_cfg is not None
+            else None
+        )
+        if kv_events_cfg is not None and kv_events_cfg.enable:
+            self.kv_event_publisher: _EventPublisher = _make_publisher(
+                enabled=True,
+                publisher_kind=kv_events_cfg.publisher,
+                endpoint=kv_events_cfg.endpoint,
+                topic=kv_events_cfg.topic,
+                hwm=kv_events_cfg.hwm,
+                buffer_steps=kv_events_cfg.buffer_steps,
+                data_parallel_rank=dp_rank,
+            )
+            logger.info(
+                "KV event publisher enabled: kind=%s endpoint=%s dp_rank=%s",
+                kv_events_cfg.publisher,
+                kv_events_cfg.endpoint,
+                dp_rank,
+            )
+        else:
+            self.kv_event_publisher = _make_publisher(
+                enabled=False,
+                publisher_kind="null",
+                endpoint="",
+            )
+
         # Cross-DP prefill alignment. Set by DPEngineCoreProc after
         # dp_group is available. See `prefill_delayer.py` for rationale.
         from atom.model_engine.prefill_delayer import PrefillDelayer
@@ -514,6 +551,22 @@ class Scheduler:
         if total <= 0:
             return 0.0
         return len(bm.used_block_ids) / total
+
+    def publish_kv_events(self) -> None:
+        """Drain BlockManager's event log and publish as one EventBatch. Called
+        by EngineCore at the end of each scheduler step. No-op when events are
+        disabled (NullEventPublisher swallows the publish call)."""
+        events = self.block_manager.take_events()
+        if events:
+            self.kv_event_publisher.publish(events)
+
+    def shutdown_kv_events(self) -> None:
+        """Tear down the publisher background thread and ZMQ socket. Called
+        by EngineCore on engine shutdown."""
+        try:
+            self.kv_event_publisher.shutdown()
+        except Exception:
+            logger.exception("KV event publisher shutdown failed")
 
     def is_finished(self):
         # `_rejected` must be considered too: if a batch of seqs is all
@@ -753,9 +806,12 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
 
+            # Use num_tokens (not num_prompt_tokens) so preempted seqs re-forward
+            # their decoded tokens — preempt() frees their KV blocks but keeps
+            # the token_ids, so num_tokens > num_prompt_tokens and those tokens
+            # still need KV recomputed.
             num_new_tokens = (
-                seq.num_prompt_tokens
-                - num_cached_blocks * self.block_manager.block_size
+                seq.num_tokens - num_cached_blocks * self.block_manager.block_size
             )
             budget_remaining = self.max_num_batched_tokens - num_batched_tokens
             if self.enable_chunked_prefill:
@@ -971,6 +1027,7 @@ class Scheduler:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
+        token_logprobs = fwd_output.logprobs  # Optional[dict[int, float]]
         # update token_ids with the actual sampled token ids
 
         finished_seqs = []
@@ -1026,6 +1083,10 @@ class Scheduler:
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
+            token_logprob = None
+            if token_logprobs is not None and seq.return_logprobs:
+                token_logprob = token_logprobs.get(seq.id)
+
             if is_deferred_out or self.use_spec:
                 # int() casts strip the np.int32 wrapper coming out of
                 # fwd_output's np.ndarray indexing. Without these, the values
@@ -1054,11 +1115,18 @@ class Scheduler:
                 # logger.info(
                 #     f"{seq.id=}, {num_new_token=} {num_rejected=} {self.mtp_k} {token_ids=} {seq.token_ids[-8:]=}"
                 # )
+                if seq.return_logprobs and token_logprob is not None:
+                    if seq.logprobs:
+                        seq.logprobs[-1] = token_logprob
+                    else:
+                        seq.logprobs.append(token_logprob)
             else:
                 num_rejected = 0
                 num_bonus = 0
                 for token_id in token_ids:
                     seq.append_token(token_id)
+                if seq.return_logprobs and token_logprob is not None:
+                    seq.logprobs.append(token_logprob)
             new_tokens = token_ids
 
             injected_t0 = getattr(seq, "_injected_t0", None)
@@ -1189,9 +1257,8 @@ class Scheduler:
                     num = num_placeholder - seq.num_rejected
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
-                    # logger.info(
-                    #     f"{seq.id=}, added {num}, total tokens now: {seq.num_tokens}"
-                    # )
+                        if seq.return_logprobs:
+                            seq.logprobs.append(0.0)
         for seq in finished_seqs:
             logger.debug("Freeing blocks for finished seq %s", seq.id)
             if seq.is_partial_prefill:
@@ -1224,6 +1291,32 @@ class Scheduler:
 
         self.finished_recving_kv_req_ids.remove(seq.id)
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
+
+        if self.block_manager.kv_events_enabled:
+            bm = self.block_manager
+            num_cached_blocks = seq.num_cached_tokens // bm.block_size
+            remote_hashes: list[int] = []
+            remote_tokens: list[int] = []
+            parent_block_hash: int | None = None
+            prev_hash: int | None = None
+            for i, block_id in enumerate(seq.block_table):
+                blk = bm.blocks[block_id]
+                if blk.hash == -1:
+                    continue
+                if i < num_cached_blocks:
+                    prev_hash = blk.hash
+                    continue
+                if not remote_hashes:
+                    parent_block_hash = prev_hash
+                remote_hashes.append(blk.hash)
+                remote_tokens.extend(blk.token_ids)
+                prev_hash = blk.hash
+            if remote_hashes:
+                self.block_manager.record_remote_store(
+                    block_hashes=remote_hashes,
+                    token_ids=remote_tokens,
+                    parent_block_hash=parent_block_hash,
+                )
         return True
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):

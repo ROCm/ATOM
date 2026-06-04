@@ -1597,8 +1597,20 @@ class DeepseekV2MLAAttention(nn.Module):
         if layer_quant_dtype == dtypes.fp4x2:
             if not use_triton_gemm():
                 source_quant_dtype = None
-                quant_config = None
-                base_quant_config = None
+                # Full-MXFP4 V2 checkpoints store attention weights/scales on disk.
+                # Keep their quant_config only for this narrow static Quark path.
+                q_a_proj_quant_config = quant_config.get_layer_quant_config(
+                    f"{prefix}.{q_a_proj_name}"
+                )
+                is_quark_static_mxfp4 = (
+                    q_a_proj_quant_config.quant_method == "quark"
+                    and layer_quant_type == QuantType.per_1x32
+                )
+                if is_quark_static_mxfp4:
+                    base_quant_config = quant_config
+                else:
+                    quant_config = None
+                    base_quant_config = None
             else:
                 source_quant_dtype = torch.bfloat16
                 base_quant_config = None
@@ -1775,7 +1787,9 @@ class DeepseekV2MLAAttention(nn.Module):
             prefix=prefix,
         )
 
-        # When ATOM_ENABLE_DS_QKNORM_QUANT_FUSION is turned on, self.fuse_qknorm_quant is turned on only if FP8 or (use_triton_gemm() and FP4),
+        # Enable q/k RMSNorm + q quant fusion for FP8 and FP4. The larger
+        # qkv_a_proj + reduce + RMSNorm + quant fusion remains gated by
+        # use_triton_gemm() in forward(), because that path depends on Triton GEMM.
         self.prefix = prefix
         self.quant_dtype = layer_quant_dtype
         self.qknorm_quant_type = layer_quant_type_value
@@ -1783,9 +1797,7 @@ class DeepseekV2MLAAttention(nn.Module):
         # always fuse qknorm
         self.fuse_qknorm = ENABLE_DS_QKNORM_FUSION
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
-            if layer_quant_dtype == dtypes.fp8 or (
-                layer_quant_dtype == dtypes.fp4x2 and use_triton_gemm()
-            ):
+            if layer_quant_dtype in (dtypes.fp8, dtypes.fp4x2):
                 self.fuse_qknorm_quant = True
 
     def forward(
