@@ -37,6 +37,7 @@ on:
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -75,6 +76,7 @@ on:
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -113,6 +115,7 @@ on:
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -151,6 +154,7 @@ on:
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -189,6 +193,7 @@ on:
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -227,6 +232,7 @@ on:
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -265,6 +271,7 @@ on:
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -303,6 +310,7 @@ on:
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -335,7 +343,7 @@ env:
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
   AITER_COMMIT: "HEAD"
-  VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
+  VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
 
 jobs:
   # ---------- OOT full validation path (schedule / workflow_dispatch) ----------
@@ -614,7 +622,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -624,7 +632,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -635,6 +643,16 @@ jobs:
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_DSV32_FP8_PTPC_TP4",
+                  "model_name": "DeepSeek-V3.2-FP8 PTPC TP4",
+                  "model_path": "amd/DeepSeek-V3.2-mtp-ptpc",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -792,15 +810,19 @@ jobs:
               },
               "DeepSeek-V3.2-FP8 TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
               },
               "DeepSeek-V3.2-FP8 TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
               },
               "DeepSeek-V3.2-FP8 MTP TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "env_vars": "",
+              },
+              "DeepSeek-V3.2-FP8 PTPC TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
               },
               "gpt-oss-120b TP1": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
@@ -851,6 +873,7 @@ jobs:
               "gpt-oss-120b TP1",
               "MiniMax-M2.5 TP2",
               "DeepSeek-V3.2-FP8 TP4",
+              "DeepSeek-V3.2-FP8 PTPC TP4",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1",
               "GLM-4.7-FP8 TP8",
               "GLM-4.7-FP8 MTP TP4",

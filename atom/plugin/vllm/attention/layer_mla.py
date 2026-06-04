@@ -18,6 +18,7 @@ from atom.model_ops.linear import use_triton_gemm
 from atom.plugin.vllm.attention.backend import (
     AiterMlaBackendForVllm,
     AiterSparseMlaBackendForVllm,
+    build_vllm_mla_prefill_backend,
 )
 from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
@@ -322,6 +323,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
         self._pad_v = True
         self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
+        self.prefill_backend = build_vllm_mla_prefill_backend(
+            self, get_current_vllm_config()
+        )
         if self.rotary_emb is not None:
             rotary_emb_cos_sin_cache = torch.cat(
                 [
