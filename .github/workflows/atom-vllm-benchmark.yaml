@@ -1731,10 +1731,6 @@ jobs:
                       ${BENCH_EXTRA_ARGS:-}
                   "
               else
-                NUM_WARMUPS="${CONC}"
-                if [[ "${MODEL_NAME}" == gpt-oss-120b* ]]; then
-                  NUM_WARMUPS="$(( CONC * 8 ))"
-                fi
                 $CONTAINER_ENGINE exec \
                   -e ISL="${ISL}" \
                   -e OSL="${OSL}" \
@@ -1756,7 +1752,7 @@ jobs:
                       --num-prompts \"$(( CONC * 8 ))\" \
                       --max-concurrency \"${CONC}\" \
                       ${TRUST_REMOTE_CODE_ARG} \
-                      --num-warmups \"${NUM_WARMUPS}\" \
+                      --num-warmups \"${CONC}\" \
                       --request-rate inf \
                       --ignore-eos \
                       --disable-tqdm \
