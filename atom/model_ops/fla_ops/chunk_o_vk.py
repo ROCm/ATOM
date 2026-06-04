@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .index import prepare_chunk_indices, prepare_rebased_cu_seqlens
+from .index import prepare_chunk_indices
 from .op import exp
 from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
 
@@ -152,8 +152,6 @@ def chunk_fwd_o_vk(
     cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
     o: torch.Tensor | None = None,
-    num_decodes: int = 0,
-    num_decode_tokens: int = 0,
 ) -> torch.Tensor:
     """Returns the attention output tensor.
 
@@ -168,16 +166,8 @@ def chunk_fwd_o_vk(
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = 64 if FLA_GDN_FIX_BT else min(chunk_size, max(16, triton.next_power_of_2(T)))
-    # See `cumsum.chunk_local_cumsum_scalar` for the cache-stable contract.
     chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT, num_decodes, num_decode_tokens)
-        if cu_seqlens is not None
-        else None
-    )
-    kernel_cu_seqlens = (
-        prepare_rebased_cu_seqlens(cu_seqlens, num_decodes, num_decode_tokens)
-        if cu_seqlens is not None
-        else None
+        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
@@ -209,7 +199,7 @@ def chunk_fwd_o_vk(
         h,
         g,
         o,
-        kernel_cu_seqlens,
+        cu_seqlens,
         chunk_indices,
         scale,
         T=T,

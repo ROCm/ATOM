@@ -36,6 +36,7 @@ def chunk_gated_delta_rule_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
+    o: torch.Tensor | None = None,
 ):
     B, T = q.shape[0], q.shape[1]
     Hv = g.shape[2]
@@ -97,6 +98,7 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        o=o,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
@@ -120,11 +122,15 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        o: torch.Tensor | None = None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
 
+        # NOTE: input_guard calls .contiguous() on every Tensor arg including
+        # o. The public chunk_gated_delta_rule entry point pre-asserts o is
+        # contiguous before .apply() so this can't silently clone.
         g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -135,10 +141,15 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            o=o,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        return o.to(q.dtype), final_state
+        # Skip the dtype cast when it's a no-op so the caller's buffer is
+        # the literal returned tensor (preserves the inplace contract).
+        if o.dtype != q.dtype:
+            o = o.to(q.dtype)
+        return o, final_state
 
 
 @torch.compiler.disable
@@ -154,6 +165,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: torch.LongTensor | None = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    o: torch.Tensor | None = None,
 ):
     r"""
     Args:
@@ -226,6 +238,17 @@ def chunk_gated_delta_rule(
         len(beta.shape) == 3
     ), "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
 
+    if o is not None and head_first:
+        # head_first=True + o= would route the kernel output through a
+        # rearrange("b t h ... -> b h t ...") below, producing a
+        # non-contiguous view of the caller's storage and silently
+        # breaking the inplace contract. Reject up front BEFORE the
+        # existing head_first DeprecationWarning so callers see the more
+        # specific error.
+        raise NotImplementedError(
+            "chunk_gated_delta_rule(o=...) does not support head_first=True"
+        )
+
     if head_first:
         raise DeprecationWarning(
             "head_first is deprecated and will be removed in a future version. "
@@ -256,6 +279,23 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if o is not None:
+        # Pre-check contiguity HERE — input_guard inside
+        # ChunkGatedDeltaRuleFunction.forward will call .contiguous() on
+        # every Tensor arg including o, silently cloning a non-contiguous
+        # caller buffer and writing the kernel output into the clone
+        # instead of the caller's storage. Asserting before .apply() is
+        # the only place where we can catch that loudly.
+        assert o.shape == v.shape, (
+            f"chunk_gated_delta_rule: o.shape {tuple(o.shape)} != v.shape "
+            f"{tuple(v.shape)}"
+        )
+        assert (
+            o.dtype == v.dtype
+        ), f"chunk_gated_delta_rule: o.dtype {o.dtype} != v.dtype {v.dtype}"
+        assert (
+            o.is_contiguous()
+        ), "chunk_gated_delta_rule: caller-provided o must be contiguous"
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
@@ -267,6 +307,7 @@ def chunk_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        o,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
