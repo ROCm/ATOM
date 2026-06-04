@@ -17,6 +17,7 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+
 # ATOM_GFX1250_WORKAROUND (ATOM_USE_TRITON_RMSNORM): aiter HIP rmsnorm2d_fwd
 # faults on gfx1250; route to the AITER Triton/Gluon fused_rmsnorm_add, which
 # arch-dispatches internally (gfx1250 Gluon vs portable Triton) and registers
@@ -87,7 +88,9 @@ def rmsnorm2d_fwd_with_add_(
     # ATOM_GFX1250_WORKAROUND (ATOM_USE_TRITON_RMSNORM): HIP rmsnorm2d_fwd_with_add
     # faults on gfx1250. fused_rmsnorm_add fuses the residual add + RMSNorm and
     # arch-dispatches internally (contiguity handled inside the launcher).
-    out, residual_out = fused_rmsnorm_add(x, weight, eps, res1=residual.reshape(-1, dim))
+    out, residual_out = fused_rmsnorm_add(
+        x, weight, eps, res1=residual.reshape(-1, dim)
+    )
     return out.view(ori_shape), residual_out.view(ori_shape)
 
 
