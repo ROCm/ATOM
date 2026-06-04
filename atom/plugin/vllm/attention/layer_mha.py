@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 ATOM_USE_GLUON_PA_DECODE = envs.ATOM_USE_GLUON_PA_DECODE
 
-_QWEN_GLUON_PA_DECODE_BS = 64
 # the dispatch rule is based on the kernel benchmark result
 #  of gluon/asm pa with model-specific shapes
 _GLUON_PA_DECODE_BS_MAPPING = {
