@@ -1187,16 +1187,28 @@ jobs:
                       key=lambda p: (
                           int(p["input_length"]),
                           int(p["output_length"]),
+                          str(p["random_range_ratio"]),
                           int(p["concurrency"]),
                       )
                   )
-                  if filtered_params:
+                  cases_by_pair = {}
+                  for param in filtered_params:
+                      pair_key = (
+                          int(param["input_length"]),
+                          int(param["output_length"]),
+                          str(param["random_range_ratio"]),
+                      )
+                      cases_by_pair.setdefault(pair_key, []).append(param)
+
+                  for pair_key in sorted(cases_by_pair):
+                      pair_cases = cases_by_pair[pair_key]
                       include.append(
                           {
                               "model": model,
-                              # Keep params for job naming and older consumers; AW runs all cases below.
-                              "params": filtered_params[0],
-                              "cases": filtered_params,
+                              # One AW matrix cell launches one server for one ISL/OSL pair,
+                              # then runs all concurrency cases for that pair.
+                              "params": pair_cases[0],
+                              "cases": pair_cases,
                           }
                       )
               else:
@@ -1340,7 +1352,7 @@ jobs:
           docker rmi atom_oot_base:ci || true
 
   benchmark:
-    name: ${{ contains(matrix.model.display, '(AW)') && format('OOT {0} all AW cases', matrix.model.display) || format('OOT {0} {1}/{2} c={3}', matrix.model.display, matrix.params.input_length, matrix.params.output_length, matrix.params.concurrency) }}
+    name: ${{ contains(matrix.model.display, '(AW)') && format('OOT {0} {1}/{2} all concurrency', matrix.model.display, matrix.params.input_length, matrix.params.output_length) || format('OOT {0} {1}/{2} c={3}', matrix.model.display, matrix.params.input_length, matrix.params.output_length, matrix.params.concurrency) }}
     needs: [resolve-atom-source, build-benchmark-matrix, build-oot-image]
     if: >-
       always()
