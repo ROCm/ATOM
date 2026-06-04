@@ -553,9 +553,31 @@ def _build_sglang_query_ranges(forward_batch) -> tuple[torch.Tensor, torch.Tenso
 def _build_sglang_block_table(forward_batch, page_size: int) -> torch.Tensor:
     req_pool_indices = forward_batch.req_pool_indices
     req_to_token = forward_batch.req_to_token_pool.req_to_token
+    token_table = req_to_token[req_pool_indices, :]
+    if not forward_batch.forward_mode.is_decode_or_idle():
+        token_table = token_table.clone()
+        query_lens = getattr(forward_batch, "extend_seq_lens", None)
+        if query_lens is None:
+            query_lens = forward_batch.seq_lens
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
+        if prefix_lens is None:
+            prefix_lens = forward_batch.seq_lens - query_lens
+        query_lens_cpu = query_lens[: int(forward_batch.batch_size)].detach().cpu()
+        prefix_lens_cpu = prefix_lens[: int(forward_batch.batch_size)].detach().cpu()
+        offset = 0
+        for req_idx, (prefix_len_raw, query_len_raw) in enumerate(
+            zip(prefix_lens_cpu, query_lens_cpu)
+        ):
+            prefix_len = int(prefix_len_raw)
+            query_len = int(query_len_raw)
+            if query_len > 0:
+                token_table[
+                    req_idx, prefix_len : prefix_len + query_len
+                ] = forward_batch.out_cache_loc[offset : offset + query_len]
+            offset += query_len
     if page_size == 1:
-        return req_to_token[req_pool_indices, :]
-    return req_to_token[req_pool_indices, ::page_size] // page_size
+        return token_table
+    return token_table[:, ::page_size] // page_size
 
 
 def sparse_attn_indexer_sglang_plugin_mode(
@@ -703,15 +725,19 @@ def sparse_attn_indexer_sglang_plugin_mode(
         cu_ends=cu_ends,
     )
     assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
+    topk_indices = topk_indices_buffer[:num_tokens, :topk_tokens]
     top_k_per_row_prefill(
         logits=logits,
         rowStarts=cu_starts,
         rowEnds=cu_ends,
-        indices=topk_indices_buffer[:num_tokens, :topk_tokens],
+        indices=topk_indices,
         values=None,
         numRows=logits.shape[0],
         stride0=logits.stride(0),
         stride1=logits.stride(1),
+    )
+    topk_indices.copy_(
+        torch.where(topk_indices >= 0, topk_indices - cu_starts[:, None], topk_indices)
     )
     return weights
 
