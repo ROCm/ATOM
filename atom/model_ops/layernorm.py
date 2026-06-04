@@ -19,7 +19,7 @@ from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quan
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils.decorators import mark_trace
 from atom.utils import envs
 from torch import Tensor, nn
@@ -285,13 +285,8 @@ class RMSNorm(nn.Module):
             self.prefix, use_online_quant=True
         )
         online_quant_type = online_cfg.quant_type
-        if online_quant_type == QuantType.No:
-            return
-        # Already emitting the target scheme; avoid a redundant update.
-        if (
-            self.quant_type == online_quant_type
-            and self.params_dtype == online_cfg.quant_dtype
-        ):
+        # Skip if excluded (No) or already emitting the target scheme.
+        if should_skip_online_quant(self.quant_type, self.params_dtype, online_cfg):
             return
         # The fused RMSNorm+quant HIP kernel only emits these activation schemes.
         assert online_quant_type.value in _AITER_RMS_QUANT_TYPE_VALUES, (

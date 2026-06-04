@@ -459,12 +459,9 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
         # V4-Flash-FP8 layout: wo_a is BF16 on disk — allocate as BF16 directly
         # so the loader receives matching dtype. Other SKUs let wo_a allocate
         # as FP8 + scale and DeepseekV4Attention dequants at load time.
-        if wo_a_is_bf16 and ".wo_a" in layer_name:
-            return no_spec
-        # NOTE: wo_a is FP8 on disk but used as BF16 in forward (aiter has no FP8
-        # grouped einsum). When online_quant is enabled, also keep wo_a BF16 so
+        # When online_quant is enabled, also keep wo_a BF16 so
         # the dequant→requant round-trip is skipped for this layer.
-        if use_online_quant and "attn.wo_a" in layer_name:
+        if ".wo_a" in layer_name and (wo_a_is_bf16 or use_online_quant):
             return no_spec
         return orig_lookup(
             layer_name,

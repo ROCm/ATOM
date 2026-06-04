@@ -23,7 +23,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from atom.config import QuantizationConfig, get_current_atom_config
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -452,12 +452,9 @@ class LinearBase(nn.Module):
             self.prefix, use_online_quant=True
         )
         online_quant_type = online_layer_quant_config.quant_type
-        if online_quant_type == QuantType.No:
-            return
         online_quant_dtype = online_layer_quant_config.quant_dtype
-        if (
-            self.quant_type == online_quant_type
-            and self.params_dtype == online_quant_dtype
+        if should_skip_online_quant(
+            self.quant_type, self.params_dtype, online_layer_quant_config
         ):
             return
         online_quant_func = get_hip_quant(online_quant_type)

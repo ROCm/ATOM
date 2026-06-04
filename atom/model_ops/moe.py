@@ -20,7 +20,7 @@ from atom.config import (
     get_current_atom_config,
 )
 from aiter.ops.flydsl.moe_common import GateMode
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
@@ -2208,14 +2208,10 @@ class FusedMoE(torch.nn.Module):
             self.layer_name, use_online_quant=True
         )
         online_quant_type = online_quant_config.quant_type
-        if online_quant_type == QuantType.No:
-            return
         online_quant_dtype = online_quant_config.quant_dtype
-
         source_quant_type = self.layer_quant_config.quant_type
-        if (
-            source_quant_type == online_quant_type
-            and self.params_dtype == online_quant_dtype
+        if should_skip_online_quant(
+            source_quant_type, self.params_dtype, online_quant_config
         ):
             return
 
