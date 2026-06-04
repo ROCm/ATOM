@@ -34,11 +34,7 @@ if [ "$TYPE" == "launch" ]; then
   fi
 
   ATOM_SERVER_LOG="/tmp/atom_server.log"
-  if [ "${USE_ATOMESH_ENTRYPOINTS:-0}" == "1" ]; then
-    SERVER_PORT_ARGS=("--port" "$ATOM_SERVER_PORT")
-  else
-    SERVER_PORT_ARGS=("--server-port" "$ATOM_SERVER_PORT")
-  fi
+  SERVER_PORT_ARGS=("--server-port" "$ATOM_SERVER_PORT")
   PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${SERVER_PORT_ARGS[@]}" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
   tail -f "$ATOM_SERVER_LOG" &

@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]  # Triggers on PRs targeting `main`
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - '**/*.md'
@@ -36,7 +35,7 @@ env:
 
 jobs:
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.head_ref, 'mesh')) }}
     name: Check Pre Checkin Signal
     runs-on: ubuntu-latest
     permissions:
@@ -202,6 +201,7 @@ jobs:
           retention-days: 7
 
   load-test-models:
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.head_ref, 'mesh')) }}
     name: Load test model configs
     runs-on: ubuntu-latest
     outputs:
@@ -238,7 +238,7 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json) }}
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.head_ref, 'mesh')) }}
     runs-on: ${{ matrix.runner }}
 
     env:
