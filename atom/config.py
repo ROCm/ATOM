@@ -1189,6 +1189,13 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(
+            (
+                getattr(self.hf_config, "use_index_cache", False),
+                getattr(self.hf_config, "index_topk_freq", None),
+                getattr(self.hf_config, "index_topk_pattern", None),
+            )
+        )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

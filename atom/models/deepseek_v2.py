@@ -169,6 +169,31 @@ def _can_fuse_indexer_wk_weights_proj(
     return True
 
 
+def _extract_layer_index_from_prefix(prefix: str) -> int:
+    for part in reversed(prefix.split(".")):
+        if part.isdigit():
+            return int(part)
+    return 0
+
+
+def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
+    if not getattr(config, "use_index_cache", False):
+        return False
+
+    layer_id = _extract_layer_index_from_prefix(prefix)
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is not None:
+        return (
+            0 <= layer_id < len(index_topk_pattern)
+            and index_topk_pattern[layer_id] == "S"
+        )
+
+    index_topk_freq = int(getattr(config, "index_topk_freq", 1))
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    return max(layer_id - 1, 0) % index_topk_freq != 0
+
+
 def _fuse_rmsnorm_fp4_quant_fake(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -1723,8 +1748,10 @@ class DeepseekV2MLAAttention(nn.Module):
             self.scaling = self.scaling * mscale * mscale
 
         self.is_v32 = hasattr(config, "index_topk")
+        self.skip_topk = False
 
         if self.is_v32:
+            self.skip_topk = _should_skip_index_topk(config, prefix)
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
@@ -1877,7 +1904,7 @@ class DeepseekV2MLAAttention(nn.Module):
         if not self.fuse_qknorm_quant and not self.fuse_qknorm:
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
-        if self.is_v32 and self.indexer is not None:
+        if self.is_v32 and self.indexer is not None and not self.skip_topk:
             self.indexer(
                 hidden_states,
                 hidden_states_or_q_c,
