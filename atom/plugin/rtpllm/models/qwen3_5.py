@@ -24,7 +24,7 @@ from atom.plugin.rtpllm.attention_backend import (
     apply_attention_mha_rtpllm_patch,
 )
 from atom.plugin.rtpllm.models.qwen3_next import apply_qwen3_next_rtpllm_patch
-from atom.plugin.rtpllm.utils import RTPForwardContext
+from atom.plugin.rtpllm.utils import RTPForwardQwen35HybridContext
 
 logger = logging.getLogger("atom.plugin.rtpllm.models")
 
@@ -127,7 +127,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         self._model_device = first_param.device
         self._model_dtype = first_param.dtype
         # Cache module layer maps once to avoid per-forward model.modules() traversal.
-        self._rtp_layer_maps = RTPForwardContext.collect_layer_maps(model=self.model)
+        self._rtp_layer_maps = RTPForwardQwen35HybridContext.collect_layer_maps(
+            model=self.model
+        )
         # Lazy-built in forward_context; invalidated by kv buffer signature change.
         self._rtp_kv_cache_data: dict | None = None
         self._rtp_kv_cache_signature: tuple | None = None
@@ -384,9 +386,17 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             or int(getattr(kv_cache, "seq_size_per_block", 0))
             or 1
         )
+        seq_size_per_block = (
+            int(getattr(kv_cache, "seq_size_per_block", 0))
+            or kernel_seq_size_per_block
+            or 1
+        )
         max_blocks = (
             int(max_seq_len) + kernel_seq_size_per_block - 1
         ) // kernel_seq_size_per_block + 1
+        physical_max_blocks = (
+            int(max_seq_len) + seq_size_per_block - 1
+        ) // seq_size_per_block
         # query_start_loc for decode: always [0, 1, 2, ..., bs], i.e. arange(bs+1).
         # seq_id for decode slot_mapping: seq_id[i] == i, i.e. arange(bs).
         self._cg_meta_bufs: dict = {
@@ -403,12 +413,16 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             "block_table_i32": torch.empty(
                 max_bs, max_blocks, device=device, dtype=torch.int32
             ),
+            "physical_block_table_i32": torch.empty(
+                max_bs, max(physical_max_blocks, 1), device=device, dtype=torch.int32
+            ),
         }
         self._cg_layers_prewarmed = True
         logger.info(
             "ATOM RTPFullAttention cuda-graph prewarmed for %d layers "
             "(max_num_tokens=%d, max_seq_len=%d, rtp_kv_heads=%s, "
-            "meta_bufs: query_start_loc[%d], slot_mapping[%d], block_table_i32[%dx%d])",
+            "meta_bufs: query_start_loc[%d], slot_mapping[%d], block_table_i32[%dx%d], "
+            "physical_block_table_i32[%dx%d])",
             len(self._atom_attn_pyobj._rtp_full_attn_layers),
             max_num_tokens,
             max_seq_len,
@@ -417,6 +431,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             max_bs,
             max_bs,
             max_blocks,
+            max_bs,
+            max(physical_max_blocks, 1),
         )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
@@ -452,7 +468,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             ):
                 inputs_embeds = inputs_embeds.to(dtype=model_dtype)
 
-        with RTPForwardContext.bind(
+        with RTPForwardQwen35HybridContext.bind(
             model=self.model,
             runtime=self,
             inputs=inputs,

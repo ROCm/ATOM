@@ -43,7 +43,9 @@ def _install_forward_context_stubs():
     utils_forward_context._forward_kv_cache_context = SimpleNamespace(kv_cache_data={})
     utils_forward_context.reset_forward_context = lambda *args, **kwargs: None
     utils_forward_context.set_forward_context = lambda *args, **kwargs: None
-    utils_forward_context.get_forward_context = lambda *args, **kwargs: SimpleNamespace()
+    utils_forward_context.get_forward_context = (
+        lambda *args, **kwargs: SimpleNamespace()
+    )
 
     def _set_kv_cache_data(value):
         utils_forward_context._forward_kv_cache_context.kv_cache_data = value
@@ -54,7 +56,10 @@ def _install_forward_context_stubs():
 
 _install_forward_context_stubs()
 
-from atom.plugin.rtpllm.utils.forward_context import RTPForwardContext  # noqa: E402
+from atom.plugin.rtpllm.utils.forward_context import (  # noqa: E402
+    RTPForwardContext,
+    RTPForwardMLAContext,
+)
 
 
 def _make_attn_inputs(
@@ -194,7 +199,7 @@ def test_plugin_attention_metadata_keeps_indexer_block_table_expanded():
         is_prefill=True,
     )
 
-    md = RTPForwardContext._build_plugin_attention_metadata(
+    md = RTPForwardMLAContext._build_plugin_attention_metadata(
         attn_inputs=attn_inputs,
         positions=torch.arange(1030, dtype=torch.int32),
         seq_size_per_block=1024,
@@ -205,6 +210,50 @@ def test_plugin_attention_metadata_keeps_indexer_block_table_expanded():
     assert md.block_tables.shape == (1, 128)
     assert md.block_tables[0, :4].cpu().tolist() == [448, 449, 450, 451]
     assert md.block_tables[0, 64:68].cpu().tolist() == [512, 513, 514, 515]
+
+
+def test_plugin_attention_metadata_keeps_physical_block_table_for_base_context():
+    attn_inputs = _make_attn_inputs(
+        input_lengths=torch.tensor([1030], dtype=torch.int32),
+        prefix_lengths=torch.tensor([0], dtype=torch.int32),
+        kv_cache_block_id_device=torch.tensor([[7, 8]], dtype=torch.int32),
+        is_prefill=True,
+    )
+
+    md = RTPForwardContext._build_plugin_attention_metadata(
+        attn_inputs=attn_inputs,
+        positions=torch.arange(1030, dtype=torch.int32),
+        seq_size_per_block=1024,
+        kernel_seq_size_per_block=16,
+    )
+
+    assert md.plugin_metadata.block_table.cpu().tolist() == [[7, 8]]
+    assert md.block_tables.shape == (1, 2)
+    assert md.block_tables.cpu().tolist() == [[7, 8]]
+
+
+def test_base_context_capture_recovers_physical_table_with_prewarmed_buffer():
+    attn_inputs = _make_attn_inputs(
+        input_lengths=torch.tensor([1], dtype=torch.int32),
+        sequence_lengths=torch.tensor([35], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.tensor(
+            [[448, 449, 450, 451, 452, 453, 454, 455]], dtype=torch.int32
+        ),
+        is_prefill=False,
+        is_cuda_graph=True,
+    )
+
+    cg_bufs = {"physical_block_table_i32": torch.empty((1, 1), dtype=torch.int32)}
+    block_table = RTPForwardContext._resolve_plugin_block_table(
+        attn_inputs=attn_inputs,
+        seq_size_per_block=1024,
+        kernel_seq_size_per_block=128,
+        cg_bufs=cg_bufs,
+        in_capture=True,
+    )
+
+    assert block_table is not None
+    assert block_table.cpu().tolist() == [[56]]
 
 
 def test_plugin_attention_metadata_builds_req_id_per_token():

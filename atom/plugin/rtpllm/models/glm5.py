@@ -83,8 +83,10 @@ class _ATOMGlm5AttnPyObj:
                 backend = getattr(candidate, "dense_backend", None)
             else:
                 backend = getattr(candidate, "dense_backend", None)
-                if backend is None and RTPSparseMlaBackend is not None and isinstance(
-                    candidate, RTPSparseMlaBackend
+                if (
+                    backend is None
+                    and RTPSparseMlaBackend is not None
+                    and isinstance(candidate, RTPSparseMlaBackend)
                 ):
                     backend = candidate
 
@@ -306,7 +308,9 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
     def _get_forward_context_cls():
         global RTPForwardContext
         if RTPForwardContext is None:
-            from atom.plugin.rtpllm.utils import RTPForwardContext as _RTPForwardContext
+            from atom.plugin.rtpllm.utils import (
+                RTPForwardMLAContext as _RTPForwardContext,
+            )
 
             RTPForwardContext = _RTPForwardContext
         return RTPForwardContext
@@ -374,14 +378,18 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
             starts = prefix_lengths_i32[: int(input_lengths_i32.numel())]
             return self._build_token_positions(input_lengths_i32, starts)
 
-        sequence_lengths_plus_1 = getattr(attn_inputs, "sequence_lengths_plus_1_d", None)
+        sequence_lengths_plus_1 = getattr(
+            attn_inputs, "sequence_lengths_plus_1_d", None
+        )
         if sequence_lengths_plus_1 is not None and sequence_lengths_plus_1.numel() > 0:
             seq_plus_one_i32 = sequence_lengths_plus_1.to(
                 device=model_device, dtype=torch.int32, non_blocking=True
             ).contiguous()
             if int(seq_plus_one_i32.numel()) < int(input_lengths_i32.numel()):
                 return None
-            starts = seq_plus_one_i32[: int(input_lengths_i32.numel())] - input_lengths_i32
+            starts = (
+                seq_plus_one_i32[: int(input_lengths_i32.numel())] - input_lengths_i32
+            )
             return self._build_token_positions(input_lengths_i32, starts)
 
         sequence_lengths = getattr(attn_inputs, "sequence_lengths", None)
@@ -392,13 +400,19 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         ).contiguous()
         if int(sequence_lengths_i32.numel()) < int(input_lengths_i32.numel()):
             return None
-        starts = sequence_lengths_i32[: int(input_lengths_i32.numel())] - input_lengths_i32 + 1
+        starts = (
+            sequence_lengths_i32[: int(input_lengths_i32.numel())]
+            - input_lengths_i32
+            + 1
+        )
         return self._build_token_positions(input_lengths_i32, starts)
 
     def _build_graph_decode_positions(
         self, attn_inputs: Any, model_device: torch.device
     ) -> torch.Tensor | None:
-        sequence_lengths_plus_1 = getattr(attn_inputs, "sequence_lengths_plus_1_d", None)
+        sequence_lengths_plus_1 = getattr(
+            attn_inputs, "sequence_lengths_plus_1_d", None
+        )
         if sequence_lengths_plus_1 is None or sequence_lengths_plus_1.numel() == 0:
             return None
         input_lengths = getattr(attn_inputs, "input_lengths", None)
@@ -413,7 +427,10 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         cg_bufs = getattr(self, "_cg_meta_bufs", None)
         if isinstance(cg_bufs, dict):
             positions_buf = cg_bufs.get("positions_i32")
-            if isinstance(positions_buf, torch.Tensor) and int(positions_buf.numel()) >= num_tokens:
+            if (
+                isinstance(positions_buf, torch.Tensor)
+                and int(positions_buf.numel()) >= num_tokens
+            ):
                 positions_i32 = positions_buf[:num_tokens]
                 torch.sub(seq_plus_one_i32[:num_tokens], 1, out=positions_i32)
                 positions_i64_buf = cg_bufs.get("positions_i64")
@@ -486,7 +503,11 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
                 device=model_device, dtype=torch.long, non_blocking=True
             ).contiguous()
         if not torch.cuda.is_current_stream_capturing():
-            pos_tokens = int(positions.shape[-1]) if positions.dim() > 0 else int(positions.numel())
+            pos_tokens = (
+                int(positions.shape[-1])
+                if positions.dim() > 0
+                else int(positions.numel())
+            )
             if token_num > 0 and pos_tokens != token_num:
                 rebuilt_positions = self._build_positions_from_attention_inputs(
                     attn_inputs=attn_inputs,
@@ -514,7 +535,9 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
                     )
         return positions
 
-    def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:  # noqa: ANN001
+    def forward(
+        self, inputs: PyModelInputs, fmha_impl=None
+    ) -> PyModelOutputs:  # noqa: ANN001
         is_cuda_graph = bool(getattr(fmha_impl, "is_cuda_graph", False))
         if is_cuda_graph:
             inputs.attention_inputs.is_cuda_graph = True
@@ -653,7 +676,9 @@ class ATOMGlm5Moe(DeepSeekV2):
                 f"{weight_name} candidates={candidates}"
                 for weight_name, candidates in missing
             )
-            raise ValueError(f"Cannot locate GLM5 RTP runtime projection weights: {details}")
+            raise ValueError(
+                f"Cannot locate GLM5 RTP runtime projection weights: {details}"
+            )
 
     def _assert_norm_weights_loaded(self, atom_model: Any) -> None:
         params = self._get_named_parameters(atom_model)
@@ -774,4 +799,3 @@ class ATOMGlm5Moe(DeepSeekV2):
         )
         logger.info("Created ATOM GLM5 runtime for rtp-llm plugin mode")
         return self.py_model
-

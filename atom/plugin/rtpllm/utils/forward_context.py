@@ -993,8 +993,32 @@ class RTPForwardContext:
         )
         return out_view
 
-    @staticmethod
+    @classmethod
+    def _resolve_plugin_block_table(
+        cls,
+        *,
+        attn_inputs: Any,
+        seq_size_per_block: int,
+        kernel_seq_size_per_block: int,
+        cg_bufs: dict | None,
+        in_capture: bool,
+    ) -> torch.Tensor | None:
+        physical_block_table = getattr(attn_inputs, "kv_cache_block_id_device", None)
+        if physical_block_table is not None and physical_block_table.numel() > 0:
+            return physical_block_table
+        kernel_block_table = cls._select_block_table_for_layer(attn_inputs=attn_inputs)
+        if kernel_block_table is None or kernel_block_table.numel() == 0:
+            return None
+        return cls._recover_physical_block_table_from_kernel(
+            kernel_block_table,
+            seq_size_per_block=int(seq_size_per_block),
+            kernel_seq_size_per_block=int(kernel_seq_size_per_block),
+            cg_bufs=cg_bufs,
+        )
+
+    @classmethod
     def _build_plugin_attention_metadata(
+        cls,
         *,
         attn_inputs: Any,
         positions: torch.Tensor,
@@ -1003,35 +1027,25 @@ class RTPForwardContext:
         cg_max_seq_len: int = 0,
         cg_bufs: dict | None = None,
     ) -> AttentionMetaData:
-        physical_block_table = getattr(attn_inputs, "kv_cache_block_id_device", None)
-        if physical_block_table is not None and physical_block_table.numel() > 0:
-            block_table = physical_block_table
-        else:
-            kernel_block_table = RTPForwardContext._select_block_table_for_layer(
-                attn_inputs=attn_inputs,
-            )
-            block_table = (
-                None
-                if kernel_block_table is None
-                else RTPForwardContext._recover_physical_block_table_from_kernel(
-                    kernel_block_table,
-                    seq_size_per_block=int(seq_size_per_block),
-                    kernel_seq_size_per_block=int(kernel_seq_size_per_block),
-                    cg_bufs=cg_bufs,
-                )
-            )
+        in_capture = torch.cuda.is_current_stream_capturing()
+        block_table = cls._resolve_plugin_block_table(
+            attn_inputs=attn_inputs,
+            seq_size_per_block=int(seq_size_per_block),
+            kernel_seq_size_per_block=int(kernel_seq_size_per_block),
+            cg_bufs=cg_bufs,
+            in_capture=in_capture,
+        )
         if block_table is None or block_table.numel() == 0:
             raise ValueError(
                 "RTP plugin requires kv_cache_block_id_device for plugin attention metadata."
             )
         device = positions.device
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
-        in_capture = torch.cuda.is_current_stream_capturing()
         if in_capture and cg_bufs is None:
             raise RuntimeError(
                 "RTP plugin capture requires prewarmed cg_bufs; metadata fallback path is disabled."
             )
-        seq_lens = RTPForwardContext._build_seq_lens(attn_inputs, device=device)
+        seq_lens = cls._build_seq_lens(attn_inputs, device=device)
         if in_capture and cg_bufs is not None:
             bs_now = int(seq_lens.shape[0])
             seq_lens_buf = cg_bufs["seq_lens_i32"]
@@ -1071,21 +1085,21 @@ class RTPForwardContext:
                 positions = positions_i32
         num_actual_tokens = int(positions.numel())
 
-        query_start_loc = RTPForwardContext._build_query_start_loc_for_plugin(
+        query_start_loc = cls._build_query_start_loc_for_plugin(
             attn_inputs=attn_inputs,
             seq_lens=seq_lens,
             num_tokens=num_actual_tokens,
             device=device,
             cg_bufs=cg_bufs,
         )
-        slot_mapping = RTPForwardContext._build_slot_mapping(
+        slot_mapping = cls._build_slot_mapping(
             positions=positions,
             query_start_loc=query_start_loc,
             block_table=block_table,
             seq_size_per_block=seq_size_per_block,
             cg_bufs=cg_bufs,
         )
-        req_id_per_token = RTPForwardContext._build_req_id_per_token(
+        req_id_per_token = cls._build_req_id_per_token(
             query_start_loc=query_start_loc,
             num_tokens=num_actual_tokens,
             device=device,
@@ -1170,34 +1184,14 @@ class RTPForwardContext:
             block_table_i32 = block_table.to(
                 device=device, dtype=torch.int32, non_blocking=True
             ).contiguous()
-        if in_capture:
-            expected_kernel_cols = 0
-            if cg_max_seq_len > 0 and int(kernel_seq_size_per_block) > 0:
-                expected_kernel_cols = (
-                    int(cg_max_seq_len) + int(kernel_seq_size_per_block) - 1
-                ) // int(kernel_seq_size_per_block)
-            if (
-                expected_kernel_cols > 0
-                and int(block_table_i32.shape[1]) >= expected_kernel_cols
-            ):
-                indexer_block_table_i32 = block_table_i32
-            else:
-                indexer_block_table_i32 = (
-                    RTPForwardContext._expand_block_table_for_atom_indexer_capture(
-                        block_table_i32,
-                        seq_size_per_block=int(seq_size_per_block),
-                        kernel_seq_size_per_block=int(kernel_seq_size_per_block),
-                        cg_bufs=cg_bufs,
-                    )
-                )
-        else:
-            indexer_block_table_i32 = (
-                RTPForwardContext._expand_block_table_for_atom_indexer(
-                    block_table_i32,
-                    seq_size_per_block=int(seq_size_per_block),
-                    kernel_seq_size_per_block=int(kernel_seq_size_per_block),
-                )
-            )
+        indexer_block_table_i32 = cls._build_indexer_block_tables(
+            block_table_i32=block_table_i32,
+            seq_size_per_block=int(seq_size_per_block),
+            kernel_seq_size_per_block=int(kernel_seq_size_per_block),
+            cg_max_seq_len=int(cg_max_seq_len),
+            in_capture=in_capture,
+            cg_bufs=cg_bufs,
+        )
         plugin_md = AiterFlashAttentionMetadataForPluginMode(
             num_actual_tokens=num_actual_tokens,
             num_actual_kv_tokens=num_actual_kv_tokens,
@@ -1591,7 +1585,7 @@ class RTPForwardContext:
             layer_group_map=layer_group_map,
             context=context,
             num_tokens=int(positions.numel()),
-            mla_layer_map=resolved_layer_maps[2],
+            mla_layer_map=cls._resolve_mla_layer_map(resolved_layer_maps),
             use_rtp_indexer_cache=cls._use_rtp_indexer_cache(),
         )
 
@@ -1789,3 +1783,408 @@ class RTPForwardContext:
                 setattr(target, attr, old_cache)
             reset_forward_context()
             set_kv_cache_data(prev_kv if prev_kv is not None else {})
+
+
+@dataclass(frozen=True)
+class RTPForwardMLAContext(RTPForwardContext):
+    @classmethod
+    def _resolve_plugin_block_table(
+        cls,
+        *,
+        attn_inputs: Any,
+        seq_size_per_block: int,
+        kernel_seq_size_per_block: int,
+        cg_bufs: dict | None,
+        in_capture: bool,
+    ) -> torch.Tensor | None:
+        physical_block_table = getattr(attn_inputs, "kv_cache_block_id_device", None)
+        if physical_block_table is not None and physical_block_table.numel() > 0:
+            return physical_block_table
+        kernel_block_table = cls._select_block_table_for_layer(attn_inputs=attn_inputs)
+        if kernel_block_table is None or kernel_block_table.numel() == 0:
+            return None
+        return cls._recover_physical_block_table_from_kernel(
+            kernel_block_table,
+            seq_size_per_block=int(seq_size_per_block),
+            kernel_seq_size_per_block=int(kernel_seq_size_per_block),
+            cg_bufs=cg_bufs if in_capture else None,
+        )
+
+    @classmethod
+    def _build_indexer_block_tables(
+        cls,
+        *,
+        block_table_i32: torch.Tensor,
+        seq_size_per_block: int,
+        kernel_seq_size_per_block: int,
+        cg_max_seq_len: int,
+        in_capture: bool,
+        cg_bufs: dict | None,
+    ) -> torch.Tensor:
+        if in_capture:
+            expected_kernel_cols = 0
+            if cg_max_seq_len > 0 and int(kernel_seq_size_per_block) > 0:
+                expected_kernel_cols = (
+                    int(cg_max_seq_len) + int(kernel_seq_size_per_block) - 1
+                ) // int(kernel_seq_size_per_block)
+            if (
+                expected_kernel_cols > 0
+                and int(block_table_i32.shape[1]) >= expected_kernel_cols
+            ):
+                return block_table_i32
+            return cls._expand_block_table_for_atom_indexer_capture(
+                block_table_i32,
+                seq_size_per_block=int(seq_size_per_block),
+                kernel_seq_size_per_block=int(kernel_seq_size_per_block),
+                cg_bufs=cg_bufs,
+            )
+        return cls._expand_block_table_for_atom_indexer(
+            block_table_i32,
+            seq_size_per_block=int(seq_size_per_block),
+            kernel_seq_size_per_block=int(kernel_seq_size_per_block),
+        )
+
+    @classmethod
+    def _resolve_mla_layer_map(
+        cls, layer_maps: RTPForwardContext.LayerMaps
+    ) -> Dict[int, Any]:
+        del cls
+        return layer_maps[2]
+
+
+@dataclass(frozen=True)
+class RTPForwardQwen35HybridContext(RTPForwardContext):
+    @staticmethod
+    def _build_seq_lens(attn_inputs: Any, *, device: torch.device) -> torch.Tensor:
+        """Qwen3.5 decode-cudagraph compatible seq_lens priority.
+
+        Keep the validated sequence_lengths_plus_1_d ordering from
+        `develop/rtp_atom_0526_qwen35_cuda_graph_ok`.
+        """
+        input_lengths = RTPForwardContext._non_empty_int32(
+            getattr(attn_inputs, "input_lengths", None),
+            device=device,
+        )
+        if input_lengths is None:
+            raise ValueError(
+                "RTP plugin requires attention_inputs.input_lengths for seq_lens."
+            )
+        is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
+        if is_prefill:
+            prefix_lengths = RTPForwardContext._non_empty_int32(
+                getattr(attn_inputs, "prefix_lengths_d", None),
+                device=device,
+            )
+            if prefix_lengths is None:
+                prefix_lengths = RTPForwardContext._non_empty_int32(
+                    getattr(attn_inputs, "prefix_lengths", None),
+                    device=device,
+                )
+            if prefix_lengths is None:
+                raise ValueError(
+                    "RTP prefill requires attention_inputs.prefix_lengths for seq_lens."
+                )
+            if int(prefix_lengths.numel()) != int(input_lengths.numel()):
+                raise ValueError(
+                    "RTP plugin prefix_lengths/input_lengths batch mismatch "
+                    f"(prefix_lengths={int(prefix_lengths.numel())}, "
+                    f"input_lengths={int(input_lengths.numel())})."
+                )
+            return (prefix_lengths + input_lengths).contiguous()
+
+        non_cuda_graph_mode = not torch.cuda.is_current_stream_capturing() and not bool(
+            getattr(attn_inputs, "is_cuda_graph", False)
+        )
+        if non_cuda_graph_mode:
+            sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
+                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                device=device,
+            )
+            if sequence_lengths_plus_1 is not None:
+                if int(sequence_lengths_plus_1.numel()) != int(input_lengths.numel()):
+                    raise ValueError(
+                        "RTP plugin sequence_lengths_plus_1_d/input_lengths batch mismatch "
+                        f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
+                        f"input_lengths={int(input_lengths.numel())})."
+                    )
+                return sequence_lengths_plus_1.contiguous()
+
+        sequence_lengths = RTPForwardContext._non_empty_int32(
+            getattr(attn_inputs, "sequence_lengths", None),
+            device=device,
+        )
+        if sequence_lengths is not None:
+            if int(sequence_lengths.numel()) != int(input_lengths.numel()):
+                raise ValueError(
+                    "RTP plugin sequence_lengths/input_lengths batch mismatch "
+                    f"(sequence_lengths={int(sequence_lengths.numel())}, "
+                    f"input_lengths={int(input_lengths.numel())})."
+                )
+            return (sequence_lengths + input_lengths).contiguous()
+
+        if not non_cuda_graph_mode:
+            sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
+                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                device=device,
+            )
+            if sequence_lengths_plus_1 is not None:
+                if int(sequence_lengths_plus_1.numel()) != int(input_lengths.numel()):
+                    raise ValueError(
+                        "RTP plugin sequence_lengths_plus_1_d/input_lengths batch mismatch "
+                        f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
+                        f"input_lengths={int(input_lengths.numel())})."
+                    )
+                return sequence_lengths_plus_1.contiguous()
+
+        raise ValueError(
+            "RTP decode requires attention_inputs.sequence_lengths_plus_1_d or "
+            "sequence_lengths for seq_lens."
+        )
+
+    @classmethod
+    def _resolve_plugin_block_table(
+        cls,
+        *,
+        attn_inputs: Any,
+        seq_size_per_block: int,
+        kernel_seq_size_per_block: int,
+        cg_bufs: dict | None,
+        in_capture: bool,
+    ) -> torch.Tensor | None:
+        del cls, seq_size_per_block, kernel_seq_size_per_block, cg_bufs, in_capture
+        return RTPForwardContext._select_block_table_for_layer(attn_inputs=attn_inputs)
+
+    @staticmethod
+    def _build_query_start_loc_for_plugin(
+        *,
+        attn_inputs: Any,
+        seq_lens: torch.Tensor,
+        num_tokens: int,
+        device: torch.device,
+        cg_bufs: dict | None = None,
+    ) -> torch.Tensor:
+        batch_size = int(seq_lens.numel())
+        if batch_size <= 0:
+            raise ValueError(
+                "RTP plugin cannot build query_start_loc with empty seq_lens."
+            )
+
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if in_capture and cg_bufs is not None:
+            return cg_bufs["query_start_loc"][: batch_size + 1]
+
+        if in_capture:
+            raise ValueError(
+                "RTP plugin capture requires prewarmed cg_bufs for query_start_loc "
+                f"(batch={batch_size}, num_tokens={int(num_tokens)})."
+            )
+
+        qsl = RTPForwardContext._query_start_loc(attn_inputs, device=device)
+        if qsl is not None and qsl.numel() == batch_size + 1:
+            lengths = qsl[1:] - qsl[:-1]
+            qsl_stats = torch.stack([qsl[-1], torch.min(lengths)], dim=0).to(
+                device="cpu"
+            )
+            qsl_total_tokens, qsl_min_len = [int(v) for v in qsl_stats.tolist()]
+            if qsl_total_tokens == int(num_tokens) and qsl_min_len > 0:
+                return qsl.contiguous()
+
+        input_lengths = RTPForwardContext._non_empty_int32(
+            getattr(attn_inputs, "input_lengths", None),
+            device=device,
+        )
+        if input_lengths is not None and int(input_lengths.numel()) == batch_size:
+            input_stats = torch.stack(
+                [torch.min(input_lengths), torch.sum(input_lengths)],
+                dim=0,
+            ).to(device="cpu")
+            min_input_len, total_input_len = [int(v) for v in input_stats.tolist()]
+            if min_input_len > 0 and total_input_len == int(num_tokens):
+                prefix = torch.zeros((1,), dtype=torch.int32, device=device)
+                return torch.cat(
+                    [prefix, input_lengths.cumsum(dim=0)], dim=0
+                ).contiguous()
+
+        if int(num_tokens) == batch_size:
+            prefix = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device)
+            return prefix.contiguous()
+        if batch_size == 1:
+            return torch.tensor([0, int(num_tokens)], dtype=torch.int32, device=device)
+
+        raise ValueError(
+            "RTP plugin failed to build valid query_start_loc for plugin attention "
+            f"(batch={batch_size}, num_tokens={int(num_tokens)})."
+        )
+
+    @classmethod
+    def _build_plugin_attention_metadata(
+        cls,
+        *,
+        attn_inputs: Any,
+        positions: torch.Tensor,
+        seq_size_per_block: int,
+        kernel_seq_size_per_block: int = 0,
+        cg_max_seq_len: int = 0,
+        cg_bufs: dict | None = None,
+    ) -> AttentionMetaData:
+        del kernel_seq_size_per_block
+        block_table = cls._resolve_plugin_block_table(
+            attn_inputs=attn_inputs,
+            seq_size_per_block=int(seq_size_per_block),
+            kernel_seq_size_per_block=0,
+            cg_bufs=cg_bufs,
+            in_capture=torch.cuda.is_current_stream_capturing(),
+        )
+        if block_table is None or block_table.numel() == 0:
+            raise ValueError(
+                "RTP plugin requires kv_cache_kernel_block_id_device for plugin attention metadata."
+            )
+        device = positions.device
+        is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if in_capture and cg_bufs is None:
+            raise RuntimeError(
+                "RTP plugin capture requires prewarmed cg_bufs; metadata fallback path is disabled."
+            )
+        seq_lens = cls._build_seq_lens(attn_inputs, device=device)
+        if in_capture and cg_bufs is not None:
+            bs_now = int(seq_lens.shape[0])
+            seq_lens_buf = cg_bufs["seq_lens_i32"]
+            if int(seq_lens_buf.shape[0]) < bs_now:
+                raise RuntimeError(
+                    "RTP plugin prewarmed seq_lens_i32 buffer is too small "
+                    f"(buffer={int(seq_lens_buf.shape[0])}, required={bs_now})."
+                )
+            seq_lens_view = seq_lens_buf[:bs_now]
+            seq_lens_view.copy_(seq_lens, non_blocking=True)
+            seq_lens = seq_lens_view
+        else:
+            seq_lens = seq_lens.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
+        batch_size = int(seq_lens.numel())
+
+        if in_capture and not is_prefill:
+            positions = positions[:batch_size]
+        num_actual_tokens = int(positions.numel())
+
+        query_start_loc = cls._build_query_start_loc_for_plugin(
+            attn_inputs=attn_inputs,
+            seq_lens=seq_lens,
+            num_tokens=num_actual_tokens,
+            device=device,
+            cg_bufs=cg_bufs,
+        )
+        slot_mapping = cls._build_slot_mapping(
+            positions=positions,
+            query_start_loc=query_start_loc,
+            block_table=block_table,
+            seq_size_per_block=seq_size_per_block,
+            cg_bufs=cg_bufs,
+        )
+
+        is_dummy_warmup = False
+        if in_capture:
+            max_query_len = 1
+            if cg_max_seq_len <= 0:
+                raise RuntimeError(
+                    "RTP plugin cuda-graph capture requires cg_max_seq_len; "
+                    "did you forget to thread it through RTPForwardContext.bind?"
+                )
+            max_seq_len = int(cg_max_seq_len)
+            num_actual_kv_tokens = max_seq_len * batch_size
+        else:
+            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            stats = torch.stack(
+                [
+                    torch.max(query_lens),
+                    torch.max(seq_lens),
+                    torch.sum(seq_lens),
+                ],
+                dim=0,
+            ).to(device="cpu")
+            max_query_len, max_seq_len, num_actual_kv_tokens = [
+                int(v) for v in stats.tolist()
+            ]
+            if max_seq_len <= 0:
+                is_dummy_warmup = True
+                max_seq_len = int(cg_max_seq_len) if cg_max_seq_len > 0 else 1
+            if max_query_len <= 0:
+                max_query_len = 1
+
+        decode_md = None
+        prefill_md = None
+        if is_prefill:
+            prefill_md = AiterFlashAttentionPrefillMetadata(
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                query_start_loc=query_start_loc,
+            )
+        else:
+            decode_md = AiterFlashAttentionDecodeMetadata(
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                query_start_loc=query_start_loc,
+            )
+
+        if in_capture and cg_bufs is not None:
+            bt_buf = cg_bufs["block_table_i32"]
+            bs_now = int(block_table.shape[0])
+            cols_now = int(block_table.shape[1])
+            if int(bt_buf.shape[0]) < bs_now or int(bt_buf.shape[1]) < cols_now:
+                raise RuntimeError(
+                    "RTP plugin prewarmed block_table_i32 buffer is too small "
+                    f"(buffer={tuple(bt_buf.shape)}, required=({bs_now}, {cols_now}))."
+                )
+            bt_view = bt_buf[:bs_now, :cols_now]
+            bt_view.copy_(block_table, non_blocking=True)
+            block_table_i32 = bt_view
+        else:
+            block_table_i32 = block_table.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
+
+        plugin_md = AiterFlashAttentionMetadataForPluginMode(
+            num_actual_tokens=num_actual_tokens,
+            num_actual_kv_tokens=num_actual_kv_tokens,
+            max_query_len=max_query_len,
+            query_start_loc=query_start_loc,
+            max_seq_len=max_seq_len,
+            seq_lens=seq_lens,
+            slot_mapping=slot_mapping,
+            block_table=block_table_i32,
+            num_decodes=0 if is_prefill else batch_size,
+            num_decode_tokens=0 if is_prefill else num_actual_tokens,
+            num_prefills=batch_size if is_prefill else 0,
+            num_prefill_tokens=num_actual_tokens if is_prefill else 0,
+            num_extends=0,
+            num_extend_tokens=0,
+            decode_metadata=decode_md,
+            prefill_metadata=prefill_md,
+            extend_metadata=None,
+            use_cascade=False,
+            common_prefix_len=0,
+            total_tokens=0,
+            context=None,
+        )
+        plugin_md.rtp_cu_seqlens_q = query_start_loc
+        plugin_md.is_dummy_warmup = bool(is_dummy_warmup)
+        prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
+        if (
+            prefix_lengths is not None
+            and int(prefix_lengths.numel()) > 0
+            and not in_capture
+        ):
+            plugin_md.rtp_has_prefix = bool((prefix_lengths > 0).any().item())
+        else:
+            plugin_md.rtp_has_prefix = False
+
+        attn_metadata = AttentionMetaData(
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_seq_len,
+            block_tables=plugin_md.block_table,
+            slot_mapping=slot_mapping,
+            context_lens=seq_lens,
+        )
+        attn_metadata.plugin_metadata = plugin_md
+        return attn_metadata
