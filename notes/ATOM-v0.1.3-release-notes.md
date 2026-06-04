@@ -7,7 +7,7 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 * **DeepSeek V4 maturity**: DeepSeek V4 received a major enablement and hardening pass this cycle — ATOM added an end-to-end inference path with Triton MoE (#650), DeepSeek V4-Pro recipe coverage (#713, #894), torch compile support (#705), MTP-K and MTP3 paths (#817, #894), TBO (#766), DP attention (#745), and PD disaggregation with prefill optimization (#812). A broad set of performance kernels and runtime fixes landed alongside it, including fused compressor and DualRMSNorm kernels (#723), sparse paged decode rewrite with optional FP8 KV (#936), fused attention / FFN norm (#967), unified AITER RMSNorm-quant plus Q-norm / WKV-gate fusions (#733), three-stream execution (#736), and prepare-decode optimization (#728).
 * **ATOM matures for native high-performance inference**: Native paths for DeepSeek V4, Qwen3.5, Qwen3-Next, GLM, gpt-oss, Kimi, MiniMax, and MiMo are expanded with accuracy, quantization, MTP, KV cache, and scheduling fixes.
 * **vLLM-ATOM coverage expands**: ATOM currently targets vLLM `0.19.0` and gains broader model, MTP, Sparse MLA, recipe, nightly, and benchmark coverage across DeepSeek V3.2 / V4, GLM, Kimi, Qwen3.5, Qwen3-Next, MiniMax, and DeepSeek-R1 FP4 (#483, #494, #557, #892, #938).
-* **SGLang-ATOM support**: ATOM currently targets SGLang `0.5.10` and adds out-of-tree support, image release and validation workflows, Qwen3.5 / Qwen3-Next / DeepSeek coverage, MTP, DP attention, Specv2, Docker support, dashboard integration, and benchmark coverage (#355, #510, #532, #548, #743, #915, #926).
+* **SGLang-ATOM support**: ATOM currently targets SGLang `0.5.10` and adds out-of-tree support, image release and validation workflows, Qwen3.5 / Qwen3-Next / DeepSeek coverage, MTP, EP, DP attention, Specv2, Docker support, dashboard integration, and benchmark coverage (#355, #510, #532, #548, #743, #915, #926).
 * **Dashboard, benchmark, and CI become release-grade**: This release redesigns the dashboard, adds regression and MTP trend tracking, improves Docker / model metadata, expands nightly accuracy and benchmark coverage, and hardens MI35x runner workflows (#492, #608, #621, #587, #444, #509).
 
 ## ATOM Server
@@ -61,9 +61,9 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 #### Model Support
 
 * Adds SGLang out-of-tree support for ATOM, including image release and validation workflows (#355, #510).
-* Adds SGLang-ATOM support for Qwen3.5, Qwen3-Next, DeepSeek V3 / R1 FP4, DeepSeek FP4 MTP, and SGLang MTP / DP attention paths (#532, #777, #643, #614, #834, #926).
+* Adds SGLang-ATOM support for Qwen3.5, Qwen3-Next, DeepSeek V3 / R1 FP4, DeepSeek FP4 MTP, and SGLang MTP / EP / DP attention paths (#532, #777, #643, #614, #834, #926).
 * Adds Qwen3.5 MHA support, DeepSeek FP4 MTP benchmark cases, and DeepSeek FP4 DP4 / EP4 nightly accuracy and benchmark cases (#819, #834, #846).
-* Adds SGLang-ATOM recipes for DeepSeek MTP and DeepSeek-R1 (#901, #942).
+* Adds SGLang-ATOM recipes for DeepSeek MTP, DeepSeek-R1, Qwen3.5 and Qwen3-Next (#901, #942, #777).
 
 #### Engine Core
 
