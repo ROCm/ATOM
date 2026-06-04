@@ -31,6 +31,7 @@ from atom.utils.debug_helper.compare import (
 )
 from atom.utils.debug_helper.dump import (
     install_block_forward_hooks,
+    install_partial_prefill_dump_hooks,
     maybe_dump_weights_and_exit,
     maybe_log_topk,
 )
@@ -43,6 +44,7 @@ from atom.utils.debug_helper.ref_patch import (
 __all__ = [
     # dump
     "install_block_forward_hooks",
+    "install_partial_prefill_dump_hooks",
     "maybe_dump_weights_and_exit",
     "maybe_log_topk",
     # compare primitives

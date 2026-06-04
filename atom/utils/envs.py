@@ -183,6 +183,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FWD_DUMP_LAYER_ATTR", "layer_id"
     ),
     "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
+    # Partial-prefill chunk dump: capture the last-token hidden state of seq 0
+    # in each prefill batch, tagged by chunk index. Used to bisect "single
+    # partial seq" vs "multiple partial seqs in same batch" divergence.
+    # Set ATOM_PARTIAL_DUMP_DIR to enable. Independent of ATOM_FWD_DUMP_*.
+    "ATOM_PARTIAL_DUMP_DIR": lambda: os.getenv("ATOM_PARTIAL_DUMP_DIR", ""),
+    "ATOM_PARTIAL_DUMP_LAYERS": lambda: os.getenv("ATOM_PARTIAL_DUMP_LAYERS", "0,30,60"),
+    "ATOM_PARTIAL_DUMP_BLOCK_CLASS": lambda: os.getenv(
+        "ATOM_PARTIAL_DUMP_BLOCK_CLASS", "Block"
+    ),
     # Per-rank weight dump + sys.exit(0) — for byte-equal weight comparison.
     "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
     "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", "0"),

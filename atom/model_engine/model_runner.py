@@ -664,12 +664,18 @@ class ModelRunner:
         # See atom/utils/debug_helper/.
         from atom.utils.debug_helper import (
             install_block_forward_hooks,
+            install_partial_prefill_dump_hooks,
             maybe_dump_weights_and_exit,
         )
 
         _n_fwd_hooks = install_block_forward_hooks(self.model)
         if _n_fwd_hooks > 0:
             logger.info(f"[ATOM_FWD_DUMP] {_n_fwd_hooks} Block forward hooks installed")
+        _n_partial_hooks = install_partial_prefill_dump_hooks(self.model)
+        if _n_partial_hooks > 0:
+            logger.info(
+                f"[ATOM_PARTIAL_DUMP] {_n_partial_hooks} partial-prefill hooks installed"
+            )
         maybe_dump_weights_and_exit(self.model)
 
         if self.config.speculative_config and get_pp_group().is_last_rank:

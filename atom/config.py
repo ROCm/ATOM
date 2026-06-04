@@ -1027,6 +1027,7 @@ class Config:
     model: str
     trust_remote_code: bool = False
     max_num_batched_tokens: int = 16384
+    long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
@@ -1151,6 +1152,19 @@ class Config:
                 self.max_model_len, hf_config_max_position_embeddings
             )
         # assert self.max_num_batched_tokens >= self.max_model_len
+        if self.long_prefill_token_threshold > 0:
+            if self.long_prefill_token_threshold > self.max_model_len:
+                raise ValueError(
+                    f"long_prefill_token_threshold "
+                    f"({self.long_prefill_token_threshold}) cannot be greater "
+                    f"than max_model_len ({self.max_model_len})."
+                )
+            if self.long_prefill_token_threshold < self.kv_cache_block_size:
+                raise ValueError(
+                    f"long_prefill_token_threshold "
+                    f"({self.long_prefill_token_threshold}) must be >= "
+                    f"kv_cache_block_size ({self.kv_cache_block_size})."
+                )
         if not is_plugin_mode():
             if self.torch_profiler_dir is not None:
                 os.makedirs(self.torch_profiler_dir, exist_ok=True)
