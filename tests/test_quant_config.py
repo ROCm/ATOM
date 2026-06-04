@@ -146,6 +146,7 @@ _m = _load_module("config.py", "_atom_config_test")
 QuantizationConfig = _m.QuantizationConfig
 LayerQuantConfig = _qs.LayerQuantConfig
 QuarkParser = _qs.QuarkParser
+QuarkOnlineParser = _qs.QuarkOnlineParser
 GenericParser = _qs.GenericParser
 get_quant_parser = _qs.get_quant_parser
 
@@ -189,6 +190,10 @@ class TestParserRegistry:
     def test_quark_registered(self):
         parser = get_quant_parser("quark")
         assert isinstance(parser, QuarkParser)
+
+    def test_online_quant_registered(self):
+        parser = get_quant_parser("online_quant")
+        assert isinstance(parser, QuarkOnlineParser)
 
     def test_generic_fallback(self):
         parser = get_quant_parser("compressed-tensors")
@@ -276,6 +281,69 @@ class TestQuarkParser:
 
 
 # =========================================================================
+# Tests — QuarkOnlineParser
+# =========================================================================
+
+
+class TestQuarkOnlineParser:
+    def test_ptpc_fp8_global_config(self):
+        parser = QuarkOnlineParser()
+        result = parser.parse({"global_quant_config": "ptpc_fp8"})
+
+        assert result.global_spec.quant_type == QuantType.per_Token
+        assert result.global_spec.quant_dtype == FP8
+        assert result.global_spec.is_dynamic is True
+        assert result.global_spec.quant_method == "quark"
+        assert result.layer_pattern_specs == []
+        assert result.exclude_layers == []
+
+    def test_mxfp4_layer_override_and_exclude_list(self):
+        parser = QuarkOnlineParser()
+        result = parser.parse(
+            {
+                "global_quant_config": "ptpc_fp8",
+                "layer_quant_config": {"*expert*": "mxfp4"},
+                "exclude_layer": ["lm_head", "*.gate.*"],
+            }
+        )
+
+        assert result.global_spec.quant_type == QuantType.per_Token
+        assert result.global_spec.quant_dtype == FP8
+        assert len(result.layer_pattern_specs) == 1
+        pattern, spec = result.layer_pattern_specs[0]
+        assert pattern == "*expert*"
+        assert spec.quant_type == QuantType.per_1x32
+        assert spec.quant_dtype == FP4X2
+        assert result.exclude_layers == ["lm_head", "*.gate.*"]
+
+    def test_string_exclude_layer_is_preserved_as_single_pattern(self):
+        parser = QuarkOnlineParser()
+        result = parser.parse(
+            {
+                "global_quant_config": "ptpc_fp8",
+                "exclude_layer": "lm_head",
+            }
+        )
+
+        assert result.exclude_layers == ["lm_head"]
+
+    def test_empty_config_returns_no_quant_defaults(self):
+        parser = QuarkOnlineParser()
+        result = parser.parse({})
+
+        assert result.global_spec.quant_type == QuantType.No
+        assert result.global_spec.quant_dtype == BF16
+        assert result.layer_pattern_specs == []
+        assert result.exclude_layers == []
+
+    def test_invalid_online_quant_format_raises(self):
+        parser = QuarkOnlineParser()
+
+        with pytest.raises(ValueError, match="Unsupported online quant format"):
+            parser.parse({"global_quant_config": "unsupported_fp8"})
+
+
+# =========================================================================
 # Tests — QuantizationConfig init
 # =========================================================================
 
@@ -294,6 +362,41 @@ class TestQuantizationConfigInit:
         assert qcfg.quant_method == ""
         assert qcfg.global_quant_config.quant_type == QuantType.No
         assert qcfg.global_quant_config.quant_dtype == BF16
+        assert qcfg.online_quant is False
+        assert qcfg.online_global_spec.quant_type == QuantType.No
+        assert qcfg.online_layer_pattern_specs == []
+        assert qcfg.online_exclude_layers == []
+
+    def test_empty_online_quant_config_does_not_enable_online_quant(self):
+        hf = FakeHFConfig(torch_dtype=BF16)
+        qcfg = QuantizationConfig(hf, online_quant_config={})
+
+        assert qcfg.online_quant is False
+        assert qcfg.online_quant_config_raw == {}
+        assert qcfg.online_global_spec.quant_type == QuantType.No
+        assert qcfg.online_layer_pattern_specs == []
+        assert qcfg.online_exclude_layers == []
+
+    def test_online_quant_config_parses_global_layer_and_exclude(self):
+        hf = FakeHFConfig(torch_dtype=BF16)
+        qcfg = QuantizationConfig(
+            hf,
+            online_quant_config={
+                "global_quant_config": "ptpc_fp8",
+                "layer_quant_config": {"*expert*": "mxfp4"},
+                "exclude_layer": ["lm_head", "*.gate.*"],
+            },
+        )
+
+        assert qcfg.online_quant is True
+        assert qcfg.online_global_spec.quant_type == QuantType.per_Token
+        assert qcfg.online_global_spec.quant_dtype == FP8
+        assert len(qcfg.online_layer_pattern_specs) == 1
+        pattern, spec = qcfg.online_layer_pattern_specs[0]
+        assert pattern == "*expert*"
+        assert spec.quant_type == QuantType.per_1x32
+        assert spec.quant_dtype == FP4X2
+        assert qcfg.online_exclude_layers == ["lm_head", "*.gate.*"]
 
     def test_quark_config_parses_global_and_layer(self):
         hf = FakeHFConfig(
@@ -368,6 +471,34 @@ class TestGetLayerQuantConfig:
         assert result.quant_type == QuantType.No
         assert result.quant_dtype == BF16
 
+    def test_online_quant_resolution_uses_online_specs(self):
+        qcfg = QuantizationConfig(
+            FakeHFConfig(torch_dtype=BF16),
+            online_quant_config={
+                "global_quant_config": "ptpc_fp8",
+                "layer_quant_config": {"*expert*": "mxfp4"},
+                "exclude_layer": ["lm_head", "*.gate.*"],
+            },
+        )
+
+        expert = qcfg.get_layer_quant_config(
+            "model.layers.0.mlp.experts.0.w13_weight",
+            use_online_quant=True,
+        )
+        assert expert.quant_type == QuantType.per_1x32
+        assert expert.quant_dtype == FP4X2
+
+        attention = qcfg.get_layer_quant_config(
+            "model.layers.0.self_attn.q_proj",
+            use_online_quant=True,
+        )
+        assert attention.quant_type == QuantType.per_Token
+        assert attention.quant_dtype == FP8
+
+        excluded = qcfg.get_layer_quant_config("lm_head", use_online_quant=True)
+        assert excluded.quant_type == QuantType.No
+        assert excluded.quant_dtype == BF16
+
 
 # =========================================================================
 # Tests — Exclude layer matching
@@ -399,6 +530,43 @@ class TestExcludeMatching:
     def test_no_match(self):
         qcfg = self._make(["lm_head"])
         assert not qcfg._is_excluded("self_attn.q_proj")
+
+    def test_check_children_matches_child_entries(self):
+        """check_children=True: parent excluded when child entries exist."""
+        qcfg = self._make(
+            [
+                "mtp.layers.60.mlp.experts.0.gate_up_proj",
+                "mtp.layers.60.mlp.experts.0.down_proj",
+            ]
+        )
+        # Without check_children: module-level prefix does NOT match
+        assert not qcfg._is_excluded("mtp.layers.60.mlp.experts")
+        # With check_children: child entries trigger a match
+        assert qcfg._is_excluded("mtp.layers.60.mlp.experts", check_children=True)
+
+    def test_check_children_no_false_positive_on_siblings(self):
+        """check_children must not match sibling modules."""
+        qcfg = self._make(["mtp.layers.60.mlp.gate"])
+        # "mlp.gate" is a sibling of "mlp.experts", not a child
+        assert not qcfg._is_excluded("mtp.layers.60.mlp.experts", check_children=True)
+
+    def test_check_children_propagates_through_get_layer_quant_config(self):
+        qcfg = QuantizationConfig(config=None)
+        qcfg.torch_dtype = BF16
+        qcfg.global_spec = LayerQuantConfig(
+            quant_type=QuantType.per_Token, quant_dtype=FP8
+        )
+        qcfg.exclude_layers = ["mtp.layers.60.mlp.experts.0.gate_up_proj"]
+
+        # Without check_children: returns global FP8
+        result = qcfg.get_layer_quant_config("mtp.layers.60.mlp.experts")
+        assert result.quant_dtype == FP8
+
+        # With check_children: returns BF16 (excluded)
+        result = qcfg.get_layer_quant_config(
+            "mtp.layers.60.mlp.experts", check_children=True
+        )
+        assert result.quant_dtype == BF16
 
 
 class TestMatchesExclude:
@@ -497,6 +665,25 @@ class TestRemapLayerName:
         qcfg.remap_layer_name(hf)
 
         assert qcfg.exclude_layers.count("model.layers.0.gate_up_proj") == 1
+
+    def test_glm_moe_dsa_remaps_like_deepseek_v3(self):
+        """GLM-5 (glm_moe_dsa) uses same packed fusing as deepseek_v3."""
+        qcfg = QuantizationConfig(config=None)
+        qcfg.layer_pattern_specs = []
+        qcfg.exclude_layers = [
+            "model.layers.0.self_attn.q_a_proj",
+            "model.layers.0.self_attn.kv_a_proj_with_mqa",
+            "model.layers.0.mlp.gate_proj",
+            "model.layers.0.mlp.up_proj",
+        ]
+
+        hf = FakeHFConfig(model_type="glm_moe_dsa", q_lora_rank=2048)
+        qcfg.remap_layer_name(hf)
+
+        assert "model.layers.0.self_attn.fused_qkv_a_proj" in qcfg.exclude_layers
+        assert "model.layers.0.mlp.gate_up_proj" in qcfg.exclude_layers
+        assert "model.layers.0.self_attn.q_a_proj" not in qcfg.exclude_layers
+        assert "model.layers.0.mlp.gate_proj" not in qcfg.exclude_layers
 
 
 class TestComputeHash:

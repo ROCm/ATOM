@@ -62,7 +62,6 @@ class KimiK25Model(DeepseekV2Model):
             lambda prefix, layer_num=None: DeepseekV2DecoderLayer(
                 config,
                 prefix,
-                topk_indices_buffer=None,
                 cache_config=cache_config,
                 quant_config=quant_config,
                 layer_num=layer_num,
@@ -80,6 +79,7 @@ class KimiK25Model(DeepseekV2Model):
             )
         else:
             self.norm = PPMissingLayer()
+        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -173,6 +173,10 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
+    quant_exclude_name_mapping = {
+        "language_model.model.": "model.language_model.model.",
+        "language_model.lm_head": "model.language_model.lm_head",
+    }
     hf_to_atom_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.visual.": "visual.",
@@ -187,7 +191,11 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
     def __init__(self, atom_config: Config, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__
         nn.Module.__init__(self)
-        config: KimiK25Config = atom_config.hf_config
+        hf_config = getattr(atom_config, "hf_config", None)
+        assert hf_config is not None, "hf_config is not found in atom_config"
+        vision_config = getattr(hf_config, "vision_config", None)
+        text_config = getattr(hf_config, "text_config", None)
+        config = KimiK25Config(vision_config, text_config)
 
         vllm_config = atom_config.plugin_config.vllm_config
         # quant_config from vLLM ignores exclude_layers in model's quantization config
@@ -242,7 +250,9 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
         self, quant_config: Any, exclude_layers: list[str], layer_name: str
     ):
         for exclude_layer in exclude_layers:
-            if QuantizationConfig._matches_exclude(layer_name, exclude_layer):
+            if QuantizationConfig._matches_exclude(
+                layer_name, exclude_layer, check_contains=True
+            ):
                 return None
         return quant_config
 

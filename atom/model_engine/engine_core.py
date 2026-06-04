@@ -6,6 +6,7 @@ import logging
 import pickle
 import queue
 import threading
+import time
 from contextlib import ExitStack
 from typing import List
 
@@ -13,12 +14,15 @@ import torch
 import zmq
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.rollout.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import init_exit_handler, make_zmq_socket
+from atom.utils import envs, init_exit_handler, make_zmq_socket
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
+
+from atom.kv_transfer.disaggregation import KVOutputAggregator
 
 logger = logging.getLogger("atom")
 
@@ -41,6 +45,8 @@ class EngineCoreRequestType(enum.Enum):
     STREAM = b"\x06"
     # Signal that EngineCore is fully initialized and ready
     READY = b"\x07"
+    # Response to a synchronous utility command
+    UTILITY_RESPONSE = b"\x08"
 
 
 class EngineCore:
@@ -51,12 +57,28 @@ class EngineCore:
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
+        # Queue for utility commands (processed in busy_loop to avoid thread contention)
+        self.utility_queue = queue.Queue()
+        self._has_pending_utility = (
+            False  # Flag to avoid checking empty queue every loop
+        )
+        self._is_rl_weights_offloaded = (
+            False  # True when weights are offloaded for RL training
+        )
         self.input_address = input_address
         self.output_address = output_address
         self.output_thread = threading.Thread(
             target=self.process_output_sockets, args=(self.output_address,), daemon=True
         )
         self.output_thread.start()
+
+        # Start input thread BEFORE _init_data_parallel so that CoreManager
+        # can receive the input socket connection and proceed to start the
+        # remaining DP ranks.  Without this, _init_data_parallel blocks on
+        # rendezvous waiting for all DP ranks, but they haven't been spawned
+        # yet because CoreManager is still waiting for *this* rank's socket.
+        # The READY signal (sent at the end of __init__) gates actual request
+        # processing, so starting the input thread early is safe.
         self.input_thread = threading.Thread(
             target=self.process_input_sockets, args=(self.input_address,), daemon=True
         )
@@ -73,10 +95,18 @@ class EngineCore:
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
                 config.tensor_parallel_size,
-                "atom.model_engine.model_runner.ModelRunner",
+                config.runner_qualname,
                 config,
             )
-            num_blocks = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+
+            block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+            num_blocks = block_info["num_kvcache_blocks"]
+            config.per_req_cache_equiv_blocks = block_info.get(
+                "per_req_cache_equiv_blocks", 0
+            )
+            config.num_per_req_cache_groups = block_info.get(
+                "num_per_req_cache_groups", 0
+            )
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -100,16 +130,15 @@ class EngineCore:
 
         self.scheduler = Scheduler(config)
 
-        # Start input thread AFTER model is loaded so the "ready" signal
-        # is sent only when the engine is truly ready to accept requests
-        # self.input_thread = threading.Thread(
-        #     target=self.process_input_sockets, args=(self.input_address,), daemon=True
-        # )
-        # self.input_thread.start()
+        self.kv_transfer_enabled = bool(config.kv_transfer_config)
+        if self.kv_transfer_enabled:
+            self.kv_aggregator = KVOutputAggregator(
+                world_size=config.tensor_parallel_size
+            )
 
-        # We can not start input thread here since dp need to sync with other ranks,
-        # Otherwise, DP will hang always.
-        # Thus we add new signal READY to notify CoreManager
+        self.utility_handler = EngineUtilityHandler(
+            self.runner_mgr, self.output_queue, label=self.label
+        )
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
@@ -124,6 +153,9 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
+        if not hasattr(self, "runner_mgr"):
+            self._send_engine_dead()
+            return
         self.runner_mgr.keep_monitoring = False
         try:
             self.runner_mgr.call_func("exit")
@@ -160,27 +192,114 @@ class EngineCore:
             if engine is not None:
                 engine.exit()
 
+    def _is_idle_rl_weights_offloaded(self) -> bool:
+        """Check if weights are offloaded for RL training.
+
+        When offloaded, busy-wait with a short delay to avoid CPU spin.
+        Returns True if the caller should skip model execution this tick.
+        """
+        if self._is_rl_weights_offloaded:
+            time.sleep(0.01)
+            return True
+        return False
+
     def busy_loop(self):
         shutdown = False
-        while True:
-            shutdown = shutdown or self.pull_and_process_input_queue()
-            if shutdown:
-                break
-            if not self.scheduler.is_finished():
-                self._process_engine_step()
+        try:
+            while True:
+                self.utility_handler.process_queue(self.utility_queue, self)
+                shutdown = shutdown or self.pull_and_process_input_queue()
+                if shutdown:
+                    break
+                if self._is_idle_rl_weights_offloaded():
+                    continue
+                if not self.scheduler.is_finished():
+                    self._process_engine_step()
+        finally:
+            # Teardown runs even on exceptions so the sender thread/socket
+            # don't leak. Isolate the final publish so a publisher hiccup
+            # cannot skip shutdown_kv_events().
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish during shutdown failed")
+            self.scheduler.shutdown_kv_events()
 
     def _process_engine_step(self):
-        if not self.scheduler.has_requests():
+        try:
+            return self._process_engine_step_inner()
+        finally:
+            # Swallow publisher errors so they cannot mask an exception from
+            # the engine step itself.
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish in engine-step finally failed")
+
+    def _process_engine_step_inner(self):
+        result = self.scheduler.schedule()
+
+        # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
+        # the scheduler) through the same finished-seq path as normal seqs.
+        # Without this, `llm.generate()` blocks forever waiting for an output
+        # the rejected seq will never produce.
+        rejected = self.scheduler.take_rejected()
+        if rejected:
+            self.output_queue.put_nowait(rejected)
+
+        if result is None:
+            if self.kv_transfer_enabled:
+                kvoutput = self.runner_mgr.call_func_with_aggregation(
+                    "async_proc_aggregation"
+                )
+                self.scheduler._update_from_kv_xfer_finished(kvoutput)
             return False
-        scheduled_batch, seqs = self.scheduler.schedule()
-        # if scheduled_batch is None:
-        #     return False
-        self.scheduler.build_profile_annotation(scheduled_batch, seqs)
-        fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+        scheduled_batch, seqs = result
+
+        if scheduled_batch is None:
+            logger.debug("%s: No sequences to schedule, skipping forward", self.label)
+            if self.kv_transfer_enabled:
+                kvoutput = self.runner_mgr.call_func_with_aggregation(
+                    "async_proc_aggregation"
+                )
+                self.scheduler._update_from_kv_xfer_finished(kvoutput)
+            return False
+
+        # Dispatch KV connector metadata to workers (triggers async KV load)
+        if (
+            self.kv_transfer_enabled
+            and scheduled_batch.connector_meta_output is not None
+        ):
+            self.runner_mgr.call_func(
+                "process_kvconnector_output", scheduled_batch.connector_meta_output
+            )
+
+        # Run the model forward pass if there are actual sequences
+        has_seqs = len(scheduled_batch.req_ids) > 0
+        if has_seqs:
+            self.scheduler.build_profile_annotation(scheduled_batch, seqs)
+            fwd_out = self.runner_mgr.call_func(
+                "forward", scheduled_batch, wait_out=True
+            )
+
+        # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
+        if self.kv_transfer_enabled:
+            kvoutput = self.runner_mgr.call_func_with_aggregation(
+                "async_proc_aggregation"
+            )
+            self.scheduler._update_from_kv_xfer_finished(kvoutput)
+
+        if not has_seqs:
+            logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
+            return False
+
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
-            seqs, fwd_out, stream_output_queue=self.stream_output_queue
+            seqs,
+            fwd_out,
+            stream_output_queue=self.stream_output_queue,
+            batch=scheduled_batch,
         )
 
         # Send stream outputs to main process via output_queue
@@ -194,6 +313,7 @@ class EngineCore:
 
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
+
         return True
 
     def pull_and_process_input_queue(self):
@@ -206,7 +326,7 @@ class EngineCore:
                     return True
                 recv_reqs.append(seq)
         if len(recv_reqs) > 0:
-            logger.info(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
+            logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
         return False
 
@@ -237,7 +357,8 @@ class EngineCore:
                         )
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
-                        # Handle utility commands like start_profile/stop_profile
+                        # Put utility commands into queue for processing in busy_loop
+                        # This ensures all runner_mgr.call_func() calls happen in the same thread
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         if cmd == "start_profile":
@@ -246,6 +367,10 @@ class EngineCore:
                             self.stop_profiler()
                         elif cmd == "get_mtp_stats":
                             self.print_mtp_statistics()
+                        else:
+                            # Queue command for processing in busy_loop (main thread)
+                            self.utility_queue.put_nowait((cmd, reqs))
+                            self._has_pending_utility = True
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
@@ -277,6 +402,15 @@ class EngineCore:
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
 
+                if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
+                    # Send utility command response back to CoreManager
+                    response_data = item[1]
+                    serialized_obj = pickle.dumps(
+                        (EngineCoreRequestType.UTILITY_RESPONSE, response_data)
+                    )
+                    socket.send(serialized_obj)
+                    continue
+
                 # Regular finished sequences
                 seqs = item
                 valid_seqs = [
@@ -302,9 +436,10 @@ class EngineCore:
     def stop_profiler(self):
         if self.profile_enbaled:
             logger.info("Profiler stopping...")
+            t0 = time.monotonic()
             self.runner_mgr.call_func("stop_profiler", wait_out=True)
             self.scheduler.profile_active = False
-            logger.info("Profiler stopped.")
+            logger.info("Profiler stopped in %.1fs", time.monotonic() - t0)
 
     def print_mtp_statistics(self):
         if self.scheduler.spec_stats is not None:
@@ -325,6 +460,19 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
+        if envs.ATOM_ENABLE_PREFILL_DELAYER:
+            from atom.model_engine.prefill_delayer import PrefillDelayer
+
+            self.scheduler.set_prefill_delayer(
+                PrefillDelayer(
+                    dp_size=config.parallel_config.data_parallel_size,
+                    cpu_group=self.dp_group,
+                    max_delay_passes=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES,
+                    max_delay_ms=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_MS,
+                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                )
+            )
+
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
         dp_size = config.parallel_config.data_parallel_size
@@ -336,6 +484,10 @@ class DPEngineCoreProc(EngineCore):
 
         self.dp_rank = dp_rank
         self.dp_group = config.parallel_config.stateless_init_dp_group()
+        # NOTE: PrefillDelayer attachment lives in __init__ (after
+        # super().__init__ creates self.scheduler) — not here. This
+        # function runs during super().__init__, before self.scheduler
+        # exists.
 
     def exit(self):
         super().exit()
@@ -344,73 +496,67 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
-        while True:
-            shutdown = shutdown or self.pull_and_process_input_queue()
-
-            local_is_prefill, local_num_tokens = self.scheduler.get_next_batch_info()
-            local_unfinished = not self.scheduler.is_finished()
-
-            (
-                global_has_prefill,
-                global_max_tokens,
-                global_has_unfinished,
-                global_shutdown,
-            ) = self._sync_dp_state(
-                local_is_prefill, local_num_tokens, local_unfinished, shutdown
-            )
-
-            if global_shutdown and not global_has_unfinished:
-                logger.info(
-                    f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
+        try:
+            while True:
+                self.utility_handler.process_queue(self.utility_queue, self)
+                shutdown = shutdown or self.pull_and_process_input_queue()
+                local_unfinished = (
+                    not self.scheduler.is_finished()
+                    and not self._is_rl_weights_offloaded
                 )
-                break
 
-            if not global_has_unfinished and not self.engines_running:
-                self.engines_running = False
-                continue
-
-            if global_has_prefill and not local_is_prefill:
-                # We must do dummy prefill to sync here
-                # Since we want to split mori output in moe, we need to make dp all run prefill or all run decode
-                logger.info(
-                    f"{self.label}: Running dummy prefill ({global_max_tokens} tokens) "
-                    f"to sync with other DP ranks doing prefill"
+                global_has_unfinished, global_shutdown, global_offloaded = (
+                    self._sync_dp_state(
+                        local_unfinished, shutdown, self._is_rl_weights_offloaded
+                    )
                 )
-                self._execute_dummy_prefill(global_max_tokens)
-            else:
+
+                if global_shutdown and not global_has_unfinished:
+                    logger.info(
+                        f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
+                    )
+                    break
+
+                if global_offloaded:
+                    time.sleep(0.01)
+                    continue
+
+                if not global_has_unfinished and not self.engines_running:
+                    self.engines_running = False
+                    continue
+
                 executed = self._process_engine_step()
                 if not executed:
                     self._execute_dummy_batch()
 
-            self.engines_running = global_has_unfinished
+                self.engines_running = global_has_unfinished
+        finally:
+            # Isolate the final publish so a publisher hiccup cannot skip
+            # shutdown_kv_events() (which closes the sender thread/socket).
+            try:
+                self.scheduler.publish_kv_events()
+            except Exception:
+                logger.exception("KV event publish during DP shutdown failed")
+            self.scheduler.shutdown_kv_events()
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)
 
-    def _execute_dummy_prefill(self, num_tokens: int):
-        """Execute dummy prefill batch to sync with other DP ranks doing prefill."""
-        return self.runner_mgr.call_func(
-            "dummy_prefill_execution", num_tokens, wait_out=True
-        )
-
     def _sync_dp_state(
         self,
-        local_is_prefill: bool,
-        local_num_tokens: int,
         local_has_unfinished: bool,
         local_shutdown: bool = False,
-    ) -> tuple[bool, int, bool, bool]:
+        local_offloaded: bool = False,
+    ) -> tuple[bool, bool, bool]:
         if self._shutting_down:
-            return (local_is_prefill, local_num_tokens, local_has_unfinished, True)
+            return local_has_unfinished, True, local_offloaded
 
         try:
-            # Pack all state: [is_prefill, num_tokens, has_unfinished, shutdown]
             state_tensor = torch.tensor(
                 [
-                    1 if local_is_prefill else 0,
-                    local_num_tokens,
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
+                    1 if local_offloaded else 0,
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -418,21 +564,14 @@ class DPEngineCoreProc(EngineCore):
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
-            global_has_prefill = state_tensor[0].item() == 1
-            global_max_tokens = state_tensor[1].item()
-            global_has_unfinished = state_tensor[2].item() == 1
-            global_shutdown = state_tensor[3].item() == 1
-            return (
-                global_has_prefill,
-                global_max_tokens,
-                global_has_unfinished,
-                global_shutdown,
-            )
+            global_has_unfinished = state_tensor[0].item() == 1
+            global_shutdown = state_tensor[1].item() == 1
+            global_offloaded = state_tensor[2].item() == 1
+            return global_has_unfinished, global_shutdown, global_offloaded
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
-            # If sync fails, assume shutdown to prevent hang
             self._shutting_down = True
-            return (local_is_prefill, local_num_tokens, local_has_unfinished, True)
+            return local_has_unfinished, True, local_offloaded
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:

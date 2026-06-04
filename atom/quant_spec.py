@@ -186,6 +186,93 @@ class QuarkParser(QuantConfigParser):
         )
 
 
+# -- Online quantization ----------------------------------------------------
+
+
+@register_quant_parser("online_quant")
+class QuarkOnlineParser(QuantConfigParser):
+    """Parser for Quark-style online ``quantization_config``."""
+
+    def parse(self, online_quant_config: dict) -> ParsedQuantConfig:
+        """Parse the user-facing online quantization dict and populate
+        ``online_global_qconfig_dict``, ``online_layer_qconfig_dict``,
+        and ``online_exclude_layers_list``.
+
+        Supported format strings:
+        - ``"ptpc_fp8"``  — per-tensor-per-channel FP8
+        - ``"mxfp4"``     — microscaling FP4 (block size 32)
+        """
+        if not isinstance(online_quant_config, dict):
+            raise TypeError("online_quant_config must be a dict parsed from JSON.")
+
+        SCHEME_MAP = {
+            "ptpc": QuantType.per_Token,
+        }
+
+        def _parse_online_quant_format(quant_format_str: str) -> LayerQuantConfig:
+            quant_format_str = quant_format_str.strip().lower()
+            quant_type = None
+            dtype_str = None
+
+            if quant_format_str.startswith("mx"):
+                quant_type = QuantType.per_1x32
+                dtype_str = quant_format_str[2:]
+            else:
+                parts = quant_format_str.split("_", 1)
+                if len(parts) == 2 and parts[0] in SCHEME_MAP:
+                    quant_type = SCHEME_MAP[parts[0]]
+                    dtype_str = parts[1]
+                else:
+                    raise ValueError(
+                        f"Unsupported online quant format: '{quant_format_str}'. "
+                        f"Expected '<scheme>_<dtype>' (e.g. ptpc_fp8) or 'mx<dtype>' (e.g. mxfp4)."
+                    )
+
+            dtype_str = dtype_str.split("_")[0]
+            if dtype_str.endswith("4"):
+                dtype_str += "x2"
+            quant_dtype = d_dtypes.get(dtype_str)
+            if quant_dtype is None:
+                raise ValueError(
+                    f"Unsupported online quant dtype: '{dtype_str}' "
+                    f"(from '{quant_format_str}')"
+                )
+
+            return LayerQuantConfig(
+                quant_type=quant_type,
+                quant_dtype=quant_dtype,
+                is_dynamic=True,
+                quant_method="quark",
+            )
+
+        global_quant_str = online_quant_config.get("global_quant_config", "")
+        if global_quant_str:
+            online_global_qconfig_dict = _parse_online_quant_format(global_quant_str)
+        else:
+            online_global_qconfig_dict = LayerQuantConfig()
+
+        layer_quant_dict = online_quant_config.get("layer_quant_config", {})
+        layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
+        if isinstance(layer_quant_dict, dict):
+            for layer_pattern, quant_str in layer_quant_dict.items():
+                layer_pattern_specs.append(
+                    (layer_pattern, _parse_online_quant_format(quant_str))
+                )
+
+        exclude_layers = online_quant_config.get("exclude_layer", [])
+        if isinstance(exclude_layers, str):
+            online_exclude_layers_list = [exclude_layers] if exclude_layers else []
+        elif isinstance(exclude_layers, list):
+            online_exclude_layers_list = exclude_layers
+        else:
+            online_exclude_layers_list = []
+        return ParsedQuantConfig(
+            global_spec=online_global_qconfig_dict,
+            layer_pattern_specs=layer_pattern_specs,
+            exclude_layers=online_exclude_layers_list,
+        )
+
+
 # -- Generic (compressed-tensors, GPTQ, AWQ, …) ----------------------------
 
 
@@ -223,11 +310,13 @@ class GenericParser(QuantConfigParser):
         is_dynamic = hf_quant_config.get("is_dynamic", True)
         # Each quantizer uses a different key for excluded layers:
         # Quark -> "exclude", compressed-tensors -> "ignore",
-        # gpt-oss/HF transformers -> "modules_to_not_convert"
+        # gpt-oss/HF transformers -> "modules_to_not_convert",
+        # MiMo-V2-Flash/HF transformers -> "ignored_layers"
         exclude = list(
             hf_quant_config.get("ignore")
             or hf_quant_config.get("modules_to_not_convert")
             or hf_quant_config.get("exclude")
+            or hf_quant_config.get("ignored_layers")
             or []
         )
 

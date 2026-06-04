@@ -158,7 +158,7 @@ jobs:
         run: |
           LOG_FILE="gpu_load_test.log"
           HOSTNAME=$(hostname)
-          LOAD_COUNT=$(grep -c "\[LOAD DONE\]" "$LOG_FILE" 2>/dev/null || echo 0)
+          LOAD_COUNT=$(grep -c "\[LOAD DONE\]" "$LOG_FILE" 2>/dev/null) || LOAD_COUNT=0
 
           # Start summary
           {

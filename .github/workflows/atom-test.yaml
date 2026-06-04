@@ -21,13 +21,19 @@ on:
         required: false
         default: 'main'
         type: string
+      atom_base_image:
+        description: 'Docker image used as the ATOM test base image'
+        required: false
+        default: 'rocm/atom-dev:latest'
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keep scheduled main runs from blocking push-triggered validation.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  ATOM_BASE_IMAGE: rocm/atom-dev:latest
+  ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)
@@ -46,7 +52,7 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' }}
         uses: actions/checkout@v6
 
-      - name: Download and check pre-checkin signal
+      - name: Wait for Pre Checkin workflow
         if: ${{ github.event_name != 'workflow_dispatch' }}
         run: bash ./.github/scripts/check_signal.sh
         env:
@@ -59,61 +65,146 @@ jobs:
     name: Download aiter wheel
     runs-on: ubuntu-latest
     steps:
-      - name: Find and download latest aiter wheel
+      - name: Prefer latest main aiter wheel manifest and fallback to artifact
         run: |
           set -euo pipefail
-          echo "=== Finding latest aiter-whl-main artifact from ROCm/aiter ==="
+          echo "=== Trying latest main aiter wheel manifest from S3 first ==="
 
+          S3_MAIN_MANIFEST_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json"
           API_URL="https://api.github.com"
           AUTH_HEADER="Authorization: token ${{ secrets.GITHUB_TOKEN }}"
           AITER_TEST_WORKFLOW_ID=179476100
 
-          RUNS=$(curl -s -H "$AUTH_HEADER" \
-            "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
-
           ARTIFACT_ID=""
           ARTIFACT_NAME=""
-          for RUN_ID in $(echo "$RUNS" | jq -r '.workflow_runs[].id'); do
-            ARTIFACT_JSON=$(curl -s -H "$AUTH_HEADER" \
-              "$API_URL/repos/ROCm/aiter/actions/runs/$RUN_ID/artifacts" \
-              | jq '[.artifacts[] | select(.name | startswith("aiter-whl-main")) | select(.expired == false)] | first')
+          ARTIFACT_RUN_ID=""
+          ARTIFACT_RUN_SHA=""
+          ARTIFACT_RUN_CREATED_AT=""
 
-            if [ "$ARTIFACT_JSON" != "null" ] && [ -n "$ARTIFACT_JSON" ]; then
-              ARTIFACT_ID=$(echo "$ARTIFACT_JSON" | jq -r '.id')
-              ARTIFACT_NAME=$(echo "$ARTIFACT_JSON" | jq -r '.name')
-              echo "Found artifact in run $RUN_ID: $ARTIFACT_NAME (ID: $ARTIFACT_ID)"
-              break
+          resolve_download_url() {
+            python3 -c 'import sys
+            from urllib.parse import quote, unquote, urlsplit, urlunsplit
+            parts = urlsplit(sys.argv[1])
+            encoded_path = "/".join(quote(unquote(segment), safe="") for segment in parts.path.split("/"))
+            print(urlunsplit((parts.scheme, parts.netloc, encoded_path, parts.query, parts.fragment)))' "$1"
+          }
+
+          find_latest_artifact() {
+            local runs_json artifact_json run_id
+
+            if [ -n "$ARTIFACT_ID" ] && [ "$ARTIFACT_ID" != "null" ]; then
+              return 0
             fi
-          done
 
-          if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
-            echo "ERROR: No aiter-whl-main artifact found in recent Aiter Test runs"
-            exit 1
+            echo "=== Finding latest aiter-whl-* artifact from ROCm/aiter ==="
+            runs_json=$(curl -fsSL -H "$AUTH_HEADER" \
+              "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
+
+            for run_id in $(echo "$runs_json" | jq -r '.workflow_runs[].id'); do
+              artifact_json=$(curl -fsSL -H "$AUTH_HEADER" \
+                "$API_URL/repos/ROCm/aiter/actions/runs/$run_id/artifacts" \
+                | jq '[.artifacts[] | select(.name | startswith("aiter-whl-")) | select(.expired == false)] | sort_by(.created_at) | last')
+
+              if [ "$artifact_json" != "null" ] && [ -n "$artifact_json" ]; then
+                ARTIFACT_ID=$(echo "$artifact_json" | jq -r '.id')
+                ARTIFACT_NAME=$(echo "$artifact_json" | jq -r '.name')
+                ARTIFACT_RUN_ID="$run_id"
+                ARTIFACT_RUN_SHA=$(echo "$runs_json" | jq -r --arg run_id "$run_id" '.workflow_runs[] | select((.id | tostring) == $run_id) | .head_sha')
+                ARTIFACT_RUN_CREATED_AT=$(echo "$runs_json" | jq -r --arg run_id "$run_id" '.workflow_runs[] | select((.id | tostring) == $run_id) | .created_at')
+                echo "Found artifact in run $ARTIFACT_RUN_ID: $ARTIFACT_NAME (ID: $ARTIFACT_ID, SHA: $ARTIFACT_RUN_SHA)"
+                return 0
+              fi
+            done
+
+            return 1
+          }
+
+          download_from_s3_manifest() {
+            local manifest_file manifest_fetch_url manifest_branch manifest_timestamp manifest_commit wheel_name wheel_url resolved_wheel_url
+
+            mkdir -p aiter-whl
+            rm -f aiter-whl/amd_aiter*.whl
+
+            manifest_file=$(mktemp)
+            trap 'rm -f "$manifest_file"' RETURN
+            manifest_fetch_url="${S3_MAIN_MANIFEST_URL}?ts=$(date +%s)"
+            curl -fsSL -H "Cache-Control: no-cache" "$manifest_fetch_url" -o "$manifest_file" || return 1
+
+            manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
+            manifest_timestamp=$(jq -r '.timestamp // empty' "$manifest_file")
+            manifest_commit=$(jq -r '.commit // empty' "$manifest_file")
+            wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
+            wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+
+            if [ "$manifest_branch" != "main" ] || [ -z "$manifest_timestamp" ] || [ -z "$manifest_commit" ] || [ -z "$wheel_name" ] || [ -z "$wheel_url" ]; then
+              echo "Invalid latest main wheel manifest"
+              return 1
+            fi
+
+            if find_latest_artifact; then
+              if [ -n "$ARTIFACT_RUN_SHA" ] && [ "$manifest_commit" != "$ARTIFACT_RUN_SHA" ]; then
+                if [ -n "$ARTIFACT_RUN_CREATED_AT" ] && [[ "$manifest_timestamp" < "$ARTIFACT_RUN_CREATED_AT" ]]; then
+                  echo "Manifest commit $manifest_commit is older than latest artifact run $ARTIFACT_RUN_ID ($ARTIFACT_RUN_SHA); treating manifest as stale"
+                  return 1
+                fi
+                echo "Manifest commit $manifest_commit differs from latest artifact run $ARTIFACT_RUN_ID ($ARTIFACT_RUN_SHA), but manifest timestamp is not older"
+              fi
+            else
+              echo "No GitHub fallback artifact found while checking manifest freshness"
+            fi
+
+            resolved_wheel_url=$(resolve_download_url "$wheel_url")
+
+            echo "Selected latest main wheel manifest: $S3_MAIN_MANIFEST_URL"
+            echo "Manifest timestamp: $manifest_timestamp"
+            echo "Manifest commit: $manifest_commit"
+            echo "Manifest wheel: $wheel_name"
+            echo "Downloading manifest-selected wheel: $resolved_wheel_url"
+            curl -fsSL "$resolved_wheel_url" -o "aiter-whl/$wheel_name" || return 1
+            echo "Downloaded wheel from manifest: aiter-whl/$wheel_name"
+
+            rm -f "$manifest_file"
+            trap - RETURN
+          }
+
+          download_from_artifact() {
+            echo "=== Falling back to latest aiter-whl-* artifact from ROCm/aiter ==="
+            find_latest_artifact || {
+              echo "ERROR: No aiter-whl-* artifact found in recent Aiter Test runs"
+              return 1
+            }
+
+            mkdir -p aiter-whl
+            rm -f aiter-whl/amd_aiter*.whl
+            curl -fsSL -H "$AUTH_HEADER" \
+              "$API_URL/repos/ROCm/aiter/actions/artifacts/$ARTIFACT_ID/zip" \
+              -o aiter-whl.zip
+            unzip -o aiter-whl.zip -d aiter-whl
+            rm -f aiter-whl.zip
+          }
+
+          if download_from_s3_manifest; then
+            echo "Using wheel from S3 main manifest"
+          else
+            echo "Main wheel manifest download failed, falling back to GitHub artifact"
+            download_from_artifact
           fi
-
-          echo "=== Downloading artifact ==="
-          mkdir -p aiter-whl
-          curl -s -L -H "$AUTH_HEADER" \
-            "$API_URL/repos/ROCm/aiter/actions/artifacts/$ARTIFACT_ID/zip" \
-            -o aiter-whl.zip
-          unzip -o aiter-whl.zip -d aiter-whl
-          rm -f aiter-whl.zip
 
           AITER_WHL=$(ls -t aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
           if [ -z "$AITER_WHL" ]; then
-            echo "ERROR: No amd_aiter wheel found in artifact"
-            ls -la aiter-whl/
+            echo "ERROR: No amd_aiter wheel available after S3/artifact attempts"
+            ls -la aiter-whl/ || true
             exit 1
           fi
 
-          echo "Downloaded wheel: $AITER_WHL"
+          echo "Selected wheel: $AITER_WHL"
 
       - name: Upload aiter wheel
         uses: actions/upload-artifact@v4
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
-          retention-days: 1
+          retention-days: 7
 
   load-test-models:
     name: Load test model configs
@@ -147,7 +238,7 @@ jobs:
 
   atom-test:
     needs: [download_aiter_wheel, load-test-models]
-    name: ATOM Test
+    name: Accuracy
     strategy:
       fail-fast: false
       matrix:
@@ -189,11 +280,47 @@ jobs:
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
+      - name: Resolve immutable native dashboard image
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if RESOLUTION_JSON="$(
+            python3 .github/scripts/resolve_atom_image.py \
+              --repository rocm/atom-dev \
+              --reference-tag latest \
+              --image-family native
+          )"; then
+            RESOLVED_ATOM_IMAGE="$(
+              RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          PY
+            )"
+            echo "Resolved native dashboard image: ${RESOLVED_ATOM_IMAGE}"
+          else
+            echo "::error::Failed to resolve ${ATOM_BASE_IMAGE} to an immutable reference for dashboard-uploading native runs."
+            exit 1
+          fi
+          echo "RESOLVED_ATOM_BASE_IMAGE=${RESOLVED_ATOM_IMAGE}" >> "$GITHUB_ENV"
+          echo "ATOM_DASHBOARD_DOCKER_IMAGE=${RESOLVED_ATOM_IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Pull immutable native dashboard image
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+        run: |
+          echo "Pulling immutable native dashboard image: ${RESOLVED_ATOM_BASE_IMAGE}"
+          docker pull "${RESOLVED_ATOM_BASE_IMAGE}"
+
       - name: Generate Dockerfile for forked repo
         if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
+          FROM ${{ env.ATOM_BASE_IMAGE }}
           RUN pip install -U lm-eval[api]
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
@@ -226,6 +353,10 @@ jobs:
           name: aiter-whl
           path: /tmp/aiter-whl
 
+      - name: Set HF token for predownload runner
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
+
       - name: Start CI container
         run: |
           echo "Clean up containers..."
@@ -248,12 +379,19 @@ jobs:
           # Write env_vars via env block (avoids expression injection)
           printenv MODEL_ENV_VARS | grep -v '^$' > /tmp/env_file.txt || true
 
-          IMAGE_TAG=${{ env.ATOM_BASE_IMAGE }}
+          IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
           echo "Starting container with image: $IMAGE_TAG"
           echo "Model-specific environment variables:"
           cat /tmp/env_file.txt
 
-          docker run -dt --pull always --device=/dev/kfd $DEVICE_FLAG \
+          PULL_FLAG=""
+          if [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
+            PULL_FLAG=""
+          elif [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+            PULL_FLAG="--pull always"
+          fi
+
+          docker run -dt $PULL_FLAG --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           $MODEL_MOUNT \
           -w /workspace \
@@ -262,6 +400,7 @@ jobs:
           --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
+          -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \
           --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
@@ -279,6 +418,10 @@ jobs:
       - name: Check shm size
         run: |
           docker exec "$CONTAINER_NAME" df -h /dev/shm
+
+      - name: Collect GPU info (inside container)
+        id: gpu-info
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
         run: |
@@ -326,16 +469,32 @@ jobs:
           "
 
       - name: Download models
+        timeout-minutes: 150
         run: |
+          set -euo pipefail
           if [ -d "/models" ]; then
-            echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
-            if ! docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
+            model_dir="/models/${{ matrix.model_path }}"
+            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            if ! docker exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${{ matrix.model_path }}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+              "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
           else
             echo "/models directory not found, skipping model download"
           fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "30m"
+          MODEL_LOCK_WAIT_SECONDS: "1800"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Run ATOM simple inference
         # Skip simple inference; accuracy test already validates correctness
@@ -392,6 +551,9 @@ jobs:
       
       - name: Run ATOM accuracy test
         timeout-minutes: 30
+        env:
+          MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
+          CLIENT_COMMAND: ${{ matrix.client_command || '' }}
         run: |
           set -euo pipefail
           echo ""
@@ -401,15 +563,31 @@ jobs:
           else
             model_path="${{ matrix.model_path }}"
           fi
-          docker exec "$CONTAINER_NAME" bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
-          "
+          # Pipe via stdin so container bash parses shell quoting in extraArgs
+          # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
+          echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
+            docker exec -i "$CONTAINER_NAME" bash -l
           echo ""
           echo "========== Running accuracy test =========="
-          docker exec "$CONTAINER_NAME" bash -lc "
+          docker exec \
+            -e CLIENT_COMMAND="${CLIENT_COMMAND}" \
+            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            "$CONTAINER_NAME" bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
       
+      - name: Dump server log
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" cat /tmp/atom_server.log 2>/dev/null || true
+
+      - name: Dump client log
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" cat /tmp/atom_client.log 2>/dev/null || true
+
       - name: Check accuracy test results
         if: success()
         env:

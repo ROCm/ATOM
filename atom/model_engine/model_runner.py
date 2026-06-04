@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import gzip
 import logging
 import math
 import os
@@ -13,7 +12,7 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
-from aiter import destroy_dist_env, dtypes, init_dist_env
+from aiter import destroy_dist_env, init_dist_env
 from aiter.dist.parallel_state import (
     get_dp_group,
     get_pp_group,
@@ -21,7 +20,7 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
-from atom.config import Config, KVCacheTensor, set_current_atom_config
+from atom.config import Config, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
@@ -34,6 +33,14 @@ from atom.utils import (
     get_hf_text_config,
     init_exit_handler,
     resolve_obj_by_qualname,
+)
+from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.utils.forward_context import get_kvconnector
+from atom.utils.tbo import (
+    UBatchWrapper,
+    local_tbo_precompute,
+    maybe_create_ubatch_slices,
+    sync_dp_for_tbo,
 )
 from atom.utils.forward_context import (
     Context,
@@ -55,12 +62,16 @@ support_model_arch_dict = {
     "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
+    "DeepseekV4ForCausalLM": "atom.models.deepseek_v4.DeepseekV4ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
+    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
+    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2_flash.MiMoV2FlashForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -77,7 +88,9 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        # self.is_deferred_out = False
+        # Deferred output is disabled when running in P/D disaggregation mode
+        # (kv_transfer_config is set), enabled otherwise.
+        # TODO: In P/D disaggregation mode, if have issue, we can disable it
         self.is_deferred_out = True
 
         self.runner = runner
@@ -91,7 +104,7 @@ class tokenIDProcessor:
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
 
-        self.async_copy_stream = torch.cuda.Stream()
+        self.async_copy_stream = torch.cuda.Stream(runner.device)
         self.default_num_rejected_tokens = torch.zeros(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
@@ -103,13 +116,20 @@ class tokenIDProcessor:
         cpu_tensor_handle,
         data_ready: torch.cuda.Event,
         copy_done: Optional[torch.cuda.Event] = None,
+        gpu_logprobs: Optional[torch.Tensor] = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
+            cpu_logprobs = (
+                gpu_logprobs.to("cpu", non_blocking=True)
+                if gpu_logprobs is not None
+                else None
+            )
             copy_done.record(self.async_copy_stream)
         cpu_tensor_handle.append((cpu_tensor, copy_done))
+        self.logprobs_cpu.append(cpu_logprobs)
 
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
@@ -117,6 +137,17 @@ class tokenIDProcessor:
         cpu_tensor, event = cpu_tensor_handle.pop(0)
         event.synchronize()
         return cpu_tensor
+
+    def recv_logprobs(self) -> Optional[list[float]]:
+        """Pop and return the earliest logprobs from the async copy queue.
+        Must be called after recv_async_output (which synchronizes the event).
+        """
+        if not self.logprobs_cpu:
+            return None
+        logprob_tensor = self.logprobs_cpu.pop(0)
+        if logprob_tensor is not None:
+            return logprob_tensor.tolist()
+        return None
 
     def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
         default_stream = torch.cuda.current_stream()
@@ -146,29 +177,45 @@ class tokenIDProcessor:
         #   prev acc decode have 0 rej, 1 bonus
         #   prev rej decode have 1 rej, 0 bonus
         # It is clear that only rejected number is not sufficient for all status tracking, bonus number is also needed.
-        self.send_to_cpu_async(num_rejected, self.rejected_tokens_cpu, data_ready)
-        self.send_to_cpu_async(num_bonus, self.bonus_tokens_cpu, data_ready)
+        # Single Event for both copies (vs. per-tensor send_to_cpu_async) so the
+        # consumer pops one queue entry and synchronizes once instead of twice.
+        copy_done = torch.cuda.Event()
+        with torch.cuda.stream(self.async_copy_stream):
+            data_ready.wait(stream=self.async_copy_stream)
+            cpu_num_rejected = num_rejected.to("cpu", non_blocking=True)
+            cpu_num_bonus = num_bonus.to("cpu", non_blocking=True)
+            copy_done.record(self.async_copy_stream)
+        self.pending_mtp_status_copies.append(
+            (cpu_num_rejected, cpu_num_bonus, copy_done)
+        )
 
     def recv_mtp_status_async(
         self,
     ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        if not self.rejected_tokens_cpu:
+        if not self.pending_mtp_status_copies:
             return None, None
-        return (
-            self.recv_async_output(self.rejected_tokens_cpu).numpy(),
-            self.recv_async_output(self.bonus_tokens_cpu).numpy(),
+        cpu_num_rejected, cpu_num_bonus, copy_done = self.pending_mtp_status_copies.pop(
+            0
         )
+        copy_done.synchronize()
+        return cpu_num_rejected.numpy(), cpu_num_bonus.numpy()
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
+        self.logprobs_cpu: list[Optional[torch.Tensor]] = []
 
         self.prev_batch: Optional[ScheduledBatch] = None
+        self.prev_token_ids: Optional[torch.Tensor] = None
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: Optional[torch.Tensor] = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
-        self.rejected_tokens_cpu: list[torch.Tensor] = []
-        self.bonus_tokens_cpu: list[torch.Tensor] = []
+        # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event) — async
+        # D2H copies fired by send_mtp_status_to_cpu_async, drained by
+        # recv_mtp_status_async after the event syncs.
+        self.pending_mtp_status_copies: list[
+            tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
+        ] = []
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
@@ -201,7 +248,8 @@ class tokenIDProcessor:
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
-    ) -> tuple[list[int], list[tuple[int, ...]]]:
+        sampled_logprobs: Optional[torch.Tensor] = None,
+    ) -> tuple[dict[int, tuple[int, ...]], Optional[dict[int, float]]]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
@@ -209,25 +257,51 @@ class tokenIDProcessor:
                 processed = self._batch_process_token_ids(token_ids)
             else:
                 processed = [(tid,) for tid in token_ids]
-            return req_ids, processed
+            ret = dict(zip(req_ids, processed))
+            ret[-1] = 0  # is_deferred_out flag
+            logprobs_map = None
+            if sampled_logprobs is not None:
+                logprobs = sampled_logprobs.tolist()
+                logprobs_map = {
+                    seq_id: logprob for seq_id, logprob in zip(req_ids, logprobs)
+                }
+            return ret, logprobs_map
 
-        token_ids = self.recv_async_output(self.token_ids_cpu).tolist()
-        self.send_to_cpu_async(sampled_token_ids, self.token_ids_cpu, sync_event)
-        req_ids_out: list[int] = []
-        processed_out: list[tuple[int, ...]] = []
+        token_ids = self.recv_async_output(self.token_ids_cpu)
+        logprobs = self.recv_logprobs()
+        self.send_to_cpu_async(
+            sampled_token_ids,
+            self.token_ids_cpu,
+            sync_event,
+            gpu_logprobs=sampled_logprobs,
+        )
+        token_id_dict = {}
+        logprobs_map = None
         self.prev_req_ids = None
         if self.prev_batch is not None:
             self.prev_req_ids = self.prev_batch.req_ids
-            req_ids_out = self.prev_req_ids
-            if token_ids and isinstance(token_ids[0], list):
-                processed_out = self._batch_process_token_ids(token_ids)
+            token_ids_list = (
+                token_ids.tolist() if hasattr(token_ids, "tolist") else token_ids
+            )
+            if token_ids_list and isinstance(token_ids_list[0], list):
+                processed = self._batch_process_token_ids(token_ids_list)
             else:
-                processed_out = [(tid,) for tid in token_ids]
+                processed = [(tid,) for tid in token_ids_list]
+            token_id_dict = dict(zip(self.prev_req_ids, processed))
+            if logprobs is not None:
+                logprobs_map = {
+                    seq_id: logprob
+                    for seq_id, logprob in zip(self.prev_req_ids, logprobs)
+                }
+        else:
+            # first time, no previous tokens
+            token_ids = {}
+            logprobs_map = None
 
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
-
-        return req_ids_out, processed_out
+        token_id_dict[-1] = 1
+        return token_id_dict, logprobs_map
 
     def get_token_locations(
         self, batch: ScheduledBatch
@@ -275,7 +349,8 @@ class tokenIDProcessor:
 
         Carefully handles the `prev_sampled_token_ids` which can be cached
         from the previous engine iteration, in which case those tokens on the
-        GPU need to be copied into the corresponding slots into input_ids."""
+        GPU need to be copied into the corresponding slots into input_ids.
+        """
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
         total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
@@ -300,6 +375,15 @@ class tokenIDProcessor:
             if self.use_spec:
                 token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
 
+            self.input_ids.np[:total_tokens_decode] = token_ids
+            return self.input_ids.copy_to_gpu(total_tokens_decode)
+
+        # PD consumer first decode: no prior prefill step initialized
+        # prev_batch, so use scheduled_tokens directly for this step.
+        if self.prev_batch is None:
+            token_ids = scheduled_tokens[
+                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
+            ]
             self.input_ids.np[:total_tokens_decode] = token_ids
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
@@ -423,12 +507,16 @@ class tokenIDProcessor:
             else:
                 # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
                 if num_new_tokens > 0:
-                    new_token_ids = scheduled_tokens[new_curr_indices].reshape(
+                    # Convert seq-level indices to token-level indices
+                    new_token_indices = (
+                        new_curr_indices[:, None] * tokens_per_seq
+                        + np.arange(tokens_per_seq)
+                    ).flatten()
+                    new_token_ids = scheduled_tokens[new_token_indices].reshape(
                         num_new_seqs, tokens_per_seq
                     )
                     if self.use_spec:
                         # MTP mode: combine scheduled_tokens and draft_tokens
-                        # For new_decode_front=False, use new_curr_indices to get the right sequences
                         draft_tokens = batch.scheduled_spec_decode_tokens[
                             new_curr_indices
                         ]
@@ -483,33 +571,18 @@ class ModelRunner:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
+        self.use_v4 = self.is_deepseek_v4()
+        rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
+        self.use_mrope = "mrope_section" in rope_parameters
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
-        # Calculate local device rank considering both TP and DP
-        # When data parallelism is enabled on the same node, different DP ranks
-        # need to use different sets of GPUs
-        dp_rank_local = config.parallel_config.data_parallel_rank_local
-        if dp_rank_local is None:
-            dp_rank_local = 0
-        local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
-        num_gpus = torch.cuda.device_count()
-        if local_device_rank >= num_gpus:
-            raise ValueError(
-                f"Calculated local_device_rank={local_device_rank} exceeds available GPUs ({num_gpus}). "
-            )
-
-        device = torch.device(f"cuda:{local_device_rank}")
-        logger.info(
-            f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, local_device_rank={local_device_rank}, device={device}"
-        )
-        self.device = device
-
-        # Initialize profiler for this rank
+        # Initialize profiler for this rank (before _setup_device_and_distributed
+        # so that dp config fields are still at their original values)
         self.profiler = None
         self.profiler_dir = None
         if config.torch_profiler_dir is not None:
-            # Create rank-specific profiler directory
+            dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
             if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
                 rank_name = f"dp{dp_rank_local}_tp{rank}"
             else:
@@ -517,23 +590,10 @@ class ModelRunner:
             self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
+        self._setup_device_and_distributed(rank, config)
+
         self.graph_bs = [0]  # for eager fallback
 
-        torch.cuda.set_device(self.device)
-        os.environ["MASTER_ADDR"] = self.config.master_addr
-        os.environ["MASTER_PORT"] = str(self.config.port)
-        distributed_init_method = get_distributed_init_method(
-            config.parallel_config.data_parallel_master_ip,
-            config.parallel_config.data_parallel_base_port,
-        )
-        init_dist_env(
-            config.tensor_parallel_size,
-            rankID=rank,
-            backend="nccl",
-            distributed_init_method=distributed_init_method,
-            data_parallel_size=config.parallel_config.data_parallel_size,
-            data_parallel_rank=config.parallel_config.data_parallel_rank,
-        )
         init_exit_handler(self)
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
@@ -542,20 +602,23 @@ class ModelRunner:
             self.block_size,
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
+            use_v4=self.use_v4,
         )
-        if self.config.speculative_config and get_pp_group().is_last_rank:
-            from atom.utils.backends import set_model_tag
+        use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
+        self.num_spec_tokens = (
+            self.config.speculative_config.num_speculative_tokens if use_spec else 0
+        )
+        self.eagle3_mode = (
+            self.config.speculative_config is not None
+            and self.config.speculative_config.method == "eagle3"
+        )
 
-            with set_model_tag("drafter"):
-                self.drafter = EagleProposer(self.config, self.device, self)
-            self.rejection_sampler = RejectionSampler()
-            self.mtp_total_draft_tokens = 0
-            self.mtp_total_accepted_tokens = 0
-        self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.use_aux_hidden_state_outputs = False
+        self._aux_hidden_states = None
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
-            hasattr(self, "drafter"),
+            use_spec,
             self.num_spec_tokens,
         )
         self.sampler = Sampler()
@@ -572,22 +635,98 @@ class ModelRunner:
         # The model construction depends on quant_config,
         # so we must complete the remapping for layers before constructing the model.
         config.quant_config.remap_layer_name(
-            config.hf_config, getattr(model_class, "packed_modules_mapping", {})
+            config.hf_config,
+            packed_modules_mapping=getattr(model_class, "packed_modules_mapping", {}),
+            quant_exclude_name_mapping=getattr(
+                model_class, "quant_exclude_name_mapping", {}
+            ),
         )
         self.model = model_class(config)
+        fused_shared_expert_load_fn = None
+        if hasattr(self.model, "load_fused_expert_weights"):
+            fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
-        load_model(self.model, config.model, config.hf_config, config.load_dummy)
+        load_model(
+            self.model,
+            config.model,
+            config.hf_config,
+            config.load_dummy,
+            load_fused_expert_weights_fn=fused_shared_expert_load_fn,
+        )
         logger.info(f"Model load done: {config.model}")
 
-        if hasattr(self, "drafter"):
+        # Optional debug instrumentation; no-op when env vars unset.
+        # See atom/utils/debug_helper/.
+        from atom.utils.debug_helper import (
+            install_block_forward_hooks,
+            maybe_dump_weights_and_exit,
+        )
+
+        _n_fwd_hooks = install_block_forward_hooks(self.model)
+        if _n_fwd_hooks > 0:
+            logger.info(f"[ATOM_FWD_DUMP] {_n_fwd_hooks} Block forward hooks installed")
+        maybe_dump_weights_and_exit(self.model)
+
+        if self.config.speculative_config and get_pp_group().is_last_rank:
+            from atom.utils.backends import set_model_tag
+
+            torch.set_default_device(self.device)
+            with set_model_tag("drafter"):
+                self.drafter = EagleProposer(self.config, self.device, self)
+            self.rejection_sampler = RejectionSampler()
+            torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
+
+        if self.eagle3_mode and self.config.speculative_config.use_aux_hidden_state:
+            aux_ids = self.config.speculative_config.eagle3_aux_layer_ids
+            if not aux_ids and hasattr(
+                self.model, "get_eagle3_aux_hidden_state_layers"
+            ):
+                aux_ids = list(self.model.get_eagle3_aux_hidden_state_layers())
+            if aux_ids:
+                self.model.set_aux_hidden_state_layers(tuple(aux_ids))
+                self.use_aux_hidden_state_outputs = True
+                logger.info(f"Eagle3 aux hidden state layers: {aux_ids}")
+
         torch.set_default_device(self.device)
+        self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
         self.physical_block_size = self.attn_metadata_builder.block_size
+        # Sanity-check: any builder that allocates a per-request cache must
+        # have its model_type listed in `InputOutputProcessor`'s
+        # `per_req_cache_model_types` set; otherwise sequences will be
+        # constructed with `has_per_req_cache=False`, the BlockManager will
+        # never assign them a slot, and the builder will silently read
+        # tensor[-1] on first decode. Catch the misconfiguration up front
+        # rather than producing wrong outputs at inference time.
+        if self.attn_metadata_builder.compute_per_req_cache_bytes() > 0:
+            from atom.model_engine.llm_engine import (
+                InputOutputProcessor as _IOProc,
+            )
+
+            mt = self.config.hf_config.model_type
+            known = _IOProc._per_req_cache_model_types()  # noqa: SLF001
+            assert mt in known, (
+                f"Attention builder {type(self.attn_metadata_builder).__name__} "
+                f"reports per_req_cache_bytes>0 but model_type={mt!r} is not in "
+                f"InputOutputProcessor.per_req_cache_model_types ({sorted(known)}). "
+                "Add it to the set or sequences will not be assigned slots "
+                "(silent corruption)."
+            )
+        if config.enable_tbo:
+            dp_gather_scatter = (
+                config.enable_dp_attention and not config.enable_expert_parallel
+            )
+            self.model = UBatchWrapper(
+                self.model,
+                attn_metadata_builder=self.attn_metadata_builder,
+                dp_gather_scatter=dp_gather_scatter,
+            )
+            logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
@@ -626,9 +765,69 @@ class ModelRunner:
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
+        elif self.hf_text_config.model_type in (
+            "qwen3_next",
+            "qwen3_next_mtp",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+        ):
             return True
         return False
+
+    def is_deepseek_v4(self) -> bool:
+        # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
+        # `_CONFIG_REGISTRY` maps deepseek_v4 → deepseek_v3 (V4 reuses V3 schema).
+        # Use `architectures` (preserved by get_hf_config:567) instead. Covers
+        # both target (DeepseekV4ForCausalLM[NextN]) and draft (whose model_type
+        # SpeculativeConfig stamps as deepseek_v4_mtp).
+        arches = getattr(self.hf_text_config, "architectures", None) or []
+        if any("DeepseekV4" in str(a) for a in arches):
+            return True
+        return getattr(self.hf_text_config, "model_type", None) in (
+            "deepseek_v4",
+            "deepseek_v4_mtp",
+        )
+
+    def is_mimo_v2(self) -> bool:
+        if not hasattr(self.hf_text_config, "model_type"):
+            return False
+        elif self.hf_text_config.model_type in ("mimo_v2_flash"):
+            return True
+        return False
+
+    def _setup_device_and_distributed(self, rank: int, config: Config):
+        # Calculate local device rank considering both TP and DP
+        # When data parallelism is enabled on the same node, different DP ranks
+        # need to use different sets of GPUs
+        dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
+        local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
+        num_gpus = torch.cuda.device_count()
+        if local_device_rank >= num_gpus:
+            raise ValueError(
+                f"Calculated local_device_rank={local_device_rank} exceeds available GPUs ({num_gpus}). "
+            )
+
+        self.device = torch.device(f"cuda:{local_device_rank}")
+        logger.info(
+            f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, "
+            f"local_device_rank={local_device_rank}, device={self.device}"
+        )
+
+        torch.cuda.set_device(self.device)
+        os.environ["MASTER_ADDR"] = self.config.master_addr
+        os.environ["MASTER_PORT"] = str(self.config.port)
+        distributed_init_method = get_distributed_init_method(
+            config.parallel_config.data_parallel_master_ip,
+            config.parallel_config.data_parallel_base_port,
+        )
+        init_dist_env(
+            config.tensor_parallel_size,
+            rankID=rank,
+            backend="nccl",
+            distributed_init_method=distributed_init_method,
+            data_parallel_size=config.parallel_config.data_parallel_size,
+            data_parallel_rank=config.parallel_config.data_parallel_rank,
+        )
 
     def _make_buffer(
         self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
@@ -670,6 +869,8 @@ class ModelRunner:
         # 2. Release CUDA graphs
         if not self.enforce_eager:
             self.graphs = self.graph_pool = None  # type: ignore
+        if isinstance(self.model, UBatchWrapper):
+            self.model.tbo_graphs.clear()
         # 3. Release GPU tensors
         for attr in (
             "kv_cache",
@@ -713,18 +914,42 @@ class ModelRunner:
             output_prefix = os.path.join(self.profiler_dir, worker_name)
 
             def _on_trace_ready(prof):
+                import gzip as _gzip
+
                 # Use a short human-readable timestamp in file name.
                 ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
                 ms = int((time.time() % 1) * 1000)
                 output_path = f"{output_prefix}_ts_{ts}_{ms:03d}.pt.trace.json.gz"
                 tmp_json_path = output_path[:-3]
-                prof.export_chrome_trace(tmp_json_path)
-                with (
-                    open(tmp_json_path, "rb") as src,
-                    gzip.open(output_path, "wb") as dst,
-                ):
-                    dst.write(src.read())
-                os.remove(tmp_json_path)
+                try:
+                    t0 = time.monotonic()
+                    prof.export_chrome_trace(tmp_json_path)
+                    # Chunked gzip: read 64 MB at a time to avoid loading
+                    # the entire JSON (~30 GB) into memory at once.
+                    with (
+                        open(tmp_json_path, "rb") as src,
+                        _gzip.open(output_path, "wb") as dst,
+                    ):
+                        while chunk := src.read(64 * 1024 * 1024):
+                            dst.write(chunk)
+                    os.remove(tmp_json_path)
+                    sz = os.path.getsize(output_path)
+                    logger.info(
+                        "Rank %d: trace exported to %s (%.1f MB, %.1fs)",
+                        self.rank,
+                        output_path,
+                        sz / 1e6,
+                        time.monotonic() - t0,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Rank %d: failed to export trace to %s",
+                        self.rank,
+                        output_path,
+                    )
+                    for p in (tmp_json_path, output_path):
+                        if os.path.exists(p):
+                            os.remove(p)
 
             self.profiler = torch_profiler.profile(
                 activities=[
@@ -737,13 +962,31 @@ class ModelRunner:
                 on_trace_ready=_on_trace_ready,
             )
             self.profiler.__enter__()
+            logger.info(
+                "Rank %d: profiler started (detailed=%s, dir=%s)",
+                self.rank,
+                enable_detailed_profiling,
+                self.profiler_dir,
+            )
         return True
 
     def stop_profiler(self):
-        """Stop profiling for this rank"""
-        if self.profiler is not None:
+        """Stop profiling for this rank."""
+        if self.profiler is None:
+            return True
+        t0 = time.monotonic()
+        logger.info("Rank %d: stopping profiler...", self.rank)
+        try:
             self.profiler.__exit__(None, None, None)
+        except Exception:
+            logger.exception("Rank %d: profiler stop failed", self.rank)
+        finally:
             self.profiler = None
+        logger.info(
+            "Rank %d: profiler stop completed in %.1fs",
+            self.rank,
+            time.monotonic() - t0,
+        )
         return True
 
     def debug(self, *args: Any):
@@ -759,6 +1002,7 @@ class ModelRunner:
         if draft_bs is None:
             draft_bs = forward_context.context.graph_bs
         for i in range(self.drafter.mtp_k):
+            self.drafter._refresh_dp_metadata(forward_context, hidden_states.shape[0])
             hidden_states = self.drafter.model(
                 input_ids=torch.zeros(
                     hidden_states.shape[0],
@@ -774,18 +1018,24 @@ class ModelRunner:
             )
             if i == 0:
                 hidden_states = hidden_states[:draft_bs]
+                # pad_for_all_gather uses graph_bs * 1, consistent with
+                # ranks running propose
+                forward_context.attn_metadata.max_seqlen_q = 1
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
         # num_tokens_original = 1
-        mtp_factor = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
+        has_drafter = hasattr(self, "drafter")
+        mtp_k = self.drafter.mtp_k if has_drafter else 0
+        mtp_factor = mtp_k + 1
         num_tokens_original = mtp_factor
 
-        seq = Sequence([0] * num_tokens_original, block_size=self.block_size)
+        seq = Sequence([0] * num_tokens_original, block_size=self.block_size, id=-1)
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
         seq.block_table = [0]
 
+        spec_tokens = {seq.id: np.zeros(mtp_k, dtype=np.int32)} if mtp_k > 0 else None
         dummy_batch = ScheduledBatch(
             seqs={seq.id: seq},
             num_scheduled_tokens=np.array([num_tokens_original], dtype=np.int32),
@@ -794,34 +1044,39 @@ class ModelRunner:
             total_seqs_num=1,
             total_seqs_num_decode=1,
             is_dummy_run=True,
+            num_spec_step=mtp_k,
+            scheduled_spec_decode_tokens=spec_tokens,
         )
 
-        bs = self.prepare_inputs(dummy_batch)
-        self.forward_vars["input_ids"].gpu[:bs].zero_()
-        input_ids = self.forward_vars["input_ids"].gpu[:bs]
-
-        logits, hidden_states = self.run_model(input_ids)
-        self._run_dummy_drafter(hidden_states)
-
-        reset_forward_context()
+        self.forward(dummy_batch)
         logger.debug(
             f"{self.label}: dummy batch executed with {dummy_batch.total_tokens_num} tokens"
         )
         return True
 
-    def dummy_prefill_execution(self, num_tokens: int):
+    def dummy_prefill_execution(self, num_tokens: int, num_reqs: int = 1):
         """Execute dummy prefill batch for DP synchronization."""
-        if num_tokens <= 0:
-            num_tokens = 1
-        seq = Sequence([0] * num_tokens, block_size=self.block_size)
+        if num_reqs < 1:
+            num_reqs = 1
+        if num_tokens < num_reqs:
+            num_tokens = num_reqs
+        # Distribute tokens evenly across requests
+        base = num_tokens // num_reqs
+        remainder = num_tokens % num_reqs
+        tokens_per_seq = [base + (1 if i < remainder else 0) for i in range(num_reqs)]
+
+        seqs = {}
+        for t in tokens_per_seq:
+            seq = Sequence([0] * t, block_size=self.block_size)
+            seqs[seq.id] = seq
 
         dummy_batch = ScheduledBatch(
-            seqs={seq.id: seq},
-            num_scheduled_tokens=np.array([num_tokens], dtype=np.int32),
+            seqs=seqs,
+            num_scheduled_tokens=np.array(tokens_per_seq, dtype=np.int32),
             total_tokens_num=num_tokens,
             total_tokens_num_prefill=num_tokens,
-            total_seqs_num=1,
-            total_seqs_num_prefill=1,
+            total_seqs_num=num_reqs,
+            total_seqs_num_prefill=num_reqs,
             is_dummy_run=True,
         )
 
@@ -837,8 +1092,9 @@ class ModelRunner:
         reset_forward_context()
 
         logger.info(
-            f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens"
+            f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens, {num_reqs} reqs"
         )
+        # TODO: initialize KV connector during warmup
         return True
 
     def warmup_model(self):
@@ -850,7 +1106,10 @@ class ModelRunner:
             self.config.max_model_len,
         )
         dp_size = get_dp_group().world_size
-        warmup_max_tokens = max_num_batched_tokens // dp_size
+        if self.config.enable_dp_attention:
+            warmup_max_tokens = max_num_batched_tokens
+        else:
+            warmup_max_tokens = max_num_batched_tokens // dp_size
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -860,7 +1119,8 @@ class ModelRunner:
             if seq_len == 0:
                 seq_len = 1
             logger.warning(
-                f"{self.label}: DP size={dp_size} too large, warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
+                f"{self.label}: dp_size={dp_size}, dp_attn={self.config.enable_dp_attention}, "
+                f"warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
                 f"Using {num_seqs} seq with length {seq_len} for warmup."
             )
         else:
@@ -908,10 +1168,21 @@ class ModelRunner:
             "top_ks": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "top_ps": CpuGpuBuffer(self.max_bs, **f32_kwargs),
             # Keep enough space for MTP decode (max_q_len > 1).
+            # `extra_output_dims` lets a model insert dims between N and dim
+            # (e.g. DeepSeek-V4 returns the un-reduced mHC residual
+            # [N, hc_mult, dim] from forward, with hc_head + LM head deferred
+            # to compute_logits). Default `()` keeps the standard 2D layout.
             "outputs": torch.empty(
-                self.max_num_batched_tokens, hidden_size, dtype=hidden_type
+                self.max_num_batched_tokens,
+                *getattr(self.model, "extra_output_dims", ()),
+                hidden_size,
+                dtype=hidden_type,
             ),
         }
+        if self.use_mrope:
+            self.forward_vars["mrope_positions"] = CpuGpuBuffer(
+                3, self.max_num_batched_tokens, **i64_kwargs
+            )
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
@@ -928,101 +1199,40 @@ class ModelRunner:
             assert self.world_size % hf_config.num_key_value_heads == 0
             return 1
 
+    def _mrope_positions_view(self, num_tokens: int) -> torch.Tensor:
+        return self.forward_vars["mrope_positions"].gpu.as_strided(
+            (3, num_tokens), (num_tokens, 1)
+        )
+
     def _get_total_num_layers(self):
-        """Return total layer count including draft (MTP) layers."""
+        """Return total layer count including draft (MTP) layers.
+
+        Drafts that own an independent KV cache via their own builder
+        (e.g. Eagle3 MHA draft on an MLA target) account for their layers
+        through that builder, so they are NOT added here. Only MTP-style
+        drafts that share the target's KV pool contribute.
+        """
         total = self.config.hf_config.num_hidden_layers
         if self.config.speculative_config and hasattr(self, "drafter"):
-            draft_hf = self.config.speculative_config.draft_model_hf_config
-            total += getattr(draft_hf, "num_nextn_predict_layers", 1)
+            if not hasattr(self, "eagle3_draft_builder"):
+                draft_hf = self.config.speculative_config.draft_model_hf_config
+                total += getattr(draft_hf, "num_nextn_predict_layers", 1)
         return total
 
     def _compute_block_bytes(self):
-        """Compute the TRUE per-block memory cost including all tensors.
+        """Per-block bytes for the unified KV pool budget.
 
-        This must match exactly what allocate_kv_cache() allocates.
-        Includes: kv_cache tensor + kv_scale tensor + draft model layers.
+        Sum across all attention builders attached to this runner: the
+        target builder always, plus an optional `eagle3_draft_builder`
+        when a heterogeneous spec-decode draft owns its own KV pool. Each
+        builder knows its own tensor layout (MLA 576-dim packed, GDN-hybrid
+        full-attn-only, MiMo-V2 per-layer-type, standard MHA split-K/V,
+        Eagle3 independent MHA). Per-request cache bytes are accounted
+        for separately via `compute_per_req_cache_bytes()`.
         """
-        config = self.config
-        hf_config = config.hf_config
-        num_kv_heads = self._get_num_kv_heads()
-        total_num_layers = self._get_total_num_layers()
-        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
-
-        if self.use_mla:
-            # MLA: shape [total_layers, blocks, block_size, 576]
-            # No kv_scale for MLA
-            block_bytes = total_num_layers * self.block_size * 576 * kv_dtype_size
-            if self.is_deepseek_v32:
-                index_dim = hf_config.index_head_dim + 4
-                aligned_index_dim = ((index_dim + 15) // 16) * 16
-                block_bytes += (
-                    hf_config.num_hidden_layers
-                    * self.block_size
-                    * aligned_index_dim
-                    * dtypes.fp8.itemsize
-                )
-        elif self.is_qwen_next():
-            self.full_attention_interval = hf_config.full_attention_interval
-            self.num_full_attn = (
-                hf_config.num_hidden_layers // self.full_attention_interval
-            )
-            self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
-            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
-            full_attn_layers = self.num_full_attn + num_draft_layers
-
-            # full attention kv_cache bytes
-            block_bytes = (
-                2
-                * full_attn_layers
-                * self.physical_block_size
-                * num_kv_heads
-                * hf_config.head_dim
-                * kv_dtype_size
-            )
-
-            # kv_scale for full attention: [2, full_attn_layers, blocks, kv_heads, phys_block_size] float32
-            block_bytes += (
-                2
-                * full_attn_layers
-                * num_kv_heads
-                * self.physical_block_size
-                * 4  # float32
-            )
-
-            # gdn attn bytes
-            mamba_shape = self.gated_delta_net_state_shape(
-                get_tp_group().world_size,
-                hf_config.linear_num_key_heads,
-                hf_config.linear_num_value_heads,
-                hf_config.linear_key_head_dim,
-                hf_config.linear_value_head_dim,
-                hf_config.linear_conv_kernel_dim,
-                self.num_spec_tokens,
-            )
-            one_layer_byte = (
-                sum(math.prod(subtuple) for subtuple in mamba_shape) * kv_dtype_size
-            )
-            block_bytes += self.num_gdn_attn_state * one_layer_byte
-        else:
-            # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
-            # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
-            # the standard path (draft layers use separate binding).
-            block_bytes = (
-                2
-                * hf_config.num_hidden_layers
-                * self.block_size
-                * num_kv_heads
-                * hf_config.head_dim
-                * kv_dtype_size
-            )
-            # kv_scale: [2, num_hidden_layers, blocks, kv_heads, phys_block_size]
-            block_bytes += (
-                2
-                * hf_config.num_hidden_layers
-                * num_kv_heads
-                * self.physical_block_size
-                * 4  # float32
-            )
+        block_bytes = self.attn_metadata_builder.compute_block_bytes()
+        if hasattr(self, "eagle3_draft_builder"):
+            block_bytes += self.eagle3_draft_builder.compute_block_bytes()
         return block_bytes
 
     def _estimate_cudagraph_overhead(self):
@@ -1044,7 +1254,7 @@ class ModelRunner:
         # memory due to pooling across multiple captured batch sizes.
         return int(activation_bytes * 0.2)
 
-    def get_num_blocks(self):
+    def get_num_blocks(self) -> dict[str, int]:
         torch.set_default_device(self.device)
         config = self.config
         hf_config = config.hf_config
@@ -1078,7 +1288,48 @@ class ModelRunner:
         torch.set_default_device("cpu")
 
         block_bytes = self._compute_block_bytes()
-        num_kvcache_blocks = available_for_kv // block_bytes
+
+        # Per-request cache (e.g. GDN recurrent state, future DeepseekV4 ring
+        # buffer + compressor state): deduct its tensor memory from the KV
+        # pool budget. The actual layout / shape is owned by the attention
+        # builder; ModelRunner only does sizing math.
+        per_req_cache_bytes = self.attn_metadata_builder.compute_per_req_cache_bytes()
+        slots_per_req = self.attn_metadata_builder.slots_per_req()
+        max_per_req_cache_slots = (
+            config.max_num_seqs * slots_per_req if per_req_cache_bytes > 0 else 0
+        )
+        per_req_cache_tensor_bytes = max_per_req_cache_slots * per_req_cache_bytes
+        available_for_pool = available_for_kv - per_req_cache_tensor_bytes
+        if available_for_pool <= 0:
+            raise RuntimeError(
+                f"Per-request cache tensor "
+                f"({per_req_cache_tensor_bytes / (1 << 30):.2f}GB for "
+                f"{max_per_req_cache_slots} slots) exceeds available KV budget "
+                f"({available_for_kv / (1 << 30):.2f}GB). "
+                f"Reduce --max-num-seqs or increase gpu_memory_utilization."
+            )
+        per_req_cache_equiv_blocks = (
+            math.ceil(per_req_cache_bytes / block_bytes)
+            if per_req_cache_bytes > 0
+            else 0
+        )
+
+        # Store for BlockManager and allocate_kv_cache.
+        # Note the distinction:
+        #   - per_req_cache_equiv_blocks: block-equivalents charged to the
+        #     unified pool per request (memory accounting)
+        #   - num_per_req_cache_groups: BlockManager free-list size; one
+        #     group == one request occupies `slots_per_req` contiguous
+        #     tensor slots
+        #   - max_per_req_cache_slots (runner-only): TENSOR slot dimension
+        #     == groups × slots_per_req (groups != slots in general)
+        config.per_req_cache_equiv_blocks = per_req_cache_equiv_blocks
+        config.num_per_req_cache_groups = (
+            config.max_num_seqs if per_req_cache_bytes > 0 else 0
+        )
+        self.max_per_req_cache_slots = max_per_req_cache_slots
+
+        num_kvcache_blocks = available_for_pool // block_bytes
 
         logger.info(
             f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
@@ -1092,6 +1343,48 @@ class ModelRunner:
             f"block_bytes={block_bytes}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
         )
+        if per_req_cache_bytes > 0:
+            logger.info(
+                f"Per-req cache pool: bytes_per_slot="
+                f"{per_req_cache_bytes / (1 << 20):.2f}MB, "
+                f"max_slots={max_per_req_cache_slots}, "
+                f"tensor_total={per_req_cache_tensor_bytes / (1 << 30):.2f}GB, "
+                f"equiv_blocks_per_req={per_req_cache_equiv_blocks}, "
+                f"pool_blocks={num_kvcache_blocks}"
+            )
+
+        # Concurrent-capacity table: at each context-length percentage of
+        # max_model_len, how many requests can simultaneously hold their
+        # KV in the pool. Per-req block usage = ceil(ctx_len/block_size);
+        # per-req state cache is in its own pre-allocated tensor (already
+        # excluded from `num_kvcache_blocks` at sizing time), so it adds
+        # no per-block cost. Concurrency is also capped by
+        # max_per_req_cache_slots (state buffer slot count).
+        max_model_len = config.max_model_len
+        cap = (
+            max_per_req_cache_slots if per_req_cache_bytes > 0 else config.max_num_seqs
+        )
+        pct_lines = []
+        for pct in (10, 30, 50, 70, 90, 100):
+            ctx = max(1, max_model_len * pct // 100)
+            blocks_per_req = math.ceil(ctx / self.block_size)
+            block_bound = (
+                num_kvcache_blocks // blocks_per_req if blocks_per_req > 0 else 0
+            )
+            max_conc = min(cap, block_bound) if cap > 0 else block_bound
+            bound_label = (
+                "slots" if cap > 0 and max_conc == cap < block_bound else "blocks"
+            )
+            pct_lines.append(
+                f"  {pct:>3}% ({ctx:>7} tok): {blocks_per_req:>6} blk/req "
+                f"→ max_concurrent={max_conc:<5} (bound by {bound_label})"
+            )
+        logger.info(
+            f"Concurrent capacity vs context length "
+            f"(max_model_len={max_model_len}, block_size={self.block_size}, "
+            f"max_slots={cap}, pool_blocks={num_kvcache_blocks}):\n"
+            + "\n".join(pct_lines)
+        )
 
         assert num_kvcache_blocks > 0, (
             f"Not enough memory for KV cache with block size({self.block_size}). "
@@ -1103,7 +1396,13 @@ class ModelRunner:
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB)"
         )
-        return num_kvcache_blocks
+        return {
+            "num_kvcache_blocks": num_kvcache_blocks,
+            "per_req_cache_equiv_blocks": per_req_cache_equiv_blocks,
+            "num_per_req_cache_groups": (
+                config.max_num_seqs if per_req_cache_bytes > 0 else 0
+            ),
+        }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
@@ -1120,107 +1419,71 @@ class ModelRunner:
         else:
             assert self.world_size % hf_config.num_key_value_heads == 0
             num_kv_heads = 1
+        # Promote to self so attention builders' build_kv_cache_tensor()
+        # hooks can access it without re-deriving from hf_config.
+        self.num_kv_heads = num_kv_heads
+        self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
         # Calculate total number of layers (target + draft)
         total_num_layers = hf_config.num_hidden_layers
         num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
-            # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
-            num_draft_layers = getattr(draft_hf_config, "num_nextn_predict_layers", 1)
-            total_num_layers += num_draft_layers
-            logger.info(
-                f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
-                f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
-            )
-
-        if self.use_mla:
-            self.kv_cache = torch.zeros(
-                total_num_layers,
-                self.num_physical_kvcache_blocks,
-                self.physical_block_size,
-                576,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
-            if self.is_deepseek_v32:
-                # Align last dimension to 16 bytes for fp8 (1 byte per element)
-                # to avoid unaligned memory access in torch inductor
-                index_dim = hf_config.index_head_dim + 4
-                aligned_index_dim = ((index_dim + 15) // 16) * 16
-                self.index_cache = torch.zeros(
-                    hf_config.num_hidden_layers,
-                    self.num_physical_kvcache_blocks,
-                    self.physical_block_size,
-                    aligned_index_dim,
-                    dtype=dtypes.fp8,
-                    device="cuda",
+            if hasattr(self, "eagle3_draft_builder"):
+                # Heterogeneous draft (e.g. Eagle3 MHA on MLA target) owns
+                # its own KV pool via its builder; don't add to target's count.
+                num_draft_layers = draft_hf_config.num_hidden_layers
+                logger.info(
+                    f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
+                    f"{num_draft_layers} Eagle3 draft layers (separate non-MLA cache)"
                 )
-        elif self.is_qwen_next():
+            else:
+                # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
+                num_draft_layers = getattr(
+                    draft_hf_config, "num_nextn_predict_layers", 1
+                )
+                total_num_layers += num_draft_layers
+                logger.info(
+                    f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
+                    f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
+                )
 
-            self.kv_cache = torch.zeros(
-                2,
-                self.num_full_attn + num_draft_layers,
-                self.num_physical_kvcache_blocks,
-                self.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
+        # Primary KV cache allocation (model-agnostic, delegated to the
+        # attention builder). Each builder owns its tensor layout: MLA →
+        # single 576-dim per layer; GDN-hybrid → only num_full_attn rows;
+        # MiMo-V2 → defer per-module; standard MHA → split-K/V `[2, L, ...]`.
+        # Returned tensors are setattr'd on `self` under their conventional
+        # names (kv_cache, kv_scale, index_cache, aligned_index_dim,
+        # _kv_layer_cache_store) so binding code and downstream consumers
+        # find them where they expect.
+        main_kv = self.attn_metadata_builder.allocate_kv_cache_tensors(
+            num_kv_heads, num_draft_layers
+        )
+        for name, value in main_kv.items():
+            setattr(self, name, value)
 
-            self.kv_scale = torch.zeros(
-                2,
-                self.num_full_attn + num_draft_layers,
-                self.num_physical_kvcache_blocks,
-                num_kv_heads,
-                self.physical_block_size,
-                dtype=dtypes.fp32,
-                device="cuda",
+        # Heterogeneous draft (e.g. Eagle3 MHA alongside an MLA target) owns
+        # its own KV pool through a sibling builder; same protocol as above,
+        # tensors land under namespaced keys (eagle3_kv_cache, eagle3_kv_scale).
+        if hasattr(self, "eagle3_draft_builder"):
+            draft_kv = self.eagle3_draft_builder.allocate_kv_cache_tensors(
+                num_kv_heads, num_draft_layers
             )
+            for name, value in draft_kv.items():
+                setattr(self, name, value)
 
-            mamba_shape = self.gated_delta_net_state_shape(
-                get_tp_group().world_size,
-                hf_config.linear_num_key_heads,
-                hf_config.linear_num_value_heads,
-                hf_config.linear_key_head_dim,
-                hf_config.linear_value_head_dim,
-                hf_config.linear_conv_kernel_dim,
-                self.num_spec_tokens,  # self.num_spec,
+        # Per-request cache allocation (model-agnostic, delegated to the
+        # attention metadata builder). For GDN this returns
+        # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
+        # attentions it returns an empty dict (no-op). Tensors are setattr'd
+        # on `self` so model layers can access them as `model_runner.<name>`.
+        if self.max_per_req_cache_slots > 0:
+            per_req_tensors = self.attn_metadata_builder.allocate_per_req_cache(
+                self.max_per_req_cache_slots
             )
-            self.mamba_k_cache = torch.zeros(
-                (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
-                + mamba_shape[0],
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
-            self.mamba_v_cache = torch.zeros(
-                (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
-                + mamba_shape[1],
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
-        else:
-            self.kv_cache = torch.zeros(
-                2,
-                hf_config.num_hidden_layers,
-                self.num_physical_kvcache_blocks,
-                self.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
+            for name, tensor in per_req_tensors.items():
+                setattr(self, name, tensor)
 
-            self.kv_scale = torch.zeros(
-                2,
-                hf_config.num_hidden_layers,
-                self.num_physical_kvcache_blocks,
-                num_kv_heads,
-                self.physical_block_size,
-                dtype=dtypes.fp32,
-                device="cuda",
-            )
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,
         # models with only one type of attention, but not support multi-type of attention models.
@@ -1233,103 +1496,44 @@ class ModelRunner:
 
         kv_cache_tensors = []
         layer_id = 0
-        x = 16 // self.kv_cache.element_size()
+        # Promote to self so the attention builder's build_kv_cache_tensor()
+        # can access it without recomputing from drafter state. Heterogeneous
+        # drafts (Eagle3) own their own layer space via their builder, so
+        # leave mtp_start_layer_idx at hf_config.num_hidden_layers in that mode.
+        self.mtp_start_layer_idx = (
+            self.drafter.model.model.mtp_start_layer_idx
+            if hasattr(self, "drafter") and not hasattr(self, "eagle3_draft_builder")
+            else hf_config.num_hidden_layers
+        )
         for model_name, model in models_to_bind:
             logger.info(
                 f"Binding KV cache for {model_name} model starting at layer_id={layer_id}"
             )
 
             for module in model.modules():
-                # Since use attention base and there are child in attention, add base condition
-                if hasattr(module, "base_attention"):
-                    if hasattr(module, "use_mla") and not module.use_mla:
-                        # Non-MLA attention
-                        if self.is_qwen_next():
-                            attn_idx = layer_id // self.full_attention_interval
-                        else:
-                            attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
-                        )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, attn_idx]
-                            module.v_scale = self.kv_scale[1, attn_idx]
-
-                        k_scale = module.k_scale
-                        v_scale = module.v_scale
-
-                        # Store in KVCacheTensor
-                        kv_cache_tensor = KVCacheTensor(
-                            layer_num=layer_id,
-                            k_cache=k_cache,
-                            v_cache=v_cache,
-                            k_scale=k_scale,
-                            v_scale=v_scale,
-                        )
-                        kv_cache_tensors.append(kv_cache_tensor)
-
-                        module.k_cache = k_cache
-                        module.v_cache = v_cache
-
-                        layer_id += 1
-                    elif hasattr(module, "use_mla") and module.use_mla:
-                        # MLA attention
-                        kv_cache = self.kv_cache[layer_id].view(
-                            self.num_physical_kvcache_blocks * self.physical_block_size,
-                            1,
-                            576,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        if self.is_deepseek_v32 and module.indexer is not None:
-                            # Use aligned dimension to avoid memory copy in torch inductor
-                            module.indexer.k_cache.kv_cache[0] = self.index_cache[
-                                layer_id
-                            ].view(
-                                self.num_physical_kvcache_blocks
-                                * self.physical_block_size,
-                                1,
-                                aligned_index_dim,
-                            )
-                        # Store in KVCacheTensor
-                        kv_cache_tensor = KVCacheTensor(
-                            layer_num=layer_id,
-                            k_cache=kv_cache,
-                            v_cache=None,
-                            k_scale=None,
-                            v_scale=None,
-                        )
-                        kv_cache_tensors.append(kv_cache_tensor)
-
-                        module.kv_cache = kv_cache
-                        module.max_model_len = self.config.max_model_len
-                        layer_id += 1
-                elif hasattr(module, "base_linear_attention"):
-                    gdn_idx = (
-                        layer_id
-                        // self.full_attention_interval
-                        * (self.full_attention_interval - 1)
-                        + layer_id % self.full_attention_interval
+                # Drafts that own an independent KV pool (Eagle3) bind through
+                # their sibling builder first; for unrecognized modules it
+                # returns None and we fall through to the target builder.
+                if model_name == "draft" and hasattr(self, "eagle3_draft_builder"):
+                    kv_cache_tensor = self.eagle3_draft_builder.build_kv_cache_tensor(
+                        layer_id, module
                     )
-                    mamba_k_cache = self.mamba_k_cache[gdn_idx]
-                    mamba_v_cache = self.mamba_v_cache[gdn_idx]
-                    kv_cache_tensor = KVCacheTensor(
-                        layer_num=layer_id,
-                        k_cache=mamba_k_cache,
-                        v_cache=mamba_v_cache,
-                        k_scale=None,
-                        v_scale=None,
-                    )
+                    if kv_cache_tensor is not None:
+                        kv_cache_tensors.append(kv_cache_tensor)
+                        layer_id += 1
+                        continue
+
+                # Per-attention-type binding is owned by the attention
+                # metadata builder; ModelRunner only walks modules and
+                # collects the resulting KVCacheTensor entries. The builder
+                # returns None for modules it does not recognize (so a
+                # sibling module like nn.LayerNorm is silently skipped),
+                # and increments through MHA / MLA / GDN / V3.2-indexer
+                # internally.
+                kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
+                    layer_id, module
+                )
+                if kv_cache_tensor is not None:
                     kv_cache_tensors.append(kv_cache_tensor)
                     layer_id += 1
 
@@ -1338,16 +1542,31 @@ class ModelRunner:
             f"layer_{i}": kv_cache_tensor
             for i, kv_cache_tensor in enumerate(kv_cache_tensors)
         }
-        # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
-        set_kv_cache_data(kv_cache_data)
+        transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
+        set_kv_cache_data(kv_cache_data, config, transfer_tensors)
 
-        # Cross-validate: compare estimated vs actual KV cache allocation
+        # Cross-validate: compare estimated vs actual KV cache allocation.
+        # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
+        # `block_bytes × num_blocks`) AND the per-request cache tensors (state
+        # buffers + SWA window prefix embedded in unified_kv). The budget
+        # math in `get_num_blocks()` reserves both separately, so the cross-
+        # check must mirror that — otherwise it spuriously fires for any
+        # backend with non-zero `compute_per_req_cache_bytes()` (V4, GDN).
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         actual_kv_bytes = post_alloc - pre_alloc
-        expected_kv_bytes = self._compute_block_bytes() * num_kvcache_blocks
+        expected_kv_bytes = (
+            self._compute_block_bytes() * num_kvcache_blocks
+            + self.attn_metadata_builder.compute_per_req_cache_bytes()
+            * self.max_per_req_cache_slots
+        )
         if expected_kv_bytes > 0:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
-            if diff_pct > 0.01:
+            # 3% threshold: budget formula matches allocation exactly, but the
+            # measured `post_alloc - pre_alloc` includes allocator alignment
+            # (round to 256 B / 16 MiB segments) and ephemeral init buffers
+            # from `_zero_state` / `_neg_inf_state` views, accounting for ~2%
+            # noise on multi-GiB pools. Lower thresholds spuriously fire.
+            if diff_pct > 0.03:
                 logger.warning(
                     f"KV cache allocation mismatch: "
                     f"expected={expected_kv_bytes / (1 << 30):.3f}GB, "
@@ -1358,31 +1577,6 @@ class ModelRunner:
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return True
-
-    def gated_delta_net_state_shape(
-        self,
-        tp_world_size: int,
-        num_k_heads: int,
-        num_v_heads: int,
-        head_k_dim: int,
-        head_v_dim: int,
-        conv_kernel_size: int,
-        num_spec: int = 0,
-    ):
-        conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
-        conv_state_shape = (
-            conv_dim // tp_world_size,
-            conv_kernel_size - 1 + num_spec,
-        )
-
-        conv_state_shape = conv_state_shape[1], conv_state_shape[0]
-
-        temporal_state_shape = (
-            num_v_heads // tp_world_size,
-            head_k_dim,
-            head_v_dim,
-        )
-        return conv_state_shape, temporal_state_shape
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
         dp_size = self.config.parallel_config.data_parallel_size
@@ -1405,18 +1599,123 @@ class ModelRunner:
 
         return max_tokens_across_dp_cpu - num_tokens, num_tokens_across_dp
 
-    def _preprocess(self, batch: ScheduledBatch):
+    def _maybe_create_tbo_slices(
+        self,
+        batch,
+        is_prefill,
+        scheduled_bs,
+        actual_num_tokens,
+        num_scheduled_tokens,
+        tbo_collective_active: bool,
+    ):
+        """Create TBO ubatch slices when the collective DP decision is True.
+
+        With the packed-reduce path the eligibility (local + cross-DP AND)
+        is decided in ``_preprocess``; here we just realise the split.
+        """
+        if not tbo_collective_active:
+            return None
+
+        tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        ubatch_slices = maybe_create_ubatch_slices(
+            num_reqs=tbo_num_reqs,
+            num_tokens=actual_num_tokens,
+            is_prefill=is_prefill,
+            num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
+        )
+        if ubatch_slices is not None:
+            logger.debug(
+                f"[TBO] splitting {'prefill' if is_prefill else 'decode'} batch: "
+                f"num_reqs={tbo_num_reqs}, ubatches={len(ubatch_slices)}"
+            )
+        return ubatch_slices
+
+    def _preprocess(
+        self,
+        batch: ScheduledBatch,
+        num_scheduled_tokens: Optional[np.ndarray] = None,
+    ):
+        """Per-step DP sync: token padding, prefill fan-out, TBO decision.
+
+        Thin wrapper over :func:`atom.utils.tbo.sync_dp_for_tbo` (the
+        actual collective) and :func:`atom.utils.tbo.local_tbo_precompute`
+        (the rank-local TBO eligibility / per-ubatch token split).
+
+        Returns:
+            (num_input_tokens, num_tokens_across_dp, dp_uniform_decode,
+             max_tokens, tbo_collective_active, ub_max_tokens_across_dp)
+        """
         num_input_tokens = batch.total_tokens_num
-        num_pad, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
-        num_input_tokens += num_pad
-        return num_input_tokens, num_tokens_across_dp
+        is_prefill = batch.total_tokens_num_prefill > 0
+        tbo_on = self.config.enable_tbo
+        dp_size = self.config.parallel_config.data_parallel_size
+
+        # Rank-local TBO precompute (needed for both dp==1 fast path and
+        # the cross-DP packed gather below).
+        local_eligible, local_ub0, local_ub1 = False, 0, 0
+        if tbo_on:
+            if num_scheduled_tokens is None:
+                num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
+            local_eligible, local_ub0, local_ub1 = local_tbo_precompute(
+                self.config, batch, is_prefill, num_scheduled_tokens
+            )
+
+        if dp_size <= 1:
+            # Single-rank: TBO decision is purely local; no collective needed.
+            # dp_uniform_decode=True mirrors the DP-disabled case in the
+            # multi-rank branch (`not enable_dp_attention` => True) and the
+            # Context default — otherwise single-GPU/TP-only decode would
+            # be forced into eager and lose the CUDAGraph decode path.
+            return (
+                num_input_tokens,
+                None,
+                True,
+                num_input_tokens,
+                local_eligible,
+                None,
+            )
+
+        sync = sync_dp_for_tbo(
+            dp_group=get_dp_group().cpu_group,
+            dp_size=dp_size,
+            num_input_tokens=num_input_tokens,
+            is_prefill=is_prefill,
+            tbo_on=tbo_on,
+            local_tbo_eligible=local_eligible,
+            local_ub_tokens=(local_ub0, local_ub1),
+        )
+
+        max_tokens = int(sync.num_tokens_across_dp.max().item())
+        dp_uniform_decode = (not sync.any_rank_has_prefill) or (
+            not self.config.enable_dp_attention
+        )
+        if dp_uniform_decode:
+            # CUDAGraph path: all ranks pad to the same max for fixed-size all_gather.
+            num_input_tokens = max_tokens
+        # else: variable-length path — each rank keeps its own token count.
+
+        return (
+            num_input_tokens,
+            sync.num_tokens_across_dp,
+            dp_uniform_decode,
+            max_tokens,
+            sync.tbo_collective_active,
+            sync.ub_max_tokens_across_dp,
+        )
 
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
+        (
+            num_input_tokens,
+            num_tokens_across_dp,
+            dp_uniform_decode,
+            max_tokens,
+            tbo_collective_active,
+            ub_max_tokens_across_dp,
+        ) = self._preprocess(batch, num_scheduled_tokens=num_scheduled_tokens)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
@@ -1426,7 +1725,8 @@ class ModelRunner:
             padded_scheduled_bs = num_input_tokens
             # for MTP, we need to divide by (mtp_k + 1) to get the actual batch size
             if hasattr(self, "drafter"):
-                padded_scheduled_bs = padded_scheduled_bs // (self.drafter.mtp_k + 1)
+                mtp_step = self.drafter.mtp_k + 1
+                padded_scheduled_bs = (padded_scheduled_bs + mtp_step - 1) // mtp_step
             bs = (
                 padded_scheduled_bs
                 if self.enforce_eager
@@ -1434,7 +1734,6 @@ class ModelRunner:
                     (x for x in self.graph_bs if x >= padded_scheduled_bs),
                     padded_scheduled_bs,
                 )
-                # Use cudagraph and padding to batch_size, if bs > graph_bs, use eager mode
             )
             assert (
                 bs >= padded_scheduled_bs
@@ -1445,7 +1744,6 @@ class ModelRunner:
         attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
 
-        # graph_bs should be batch size (number of sequences), not token count
         graph_bs = num_input_tokens if is_prefill else bs
         context = Context(
             positions=positions,
@@ -1453,7 +1751,9 @@ class ModelRunner:
             is_dummy_run=batch.is_dummy_run,
             batch_size=context_bs,
             graph_bs=graph_bs,
+            dp_uniform_decode=dp_uniform_decode,
         )
+
         actual_num_tokens = batch.total_tokens_num
 
         spec_decode_metadata = None
@@ -1465,6 +1765,15 @@ class ModelRunner:
                 input_ids,
             )
 
+        ubatch_slices = self._maybe_create_tbo_slices(
+            batch,
+            is_prefill,
+            scheduled_bs if not is_prefill else 0,
+            actual_num_tokens,
+            num_scheduled_tokens,
+            tbo_collective_active,
+        )
+
         set_forward_context(
             attn_metadata=attn_metadata,
             atom_config=self.config,
@@ -1472,16 +1781,24 @@ class ModelRunner:
             num_tokens=actual_num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             spec_decode_metadata=spec_decode_metadata,
+            ubatch_slices=ubatch_slices,
+            ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         )
         return graph_bs
 
     def prepare_sample(
         self, batch: ScheduledBatch
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool, bool]:
         bs = batch.total_seqs_num
 
         # Check on CPU whether all requests are greedy (temperature=0)
         all_greedy = (batch.temperatures == 0).all()
+
+        # Check on CPU whether any fan-out sibling needs per-row random noise.
+        # Missing attribute (e.g. dummy runs, older callers) -> False.
+        needs_independent_noise = bool(
+            getattr(batch, "needs_independent_noise", np.zeros(0, dtype=bool)).any()
+        )
 
         temp_buffer = self.forward_vars["temperatures"]
         # Clamp temperatures on CPU to avoid division by zero in sampler
@@ -1515,13 +1832,15 @@ class ModelRunner:
         else:
             top_ps = None
 
-        return temperatures, top_ks, top_ps, all_greedy
+        return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
     def prepare_model(self, batch: ScheduledBatch):
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
-        temperatures, top_ks, top_ps, all_greedy = self.prepare_sample(batch)
+        temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
+            self.prepare_sample(batch)
+        )
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
         self.prepare_inputs(batch, input_ids)
         return (
@@ -1530,6 +1849,7 @@ class ModelRunner:
             top_ks,
             top_ps,
             all_greedy,
+            needs_independent_noise,
         )
 
     def run_model(
@@ -1542,9 +1862,19 @@ class ModelRunner:
         bs = context.batch_size
         is_prefill = context.is_prefill
         positions = context.positions
-        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-            # prefill[bs=1 tok=115 ctx=115]
-            label = f"prefill[bs={bs}"
+
+        if (
+            is_prefill
+            or self.enforce_eager
+            or not context.dp_uniform_decode
+            or bs > self.graph_bs[-1]
+        ):
+            # prefill, or decode forced eager (enforce_eager / DP peer
+            # prefill / bs above the largest captured graph).
+            if is_prefill:
+                label = f"prefill[bs={bs}"
+            else:
+                label = f"eager_decode[bs={bs}"
             if batch is not None:
                 ctx = batch.context_lens
                 if len(ctx) == 1:
@@ -1556,7 +1886,42 @@ class ModelRunner:
                 label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
             label += "]"
             with record_function(label):
-                hidden_states = self.model(input_ids, positions)
+                # Handle multimodal prefill: compute vision embeddings and merge
+                inputs_embeds = None
+                if (
+                    is_prefill
+                    and hasattr(self.model, "get_vision_embeddings")
+                    and batch is not None
+                    and hasattr(batch, "multimodal_data")
+                    and batch.multimodal_data
+                ):
+                    mm_data_values = list(batch.multimodal_data.values())
+                    pixel_values = torch.cat(
+                        [mm_data["pixel_values"] for mm_data in mm_data_values], dim=0
+                    ).to(device=self.device, dtype=self.config.torch_dtype)
+                    grid_thw = torch.cat(
+                        [mm_data["image_grid_thw"] for mm_data in mm_data_values],
+                        dim=0,
+                    ).to(device=self.device)
+                    vision_embeds = self.model.get_vision_embeddings(
+                        pixel_values, grid_thw
+                    )
+                    text_embeds = self.model.embed_input_ids(input_ids)
+                    inputs_embeds = self.model.merge_multimodal_embeddings(
+                        input_ids, text_embeds, vision_embeds
+                    )
+
+                if inputs_embeds is None:
+                    model_output = self.model(input_ids, positions)
+                else:
+                    model_output = self.model(
+                        input_ids, positions, inputs_embeds=inputs_embeds
+                    )
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, self._aux_hidden_states = model_output
+                else:
+                    hidden_states = model_output
+                    self._aux_hidden_states = None
                 logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
@@ -1576,6 +1941,12 @@ class ModelRunner:
                 self.graphs[graph_key].replay()
                 num_tokens = context.batch_size * max_q_len
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
+                if graph_key in self.graph_aux_hidden:
+                    self._aux_hidden_states = [
+                        aux[:num_tokens] for aux in self.graph_aux_hidden[graph_key]
+                    ]
+                else:
+                    self._aux_hidden_states = None
                 if self.logits_in_graph:
                     logits = self.graph_logits[graph_key][:num_tokens]
                 else:
@@ -1593,12 +1964,18 @@ class ModelRunner:
         all_greedy: bool,
         # following for draft
         hidden_states: torch.Tensor,
+        needs_independent_noise: bool = False,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(
-                logits, temperatures, top_ks, top_ps, all_greedy
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise=needs_independent_noise,
             )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
@@ -1615,6 +1992,7 @@ class ModelRunner:
                 top_ks=top_ks,
                 top_ps=top_ps,
                 all_greedy=all_greedy,
+                needs_independent_noise=needs_independent_noise,
             )
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
@@ -1636,12 +2014,31 @@ class ModelRunner:
         if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
+        # Compute logprobs if any sequence requested them
+        need_logprobs = any(batch.return_logprobs)
+        sampled_logprobs = None
+        if need_logprobs:
+            logits_fp32 = logits.float()
+            safe_temps = torch.where(
+                temperatures <= 0, torch.ones_like(temperatures), temperatures
+            )
+            scaled_logits = logits_fp32 / safe_temps.view(-1, 1)
+            log_probs = torch.log_softmax(scaled_logits, dim=-1)
+            sampled_logprobs = log_probs.gather(
+                -1, sampled_tokens.to(torch.long).unsqueeze(-1)
+            ).squeeze(-1)
+            if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
+                sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
+
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
-        req_ids_out, token_ids_out = self.tokenID_processor.prepare_sampled_ids(
-            batch, sampled_tokens, self.forward_done_event
+        token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
+            batch, sampled_tokens, self.forward_done_event, sampled_logprobs
         )
+        # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
+        req_ids_out = [k for k in token_id_dict if k != -1]
+        token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
         draft_token_ids: Optional[np.ndarray] = None
         if self.tokenID_processor.is_deferred_out:
@@ -1686,18 +2083,29 @@ class ModelRunner:
             is_deferred_out=self.tokenID_processor.is_deferred_out,
             num_rejected=prev_rejected_num,
             num_bonus=prev_bonus_num,
+            logprobs=logprobs_map,
         )
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         annotation = batch.profile_annotation
-        if annotation and (self.profiler is not None and os.environ.get("ATOM_ENABLE_ROOFLINE_ANNOTATION", "0") == "1"):
+        if annotation and (
+            self.profiler is not None
+            and os.environ.get("ATOM_ENABLE_ROOFLINE_ANNOTATION", "0") == "1"
+        ):
             ctx = torch.profiler.record_function(annotation)
             ctx.__enter__()
         else:
             ctx = None
 
-        input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(batch)
+        (
+            input_ids,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            needs_independent_noise,
+        ) = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
         fwd_output = self.postprocess(
             batch,
@@ -1707,6 +2115,7 @@ class ModelRunner:
             top_ps,
             all_greedy,
             hidden_states,
+            needs_independent_noise=needs_independent_noise,
         )
         reset_forward_context()
 
@@ -1714,6 +2123,26 @@ class ModelRunner:
             ctx.__exit__(None, None, None)
 
         return fwd_output
+
+    @torch.inference_mode()
+    def process_kvconnector_output(self, connector_meta_output):
+        """Dispatch KV connector metadata to initiate async KV loading."""
+        if connector_meta_output is not None:
+            connector = get_kvconnector()
+            if connector is not None:
+                connector.start_load_kv(connector_meta_output)
+
+    @torch.inference_mode()
+    def async_proc_aggregation(self) -> KVConnectorOutput:
+        """Collect finished send/recv status from the KV connector."""
+        connector = get_kvconnector()
+        if connector is None:
+            return KVConnectorOutput(finished_sending=[], finished_recving=[])
+        done_sending, done_recving = connector.get_finished()
+
+        return KVConnectorOutput(
+            finished_sending=done_sending, finished_recving=done_recving
+        )
 
     def propose_draft_token_ids(
         self,
@@ -1741,6 +2170,7 @@ class ModelRunner:
             num_reject_tokens=num_reject_tokens,
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
+            aux_hidden_states=self._aux_hidden_states,
         )
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
@@ -1785,19 +2215,41 @@ class ModelRunner:
                 self.graph_bs = cuda_graph_sizes
         self.graph_bs.sort(reverse=True)
 
-        assert (
-            self.graph_bs[0] <= self.config.max_num_seqs
-        ), "cudagraph capture sizes must be less than max_num_seqs."
+        # Drop any capture size that exceeds max_num_seqs — those graphs would
+        # never be replayed since the scheduler can't produce a batch larger
+        # than max_num_seqs. Warn so the user notices a misconfig (default
+        # cuda_graph_sizes=[512] vs e.g. max_num_seqs=16) without crashing.
+        max_bs = self.config.max_num_seqs
+        oversized = [s for s in self.graph_bs if s > max_bs]
+        if oversized:
+            self.graph_bs = [s for s in self.graph_bs if s <= max_bs]
+            logger.warning(
+                "cudagraph capture sizes %s exceed max_num_seqs=%d; dropping. "
+                "Remaining: %s",
+                oversized,
+                max_bs,
+                self.graph_bs,
+            )
+        assert self.graph_bs, (
+            f"no cudagraph capture sizes left after filtering by "
+            f"max_num_seqs={max_bs}; pass --cudagraph-capture-sizes or raise "
+            f"--max-num-seqs."
+        )
 
         input_ids = self.forward_vars["input_ids"].gpu
         positions = self.forward_vars["positions"].gpu
         outputs = self.forward_vars["outputs"]
         self.forward_vars["kv_indptr"].gpu.zero_()
+        if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
+            self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
+        self.graph_aux_hidden: dict[tuple[int, int], list[torch.Tensor]] = dict()
         self.graph_pool = None
-        self.logits_in_graph = self.world_size == 1
+        is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
+        # TBO graphs don't capture compute_logits, so disable logits_in_graph.
+        self.logits_in_graph = self.world_size == 1 and not is_tbo
 
         #start capture profiler
         self.start_capture_profiler()
@@ -1823,52 +2275,102 @@ class ModelRunner:
                 self.forward_vars["positions"].np[:num_tokens] = (
                     np.arange(num_tokens, dtype=np.int64) % max_q_len
                 )
-
                 attn_metadata, context = (
                     self.attn_metadata_builder.build_for_cudagraph_capture(bs=bs)
                 )
+                if self.use_mrope:
+                    mrope_positions = self._mrope_positions_view(num_tokens)
+                    mrope_positions.copy_(
+                        positions[:num_tokens].unsqueeze(0).expand(3, -1)
+                    )
+                    context.positions = mrope_positions
                 num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
                 num_tokens += num_pad
+                # Create ubatch slices for TBO capture (need >= 2 requests)
+                ubatch_slices = None
+                if is_tbo and self.config.enable_tbo_decode and bs >= 2:
+                    ubatch_slices = maybe_create_ubatch_slices(
+                        num_reqs=bs,
+                        num_tokens=num_tokens,
+                    )
+
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
                     num_tokens=num_tokens,
                     num_tokens_across_dp=num_tokens_across_dp,
+                    ubatch_slices=ubatch_slices,
+                    in_hipgraph=True,
                 )
 
                 # Warmup
-                outputs[:num_tokens] = self.model(
-                    input_ids[:num_tokens], positions[:num_tokens]
+                model_positions = (
+                    self._mrope_positions_view(num_tokens)
+                    if self.use_mrope
+                    else positions[:num_tokens]
                 )
+                model_output = self.model(
+                    input_ids[:num_tokens],
+                    model_positions,
+                )
+                if self.use_aux_hidden_state_outputs:
+                    outputs[:num_tokens] = model_output[0]
+                else:
+                    outputs[:num_tokens] = model_output
                 if self.logits_in_graph:
                     self.model.compute_logits(outputs[:num_tokens])
                 if prof is not None:
                     prof.step()
 
-                # Capture: include compute_logits only when TP=1 since
-                # ParallelLMHead uses NCCL all_gather which is not
-                # graph-capturable on HIP when TP > 1.
+                # Capture
                 with (
                     record_function(f"capture_graph_bs_{bs}")
                     if self.mark_trace
                     else nullcontext()
                 ):
-                    with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
-                        outputs[:num_tokens] = self.model(
-                            input_ids[:num_tokens], positions[:num_tokens]
+                    if ubatch_slices is not None:
+                        # TBO capture: threads + multi-stream captured in graph.
+                        graph, graph_output = self.model.capture_tbo_graph(
+                            input_ids[:num_tokens],
+                            positions[:num_tokens],
+                            self.graph_pool,
+                            gc.stream,
+                            output_buffer=outputs[:num_tokens],
                         )
-                        if self.logits_in_graph:
-                            graph_logits = self.model.compute_logits(
-                                outputs[:num_tokens]
+                        graph_aux = None
+                    else:
+                        # Standard single-stream capture
+                        graph = torch.cuda.CUDAGraph()
+                        model_positions = (
+                            self._mrope_positions_view(num_tokens)
+                            if self.use_mrope
+                            else positions[:num_tokens]
+                        )
+                        with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
+                            model_output = self.model(
+                                input_ids[:num_tokens],
+                                model_positions,
                             )
+                            if self.use_aux_hidden_state_outputs:
+                                outputs[:num_tokens] = model_output[0]
+                                graph_aux = model_output[1]
+                            else:
+                                outputs[:num_tokens] = model_output
+                                graph_aux = None
+                            if self.logits_in_graph:
+                                graph_logits = self.model.compute_logits(
+                                    outputs[:num_tokens]
+                                )
                 if self.graph_pool is None:
                     self.graph_pool = graph.pool()
                 self.graphs[(bs, max_q_len)] = graph
-                if self.logits_in_graph:
+                if self.logits_in_graph and ubatch_slices is None:
                     self.graph_logits[(bs, max_q_len)] = graph_logits
                 if prof is not None:
                     prof.step()
+                if graph_aux is not None:
+                    self.graph_aux_hidden[(bs, max_q_len)] = graph_aux
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
 

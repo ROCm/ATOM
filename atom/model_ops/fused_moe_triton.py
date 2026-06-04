@@ -22,7 +22,12 @@ import torch
 from typing import Any
 import logging
 from math import prod
+from aiter import ActivationType
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.fusions.fused_routing_from_topk import (
+    fused_routing_from_topk as _aiter_fused_routing_from_topk,
+)
+from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from atom.model_ops.utils import has_triton_kernels
 
 logger = logging.getLogger("atom")
@@ -30,9 +35,23 @@ logger = logging.getLogger("atom")
 
 if has_triton_kernels():
     try:
-        from triton_kernels.matmul_ogs import matmul_ogs
+        import triton_kernels.swiglu
+
+        try:
+            from triton_kernels.matmul import (
+                FnSpecs,
+                FusedActivation,
+                PrecisionConfig,
+                matmul as matmul_ogs,
+            )
+        except ImportError:
+            from triton_kernels.matmul_ogs import (
+                FnSpecs,
+                FusedActivation,
+                PrecisionConfig,
+                matmul_ogs,
+            )
         from triton_kernels.routing import routing
-        from triton_kernels.matmul_ogs import PrecisionConfig
     except (AttributeError, ImportError) as e:
         logger.error(
             "Failed to import Triton kernels. Please make sure your triton "
@@ -52,9 +71,9 @@ def _swizzle_mxfp4(quant_tensor, scale):
     scale_layout_opts: dict[str, Any] = {}
     value_layout = StridedLayout
     if get_gfx() == "gfx950":
-        from triton_kernels.tensor_details.layout import GFX950MXScaleLayout
+        from triton_kernels.tensor_details.layout import CDNA4MXScaleLayout
 
-        scale_layout = GFX950MXScaleLayout
+        scale_layout = CDNA4MXScaleLayout
     else:
         scale_layout = StridedLayout
 
@@ -67,7 +86,64 @@ def _swizzle_mxfp4(quant_tensor, scale):
     return quant_tensor, InFlexData(), scale
 
 
-def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
+def fused_routing_from_topk_triton(
+    topk_weights, topk_ids, n_expts_tot, expert_map: torch.Tensor | None = None
+):
+    """Build matmul_ogs routing data via the AITER fused-routing kernel.
+
+    Thin bridge over ``aiter.ops.triton.fused_routing_from_topk``: invokes
+    the single-CTA counting-sort kernel for small NK and packages the
+    resulting indices into the ``RoutingData`` / ``GatherIndx`` /
+    ``ScatterIndx`` structures consumed by
+    ``triton_kernels.matmul_ogs``. For ``NK = n_tokens * n_expts_act``
+    above the kernel's single-CTA budget (prefill-shaped inputs), falls
+    back to the multi-kernel ``routing_from_topk`` reference defined
+    below — that path does the per-row sort + global stable argsort in
+    plain torch and is correctness-stable at any NK.
+
+    Equivalence vs reference: the fused kernel skips the per-row sort,
+    so ``topk_indx`` / ``gate_indx`` differ at intra-expert ordering.
+    ``hist`` and the per-(token, expert, weight) bucket assignments
+    match exactly; ``matmul_ogs`` is commutative over per-expert slices
+    so the MoE output is unchanged (up to FP non-associativity).
+    """
+    if not has_triton_kernels():
+        return routing_from_topk(
+            topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+        )
+
+    n_tokens, n_expts_act = topk_weights.shape
+    n_gates_pad = n_tokens * n_expts_act
+
+    if n_gates_pad > 4096:
+        # Single-CTA design exceeded; fall back rather than degrading
+        # silently. Typically only hit during prefill.
+        return routing_from_topk(
+            topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+        )
+    hist, topk_indx, gate_indx, gate_scal = _aiter_fused_routing_from_topk(
+        topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+    )
+
+    # Package as the matmul_ogs routing data structures.
+    from triton_kernels.routing import (
+        RoutingData,
+        GatherIndx,
+        ScatterIndx,
+        compute_expt_data,
+    )
+
+    gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
+    scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
+    expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad)
+
+    routing_data = RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
+    return routing_data, gather_indx, scatter_indx
+
+
+def routing_from_topk(
+    topk_weights, topk_ids, n_expts_tot, expert_map: torch.Tensor | None = None
+):
     """Convert FusedMoE.select_experts output to triton routing data structures.
 
     This bridges the gap between ATOM's grouped topk / sigmoid routing
@@ -91,6 +167,12 @@ def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
 
     n_tokens, n_expts_act = topk_weights.shape
     n_gates_pad = n_tokens * n_expts_act
+
+    if expert_map is not None:
+        local_ids = expert_map[topk_ids.long()]
+        invalid = local_ids < 0
+        topk_weights = topk_weights.masked_fill(invalid, 0.0)
+        topk_ids = local_ids.masked_fill(invalid, 0).to(torch.int32)
 
     # Sort each token's selected experts by expert_id (required by triton kernels)
     expt_indx_sorted, sort_indices = torch.sort(topk_ids.int(), dim=1)
@@ -241,22 +323,45 @@ def triton_kernel_fused_experts(
         dtype=hidden_states.dtype,
     )
 
-    matmul_ogs(
-        hidden_states,
-        w1,
-        w1_bias,
-        routing_data,
-        gather_indx=gather_indx,
-        precision_config=w13_precision_config,
-        gammas=gammas if apply_router_weight_on_input else None,
-        y=raw_intermediate,
-    )
-
-    # Standard SiLU/SwiGLU activation: silu(gate) * up
-    raw_2d = raw_intermediate.view(M * topk, N)
-    gate = raw_2d[:, :half_N]
-    up = raw_2d[:, half_N:]
-    intermediate_cache[0] = torch.nn.functional.silu(gate) * up
+    if activation == ActivationType.Swiglu:
+        # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
+        act = FusedActivation(
+            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
+            (swiglu_alpha, swiglu_limit),
+            2,
+        )
+        matmul_ogs(
+            hidden_states,
+            w1,
+            w1_bias,
+            routing_data,
+            gather_indx=gather_indx,
+            precision_config=w13_precision_config,
+            gammas=gammas if apply_router_weight_on_input else None,
+            fused_activation=act,
+            y=intermediate_cache,
+        )
+    else:
+        # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation
+        raw_intermediate = matmul_ogs(
+            hidden_states,
+            w1,
+            w1_bias,
+            routing_data,
+            gather_indx=gather_indx,
+            precision_config=w13_precision_config,
+            gammas=gammas if apply_router_weight_on_input else None,
+        )
+        raw_2d = raw_intermediate.view(M * topk, N)
+        intermediate_cache = intermediate_cache.view(M * topk, half_N)
+        fused_clamp_act_mul(
+            raw_2d,
+            out=intermediate_cache,
+            swiglu_limit=swiglu_limit,
+            activation="silu",
+            dtype_quant=None,
+        )
+        intermediate_cache = intermediate_cache.view(batch_dim, M * topk, half_N)
 
     matmul_ogs(
         intermediate_cache.view(M * topk, half_N),

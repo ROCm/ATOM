@@ -1,0 +1,55 @@
+name: Deploy Static Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/pages/**'
+  workflow_dispatch:
+
+# To add a new page:
+#   1. Create .github/pages/<page-name>/index.html
+#   2. Push to main
+#   3. The workflow auto-discovers and deploys all subdirectories
+#   4. URL: https://rocm.github.io/ATOM/<page-name>
+
+jobs:
+  deploy-pages:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Deploy all pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          CURRENT_SHA=$(git rev-parse HEAD)
+
+          # Save all page directories before switching branches
+          for dir in .github/pages/*/; do
+            page_name=$(basename "$dir")
+            cp -r "$dir" "/tmp/page_${page_name}"
+            echo "Found page: $page_name"
+          done
+
+          # Switch to gh-pages
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          # Copy each page to its destination
+          for dir in /tmp/page_*/; do
+            page_name=$(basename "$dir" | sed 's/^page_//')
+            mkdir -p "$page_name"
+            cp -r "$dir"* "$page_name/"
+            git add "$page_name/"
+            echo "Deployed: $page_name"
+          done
+
+          git diff --cached --quiet || git commit -m "pages: deploy static pages"
+          git push origin gh-pages
+          git checkout "$CURRENT_SHA"

@@ -12,41 +12,84 @@ docker pull rocm/atom-dev:vllm-latest
 
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
-### Qwen3-Next-80B-A3B-Instruct-FP8 (TP=2)
+### Qwen3-Next-80B-A3B-Instruct-FP8 (TP=1/TP=4, MI355X)
 
 ```bash
-export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+TP=1
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export ATOM_USE_CUSTOM_ALL_GATHER=0
+export ATOM_USE_FLYDSL_GDR=1
+export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
+if [ "${TP}" != "1" ]; then export AITER_QUICK_REDUCE_QUANTIZATION=INT4; fi
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size 2 \
+    --tensor-parallel-size "${TP}" \
     --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --max-model-len 16384 \
+    --max-num-batched-tokens 32768 \
+    --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching
 ```
 
-**Important**: `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1` is required for Qwen3-Next because it uses a hybrid architecture with both linear attention (GatedDeltaNet) and full attention layers. This env var ensures full attention layers use vLLM's default implementation.
+### Qwen3-Next-80B-A3B-Instruct-FP8 MTP (TP=1/TP=4, MI355X)
 
+**Important**: ATOM-vLLM no longer supports disabling only ATOM attention while keeping ATOM models active. Use `ATOM_DISABLE_VLLM_PLUGIN=1` for a pure vLLM run.
+
+```bash
+TP=1
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export ATOM_USE_CUSTOM_ALL_GATHER=0
+export ATOM_USE_FLYDSL_GDR=1
+export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
+if [ "${TP}" != "1" ]; then export AITER_QUICK_REDUCE_QUANTIZATION=INT4; fi
+
+vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
+    --host localhost \
+    --port 8000 \
+    --tensor-parallel-size "${TP}" \
+    --kv-cache-dtype fp8 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --max-model-len 16384 \
+    --max-num-batched-tokens 32768 \
+    --speculative-config '{"num_speculative_tokens":1, "method": "mtp"}' \
+    --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching
+```
 ## Step 3: Performance Benchmark
 
 Users can use the default vllm bench commands for performance benchmarking.
 
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
-    --host localhost \
-    --port 8000 \
+    --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --endpoint /v1/completions \
     --model Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --dataset-name random \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.8 \
-    --max-concurrency 64 \
-    --num-prompts 640 \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --max-concurrency "${CONC}" \
+    --num-prompts "$(( CONC * 8 ))" \
     --trust_remote_code \
+    --num-warmups "${CONC}" \
+    --request-rate inf \
+    --ignore-eos \
+    --disable-tqdm \
+    --save-result \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 
@@ -70,7 +113,7 @@ lm_eval --model local-completions \
 
 ## Key Environment Variables
 
-- `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`: **Required** - disables ATOM attention plugin to use vLLM's implementation for full attention layers
+- `ATOM_DISABLE_VLLM_PLUGIN=1`: Optional pure-vLLM control when you do not want to use the ATOM vLLM plugin.
 
 ## Architecture Notes
 

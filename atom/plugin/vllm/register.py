@@ -4,13 +4,12 @@ import logging
 import torch
 from atom.plugin.prepare import _set_framework_backbone
 from atom.utils import envs
-from atom.plugin.vllm.mla_patch import patch_vllm_mla_attention
+from atom.plugin.vllm.spec_decode_patch import apply_vllm_spec_decode_patch
 
 logger = logging.getLogger("atom")
 
 # this flag is used to enable the vllm plugin mode
 disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
-disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 
 # those 2 models are covering most of dense and moe models
 ATOM_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMForCausalLM"
@@ -19,15 +18,22 @@ ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMMoEForCau
 # when register new model to vllm, add here
 # Keys is from hf config arch name
 _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
+    "LlamaForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3ForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "GptOssForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV3ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "DeepseekV32ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
-    "Qwen3NextForCausalLM": "atom.models.qwen3_next:Qwen3NextForCausalLMVllm",
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
+    "GlmMoeDsaForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "DeepSeekMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "Glm4MoeMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLMVllm",
+    "Qwen3NextMTP": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration",
+    "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
 }
 
 
@@ -43,7 +49,11 @@ def register_platform() -> Optional[str]:
         logger.info("Disable ATOM OOT plugin platforms")
         return None
 
-    _set_plugin_mode()
+    # Do not call _set_plugin_mode() here. SGLang (and other stacks) discover
+    # vllm.platform_plugins and would set atom's backbone to "vllm" before
+    # importing SGLang plugin modules — then atom.models.qwen3_5's ``if is_vllm():``
+    # branch runs and requires vllm.model_executor.models.qwen3_5, which may be
+    # absent. Backbone is set in register_model() for real vLLM runs.
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
@@ -83,6 +93,8 @@ def register_model() -> None:
         logger.info("Disable ATOM model register")
         return
 
+    _set_plugin_mode()
+
     import vllm.model_executor.models.registry as vllm_model_registry
 
     any_updated = False
@@ -106,7 +118,6 @@ def register_model() -> None:
         vllm_model_registry._try_load_model_cls.cache_clear()
         vllm_model_registry._try_inspect_model_cls.cache_clear()
 
-    patch_vllm_mla_attention()
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader
     try:
@@ -116,6 +127,10 @@ def register_model() -> None:
 
     _patch_vllm_attention_process_weights_after_loading(Attention)
     _patch_vllm_attention_process_weights_after_loading(MLAAttention)
+    # vLLM's speculative decoder keeps an allow-list of attention metadata
+    # classes. ATOM-vLLM uses its own metadata classes after attention
+    # isolation, so extend that allow-list before MTP/Eagle proposal runs.
+    apply_vllm_spec_decode_patch()
 
     # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in fused_allreduce_rmsnorm when model uses aiter collectives

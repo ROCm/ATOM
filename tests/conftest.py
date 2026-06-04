@@ -40,7 +40,23 @@ class _StubConfig:
     pass
 
 
+class _StubKVCacheTensor:
+    """Placeholder for KVCacheTensor."""
+
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class _StubParallelConfig:
+    """Placeholder for ParallelConfig."""
+
+    pass
+
+
 _atom_config.Config = _StubConfig
+_atom_config.KVCacheTensor = _StubKVCacheTensor
+_atom_config.ParallelConfig = _StubParallelConfig
 sys.modules["atom.config"] = _atom_config
 
 # ── 4. Stub zmq / zmq.asyncio if not installed ────────────────────────────
@@ -102,11 +118,13 @@ class MockConfig:
             enable_prefix_caching=False,
             max_num_seqs=4,
             max_num_batched_tokens=64,
+            max_model_len=64,
             bos_token_id=1,
             eos_token_id=2,
             stop_token_ids=[],
             scheduler_delay_factor=0.0,
             speculative_config=None,
+            enable_chunked_prefill=False,
         )
         defaults.update(overrides)
         for k, v in defaults.items():

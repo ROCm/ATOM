@@ -61,12 +61,14 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `eos_token_id` | `int` | `-1` | End-of-sequence token ID (`-1` = use model default) |
 | `stop_token_ids` | `list[int]` | `[]` | Additional stop token IDs; populated from `GenerationConfig.eos_token_id` during init |
 
-**Auto-derived fields** (set in `__post_init__`, not user-supplied):
+**Auto-derived fields** (set in `__post_init__` or by `ModelRunner.get_num_blocks()`, not user-supplied):
 
 | Field | Type | Description |
 |---|---|---|
 | `hf_config` | `PretrainedConfig` | Loaded automatically via `get_hf_config(model)` |
 | `generation_config` | `GenerationConfig` | Loaded automatically via `get_generation_config(model)` |
+| `per_req_cache_equiv_blocks` | `int` | Number of KV cache block equivalents reserved per request for the per-request stateful-attention cache (currently GDN recurrent state; future stateful attentions plug in via `AttentionMetadataBuilder.compute_per_req_cache_bytes()`); computed by `ModelRunner.get_num_blocks()` |
+| `num_per_req_cache_groups` | `int` | Number of per-request slot groups available (= `max_num_seqs` for stateful-attention models, 0 otherwise); computed by `ModelRunner.get_num_blocks()` |
 
 ---
 
@@ -206,6 +208,45 @@ parameters:
 
 Linear layers, MoE layers, and fused ops call `quant_config.get_layer_quant_config(prefix)` to obtain the appropriate `LayerQuantConfig` for their position in the model. This enables mixed-precision quantization where different layers can have different quant types and dtypes (e.g., FP8 for attention, FP4 for MLP).
 
+### 3.7 Online Quantization at Load Time
+
+ATOM can re-quantize model weights while loading them by passing
+`--online_quant_config` to the engine. This is useful when the source checkpoint
+is unquantized or uses a different supported quantization layout than the runtime
+layout you want to benchmark.
+
+The flag accepts a JSON object:
+
+```bash
+--online_quant_config '{
+  "global_quant_config": "ptpc_fp8",
+  "layer_quant_config": {"*expert*": "mxfp4"},
+  "exclude_layer": ["lm_head", "*.gate.*"]
+}'
+```
+
+Fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `global_quant_config` | `str` | Default target quantization format for all layers. |
+| `layer_quant_config` | `dict[str, str]` | Per-layer target overrides. Keys are fnmatch-style layer patterns such as `"*expert*"`. |
+| `exclude_layer` | `str \| list[str]` | Layers to leave unquantized. Supports exact/prefix matches, glob patterns, and `re:` regex entries. Prefer a JSON list when excluding multiple patterns. |
+
+Supported target format strings:
+
+| Format | Target config |
+|---|---|
+| `ptpc_fp8` | `QuantType.per_Token` with FP8 weights |
+| `mxfp4` | `QuantType.per_1x32` with packed MXFP4 weights |
+
+Notes:
+
+- An empty JSON object (`--online_quant_config '{}'`) is treated the same as not passing the flag and does not enable online quantization.
+- Online quantization currently applies when the source model is unquantized or uses supported FP8 block quantization (`QuantType.per_1x128`). The loader dequantizes FP8 block weights before applying the requested target format.
+- Tensor-parallel weights are gathered before quantization only when local quantization would produce different scales than quantizing the full unpartitioned weight.
+- Rank 0 writes an `online_quant_info_*.json` summary with elapsed time and per-layer target formats. The file is written under `ATOM_TORCH_PROFILER_DIR` when set, otherwise the current working directory.
+
 ---
 
 ## 4. Parallel Configuration (`ParallelConfig`)
@@ -242,10 +283,55 @@ method with `num_speculative_tokens=1` is supported.
 | `num_speculative_tokens` | `Optional[int]` | `None` | Number of speculative tokens per iteration; **must be `1`** |
 | `draft_model_hf_config` | `Optional[PretrainedConfig]` | `None` | HuggingFace config for the draft model; auto-loaded from `model` when `None` |
 
-**Post-init behaviour:**
+### 5.1 Table-Driven MTP Config
+
+MTP configuration uses two class-level lookup tables to support multiple model
+families without per-model branching.
+
+**`_MTP_TYPE_MAP`** -- maps a base `model_type` to its MTP `model_type`:
+
+| Base `model_type` | MTP `model_type` |
+|---|---|
+| `deepseek_v3` | `deepseek_mtp` |
+| `glm_moe_dsa` | `deepseek_mtp` |
+| `qwen3_next` | `qwen3_next_mtp` |
+| `qwen3_5` | `qwen3_5_mtp` |
+| `qwen3_5_moe` | `qwen3_5_mtp` |
+| `qwen3_5_text` | `qwen3_5_mtp` |
+| `qwen3_5_moe_text` | `qwen3_5_mtp` |
+
+**`_MTP_CONFIG`** -- maps MTP `model_type` to a `(n_predict_attr, architecture)` tuple:
+
+| MTP `model_type` | `n_predict_attr` | Architecture |
+|---|---|---|
+| `deepseek_mtp` | `num_nextn_predict_layers` | `DeepSeekMTPModel` |
+| `qwen3_next_mtp` | `num_nextn_predict_layers` | `Qwen3NextMTPModel` |
+| `qwen3_5_mtp` | `mtp_num_hidden_layers` | `Qwen3_5MTPModel` |
+
+### 5.2 Post-init behaviour (`hf_config_override`)
+
+The static method `hf_config_override` applies a two-step transformation to the
+draft model's HuggingFace config:
+
+1. **Resolve model type** -- looks up `hf_config.model_type` in `_MTP_TYPE_MAP`.
+   If found, rewrites `model_type` to the MTP variant (e.g.
+   `deepseek_v3` -> `deepseek_mtp`).
+
+2. **Apply MTP overrides** -- looks up the (possibly rewritten) `model_type` in
+   `_MTP_CONFIG`. If found:
+   - Reads `n_predict` from the model-specific attribute (e.g.
+     `num_nextn_predict_layers` or `mtp_num_hidden_layers`), defaulting to 1.
+     Warns and forces it to 1 if the original value differs.
+   - Sets `n_predict=1`, `num_nextn_predict_layers=1` (universal across all MTP
+     families), and `architectures` to the corresponding MTP model class.
+   - **Qwen3.5 MTP only**: additionally injects `n_shared_experts=1` and
+     `n_routed_experts` (read from `hf_config.num_experts`, default 0) so the
+     MTP module can construct its MoE layer.
+
+Other post-init steps:
 
 - Loads `draft_model_hf_config` from `model` if not provided.
-- For DeepSeek V3 / MTP models: overrides `model_type` to `"deepseek_mtp"`, sets `n_predict=1` and `num_nextn_predict_layers=1`, and switches architectures to `["DeepSeekMTPModel"]`.
+- Extracts `text_config` from multimodal model configs when present.
 - `Config.__post_init__` raises `ValueError` if `num_speculative_tokens != 1`.
 
 ---
@@ -293,6 +379,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 -- 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |
+| `--online_quant_config` | | JSON string | `None` | Load-time online quantization override; see Section 3.7 |
 
 **Example:**
 

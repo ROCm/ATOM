@@ -53,7 +53,7 @@ Key entry points:
 ## Key Development Patterns
 
 - **Adding a model**: see `/add-model` for full guide
-- **Model reuse**: DeepSeek V3/V3.2/GLM-5 share `deepseek_v2.py`; MTP models in `deepseek_mtp.py` and `qwen3_next_mtp.py`
+- **Model reuse**: DeepSeek V3/V3.2/GLM-5 share `deepseek_v2.py`; MTP models in `deepseek_mtp.py`, `qwen3_next_mtp.py`, and `qwen3_5_mtp.py`
 - **Compilation levels**: `--level` 0=eager, 1=torch.compile, 2=dynamo once, 3=piecewise+CUDAGraph (default)
 
 ## Dependencies

@@ -1,6 +1,6 @@
 # Qwen3.5 with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `Qwen3.5-35B-A3B-Instruct-FP8` and `Qwen3.5-397B-A5B-Instruct-FP8` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `Qwen3.5-397B-A17B-FP8`, `Qwen3.5-397B-A17B`, and `Qwen3.5-397B-A17B-MXFP4` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
 ## Step 1: Pull the OOT Docker
 
@@ -12,58 +12,109 @@ docker pull rocm/atom-dev:vllm-latest
 
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
-### Qwen3.5-35B-A3B (TP=2)
+### Qwen3.5-397B-A17B-FP8 (TP=4/TP=8)
 
 ```bash
-export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export ATOM_USE_CUSTOM_ALL_GATHER=0
+export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
+TP=8
 
-vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
+vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size 2 \
-    --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size "${TP}" \
+    --attention-backend ROCM_AITER_FA \
+    --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
+    --gpu-memory-utilization 0.8 \
     --no-enable-prefix-caching
 ```
 
 ### Qwen3.5-397B-A17B (TP=8)
 
 ```bash
-export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export ATOM_USE_CUSTOM_ALL_GATHER=0
+export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
 
-vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
+vllm serve Qwen/Qwen3.5-397B-A17B \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size 8 \
-    --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 8 \
+    --attention-backend ROCM_AITER_FA \
+    --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
+    --gpu-memory-utilization 0.8 \
     --no-enable-prefix-caching
 ```
 
-**Important**: `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1` is required for Qwen3.5 because it uses a hybrid architecture with both linear attention (GatedDeltaNet) and full attention layers. This env var ensures full attention layers use vLLM's default implementation.
+### Qwen3.5-397B-A17B-MXFP4 (TP=4)
+
+```bash
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export ATOM_USE_CUSTOM_ALL_GATHER=0
+export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
+
+vllm serve amd/Qwen3.5-397B-A17B-MXFP4 \
+    --host localhost \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching
+```
+
+**Important**: ATOM-vLLM no longer supports disabling only ATOM attention while keeping ATOM models active. Use `ATOM_DISABLE_VLLM_PLUGIN=1` for a pure vLLM run.
+
+The following environment variables are relevant for Qwen3.5:
+
+- `ATOM_USE_CUSTOM_ALL_GATHER=0`: Disables custom all-gather for compatibility with Qwen3.5 model architecture
+- `ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0`: Disables FP8 blockscale weight preshuffle
+- `AITER_QUICK_REDUCE_QUANTIZATION=INT4`: **Performance optimization** - enables INT4 quantization for quick reduce operations, which can significantly improve TTFT (Time To First Token) performance. **Note**: This optimization may introduce a risk of accuracy degradation. For accuracy-critical workloads, consider validating with your specific use case.
 
 ## Step 3: Performance Benchmark
 
 Users can use the default vllm bench commands for performance benchmarking.
 
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
-    --host localhost \
-    --port 8000 \
-    --model Qwen/Qwen3.5-35B-A3B-FP8 \
+    --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --endpoint /v1/completions \
+    --model Qwen/Qwen3.5-397B-A17B-FP8 \
     --dataset-name random \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.8 \
-    --max-concurrency 64 \
-    --num-prompts 640 \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --max-concurrency "${CONC}" \
+    --num-prompts "$(( CONC * 8 ))" \
     --trust_remote_code \
+    --num-warmups "${CONC}" \
+    --request-rate inf \
+    --ignore-eos \
+    --disable-tqdm \
+    --save-result \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 
@@ -80,15 +131,38 @@ profiler_config=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_p
 
 ```bash
 lm_eval --model local-completions \
-        --model_args model=Qwen/Qwen3.5-35B-A3B-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+        --model_args model=Qwen/Qwen3.5-397B-A17B-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
         --tasks gsm8k \
         --num_fewshot 3
+```
+
+### Qwen3.5-397B-A17B accuracy example
+
+```bash
+lm_eval --model local-completions \
+        --model_args model=Qwen/Qwen3.5-397B-A17B,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+        --tasks gsm8k \
+        --num_fewshot 3
+```
+
+Reference result (TP=8):
+
+```bash
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     3|exact_match|↑  |0.8506|±  |0.0098|
+|     |       |strict-match    |     3|exact_match|↑  |0.8378|±  |0.0102|
 ```
 
 
 ## Key Environment Variables
 
-- `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`: **Required** - disables ATOM attention plugin to use vLLM's implementation for full attention layers
+- `ATOM_USE_CUSTOM_ALL_GATHER=0`: **Required** - disables custom all-gather for compatibility with Qwen3.5 model architecture
+- `ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0`: **Required** - disables FP8 blockscale weight preshuffle
+- `AITER_QUICK_REDUCE_QUANTIZATION=INT4`: **Performance optimization** - enables INT4 quantization for quick reduce operations
+  - **Benefit**: Significantly improves TTFT (Time To First Token) performance by reducing communication overhead during tensor parallelism all-reduce operations
+  - **Risk**: May cause slight accuracy degradation due to lower quantization precision
+  - **Recommendation**: Use for latency-sensitive workloads where TTFT is critical. For accuracy-critical applications, validate with your specific dataset or consider removing this flag
 
 
 ## Performance baseline
@@ -100,8 +174,8 @@ python -m atom.benchmarks.benchmark_serving \
     --model=Qwen/Qwen3.5-397B-A17B-FP8 --backend=vllm --base-url=http://localhost:8000 \
     --dataset-name=random \
     --random-input-len=${ISL} --random-output-len=${OSL} \
-    --random-range-ratio 0.8 \
-    --num-prompts=$(( $CONC * 10 )) \
+    --random-range-ratio 0.0 \
+    --num-prompts=$(( CONC * 8 )) \
     --max-concurrency=$CONC \
     --request-rate=inf --ignore-eos \
     --save-result --result-dir=${result_dir} --result-filename=$RESULT_FILENAME.json \
@@ -151,7 +225,7 @@ IMAGE_BASE64=$(base64 -w 0 ATOM/recipes/atom_vllm/dog.png)
 curl -X POST "http://localhost:${PORT}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "/mnt/data/pretrained_model/Qwen/Qwen3.5-35B-A3B-FP8",
+    "model": "Qwen/Qwen3.5-397B-A17B-FP8",
     "messages": [
       {
         "role": "user",
@@ -183,7 +257,7 @@ And you are expected to receive the response like following:
     "id": "chatcmpl-8191fab14490fc74",
     "object": "chat.completion",
     "created": 1773631986,
-    "model": "/mnt/data/pretrained_model/Qwen/Qwen3.5-35B-A3B-FP8",
+    "model": "Qwen/Qwen3.5-397B-A17B-FP8",
     "choices": [
         {
             "index": 0,
