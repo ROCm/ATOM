@@ -281,7 +281,7 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids(monkeypatch):
         )
     }
     codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4)
+    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
     memory_obj = SimpleNamespace(
         tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
     )
@@ -318,6 +318,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         pytest.skip("real torch is unavailable")
 
     monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "2")
     original = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
@@ -335,24 +336,39 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         )
     }
     codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4)
+    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
     monkeypatch.setattr(connector, "_can_use_fused_chunk_major", lambda: True)
     orig_pack = codec.gpu_to_chunk_major_device_buffer
     orig_unpack = codec.chunk_major_device_buffer_to_gpu
+
+    pack_groups = []
+    unpack_groups = []
+    slot_requests = []
+
     monkeypatch.setattr(
         codec,
         "gpu_to_chunk_major_device_buffer",
-        lambda device_buf, block_id_groups, stream=None: orig_pack(
-            device_buf, block_id_groups, stream=None
-        ),
+        lambda device_buf, block_id_groups, stream=None: (
+            pack_groups.append([list(group) for group in block_id_groups]),
+            orig_pack(device_buf, block_id_groups, stream=None),
+        )[-1],
     )
     monkeypatch.setattr(
         codec,
         "chunk_major_device_buffer_to_gpu",
-        lambda device_buf, block_id_groups, stream=None: orig_unpack(
-            device_buf, block_id_groups, stream=None
-        ),
+        lambda device_buf, block_id_groups, stream=None: (
+            unpack_groups.append([list(group) for group in block_id_groups]),
+            orig_unpack(device_buf, block_id_groups, stream=None),
+        )[-1],
     )
+    orig_ensure_slot = connector._ensure_slot
+
+    def _ensure_slot(slot, nbytes):
+        device_buf = orig_ensure_slot(slot, nbytes)
+        slot_requests.append((nbytes, int(slot.tensor.numel())))
+        return device_buf
+
+    monkeypatch.setattr(connector, "_ensure_slot", _ensure_slot)
 
     class _FakeEvent:
         def record(self, stream) -> None:
@@ -420,6 +436,20 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         ]
     )
     assert connector.last_fastpath() == "fused_chunk"
+    transfer_stats = connector.last_transfer_stats()
+    assert transfer_stats["chunks"] == 2
+    assert transfer_stats["groups"] == 1
+    assert transfer_stats["max_chunk_bytes"] == 2 * codec.bytes_per_block
+    assert transfer_stats["max_group_bytes"] == 3 * codec.bytes_per_block
+    assert transfer_stats["total_bytes"] == 3 * codec.bytes_per_block
+    assert transfer_stats["gpu_staging_chunk_bytes"] == 2 * codec.bytes_per_block
+    assert transfer_stats["gpu_staging_group_chunks"] == 2
+    assert transfer_stats["gpu_staging_capacity_bytes"] == 4 * codec.bytes_per_block
+    assert transfer_stats["gpu_staging_slots"] == 1
+    assert transfer_stats["transfer_ms"] >= 0
+    assert pack_groups == [[[1, 2], [3]]]
+    assert all(nbytes <= 4 * codec.bytes_per_block for nbytes, _ in slot_requests)
+    assert all(capacity == 4 * codec.bytes_per_block for _, capacity in slot_requests)
     assert torch.equal(memory_objs[0].tensor, expected0)
     assert torch.equal(memory_objs[1].tensor, expected1)
 
@@ -433,11 +463,220 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     )
 
     assert connector.last_fastpath() == "fused_chunk"
+    assert unpack_groups == [[[1, 2], [3]]]
     for bid in [1, 2, 3]:
         assert torch.equal(kv_caches["l0"].k_cache[bid], original["l0"].k_cache[bid])
         assert torch.equal(kv_caches["l0"].v_cache[bid], original["l0"].v_cache[bid])
     assert torch.count_nonzero(kv_caches["l0"].k_cache[0]) == 0
     assert torch.count_nonzero(kv_caches["l0"].v_cache[0]) == 0
+
+
+def test_lmcache_connector_fallback_staging_is_chunk_bounded(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
+    original = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(8 * 2, dtype=torch.uint8).reshape(8, 2),
+            v_cache=(torch.arange(8 * 3, dtype=torch.uint8).reshape(8, 3) + 51),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=original["l0"].k_cache.clone(),
+            v_cache=original["l0"].v_cache.clone(),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    cap = 2 * codec.bytes_per_block
+    slot_requests = []
+    host_requests = []
+    orig_ensure_slot = connector._ensure_slot
+    orig_ensure_host_tmp = connector._ensure_host_tmp
+
+    def _ensure_slot(slot, nbytes):
+        device_buf = orig_ensure_slot(slot, nbytes)
+        slot_requests.append((nbytes, int(slot.tensor.numel())))
+        return device_buf
+
+    def _ensure_host_tmp(state, nbytes):
+        host_buf = orig_ensure_host_tmp(state, nbytes)
+        host_requests.append((nbytes, int(state.host_tmp.numel())))
+        return host_buf
+
+    monkeypatch.setattr(connector, "_ensure_slot", _ensure_slot)
+    monkeypatch.setattr(connector, "_ensure_host_tmp", _ensure_host_tmp)
+    memory_objs = [
+        SimpleNamespace(
+            tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
+        ),
+        SimpleNamespace(
+            tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
+        ),
+        SimpleNamespace(
+            tensor=torch.empty(1 * codec.bytes_per_block, dtype=torch.uint8)
+        ),
+    ]
+
+    connector.batched_from_gpu(
+        memory_objs,
+        [0, 8, 16],
+        [8, 16, 20],
+        block_ids=list(range(8)),
+    )
+
+    assert connector.last_fastpath() == "chunk"
+    assert connector.last_transfer_stats()["chunks"] == 3
+    assert connector.last_transfer_stats()["max_chunk_bytes"] == cap
+    assert all(nbytes <= cap for nbytes, _ in slot_requests)
+    assert all(capacity == cap for _, capacity in slot_requests)
+    assert all(nbytes <= cap for nbytes, _ in host_requests)
+    assert all(capacity == cap for _, capacity in host_requests)
+
+    kv_caches["l0"].k_cache.zero_()
+    kv_caches["l0"].v_cache.zero_()
+    connector.batched_to_gpu(
+        memory_objs,
+        [0, 8, 16],
+        [8, 16, 20],
+        block_ids=list(range(8)),
+    )
+
+    for bid in range(5):
+        assert torch.equal(kv_caches["l0"].k_cache[bid], original["l0"].k_cache[bid])
+        assert torch.equal(kv_caches["l0"].v_cache[bid], original["l0"].v_cache[bid])
+    assert torch.count_nonzero(kv_caches["l0"].k_cache[5]) == 0
+    assert torch.count_nonzero(kv_caches["l0"].v_cache[5]) == 0
+
+
+def test_lmcache_connector_release_covers_fallback_chunks(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
+    monkeypatch.setenv("OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER", "1")
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    memory_objs = [
+        SimpleNamespace(
+            tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
+        ),
+        SimpleNamespace(
+            tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
+        ),
+    ]
+
+    connector.batched_from_gpu(
+        memory_objs,
+        [0, 8],
+        [8, 16],
+        block_ids=list(range(4)),
+    )
+
+    state = connector._thread_state()
+    assert state.host_tmp is not None
+    assert int(state.host_tmp.numel()) == 2 * codec.bytes_per_block
+    assert all(slot.tensor is None for slot in state.slots)
+
+
+def test_lmcache_connector_rejects_oversized_memory_obj(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
+            v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+    memory_obj = SimpleNamespace(
+        tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
+    )
+
+    with pytest.raises(ValueError, match="single MemoryObj exceeds"):
+        connector.batched_from_gpu(
+            [memory_obj],
+            [0],
+            [8],
+            block_ids=list(range(4)),
+        )
+
+
+def test_lmcache_connector_respects_staging_slot_env(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_SLOTS", "2")
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "3")
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
+            v_cache=torch.arange(2 * 3, dtype=torch.uint8).reshape(2, 3),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+
+    assert connector.staging_slots == 2
+    assert connector.gpu_staging_group_chunks == 3
+    assert connector.gpu_staging_capacity_bytes == 3 * connector.gpu_staging_chunk_bytes
+    assert len(connector._thread_state().slots) == 2
+
+
+def test_lmcache_connector_default_staging_group_chunks_is_two(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_CHUNKS", raising=False)
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
+            v_cache=torch.arange(2 * 3, dtype=torch.uint8).reshape(2, 3),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+
+    assert connector.gpu_staging_group_chunks == 2
+    assert connector.gpu_staging_capacity_bytes == 2 * connector.gpu_staging_chunk_bytes
 
 
 def test_codec_chunk_major_device_buffer_layout(monkeypatch):

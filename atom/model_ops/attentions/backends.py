@@ -167,6 +167,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return 0
 
+    def compute_offload_staging_block_bytes(self) -> int:
+        """Bytes copied by ATOM KV offload for one block id.
+
+        This must match ``ATOMKVByteCodec.bytes_per_block`` without requiring
+        the actual KV tensors to exist yet. The default mirrors the KV pool
+        block estimate; backends whose exposed ``KVCacheTensor`` block geometry
+        differs from the scheduler block geometry should override it.
+        """
+        return self.compute_block_bytes()
+
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict[str, Any]:

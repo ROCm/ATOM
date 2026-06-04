@@ -585,6 +585,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         return block_bytes
 
+    def compute_offload_staging_block_bytes(self) -> int:
+        """Per exposed MLA KVCacheTensor block copied by ATOM offload."""
+        runner = self.model_runner
+        config = runner.config
+        total_num_layers = runner._get_total_num_layers()
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+        return total_num_layers * 576 * kv_dtype_size
+
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict:

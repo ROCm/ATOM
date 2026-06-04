@@ -360,6 +360,55 @@ class AiterAttentionMetadataBuilder:
         )
         return block_bytes
 
+    def compute_offload_staging_block_bytes(self) -> int:
+        """Per exposed KVCacheTensor block copied by ATOM offload.
+
+        ``compute_block_bytes()`` is a scheduler-block KV pool estimate.
+        The offload codec copies slices exposed by ``build_kv_cache_tensor``;
+        for the AITER MHA layout those slices are physical KV blocks.
+        """
+        from aiter import dtypes
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+        physical_block_size = runner.physical_block_size
+
+        def per_layer_bytes(num_kv_heads: int) -> int:
+            block_bytes = (
+                2
+                * num_kv_heads
+                * hf_config.head_dim
+                * physical_block_size
+                * kv_dtype_size
+            )
+            if config.kv_cache_dtype == "fp8":
+                block_bytes += 2 * num_kv_heads * physical_block_size * 4
+            return block_bytes
+
+        if runner.is_mimo_v2():
+            pattern = hf_config.hybrid_layer_pattern
+            num_swa_layers = sum(
+                1 for i in range(hf_config.num_hidden_layers) if pattern[i] == 1
+            )
+            num_full_layers = hf_config.num_hidden_layers - num_swa_layers
+            num_draft_layers = (
+                runner._get_total_num_layers() - hf_config.num_hidden_layers
+            )
+            num_swa_layers += num_draft_layers
+            _swa_raw = getattr(hf_config, "swa_num_key_value_heads", 0)
+            swa_kv_heads = (
+                _swa_raw // runner.world_size
+                if _swa_raw >= runner.world_size
+                else (1 if _swa_raw else 0)
+            )
+            return num_full_layers * per_layer_bytes(
+                runner._get_num_kv_heads()
+            ) + num_swa_layers * per_layer_bytes(swa_kv_heads)
+
+        return hf_config.num_hidden_layers * per_layer_bytes(runner._get_num_kv_heads())
+
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict:
