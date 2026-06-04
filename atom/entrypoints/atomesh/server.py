@@ -8,8 +8,10 @@ constructed Python objects and uses them in ``AtomStandaloneRouter``.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import importlib
 import importlib.util
+import json
 import logging
 from pathlib import Path
 import sys
@@ -19,6 +21,15 @@ logger = logging.getLogger("atom")
 
 engine: Any | None = None
 tokenizer: Any | None = None
+
+
+@dataclass(frozen=True)
+class StandaloneArgs:
+    """Parsed standalone launch args split by their owning layer."""
+
+    engine_args: argparse.Namespace
+    mesh_args: list[str]
+    default_chat_template_kwargs: dict[str, Any]
 
 
 def import_atomesh_runner() -> Any:
@@ -84,7 +95,10 @@ def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
     return engine, tokenizer
 
 
-def initialize_standalone_service(args: argparse.Namespace) -> Any:
+def initialize_standalone_service(
+    args: argparse.Namespace,
+    default_chat_template_kwargs: dict[str, Any],
+) -> Any:
     from atom.entrypoints.atomesh.atom_standalone_service import AtomStandaloneService
 
     global engine, tokenizer
@@ -92,35 +106,84 @@ def initialize_standalone_service(args: argparse.Namespace) -> Any:
         engine=engine,
         tokenizer=tokenizer,
         model_name=args.model,
+        default_chat_template_kwargs=default_chat_template_kwargs,
     )
 
 
-def split_standalone_args(raw_args: list[str]) -> tuple[list[str], list[str]]:
-    """Keep mesh router --port from being consumed by EngineArgs.
+def split_standalone_mesh_args(raw_args: list[str]) -> tuple[list[str], list[str]]:
+    """Keep mesh-owned network args from being consumed by Python parsers.
 
     EngineArgs also defines --port for internal engine communication. In
     Atomesh standalone mode, the user-facing --port should configure the mesh
-    HTTP router, matching the Rust CLI behavior.
+    HTTP router, matching the Rust CLI behavior. --server-port is accepted for
+    compatibility with the classic OpenAI entrypoint and translated to --port.
     """
     mesh_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    mesh_parser.add_argument("--host")
     mesh_parser.add_argument("--port")
-    mesh_args, engine_args = mesh_parser.parse_known_args(raw_args)
-    if mesh_args.port is None:
-        return engine_args, []
-    return engine_args, ["--port", mesh_args.port]
+    mesh_parser.add_argument("--server-port")
+    mesh_namespace, python_args = mesh_parser.parse_known_args(raw_args)
+
+    mesh_args: list[str] = []
+    if mesh_namespace.host is not None:
+        mesh_args.extend(["--host", mesh_namespace.host])
+    port = mesh_namespace.port or mesh_namespace.server_port
+    if port is not None:
+        mesh_args.extend(["--port", port])
+    return python_args, mesh_args
+
+
+def json_object_arg(raw_value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--default-chat-template-kwargs must be valid JSON: {exc.msg}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError(
+            "--default-chat-template-kwargs must decode to a JSON object"
+        )
+    return parsed
+
+
+def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
+    from atom.model_engine.arg_utils import EngineArgs
+
+    parser = argparse.ArgumentParser(
+        description="ATOM Mesh Python interface",
+        allow_abbrev=False,
+    )
+    EngineArgs.add_cli_args(parser)
+    parser.add_argument(
+        "--default-chat-template-kwargs",
+        type=json_object_arg,
+        default=None,
+        help=(
+            "Default kwargs for chat template rendering (JSON string). "
+            "Merged with per-request chat_template_kwargs (request wins). "
+        ),
+    )
+
+    python_raw_args, mesh_network_args = split_standalone_mesh_args(raw_args)
+    engine_args, mesh_args = parser.parse_known_args(python_raw_args)
+
+    return StandaloneArgs(
+        engine_args=engine_args,
+        mesh_args=mesh_args + mesh_network_args,
+        default_chat_template_kwargs=engine_args.default_chat_template_kwargs or {},
+    )
 
 
 def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
-    from atom.model_engine.arg_utils import EngineArgs
-
-    parser = argparse.ArgumentParser(description="ATOM Mesh Python interface")
-    EngineArgs.add_cli_args(parser)
-    engine_raw_args, mesh_port_args = split_standalone_args(raw_args)
-    engine_args, mesh_args = parser.parse_known_args(engine_raw_args)
-    parsed_args = atomesh_runner.parse_from(mesh_args + mesh_port_args)
+    standalone_args = parse_standalone_args(raw_args)
+    parsed_args = atomesh_runner.parse_from(standalone_args.mesh_args)
     cli_args = parsed_args["cli_args"]
-    initialize_engine(engine_args)
-    standalone_service = initialize_standalone_service(engine_args)
+    initialize_engine(standalone_args.engine_args)
+    standalone_service = initialize_standalone_service(
+        standalone_args.engine_args,
+        standalone_args.default_chat_template_kwargs,
+    )
 
     print("\033[32mATOM starting...\033[0m")
     print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")
