@@ -1325,9 +1325,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             if not dp_enabled
             else disabled_mla_persistent_metadata()
         )
-        persistent_metadata = AiterMlaPersistentMetadataForVllm(
-            **ctx_mla_ps
-        )
+        persistent_metadata = AiterMlaPersistentMetadataForVllm(**ctx_mla_ps)
 
         attn_metadata.persistent_metadata = persistent_metadata
         return attn_metadata
