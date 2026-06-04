@@ -21,6 +21,11 @@ on:
         required: false
         default: 'main'
         type: string
+      atom_base_image:
+        description: 'Docker image used as the ATOM test base image'
+        required: false
+        default: 'rocm/atom-dev:latest'
+        type: string
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
@@ -28,7 +33,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  ATOM_BASE_IMAGE: rocm/atom-dev:latest
+  ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)
@@ -315,7 +320,7 @@ jobs:
         if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
+          FROM ${{ env.ATOM_BASE_IMAGE }}
           RUN pip install -U lm-eval[api]
           RUN pip show lm-eval || true
           RUN pip install hf_transfer

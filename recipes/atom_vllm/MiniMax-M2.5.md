@@ -14,7 +14,7 @@ docker pull rocm/atom-dev:vllm-latest
 
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
-The following matches the internal benchmark entry (`--kv_cache_dtype fp8 -tp 2 --trust-remote-code` in `.github/benchmark/models.json`). On multi-GPU hosts, use tensor parallel size 2 or 4; TP8 is not supported for this model.
+The following matches the vLLM-ATOM benchmark entries in `.github/benchmark/oot_benchmark_models.json`. On multi-GPU hosts, the benchmark covers TP2, TP4, and TP8.
 
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
@@ -31,6 +31,7 @@ vllm serve MiniMaxAI/MiniMax-M2.5 \
     --kv-cache-dtype fp8 \
     --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
+    --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching
 ```
 
@@ -39,18 +40,23 @@ Caveat: the upstream `config.json` may advertise MTP-related fields; the current
 ## Step 3: Performance Benchmark
 
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
     --backend vllm \
     --base-url http://127.0.0.1:8000 \
     --endpoint /v1/completions \
     --model MiniMaxAI/MiniMax-M2.5 \
     --dataset-name random \
-    --random-input-len 1000 \
-    --random-output-len 100 \
-    --max-concurrency 4 \
-    --num-prompts 40 \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --max-concurrency "${CONC}" \
+    --num-prompts "$(( CONC * 8 ))" \
     --trust_remote_code \
-    --num-warmups 8 \
+    --num-warmups "${CONC}" \
     --request-rate inf \
     --ignore-eos \
     --disable-tqdm \

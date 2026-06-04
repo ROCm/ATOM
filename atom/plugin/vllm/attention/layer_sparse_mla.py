@@ -254,9 +254,9 @@ def sparse_attn_indexer_plugin_mode(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
-    topk_indices = torch.empty(
-        hidden_states.shape[0],
-        topk_tokens,
+    topk_indices = torch.full(
+        (hidden_states.shape[0], topk_tokens),
+        -1,
         dtype=torch.int32,
         device=hidden_states.device,
     )

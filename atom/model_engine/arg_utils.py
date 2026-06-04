@@ -205,8 +205,7 @@ class EngineArgs:
             action=argparse.BooleanOptionalAction,
             default=True,
             help="Enable chunked prefill (default: enabled). "
-            "Use --no-enable_chunked_prefill to disable. "
-            "Note: DeepSeek-V4 auto-disables this (unsupported).",
+            "Use --no-enable_chunked_prefill to disable.",
         )
         parser.add_argument(
             "--max-num-seqs",

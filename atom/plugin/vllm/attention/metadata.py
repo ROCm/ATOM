@@ -1224,9 +1224,6 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         workspace=self.chunked_prefill_workspace,
                     )
 
-                if self._use_cudnn_prefill:
-                    chunked_context_metadata.seq_lens = chunk_seq_lens
-
                 assert (
                     max(chunked_context_metadata.max_seq_lens)
                     <= self.chunked_prefill_workspace_size
