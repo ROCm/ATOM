@@ -407,7 +407,7 @@ class MLAAttention(nn.Module):
         flat_cache = kv_cache.view(-1, self.kv_lora_rank + self.qk_rope_head_dim)
         # ``kv_indices`` is a reusable workspace; only the current k/v output
         # length is valid for this call.
-        valid_indices = kv_indices[: k_out.shape[0]].to(torch.long)
+        valid_indices = kv_indices[: k_out.shape[0]]
         cached = flat_cache.index_select(0, valid_indices).to(self.dtype)
         if self.kv_cache_dtype == "fp8" and self._k_scale is not None:
             cached = cached * self._k_scale.to(device=cached.device, dtype=cached.dtype)
