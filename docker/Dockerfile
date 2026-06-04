@@ -38,7 +38,7 @@ RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
 RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========" && \
     "${VENV_PYTHON}" -m pip show atom || true && \
     "${VENV_PYTHON}" -m pip show amd-aiter || true && \
-    "${VENV_PYTHON}" -m pip show mori || true && \
+    "${VENV_PYTHON}" -m pip show amd-mori-nightly || true && \
     echo "========== [OOT 2/7] Back up base image triton ==========" && \
     BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
     mkdir -p /tmp/triton-base-backup && \
@@ -117,7 +117,7 @@ RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && 
     if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi && \
     "${VENV_PYTHON}" -c "import boto3, botocore, s3transfer; print(f'boto3: {boto3.__version__}'); print(f'botocore: {botocore.__version__}'); print(f's3transfer: {s3transfer.__version__}')" && \
     "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" && \
-    "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom mori || true
+    "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom amd-mori-nightly || true
 
 RUN echo "========== [VLLM-ATOM] Validate vision/audio wheels ==========" && \
     "${VENV_PYTHON}" -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; from transformers.models.auto.image_processing_auto import get_image_processor_config; print(f'torch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'InterpolationMode: {InterpolationMode.BILINEAR}'); print(f'get_image_processor_config: {get_image_processor_config.__name__}')"
@@ -187,7 +187,7 @@ ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL versions before SGLang build ==========" && \
-    "${VENV_PYTHON}" -m pip show atom mori amd-aiter flydsl || true
+    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl || true
 
 RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     rm -rf /app/sglang && \
@@ -265,17 +265,16 @@ RUN echo "========== [SGLANG-ATOM 5/6] Install validated Triton ==========" && \
     "${VENV_PYTHON}" -m pip show triton
 
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
-    "${VENV_PYTHON}" -m pip show atom mori amd-aiter flydsl || true
+    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl || true
 
 CMD ["/bin/bash"]
 
 # ====================================================================
 # ATOM image: multi-stage parallel build
 #
-# BuildKit runs independent stages in parallel:
-#   base ──┬── build_mori   ──┐
-#          ├── build_rccl   ──┤
-#          ├── build_triton ──┼── atom_image (merge + ATOM install)
+# BuildKit runs independent builder stages in parallel:
+#   base ──┬── build_rccl   ──┐
+#          ├── build_triton ──┼── atom_image (merge builders + install MORI/ATOM)
 #          └── build_aiter  ──┘
 # ====================================================================
 
@@ -297,19 +296,7 @@ RUN pip install --upgrade pip && \
     rm -rf /var/lib/apt/lists/*
 
 # --------------------------------------------------------------------
-# Stage 1: MORI — parallel
-# --------------------------------------------------------------------
-FROM base AS build_mori
-ARG MORI_COMMIT="v1.1.0"
-
-RUN echo "========== [Parallel] Building MORI ==========" && \
-    git clone https://github.com/ROCm/mori.git /app/mori && \
-    cd /app/mori && \
-    git checkout $MORI_COMMIT && \
-    pip install .
-
-# --------------------------------------------------------------------
-# Stage 2: RCCL — parallel
+# Stage 1: RCCL — parallel
 # --------------------------------------------------------------------
 FROM base AS build_rccl
 ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
@@ -323,7 +310,7 @@ RUN echo "========== [Parallel] Building RCCL ==========" && \
     ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST
 
 # --------------------------------------------------------------------
-# Stage 3: Triton — parallel
+# Stage 2: Triton — parallel
 # --------------------------------------------------------------------
 FROM base AS build_triton
 
@@ -342,7 +329,7 @@ RUN echo "========== [Parallel] Building Triton ==========" && \
     python -c "import triton_kernels; print(f'triton_kernels: {triton_kernels.__file__}')"
 
 # --------------------------------------------------------------------
-# Stage 4: Aiter — parallel
+# Stage 3: Aiter — parallel
 # --------------------------------------------------------------------
 FROM base AS build_aiter
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
@@ -361,7 +348,7 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
     GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 
 # --------------------------------------------------------------------
-# Stage 5: Final merge — collect all build artifacts + install ATOM
+# Stage 4: Final merge — collect all build artifacts + install MORI/ATOM
 # --------------------------------------------------------------------
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
@@ -370,10 +357,13 @@ ARG ATOM_COMMIT="HEAD"
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
 
-# MORI: copy installed package from build stage
-COPY --from=build_mori /opt/venv /opt/venv
-COPY --from=build_mori /app/mori /app/mori
-RUN pip show mori || true
+# MORI: install the prebuilt nightly wheel directly (no source build needed).
+# The `amd-mori-nightly` PyPI package provides the `mori` Python module.
+# See: https://pypi.org/project/amd-mori-nightly/
+RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
+    pip install --pre amd-mori-nightly && \
+    python -c "import mori; print(f'mori: {mori.__file__}')" && \
+    pip show amd-mori-nightly
 
 # RCCL: install .deb from build stage
 COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
