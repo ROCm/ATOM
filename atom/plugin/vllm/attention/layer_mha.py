@@ -194,7 +194,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             self.layer_name,
             positions,
             q_scale,
-            None,
+            qkv,
         )
 
     def rope_cache(
