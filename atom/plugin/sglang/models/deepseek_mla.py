@@ -16,7 +16,7 @@ from atom.plugin.sglang.models.deepseek_mla_attention import (
     SGLangDeepseekMLAAttention,
 )
 from atom.plugin.sglang.models.deepseek_mla_forward import (
-    _patch_kv_b_proj_for_sglang_mxfp4,
+    _patch_attention_projs_for_sglang_mxfp4,
     init_sgl_attrs,
     process_mla_kv_b_proj_after_loading,
 )
@@ -57,7 +57,7 @@ def _patch_mla_attention_for_sglang(
 ) -> None:
     """Patch one DeepSeek MLA layer for SGLang plugin mode."""
     init_sgl_attrs(attn, config, kv_cache_dtype)
-    _patch_kv_b_proj_for_sglang_mxfp4(attn)
+    _patch_attention_projs_for_sglang_mxfp4(attn)
     if not isinstance(attn.mla_attn, SGLangDeepseekMLAAttention):
         attn.mla_attn = SGLangDeepseekMLAAttention(attn, attn.mla_attn)
     attn.process_weights_after_loading = lambda: process_mla_kv_b_proj_after_loading(

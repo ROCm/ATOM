@@ -33,6 +33,7 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --max-model-len 16384 \
     --max-num-batched-tokens 32768 \
+    --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching
 ```
 
@@ -60,6 +61,7 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --max-model-len 16384 \
     --max-num-batched-tokens 32768 \
     --speculative-config '{"num_speculative_tokens":1, "method": "mtp"}' \
+    --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching
 ```
 ## Step 3: Performance Benchmark
@@ -67,18 +69,23 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
 Users can use the default vllm bench commands for performance benchmarking.
 
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
     --backend vllm \
     --base-url http://127.0.0.1:8000 \
     --endpoint /v1/completions \
     --model Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --dataset-name random \
-    --random-input-len 1000 \
-    --random-output-len 100 \
-    --max-concurrency 4 \
-    --num-prompts 40 \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --max-concurrency "${CONC}" \
+    --num-prompts "$(( CONC * 8 ))" \
     --trust_remote_code \
-    --num-warmups 8 \
+    --num-warmups "${CONC}" \
     --request-rate inf \
     --ignore-eos \
     --disable-tqdm \
