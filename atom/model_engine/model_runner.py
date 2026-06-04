@@ -2019,11 +2019,7 @@ class ModelRunner:
         sampled_logprobs = None
         if need_logprobs:
             logits_fp32 = logits.float()
-            safe_temps = torch.where(
-                temperatures <= 0, torch.ones_like(temperatures), temperatures
-            )
-            scaled_logits = logits_fp32 / safe_temps.view(-1, 1)
-            log_probs = torch.log_softmax(scaled_logits, dim=-1)
+            log_probs = torch.log_softmax(logits_fp32, dim=-1)
             sampled_logprobs = log_probs.gather(
                 -1, sampled_tokens.to(torch.long).unsqueeze(-1)
             ).squeeze(-1)
