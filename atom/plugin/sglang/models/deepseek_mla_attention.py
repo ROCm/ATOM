@@ -178,12 +178,20 @@ class SGLangDeepseekMLAAttention(nn.Module):
             )
 
         save_kv_cache = True
+        topk_indices = None
+        q_descale = None
+        if getattr(attn, "use_nsa", False) and getattr(attn, "indexer", None) is not None:
+            topk_indices = attn.indexer.topk_indices_buffer[: q_input.shape[0]]
         if attn.use_fused_qk_rope_concat_and_cache_mla:
             mla_attn = _get_sglang_radix_attn(self.base_attn)
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(mla_attn.layer_id)
+            q_cache_scale = getattr(mla_attn, "q_scale", None)
+            if q_cache_scale is None:
+                q_cache_scale = mla_attn.k_scale
             q_out_dtype = (
                 dtypes.fp8 if attn.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
             )
+            q_descale = q_cache_scale if attn.kv_cache_dtype == "fp8_e4m3" else None
             q = torch.empty(
                 (
                     q_nope_out.shape[0],
@@ -202,7 +210,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
                 q,
                 forward_batch.out_cache_loc,
                 mla_attn.k_scale,
-                mla_attn.k_scale,
+                q_cache_scale,
                 positions,
                 attn.rotary_emb.cos_cache,
                 attn.rotary_emb.sin_cache,
@@ -217,12 +225,17 @@ class SGLangDeepseekMLAAttention(nn.Module):
             k = torch.cat([k_nope, k_pe], dim=-1)
             v = k_nope
 
+        extra_kwargs: dict[str, Any] = {}
+        if topk_indices is not None:
+            extra_kwargs["topk_indices"] = topk_indices
         attn_output = self.base_attn(
             q,
             k,
             v,
             forward_batch=forward_batch,
             save_kv_cache=save_kv_cache,
+            q_scale=q_descale,
+            **extra_kwargs,
         )
         attn_output = attn_output.view(-1, attn.num_local_heads, attn.kv_lora_rank)
         attn_bmm_output = mla_v_up_proj(

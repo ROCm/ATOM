@@ -100,6 +100,9 @@ class RadixAttention(BaseAttention):
                 self.attn.v_scale = atom_parameter(
                     self.attn.v_scale.detach().to(device="cuda")
                 )
+            self.attn.q_scale = atom_parameter(
+                torch.tensor([1.0], dtype=torch.float32, device="cuda")
+            )
             # Some SGLang attention backends consume the host-side float scales
             # directly. Keep them in sync with the device-side defaults so the
             # plugin path works even when checkpoint loading never populates them.
@@ -169,6 +172,7 @@ class RadixAttention(BaseAttention):
                     input_dtype=getattr(
                         forward_batch.attn_backend, "input_dtype", torch.bfloat16
                     ),
+                    q_scale=q_scale,
                 )
 
             return self.attn(
