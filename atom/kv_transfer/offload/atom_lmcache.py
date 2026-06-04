@@ -219,8 +219,8 @@ class ATOMLMCacheGPUConnector:
             return
         raise RuntimeError(
             "ATOM LMCache connector requires Triton fused chunk-major staging; "
-            "set OFFLOAD_FUSED_KV_STAGING=1 and ensure the Triton staging "
-            "kernel loads successfully"
+            "ensure KV tensors are on CUDA/HIP and the Triton staging kernel "
+            "loads successfully"
         )
 
     def _memory_tensor(self, memory_obj: Any, nbytes: int) -> torch.Tensor:

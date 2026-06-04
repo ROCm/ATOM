@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import logging
 import operator
-import os
 
 import torch
 
@@ -38,7 +37,7 @@ logger = logging.getLogger("atom")
 
 
 class ATOMKVByteCodec:
-    """Per-block byte mover between paged GPU KV tensors and a flat host buffer."""
+    """Per-block byte mover between paged GPU KV tensors and flat buffers."""
 
     def __init__(self, kv_caches: dict) -> None:
         """``kv_caches``: ordered ``{layer_name: KVCacheTensor}`` from
@@ -79,20 +78,10 @@ class ATOMKVByteCodec:
         ]
         self.bytes_per_block: int = sum(self._seg_block_bytes)
         self._fused_kv_staging = None
-        fused_env = os.environ.get(
-            "OFFLOAD_FUSED_KV_STAGING",
-            os.environ.get("OFFLOAD_NATIVE_KV_STAGING", "0"),
-        )
-        if self._device.type == "cuda" and fused_env.lower() not in (
-            "0",
-            "false",
-            "no",
-            "off",
-        ):
+        if self._device.type == "cuda":
             try:
                 from atom.kv_transfer.offload import triton_kv_staging
 
-                triton_kv_staging.load_extension()
                 self._fused_kv_staging = triton_kv_staging
             except Exception:
                 logger.warning(

@@ -255,7 +255,6 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
 
     class _FakeState:
         def __init__(self) -> None:
-            self.use_cuda = True
             self.pack_stream = _FakeStream()
             self.copy_stream = _FakeStream()
             self.next_slot = 0

@@ -67,7 +67,6 @@ class _ThreadTransferState:
         staging_slots: int,
     ) -> None:
         self.device = device
-        self.use_cuda = use_cuda
         self.pack_stream = None
         self.copy_stream = None
         self.next_slot = 0

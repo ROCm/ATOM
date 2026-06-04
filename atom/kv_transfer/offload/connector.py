@@ -168,14 +168,13 @@ class LMCacheOffloadConnector(KVConnectorBase):
 
         logger.info(
             "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d "
-            "codec_layout=%s gpu_staging_slots=%d "
+            "gpu_staging_slots=%d "
             "gpu_staging_chunk_bytes=%d gpu_staging_group_chunks=%d "
             "gpu_staging_capacity_bytes=%d release_gpu_staging=%s "
             "save=%s load=%s",
             rank,
             self._codec.bytes_per_block,
             self.chunk_size,
-            "chunk_major",
             gpu_connector.staging_slots,
             gpu_connector.gpu_staging_chunk_bytes,
             gpu_connector.gpu_staging_group_chunks,

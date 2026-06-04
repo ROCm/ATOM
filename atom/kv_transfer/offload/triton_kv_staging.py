@@ -107,11 +107,6 @@ def _unpack_chunk_major_kernel(
     tl.store(dst, data, mask=mask)
 
 
-def load_extension() -> None:
-    """Compatibility hook matching the old native module API."""
-    return None
-
-
 def _device_i64(values: list[int], device: torch.device) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int64, device=device)
 
