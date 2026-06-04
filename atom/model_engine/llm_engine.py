@@ -206,11 +206,12 @@ class LLMEngine:
         return outputs
 
     def start_profile(self):
-        self.core_mgr.send_utility_command("start_profile")
+        self.core_mgr.broadcast_utility_command_sync("start_profile")
         logger.info("Profiling started")
 
-    def stop_profile(self):
-        self.core_mgr.send_utility_command("stop_profile")
+    def stop_profile(self) -> List[Dict[str, Any]]:
+        responses = self.core_mgr.broadcast_utility_command_sync("stop_profile")
+        return [resp.get("result", {}) for resp in responses]
 
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")

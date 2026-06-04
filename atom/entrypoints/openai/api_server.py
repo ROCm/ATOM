@@ -1065,10 +1065,11 @@ async def stop_profile():
     """Stop profiling the engine."""
     global engine
     try:
-        engine.stop_profile()
+        traces = engine.stop_profile()
         return {
             "status": "success",
             "message": "Profiling stopped. Trace files generated.",
+            "traces": traces,
         }
     except Exception as e:
         logger.error(f"Failed to stop profiling: {e}", exc_info=True)

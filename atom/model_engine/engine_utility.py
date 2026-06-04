@@ -8,17 +8,24 @@ logger = logging.getLogger("atom")
 
 
 class EngineUtilityHandler:
-    """Handles utility commands dispatched by EngineCore.
+    """Centralised handler for all utility commands dispatched by EngineCore.
+
+    Covers weight management, memory lifecycle, profiling, MTP statistics,
+    and TorchSpec hidden-state extraction.  Every command is registered in
+    ``_UTILITY_HANDLERS`` and executed in the main busy-loop thread so that
+    ``runner_mgr.call_func`` calls are serialized.
 
     Parameters
     ----------
     runner_mgr : AsyncIOProcManager
         The model-runner process manager used to execute ``call_func``.
     output_queue : queue.Queue
-        The EngineCore output queue, used by ``_handle_update_weights_shm``
-        to push ``UTILITY_RESPONSE`` messages back to ``CoreManager``.
+        The EngineCore output queue for pushing ``UTILITY_RESPONSE`` messages
+        back to ``CoreManager``.
     label : str, optional
         Label used in log messages (default ``"Engine Core"``).
+    scheduler : Scheduler, optional
+        The scheduler instance, needed by MTP statistics handlers.
     """
 
     # Utility command name  ->  handler method name
@@ -30,12 +37,19 @@ class EngineUtilityHandler:
         "resume_memory": "_handle_resume_memory",
         "clear_kv_cache": "_handle_clear_kv_cache",
         "configure_hidden_states": "_handle_configure_hidden_states",
+        "start_profile": "_handle_start_profile",
+        "stop_profile": "_handle_stop_profile",
+        "get_mtp_stats": "_handle_get_mtp_stats",
+        "get_mtp_statistics": "_handle_get_mtp_statistics",
     }
 
-    def __init__(self, runner_mgr, output_queue, label: str = "Engine Core"):
+    def __init__(
+        self, runner_mgr, output_queue, label: str = "Engine Core", scheduler=None
+    ):
         self.runner_mgr = runner_mgr
         self.output_queue = output_queue
         self.label = label
+        self.scheduler = scheduler
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -118,7 +132,8 @@ class EngineUtilityHandler:
         After all ModelRunners finish, a UTILITY_RESPONSE is pushed onto the
         output_queue so that the caller (LLMEngine) can synchronise.
 
-        NOTE: This is the **only** handler that writes to ``output_queue``.
+        After completion, a ``UTILITY_RESPONSE`` is pushed so the caller
+        (LLMEngine) can synchronise.
         """
         shm_name = args.get("shm_name", "")
         bucket_meta = args.get("bucket_meta", {})
@@ -208,4 +223,48 @@ class EngineUtilityHandler:
         )
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "configure_hidden_states", "result": result})
+        )
+
+    # ------------------------------------------------------------------
+    # Profiler
+    # ------------------------------------------------------------------
+
+    def _handle_start_profile(self, args: dict):
+        result = self.runner_mgr.call_func("start_profiler", wait_out=True)
+        logger.info(f"{self.label}: profiler started")
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "start_profile", "result": result})
+        )
+
+    def _handle_stop_profile(self, args: dict):
+        logger.info(f"{self.label}: stopping profiler...")
+        result = self.runner_mgr.call_func("stop_profiler", wait_out=True)
+        logger.info(f"{self.label}: profiler stopped, result={result}")
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "stop_profile", "result": result})
+        )
+
+    # ------------------------------------------------------------------
+    # MTP statistics
+    # ------------------------------------------------------------------
+
+    def _handle_get_mtp_stats(self, args: dict):
+        """Print MTP statistics to log (fire-and-forget)."""
+        if self.scheduler is not None and self.scheduler.spec_stats is not None:
+            self.scheduler.spec_stats._log()
+        else:
+            logger.info(
+                "\n[MTP Stats] No MTP statistics available "
+                "(MTP not enabled or no tokens processed)\n"
+            )
+
+    def _handle_get_mtp_statistics(self, args: dict):
+        """Return structured MTP statistics via UTILITY_RESPONSE."""
+        if self.scheduler is None or self.scheduler.spec_stats is None:
+            result = {"enabled": False}
+        else:
+            result = self.scheduler.spec_stats.get_statistics()
+            result["enabled"] = True
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "get_mtp_statistics", "result": result})
         )
