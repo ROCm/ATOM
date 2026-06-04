@@ -1744,9 +1744,6 @@ jobs:
                   "
               else
                 NUM_WARMUPS="${CONC}"
-                if [[ "${MODEL_NAME}" == gpt-oss-120b* ]]; then
-                  NUM_WARMUPS="$(( CONC * 8 ))"
-                fi
                 $CONTAINER_ENGINE exec \
                   -e ISL="${ISL}" \
                   -e OSL="${OSL}" \

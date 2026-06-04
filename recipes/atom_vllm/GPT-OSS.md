@@ -51,7 +51,7 @@ vllm bench serve \
     --num-prompts "$(( CONC * 8 ))" \
     --max-concurrency "${CONC}" \
     --trust_remote_code \
-    --num-warmups "$(( CONC * 8 ))" \
+    --num-warmups "${CONC}" \
     --request-rate inf \
     --ignore-eos \
     --disable-tqdm \
