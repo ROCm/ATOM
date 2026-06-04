@@ -39,7 +39,7 @@ from atom.kv_transfer.disaggregation.base import (
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput, ReqId
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.gpu_connector import ATOMKVByteCodec
-from atom.kv_transfer.offload.lmcache_compat import ATOMLMCacheGPUConnector
+from atom.kv_transfer.offload.atom_lmcache import ATOMLMCacheGPUConnector
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
@@ -76,7 +76,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         # parked seq is waiting for it) never queues behind a backlog of fire-
         # and-forget saves (Phase 4 root cause: with one shared serial daemon, a
         # reload sat behind ~N filler saves -> request hung well past timeout).
-        # The LMCache-compatible GPU connector owns per-thread staging streams.
+        # The ATOM LMCache GPU connector owns per-thread staging streams.
         # OFFLOAD_COPY_WORKERS tunes the SAVE pool only.
         n_save_workers = int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
         self._load_executor = ThreadPoolExecutor(

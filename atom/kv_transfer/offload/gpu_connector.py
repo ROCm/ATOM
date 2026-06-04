@@ -186,7 +186,7 @@ class ATOMKVByteCodec:
 
         The staging layout is always segment-major:
         ``[seg0 blocks | seg1 blocks | ...]``. This is the layout consumed by
-        the LMCache-compatible connector before it copies the bytes to a
+        the ATOM LMCache connector before it copies the bytes to a
         ``MemoryObj``.
         """
         block_ids = self._normalize_block_ids(block_ids)

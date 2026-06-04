@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""LMCache-compatible raw-byte connector for ATOM offload.
+"""ATOM LMCache raw-byte connector for offload.
 
 This module lets ATOM use LMCache ``CacheEngine.store()`` /
 ``CacheEngine.retrieve()`` without adopting LMCache's vLLM token-major KV
@@ -20,7 +20,7 @@ from typing import Any
 import torch
 
 from atom.kv_transfer.offload.gpu_connector import ATOMKVByteCodec
-from atom.kv_transfer.offload.lmcache_staging import (
+from atom.kv_transfer.offload.atom_lmcache_staging import (
     _StagingSlot,
     _ThreadTransferState,
     _env_flag,
