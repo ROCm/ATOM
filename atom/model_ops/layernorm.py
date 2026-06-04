@@ -17,14 +17,11 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
-# ATOM_GFX1250_WORKAROUND (ported from ce1809f8473f): aiter HIP rmsnorm2d_fwd
-# faults on gfx1250; route to the AITER Triton equivalents at every call site.
-from aiter.ops.triton.normalization.rmsnorm import (
-    _rmsnorm_forward as _triton_rmsnorm_forward,
-    _rmsnorm_forward_with_add as _triton_rmsnorm_forward_with_add,
-)
-from aiter.ops.triton.normalization.fused_rms_gluon import fused_rms_gluon
-from aiter.jit.utils.chip_info import get_gfx
+# ATOM_GFX1250_WORKAROUND (ATOM_USE_TRITON_RMSNORM): aiter HIP rmsnorm2d_fwd
+# faults on gfx1250; route to the AITER Triton/Gluon fused_rmsnorm_add, which
+# arch-dispatches internally (gfx1250 Gluon vs portable Triton) and registers
+# its own torch.compile fake.
+from aiter.ops.triton.normalization.fused_rmsnorm_add import fused_rmsnorm_add
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
@@ -59,13 +56,7 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
     return torch._C._nn.silu(input)
 
 
-def rmsnorm2d_fwd_fake_tensors(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-@torch_compile_guard(gen_fake=rmsnorm2d_fwd_fake_tensors)
+@torch_compile_guard()
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
 ) -> torch.Tensor:
@@ -75,51 +66,28 @@ def rmsnorm2d_fwd_(
         # Default path: original AITER HIP kernel (faults on gfx1250).
         return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
     # ATOM_GFX1250_WORKAROUND (ATOM_USE_TRITON_RMSNORM): HIP rmsnorm2d_fwd faults
-    # on gfx1250. Prefer the gfx1250 gluon TDM kernel (bf16 out, no quant); fall
-    # back to AITER Triton rmsnorm on other arches.
-    if get_gfx() == "gfx1250":
-        out = fused_rms_gluon(x, weight, eps)
-    else:
-        out, _ = _triton_rmsnorm_forward(x, weight, eps)
+    # on gfx1250. fused_rmsnorm_add arch-dispatches internally (gfx1250 Gluon vs
+    # portable Triton) and registers its own compile fake.
+    out = fused_rmsnorm_add(x, weight, eps)
     return out.view(ori_shape)
 
 
-def rmsnorm2d_fwd_with_add_fake_tensors(
-    x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float, dim: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(x), torch.empty_like(x)
-
-
-@torch_compile_guard(gen_fake=rmsnorm2d_fwd_with_add_fake_tensors)
+@torch_compile_guard()
 def rmsnorm2d_fwd_with_add_(
     x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float, dim: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
+    x = x.reshape(-1, dim)
     if not envs.ATOM_USE_TRITON_RMSNORM:
         # Default path: original AITER HIP kernel (faults on gfx1250).
-        x = x.reshape(-1, dim)
         out = torch.empty_like(x)
         residual_out = torch.empty_like(x)
         rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
         return out.view(ori_shape), residual_out.view(ori_shape)
     # ATOM_GFX1250_WORKAROUND (ATOM_USE_TRITON_RMSNORM): HIP rmsnorm2d_fwd_with_add
-    # faults on gfx1250.
-    # The Triton _fused_add_rmsnorm_kernel only takes ONE input-side row-stride and reuses
-    # it for x/residual_in/residual_out, so force the same contiguous layout before launch.
-    x = x.reshape(-1, dim).contiguous()
-    residual = residual.contiguous()
-    weight_c = weight.contiguous()
-    # Prefer the gfx1250 gluon TDM kernel (fused residual-add + RMSNorm, bf16
-    # out); fall back to AITER Triton otherwise.
-    if get_gfx() == "gfx1250":
-        out, residual_out = fused_rms_gluon(x, weight_c, eps, res1=residual)
-        return out.view(ori_shape), residual_out.view(ori_shape)
-    out = torch.empty_like(x)
-    residual_out = torch.empty_like(x)
-    rsigma = torch.empty((x.shape[0],), dtype=torch.float32, device=x.device)
-    _triton_rmsnorm_forward_with_add(
-        out, x, residual, residual_out, weight_c, rsigma, eps
-    )
+    # faults on gfx1250. fused_rmsnorm_add fuses the residual add + RMSNorm and
+    # arch-dispatches internally (contiguity handled inside the launcher).
+    out, residual_out = fused_rmsnorm_add(x, weight, eps, res1=residual.reshape(-1, dim))
     return out.view(ori_shape), residual_out.view(ori_shape)
 
 
