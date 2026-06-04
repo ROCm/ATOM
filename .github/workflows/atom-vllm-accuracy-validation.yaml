@@ -335,7 +335,7 @@ env:
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
   AITER_COMMIT: "HEAD"
-  VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
+  VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
 
 jobs:
   # ---------- OOT full validation path (schedule / workflow_dispatch) ----------

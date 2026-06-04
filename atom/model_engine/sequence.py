@@ -47,12 +47,14 @@ class Sequence:
         needs_independent_noise: bool = False,
         parent_request_id: Optional[str] = None,
         sibling_index: int = 0,
+        request_id: Optional[str] = None,
         multimodal_data: Optional[dict] = None,
         mrope_positions: Optional[np.ndarray] = None,
         mrope_position_delta: int = 0,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
+        self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
         self.type = SequenceType.DUMMY
         self.token_ids = copy(token_ids)
@@ -99,6 +101,8 @@ class Sequence:
         # already been flipped to DECODE. A seq.type / len(output_tokens) gate
         # would never fire for the prefill blocks; this flag does.
         self.prefix_hashes_published = False
+        self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
+        self.logprobs: list[float] = []
         # stream callback
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens

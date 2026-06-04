@@ -1012,6 +1012,7 @@ class Config:
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
+    runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
@@ -1031,6 +1032,8 @@ class Config:
                 self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
+        if isinstance(self.compilation_config, dict):
+            self.compilation_config = CompilationConfig(**self.compilation_config)
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8

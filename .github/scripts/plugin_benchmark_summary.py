@@ -46,27 +46,27 @@ def _expected_cases(matrix_payload: dict) -> list[dict]:
     cases: list[dict] = []
     for cell in matrix_payload.get("include", []):
         model = cell["model"]
-        params = cell["params"]
-        ratio_text = str(params["random_range_ratio"])
-        result_filename = (
-            f'{model["prefix"]}-'
-            f'{params["input_length"]}-'
-            f'{params["output_length"]}-'
-            f'{params["concurrency"]}-'
-            f"{ratio_text}.json"
-        )
-        cases.append(
-            {
-                "display": model.get("display", model["prefix"]),
-                "prefix": model["prefix"],
-                "isl": int(params["input_length"]),
-                "osl": int(params["output_length"]),
-                "concurrency": int(params["concurrency"]),
-                "ratio": ratio_text,
-                "tensor_parallel_size": _expected_tensor_parallel(model),
-                "result_filename": result_filename,
-            }
-        )
+        for params in cell.get("cases") or [cell["params"]]:
+            ratio_text = str(params["random_range_ratio"])
+            result_filename = (
+                f'{model["prefix"]}-'
+                f'{params["input_length"]}-'
+                f'{params["output_length"]}-'
+                f'{params["concurrency"]}-'
+                f"{ratio_text}.json"
+            )
+            cases.append(
+                {
+                    "display": model.get("display", model["prefix"]),
+                    "prefix": model["prefix"],
+                    "isl": int(params["input_length"]),
+                    "osl": int(params["output_length"]),
+                    "concurrency": int(params["concurrency"]),
+                    "ratio": ratio_text,
+                    "tensor_parallel_size": _expected_tensor_parallel(model),
+                    "result_filename": result_filename,
+                }
+            )
     return cases
 
 

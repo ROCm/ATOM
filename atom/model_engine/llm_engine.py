@@ -36,6 +36,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
+        data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
@@ -48,6 +49,8 @@ class LLMEngine:
         config.stop_token_ids = list(stop_token_ids)
         # Set data parallel size in config
         config.parallel_config.data_parallel_size = data_parallel_size
+        if data_parallel_master_port is not None:
+            config.parallel_config.data_parallel_master_port = data_parallel_master_port
         self.data_parallel_size = data_parallel_size
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
@@ -82,6 +85,7 @@ class LLMEngine:
         sampling_params_list: SamplingParams | List[SamplingParams],
         stream_callback=None,
         multimodal_data_list: List[dict] | None = None,
+        request_ids: Optional[list[str]] = None,
     ):
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
@@ -119,18 +123,31 @@ class LLMEngine:
         else:
             mm_data_iter = itertools.repeat(None)
 
+        # Handle request_ids
+        if request_ids is not None:
+            if len(request_ids) != len(prompt_or_tokens_list):
+                raise ValueError(
+                    "number of elements in prompt_or_tokens_list and request_ids is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(request_ids)=}"
+                )
+            request_id_iter = iter(request_ids)
+        else:
+            request_id_iter = itertools.repeat(None)
+
         reqs = []
-        for prompt, sampling_param, callback, mm_data in zip(
+        for prompt, sampling_param, callback, mm_data, request_id in zip(
             prompt_or_tokens_list,
             sampling_params_iter,
             stream_callback_iter,
             mm_data_iter,
+            request_id_iter,
         ):
             req = self.io_processor.preprocess(
                 prompt,
                 sampling_param,
                 stream_callback=callback,
                 multimodal_data=mm_data,
+                request_id=request_id,
             )
             reqs.append(req)
         self.core_mgr.add_request(reqs)
@@ -144,14 +161,14 @@ class LLMEngine:
 
     def generate(
         self,
-        # prompts: list[str] | list[list[int]],
         prompts: list[str],
         sampling_params: SamplingParams | list[SamplingParams],
+        request_ids: Optional[list[str]] = None,
     ) -> list[str]:
         # Reset round-robin counter to ensure consistent DP not core dump
         self.core_mgr._rr_counter = 0
 
-        self.add_request(prompts, sampling_params)
+        self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -210,6 +227,8 @@ class InputOutputProcessor:
         # constructed for these models trigger BlockManager to reserve a
         # per-req cache slot. Currently: GDN-based models (Qwen3-Next /
         # Qwen3.5). Future stateful models (DeepseekV4, etc.) extend the set.
+        self._external_to_internal: dict[str, int] = {}
+        self._internal_to_external: dict[int, str] = {}
         self.has_per_req_cache = False
         self.num_speculative_tokens = 0
         if (
@@ -248,6 +267,7 @@ class InputOutputProcessor:
         stream_callback=None,
         kv_transfer_params=None,
         multimodal_data=None,
+        request_id: Optional[str] = None,
     ):
         """responsible for:
         1) Tokenize
@@ -268,6 +288,7 @@ class InputOutputProcessor:
             stream_callback=stream_callback,
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
+            parent_request_id=request_id,
         )
         return seqs[0]
 
@@ -350,9 +371,13 @@ class InputOutputProcessor:
                 needs_independent_noise=(n > 1),
                 parent_request_id=parent_request_id,
                 sibling_index=i,
+                request_id=parent_request_id if n == 1 else None,
             )
             seq.arrive_time = time.time()
             self.requests[seq.id] = seq
+            if seq.external_request_id is not None:
+                self._external_to_internal[seq.external_request_id] = seq.id
+                self._internal_to_external[seq.id] = seq.external_request_id
             seqs.append(seq)
 
         if n == 1:
@@ -376,6 +401,9 @@ class InputOutputProcessor:
         outputs = {}
         for req in reqs:
             self.requests.pop(req.id)
+            external_request_id = self._internal_to_external.pop(req.id, None)
+            if external_request_id is not None:
+                self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
             req.leave_time = time.time()
 
@@ -395,11 +423,11 @@ class InputOutputProcessor:
                 f"Input tokens: {req.num_prompt_tokens}, output tokens: {req.num_completion_tokens}, "
                 f"latency: {req.leave_time - req.arrive_time:.2f}s, "
                 f"TTFT: {ttft:.3f}s, TPOT: {tpot:.3f}s"
-                # f"{req.completion_token_ids}"
             )
             outputs[req.id] = {
                 "text": output_str,
                 "token_ids": req.completion_token_ids,
+                "logprobs": req.logprobs if req.return_logprobs else None,
                 "latency": req.leave_time - req.arrive_time,
                 "finish_reason": req.leave_reason,
                 "num_tokens_input": req.num_prompt_tokens,

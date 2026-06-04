@@ -1,6 +1,7 @@
 from typing import Type
 
 import torch
+from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 
 
 class AiterMhaBackendForVllm:
@@ -62,6 +63,10 @@ class AiterMhaBackendForVllm:
 
     @classmethod
     def is_mla(cls) -> bool:
+        return False
+
+    @classmethod
+    def is_ssm(cls) -> bool:
         return False
 
     @staticmethod
@@ -126,6 +131,10 @@ class AiterMlaBackendForVllm:
     def is_mla(cls) -> bool:
         return True
 
+    @classmethod
+    def is_ssm(cls) -> bool:
+        return False
+
     @staticmethod
     def get_required_kv_cache_layout():
         return None
@@ -159,6 +168,68 @@ class AiterMlaBackendForVllm:
     @classmethod
     def full_cls_name(cls) -> tuple[str, str]:
         return (cls.__module__, cls.__qualname__)
+
+
+class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
+    """vLLM 0.22 MLA prefill interface backed by ATOM's aiter path."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "ATOM_AITER_MLA_PREFILL"
+
+    def __init__(
+        self,
+        layer,
+        num_heads: int,
+        scale: float,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        vllm_config,
+    ) -> None:
+        super().__init__(
+            num_heads=num_heads,
+            scale=scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            vllm_config=vllm_config,
+        )
+        self._layer = layer
+
+    def run_prefill_new_tokens(self, q, k, v, return_softmax_lse):
+        return self._layer._run_prefill_new_tokens(
+            self._prefill_metadata,
+            q,
+            k,
+            v,
+            return_softmax_lse,
+        )
+
+    def run_prefill_context_chunk(self, chunk_idx: int, q, k, v):
+        return self._layer._run_prefill_context_chunk(
+            self._prefill_metadata,
+            chunk_idx,
+            q,
+            k,
+            v,
+        )
+
+
+def build_vllm_mla_prefill_backend(layer, vllm_config):
+    """Create the vLLM 0.22 MLA prefill backend for an ATOM MLA layer."""
+    return AtomAiterMLAPrefillBackend(
+        layer=layer,
+        num_heads=layer.num_heads,
+        scale=layer.scale,
+        kv_lora_rank=layer.kv_lora_rank,
+        qk_nope_head_dim=layer.qk_nope_head_dim,
+        qk_rope_head_dim=layer.qk_rope_head_dim,
+        v_head_dim=layer.v_head_dim,
+        vllm_config=vllm_config,
+    )
 
 
 class AiterSparseMlaBackendForVllm(AiterMlaBackendForVllm):
