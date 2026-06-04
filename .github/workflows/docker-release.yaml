@@ -52,6 +52,9 @@ on:
         description: "Skip test step"
         type: boolean
         default: false
+      custom_tag:
+        description: "Custom tag for the native Docker image (e.g. 'my-feature'). Produces rocm/atom-dev:<custom_tag>. When set, branch-based tagging and 'latest' update are skipped."
+        default: ""
       build_oot_image:
         description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT; default enabled so manual releases also publish OOT)"
         type: boolean
@@ -70,9 +73,6 @@ on:
         description: "Release the OOT vLLM image (skips native image test/push). If both this and SGLang are checked, both will be released."
         type: boolean
         default: false
-      custom_tag:
-        description: "Custom tag for the native Docker image (e.g. 'my-feature'). Produces rocm/atom-dev:<custom_tag>. When set, branch-based tagging and 'latest' update are skipped."
-        default: ""
       only_release_sglang:
         description: "Release the SGLang+ATOM image (skips native image test/push). If both this and OOT are checked, both will be released."
         type: boolean
