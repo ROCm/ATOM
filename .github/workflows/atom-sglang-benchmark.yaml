@@ -383,11 +383,38 @@ jobs:
           import sys
           from pathlib import Path
 
-          models = json.loads(
-              Path(".github/benchmark/sglang_benchmark_models.json").read_text(
-                  encoding="utf-8"
-              )
-          )
+          def expand_template_parts(value, templates, separator):
+              if isinstance(value, str):
+                  return templates.get(value, value)
+              if isinstance(value, list):
+                  return separator.join(
+                      templates.get(str(part), str(part))
+                      for part in value
+                      if str(part)
+                  )
+              return value
+
+          def load_model_catalog(path):
+              catalog = json.loads(path.read_text(encoding="utf-8"))
+              if isinstance(catalog, list):
+                  return catalog
+
+              templates = catalog.get("templates", {})
+              extra_arg_templates = templates.get("extra_args", {})
+              env_var_templates = templates.get("env_vars", {})
+              models = []
+              for model in catalog.get("models", []):
+                  expanded = dict(model)
+                  expanded["extra_args"] = expand_template_parts(
+                      expanded.get("extra_args", ""), extra_arg_templates, " "
+                  )
+                  expanded["env_vars"] = expand_template_parts(
+                      expanded.get("env_vars", ""), env_var_templates, "\n"
+                  )
+                  models.append(expanded)
+              return models
+
+          models = load_model_catalog(Path(".github/benchmark/sglang_benchmark_models.json"))
 
           event = os.environ["GITHUB_EVENT_NAME"]
           workload_label = os.environ.get("WORKLOAD_LABEL") or "SGLang-OOB"
@@ -1409,11 +1436,38 @@ jobs:
           sys.path.insert(0, str(llm_booster_dashboard))
           from update_data import index_root_for, rebuild_index  # noqa: E402
 
-          catalog = json.loads(
-              (root / ".github" / "benchmark" / "sglang_benchmark_models.json").read_text(
-                  encoding="utf-8"
-              )
-          )
+          def expand_template_parts(value, templates, separator):
+              if isinstance(value, str):
+                  return templates.get(value, value)
+              if isinstance(value, list):
+                  return separator.join(
+                      templates.get(str(part), str(part))
+                      for part in value
+                      if str(part)
+                  )
+              return value
+
+          def load_model_catalog(path):
+              catalog = json.loads(path.read_text(encoding="utf-8"))
+              if isinstance(catalog, list):
+                  return catalog
+
+              templates = catalog.get("templates", {})
+              extra_arg_templates = templates.get("extra_args", {})
+              env_var_templates = templates.get("env_vars", {})
+              models = []
+              for model in catalog.get("models", []):
+                  expanded = dict(model)
+                  expanded["extra_args"] = expand_template_parts(
+                      expanded.get("extra_args", ""), extra_arg_templates, " "
+                  )
+                  expanded["env_vars"] = expand_template_parts(
+                      expanded.get("env_vars", ""), env_var_templates, "\n"
+                  )
+                  models.append(expanded)
+              return models
+
+          catalog = load_model_catalog(root / ".github" / "benchmark" / "sglang_benchmark_models.json")
 
           def slugify(text: str) -> str:
               return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "unknown"
