@@ -2070,29 +2070,13 @@ class MoE(nn.Module):
         shared_spec = qc.get_layer_quant_config(f"{prefix}.shared_experts")
         routed_dtype = routed_spec.quant_dtype
         shared_dtype = shared_spec.quant_dtype
-        # aiter's fused shared+routed kernel is broken on gfx942 with FP8
-        # per-block routed experts (V4-Flash-Base on MI308 produces garbage
-        # output unless we run shared and routed as 2 separate kernels). Auto-
-        # disable in that combination; explicit env override always wins.
-        env_override = os.environ.get("ATOM_V4_DISABLE_FUSED_SHARED")
-        if env_override is not None:
-            disable_fused = env_override == "1"
-        else:
-            try:
-                from aiter.jit.utils.chip_info import get_gfx
-
-                gfx = get_gfx() or ""
-            except Exception:
-                gfx = ""
-            disable_fused = (
-                gfx.startswith("gfx94")
-                and routed_spec.quant_type == QuantType.per_1x128
-                and routed_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-            )
+        # Fuse shared expert into the routed MoE kernel whenever physically
+        # possible. Falls back to a standalone Expert module only when fusion is
+        # infeasible: routed/shared quant dtypes differ (V4-Pro: FP4 routed vs
+        # FP8 shared) or aiter fusion is unavailable (e.g. DP + mori all2all).
         self._fuse_shared_into_routed = (
             routed_dtype == shared_dtype
             and is_rocm_aiter_fusion_shared_expert_enabled()
-            and not disable_fused
         )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
@@ -2213,6 +2197,32 @@ class MoE(nn.Module):
                 dim=-1, keepdim=True
             ).clamp_min(1e-20)
         topk_weights = topk_weights * self.routed_scaling_factor
+
+        # Fused shared expert: the custom_routing_function path in
+        # `select_experts` (moe.py:3055) returns early and bypasses the
+        # sqrtsoftplus fused-shared branch (moe.py:3108). Without this block the
+        # returned topk_ids are [N, top_k] with ids in 0..n_routed-1 only — the
+        # shared expert (slot n_routed_experts) never appears, so moe_sorting
+        # assigns it no tokens and its contribution (≈40% of the layer output)
+        # is silently dropped. Replicate the shared-col append: write the routed
+        # weights/ids into the first `top_k` columns of the global topK buffer
+        # and return the full [N, top_k + n_shared] view (last cols pre-filled
+        # with shared id = n_routed_experts and weight = shared_experts_score).
+        num_fused_shared = getattr(self.experts, "num_fused_shared_experts", 0)
+        if num_fused_shared > 0:
+            import atom.model_ops.topK as _topK_mod
+
+            assert _topK_mod.aiter_topK_meta_data is not None, (
+                "AITER topK meta data is not initialized. "
+                "init_aiter_topK_meta_data must run before hash-layer routing."
+            )
+            total_topk_weights, total_topk_ids = _topK_mod.aiter_topK_meta_data
+            n_tokens = topk_ids.shape[0]
+            assert total_topk_weights.shape[0] >= n_tokens
+            total_topk_ids[:n_tokens, :topk] = topk_ids
+            total_topk_weights[:n_tokens, :topk] = topk_weights
+            return total_topk_weights[:n_tokens], total_topk_ids[:n_tokens]
+
         return topk_weights, topk_ids
 
     def routed_expert_forward(
@@ -2709,6 +2719,18 @@ class DeepseekV4ForCausalLM(nn.Module):
         # the un-reduced mHC residual stack [N, hc, dim].
         self.extra_output_dims: tuple[int, ...] = (self.args.hc_mult,)
 
+    @property
+    def disable_fused_shared_loading(self) -> bool:
+        """True when shared experts are NOT fused into the routed MoE kernel, so
+        the weight loader must keep `ffn.shared_experts.*` on the standalone
+        Expert module instead of rewriting them into the fused slot. Read from
+        the actual built MoE layers so it always agrees with model structure.
+        """
+        for m in self.model.modules():
+            if m.__class__.__name__ == "MoE":
+                return not getattr(m, "_fuse_shared_into_routed", True)
+        return False
+
     def forward(
         self,
         input_ids: torch.Tensor,  # [num_tokens] int
@@ -2748,12 +2770,31 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         V4 expert weights on disk are named `ffn.experts.{e}.w{1,2,3}`. Pass
         these as the gate/down/up names to FusedMoE.make_expert_params_mapping.
+
+        When fused shared expert is enabled, FusedMoE allocates one extra expert
+        slot (id = n_routed_experts) for the shared expert. Include it in the
+        mapping so the loader can dispatch `ffn.shared_experts.w*` (rewritten to
+        `ffn.experts.{n_routed_experts}.w*` by the loader) into that slot.
+        Otherwise the shared expert weights are dropped and slot N stays
+        uninitialized -> garbage MoE output.
         """
+        # Whether the shared expert is fused into the routed buffer is decided
+        # per-MoE-layer (`_fuse_shared_into_routed`). Read the ACTUAL allocated
+        # buffer state from a real MoE layer instead of the global
+        # `is_rocm_aiter_fusion_shared_expert_enabled()` — otherwise when fusion
+        # is disabled (buffer=256) the mapping would emit 257 entries and
+        # mis-load expert weights -> garbage.
+        num_fused_shared = 0
+        for _m in self.model.modules():
+            if _m.__class__.__name__ == "FusedMoE":
+                num_fused_shared = getattr(_m, "num_fused_shared_experts", 0)
+                break
+        num_experts = self.args.n_routed_experts + num_fused_shared
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.args.n_routed_experts,
+            num_experts=num_experts,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
