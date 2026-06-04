@@ -51,7 +51,7 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 
 #### Engine Core
 
-* Enables Sparse MLA and GLM-5 for vLLM-ATOM, aligns plugin paged attention behavior, fixes KV cache dtype auto parsing, handles scalar KV scales, and passes FP8 dtype into Sparse MLA metadata (#399, #657, #804, #806, #793, #884).
+* Enables Sparse MLA and GLM-5 for vLLM-ATOM, aligns plugin paged attention behavior, fixes KV cache dtype auto parsing, and passes FP8 dtype into Sparse MLA metadata (#399, #657, #804, #806, #884).
 * Improves plugin decode metadata with caching and tail-only fills (#970).
 * Removes sequence-length D2H traffic for vLLM-ATOM MTP speculative decode (#933).
 * Fixes trust-remote-code and config handling for Kimi-K2.5 and Qwen3.5 model configs (#751, #655).
@@ -92,8 +92,7 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 * Improves plugin decode build cost with cached metadata, tail-only fills, and removal of sequence-length D2H traffic for MTP speculative decode (#970, #933).
 * Enables and tunes GLM-4.7 fusions in the vLLM-ATOM plugin path (#940).
 * MoE and communication paths improve with a fused routing-from-topk switch, configurable FP8 blockscale GEMM weight pre-shuffle, GPT-OSS int4 allreduce, MiniMax fused QKNorm+allreduce, and broader MiniMax communication fusion shapes (#725, #694, #776, #774, #820).
-* Refines DeepSeek FP4 TP8 / EP8 validation coverage (#639).
-* Adds DeepSeek V3.2 MTP TP4 benchmark / nightly cases and V4 DP benchmark coverage (#950, #949).
+* Adds DeepSeek V3.2 MTP TP4 benchmark / nightly cases (#950).
 
 ### SGLang-ATOM
 
@@ -103,7 +102,7 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 * Fixes FP8 attention weight accuracy via PTPC quant recipes (#747).
 * Removes MLA flattening in SGLang-ATOM to match the ATOM vLLM MLA path and reduce extra layout work (#525).
 * Enables pure data parallel, DP attention, and MTP + DP attention paths for SGLang-ATOM (#665, #743, #926).
-* Adds DeepSeek FP4 MTP benchmark coverage and DeepSeek FP4 DP4 / EP4 nightly accuracy and benchmark cases (#834, #846).
+* Adds DeepSeek FP4 MTP, TP8 / EP8, and DP4 / EP4 benchmark and nightly accuracy cases (#834, #639, #846).
 
 ## Dashboard, Docs & Tooling
 
