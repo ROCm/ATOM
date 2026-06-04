@@ -780,7 +780,7 @@ class MLAAttention(nn.Module):
                     paged_kv_indices = self.sparse_kv_indices_buffer
 
             dp_size = get_dp_group().world_size
-            use_persistent_mode = not (dp_size > 1)
+            use_persistent_mode = dp_size <= 8
 
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
