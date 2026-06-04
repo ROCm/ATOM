@@ -167,7 +167,17 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self.atom_config.hf_config = main_atom_config.hf_config
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
+            # Config.__post_init__ reloads the HF config from disk. Preserve vLLM's
+            # already-mutated hf_config so --hf-overrides reach ATOM model layers.
+            self.atom_config.hf_config = self.text_config
         self.model_arch = model_arch
+        logger.info(
+            "ATOM vLLM hf config overrides: use_index_cache=%s, index_topk_freq=%s, "
+            "index_topk_pattern=%s",
+            getattr(self.atom_config.hf_config, "use_index_cache", None),
+            getattr(self.atom_config.hf_config, "index_topk_freq", None),
+            getattr(self.atom_config.hf_config, "index_topk_pattern", None),
+        )
         _prepare_env(atom_config=self.atom_config)
         model_cls = _get_atom_model_cls(model_arch)
         module_remapping = getattr(model_cls, "packed_modules_mapping", {})
