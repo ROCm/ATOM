@@ -14,14 +14,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
-import time
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
 from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_staging import (
-    _StagingSlot,
+    _StagingBuffer,
     _ThreadTransferState,
     _env_flag,
     _env_int,
@@ -45,6 +44,18 @@ class _TransferChunk:
 class _TransferGroup:
     chunks: list[_TransferChunk]
     nbytes: int
+
+
+@dataclass(frozen=True)
+class _PipelineStage:
+    """One leg of the two-stage staging pipeline.
+
+    ``stream`` is the CUDA stream the work is issued on; ``run(group,
+    device_buf)`` does the work.
+    """
+
+    stream: Any
+    run: Callable[[_TransferGroup, torch.Tensor], None]
 
 
 class ATOMLMCacheGPUConnector:
@@ -79,7 +90,7 @@ class ATOMLMCacheGPUConnector:
             )
         self.device = torch.device(codec.device)
         self._tls = threading.local()
-        requested_group_chunks = _env_int("OFFLOAD_GPU_STAGING_CHUNKS", 2)
+        requested_buffer_chunks = _env_int("OFFLOAD_GPU_STAGING_CHUNKS", 2)
         max_staging_bytes = _env_optional_int("OFFLOAD_GPU_STAGING_MAX_BYTES")
         if max_staging_bytes is not None:
             if max_staging_bytes < self._gpu_staging_chunk_bytes:
@@ -89,77 +100,33 @@ class ATOMLMCacheGPUConnector:
                     f"max_bytes={max_staging_bytes}, "
                     f"chunk_bytes={self._gpu_staging_chunk_bytes}"
                 )
-            requested_group_chunks = min(
-                requested_group_chunks,
+            requested_buffer_chunks = min(
+                requested_buffer_chunks,
                 max_staging_bytes // self._gpu_staging_chunk_bytes,
             )
-        self._staging_group_chunks = max(1, int(requested_group_chunks))
-        self._gpu_staging_capacity_bytes = (
-            self._staging_group_chunks * self._gpu_staging_chunk_bytes
+        self._staging_buffer_chunks = max(1, int(requested_buffer_chunks))
+        self._gpu_staging_buffer_bytes = (
+            self._staging_buffer_chunks * self._gpu_staging_chunk_bytes
         )
-        self._staging_slots = _env_int("OFFLOAD_GPU_STAGING_SLOTS", 1)
         self._release_gpu_staging_after_transfer = _env_flag(
             "OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER"
         )
-
-    @property
-    def staging_slots(self) -> int:
-        return self._staging_slots
 
     @property
     def gpu_staging_chunk_bytes(self) -> int:
         return self._gpu_staging_chunk_bytes
 
     @property
-    def gpu_staging_group_chunks(self) -> int:
-        return self._staging_group_chunks
+    def gpu_staging_buffer_chunks(self) -> int:
+        return self._staging_buffer_chunks
 
     @property
-    def gpu_staging_capacity_bytes(self) -> int:
-        return self._gpu_staging_capacity_bytes
+    def gpu_staging_buffer_bytes(self) -> int:
+        return self._gpu_staging_buffer_bytes
 
     @property
     def release_gpu_staging_after_transfer(self) -> bool:
         return self._release_gpu_staging_after_transfer
-
-    def _set_last_transfer_stats(
-        self,
-        *,
-        chunks: int = 0,
-        max_chunk_bytes: int = 0,
-        groups: int = 0,
-        max_group_bytes: int = 0,
-        total_bytes: int = 0,
-        pack_ms: float = 0.0,
-        copy_ms: float = 0.0,
-        sync_ms: float = 0.0,
-        transfer_ms: float = 0.0,
-    ) -> None:
-        effective_gbps = 0.0
-        if transfer_ms > 0 and total_bytes > 0:
-            effective_gbps = total_bytes / (transfer_ms * 1_000_000.0)
-        self._tls.last_transfer_stats = {
-            "chunks": int(chunks),
-            "max_chunk_bytes": int(max_chunk_bytes),
-            "groups": int(groups),
-            "max_group_bytes": int(max_group_bytes),
-            "total_bytes": int(total_bytes),
-            "gpu_staging_chunk_bytes": self._gpu_staging_chunk_bytes,
-            "gpu_staging_group_chunks": self._staging_group_chunks,
-            "gpu_staging_capacity_bytes": self._gpu_staging_capacity_bytes,
-            "gpu_staging_slots": self._staging_slots,
-            "pack_ms": float(pack_ms),
-            "copy_ms": float(copy_ms),
-            "sync_ms": float(sync_ms),
-            "transfer_ms": float(transfer_ms),
-            "effective_gbps": float(effective_gbps),
-        }
-
-    def reset_transfer_stats(self) -> None:
-        self._set_last_transfer_stats()
-
-    def last_transfer_stats(self) -> dict[str, int | float]:
-        return dict(getattr(self._tls, "last_transfer_stats", {}))
 
     def _use_cuda(self) -> bool:
         return self.device.type == "cuda"
@@ -175,41 +142,42 @@ class ATOMLMCacheGPUConnector:
             state = _ThreadTransferState(
                 self.device,
                 self._use_cuda(),
-                self._staging_slots,
             )
             states[key] = state
         return state
 
-    def _ensure_slot(self, slot: _StagingSlot, nbytes: int) -> torch.Tensor:
+    def _ensure_staging_buffer(
+        self,
+        staging_buffer: _StagingBuffer,
+        nbytes: int,
+    ) -> torch.Tensor:
         nbytes = int(nbytes)
-        if nbytes > self._gpu_staging_capacity_bytes:
+        if nbytes > self._gpu_staging_buffer_bytes:
             raise RuntimeError(
                 "ATOM LMCache connector internal error: transfer group exceeds "
-                "bounded GPU staging capacity: "
-                f"nbytes={nbytes}, capacity={self._gpu_staging_capacity_bytes}"
+                "bounded GPU staging buffer: "
+                f"nbytes={nbytes}, capacity={self._gpu_staging_buffer_bytes}"
             )
         if (
-            slot.tensor is None
-            or int(slot.tensor.numel()) != self._gpu_staging_capacity_bytes
+            staging_buffer.tensor is None
+            or int(staging_buffer.tensor.numel()) != self._gpu_staging_buffer_bytes
         ):
-            slot.tensor = torch.empty(
-                (self._gpu_staging_capacity_bytes,),
+            staging_buffer.tensor = torch.empty(
+                (self._gpu_staging_buffer_bytes,),
                 dtype=torch.uint8,
                 device=self.device,
             )
-            slot.free_event_valid = False
-        return slot.tensor[:nbytes]
+            staging_buffer.free_event_valid = False
+        return staging_buffer.tensor[:nbytes]
 
-    def _next_slot(self, state: _ThreadTransferState) -> _StagingSlot:
-        slot = state.slots[state.next_slot % len(state.slots)]
-        state.next_slot += 1
-        return slot
-
-    def _release_slot_if_requested(self, slot: _StagingSlot) -> None:
+    def _release_staging_buffer_if_requested(
+        self,
+        staging_buffer: _StagingBuffer,
+    ) -> None:
         if not self._release_gpu_staging_after_transfer:
             return
-        slot.tensor = None
-        slot.free_event_valid = False
+        staging_buffer.tensor = None
+        staging_buffer.free_event_valid = False
 
     def _assert_fused_chunk_major_available(self) -> None:
         if self._use_cuda() and self.codec.has_fused_chunk_major_staging:
@@ -324,9 +292,9 @@ class ATOMLMCacheGPUConnector:
         current: list[_TransferChunk] = []
         current_bytes = 0
         for chunk in chunks:
-            would_exceed_count = len(current) >= self._staging_group_chunks
+            would_exceed_count = len(current) >= self._staging_buffer_chunks
             would_exceed_bytes = (
-                current_bytes + chunk.nbytes > self._gpu_staging_capacity_bytes
+                current_bytes + chunk.nbytes > self._gpu_staging_buffer_bytes
             )
             if current and (would_exceed_count or would_exceed_bytes):
                 groups.append(_TransferGroup(chunks=current, nbytes=current_bytes))
@@ -337,31 +305,6 @@ class ATOMLMCacheGPUConnector:
         if current:
             groups.append(_TransferGroup(chunks=current, nbytes=current_bytes))
         return groups
-
-    def _record_transfer_stats(
-        self,
-        chunks: list[_TransferChunk],
-        groups: list[_TransferGroup] | None = None,
-        *,
-        pack_ms: float = 0.0,
-        copy_ms: float = 0.0,
-        sync_ms: float = 0.0,
-        transfer_ms: float = 0.0,
-    ) -> None:
-        if groups is None:
-            groups = []
-        total_bytes = sum(chunk.nbytes for chunk in chunks)
-        self._set_last_transfer_stats(
-            chunks=len(chunks),
-            max_chunk_bytes=max((chunk.nbytes for chunk in chunks), default=0),
-            groups=len(groups),
-            max_group_bytes=max((group.nbytes for group in groups), default=0),
-            total_bytes=total_bytes,
-            pack_ms=pack_ms,
-            copy_ms=copy_ms,
-            sync_ms=sync_ms,
-            transfer_ms=transfer_ms,
-        )
 
     @staticmethod
     def _group_block_ids(group: _TransferGroup) -> list[list[int]]:
@@ -387,16 +330,65 @@ class ATOMLMCacheGPUConnector:
             )
             offset += chunk.nbytes
 
-    @staticmethod
-    def _remember_slot(used_slots: list[_StagingSlot], slot: _StagingSlot) -> None:
-        if not any(existing is slot for existing in used_slots):
-            used_slots.append(slot)
+    def _prepare_transfer(
+        self,
+        memory_objs: list[Any] | None,
+        starts: list[int] | None,
+        ends: list[int] | None,
+        **kwargs,
+    ) -> tuple[_ThreadTransferState, list[_TransferGroup]] | None:
+        """Validate inputs and build the chunk/group transfer plan."""
+        if memory_objs is None or starts is None or ends is None:
+            raise ValueError("memory_objs, starts, and ends are required")
+        if not (len(memory_objs) == len(starts) == len(ends)):
+            raise ValueError("memory_objs, starts, and ends must have equal length")
+        block_id_groups = self._ranges_to_block_ids(starts, ends, **kwargs)
+        if not memory_objs:
+            return None
+        state = self._thread_state()
+        chunks = self._iter_transfer_chunks(memory_objs, block_id_groups)
+        if not chunks:
+            return None
+        return state, self._iter_transfer_groups(chunks)
 
-    def _release_slots_if_requested(self, used_slots: list[_StagingSlot]) -> None:
-        if not self._release_gpu_staging_after_transfer:
-            return
-        for slot in used_slots:
-            self._release_slot_if_requested(slot)
+    def _run_staged_pipeline(
+        self,
+        state: _ThreadTransferState,
+        groups: list[_TransferGroup],
+        stage_a: _PipelineStage,
+        stage_b: _PipelineStage,
+    ) -> None:
+        """Drive an event-synced two-stage staging pipeline.
+
+        Each group flows ``stage_a`` -> ``stage_b`` on their respective streams,
+        handed off via the staging buffer's ready event; the free event gates a
+        later group's reuse of the same buffer. ``stage_b``'s stream produces
+        the observable result, so it is the one synchronized at the end.
+        """
+        self._assert_fused_chunk_major_available()
+        staging_buffer = state.staging_buffer
+        used_buffer = False
+        try:
+            for group in groups:
+                device_buf = self._ensure_staging_buffer(staging_buffer, group.nbytes)
+                used_buffer = True
+                if staging_buffer.free_event_valid:
+                    stage_a.stream.wait_event(staging_buffer.free_event)
+                with state.stream_ctx(stage_a.stream):
+                    stage_a.run(group, device_buf)
+                staging_buffer.ready_event.record(stage_a.stream)
+                stage_b.stream.wait_event(staging_buffer.ready_event)
+                with state.stream_ctx(stage_b.stream):
+                    stage_b.run(group, device_buf)
+                staging_buffer.free_event.record(stage_b.stream)
+                staging_buffer.free_event_valid = True
+            stage_b.stream.synchronize()
+        except Exception:
+            staging_buffer.free_event_valid = False
+            raise
+        finally:
+            if used_buffer:
+                self._release_staging_buffer_if_requested(staging_buffer)
 
     def from_gpu(self, memory_obj: Any, start: int, end: int, **kwargs) -> None:
         self.batched_from_gpu([memory_obj], [start], [end], **kwargs)
@@ -412,65 +404,23 @@ class ATOMLMCacheGPUConnector:
         **kwargs,
     ) -> None:
         """Pack ATOM KV blocks to LMCache MemoryObjs via bounded staging."""
-        if not (len(memory_objs) == len(starts) == len(ends)):
-            raise ValueError("memory_objs, starts, and ends must have equal length")
-        block_id_groups = self._ranges_to_block_ids(starts, ends, **kwargs)
-        if not memory_objs:
-            self._set_last_transfer_stats()
+        prepared = self._prepare_transfer(memory_objs, starts, ends, **kwargs)
+        if prepared is None:
             return
-
-        state = self._thread_state()
-        chunks = self._iter_transfer_chunks(memory_objs, block_id_groups)
-        groups = self._iter_transfer_groups(chunks)
-        self._record_transfer_stats(chunks, groups)
-        if not chunks:
-            return
-
-        self._assert_fused_chunk_major_available()
-        used_slots: list[_StagingSlot] = []
-        pack_ms = 0.0
-        copy_ms = 0.0
-        sync_ms = 0.0
-        t_total0 = time.perf_counter()
-        try:
-            for group in groups:
-                slot = self._next_slot(state)
-                self._remember_slot(used_slots, slot)
-                device_buf = self._ensure_slot(slot, group.nbytes)
-                if slot.free_event_valid:
-                    state.pack_stream.wait_event(slot.free_event)
-                t0 = time.perf_counter()
-                with state.stream_ctx(state.pack_stream):
-                    self.codec.gpu_to_chunk_major_device_buffer(
-                        device_buf,
-                        self._group_block_ids(group),
-                        stream=state.pack_stream,
-                    )
-                pack_ms += (time.perf_counter() - t0) * 1000
-                slot.ready_event.record(state.pack_stream)
-                state.copy_stream.wait_event(slot.ready_event)
-                t0 = time.perf_counter()
-                with state.stream_ctx(state.copy_stream):
-                    self._slice_to_memory_objs(group, device_buf)
-                copy_ms += (time.perf_counter() - t0) * 1000
-                slot.free_event.record(state.copy_stream)
-                slot.free_event_valid = True
-            t0 = time.perf_counter()
-            state.copy_stream.synchronize()
-            sync_ms += (time.perf_counter() - t0) * 1000
-        except Exception:
-            for slot in used_slots:
-                slot.free_event_valid = False
-            raise
-        finally:
-            self._release_slots_if_requested(used_slots)
-        self._record_transfer_stats(
-            chunks,
+        state, groups = prepared
+        self._run_staged_pipeline(
+            state,
             groups,
-            pack_ms=pack_ms,
-            copy_ms=copy_ms,
-            sync_ms=sync_ms,
-            transfer_ms=(time.perf_counter() - t_total0) * 1000,
+            stage_a=_PipelineStage(
+                state.pack_stream,
+                lambda group, buf: self.codec.gpu_to_chunk_major_device_buffer(
+                    buf, self._group_block_ids(group), stream=state.pack_stream
+                ),
+            ),
+            stage_b=_PipelineStage(
+                state.copy_stream,
+                lambda group, buf: self._slice_to_memory_objs(group, buf),
+            ),
         )
 
     def batched_to_gpu(
@@ -481,65 +431,21 @@ class ATOMLMCacheGPUConnector:
         **kwargs,
     ) -> None:
         """Load LMCache MemoryObjs back into ATOM KV blocks via bounded staging."""
-        if memory_objs is None or starts is None or ends is None:
-            raise ValueError("memory_objs, starts, and ends are required")
-        if not (len(memory_objs) == len(starts) == len(ends)):
-            raise ValueError("memory_objs, starts, and ends must have equal length")
-        block_id_groups = self._ranges_to_block_ids(starts, ends, **kwargs)
-        if not memory_objs:
-            self._set_last_transfer_stats()
+        prepared = self._prepare_transfer(memory_objs, starts, ends, **kwargs)
+        if prepared is None:
             return
-
-        state = self._thread_state()
-        chunks = self._iter_transfer_chunks(memory_objs, block_id_groups)
-        groups = self._iter_transfer_groups(chunks)
-        self._record_transfer_stats(chunks, groups)
-        if not chunks:
-            return
-
-        self._assert_fused_chunk_major_available()
-        used_slots: list[_StagingSlot] = []
-        copy_ms = 0.0
-        pack_ms = 0.0
-        sync_ms = 0.0
-        t_total0 = time.perf_counter()
-        try:
-            for group in groups:
-                slot = self._next_slot(state)
-                self._remember_slot(used_slots, slot)
-                device_buf = self._ensure_slot(slot, group.nbytes)
-                if slot.free_event_valid:
-                    state.copy_stream.wait_event(slot.free_event)
-                t0 = time.perf_counter()
-                with state.stream_ctx(state.copy_stream):
-                    self._memory_objs_to_slice(group, device_buf)
-                copy_ms += (time.perf_counter() - t0) * 1000
-                slot.ready_event.record(state.copy_stream)
-                state.pack_stream.wait_event(slot.ready_event)
-                t0 = time.perf_counter()
-                with state.stream_ctx(state.pack_stream):
-                    self.codec.chunk_major_device_buffer_to_gpu(
-                        device_buf,
-                        self._group_block_ids(group),
-                        stream=state.pack_stream,
-                    )
-                pack_ms += (time.perf_counter() - t0) * 1000
-                slot.free_event.record(state.pack_stream)
-                slot.free_event_valid = True
-            t0 = time.perf_counter()
-            state.pack_stream.synchronize()
-            sync_ms += (time.perf_counter() - t0) * 1000
-        except Exception:
-            for slot in used_slots:
-                slot.free_event_valid = False
-            raise
-        finally:
-            self._release_slots_if_requested(used_slots)
-        self._record_transfer_stats(
-            chunks,
+        state, groups = prepared
+        self._run_staged_pipeline(
+            state,
             groups,
-            pack_ms=pack_ms,
-            copy_ms=copy_ms,
-            sync_ms=sync_ms,
-            transfer_ms=(time.perf_counter() - t_total0) * 1000,
+            stage_a=_PipelineStage(
+                state.copy_stream,
+                lambda group, buf: self._memory_objs_to_slice(group, buf),
+            ),
+            stage_b=_PipelineStage(
+                state.pack_stream,
+                lambda group, buf: self.codec.chunk_major_device_buffer_to_gpu(
+                    buf, self._group_block_ids(group), stream=state.pack_stream
+                ),
+            ),
         )

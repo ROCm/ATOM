@@ -150,17 +150,15 @@ class LMCacheOffloadConnector(KVConnectorBase):
 
         logger.info(
             "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d "
-            "gpu_staging_slots=%d "
-            "gpu_staging_chunk_bytes=%d gpu_staging_group_chunks=%d "
-            "gpu_staging_capacity_bytes=%d release_gpu_staging=%s "
+            "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
+            "gpu_staging_buffer_bytes=%d release_gpu_staging=%s "
             "save=%s load=%s",
             rank,
             self._codec.bytes_per_block,
             self.chunk_size,
-            gpu_connector.staging_slots,
             gpu_connector.gpu_staging_chunk_bytes,
-            gpu_connector.gpu_staging_group_chunks,
-            gpu_connector.gpu_staging_capacity_bytes,
+            gpu_connector.gpu_staging_buffer_chunks,
+            gpu_connector.gpu_staging_buffer_bytes,
             gpu_connector.release_gpu_staging_after_transfer,
             self._do_save,
             self._do_load,
@@ -329,9 +327,11 @@ class LMCacheOffloadConnector(KVConnectorBase):
             max_chunk_bytes=transfer_stats.get("max_chunk_bytes", 0),
             max_group_bytes=transfer_stats.get("max_group_bytes", 0),
             gpu_staging_chunk_bytes=transfer_stats.get("gpu_staging_chunk_bytes", 0),
-            gpu_staging_group_chunks=transfer_stats.get("gpu_staging_group_chunks", 0),
-            gpu_staging_capacity_bytes=transfer_stats.get(
-                "gpu_staging_capacity_bytes", 0
+            gpu_staging_buffer_chunks=transfer_stats.get(
+                "gpu_staging_buffer_chunks", 0
+            ),
+            gpu_staging_buffer_bytes=transfer_stats.get(
+                "gpu_staging_buffer_bytes", 0
             ),
             total_bytes=transfer_stats.get("total_bytes", 0),
             pack_ms=f"{float(transfer_stats.get('pack_ms', 0.0)):.2f}",
@@ -347,8 +347,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d "
                 "retrieved=%d status=%s chunks=%d groups=%d "
                 "max_chunk_bytes=%d max_group_bytes=%d "
-                "gpu_staging_chunk_bytes=%d gpu_staging_group_chunks=%d "
-                "gpu_staging_capacity_bytes=%d total_bytes=%d "
+                "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
+                "gpu_staging_buffer_bytes=%d total_bytes=%d "
                 "pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
                 "transfer_ms=%.2f effective_gbps=%.2f "
                 "retrieve_ms=%.2f total_ms=%.2f",
@@ -363,8 +363,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 int(transfer_stats.get("max_chunk_bytes", 0)),
                 int(transfer_stats.get("max_group_bytes", 0)),
                 int(transfer_stats.get("gpu_staging_chunk_bytes", 0)),
-                int(transfer_stats.get("gpu_staging_group_chunks", 0)),
-                int(transfer_stats.get("gpu_staging_capacity_bytes", 0)),
+                int(transfer_stats.get("gpu_staging_buffer_chunks", 0)),
+                int(transfer_stats.get("gpu_staging_buffer_bytes", 0)),
                 int(transfer_stats.get("total_bytes", 0)),
                 float(transfer_stats.get("pack_ms", 0.0)),
                 float(transfer_stats.get("copy_ms", 0.0)),
@@ -431,9 +431,11 @@ class LMCacheOffloadConnector(KVConnectorBase):
             max_chunk_bytes=transfer_stats.get("max_chunk_bytes", 0),
             max_group_bytes=transfer_stats.get("max_group_bytes", 0),
             gpu_staging_chunk_bytes=transfer_stats.get("gpu_staging_chunk_bytes", 0),
-            gpu_staging_group_chunks=transfer_stats.get("gpu_staging_group_chunks", 0),
-            gpu_staging_capacity_bytes=transfer_stats.get(
-                "gpu_staging_capacity_bytes", 0
+            gpu_staging_buffer_chunks=transfer_stats.get(
+                "gpu_staging_buffer_chunks", 0
+            ),
+            gpu_staging_buffer_bytes=transfer_stats.get(
+                "gpu_staging_buffer_bytes", 0
             ),
             total_bytes=transfer_stats.get("total_bytes", 0),
             pack_ms=f"{float(transfer_stats.get('pack_ms', 0.0)):.2f}",
@@ -449,7 +451,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d "
                 "chunks=%d groups=%d max_chunk_bytes=%d max_group_bytes=%d "
                 "gpu_staging_chunk_bytes=%d "
-                "gpu_staging_group_chunks=%d gpu_staging_capacity_bytes=%d "
+                "gpu_staging_buffer_chunks=%d gpu_staging_buffer_bytes=%d "
                 "total_bytes=%d pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
                 "transfer_ms=%.2f effective_gbps=%.2f "
                 "store_ms=%.2f total_ms=%.2f",
@@ -462,8 +464,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 int(transfer_stats.get("max_chunk_bytes", 0)),
                 int(transfer_stats.get("max_group_bytes", 0)),
                 int(transfer_stats.get("gpu_staging_chunk_bytes", 0)),
-                int(transfer_stats.get("gpu_staging_group_chunks", 0)),
-                int(transfer_stats.get("gpu_staging_capacity_bytes", 0)),
+                int(transfer_stats.get("gpu_staging_buffer_chunks", 0)),
+                int(transfer_stats.get("gpu_staging_buffer_bytes", 0)),
                 int(transfer_stats.get("total_bytes", 0)),
                 float(transfer_stats.get("pack_ms", 0.0)),
                 float(transfer_stats.get("copy_ms", 0.0)),

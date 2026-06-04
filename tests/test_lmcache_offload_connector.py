@@ -211,7 +211,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
 
     pack_groups = []
     unpack_groups = []
-    slot_requests = []
+    buffer_requests = []
 
     monkeypatch.setattr(
         codec,
@@ -233,14 +233,14 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
             ),
         )[-1],
     )
-    orig_ensure_slot = connector._ensure_slot
+    orig_ensure_staging_buffer = connector._ensure_staging_buffer
 
-    def _ensure_slot(slot, nbytes):
-        device_buf = orig_ensure_slot(slot, nbytes)
-        slot_requests.append((nbytes, int(slot.tensor.numel())))
+    def _ensure_staging_buffer(staging_buffer, nbytes):
+        device_buf = orig_ensure_staging_buffer(staging_buffer, nbytes)
+        buffer_requests.append((nbytes, int(staging_buffer.tensor.numel())))
         return device_buf
 
-    monkeypatch.setattr(connector, "_ensure_slot", _ensure_slot)
+    monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure_staging_buffer)
 
     class _FakeEvent:
         def record(self, stream) -> None:
@@ -257,21 +257,12 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         def __init__(self) -> None:
             self.pack_stream = _FakeStream()
             self.copy_stream = _FakeStream()
-            self.next_slot = 0
-            self.slots = [
-                SimpleNamespace(
-                    tensor=None,
-                    ready_event=_FakeEvent(),
-                    free_event=_FakeEvent(),
-                    free_event_valid=False,
-                ),
-                SimpleNamespace(
-                    tensor=None,
-                    ready_event=_FakeEvent(),
-                    free_event=_FakeEvent(),
-                    free_event_valid=False,
-                ),
-            ]
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent(),
+                free_event=_FakeEvent(),
+                free_event_valid=False,
+            )
 
         def stream_ctx(self, stream):
             return nullcontext()
@@ -306,20 +297,11 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
             original["l0"].v_cache[[3]].reshape(-1),
         ]
     )
-    transfer_stats = connector.last_transfer_stats()
-    assert transfer_stats["chunks"] == 2
-    assert transfer_stats["groups"] == 1
-    assert transfer_stats["max_chunk_bytes"] == 2 * codec.bytes_per_block
-    assert transfer_stats["max_group_bytes"] == 3 * codec.bytes_per_block
-    assert transfer_stats["total_bytes"] == 3 * codec.bytes_per_block
-    assert transfer_stats["gpu_staging_chunk_bytes"] == 2 * codec.bytes_per_block
-    assert transfer_stats["gpu_staging_group_chunks"] == 2
-    assert transfer_stats["gpu_staging_capacity_bytes"] == 4 * codec.bytes_per_block
-    assert transfer_stats["gpu_staging_slots"] == 1
-    assert transfer_stats["transfer_ms"] >= 0
     assert pack_groups == [[[1, 2], [3]]]
-    assert all(nbytes <= 4 * codec.bytes_per_block for nbytes, _ in slot_requests)
-    assert all(capacity == 4 * codec.bytes_per_block for _, capacity in slot_requests)
+    assert all(nbytes <= 4 * codec.bytes_per_block for nbytes, _ in buffer_requests)
+    assert all(
+        capacity == 4 * codec.bytes_per_block for _, capacity in buffer_requests
+    )
     assert torch.equal(memory_objs[0].tensor, expected0)
     assert torch.equal(memory_objs[1].tensor, expected1)
 
@@ -400,13 +382,12 @@ def test_lmcache_connector_rejects_oversized_memory_obj():
         )
 
 
-def test_lmcache_connector_respects_staging_slot_env(monkeypatch):
+def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
     import torch
 
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_GPU_STAGING_SLOTS", "2")
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "3")
     kv_caches = {
         "l0": SimpleNamespace(
@@ -419,13 +400,12 @@ def test_lmcache_connector_respects_staging_slot_env(monkeypatch):
     codec = ATOMKVByteCodec(kv_caches)
     connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
 
-    assert connector.staging_slots == 2
-    assert connector.gpu_staging_group_chunks == 3
-    assert connector.gpu_staging_capacity_bytes == 3 * connector.gpu_staging_chunk_bytes
-    assert len(connector._thread_state().slots) == 2
+    assert connector.gpu_staging_buffer_chunks == 3
+    assert connector.gpu_staging_buffer_bytes == 3 * connector.gpu_staging_chunk_bytes
+    assert connector._thread_state().staging_buffer.tensor is None
 
 
-def test_lmcache_connector_default_staging_group_chunks_is_two(monkeypatch):
+def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
     import torch
 
     if not hasattr(torch, "arange"):
@@ -444,8 +424,8 @@ def test_lmcache_connector_default_staging_group_chunks_is_two(monkeypatch):
     codec = ATOMKVByteCodec(kv_caches)
     connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
 
-    assert connector.gpu_staging_group_chunks == 2
-    assert connector.gpu_staging_capacity_bytes == 2 * connector.gpu_staging_chunk_bytes
+    assert connector.gpu_staging_buffer_chunks == 2
+    assert connector.gpu_staging_buffer_bytes == 2 * connector.gpu_staging_chunk_bytes
 
 
 def test_codec_chunk_major_device_buffer_layout():

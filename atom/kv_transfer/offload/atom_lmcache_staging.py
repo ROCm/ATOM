@@ -18,7 +18,7 @@ class _NullCtx:
         return False
 
 
-class _StagingSlot:
+class _StagingBuffer:
     def __init__(self, use_cuda: bool) -> None:
         self.tensor: torch.Tensor | None = None
         self.ready_event = None
@@ -64,19 +64,15 @@ class _ThreadTransferState:
         self,
         device: torch.device,
         use_cuda: bool,
-        staging_slots: int,
     ) -> None:
         self.device = device
         self.pack_stream = None
         self.copy_stream = None
-        self.next_slot = 0
         if use_cuda:
             with torch.cuda.device(device):
                 self.pack_stream = torch.cuda.Stream()
                 self.copy_stream = torch.cuda.Stream()
-                self.slots = [_StagingSlot(use_cuda) for _ in range(staging_slots)]
-        else:
-            self.slots = [_StagingSlot(use_cuda) for _ in range(staging_slots)]
+        self.staging_buffer = _StagingBuffer(use_cuda)
 
     def stream_ctx(self, stream):
         if stream is None:
