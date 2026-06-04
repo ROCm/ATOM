@@ -46,7 +46,7 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 * **DeepSeek V3.2**: Adds vLLM-ATOM plugin support, MTP support, FP8 KV cache and Sparse MLA recipes for TP4, plus benchmark / nightly coverage (#494, #557, #835, #892, #938).
 * **GLM**: Enables GLM-5 and GLM-4.7 support, including GLM-4.7 MTP in the vLLM-ATOM plugin (#399, #722, #805).
 * **Kimi**: Adds Kimi-K2.5 plugin support and recipe coverage (#401).
-* **Qwen3.5 / Qwen3-Next**: Adds Qwen3-Next MTP support in the vLLM-ATOM plugin (#772).
+* **Qwen3.5 / Qwen3-Next**: Adds Qwen3.5 FP8 / FP4 support and Qwen3-Next MTP in the vLLM-ATOM plugin (#448, #593, #772).
 * **MiniMax**: Adds MiniMax support in ATOM vLLM plugin mode (#545).
 
 #### Engine Core
@@ -61,7 +61,7 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 #### Model Support
 
 * Adds SGLang out-of-tree support for ATOM, including image release and validation workflows (#355, #510).
-* Adds SGLang-ATOM support for Qwen3.5, Qwen3-Next, DeepSeek V3 / V3.2 / R1 FP4, DeepSeek FP4 MTP, and SGLang MTP / DP attention paths (#532, #777, #643, #614, #834, #926).
+* Adds SGLang-ATOM support for Qwen3.5, Qwen3-Next, DeepSeek V3 / R1 FP4, DeepSeek FP4 MTP, and SGLang MTP / DP attention paths (#532, #777, #643, #614, #834, #926).
 * Adds Qwen3.5 MHA support, DeepSeek FP4 MTP benchmark cases, and DeepSeek FP4 DP4 / EP4 nightly accuracy and benchmark cases (#819, #834, #846).
 * Adds SGLang-ATOM recipes for DeepSeek MTP and DeepSeek-R1 (#901, #942).
 
