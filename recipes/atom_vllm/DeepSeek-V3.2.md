@@ -28,6 +28,7 @@ vllm serve deepseek-ai/DeepSeek-V3.2 \
     --tensor-parallel-size "${TP}" \
     --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --no-enable-prefix-caching
 ```
 
@@ -70,6 +71,7 @@ vllm serve amd/DeepSeek-V3.2-mtp-ptpc \
     --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --no-enable-prefix-caching
 ```
 
