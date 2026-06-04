@@ -449,7 +449,7 @@ def aiter_a8w4_fused_experts(
         apply_swiglu=True,
         alpha=_A8W4_SWIGLU_ALPHA,
         limit=_A8W4_SWIGLU_LIMIT,
-        add_residual=True,
+        swiglu_add_residual=True,
     )
 
     # gemm2: down_proj. fp8 activations (re-using s2 as the static scale), gate
