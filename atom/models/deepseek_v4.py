@@ -222,6 +222,9 @@ class DeepseekV4Args:
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 1024
+    use_index_cache: bool = False
+    index_topk_freq: int = 1
+    index_topk_pattern: Optional[Any] = None
 
     # MoE
     moe_inter_dim: int = 3072  # moe_intermediate_size
@@ -284,6 +287,9 @@ class DeepseekV4Args:
             index_n_heads=g("index_n_heads", 64),
             index_head_dim=g("index_head_dim", 128),
             index_topk=g("index_topk", 1024),
+            use_index_cache=bool(g("use_index_cache", False)),
+            index_topk_freq=int(g("index_topk_freq", 1)),
+            index_topk_pattern=g("index_topk_pattern", None),
             moe_inter_dim=g("moe_intermediate_size", 2048),
             n_routed_experts=g("n_routed_experts", 256),
             n_shared_experts=g("n_shared_experts", 1),
@@ -304,6 +310,38 @@ class DeepseekV4Args:
             # HF config.json does not carry this field, only inference/config.json does.
             scale_fmt=g("scale_fmt", "ue8m0"),
         )
+
+
+def _v4_index_topk_refreshes(args: DeepseekV4Args, layer_id: int) -> bool:
+    index_topk_pattern = args.index_topk_pattern
+    if index_topk_pattern is not None:
+        return not (
+            0 <= layer_id < len(index_topk_pattern)
+            and index_topk_pattern[layer_id] == "S"
+        )
+
+    index_topk_freq = int(args.index_topk_freq)
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    return max(layer_id - 1, 0) % index_topk_freq == 0
+
+
+def _should_skip_v4_index_topk(args: DeepseekV4Args, layer_id: int) -> bool:
+    if not args.use_index_cache:
+        return False
+    if args.compress_ratios[layer_id] != 4:
+        return False
+    if _v4_index_topk_refreshes(args, layer_id):
+        return False
+
+    # V4 writes CSA indices into a shared per-forward buffer and immediately
+    # consumes it. A skip layer is safe only after an earlier CSA refresh layer
+    # has populated that buffer in the same forward pass.
+    return any(
+        args.compress_ratios[prev_layer] == 4
+        and _v4_index_topk_refreshes(args, prev_layer)
+        for prev_layer in range(layer_id - 1, -1, -1)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1395,6 +1433,7 @@ class DeepseekV4Attention(nn.Module):
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
         self.scale_fmt = args.scale_fmt
+        self.skip_topk = False
 
         qc = args.quant_config
         p = prefix  # e.g. "layers.7.attn"
@@ -1459,6 +1498,7 @@ class DeepseekV4Attention(nn.Module):
             )
             if self.compress_ratio == 4:
                 self.indexer = Indexer(args, self.compress_ratio, prefix=f"{p}.indexer")
+                self.skip_topk = _should_skip_v4_index_topk(args, layer_id)
             else:
                 self.indexer = None
         else:
@@ -1592,7 +1632,7 @@ class DeepseekV4Attention(nn.Module):
         current_stream = fc.main_stream
         use_async_compress = self._use_async_compress and fc.in_hipgraph
         has_compressor = self.compressor is not None
-        has_indexer = self.indexer is not None
+        has_indexer = self.indexer is not None and not self.skip_topk
         if use_async_compress:
             if has_compressor:
                 self.alt_stream.wait_stream(current_stream)
@@ -1750,7 +1790,7 @@ class DeepseekV4Attention(nn.Module):
             if self.indexer is not None:
                 current_stream.wait_stream(self.compress_stream)
         # ===== Compressor + Indexer =====
-        if self.indexer is not None:
+        if self.indexer is not None and not self.skip_topk:
             indexer_topk_batched = self.indexer.forward_batched(
                 x_full=x,
                 qr_full=qr,
