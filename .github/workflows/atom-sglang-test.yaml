@@ -212,7 +212,7 @@ jobs:
             accuracy_test_threshold: 0.91
             runner: linux-atom-mi35x-4
           - model_name: "DeepSeek-R1-FP4 TP4"
-            model_path: "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+            model_path: "amd/DeepSeek-R1-0528-MXFP4-v2"
             extra_args: "--tensor-parallel-size 4"
             env_vars: |
               SGLANG_AITER_FP8_PREFILL_ATTN=0
