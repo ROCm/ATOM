@@ -622,7 +622,7 @@ jobs:
                   "toggle_env": "RUN_DSV32_FP8_MTP_TP4",
                   "model_name": "DeepSeek-V3.2-FP8 MTP TP4",
                   "model_path": "deepseek-ai/DeepSeek-V3.2",
-                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}' --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
@@ -800,7 +800,7 @@ jobs:
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
               },
               "DeepSeek-V3.2-FP8 MTP TP4": {
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}' --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "env_vars": "",
               },
               "DeepSeek-V3.2-FP8 PTPC TP4": {

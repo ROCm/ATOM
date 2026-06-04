@@ -320,7 +320,7 @@
           "dashboard_model": "DeepSeek-V3.2-FP8-MTP-aw-tp4",
           "prefix": "deepseek-v3-2-fp8-mtp-aw-tp4",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}' --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
           "env_vars": ""
         }
       ]

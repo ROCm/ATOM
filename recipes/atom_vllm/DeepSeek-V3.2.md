@@ -52,7 +52,6 @@ vllm serve deepseek-ai/DeepSeek-V3.2 \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP}}" \
     --gpu-memory-utilization 0.9 \
-    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --no-enable-prefix-caching
 ```
 
