@@ -62,6 +62,50 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     return sched
 
 
+def _install_fake_fused_chunk_major(codec: ATOMKVByteCodec) -> None:
+    def _pack(
+        segments,
+        seg_block_bytes,
+        chunk_block_counts,
+        flat_block_ids,
+        device_buf,
+    ) -> None:
+        offset = 0
+        cursor = 0
+        for count in chunk_block_counts:
+            block_ids = flat_block_ids[cursor : cursor + count]
+            cursor += count
+            idx = torch.tensor(block_ids, dtype=torch.long, device=codec.device)
+            for seg, nbytes in zip(segments, seg_block_bytes):
+                src = seg.index_select(0, idx).contiguous().view(torch.uint8)
+                device_buf[offset : offset + count * nbytes].copy_(src.reshape(-1))
+                offset += count * nbytes
+
+    def _unpack(
+        device_buf,
+        segments,
+        seg_block_bytes,
+        chunk_block_counts,
+        flat_block_ids,
+    ) -> None:
+        offset = 0
+        cursor = 0
+        for count in chunk_block_counts:
+            block_ids = flat_block_ids[cursor : cursor + count]
+            cursor += count
+            idx = torch.tensor(block_ids, dtype=torch.long, device=codec.device)
+            for seg, nbytes in zip(segments, seg_block_bytes):
+                src = device_buf[offset : offset + count * nbytes]
+                src = src.view(seg.dtype).reshape((count,) + tuple(seg.shape[1:]))
+                seg.index_copy_(0, idx, src)
+                offset += count * nbytes
+
+    codec._fused_kv_staging = SimpleNamespace(
+        fused_pack_chunk_major=_pack,
+        fused_unpack_chunk_major=_unpack,
+    )
+
+
 def test_raw_bytes_metadata_shapes_are_block_rounded():
     import torch
 
@@ -96,57 +140,6 @@ def test_raw_bytes_metadata_rejects_unaligned_chunk_size():
             atom_block_size=4,
             bytes_per_block=32,
         )
-
-
-def test_codec_device_buffer_roundtrip_noncontiguous_blocks():
-    import torch
-
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    original = {
-        "l0": SimpleNamespace(
-            k_cache=torch.arange(8 * 2 * 3, dtype=torch.uint8).reshape(8, 2, 3),
-            v_cache=(torch.arange(8 * 4, dtype=torch.uint8).reshape(8, 4) + 51),
-            k_scale=None,
-            v_scale=None,
-        ),
-        "l1": SimpleNamespace(
-            k_cache=(torch.arange(8 * 3, dtype=torch.uint8).reshape(8, 3) + 101),
-            v_cache=(torch.arange(8 * 2, dtype=torch.uint8).reshape(8, 2) + 151),
-            k_scale=None,
-            v_scale=None,
-        ),
-    }
-    kv_caches = {
-        name: SimpleNamespace(
-            k_cache=layer.k_cache.clone(), v_cache=layer.v_cache.clone()
-        )
-        for name, layer in original.items()
-    }
-    for layer in kv_caches.values():
-        layer.k_scale = None
-        layer.v_scale = None
-
-    codec = ATOMKVByteCodec(kv_caches)
-    block_ids = [1, 3, 4, 7]
-    device_buf = torch.empty(
-        len(block_ids) * codec.bytes_per_block,
-        dtype=torch.uint8,
-        device=codec.device,
-    )
-
-    codec.gpu_to_device_buffer(device_buf, block_ids)
-    for layer in kv_caches.values():
-        layer.k_cache.zero_()
-        layer.v_cache.zero_()
-    codec.device_buffer_to_gpu(device_buf, block_ids)
-
-    for name, layer in kv_caches.items():
-        src = original[name]
-        for bid in block_ids:
-            assert torch.equal(layer.k_cache[bid], src.k_cache[bid])
-            assert torch.equal(layer.v_cache[bid], src.v_cache[bid])
 
 
 def test_lmcache_connector_maps_token_ranges_to_block_ids():
@@ -211,9 +204,10 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     }
     codec = ATOMKVByteCodec(kv_caches)
     connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
-    monkeypatch.setattr(connector, "_can_use_fused_chunk_major", lambda: True)
-    orig_pack = codec.gpu_to_chunk_major_device_buffer
-    orig_unpack = codec.chunk_major_device_buffer_to_gpu
+    _install_fake_fused_chunk_major(codec)
+    monkeypatch.setattr(
+        connector, "_assert_fused_chunk_major_available", lambda: None
+    )
 
     pack_groups = []
     unpack_groups = []
@@ -224,7 +218,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         "gpu_to_chunk_major_device_buffer",
         lambda device_buf, block_id_groups, stream=None: (
             pack_groups.append([list(group) for group in block_id_groups]),
-            orig_pack(device_buf, block_id_groups, stream=None),
+            ATOMKVByteCodec.gpu_to_chunk_major_device_buffer(
+                codec, device_buf, block_id_groups, stream=None
+            ),
         )[-1],
     )
     monkeypatch.setattr(
@@ -232,7 +228,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         "chunk_major_device_buffer_to_gpu",
         lambda device_buf, block_id_groups, stream=None: (
             unpack_groups.append([list(group) for group in block_id_groups]),
-            orig_unpack(device_buf, block_id_groups, stream=None),
+            ATOMKVByteCodec.chunk_major_device_buffer_to_gpu(
+                codec, device_buf, block_id_groups, stream=None
+            ),
         )[-1],
     )
     orig_ensure_slot = connector._ensure_slot
@@ -473,6 +471,7 @@ def test_codec_chunk_major_device_buffer_layout():
         )
     }
     codec = ATOMKVByteCodec(kv_caches)
+    _install_fake_fused_chunk_major(codec)
     block_id_groups = [[0, 1], [2, 3]]
     device_buf = torch.empty(
         4 * codec.bytes_per_block,
@@ -530,6 +529,7 @@ def test_codec_chunk_major_handles_tail_and_sparse_blocks():
         for name, layer in original.items()
     }
     codec = ATOMKVByteCodec(kv_caches)
+    _install_fake_fused_chunk_major(codec)
     block_id_groups = [[4, 1, 3], [0]]
     device_buf = torch.empty(
         4 * codec.bytes_per_block,

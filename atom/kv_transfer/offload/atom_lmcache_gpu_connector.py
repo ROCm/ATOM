@@ -211,11 +211,8 @@ class ATOMLMCacheGPUConnector:
         slot.tensor = None
         slot.free_event_valid = False
 
-    def _can_use_fused_chunk_major(self) -> bool:
-        return self._use_cuda() and self.codec.has_fused_chunk_major_staging
-
-    def _require_fused_chunk_major(self) -> None:
-        if self._can_use_fused_chunk_major():
+    def _assert_fused_chunk_major_available(self) -> None:
+        if self._use_cuda() and self.codec.has_fused_chunk_major_staging:
             return
         raise RuntimeError(
             "ATOM LMCache connector requires Triton fused chunk-major staging; "
@@ -429,7 +426,7 @@ class ATOMLMCacheGPUConnector:
         if not chunks:
             return
 
-        self._require_fused_chunk_major()
+        self._assert_fused_chunk_major_available()
         used_slots: list[_StagingSlot] = []
         pack_ms = 0.0
         copy_ms = 0.0
@@ -500,7 +497,7 @@ class ATOMLMCacheGPUConnector:
         if not chunks:
             return
 
-        self._require_fused_chunk_major()
+        self._assert_fused_chunk_major_available()
         used_slots: list[_StagingSlot] = []
         copy_ms = 0.0
         pack_ms = 0.0

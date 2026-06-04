@@ -24,6 +24,7 @@ v_scale. The canonical staging layout for one chunk is segment-major::
     [ all L0.K blocks | all L0.V blocks | all L0.kS blocks | ... ]
 
 and batched transfers concatenate those per-chunk buffers for LMCache MemoryObjs.
+The production path requires Triton fused chunk-major staging.
 """
 
 from __future__ import annotations
@@ -86,7 +87,7 @@ class ATOMKVByteCodec:
             except Exception:
                 logger.warning(
                     "ATOMKVByteCodec: Triton KV staging unavailable; "
-                    "fused chunk-major staging disabled",
+                    "fused chunk-major staging unavailable",
                     exc_info=True,
                 )
 
@@ -99,14 +100,6 @@ class ATOMKVByteCodec:
         return self._fused_kv_staging is not None
 
     # -- helpers ----------------------------------------------------------
-    def _segment_bases(self, nblocks: int) -> list[int]:
-        bases = []
-        acc = 0
-        for nb in self._seg_block_bytes:
-            bases.append(acc)
-            acc += nb * nblocks
-        return bases
-
     def _device_ctx(self):
         if self._device.type == "cuda":
             return torch.cuda.device(self._device)
@@ -158,65 +151,7 @@ class ATOMKVByteCodec:
                 f"got {int(device_buf.numel())}"
             )
 
-    @staticmethod
-    def _segment_bytes_matrix(seg: torch.Tensor) -> torch.Tensor:
-        if not seg.is_contiguous():
-            raise RuntimeError("ATOMKVByteCodec: segment tensor not contiguous")
-        return seg.reshape(seg.shape[0], -1).view(torch.uint8)
-
     # -- public API -------------------------------------------------------
-    def gpu_to_device_buffer(
-        self,
-        device_buf: torch.Tensor,
-        block_ids: list[int],
-        stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        """Gather ATOM KV blocks into a flat device staging buffer.
-
-        The staging layout is always segment-major:
-        ``[seg0 blocks | seg1 blocks | ...]``. This is the layout consumed by
-        the ATOM LMCache connector before it copies the bytes to a
-        ``MemoryObj``.
-        """
-        block_ids = self._normalize_block_ids(block_ids)
-        self._validate_device_buf(device_buf, len(block_ids))
-        if not block_ids:
-            return
-        with self._device_ctx():
-            stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
-            with stream_ctx:
-                idx = torch.tensor(block_ids, dtype=torch.long, device=self._device)
-                bases = self._segment_bases(len(block_ids))
-                for seg, base, nb in zip(self._segments, bases, self._seg_block_bytes):
-                    mat = self._segment_bytes_matrix(seg)
-                    dst = device_buf[base : base + len(block_ids) * nb].reshape(
-                        len(block_ids), nb
-                    )
-                    torch.index_select(mat, 0, idx, out=dst)
-
-    def device_buffer_to_gpu(
-        self,
-        device_buf: torch.Tensor,
-        block_ids: list[int],
-        stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        """Scatter a segment-major device staging buffer into ATOM KV blocks."""
-        block_ids = self._normalize_block_ids(block_ids)
-        self._validate_device_buf(device_buf, len(block_ids))
-        if not block_ids:
-            return
-        with self._device_ctx():
-            stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
-            with stream_ctx:
-                idx = torch.tensor(block_ids, dtype=torch.long, device=self._device)
-                bases = self._segment_bases(len(block_ids))
-                for seg, base, nb in zip(self._segments, bases, self._seg_block_bytes):
-                    mat = self._segment_bytes_matrix(seg)
-                    src = device_buf[base : base + len(block_ids) * nb].reshape(
-                        len(block_ids), nb
-                    )
-                    mat.index_copy_(0, idx, src)
-
     def gpu_to_chunk_major_device_buffer(
         self,
         device_buf: torch.Tensor,
@@ -227,39 +162,29 @@ class ATOMKVByteCodec:
 
         Layout is MemoryObj-compatible:
         ``[chunk0: seg0 blocks | seg1 blocks | ...][chunk1: ...]``.
-        Fused Triton staging is used when available; otherwise this method
-        provides a reference implementation for tests.
+        Fused Triton staging is required.
         """
-        groups, flat_block_ids, chunk_block_counts = self._normalize_block_id_groups(
+        _, flat_block_ids, chunk_block_counts = self._normalize_block_id_groups(
             block_id_groups,
             reject_repeated=True,
         )
         self._validate_device_buf(device_buf, len(flat_block_ids))
         if not flat_block_ids:
             return
+        if self._fused_kv_staging is None:
+            raise RuntimeError(
+                "ATOMKVByteCodec requires Triton fused chunk-major staging"
+            )
         with self._device_ctx():
             stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
             with stream_ctx:
-                if self._fused_kv_staging is not None:
-                    self._fused_kv_staging.fused_pack_chunk_major(
-                        self._segments,
-                        self._seg_block_bytes,
-                        chunk_block_counts,
-                        flat_block_ids,
-                        device_buf,
-                    )
-                    return
-
-                offset = 0
-                for block_ids in groups:
-                    nblocks = len(block_ids)
-                    chunk_nbytes = nblocks * self.bytes_per_block
-                    self.gpu_to_device_buffer(
-                        device_buf[offset : offset + chunk_nbytes],
-                        block_ids,
-                        stream=stream,
-                    )
-                    offset += chunk_nbytes
+                self._fused_kv_staging.fused_pack_chunk_major(
+                    self._segments,
+                    self._seg_block_bytes,
+                    chunk_block_counts,
+                    flat_block_ids,
+                    device_buf,
+                )
 
     def chunk_major_device_buffer_to_gpu(
         self,
@@ -268,36 +193,27 @@ class ATOMKVByteCodec:
         stream: torch.cuda.Stream | None = None,
     ) -> None:
         """Scatter a chunk-major device staging buffer into ATOM KV blocks."""
-        groups, flat_block_ids, chunk_block_counts = self._normalize_block_id_groups(
+        _, flat_block_ids, chunk_block_counts = self._normalize_block_id_groups(
             block_id_groups,
             reject_repeated=True,
         )
         self._validate_device_buf(device_buf, len(flat_block_ids))
         if not flat_block_ids:
             return
+        if self._fused_kv_staging is None:
+            raise RuntimeError(
+                "ATOMKVByteCodec requires Triton fused chunk-major staging"
+            )
         with self._device_ctx():
             stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
             with stream_ctx:
-                if self._fused_kv_staging is not None:
-                    self._fused_kv_staging.fused_unpack_chunk_major(
-                        device_buf,
-                        self._segments,
-                        self._seg_block_bytes,
-                        chunk_block_counts,
-                        flat_block_ids,
-                    )
-                    return
-
-                offset = 0
-                for block_ids in groups:
-                    nblocks = len(block_ids)
-                    chunk_nbytes = nblocks * self.bytes_per_block
-                    self.device_buffer_to_gpu(
-                        device_buf[offset : offset + chunk_nbytes],
-                        block_ids,
-                        stream=stream,
-                    )
-                    offset += chunk_nbytes
+                self._fused_kv_staging.fused_unpack_chunk_major(
+                    device_buf,
+                    self._segments,
+                    self._seg_block_bytes,
+                    chunk_block_counts,
+                    flat_block_ids,
+                )
 
 
 class _nullctx:
