@@ -136,26 +136,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._engine.fmt = MemoryFormat.KV_2LTD
         self._engine.post_init()
 
-        # DEBUG: wrap engine.lookup to capture EVERY call (incl. the ones the ZMQ
-        # lookup_server makes on behalf of the scheduler) — args + result.
-        _orig_lookup = self._engine.lookup
-        _rk = rank
-
-        def _logged_lookup(*a, **k):
-            r = _orig_lookup(*a, **k)
-            h = k.get("hashes")
-            logger.debug(
-                "[ENGINE.LOOKUP] rank=%s lookup_id=%s nhashes=%s first3=%s -> %s",
-                _rk,
-                k.get("lookup_id"),
-                (len(h) if h is not None else None),
-                (list(h[:3]) if h else None),
-                r,
-            )
-            return r
-
-        self._engine.lookup = _logged_lookup
-
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
             from lmcache.v1.lookup_client.factory import LookupClientFactory
@@ -236,7 +216,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
             pass
 
     def _profile_enabled(self) -> bool:
-        return os.environ.get("OFFLOAD_PROFILE", "1").lower() not in (
+        return os.environ.get("OFFLOAD_PROFILE", "0").lower() not in (
             "0",
             "false",
             "no",
@@ -392,7 +372,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 retrieve_ms,
                 total_ms,
             )
-        logger.info("offload _do_load DONE req=%s", req.req_id)
 
     def _do_save_req(self, req: LMCacheReqMeta) -> None:
         ss = req.save_spec
@@ -798,7 +777,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._handoff_loads.add(sid)
         seq.offload_loaded_tokens = hbm
         seq.offload_handoff_boundary_tokens = boundary
-        logger.info(
+        logger.debug(
             "[OFFLOAD-LOAD-HANDOFF] seq=%s hbm_cached=%d boundary=%d "
             "lmc_cached=%d need_after_boundary=%d min_load=%d chunk=%d",
             seq.id,
@@ -869,7 +848,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._reqs_need_recv[sid] = seq
         self._handoff_loads.discard(sid)
         seq.offload_loaded_tokens = max(hbm, lmc)
-        logger.info(
+        logger.debug(
             "[OFFLOAD-LOAD-HANDOFF-READY] seq=%s hbm_cached=%d "
             "lmc_cached=%d offload_loaded=%d need=%d",
             seq.id,
@@ -899,7 +878,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     ) -> None:
         seq.offload_loaded_tokens = hbm
         min_load = int(getattr(self, "_min_load_tokens", 8192))
-        logger.info(
+        logger.debug(
             "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
             "need=%d min_load=%d chunk=%d reason=%s",
             seq.id,
@@ -977,7 +956,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
             # LMCache's lookup/pin API. A str here silently never wakes the seq.
-            logger.info(
+            logger.debug(
                 "[OFFLOAD-LOAD-EMIT] seq=%s hbm_cached=%d lmc_cached=%d "
                 "offload_loaded=%d need=%d min_load=%d nblocks=%d reason=aligned_large_hit",
                 seq.id,
