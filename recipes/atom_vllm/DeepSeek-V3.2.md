@@ -50,7 +50,6 @@ vllm serve deepseek-ai/DeepSeek-V3.2 \
     --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
     --speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP}}" \
-    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     --no-enable-prefix-caching
 ```
 
