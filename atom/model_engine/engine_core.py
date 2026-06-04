@@ -114,20 +114,12 @@ class EngineCore:
 
             config.num_kvcache_blocks = num_blocks
             if not config.enforce_eager:
-                # Start profiler before cudagraph capture only if mark-trace is enabled.
-                if self.profile_enbaled and self.mark_trace:
-                    self.runner_mgr.call_func(
-                        "start_profiler", "capture_graph", wait_out=True
-                    )
                 cap_cost, bs = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
                 )
                 logger.info(
                     f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} seconds"
                 )
-                if self.profile_enbaled and self.mark_trace:
-                    # Persist a dedicated capture-graph trace immediately.
-                    self.runner_mgr.call_func("stop_profiler", wait_out=True)
             good = True
         finally:
             logger.info(
@@ -285,6 +277,7 @@ class EngineCore:
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
+            self.scheduler.build_profile_annotation(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
@@ -437,6 +430,7 @@ class EngineCore:
 
     def start_profiler(self):
         if self.profile_enbaled:
+            self.scheduler.profile_active = True
             self.runner_mgr.call_func("start_profiler", wait_out=True)
 
     def stop_profiler(self):
@@ -444,6 +438,7 @@ class EngineCore:
             logger.info("Profiler stopping...")
             t0 = time.monotonic()
             self.runner_mgr.call_func("stop_profiler", wait_out=True)
+            self.scheduler.profile_active = False
             logger.info("Profiler stopped in %.1fs", time.monotonic() - t0)
 
     def print_mtp_statistics(self):

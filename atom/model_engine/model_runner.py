@@ -2088,6 +2088,16 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        annotation = batch.profile_annotation
+        if annotation and (
+            self.profiler is not None
+            and os.environ.get("ATOM_ENABLE_ROOFLINE_ANNOTATION", "0") == "1"
+        ):
+            ctx = torch.profiler.record_function(annotation)
+            ctx.__enter__()
+        else:
+            ctx = None
+
         (
             input_ids,
             temperatures,
@@ -2108,6 +2118,10 @@ class ModelRunner:
             needs_independent_noise=needs_independent_noise,
         )
         reset_forward_context()
+
+        if ctx is not None:
+            ctx.__exit__(None, None, None)
+
         return fwd_output
 
     @torch.inference_mode()
@@ -2159,6 +2173,31 @@ class ModelRunner:
             aux_hidden_states=self._aux_hidden_states,
         )
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
+
+    def start_capture_profiler(self):
+        if self.profiler_dir is not None and self.mark_trace and self.rank == 0:
+            self._profile_bs_idx = 0
+            self.capture_traces_dir = os.path.join(self.profiler_dir, "capture_traces")
+            os.makedirs(self.capture_traces_dir, exist_ok=True)
+            logger.info(f"{self.label}: Starting CUDA graph capture profiler...")
+
+            def on_trace_ready(prof):
+                bs = self.graph_bs[self._profile_bs_idx]
+                trace_file = os.path.join(self.capture_traces_dir, f"bs_{bs}_rank{self.rank}.json.gz")
+                prof.export_chrome_trace(trace_file)
+                logger.info(f"Saved trace for bs={bs} to {trace_file}")
+                self._profile_bs_idx += 1
+
+            self.capture_profiler = torch_profiler.profile(
+                activities=[torch_profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
+                schedule=torch_profiler.schedule(wait=1, warmup=0, active=1, repeat=0),
+                record_shapes=True,
+                with_stack=True,
+                profile_memory=False,
+                on_trace_ready=on_trace_ready
+            )
+        else:
+            self.capture_profiler = nullcontext()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -2212,7 +2251,10 @@ class ModelRunner:
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
         self.logits_in_graph = self.world_size == 1 and not is_tbo
 
-        with graph_capture() as gc:
+        #start capture profiler
+        self.start_capture_profiler()
+
+        with graph_capture() as gc, self.capture_profiler as prof:
             capture_range = (
                 tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
             )
@@ -2278,6 +2320,8 @@ class ModelRunner:
                     outputs[:num_tokens] = model_output
                 if self.logits_in_graph:
                     self.model.compute_logits(outputs[:num_tokens])
+                if prof is not None:
+                    prof.step()
 
                 # Capture
                 with (
@@ -2323,6 +2367,8 @@ class ModelRunner:
                 self.graphs[(bs, max_q_len)] = graph
                 if self.logits_in_graph and ubatch_slices is None:
                     self.graph_logits[(bs, max_q_len)] = graph_logits
+                if prof is not None:
+                    prof.step()
                 if graph_aux is not None:
                     self.graph_aux_hidden[(bs, max_q_len)] = graph_aux
                 torch.cuda.synchronize()
