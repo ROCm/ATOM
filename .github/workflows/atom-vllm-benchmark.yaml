@@ -1200,8 +1200,21 @@ jobs:
                           }
                       )
               else:
+                  grouped_params = {}
                   for param in filtered_params:
-                      include.append({"model": model, "params": param, "cases": [param]})
+                      key = (
+                          int(param["input_length"]),
+                          int(param["output_length"]),
+                          str(param["random_range_ratio"]),
+                      )
+                      grouped_params.setdefault(key, []).append(param)
+
+                  for key in sorted(grouped_params):
+                      cases = sorted(
+                          grouped_params[key],
+                          key=lambda p: int(p["concurrency"]),
+                      )
+                      include.append({"model": model, "params": cases[0], "cases": cases})
 
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
@@ -1340,7 +1353,7 @@ jobs:
           docker rmi atom_oot_base:ci || true
 
   benchmark:
-    name: ${{ contains(matrix.model.display, '(AW)') && format('OOT {0} all AW cases', matrix.model.display) || format('OOT {0} {1}/{2} c={3}', matrix.model.display, matrix.params.input_length, matrix.params.output_length, matrix.params.concurrency) }}
+    name: ${{ contains(matrix.model.display, '(AW)') && format('OOT {0} all AW cases', matrix.model.display) || format('OOT {0} {1}/{2} all concurrency', matrix.model.display, matrix.params.input_length, matrix.params.output_length) }}
     needs: [resolve-atom-source, build-benchmark-matrix, build-oot-image]
     if: >-
       always()
