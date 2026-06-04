@@ -44,15 +44,14 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 
 * Targets vLLM `0.19.0` and transformers `5.2.0` for the vLLM-ATOM plugin path (#483, #597).
 * **DeepSeek V3.2**: Adds vLLM-ATOM plugin support, MTP support, FP8 KV cache and Sparse MLA recipes for TP4, plus benchmark / nightly coverage (#494, #557, #835, #892, #938).
-* **DeepSeek V4 / DeepSeek-R1 FP4**: Expands plugin coverage for DeepSeek V4 and adds DeepSeek-R1 FP4 validation / recipes (#650, #614).
 * **GLM**: Enables GLM-5 and GLM-4.7 support, including GLM-4.7 MTP in the vLLM-ATOM plugin (#399, #722, #805).
 * **Kimi**: Adds Kimi-K2.5 plugin support and recipe coverage (#401).
-* **Qwen3.5 / Qwen3-Next**: Adds plugin support for Qwen3.5 and Qwen3-Next, including Qwen3-Next MTP (#532, #772).
+* **Qwen3.5 / Qwen3-Next**: Adds Qwen3.5 FP8 / FP4 support and Qwen3-Next MTP in the vLLM-ATOM plugin (#448, #593, #772).
 * **MiniMax**: Adds MiniMax support in ATOM vLLM plugin mode (#545).
 
 #### Engine Core
 
-* Enables Sparse MLA and GLM-5 for vLLM-ATOM, aligns plugin paged attention behavior, fixes KV cache dtype auto parsing, handles scalar KV scales, and passes FP8 dtype into Sparse MLA metadata (#399, #657, #804, #806, #793, #884).
+* Enables Sparse MLA and GLM-5 for vLLM-ATOM, aligns plugin paged attention behavior, fixes KV cache dtype auto parsing, and passes FP8 dtype into Sparse MLA metadata (#399, #657, #804, #806, #884).
 * Improves plugin decode metadata with caching and tail-only fills (#970).
 * Removes sequence-length D2H traffic for vLLM-ATOM MTP speculative decode (#933).
 * Fixes trust-remote-code and config handling for Kimi-K2.5 and Qwen3.5 model configs (#751, #655).
@@ -62,7 +61,7 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 #### Model Support
 
 * Adds SGLang out-of-tree support for ATOM, including image release and validation workflows (#355, #510).
-* Adds SGLang-ATOM support for Qwen3.5, Qwen3-Next, DeepSeek V3 / V3.2 / R1 FP4, DeepSeek FP4 MTP, and SGLang MTP / DP attention paths (#532, #777, #643, #614, #834, #926).
+* Adds SGLang-ATOM support for Qwen3.5, Qwen3-Next, DeepSeek V3 / R1 FP4, DeepSeek FP4 MTP, and SGLang MTP / DP attention paths (#532, #777, #643, #614, #834, #926).
 * Adds Qwen3.5 MHA support, DeepSeek FP4 MTP benchmark cases, and DeepSeek FP4 DP4 / EP4 nightly accuracy and benchmark cases (#819, #834, #846).
 * Adds SGLang-ATOM recipes for DeepSeek MTP and DeepSeek-R1 (#901, #942).
 
@@ -88,13 +87,12 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 ### vLLM-ATOM
 
 * Optimizes Sparse MLA and updates benchmark scope for key plugin workloads (#765, #739).
-* Adds Q/K norm-quant fusion, DeepSeek V3.2 fused indexer path, FP8 dtype plumbing for Sparse MLA metadata, and auto KV-cache dtype handling for Sparse MLA (#528, #788, #884, #806).
+* Adds a DeepSeek V3.2 fused indexer path, FP8 dtype plumbing for Sparse MLA metadata, and auto KV-cache dtype handling for Sparse MLA (#788, #884, #806).
 * Adds FlyDSL GDR support for Qwen3-Next in benchmark and recipe paths, plus GDR decode layout fixes (#634, #895, #752).
 * Improves plugin decode build cost with cached metadata, tail-only fills, and removal of sequence-length D2H traffic for MTP speculative decode (#970, #933).
 * Enables and tunes GLM-4.7 fusions in the vLLM-ATOM plugin path (#940).
 * MoE and communication paths improve with a fused routing-from-topk switch, configurable FP8 blockscale GEMM weight pre-shuffle, GPT-OSS int4 allreduce, MiniMax fused QKNorm+allreduce, and broader MiniMax communication fusion shapes (#725, #694, #776, #774, #820).
-* Refines DeepSeek FP4 TP8 / EP8 and DeepSeek-R1 FP4 validation coverage (#639, #614).
-* Adds DeepSeek V3.2 MTP TP4 benchmark / nightly cases and V4 DP benchmark coverage (#950, #949).
+* Adds DeepSeek V3.2 MTP TP4 benchmark / nightly cases (#950).
 
 ### SGLang-ATOM
 
@@ -104,7 +102,7 @@ This release features 294 merged PRs from 42 contributors (18 new)!
 * Fixes FP8 attention weight accuracy via PTPC quant recipes (#747).
 * Removes MLA flattening in SGLang-ATOM to match the ATOM vLLM MLA path and reduce extra layout work (#525).
 * Enables pure data parallel, DP attention, and MTP + DP attention paths for SGLang-ATOM (#665, #743, #926).
-* Adds DeepSeek FP4 MTP benchmark coverage and DeepSeek FP4 DP4 / EP4 nightly accuracy and benchmark cases (#834, #846).
+* Adds DeepSeek FP4 MTP, TP8 / EP8, and DP4 / EP4 benchmark and nightly accuracy cases (#834, #639, #846).
 
 ## Dashboard, Docs & Tooling
 
