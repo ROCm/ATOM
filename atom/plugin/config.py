@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 import logging
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
 
 # vLLM does not expose a stable prefill/decode flag for MORI launch-config
