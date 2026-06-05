@@ -14,7 +14,7 @@ Two-node Prefill-Decode disaggregation using the ATOM native inference engine an
 On both nodes:
 
 ```bash
-docker pull rocm/atom-dev:sglang-latest
+docker pull rocm/atom-dev:latest
 ```
 
 ## Step 2: Start Docker Containers
@@ -31,7 +31,7 @@ docker run -d --name atom_mesh \
     --shm-size 128G \
     -v /mnt:/mnt \
     -v /it-share:/it-share \
-    rocm/atom-dev:sglang-latest sleep infinity
+    rocm/atom-dev:latest sleep infinity
 ```
 
 ## Step 3: Start Prefill Server (Node 1)

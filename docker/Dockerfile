@@ -306,7 +306,7 @@ RUN pip install --upgrade setuptools_scm
 RUN echo "========== [Parallel] Building Aiter ==========" && \
     git clone $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
-    git checkout -f $AITER_COMMIT && \
+    git checkout $AITER_COMMIT && \
     git submodule sync && git submodule update --init --recursive && \
     pip install -r requirements.txt && \
     MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
@@ -317,7 +317,7 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
 # --------------------------------------------------------------------
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
-ARG ATOM_COMMIT="Jasen/atom_mesh"
+ARG ATOM_COMMIT="HEAD"
 
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
