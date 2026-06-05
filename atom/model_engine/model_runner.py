@@ -971,9 +971,13 @@ class ModelRunner:
         return True
 
     def stop_profiler(self):
-        """Stop profiling for this rank."""
+        """Stop profiling for this rank.
+
+        Returns a dict with ``trace_dir`` and ``elapsed`` so the caller
+        can report where the trace was written.
+        """
         if self.profiler is None:
-            return True
+            return {"trace_dir": self.profiler_dir, "elapsed": 0.0}
         t0 = time.monotonic()
         logger.info("Rank %d: stopping profiler...", self.rank)
         try:
@@ -982,12 +986,13 @@ class ModelRunner:
             logger.exception("Rank %d: profiler stop failed", self.rank)
         finally:
             self.profiler = None
+        elapsed = round(time.monotonic() - t0, 1)
         logger.info(
             "Rank %d: profiler stop completed in %.1fs",
             self.rank,
-            time.monotonic() - t0,
+            elapsed,
         )
-        return True
+        return {"trace_dir": self.profiler_dir, "elapsed": elapsed}
 
     def debug(self, *args: Any):
         if self.rank == 0:
