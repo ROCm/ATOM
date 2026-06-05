@@ -1779,7 +1779,7 @@ def _causal_conv1d_fwd_kernel_tile(  # 2D tiled prefill
     tl.store(k_ptrs, acc, mask=valid_token_2d & is_k_block[:, None])
 
     v_feat_idx = idx_feats - v_start_dim
-    is_v_block = idx_feats >= v_start_dim
+    is_v_block = (idx_feats >= v_start_dim) & (idx_feats < dim)
     v_ptrs = value_ptr + token_pos[None, :] * value_token_stride + v_feat_idx[:, None] * value_dim_stride
     tl.store(v_ptrs, acc, mask=valid_token_2d & is_v_block[:, None])
 
@@ -1823,7 +1823,6 @@ def _causal_conv1d_fn_tile(
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
 
     dim, cu_seqlen = x.shape
