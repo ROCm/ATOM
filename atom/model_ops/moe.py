@@ -38,7 +38,6 @@ from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinaliz
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
     is_rocm_aiter_fuse_routed_scaling_factor,
-    is_rocm_aiter_fusion_shared_expert_enabled,
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
@@ -2067,10 +2066,12 @@ class FusedMoE(torch.nn.Module):
         if shared_expert_prefix is None and prefix.endswith(".experts"):
             shared_expert_prefix = prefix[: -len(".experts")] + ".shared_experts"
 
-        fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
-            quant_config,
-            shared_expert_prefix=shared_expert_prefix,
-            routed_expert_prefix=prefix,
+        fuse_shared_experts = (
+            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                quant_config,
+                shared_expert_prefix=shared_expert_prefix,
+                routed_expert_prefix=prefix,
+            )
         )
         self.num_fused_shared_experts = (
             config.n_shared_experts

@@ -79,7 +79,6 @@ from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
 from atom.model_ops.topK import (
-    is_rocm_aiter_fusion_shared_expert_enabled,
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
