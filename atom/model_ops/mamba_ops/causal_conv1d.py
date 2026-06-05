@@ -1862,8 +1862,20 @@ def _causal_conv1d_fn_tile(
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
+    assert width in (
+        2,
+        3,
+        4,
+    ), f"Tiled causal_conv1d only supports KERNEL_WIDTH in {{2, 3, 4}}, got {width}"
+
     BLOCK_M = block_m
     BLOCK_N = block_n
+
+    if metadata is not None:
+        assert BLOCK_M in metadata.nums_dict, (
+            f"metadata does not contain entry for BLOCK_M={BLOCK_M}, "
+            f"available keys: {list(metadata.nums_dict.keys())}"
+        )
 
     if block_size_to_align is None or block_size_to_align <= 0:
         block_size_to_align = BLOCK_M
@@ -1886,7 +1898,7 @@ def _causal_conv1d_fn_tile(
         assert x.dim() == 2
         assert query_start_loc is not None
         assert query_start_loc.dim() == 1
-        assert x.stride(0) == 1 or x.stride(1) == 1
+        assert x.stride(0) == 1
         if bias is not None:
             assert bias.dim() == 1
             assert dim == bias.size(0)
