@@ -56,7 +56,7 @@ PREFILL_CHUNKED_PREFILL_SIZE="${PREFILL_CHUNKED_PREFILL_SIZE:-65536}"
 CUDA_GRAPH_BS_START="${CUDA_GRAPH_BS_START:-1}"
 CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-160}"
 IB_DEVICE="${IB_DEVICE:-rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7}"
-MESH_BIN="${MESH_BIN:-/usr/local/bin/atom-mesh}"
+MESH_BIN="${MESH_BIN:-/usr/local/bin/atomesh}"
 
 MORI_DISPATCH_DTYPE="${MORI_DISPATCH_DTYPE:-bf16}"
 MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-16384}"
@@ -423,7 +423,7 @@ cleanup() {
             docker logs '${CONTAINER}' > '${LOG_ROOT}/docker_\$(hostname).log' 2>&1 || true
             docker rm -f '${CONTAINER}' >/dev/null 2>&1 || true
             pkill -9 -f 'sglang.launch_server' 2>/dev/null || true
-            pkill -9 -f 'atom-mesh' 2>/dev/null || true
+            pkill -9 -f 'atomesh' 2>/dev/null || true
         " &
     done
     wait

@@ -13,11 +13,11 @@
 #SBATCH --output=/it-share/yajizhan/slurm_logs/ds_fp4_atom_2p_dp8ep8_1d_dp8ep8-%j.out
 #SBATCH --error=/it-share/yajizhan/slurm_logs/ds_fp4_atom_2p_dp8ep8_1d_dp8ep8-%j.err
 #
-# 2P+1D PD-disaggregated benchmark for ATOM native server + atom-mesh router.
+# 2P+1D PD-disaggregated benchmark for ATOM native server + atomesh router.
 #   prefill0: ATOM kv_producer, TP=1, DP=8, EP=8 (1 node)
 #   prefill1: ATOM kv_producer, TP=1, DP=8, EP=8 (1 node)
 #   decode:   ATOM kv_consumer, TP=1, DP=8, EP=8 (1 node)
-#   router:   atom-mesh launch --backend atom (no bootstrap port)
+#   router:   atomesh launch --backend atom (no bootstrap port)
 #   KV transfer: Mooncake RDMA (atom/kv_transfer/disaggregation/mooncake)
 #
 # Mesh router learns each prefill's tp_size/dp_size/kv_role by GETing
@@ -55,7 +55,7 @@ BLOCK_SIZE="${BLOCK_SIZE:-16}"
 PREFILL_MAX_NUM_SEQS="${PREFILL_MAX_NUM_SEQS:-4096}"
 DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-4096}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
-MESH_BIN="${MESH_BIN:-/usr/local/bin/atom-mesh}"
+MESH_BIN="${MESH_BIN:-/usr/local/bin/atomesh}"
 
 MORI_DISPATCH_DTYPE="${MORI_DISPATCH_DTYPE:-bf16}"
 MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-16384}"
@@ -315,7 +315,7 @@ IFS=',' read -ra CONCS <<< "${CONC_LIST}"
 
 for ISL in "\${ISLS[@]}"; do
     for CONC in "\${CONCS[@]}"; do
-        RESULT_FILENAME="pd-atom-mesh-dp8ep8-\${ISL}-${OSL}-\${CONC}-${RANDOM_RANGE_RATIO}"
+        RESULT_FILENAME="pd-atomesh-dp8ep8-\${ISL}-${OSL}-\${CONC}-${RANDOM_RANGE_RATIO}"
         echo ""
         echo "========================================="
         echo "[bench] ISL=\${ISL} OSL=${OSL} CONC=\${CONC}"
@@ -352,7 +352,7 @@ from pathlib import Path
 import json
 
 result_dir = Path('\${RESULT_DIR}')
-json_files = sorted(result_dir.glob('pd-atom-mesh-dp8ep8-*.json'))
+json_files = sorted(result_dir.glob('pd-atomesh-dp8ep8-*.json'))
 if not json_files:
     print('No result files found')
     exit(0)
@@ -388,7 +388,7 @@ cleanup() {
             docker logs '${CONTAINER}' > '${LOG_ROOT}/docker_\$(hostname).log' 2>&1 || true
             docker rm -f '${CONTAINER}' >/dev/null 2>&1 || true
             pkill -9 -f 'atom.entrypoints.openai_server' 2>/dev/null || true
-            pkill -9 -f 'atom-mesh' 2>/dev/null || true
+            pkill -9 -f 'atomesh' 2>/dev/null || true
         " &
     done
     wait
@@ -534,7 +534,7 @@ verify_kv_info decode    "$DECODE_NODE"    "$DECODE_IP"    "$DECODE_PORT"   kv_c
 
 # ======================== 4. start router (detached) ========================
 echo ""
-echo "[router] launching atom-mesh on ${PREFILL_NODE_0}"
+echo "[router] launching atomesh on ${PREFILL_NODE_0}"
 srun --nodelist="$PREFILL_NODE_0" --nodes=1 --ntasks=1 bash -lc "
     docker exec -d '${CONTAINER}' bash '${LOG_ROOT}/scripts/router.sh'
 "

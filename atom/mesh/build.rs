@@ -1,7 +1,7 @@
 use std::process::Command;
 
 const DEFAULT_VERSION: &str = "0.0.0";
-const DEFAULT_PROJECT_NAME: &str = "atom-mesh";
+const DEFAULT_PROJECT_NAME: &str = "atomesh";
 
 /// Set a compile-time environment variable with the ATOM_MESH_ prefix
 macro_rules! set_env {

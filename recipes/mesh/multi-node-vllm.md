@@ -1,6 +1,6 @@
 # Multi-Node PD Disaggregation with vLLM Backend
 
-Two-node Prefill-Decode disaggregation using the vLLM backend with MooncakeConnector and atom-mesh router.
+Two-node Prefill-Decode disaggregation using the vLLM backend with MooncakeConnector and atomesh router.
 
 ## Prerequisites
 
@@ -115,7 +115,7 @@ Key differences from prefill:
 Wait for both servers to report ready (`/v1/models` returns 200), then launch the router:
 
 ```bash
-atom-mesh launch \
+atomesh launch \
     --host 0.0.0.0 --port 8000 \
     --pd-disaggregation \
     --prefill "http://${PREFILL_IP}:8010" 8998 \

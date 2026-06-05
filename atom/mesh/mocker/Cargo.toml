@@ -1,5 +1,5 @@
 [package]
-name = "atom-mesh-mocker"
+name = "atomesh-mocker"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,7 +12,7 @@ name = "atomesh-mocker"
 path = "main.rs"
 
 [dependencies]
-mesh = { package = "atom-mesh", path = ".." }
+mesh = { package = "atomesh", path = ".." }
 axum = { version = "0.8.6", features = ["macros", "ws", "tracing"] }
 clap = { version = "4", features = ["derive", "env"] }
 data-connector = "=1.0.0"

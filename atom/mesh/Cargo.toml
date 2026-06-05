@@ -1,5 +1,5 @@
 [package]
-name = "atom-mesh"
+name = "atomesh"
 version = "0.1.0"
 edition = "2021"
 
@@ -15,7 +15,7 @@ name = "mesh"
 crate-type = ["rlib", "cdylib"]
 
 [[bin]]
-name = "atom-mesh"
+name = "atomesh"
 path = "src/main.rs"
 
 [dependencies]

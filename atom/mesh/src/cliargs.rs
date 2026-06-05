@@ -155,7 +155,7 @@ ATOM Mesh - Rust-based inference gateway
 
 Usage:
   mesh launch [OPTIONS]       Launch router (short command)
-  atom-mesh launch [OPTIONS]  Launch router (full name)
+  atomesh launch [OPTIONS]  Launch router (full name)
 
 Examples:
   # Regular mode

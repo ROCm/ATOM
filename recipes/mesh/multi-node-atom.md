@@ -1,6 +1,6 @@
 # Multi-Node PD Disaggregation with ATOM Native Backend
 
-Two-node Prefill-Decode disaggregation using the ATOM native inference engine and atom-mesh router for DeepSeek-V4-Pro. KV cache transfer via Mooncake RDMA.
+Two-node Prefill-Decode disaggregation using the ATOM native inference engine and atomesh router for DeepSeek-V4-Pro. KV cache transfer via Mooncake RDMA.
 
 ## Prerequisites
 
@@ -130,7 +130,7 @@ curl -s http://<DECODE_IP>:8020/kv_transfer_info | python3 -m json.tool
 Inside the prefill node container:
 
 ```bash
-atom-mesh launch \
+atomesh launch \
     --host 0.0.0.0 --port 8000 \
     --pd-disaggregation \
     --prefill "http://${PREFILL_IP}:8010" \

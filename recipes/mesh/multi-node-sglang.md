@@ -1,6 +1,6 @@
 # Multi-Node PD Disaggregation with SGLang Backend
 
-Two-node Prefill-Decode disaggregation using the SGLang-ATOM backend and atom-mesh router. KV cache transfer via Mooncake RDMA.
+Two-node Prefill-Decode disaggregation using the SGLang-ATOM backend and atomesh router. KV cache transfer via Mooncake RDMA.
 
 ## Prerequisites
 
@@ -139,7 +139,7 @@ Wait for both gRPC servers to become healthy, then launch the router:
 ```bash
 export HF_HUB_CACHE=/mnt/hf_hub_cache
 
-atom-mesh launch \
+atomesh launch \
     --host 0.0.0.0 --port 8000 \
     --pd-disaggregation \
     --prefill "grpc://${PREFILL_IP}:8010" 8998 \

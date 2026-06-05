@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start the atom-mesh vLLM Docker container.
+# Start the atomesh vLLM Docker container.
 #
 # Optional env (with defaults):
 #   CONTAINER=atom_vllm_mesh

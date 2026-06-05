@@ -120,7 +120,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
     ),
     # --- Atomesh ---
-    # Build atom-mesh when installing ATOM from source.
+    # Build atomesh when installing ATOM from source.
     "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",
     # Route the OpenAI-compatible server entrypoint through Atomesh.
     "USE_ATOMESH_ENTRYPOINTS": lambda: (

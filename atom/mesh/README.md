@@ -49,7 +49,7 @@ cargo build
 cargo build --release
 ```
 
-Artifacts: `target/release/atom-mesh`, `target/release/libmesh.so`.
+Artifacts: `target/release/atomesh`, `target/release/libmesh.so`.
 
 ### Build during ATOM package install
 
@@ -98,7 +98,7 @@ entrypoint. For the Python entrypoint, `mesh-only` selects Mesh routing;
 without `mesh-only`, it defaults to ATOM standalone mode.
 
 ```bash
-./target/release/atom-mesh launch \
+./target/release/atomesh launch \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 
@@ -110,7 +110,7 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
 ### Prefill / decode disaggregation
 
 ```bash
-./target/release/atom-mesh launch --pd-disaggregation \
+./target/release/atomesh launch --pd-disaggregation \
   --prefill http://prefill1:30001 9001 \
   --prefill http://prefill2:30002 \
   --decode http://decode1:30011 \
@@ -131,7 +131,7 @@ Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cac
 ### gRPC routing
 
 ```bash
-./target/release/atom-mesh launch \
+./target/release/atomesh launch \
   --worker-urls grpc://worker1:31001 grpc://worker2:31002 \
   --tokenizer-path /path/to/tokenizer.json \
   --reasoning-parser deepseek-r1 \
@@ -220,7 +220,7 @@ Structured logging via `tracing`, optional file sink (`--log-dir`), and log leve
 Optional API key protection for router endpoints:
 
 ```bash
-./target/release/atom-mesh launch --api-key "your-secret-key" \
+./target/release/atomesh launch --api-key "your-secret-key" \
   --worker-urls http://worker1:8000 http://worker2:8000
 
 USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only --api-key "your-secret-key" \

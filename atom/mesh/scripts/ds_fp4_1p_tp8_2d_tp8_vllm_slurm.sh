@@ -45,7 +45,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 LOAD_FORMAT="${LOAD_FORMAT:-fastsafetensors}"
 IB_DEVICE="${IB_DEVICE:-rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7}"
-MESH_BIN="${MESH_BIN:-/usr/local/bin/atom-mesh}"
+MESH_BIN="${MESH_BIN:-/usr/local/bin/atomesh}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-}"
 CUDA_GRAPH_BS_START="${CUDA_GRAPH_BS_START:-1}"
 CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-256}"
@@ -435,7 +435,7 @@ cleanup() {
             docker logs '${CONTAINER}' > '${LOG_ROOT}/docker_\$(hostname).log' 2>&1 || true
             docker rm -f '${CONTAINER}' >/dev/null 2>&1 || true
             pkill -9 -f 'vllm.entrypoints' 2>/dev/null || true
-            pkill -9 -f 'atom-mesh' 2>/dev/null || true
+            pkill -9 -f 'atomesh' 2>/dev/null || true
         " &
     done
     wait

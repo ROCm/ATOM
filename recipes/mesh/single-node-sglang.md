@@ -1,6 +1,6 @@
 # Single-Node PD Disaggregation with SGLang Backend
 
-Prefill-Decode disaggregation on a single machine using the SGLang backend and atom-mesh router. Split GPUs between prefill and decode instances (xPyD topology).
+Prefill-Decode disaggregation on a single machine using the SGLang backend and atomesh router. Split GPUs between prefill and decode instances (xPyD topology).
 
 ## Prerequisites
 
@@ -123,7 +123,7 @@ Key differences from prefill:
 Wait for both servers to report ready, then launch the router:
 
 ```bash
-atom-mesh launch \
+atomesh launch \
     --host 0.0.0.0 --port 8000 \
     --pd-disaggregation \
     --prefill "http://${NODE_IP}:8010" 8998 \
