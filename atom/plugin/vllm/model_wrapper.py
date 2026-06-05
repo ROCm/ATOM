@@ -168,8 +168,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
             # Config.__post_init__ reloads the HF config from disk. Preserve vLLM's
-            # already-mutated hf_config so --hf-overrides reach ATOM model layers.
-            self.atom_config.hf_config = self.text_config
+            # root HF config so --hf-overrides survive without losing multimodal
+            # sub-configs such as Kimi-K2.5's vision_config/text_config.
+            self.atom_config.hf_config = self.config
         self.model_arch = model_arch
         logger.info(
             "ATOM vLLM hf config overrides: use_index_cache=%s, index_topk_freq=%s, "
