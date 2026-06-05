@@ -303,6 +303,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         bias2: Optional[torch.Tensor] = None,
         hidden_pad: Optional[int] = 0,
         intermediate_pad: Optional[int] = 0,
+        moe_extra_args: Optional[dict] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         if inplace and self.shared_experts is None and not disable_inplace():
@@ -345,6 +346,10 @@ class FusedMoEModularKernel(torch.nn.Module):
             if dispatch_scale is not None:
                 dispatch_scale = dispatch_scale[:total_valid_tokens]
 
+        # Extra, model-/method-specific kwargs (e.g. DeepSeek-V4 MXFP4 needs
+        # gate_mode=INTERLEAVE + swiglu_limit) are forwarded verbatim from the
+        # quant method's apply() via `moe_extra_args`.
+        extra_kwargs = dict(moe_extra_args or {})
         fused_out = fused_moe(
             dispatch_a1,
             w1,
@@ -365,6 +370,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             bias1=bias1,
             bias2=bias2,
             dtype=hidden_states.dtype,
+            **extra_kwargs,
         )
         return self._finalize(
             output,

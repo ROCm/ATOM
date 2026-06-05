@@ -1107,6 +1107,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
+        moe_extra_args = {
+            "gate_mode": (
+                GateMode.INTERLEAVE.value
+                if self.is_guinterleave
+                else GateMode.SEPARATED.value
+            ),
+            "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
+        }
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -1126,12 +1134,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_pad=self.intermediate_pad,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
-                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
-                gate_mode=(
-                    GateMode.INTERLEAVE.value
-                    if self.is_guinterleave
-                    else GateMode.SEPARATED.value
-                ),
+                **moe_extra_args,
             )
         return self.fused_experts(
             hidden_states=x,
@@ -1153,6 +1156,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             bias2=layer.w2_bias,
             hidden_pad=self.hidden_pad,
             intermediate_pad=self.intermediate_pad,
+            moe_extra_args=moe_extra_args,
         )
 
 
