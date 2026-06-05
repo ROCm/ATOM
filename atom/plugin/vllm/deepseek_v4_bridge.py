@@ -977,7 +977,7 @@ def build_atom_v4_attention_metadata(
         positions = torch.arange(total, dtype=torch.int64, device=device)
     pos_np = positions[:total].detach().cpu().numpy().astype(np.int32)
     if is_decode:
-        _populate_decode(md, common_attn_metadata, batch_np, pos_np)
+        _populate_decode(md, common_attn_metadata, batch_np, pos_np, positions)
     else:
         _populate_prefill(md, common_attn_metadata, batch_np, pos_np, q_np, positions)
     _populate_indexer(md, common_attn_metadata, batch_np, positions[:total], device)
@@ -1017,6 +1017,8 @@ def _populate_decode_persistent(
         write_v4_paged_decode_indices,
     )
 
+    from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_hca_compress_tail
+
     win = int(md.swa_window)
     cs = int(md.swa_cs)
     index_topk = int(md.index_topk)
@@ -1045,36 +1047,20 @@ def _populate_decode_persistent(
     swa_indptr_gpu = bufs.stage(bufs.indptr_swa, swa_indptr)
     csa_indptr_gpu = bufs.stage(bufs.indptr_csa, csa_indptr)
     hca_indptr_gpu = bufs.stage(bufs.indptr_hca, hca_indptr)
-
-    # HCA compress tail: per token, the committed HCA blocks map to physical
-    # pages `swa_pages + block_tables[seq, j]`. Scatter on CPU into the idx_hca
-    # head (window-prefix slots left -1; overwritten by the kernel below).
     hca_total = int(hca_indptr[total]) if total else 0
-    hca_indices_np = np.full(max(hca_total, 0), -1, dtype=np.int32)
-    total_hca = int(n_h_per_token.sum())
-    if total_hca > 0:
-        max_n_h = int(n_hca_cpu[:scheduled_bs].max()) if scheduled_bs else 0
-        bt_np = (
-            common.block_table_tensor[:scheduled_bs, :max_n_h].detach().cpu().numpy()
-        )
-        token_indices = np.repeat(np.arange(total, dtype=np.int32), n_h_per_token)
-        cu_n_h = np.zeros(total + 1, dtype=np.int32)
-        np.cumsum(n_h_per_token, out=cu_n_h[1:], dtype=np.int32)
-        entry_offsets = np.arange(total_hca, dtype=np.int32) - np.repeat(
-            cu_n_h[:total], n_h_per_token
-        )
-        write_pos = (
-            hca_indptr[token_indices] + actual_swa[token_indices] + entry_offsets
-        )
-        bid_expanded = batch_np[token_indices]
-        hca_indices_np[write_pos] = (
-            swa_pages + bt_np[bid_expanded, entry_offsets]
-        ).astype(np.int32)
-    bufs.stage(bufs.idx_hca, hca_indices_np)
 
-    # Window-prefix offsets for all three regions in one kernel (writes into the
-    # persistent idx buffers). T == real tokens; the -1 batch_id tail tokens are
-    # skipped natively.
+    # Build the whole decode index set on-GPU with two Triton kernels writing
+    # directly into the persistent idx buffers:
+    #   1. `write_v4_paged_decode_indices` -- the SWA window prefix shared by
+    #      the SWA / CSA / HCA regions.
+    #   2. `write_v4_decode_hca_compress_tail` -- the HCA compress tail
+    #      (`swa_pages + block_tables[seq, j]`), reading the block table
+    #      straight from GPU.
+    # The two write each token's disjoint prefix / tail, together covering its
+    # full HCA segment `[hca_indptr[t], hca_indptr[t+1])`, so no `-1` pre-fill
+    # is needed. This replaces the prior CPU HCA-tail scatter (a per-step
+    # block-table D2H + numpy repeat/cumsum/fancy-index + H2D). T == real
+    # tokens; the `-1` batch_id pad tail is skipped natively by both kernels.
     swa_indices_gpu = bufs.idx_swa.gpu
     csa_indices_gpu = bufs.idx_csa.gpu
     write_v4_paged_decode_indices(
@@ -1090,6 +1076,17 @@ def _populate_decode_persistent(
         T=total,
         win=win,
         cs=cs,
+    )
+    write_v4_decode_hca_compress_tail(
+        batch_id_per_token=md.batch_id_per_token,
+        positions=positions_gpu,
+        hca_indptr=hca_indptr_gpu,
+        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+        block_tables=common.block_table_tensor,
+        hca_indices=bufs.idx_hca.gpu,
+        T=total,
+        win=win,
+        swa_pages=swa_pages,
     )
     md.kv_indices_swa = swa_indices_gpu[: int(swa_indptr[total])]
     md.kv_indices_csa = csa_indices_gpu[: int(csa_indptr[total])]
@@ -1311,45 +1308,102 @@ def _prefill_scatter_reference(
     return ext_arr, swa_arr, csa_arr, hca_arr
 
 
-def _populate_decode(md, common, batch_np, pos_np):
+def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     device = md.state_slot_mapping.device
     win = int(md.swa_window)
+    cs = int(md.swa_cs)
     # SWA ring boundary in unified_kv is num_slots*cs (the real pool size, ==
     # max_num_seqs), not the per-forward request count -- the HCA compress tail
     # (swa_pages + block_id) lands in the wrong region otherwise once a sequence
     # is long enough to commit HCA entries (>=128 tokens).
-    swa_pages = int(md.swa_num_slots) * int(md.swa_cs)
+    swa_pages = int(md.swa_num_slots) * cs
     index_topk = int(md.index_topk)
     swa_counts = np.minimum(pos_np + 1, win).astype(np.int32)
     csa_counts = np.minimum(
         np.minimum((pos_np + 1) // 4, index_topk),
         md.n_committed_csa_per_seq_cpu[batch_np],
-    )
-    hca_counts = md.n_committed_hca_per_seq_cpu[batch_np]
-    swa_indptr = _counts_to_indptr(swa_counts)
-    csa_indptr = _counts_to_indptr(swa_counts + csa_counts)
-    hca_indptr = _counts_to_indptr(swa_counts + hca_counts)
-    swa_vals = []
-    csa = np.empty(int(csa_indptr[-1]), dtype=np.int32)
-    hca = np.empty(int(hca_indptr[-1]), dtype=np.int32)
-    for t, bid in enumerate(batch_np):
-        slot = int(md.state_slot_mapping[int(bid)].item())
-        pos = int(pos_np[t])
-        n = int(swa_counts[t])
-        vals = [slot * win + ((pos - n + 1 + i) % win) for i in range(n)]
-        swa_vals.extend(vals)
-        csa[csa_indptr[t] : csa_indptr[t] + n] = vals
-        hca[hca_indptr[t] : hca_indptr[t] + n] = vals
-    md.kv_indices_swa = torch.tensor(swa_vals, dtype=torch.int32, device=device)
-    md.kv_indptr_swa = torch.from_numpy(swa_indptr).to(device)
-    md.kv_indices_csa = torch.from_numpy(csa).to(device)
-    md.kv_indptr_csa = torch.from_numpy(csa_indptr).to(device)
-    # `hca` already holds the per-token SWA window prefix; append the HCA
-    # compress tail in place so the window prefix is preserved (the sparse
-    # decode kernel reads window-prefix + compress as one ragged segment).
-    _fill_hca_compress_tail(hca, md, common, hca_indptr, swa_counts, swa_pages)
-    md.kv_indices_hca = torch.from_numpy(hca).to(device)
-    md.kv_indptr_hca = torch.from_numpy(hca_indptr).to(device)
+    ).astype(np.int32)
+    hca_counts = md.n_committed_hca_per_seq_cpu[batch_np].astype(np.int32)
+    swa_indptr_np = _counts_to_indptr(swa_counts)
+    csa_indptr_np = _counts_to_indptr(swa_counts + csa_counts)
+    hca_indptr_np = _counts_to_indptr(swa_counts + hca_counts)
+    swa_total = int(swa_indptr_np[-1])
+    csa_total = int(csa_indptr_np[-1])
+    hca_total = int(hca_indptr_np[-1])
+    swa_indptr = torch.from_numpy(swa_indptr_np).to(device)
+    csa_indptr = torch.from_numpy(csa_indptr_np).to(device)
+    hca_indptr = torch.from_numpy(hca_indptr_np).to(device)
+    T = len(batch_np)
+
+    if device.type == "cuda":
+        # On-GPU build (mirrors the persistent decode path): one kernel writes
+        # the shared SWA window prefix into all three buffers, a second appends
+        # the HCA compress tail straight from the GPU block table -- no Python
+        # per-token loop, no block-table D2H. The CSA topk tail is filled per
+        # layer by `csa_translate_pack` (left untouched here).
+        from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
+
+        from atom.plugin.vllm.deepseek_v4_ops import (
+            write_v4_decode_hca_compress_tail,
+        )
+
+        swa_indices = torch.empty(max(swa_total, 1), dtype=torch.int32, device=device)
+        csa_indices = torch.empty(max(csa_total, 1), dtype=torch.int32, device=device)
+        hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
+        write_v4_paged_decode_indices(
+            state_slot_per_seq=md.state_slot_mapping,
+            batch_id_per_token=md.batch_id_per_token,
+            positions=positions_gpu,
+            swa_indptr=swa_indptr,
+            csa_indptr=csa_indptr,
+            hca_indptr=hca_indptr,
+            swa_indices=swa_indices,
+            csa_indices=csa_indices,
+            hca_indices=hca_indices,
+            T=T,
+            win=win,
+            cs=cs,
+        )
+        write_v4_decode_hca_compress_tail(
+            batch_id_per_token=md.batch_id_per_token,
+            positions=positions_gpu,
+            hca_indptr=hca_indptr,
+            n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+            block_tables=common.block_table_tensor,
+            hca_indices=hca_indices,
+            T=T,
+            win=win,
+            swa_pages=swa_pages,
+        )
+        md.kv_indices_swa = swa_indices[:swa_total]
+        md.kv_indices_csa = csa_indices[:csa_total]
+        md.kv_indices_hca = hca_indices[:hca_total]
+    else:
+        # CPU reference path (unit tests / standalone): numpy build. `csa`'s
+        # topk tail is left uninitialized (filled per layer by
+        # `csa_translate_pack`), matching the GPU branch.
+        swa_vals = []
+        csa = np.empty(csa_total, dtype=np.int32)
+        hca = np.empty(hca_total, dtype=np.int32)
+        for t, bid in enumerate(batch_np):
+            slot = int(md.state_slot_mapping[int(bid)].item())
+            pos = int(pos_np[t])
+            n = int(swa_counts[t])
+            vals = [slot * win + ((pos - n + 1 + i) % win) for i in range(n)]
+            swa_vals.extend(vals)
+            csa[csa_indptr_np[t] : csa_indptr_np[t] + n] = vals
+            hca[hca_indptr_np[t] : hca_indptr_np[t] + n] = vals
+        # `hca` already holds the per-token SWA window prefix; append the HCA
+        # compress tail in place so the window prefix is preserved (the sparse
+        # decode kernel reads window-prefix + compress as one ragged segment).
+        _fill_hca_compress_tail(hca, md, common, hca_indptr_np, swa_counts, swa_pages)
+        md.kv_indices_swa = torch.tensor(swa_vals, dtype=torch.int32, device=device)
+        md.kv_indices_csa = torch.from_numpy(csa).to(device)
+        md.kv_indices_hca = torch.from_numpy(hca).to(device)
+
+    md.kv_indptr_swa = swa_indptr
+    md.kv_indptr_csa = csa_indptr
+    md.kv_indptr_hca = hca_indptr
     md.swa_pages = swa_pages
 
 
