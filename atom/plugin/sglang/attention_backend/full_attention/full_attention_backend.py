@@ -34,7 +34,7 @@ from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
     build_pa_metadata_for_decode as _build_pa_metadata_for_decode,
     build_pa_metadata_for_prefill as _build_pa_metadata_for_prefill,
 )
-from atom.plugin.vllm.attention.layer_sparse_mla import (
+from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
     triton_convert_req_index_to_global_index,
 )
 
