@@ -20,7 +20,6 @@ env:
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   NIGHTLY_SGLANG_IMAGE_TAG: rocm/atom-dev:sglang-latest
-  SGLANG_REF: "v0.5.12"
 
 jobs:
   # ---------- SGLANG CI path (pull_request only) ----------
@@ -233,7 +232,6 @@ jobs:
     timeout-minutes: 180
     env:
       CONTAINER_NAME: atom_sglang_${{ strategy.job-index }}
-      SGLANG_REF: v0.5.12
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
@@ -250,6 +248,9 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+
+      - name: Resolve SGLang version metadata
+        run: python3 .github/scripts/resolve_sglang_metadata.py
 
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV

@@ -81,7 +81,6 @@ env:
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
   AITER_COMMIT: "HEAD"
-  SGLANG_REF: "v0.5.12"
 
 jobs:
   # ---------- SGLANG full validation path (schedule / workflow_dispatch) ----------
@@ -95,6 +94,9 @@ jobs:
     steps:
       - name: Checkout selected ATOM branch
         uses: actions/checkout@v6
+
+      - name: Resolve SGLang version metadata
+        run: python3 .github/scripts/resolve_sglang_metadata.py
 
       - name: Docker Login
         if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name != 'main' }}

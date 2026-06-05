@@ -35,11 +35,11 @@ on:
         description: "SGLang repo"
         default: "https://github.com/sgl-project/sglang.git"
       sglang_ref:
-        description: "SGLang git ref"
-        default: "v0.5.12"
+        description: "SGLang git ref. Leave empty to use the workflow default."
+        default: ""
       sglang_version:
-        description: "SGLang version used in the published tag"
-        default: "0.5.12"
+        description: "SGLang version used in the published tag. Leave empty to use the workflow default."
+        default: ""
       runner:
         description: "Runner label to use"
         type: choice
