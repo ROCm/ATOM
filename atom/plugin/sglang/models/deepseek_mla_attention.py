@@ -122,14 +122,13 @@ class SGLangDeepseekMLAAttention(nn.Module):
         q_scale: torch.Tensor | None,
     ) -> torch.Tensor:
         attn = self.owner_attn
-        from atom.plugin.sglang.models.deepseek_mla_forward import _unwrap_linear_output
+        from atom.plugin.sglang.models.deepseek_mla_forward import (
+            _q_b_proj_with_optional_scale,
+            _unwrap_linear_output,
+        )
 
         if attn.q_lora_rank is not None:
-            q = (
-                attn.q_b_proj(q_input, q_scale)
-                if q_scale is not None
-                else attn.q_b_proj(q_input)
-            )
+            q = _q_b_proj_with_optional_scale(attn, q_input, q_scale)
         else:
             q = (
                 attn.q_proj(q_input, q_scale)

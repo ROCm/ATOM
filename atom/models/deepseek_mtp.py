@@ -46,6 +46,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         atom_config: Config,
         prefix: str,
         layer_idx: int,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
 
@@ -75,6 +76,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             layer_num=layer_idx,
             is_mtp_block=True,
+            alt_stream=alt_stream,
         )
 
     def forward(
@@ -114,6 +116,12 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         config = atom_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
+        self.alt_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream()
+            if torch.cuda.is_available()
+            and getattr(config, "n_shared_experts", None) is not None
+            else None
+        )
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
@@ -121,6 +129,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                     atom_config,
                     f"{prefix}.layers.{idx}",
                     layer_idx=idx,
+                    alt_stream=self.alt_stream,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,

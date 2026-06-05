@@ -39,7 +39,6 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Type, cast
 
-
 import numpy as np
 import torch
 from aiter import dtypes
@@ -595,11 +594,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         standard MHA path uses.
         """
         # Local imports to avoid circular dependency at module load time.
-        from atom.models.deepseek_v4 import (
-            Compressor as _V4Compressor,
-            DeepseekV4Attention as _V4Attention,
-            Indexer as _V4Indexer,
-        )
+        from atom.models.deepseek_v4 import Compressor as _V4Compressor
+        from atom.models.deepseek_v4 import DeepseekV4Attention as _V4Attention
+        from atom.models.deepseek_v4 import Indexer as _V4Indexer
 
         runner = self.model_runner
         num_slots = self.model_runner.max_per_req_cache_slots
@@ -1104,11 +1101,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         var["positions"].np[:sum_scheduled_tokens] = positions_np
 
-        cu_seqlens_q_np = np.arange(
-            0, (scheduled_bs + 1) * max_seqlen_q, max_seqlen_q, dtype=np.int32
-        )
-        var["cu_seqlens_q"].np[: scheduled_bs + 1] = cu_seqlens_q_np
-
         var["context_lens"].np[:scheduled_bs] = context_lens_np
 
         # Inline block_tables CPU fill (H2D deferred to prep_stream).
@@ -1130,7 +1122,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         prep_stream.wait_stream(current_stream)
         with torch.cuda.stream(prep_stream):
             positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
-            cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(scheduled_bs + 1)
+            cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(bs + 1)
             context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
             block_tables_gpu = var["block_tables"].copy_to_gpu(scheduled_bs)
             state_slot_gpu = ss_buf.copy_to_gpu(scheduled_bs)

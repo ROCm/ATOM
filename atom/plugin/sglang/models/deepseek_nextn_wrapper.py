@@ -5,6 +5,7 @@ so ModelRegistry can override the upstream implementation, but delegates the
 actual draft core to ATOM's `DeepSeekMTP`.
 """
 
+import copy
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -17,6 +18,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 
+from atom.config import QuantizationConfig as AtomQuantizationConfig
 from atom.config import SpeculativeConfig
 from atom.plugin.config import generate_atom_config_for_plugin_mode
 from atom.plugin.sglang.models.deepseek_mla import (
@@ -83,6 +85,31 @@ def _retag_mtp_runtime_layer_ids(model: nn.Module) -> None:
                 _set_runtime_layer_id(nested_attn, local_layer_id)
 
 
+def _install_local_nextn_weight_remap(model: nn.Module) -> None:
+    """Teach a standalone NextN checkpoint's local layer names to ATOM MTP."""
+
+    from atom.models.deepseek_mtp import rewrite_spec_layer_name
+
+    original_remap_mtp_weight_name = model.remap_mtp_weight_name
+    config = model.config
+
+    def remap_mtp_weight_name(name: str) -> str | None:
+        num_nextn_layers = getattr(config, "num_nextn_predict_layers", 0)
+        for local_idx in range(num_nextn_layers):
+            local_prefix = f"model.layers.{local_idx}."
+            if name.startswith(local_prefix):
+                spec_layer = config.num_hidden_layers + local_idx
+                global_layer_name = name.replace(
+                    local_prefix,
+                    f"model.layers.{spec_layer}.",
+                    1,
+                )
+                return rewrite_spec_layer_name(spec_layer, global_layer_name)
+        return original_remap_mtp_weight_name(name)
+
+    model.remap_mtp_weight_name = remap_mtp_weight_name
+
+
 class DeepseekV3ForCausalLMNextN(nn.Module):
     """SGLang-compatible draft wrapper backed by ATOM's `DeepSeekMTP`."""
 
@@ -108,7 +135,31 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
 
         # Draft workers need ATOM's MTP-specific config semantics rather than the
         # default target-model translation used by the generic plugin wrapper.
-        SpeculativeConfig.hf_config_override(self.atom_config.hf_config)
+        server_args = get_global_server_args()
+        draft_model_path = (
+            server_args.speculative_draft_model_path or server_args.model_path
+        )
+        use_standalone_draft = (
+            server_args.speculative_draft_model_path is not None
+            and server_args.speculative_draft_model_path != server_args.model_path
+        )
+        self.use_standalone_draft = use_standalone_draft
+        self.atom_config.model = draft_model_path
+        if use_standalone_draft and hasattr(config, "quantization_config"):
+            # Keep the target-derived structural config (num_hidden_layers=61,
+            # expert counts, etc.) but use the standalone NextN checkpoint's
+            # quantization metadata so FP8 attention scales are materialized.
+            self.atom_config.hf_config.quantization_config = copy.deepcopy(
+                config.quantization_config
+            )
+        SpeculativeConfig.hf_config_override(
+            self.atom_config.hf_config, model_path=draft_model_path
+        )
+        if use_standalone_draft:
+            self.atom_config.quant_config = AtomQuantizationConfig(
+                self.atom_config.hf_config,
+                self.atom_config.online_quant_config,
+            )
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
             from atom.plugin.register import (
@@ -123,6 +174,8 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             init_aiter_dist(config=self.atom_config)
 
             self.model = DeepSeekMTP(atom_config=self.atom_config)
+            if self.use_standalone_draft:
+                _install_local_nextn_weight_remap(self.model)
             self.model.atom_config = self.atom_config
             setup_deepseek_for_sglang(self.model)
             _retag_mtp_runtime_layer_ids(self.model)

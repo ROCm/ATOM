@@ -16,6 +16,7 @@ from atom.plugin.vllm.attention.backend import AiterMhaBackendForVllm
 from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
+from atom.utils import envs
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
@@ -24,7 +25,15 @@ if TYPE_CHECKING:
         AiterMhaMetadataForVllm,
     )
 
-_QWEN_GLUON_PA_DECODE_BS = 64
+ATOM_USE_GLUON_PA_DECODE = envs.ATOM_USE_GLUON_PA_DECODE
+
+# the dispatch rule is based on the kernel benchmark result
+#  of gluon/asm pa with model-specific shapes
+_GLUON_PA_DECODE_BS_MAPPING = {
+    "qwen3_moe": 64,
+    "glm4_moe": 32,
+    "minimax_m2": 16,
+}
 _NO_PS_FIXED_SPLITS = 64
 
 
@@ -130,6 +139,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         self.k_norm = k_norm
         self.use_flash_layout = False
         self.supports_quant_query_input = False
+
+        hf_config = atom_config.hf_config
+        self.model_type = getattr(hf_config, "model_type", "")
 
         _init_vllm_mha_layer_state(
             self,
@@ -464,7 +476,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
         num_decodes: int,
-        num_decode_tokens: int,
         attn_metadata: "AiterMhaMetadataForVllm",
         out: torch.Tensor,
     ):
@@ -481,7 +492,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             context_lens=attn_metadata.seq_lens[:num_decodes],
             k_scale=k_scale,
             v_scale=v_scale,
-            out=out[:num_decode_tokens],
+            out=out,
             qo_indptr=qo_indptr,
             max_qlen=max_qlen,
             high_precision=0,
@@ -681,6 +692,17 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             suffix_lse=lse,
         )
 
+    def _dispatch_decode_backend(self, num_decodes):
+        # use asm pa for models without setting gluon pa decode bs
+        gluon_pa_decode_bs = _GLUON_PA_DECODE_BS_MAPPING.get(self.model_type, -1)
+        if self.use_triton_attn:
+            return self.paged_attention_triton
+        else:
+            if ATOM_USE_GLUON_PA_DECODE and num_decodes <= gluon_pa_decode_bs:
+                return self.paged_attention_triton
+            else:
+                return self.paged_attention_asm
+
     def forward_impl(
         self,
         query: torch.Tensor,
@@ -863,42 +885,17 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         if num_decodes > 0:
             assert attn_metadata.decode_metadata is not None
 
-            if self.use_triton_attn:
-                self.paged_attention_triton(
-                    q=query[:num_decode_tokens],
-                    k_cache=new_key_cache,
-                    v_cache=new_value_cache,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    num_decodes=num_decodes,
-                    out=output_actual_tokens[:num_decode_tokens],
-                    attn_metadata=attn_metadata,
-                )
-            else:
-                # Qwen only uses gluon pa decode when bs=64
-                if num_decodes == _QWEN_GLUON_PA_DECODE_BS:
-                    self.paged_attention_triton(
-                        q=query[:num_decode_tokens],
-                        k_cache=new_key_cache,
-                        v_cache=new_value_cache,
-                        k_scale=k_scale,
-                        v_scale=v_scale,
-                        num_decodes=num_decodes,
-                        out=output_actual_tokens[:num_decode_tokens],
-                        attn_metadata=attn_metadata,
-                    )
-                else:
-                    self.paged_attention_asm(
-                        q=query[:num_decode_tokens],
-                        k_cache=new_key_cache,
-                        v_cache=new_value_cache,
-                        k_scale=k_scale,
-                        v_scale=v_scale,
-                        num_decodes=num_decodes,
-                        num_decode_tokens=num_decode_tokens,
-                        out=output_actual_tokens[:num_decode_tokens],
-                        attn_metadata=attn_metadata,
-                    )
+            decode_backend_func = self._dispatch_decode_backend(num_decodes)
+            decode_backend_func(
+                q=query[:num_decode_tokens],
+                k_cache=new_key_cache,
+                v_cache=new_value_cache,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                num_decodes=num_decodes,
+                out=output_actual_tokens[:num_decode_tokens],
+                attn_metadata=attn_metadata,
+            )
 
         output = output.view(-1, self.num_heads * self.head_dim)
 

@@ -1803,12 +1803,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 per_act_token_quant=True,
             )
         else:
+            # block_quant (per_1x128 / per_1x32) MUST hand the kernel its block
+            # shape — otherwise fp8_w8a8 broadcasts the [N/128, K/128] scale as
+            # if it were per-tensor / per-channel and produces garbage.
+            # V4-Flash-Base on gfx942 hits this: routed experts are FP8 e4m3
+            # per_1x128 + UE8M0 block-scale.
+            if self.block_quant:
+                if self.quant_type == QuantType.per_1x128:
+                    block_shape = [128, 128]
+                elif self.quant_type == QuantType.per_1x32:
+                    block_shape = [1, 32]
+                else:
+                    block_shape = None
+            else:
+                block_shape = None
             return fp8_w8a8_moe_quant_config(
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
-                block_shape=None,
+                block_shape=block_shape,
             )
 
     @mark_trace(prefix="fp8_moe", torch_compile=False)
@@ -2960,15 +2974,47 @@ class FusedMoE(torch.nn.Module):
 
                 topk_ids = topk_ids.to(torch.int32)
             elif scoring_func == "sqrtsoftplus":
-                # # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
-                # # weights gathered from the unbiased sqrt(softplus(.)) values.
+                # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
+                # weights gathered from the unbiased sqrt(softplus(.)) values.
                 tokens_num = router_logits.shape[0]
-                topk_ids = torch.empty(
-                    tokens_num, top_k, dtype=torch.int32, device=router_logits.device
+                fuse_shared = (
+                    is_rocm_aiter_fusion_shared_expert_enabled()
+                    and num_fused_shared_experts > 0
                 )
-                topk_weights = torch.empty(
-                    tokens_num, top_k, dtype=torch.float32, device=router_logits.device
-                )
+                if fuse_shared:
+                    import atom.model_ops.topK as _topK_mod
+
+                    assert _topK_mod.aiter_topK_meta_data is not None, (
+                        "AITER topK meta data is not initialized. "
+                        "Please ensure that init_aiter_topK_meta_data is called "
+                        "before this function."
+                    )
+                    total_topk_weights, total_topk_ids = _topK_mod.aiter_topK_meta_data
+                    assert total_topk_weights.shape[0] >= tokens_num
+                    n_extra = total_topk_ids.shape[1] - top_k
+                    topk_ids, _ = torch.split(
+                        total_topk_ids[:tokens_num],
+                        [top_k, n_extra],
+                        dim=1,
+                    )
+                    topk_weights, _ = torch.split(
+                        total_topk_weights[:tokens_num],
+                        [top_k, n_extra],
+                        dim=1,
+                    )
+                else:
+                    topk_ids = torch.empty(
+                        tokens_num,
+                        top_k,
+                        dtype=torch.int32,
+                        device=router_logits.device,
+                    )
+                    topk_weights = torch.empty(
+                        tokens_num,
+                        top_k,
+                        dtype=torch.float32,
+                        device=router_logits.device,
+                    )
                 topk_gating(
                     topk_weights,
                     topk_ids,
@@ -2978,6 +3024,11 @@ class FusedMoE(torch.nn.Module):
                     routed_scaling_factor,
                     score_func="sqrtsoftplus",
                 )
+                if fuse_shared:
+                    # Switch from the stride-7 routed view back to the full
+                    # 7-col buffer (routed + shared cols) for the fused kernel.
+                    topk_weights = total_topk_weights[:tokens_num]
+                    topk_ids = total_topk_ids[:tokens_num]
             else:
                 raise ValueError(
                     f"Unsupported scoring function for non-grouped topk: {scoring_func}"

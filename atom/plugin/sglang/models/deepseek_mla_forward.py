@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from aiter import dtypes
+from aiter.utility import fp4_utils
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mla import (
     dynamic_per_batched_tensor_quant,
@@ -41,6 +42,12 @@ from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
     batched_gemm_a16wfp4,
 )
+
+try:
+    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+except ImportError:
+    gemm_afp4wfp4 = None
+
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
@@ -126,6 +133,55 @@ def _fuse_qk_rmsnorm_and_q_quant(
         transpose_scale=True,
     )
     return q_quantized, q_scale, q_normed, k_nope_normed
+
+
+def _q_b_proj_mxfp4_raw_scale(
+    attn: DeepseekV2MLAAttention,
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Run q_b_proj with native SGLang-style raw MXFP4 activation scales."""
+
+    raw_weight = getattr(attn.q_b_proj, "_mxfp4_unshuffled_weight", None)
+    raw_weight_scale = getattr(attn.q_b_proj, "_mxfp4_unshuffled_weight_scale", None)
+    bias = getattr(attn.q_b_proj, "bias", None)
+    if (
+        gemm_afp4wfp4 is not None
+        and raw_weight is not None
+        and raw_weight_scale is not None
+        and bias is None
+    ):
+        q_2d = q.view(-1, q.size(-1))
+        y = torch.empty(
+            q_2d.shape[0],
+            raw_weight.shape[0],
+            device=q.device,
+            dtype=torch.bfloat16,
+        )
+        gemm_afp4wfp4(
+            q_2d.view(torch.uint8),
+            raw_weight.view(torch.uint8),
+            q_scale.view(torch.uint8),
+            raw_weight_scale.view(torch.uint8),
+            torch.bfloat16,
+            y,
+        )
+        return y
+
+    q_scale = fp4_utils.e8m0_shuffle(q_scale.view(torch.float8_e8m0fnu))
+    return _unwrap_linear_output(attn.q_b_proj(q, q_scale))
+
+
+def _q_b_proj_with_optional_scale(
+    attn: DeepseekV2MLAAttention,
+    q: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if q_scale is None:
+        return _unwrap_linear_output(attn.q_b_proj(q))
+    if getattr(attn, "quant_dtype", None) == dtypes.fp4x2:
+        return _q_b_proj_mxfp4_raw_scale(attn, q, q_scale)
+    return _unwrap_linear_output(attn.q_b_proj(q, q_scale))
 
 
 def _fuse_qk_rmsnorm(
@@ -446,16 +502,16 @@ def _can_run_non_absorbed_mla_now(
     return True
 
 
-def _is_static_quark_mxfp4_kv_b_proj(kv_b_proj) -> bool:
-    layer_quant_config = getattr(kv_b_proj, "layer_quant_config", None)
+def _is_static_quark_mxfp4_linear(linear: Any) -> bool:
+    layer_quant_config = getattr(linear, "layer_quant_config", None)
     return (
-        getattr(kv_b_proj, "weight", None) is not None
-        and kv_b_proj.weight.dim() == 2
+        getattr(linear, "weight", None) is not None
+        and linear.weight.dim() == 2
         and layer_quant_config is not None
         and layer_quant_config.quant_method == "quark"
         and layer_quant_config.quant_dtype == dtypes.fp4x2
         and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
-        and getattr(kv_b_proj, "source_quant_dtype", None) is None
+        and getattr(linear, "source_quant_dtype", None) is None
     )
 
 
@@ -473,7 +529,7 @@ def _read_kv_b_proj_weight(attn: DeepseekV2MLAAttention) -> torch.Tensor:
             attn.kv_b_proj.qzeros,
         ).T
     else:
-        if _is_static_quark_mxfp4_kv_b_proj(attn.kv_b_proj):
+        if _is_static_quark_mxfp4_linear(attn.kv_b_proj):
             w = getattr(
                 attn.kv_b_proj,
                 "_mxfp4_unshuffled_weight",
@@ -711,7 +767,7 @@ def process_mla_kv_b_proj_after_loading(attn: DeepseekV2MLAAttention) -> None:
     kv_b_proj into absorbed w_kc / w_vc weights.
     """
     _bind_non_absorbed_kv_b_proj(attn)
-    if _is_static_quark_mxfp4_kv_b_proj(attn.kv_b_proj) and not getattr(
+    if _is_static_quark_mxfp4_linear(attn.kv_b_proj) and not getattr(
         attn.kv_b_proj, "_sgl_mxfp4_process_done", False
     ):
         attn.kv_b_proj.process_weights_after_loading()
@@ -733,27 +789,33 @@ def process_mla_kv_b_proj_after_loading(attn: DeepseekV2MLAAttention) -> None:
     _split_and_assign_kc_vc(attn, w, use_deep_gemm_bmm, block_scale, weight_block_size)
 
 
-def _patch_kv_b_proj_for_sglang_mxfp4(attn: DeepseekV2MLAAttention) -> None:
-    """Preserve DeepSeek MLA kv_b_proj's original MXFP4 layout for kc/vc split."""
-    kv_b_proj = attn.kv_b_proj
-    if getattr(kv_b_proj, "_sgl_mxfp4_preserve_patched", False):
+def _patch_linear_for_sglang_mxfp4_preserve(linear: Any) -> None:
+    """Preserve a DeepSeek MLA projection's original MXFP4 layout before shuffle."""
+    if getattr(linear, "_sgl_mxfp4_preserve_patched", False):
         return
 
-    orig_process_weights_after_loading = kv_b_proj.process_weights_after_loading
+    orig_process_weights_after_loading = linear.process_weights_after_loading
 
     def process_weights_after_loading_with_mxfp4_preserve():
-        if getattr(kv_b_proj, "_sgl_mxfp4_process_done", False):
+        if getattr(linear, "_sgl_mxfp4_process_done", False):
             return
 
-        if _is_static_quark_mxfp4_kv_b_proj(kv_b_proj):
-            kv_b_proj._mxfp4_unshuffled_weight = kv_b_proj.weight.detach().clone()
-            kv_b_proj._mxfp4_unshuffled_weight_scale = (
-                kv_b_proj.weight_scale.detach().clone()
-            )
+        if _is_static_quark_mxfp4_linear(linear):
+            linear._mxfp4_unshuffled_weight = linear.weight.detach().clone()
+            linear._mxfp4_unshuffled_weight_scale = linear.weight_scale.detach().clone()
         orig_process_weights_after_loading()
-        kv_b_proj._sgl_mxfp4_process_done = True
+        linear._sgl_mxfp4_process_done = True
 
-    kv_b_proj.process_weights_after_loading = (
+    linear.process_weights_after_loading = (
         process_weights_after_loading_with_mxfp4_preserve
     )
-    kv_b_proj._sgl_mxfp4_preserve_patched = True
+    linear._sgl_mxfp4_preserve_patched = True
+
+
+def _patch_attention_projs_for_sglang_mxfp4(
+    attn: DeepseekV2MLAAttention,
+) -> None:
+    """Preserve DeepSeek MLA q/kv projections' original MXFP4 layouts."""
+    if hasattr(attn, "q_b_proj"):
+        _patch_linear_for_sglang_mxfp4_preserve(attn.q_b_proj)
+    _patch_linear_for_sglang_mxfp4_preserve(attn.kv_b_proj)

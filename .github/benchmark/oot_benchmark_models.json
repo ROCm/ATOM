@@ -49,8 +49,8 @@
           "prefix": "gpt-oss-120b-met",
           "dashboard_model": "gpt-oss-120b-tp1",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
+          "extra_args": "--trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_USE_V2_MODEL_RUNNER=1"
         },
         {
           "tp_size": 1,
@@ -58,8 +58,8 @@
           "dashboard_model": "gpt-oss-120b-aw-tp1",
           "prefix": "gpt-oss-120b-aw-tp1",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
+          "extra_args": "--trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_USE_V2_MODEL_RUNNER=1"
         },
         {
           "tp_size": 2,
@@ -67,8 +67,8 @@
           "dashboard_model": "gpt-oss-120b-aw-tp2",
           "prefix": "gpt-oss-120b-aw-tp2",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 2 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
+          "extra_args": "--trust-remote-code --tensor-parallel-size 2 --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
         },
         {
           "tp_size": 8,
@@ -76,8 +76,8 @@
           "dashboard_model": "gpt-oss-120b-aw-tp8",
           "prefix": "gpt-oss-120b-aw-tp8",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
+          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
         }
       ]
     },
@@ -326,6 +326,24 @@
       ]
     },
     {
+      "choice_label": "DeepSeek-V3.2 FP8 PTPC",
+      "source_path": "amd/DeepSeek-V3.2-mtp-ptpc",
+      "path": "amd/DeepSeek-V3.2-mtp-ptpc",
+      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "nightly_group": "B",
+      "variants": [
+        {
+          "tp_size": 4,
+          "display": "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
+          "dashboard_model": "DeepSeek-V3.2-FP8-PTPC-aw-tp4",
+          "prefix": "deepseek-v3-2-fp8-ptpc-aw-tp4",
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0"
+        }
+      ]
+    },
+    {
       "choice_label": "GLM-4.7-FP8",
       "source_path": "zai-org/GLM-4.7-FP8",
       "path": "zai-org/GLM-4.7-FP8",
@@ -339,7 +357,7 @@
           "prefix": "glm-4-7-fp8-aw-tp4",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1"
         },
         {
           "tp_size": 8,
@@ -348,7 +366,7 @@
           "prefix": "glm-4-7-fp8-aw-tp8",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1"
         }
       ]
     },
@@ -393,7 +411,7 @@
           "prefix": "minimax-m2-5-aw-tp2",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 2 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1"
         },
         {
           "tp_size": 4,
@@ -402,7 +420,7 @@
           "prefix": "minimax-m2-5-aw-tp4",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1"
         },
         {
           "tp_size": 8,
@@ -411,7 +429,7 @@
           "prefix": "minimax-m2-5-aw-tp8",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1"
         }
       ]
     }

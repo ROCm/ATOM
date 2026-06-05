@@ -14,6 +14,7 @@ import torch
 import zmq
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.rollout.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
 from atom.utils import envs, init_exit_handler, make_zmq_socket
@@ -44,6 +45,8 @@ class EngineCoreRequestType(enum.Enum):
     STREAM = b"\x06"
     # Signal that EngineCore is fully initialized and ready
     READY = b"\x07"
+    # Response to a synchronous utility command
+    UTILITY_RESPONSE = b"\x08"
 
 
 class EngineCore:
@@ -54,6 +57,14 @@ class EngineCore:
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
+        # Queue for utility commands (processed in busy_loop to avoid thread contention)
+        self.utility_queue = queue.Queue()
+        self._has_pending_utility = (
+            False  # Flag to avoid checking empty queue every loop
+        )
+        self._is_rl_weights_offloaded = (
+            False  # True when weights are offloaded for RL training
+        )
         self.input_address = input_address
         self.output_address = output_address
         self.output_thread = threading.Thread(
@@ -84,9 +95,10 @@ class EngineCore:
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
                 config.tensor_parallel_size,
-                "atom.model_engine.model_runner.ModelRunner",
+                config.runner_qualname,
                 config,
             )
+
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
             num_blocks = block_info["num_kvcache_blocks"]
             config.per_req_cache_equiv_blocks = block_info.get(
@@ -132,6 +144,10 @@ class EngineCore:
                 world_size=config.tensor_parallel_size
             )
 
+        self.utility_handler = EngineUtilityHandler(
+            self.runner_mgr, self.output_queue, label=self.label
+        )
+
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
 
@@ -145,6 +161,9 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
+        if not hasattr(self, "runner_mgr"):
+            self._send_engine_dead()
+            return
         self.runner_mgr.keep_monitoring = False
         try:
             self.runner_mgr.call_func("exit")
@@ -181,13 +200,27 @@ class EngineCore:
             if engine is not None:
                 engine.exit()
 
+    def _is_idle_rl_weights_offloaded(self) -> bool:
+        """Check if weights are offloaded for RL training.
+
+        When offloaded, busy-wait with a short delay to avoid CPU spin.
+        Returns True if the caller should skip model execution this tick.
+        """
+        if self._is_rl_weights_offloaded:
+            time.sleep(0.01)
+            return True
+        return False
+
     def busy_loop(self):
         shutdown = False
         try:
             while True:
+                self.utility_handler.process_queue(self.utility_queue, self)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
+                if self._is_idle_rl_weights_offloaded():
+                    continue
                 if not self.scheduler.is_finished():
                     self._process_engine_step()
         finally:
@@ -331,7 +364,8 @@ class EngineCore:
                         )
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
-                        # Handle utility commands like start_profile/stop_profile
+                        # Put utility commands into queue for processing in busy_loop
+                        # This ensures all runner_mgr.call_func() calls happen in the same thread
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         if cmd == "start_profile":
@@ -340,6 +374,10 @@ class EngineCore:
                             self.stop_profiler()
                         elif cmd == "get_mtp_stats":
                             self.print_mtp_statistics()
+                        else:
+                            # Queue command for processing in busy_loop (main thread)
+                            self.utility_queue.put_nowait((cmd, reqs))
+                            self._has_pending_utility = True
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
@@ -369,6 +407,15 @@ class EngineCore:
                     obj = pickle.dumps((EngineCoreRequestType.READY, None))
                     socket.send(obj)
                     logger.debug(f"{self.label}: sent READY signal")
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
+                    # Send utility command response back to CoreManager
+                    response_data = item[1]
+                    serialized_obj = pickle.dumps(
+                        (EngineCoreRequestType.UTILITY_RESPONSE, response_data)
+                    )
+                    socket.send(serialized_obj)
                     continue
 
                 # Regular finished sequences
@@ -456,11 +503,17 @@ class DPEngineCoreProc(EngineCore):
         shutdown = False
         try:
             while True:
+                self.utility_handler.process_queue(self.utility_queue, self)
                 shutdown = shutdown or self.pull_and_process_input_queue()
-                local_unfinished = not self.scheduler.is_finished()
+                local_unfinished = (
+                    not self.scheduler.is_finished()
+                    and not self._is_rl_weights_offloaded
+                )
 
-                global_has_unfinished, global_shutdown = self._sync_dp_state(
-                    local_unfinished, shutdown
+                global_has_unfinished, global_shutdown, global_offloaded = (
+                    self._sync_dp_state(
+                        local_unfinished, shutdown, self._is_rl_weights_offloaded
+                    )
                 )
 
                 if global_shutdown and not global_has_unfinished:
@@ -468,6 +521,10 @@ class DPEngineCoreProc(EngineCore):
                         f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
                     )
                     break
+
+                if global_offloaded:
+                    time.sleep(0.01)
+                    continue
 
                 if not global_has_unfinished and not self.engines_running:
                     self.engines_running = False
@@ -494,15 +551,17 @@ class DPEngineCoreProc(EngineCore):
         self,
         local_has_unfinished: bool,
         local_shutdown: bool = False,
-    ) -> tuple[bool, bool]:
+        local_offloaded: bool = False,
+    ) -> tuple[bool, bool, bool]:
         if self._shutting_down:
-            return local_has_unfinished, True
+            return local_has_unfinished, True, local_offloaded
 
         try:
             state_tensor = torch.tensor(
                 [
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
+                    1 if local_offloaded else 0,
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -512,11 +571,12 @@ class DPEngineCoreProc(EngineCore):
             )
             global_has_unfinished = state_tensor[0].item() == 1
             global_shutdown = state_tensor[1].item() == 1
-            return global_has_unfinished, global_shutdown
+            global_offloaded = state_tensor[2].item() == 1
+            return global_has_unfinished, global_shutdown, global_offloaded
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             self._shutting_down = True
-            return local_has_unfinished, True
+            return local_has_unfinished, True, local_offloaded
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:
