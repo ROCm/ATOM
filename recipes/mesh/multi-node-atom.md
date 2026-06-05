@@ -1,13 +1,13 @@
 # Multi-Node PD Disaggregation with ATOM Native Backend
 
-Two-node Prefill-Decode disaggregation using the ATOM native inference engine and atom-mesh router. KV cache transfer via Mooncake RDMA.
+Two-node Prefill-Decode disaggregation using the ATOM native inference engine and atom-mesh router for DeepSeek-V4-Pro. KV cache transfer via Mooncake RDMA.
 
 ## Prerequisites
 
-- Two nodes with AMD MI300X / MI325X / MI355X GPUs (8 GPUs each)
+- Two nodes with AMD MI355X GPUs (8 GPUs each)
 - RDMA network connectivity between nodes (RoCE or InfiniBand)
 - Shared filesystem (NFS) mounting model weights at the same path on both nodes
-- Model: `amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4` (or any supported checkpoint)
+- Model: `DeepSeek-V4-Pro` (FP8 native weights)
 
 ## Step 1: Pull Docker Image
 
@@ -30,7 +30,6 @@ docker run -d --name atom_mesh \
     --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \
     --shm-size 128G \
     -v /mnt:/mnt \
-    -v /it-share:/it-share \
     rocm/atom-dev:latest sleep infinity
 ```
 
@@ -47,24 +46,32 @@ Find the node IP and launch:
 ```bash
 export PREFILL_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
 
-HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-PYTHONUNBUFFERED=1 \
-AITER_LOG_LEVEL=WARNING \
-ATOM_HOST_IP=${PREFILL_IP} \
-LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-} \
+# Clear stale ATOM compile cache from prior runs
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTHONUNBUFFERED=1
+export AITER_LOG_LEVEL=WARNING
+export AITER_BF16_FP8_MOE_BOUND=0
+export ATOM_MOE_GU_ITLV=1
+export ATOM_HOST_IP=${PREFILL_IP}
+export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+
 python3 -m atom.entrypoints.openai_server \
-    --model /mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 \
+    --model /mnt/models/DeepSeek-V4-Pro/ \
     --host 0.0.0.0 --server-port 8010 \
     --trust-remote-code \
     -tp 8 \
     --kv_cache_dtype fp8 \
     --block-size 16 \
+    --gpu-memory-utilization 0.85 \
     --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"'"${PREFILL_IP}"'","handshake_port":6301}' \
     2>&1 | tee /workspace/logs/prefill.log
 ```
 
 Key parameters:
 - `ATOM_HOST_IP` — must be set to the node's routable IP
+- `AITER_BF16_FP8_MOE_BOUND=0` and `ATOM_MOE_GU_ITLV=1` — required for V4-Pro MoE in PD mode
 - `--kv-transfer-config` — JSON with `kv_role: kv_producer` and Mooncake handshake port
 - `-tp 8` — TP=8 across all 8 GPUs
 
@@ -79,18 +86,24 @@ docker exec -it atom_mesh bash
 ```bash
 export DECODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
 
-HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-PYTHONUNBUFFERED=1 \
-AITER_LOG_LEVEL=WARNING \
-ATOM_HOST_IP=${DECODE_IP} \
-LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-} \
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTHONUNBUFFERED=1
+export AITER_LOG_LEVEL=WARNING
+export AITER_BF16_FP8_MOE_BOUND=0
+export ATOM_MOE_GU_ITLV=1
+export ATOM_HOST_IP=${DECODE_IP}
+export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+
 python3 -m atom.entrypoints.openai_server \
-    --model /mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 \
+    --model /mnt/models/DeepSeek-V4-Pro/ \
     --host 0.0.0.0 --server-port 8020 \
     --trust-remote-code \
     -tp 8 \
     --kv_cache_dtype fp8 \
     --block-size 16 \
+    --gpu-memory-utilization 0.85 \
     --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"'"${DECODE_IP}"'","handshake_port":6301}' \
     2>&1 | tee /workspace/logs/decode.log
 ```
@@ -140,7 +153,7 @@ Verify the full pipeline with a quick completion:
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/v1/completions \
     -H 'Content-Type: application/json' \
-    -d '{"model":"/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
+    -d '{"model":"/mnt/models/DeepSeek-V4-Pro/","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
 ```
 
 ## Step 8: Performance Benchmark
@@ -149,7 +162,7 @@ curl -sS -X POST http://127.0.0.1:8000/v1/completions \
 git clone --depth 1 https://github.com/kimbochen/bench_serving.git /tmp/bench_serving
 
 python3 /tmp/bench_serving/benchmark_serving.py \
-    --model=/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 \
+    --model=/mnt/models/DeepSeek-V4-Pro/ \
     --backend=vllm \
     --base-url=http://127.0.0.1:8000 \
     --dataset-name=random \
@@ -165,7 +178,7 @@ python3 /tmp/bench_serving/benchmark_serving.py \
     --save-result \
     --percentile-metrics='ttft,tpot,itl,e2el' \
     --result-dir=/workspace/benchmark_results \
-    --result-filename=pd-atom-mesh-8192-1024-16.json
+    --result-filename=pd-atom-v4-mesh-8192-1024-16.json
 ```
 
 The benchmark client uses `--backend=vllm` because the mesh router exposes OpenAI-compatible `/v1/completions` regardless of the upstream backend.
@@ -176,7 +189,7 @@ The benchmark client uses `--backend=vllm` because the mesh router exposes OpenA
 pip install 'lm-eval[api]'
 
 lm_eval --model local-completions \
-    --model_args "model=/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+    --model_args "model=/mnt/models/DeepSeek-V4-Pro/,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
     --tasks gsm8k \
     --num_fewshot 3
 ```
