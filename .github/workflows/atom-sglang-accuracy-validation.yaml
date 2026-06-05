@@ -369,7 +369,23 @@ jobs:
 
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
-
+            
+      - name: Print runner user and Docker diagnostics
+        run: |
+          echo "=== Docker diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+          echo "docker path: $(command -v docker || true)"
+          ls -l /var/run/docker.sock || true
+          stat -c '%U %G %a %n' /var/run/docker.sock || true
+          echo "docker version:"
+          docker version || true
+          echo "docker info:"
+          docker info || true
+          echo "=== End Docker diagnostics ==="
+        
       - name: Pull SGLANG image
         run: |
           docker pull "${SGLANG_IMAGE_TAG}"
