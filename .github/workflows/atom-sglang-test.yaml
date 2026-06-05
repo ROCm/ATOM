@@ -9,7 +9,7 @@ on:
       - 'docs/**'
       - 'atom/plugin/vllm/**'
       - '.github/workflows/atom-vllm-*.yaml'
-      - '.github/benchmark/sglang_models_accuracy.json'
+      - '.github/benchmark/oot_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
 

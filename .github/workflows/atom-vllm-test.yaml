@@ -9,7 +9,7 @@ on:
       - 'docs/**'
       - 'atom/plugin/sglang/**'
       - '.github/workflows/atom-sglang-*.yaml'
-      - '.github/benchmark/oot_models_accuracy.json'
+      - '.github/benchmark/sglang_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
 
