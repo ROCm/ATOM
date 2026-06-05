@@ -4,12 +4,14 @@ on:
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
     types: [opened, synchronize, reopened, ready_for_review, closed]
-    paths:
-      - 'atom/plugin/**'
-      - '!atom/plugin/sglang/**'
-      - 'atom/plugin/vllm/**'
-      - '.github/workflows/atom-vllm-*.yaml'
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'atom/plugin/sglang/**'
+      - '.github/workflows/atom-sglang-*.yaml'
       - '.github/benchmark/oot_models_accuracy.json'
+      - 'LICENSE'
+      - '.gitignore'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
