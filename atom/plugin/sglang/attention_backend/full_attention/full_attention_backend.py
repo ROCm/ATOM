@@ -159,6 +159,15 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         )
         self.decode_using_pa_ps = self.page_size == 1024
 
+    def _cuda_graph_mla_max_seqlen_qo(self) -> int:
+        """Largest q length used by MLA CUDA graph speculative paths."""
+        max_seqlen_qo = 1
+        if self.num_draft_tokens is not None:
+            max_seqlen_qo = max(max_seqlen_qo, self.num_draft_tokens)
+        if self.speculative_num_steps is not None:
+            max_seqlen_qo = max(max_seqlen_qo, self.speculative_num_steps + 1)
+        return max_seqlen_qo
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -744,7 +753,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         )
 
         if self.use_mla and _sglang_aiter._use_mla_ps_kernel:
-            max_seqlen_qo = 1
+            max_seqlen_qo = self._cuda_graph_mla_max_seqlen_qo()
             (
                 self.work_metadata,
                 self.work_indptr,

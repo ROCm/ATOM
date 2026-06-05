@@ -294,6 +294,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         quant_type: QuantType = QuantType.No,
         global_num_experts: int = -1,
         expert_map: torch.Tensor | None = None,
+        expert_mask: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         w1_scale: Optional[torch.Tensor] = None,
         w2_scale: Optional[torch.Tensor] = None,
@@ -346,6 +347,11 @@ class FusedMoEModularKernel(torch.nn.Module):
             if dispatch_scale is not None:
                 dispatch_scale = dispatch_scale[:total_valid_tokens]
 
+        # aiter fused_moe expects a *binary* (0/1) expert_mask in this slot, not
+        # the index-style expert_map (which carries -1 sentinels for non-local
+        # experts). Passing expert_map here makes moe_sorting mis-classify
+        # routing and compute out-of-range expert ids -> illegal memory access.
+        # See PR #887 which fixed the same bug on the non-modular path.
         # Extra, model-/method-specific kwargs (e.g. DeepSeek-V4 MXFP4 needs
         # gate_mode=INTERLEAVE + swiglu_limit) are forwarded verbatim from the
         # quant method's apply() via `moe_extra_args`.
@@ -356,7 +362,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             w2,
             dispatch_weights,
             dispatch_ids,
-            expert_map,
+            expert_mask,
             activation,
             quant_type=quant_type,
             num_local_tokens=expert_tokens_meta.expert_num_tokens,

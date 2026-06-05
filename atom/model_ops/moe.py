@@ -604,6 +604,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 quant_type=QuantType.No,
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
+                expert_mask=layer.expert_mask,
             )
         return fused_moe(
             hidden_states=x,
@@ -1148,6 +1149,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=apply_router_weight_on_input,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
+            expert_mask=layer.expert_mask,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=a1_scale,
@@ -1521,6 +1523,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 quant_type=self.quant_type,
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
+                expert_mask=layer.expert_mask,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=a1_scale,
@@ -1894,6 +1897,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_type=self.quant_type,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
+            expert_mask=layer.expert_mask,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
