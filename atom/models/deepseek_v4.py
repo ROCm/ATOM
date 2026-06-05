@@ -353,7 +353,10 @@ def _wo_a_is_bf16_on_disk(model_path):
 
         with safe_open(os.path.join(model_path, wmap[probe]), framework="pt") as h:
             w = h.get_slice(probe)
-            if w.dtype == torch.bfloat16:
+            w_dtype = (
+                w.get_dtype() if hasattr(w, "get_dtype") else getattr(w, "dtype", None)
+            )
+            if w_dtype in (torch.bfloat16, "BF16"):
                 return True  # BF16 weight; no scale needed regardless of index
             if not scale_present_in_idx:
                 return False
