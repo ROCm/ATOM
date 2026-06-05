@@ -78,7 +78,10 @@ from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
-from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.topK import (
+    is_rocm_aiter_fusion_shared_expert_enabled,
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
+)
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (
@@ -2062,9 +2065,12 @@ class MoE(nn.Module):
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
         assert args.n_shared_experts == 1
-        self._fuse_shared_into_routed = is_rocm_aiter_fusion_shared_expert_enabled(
-            shared_expert_prefix=f"{prefix}.shared_experts",
-            routed_expert_prefix=f"{prefix}.experts",
+        self._fuse_shared_into_routed = (
+            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                qc,
+                shared_expert_prefix=f"{prefix}.shared_experts",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
         )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,

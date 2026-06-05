@@ -11,14 +11,14 @@ from atom.model_ops.utils import _has_module
 from atom.utils.custom_register import direct_register_custom_op
 
 
-@torch_compile_guard()
-def is_rocm_aiter_fusion_shared_expert_enabled(
+def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+    quant_config,
     shared_expert_prefix: Optional[str] = None,
     routed_expert_prefix: Optional[str] = None,
 ) -> bool:
     config = get_current_atom_config()
-
-    quant_config = config.quant_config
+    if quant_config is None:
+        quant_config = config.quant_config
 
     dp_size = config.parallel_config.data_parallel_size
     if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
@@ -57,6 +57,19 @@ def is_rocm_aiter_fusion_shared_expert_enabled(
             break
 
     return True
+
+
+@torch_compile_guard()
+def is_rocm_aiter_fusion_shared_expert_enabled(
+    shared_expert_prefix: Optional[str] = None,
+    routed_expert_prefix: Optional[str] = None,
+) -> bool:
+    config = get_current_atom_config()
+    return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+        config.quant_config,
+        shared_expert_prefix=shared_expert_prefix,
+        routed_expert_prefix=routed_expert_prefix,
+    )
 
 
 def is_rocm_aiter_fuse_routed_scaling_factor():

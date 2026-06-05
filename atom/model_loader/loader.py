@@ -37,9 +37,10 @@ from atom.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 from atom.model_ops.base_config import QuantizeMethodBase
-from atom.model_ops.moe import (
-    FusedMoEMethodBase,
+from atom.model_ops.moe import FusedMoEMethodBase
+from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled,
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from aiter.dist.parallel_state import get_tp_group
 
@@ -309,6 +310,15 @@ def load_model(
         module_prefix = matching_name.split("shared_expert", 1)[0]
         shared_expert_prefix = layer_prefix + matching_name.rstrip(".")
         routed_expert_prefix = layer_prefix + f"{module_prefix}experts"
+        model_quant_config = getattr(getattr(model, "args", None), "quant_config", None)
+        if model_quant_config is None:
+            model_quant_config = getattr(model, "quant_config", None)
+        if model_quant_config is not None:
+            return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                model_quant_config,
+                shared_expert_prefix=shared_expert_prefix,
+                routed_expert_prefix=routed_expert_prefix,
+            )
         return is_rocm_aiter_fusion_shared_expert_enabled(
             shared_expert_prefix=shared_expert_prefix,
             routed_expert_prefix=routed_expert_prefix,
