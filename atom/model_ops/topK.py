@@ -31,7 +31,11 @@ def is_rocm_aiter_fusion_shared_expert_enabled(
             if routed_expert_prefix is not None
             else quant_config
         )
-        return shared_spec.quant_dtype == routed_spec.quant_dtype
+        return (
+            shared_spec.quant_dtype == routed_spec.quant_dtype
+            and shared_spec.quant_type == routed_spec.quant_type
+            and shared_spec.is_dynamic == routed_spec.is_dynamic
+        )
 
     # Resolve actual dtypes for shared experts vs routed experts.
     # Find a representative shared expert entry from the exclude list to
