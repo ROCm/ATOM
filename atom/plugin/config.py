@@ -5,7 +5,13 @@ from dataclasses import dataclass
 import torch
 import logging
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
+
+# vLLM does not expose a stable prefill/decode flag for MORI launch-config
+# selection, so use a plugin-scoped token-count threshold instead
+VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD = 4096
 
 
 @dataclass
@@ -116,6 +122,17 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     vllm_scheduler_config = config.scheduler_config
     vllm_cache_config = config.cache_config
     vllm_parallel_config = config.parallel_config
+    use_dp_ep = (
+        vllm_parallel_config.enable_expert_parallel
+        and vllm_parallel_config.data_parallel_size > 1
+    )
+
+    # TODO: support moe chunking in future
+    if use_dp_ep and envs.is_set("VLLM_MOE_DP_CHUNK_SIZE"):
+        logger.warning(
+            "vLLM-ATOM DP+EP ignores VLLM_MOE_DP_CHUNK_SIZE because the vLLM-ATOM path "
+            "does not currently implement MoE chunking"
+        )
 
     # here use the ATOM compilation config, as the ATOM compile policy is used
     # instead of vLLM one for torch compile, while for cuda graph capture,

@@ -42,6 +42,7 @@ from atom.model_ops.topK import (
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
+from atom.plugin.prepare import is_vllm
 from atom.model_ops.utils import (
     _has_module,
     atom_parameter,
@@ -105,12 +106,18 @@ class FusedMoEParallelConfig:
         # Otherwise, use pure DP for MoE.
         enable_dp_attention = parallel_config.enable_dp_attention
 
+        # for vllm mode, when ep is enabled, the ep rank needs to
+        # be calculated in DP * TP flatten group space
+        flatten_tp_across_dp_for_moe = enable_dp_attention or (
+            is_vllm() and parallel_config.enable_expert_parallel
+        )
+
         use_ep = dp_size_ * tp_size_ > 1 and parallel_config.enable_expert_parallel
 
         dp_size = dp_size_
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
 
-        if enable_dp_attention:
+        if flatten_tp_across_dp_for_moe:
             tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
         else:
             tp_size = tp_size_
@@ -388,6 +395,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # )
             # mori_dtype = torch.bfloat16
 
+            if is_vllm():
+                max_num_tokens_per_dp_rank = moe.max_num_tokens
+            else:
+                max_num_tokens_per_dp_rank = 16384
+
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
@@ -398,7 +410,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=16384,
+                max_num_tokens_per_dp_rank=max_num_tokens_per_dp_rank,
                 # input_dtype=moe.in_dtype,
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
@@ -1031,8 +1043,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
                 n_expts_act = topk_weights.shape[1]
 
-                # Convert to triton routing data structures
-                if expert_map is not None:
+                # Convert to triton routing data structures.
+                # The expert_map arg carries the 0/1 expert_mask, but triton routing
+                # remap needs the global-to-local int index map (-1 for non-local)
+                ep_expert_map = layer.expert_map
+                if ep_expert_map is not None:
                     # local_num_experts already includes fused shared experts
                     # (added at FusedMoE.__init__ line ~2056).
                     n_expts_tot = layer.local_num_experts
@@ -1043,7 +1058,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
                 routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
-                    topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+                    topk_weights, topk_ids, n_expts_tot, expert_map=ep_expert_map
                 )
 
                 output = torch.empty_like(x)
@@ -1064,7 +1079,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
-                    expert_map=expert_map,
+                    expert_map=ep_expert_map,
                 )
                 return _moe_result
 
@@ -1084,7 +1099,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_precision_config=self.w2_precision_config,
                 w1_bias=layer.w13_bias,
                 w2_bias=layer.w2_bias,
-                expert_map=expert_map,
+                expert_map=layer.expert_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
             )
@@ -3094,7 +3109,10 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            expert_map=self.expert_map,
+            # Non-triton routing consume 0/1 expert_masks indexed by global
+            # expert id. For triton routing that needs index map, read the
+            # layer.expert_map directly in Mxfp4MoEMethod.apply.
+            expert_map=self.expert_mask,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
@@ -3152,7 +3170,10 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            expert_map=self.expert_map,
+            # Non-triton routing consume 0/1 expert_masks indexed by global
+            # expert id. For triton routing that needs index map, read the
+            # layer.expert_map directly in Mxfp4MoEMethod.apply.
+            expert_map=self.expert_mask,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
