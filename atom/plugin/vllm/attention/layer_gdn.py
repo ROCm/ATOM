@@ -297,7 +297,10 @@ class GatedDeltaNet(nn.Module):
         internally under `@tensor_cache`, avoiding a per-call D2H sync.
         """
         # from aiter.ops.flydsl.linear_attention_prefill_kernels import flydsl_gdr_prefill
-        from aiter.ops.triton.gated_delta_net.gated_delta_rule import chunk_gated_delta_rule_opt_vk
+        from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
+            chunk_gated_delta_rule_opt_vk,
+        )
+
         initial_state = ssm_state[non_spec_state_indices].contiguous()
         initial_state[~has_initial_state, ...] = 0
         core_attn_out, last_recurrent_state = chunk_gated_delta_rule_opt_vk(
