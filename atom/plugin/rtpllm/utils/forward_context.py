@@ -112,7 +112,7 @@ if triton is not None:
 
 @dataclass(frozen=True)
 class RTPForwardContext:
-    gdn_metadata: GDNAttentionMetadata
+    gdn_metadata: GDNAttentionMetadata | None
     attn_metadata: AttentionMetaData
     rtp_attn_inputs: Any
     rtp_seq_size_per_block: int
@@ -1235,7 +1235,6 @@ class RTPForwardContext:
         plugin_md.topk_tokens = 0
         plugin_md.sparse_block_size = int(seq_size_per_block)
         plugin_md.cg_bufs = cg_bufs
-        plugin_md.positions = positions
         cu_seqlen_ks = None
         cu_seqlen_ke = None
         if is_prefill:
@@ -1531,6 +1530,8 @@ class RTPForwardContext:
         if kernel_seq_size_per_block <= 0:
             kernel_seq_size_per_block = int(seq_size_per_block)
         state_indices_cache: Dict[tuple[int, bool], torch.Tensor] = {}
+        resolved_layer_maps = layer_maps or cls.collect_layer_maps(model)
+        gdn_layer_map, _, _ = resolved_layer_maps
         layer_group_map_signature = cls._layer_group_map_signature(attn_inputs)
         layer_group_map = getattr(runtime, "_rtp_layer_group_map", None)
         cached_layer_group_map_signature = getattr(
@@ -1543,19 +1544,21 @@ class RTPForwardContext:
             layer_group_map = cls._build_layer_group_map(attn_inputs)
             runtime._rtp_layer_group_map = layer_group_map
             runtime._rtp_layer_group_map_signature = layer_group_map_signature
-        gdn_metadata = cls._build_gdn_metadata(
-            attn_inputs,
-            seq_size_per_block=seq_size_per_block,
-            num_tokens=int(positions.numel()),
-            state_indices_cache=state_indices_cache,
-            layer_group_map=layer_group_map,
-        )
-        # Keep raw RTP attention inputs in metadata so GDN can resolve per-layer
-        # block-map/state-index semantics (same idea as RTP's select_block_map_for_layer).
-        gdn_metadata.rtp_attn_inputs = attn_inputs
-        gdn_metadata.rtp_seq_size_per_block = int(seq_size_per_block)
-        gdn_metadata.rtp_state_indices_cache = state_indices_cache
-        gdn_metadata.rtp_layer_group_map = layer_group_map
+        gdn_metadata = None
+        if gdn_layer_map:
+            gdn_metadata = cls._build_gdn_metadata(
+                attn_inputs,
+                seq_size_per_block=seq_size_per_block,
+                num_tokens=int(positions.numel()),
+                state_indices_cache=state_indices_cache,
+                layer_group_map=layer_group_map,
+            )
+            # Keep raw RTP attention inputs in metadata so GDN can resolve per-layer
+            # block-map/state-index semantics (same idea as RTP's select_block_map_for_layer).
+            gdn_metadata.rtp_attn_inputs = attn_inputs
+            gdn_metadata.rtp_seq_size_per_block = int(seq_size_per_block)
+            gdn_metadata.rtp_state_indices_cache = state_indices_cache
+            gdn_metadata.rtp_layer_group_map = layer_group_map
         attn_metadata = cls._build_plugin_attention_metadata(
             attn_inputs=attn_inputs,
             positions=positions,
@@ -1564,7 +1567,6 @@ class RTPForwardContext:
             cg_max_seq_len=int(cg_max_seq_len),
             cg_bufs=cg_bufs,
         )
-        resolved_layer_maps = layer_maps or cls.collect_layer_maps(model)
         kv_cache_signature = cls._kv_cache_signature(
             runtime=runtime,
             layer_maps=resolved_layer_maps,

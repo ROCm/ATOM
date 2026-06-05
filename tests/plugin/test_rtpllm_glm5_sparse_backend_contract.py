@@ -590,6 +590,7 @@ def test_real_sparse_decode_uses_atom_aiter_metadata(monkeypatch):
 def test_real_sparse_decode_rejects_oob_paged_kv_indices(monkeypatch):
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
     decode_called = {"value": False}
+    monkeypatch.setenv("ATOM_RTP_GLM5_SPARSE_VALIDATE", "1")
 
     fake_mla = type(sys)("aiter.mla")
 

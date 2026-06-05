@@ -100,6 +100,13 @@ class _RealSparseMlaImpl:
         self._cache_write_scale: dict[torch.device, torch.Tensor] = {}
         self._cg_sparse_bufs: dict[str, torch.Tensor] | None = None
         self._cg_workspace_signature: tuple[Any, ...] | None = None
+        self._sparse_page_size = self._resolve_sparse_page_size()
+        self._enable_debug_safe_path = (
+            os.getenv("ATOM_RTP_GLM5_SPARSE_DEBUG_SAFE", "0") == "1"
+        )
+        self._enable_sparse_validate = (
+            os.getenv("ATOM_RTP_GLM5_SPARSE_VALIDATE", "0") == "1"
+        )
 
     @staticmethod
     def _resolve_sparse_page_size() -> int:
@@ -531,47 +538,6 @@ class _RealSparseMlaImpl:
         )
 
     @staticmethod
-    def _decode_indptr(
-        *,
-        num_tokens: int,
-        topk: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        qo_indptr = torch.arange(num_tokens + 1, device=device, dtype=torch.int32)
-        paged_kv_indptr = torch.arange(
-            num_tokens + 1, device=device, dtype=torch.int32
-        ) * int(topk)
-        paged_kv_last_page_len = torch.ones(
-            (num_tokens,), device=device, dtype=torch.int32
-        )
-        return qo_indptr, paged_kv_indptr, paged_kv_last_page_len
-
-    @staticmethod
-    def _generate_sparse_seqlen_torch(
-        *,
-        query_lens: torch.Tensor,
-        seq_lens: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        topk: int,
-        num_tokens: int,
-    ) -> torch.Tensor:
-        out = torch.zeros((num_tokens,), dtype=torch.int32, device=query_lens.device)
-        for req_id in range(int(query_lens.numel())):
-            q_len = int(query_lens[req_id].item())
-            seq_len = int(seq_lens[req_id].item())
-            start = int(query_start_loc[req_id].item())
-            if q_len <= 0 or seq_len <= 0:
-                continue
-            context_start = seq_len - q_len
-            offsets = torch.arange(q_len, device=query_lens.device, dtype=torch.int32)
-            out[start : start + q_len] = torch.clamp(
-                context_start + offsets + 1,
-                min=0,
-                max=int(topk),
-            )
-        return out
-
-    @staticmethod
     def _aiter_dtype_for_tensor(tensor: torch.Tensor) -> Any:
         try:
             from aiter import dtypes
@@ -945,10 +911,9 @@ class _RealSparseMlaImpl:
                 f"GLM5 RTP sparse MLA requires positive block_size, got {block_size}."
             )
 
-        if not in_capture and topk >= 2048:
-            # Debug-safe path for long-context GLM5: avoid Triton req->global
-            # conversion kernel first, because if this step writes invalid data it
-            # can hard-crash GPU before Python can surface an exception.
+        if not in_capture and self._enable_debug_safe_path and topk >= 2048:
+            # Keep a debug-safe fallback for field diagnostics. This path is slower
+            # than Triton and should stay disabled in normal serving.
             global_topk = self._convert_topk_to_global(
                 topk_indices=topk_indices_i32,
                 attn_metadata=attn_metadata,
@@ -994,12 +959,8 @@ class _RealSparseMlaImpl:
             reduce_final_map = sparse_bufs["reduce_final_map"]
             reduce_partial_map = sparse_bufs["reduce_partial_map"]
         else:
-            used_sparse_entries = (
-                int(paged_kv_indptr[-1].item()) if int(num_tokens) > 0 else 0
-            )
-            metadata_budget_tokens = max(
-                self._metadata_token_budget(num_tokens=num_tokens, topk=topk),
-                used_sparse_entries,
+            metadata_budget_tokens = self._metadata_token_budget(
+                num_tokens=num_tokens, topk=topk
             )
             (
                 (work_meta_data_size, work_meta_data_type),
@@ -1035,7 +996,7 @@ class _RealSparseMlaImpl:
             reduce_partial_map = torch.empty(
                 reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
             )
-        requested_page_size = self._resolve_sparse_page_size()
+        requested_page_size = self._sparse_page_size
         kv_token_slots = self._kv_token_slot_capacity(kv_cache_base)
         page_size = requested_page_size
         if (
@@ -1072,7 +1033,7 @@ class _RealSparseMlaImpl:
             # the current kv slot range to avoid kernel-side OOB accesses.
             paged_kv_indices.clamp_(min=0, max=max(int(max_page_slots) - 1, 0))
 
-        if not in_capture:
+        if not in_capture and self._enable_sparse_validate:
             self._validate_sparse_index_contract(
                 paged_kv_indptr=paged_kv_indptr,
                 paged_kv_indices=paged_kv_indices,
@@ -1211,7 +1172,11 @@ class _RealSparseMlaImpl:
                     )
                     kv_cache_base = torch.cat((kv_cache_base, pad), dim=0)
                 kv_buffer = kv_cache_base.reshape(-1, page_size, 1, latent_dim)
-            if not in_capture and int(sparse_meta.paged_kv_indices.numel()) > 0:
+            if (
+                not in_capture
+                and self._enable_sparse_validate
+                and int(sparse_meta.paged_kv_indices.numel()) > 0
+            ):
                 self._validate_sparse_index_contract(
                     paged_kv_indptr=sparse_meta.paged_kv_indptr,
                     paged_kv_indices=sparse_meta.paged_kv_indices,
@@ -1399,6 +1364,12 @@ class RTPSparseMlaBackend:
         else:
             self.sparse_impl = _ContractSparseMlaImpl(self.v_head_dim)
             self._default_mock = True
+        self._sparse_impl_accepts_positions = self._impl_accepts_positions(
+            self.sparse_impl
+        )
+        self._dense_forward_accepts_positions = self._call_accepts_positions(
+            getattr(self.dense_backend, "forward", None)
+        )
 
     def prepare_cuda_graph(self, attn_inputs) -> None:  # noqa: ANN001
         del attn_inputs
@@ -1487,7 +1458,7 @@ class RTPSparseMlaBackend:
         positions: Optional[torch.Tensor],
     ) -> torch.Tensor:
         kwargs = {"topk_indices": topk_indices}
-        if self._call_accepts_positions(self.dense_backend.forward):
+        if self._dense_forward_accepts_positions:
             kwargs["positions"] = positions
         return self.dense_backend.forward(
             q,
@@ -1538,7 +1509,7 @@ class RTPSparseMlaBackend:
             "topk_indices": topk_indices,
             "attn_metadata": attn_metadata,
         }
-        if self._impl_accepts_positions(self.sparse_impl):
+        if self._sparse_impl_accepts_positions:
             kwargs["positions"] = positions
         try:
             return self.sparse_impl.forward(

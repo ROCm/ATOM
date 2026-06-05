@@ -23,7 +23,9 @@ def _resolve_index_topk(attn) -> int:
 
 def _get_topk_indices_buffer(attn) -> torch.Tensor:
     indexer = getattr(attn, "indexer", None)
-    buffer = getattr(indexer, "topk_indices_buffer", None) if indexer is not None else None
+    buffer = (
+        getattr(indexer, "topk_indices_buffer", None) if indexer is not None else None
+    )
     if buffer is None:
         buffer = getattr(attn, "topk_indices_buffer", None)
     if buffer is None:
@@ -110,6 +112,11 @@ class RTPMLAAttention:
             self.dense_backend = None
         self.kv_cache = kwargs.get("kv_cache")
         self.layer_id = int(kwargs.get("layer_id", kwargs.get("layer_num", 0)))
+        self._dense_backend_accepts_positions = (
+            self._backend_accepts_positions(self.dense_backend)
+            if self.dense_backend is not None
+            else False
+        )
 
     @staticmethod
     def _backend_accepts_positions(backend: object) -> bool:
@@ -134,7 +141,9 @@ class RTPMLAAttention:
         if q.ndim == 3:
             return q, True
 
-        num_heads = self.num_local_heads if self.num_local_heads is not None else self.num_heads
+        num_heads = (
+            self.num_local_heads if self.num_local_heads is not None else self.num_heads
+        )
         if num_heads is None:
             if self.qk_head_dim is None:
                 raise AttributeError("GLM5 RTP MLA native contract requires num_heads")
@@ -182,7 +191,7 @@ class RTPMLAAttention:
             kwargs.get("topk_indices", topk_indices),
         )
         forward_kwargs = {"topk_indices": topk_indices}
-        if self._backend_accepts_positions(self.dense_backend):
+        if self._dense_backend_accepts_positions:
             forward_kwargs["positions"] = positions
         attn_output = self.dense_backend.forward(
             q,
@@ -207,4 +216,3 @@ def apply_attention_mla_rtpllm_patch() -> None:
 
     ops.RTPMLAAttention = RTPMLAAttention
     ops.Attention = RTPMLAAttention
-
