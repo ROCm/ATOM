@@ -796,6 +796,40 @@ class ParallelConfig:
         # self.data_parallel_master_port = get_open_port()
 
 
+def _normalize_moe_config_fields(
+    hf_config: PretrainedConfig,
+    model_path: Optional[str] = None,
+) -> None:
+    """Normalize common MoE config field names across model families."""
+    moe_config = getattr(hf_config, "text_config", hf_config)
+    updates: dict[str, Any] = {}
+
+    n_routed = getattr(
+        moe_config,
+        "n_routed_experts",
+        getattr(moe_config, "num_experts", None),
+    )
+    if n_routed is not None:
+        updates["n_routed_experts"] = n_routed
+
+    existing_n_shared = getattr(moe_config, "n_shared_experts", None)
+    if existing_n_shared is not None:
+        updates["n_shared_experts"] = existing_n_shared
+    elif n_routed is not None and model_path is not None:
+        from atom.models.utils import ckpt_shared_expert_count
+
+        n_shared = ckpt_shared_expert_count(model_path)
+        if n_shared > 0:
+            updates["n_shared_experts"] = n_shared
+
+    if not updates:
+        return
+
+    moe_config.update(updates)
+    if moe_config is not hf_config:
+        hf_config.update(updates)
+
+
 @dataclass
 class SpeculativeConfig:
     method: Optional[str] = ""
@@ -889,34 +923,6 @@ class SpeculativeConfig:
                 "num_nextn_predict_layers": n_predict,
                 "architectures": [arch],
             }
-            # Naming differs across families:
-            #   DeepSeek / GLM       → already have `n_routed_experts`
-            #   Qwen3.5 / Qwen3-Next → only carry `num_experts`
-            #   non-MoE / unknown    → leave unset (no MoE = no field)
-            n_routed = getattr(
-                hf_config,
-                "n_routed_experts",
-                getattr(hf_config, "num_experts", None),
-            )
-            if n_routed is not None:
-                updates["n_routed_experts"] = n_routed
-            # n_shared_experts: prefer the field's own value if it exists
-            # (DeepSeek / GLM ship it natively); else scan the checkpoint
-            # for `shared_expert` weights and use the parsed count (1 for
-            # the flat-block layout every released model uses). Leaving
-            # the field unset for ckpts without shared experts avoids
-            # fabricating a phantom shared block (e.g. R1 MTP eh_proj
-            # would otherwise pull a stale BF16 weight_scale).
-            existing_n_shared = getattr(hf_config, "n_shared_experts", None)
-            if existing_n_shared is not None:
-                updates["n_shared_experts"] = existing_n_shared
-            else:
-                from atom.models.utils import ckpt_shared_expert_count
-
-                n_shared = ckpt_shared_expert_count(model_path)
-                if n_shared > 0:
-                    updates["n_shared_experts"] = n_shared
-
             hf_config.update(updates)
 
         # MiMo-V2 has not MTP related information in HF config.json,
@@ -931,6 +937,7 @@ class SpeculativeConfig:
                 }
             )
 
+        _normalize_moe_config_fields(hf_config, model_path)
         logger.info(f"hf config is: {hf_config}")
 
     def __repr__(self) -> str:
@@ -1042,6 +1049,7 @@ class Config:
         )
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
+        _normalize_moe_config_fields(self.hf_config, self.model)
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:

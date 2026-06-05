@@ -304,20 +304,11 @@ def load_model(
                 return maybe_matching_name
         return None
 
-    is_deepseek = any(
-        "deepseek" in str(architecture).lower()
-        for architecture in getattr(hf_config, "architectures", []) or []
-    )
-
     def should_fuse_shared_expert_weight(name: str, matching_name: str) -> bool:
-        if not is_deepseek:
-            return is_rocm_aiter_fusion_shared_expert_enabled()
-        # Added specifically to support shared expert fusion for
-        # DeepSeek-R1-0528-MXFP4-v2, whose shared/routed dtypes can differ
-        # by layer. Keep other models on the legacy global remap gate.
         layer_prefix = name.split(matching_name, 1)[0]
+        module_prefix = matching_name.split("shared_expert", 1)[0]
         shared_expert_prefix = layer_prefix + matching_name.rstrip(".")
-        routed_expert_prefix = layer_prefix + "mlp.experts"
+        routed_expert_prefix = layer_prefix + f"{module_prefix}experts"
         return is_rocm_aiter_fusion_shared_expert_enabled(
             shared_expert_prefix=shared_expert_prefix,
             routed_expert_prefix=routed_expert_prefix,

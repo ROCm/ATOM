@@ -2062,24 +2062,9 @@ class MoE(nn.Module):
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
         assert args.n_shared_experts == 1
-        # aiter can fuse shared expert into the routed FusedMoE kernel ONLY
-        # when shared and routed have the same quant dtype.
-        # `is_rocm_aiter_fusion_shared_expert_enabled` compares shared vs
-        # GLOBAL (=base dtype), but V4-Pro has routed=FP4 (per-layer override
-        # for `.ffn.experts`) and shared=FP8 (=global). The function returns
-        # True for V4 because shared matches global, missing the routed-shared
-        # mismatch. Direct comparison: get routed and shared specs and compare.
-        routed_spec = qc.get_layer_quant_config(f"{prefix}.experts")
-        shared_spec = qc.get_layer_quant_config(f"{prefix}.shared_experts")
-        routed_dtype = routed_spec.quant_dtype
-        shared_dtype = shared_spec.quant_dtype
-        # Fuse shared expert into the routed MoE kernel whenever physically
-        # possible. Falls back to a standalone Expert module only when fusion is
-        # infeasible: routed/shared quant dtypes differ (V4-Pro: FP4 routed vs
-        # FP8 shared) or aiter fusion is unavailable (e.g. DP + mori all2all).
-        self._fuse_shared_into_routed = (
-            routed_dtype == shared_dtype
-            and is_rocm_aiter_fusion_shared_expert_enabled()
+        self._fuse_shared_into_routed = is_rocm_aiter_fusion_shared_expert_enabled(
+            shared_expert_prefix=f"{prefix}.shared_experts",
+            routed_expert_prefix=f"{prefix}.experts",
         )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
@@ -2100,6 +2085,7 @@ class MoE(nn.Module):
             scoring_func=args.score_func,  # "sqrtsoftplus"
             e_score_correction_bias=getattr(self.gate, "e_score_correction_bias", None),
             config=moe_cfg,
+            shared_expert_prefix=f"{prefix}.shared_experts",
         )
         self.experts.swiglu_limit = args.swiglu_limit
 
