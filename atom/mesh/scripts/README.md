@@ -1,6 +1,6 @@
-# ATOM Mesh PD Disaggregation Scripts
+# Atomesh PD Disaggregation Scripts
 
-End-to-end guide for building, deploying, and benchmarking the ATOM Mesh prefill-decode (PD) disaggregation setup.
+End-to-end guide for building, deploying, and benchmarking the Atomesh prefill-decode (PD) disaggregation setup.
 
 ## Prerequisites
 
@@ -90,7 +90,7 @@ The script waits for both prefill and decode servers to be ready before starting
 | `DECODE_PORT` | `8020` | Decode server port |
 | `ROUTER_PORT` | `8000` | Router listening port |
 | `POLICY` | `random` | Routing policy |
-| `MESH_BIN` | `/usr/local/bin/atom-mesh` | Path to atom-mesh binary |
+| `MESH_BIN` | `/usr/local/bin/atomesh` | Path to atomesh binary |
 | `WAIT_TIMEOUT` | `900` | Timeout waiting for prefill/decode (seconds) |
 
 ## 5. Verify
@@ -202,7 +202,7 @@ SBATCH directives (edit in script if your cluster differs):
 └── <MMDD>_ds_fp8_1p_tp4_1d_tp8_<jobid>/
     ├── prefill/prefill.log               # sglang prefill server
     ├── decode/decode.log                 # sglang decode server
-    ├── router/                           # atom-mesh router
+    ├── router/                           # atomesh router
     ├── gsm8k/<timestamp>_gsm8k/          # lm_eval GSM8K results (if enabled)
     ├── bench/pd-mesh-<isl>-<osl>-<conc>-<ratio>.json
     └── scripts/                          # generated in-container scripts

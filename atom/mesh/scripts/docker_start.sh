@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start the atom-mesh Docker container.
+# Start the atomesh Docker container.
 #
 # Optional env (with defaults):
 #   CONTAINER=atom_sglang_mesh

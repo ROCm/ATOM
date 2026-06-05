@@ -54,11 +54,11 @@ print_summary() {
 
 TEST_COMMANDS=(
     # Metrics subsystem unit tests.
-    "cargo test -p atom-mesh --lib observability::metrics"
+    "cargo test -p atomesh --lib observability::metrics"
     # Worker /engine_metrics aggregation integration tests.
-    "cargo test -p atom-mesh --test metrics_aggregator_test -- --nocapture"
+    "cargo test -p atomesh --test metrics_aggregator_test -- --nocapture"
     # End-to-end Atomesh harness API test.
-    "cargo test -p atom-mesh --test api_tests -- --nocapture --test-threads=1"
+    "cargo test -p atomesh --test api_tests -- --nocapture --test-threads=1"
 )
 
 for test_command in "${TEST_COMMANDS[@]}"; do

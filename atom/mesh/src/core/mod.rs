@@ -1,4 +1,4 @@
-//! Core abstractions for ATOM Mesh
+//! Core abstractions for Atomesh
 //!
 //! This module contains the fundamental types and traits used throughout the router:
 //! - Worker trait and implementations

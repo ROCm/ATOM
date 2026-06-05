@@ -1,4 +1,4 @@
-"""Python entrypoint for running ATOM Mesh with a Python-owned engine.
+"""Python entrypoint for running Atomesh with a Python-owned engine.
 
 This module intentionally mirrors the engine/tokenizer initialization used by
 ``atom.entrypoints.openai.api_server``. The Rust side receives the already
@@ -77,7 +77,7 @@ def print_version(verbose: bool = False) -> None:
         )
         print(version_fn())
     except Exception:
-        print("ATOM Mesh Python interface")
+        print("Atomesh Python interface")
 
 
 def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
@@ -151,7 +151,7 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
     from atom.model_engine.arg_utils import EngineArgs
 
     parser = argparse.ArgumentParser(
-        description="ATOM Mesh Python interface",
+        description="Atomesh Python interface",
         allow_abbrev=False,
     )
     EngineArgs.add_cli_args(parser)

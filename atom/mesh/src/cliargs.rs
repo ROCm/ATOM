@@ -148,14 +148,14 @@ impl std::str::FromStr for Backend {
 
 #[derive(Parser, Debug)]
 #[command(name = "mesh")]
-#[command(about = "ATOM Mesh - High-performance inference gateway")]
+#[command(about = "Atomesh - High-performance inference gateway")]
 #[command(args_conflicts_with_subcommands = true)]
 #[command(long_about = r#"
-ATOM Mesh - Rust-based inference gateway
+Atomesh - Rust-based inference gateway
 
 Usage:
   mesh launch [OPTIONS]       Launch router (short command)
-  atom-mesh launch [OPTIONS]  Launch router (full name)
+  atomesh launch [OPTIONS]  Launch router (full name)
 
 Examples:
   # Regular mode

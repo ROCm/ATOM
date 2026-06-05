@@ -45,7 +45,7 @@ MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
 CUDA_GRAPH_BS_START="${CUDA_GRAPH_BS_START:-1}"
 CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-64}"
 IB_DEVICE="${IB_DEVICE:-rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7}"
-MESH_BIN="${MESH_BIN:-/usr/local/bin/atom-mesh}"
+MESH_BIN="${MESH_BIN:-/usr/local/bin/atomesh}"
 
 ISL_LIST="${ISL_LIST:-8192}"
 OSL="${OSL:-1024}"
@@ -90,7 +90,7 @@ fi
 
 # ======================== pre-cleanup ========================
 # Force-stop ALL running docker containers on both nodes before starting fresh.
-# This ensures no residual sglang/atom-mesh processes are holding GPU memory
+# This ensures no residual sglang/atomesh processes are holding GPU memory
 # or ports from previous runs (e.g. when `scancel` killed the sbatch shell
 # without propagating into the containers).
 echo "=== pre-cleanup: force-stopping all docker containers on both nodes ==="
@@ -445,7 +445,7 @@ cleanup() {
             docker rm -f '${CONTAINER}' >/dev/null 2>&1 || true
             # Belt-and-suspenders: kill any orphaned GPU processes from this run
             pkill -9 -f 'sglang.launch_server' 2>/dev/null || true
-            pkill -9 -f 'atom-mesh' 2>/dev/null || true
+            pkill -9 -f 'atomesh' 2>/dev/null || true
         " &
     done
     # Wait for both cleanup sruns (with a timeout)

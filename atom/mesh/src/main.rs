@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => cli.router_args,
     };
 
-    println!("ATOM Mesh starting...");
+    println!("Atomesh starting...");
     println!("Host: {}:{}", cli_args.host, cli_args.port);
     let mode_str = if cli_args.pd_disaggregation {
         "PD Disaggregated".to_string()

@@ -39,7 +39,7 @@ Workers bind to `base-port + worker_index`. For example, `--base-port 30010 --wo
 Start Atomesh and point it at the virtual worker URL:
 
 ```bash
-cd ATOM/atom/mesh && ./target/debug/atom-mesh \
+cd ATOM/atom/mesh && ./target/debug/atomesh \
   --host 127.0.0.1 \
   --port 30000 \
   --worker http://127.0.0.1:30010

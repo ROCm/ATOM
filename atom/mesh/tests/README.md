@@ -93,22 +93,22 @@ Contract tests that verify serialization/deserialization behavior of protocol ty
 
 ```bash
 # Run all mesh tests
-cargo test -p atom-mesh
+cargo test -p atomesh
 
 # Run local quick checks used during harness development
-cargo test -p atom-mesh --lib
-cargo test -p atom-mesh --test spec_test
+cargo test -p atomesh --lib
+cargo test -p atomesh --test spec_test
 
 # Run a specific test module
-cargo test -p atom-mesh --test api_tests
-cargo test -p atom-mesh --test routing_tests
-cargo test -p atom-mesh --test reliability_tests
-cargo test -p atom-mesh --test security_tests
-cargo test -p atom-mesh --test spec_test
+cargo test -p atomesh --test api_tests
+cargo test -p atomesh --test routing_tests
+cargo test -p atomesh --test reliability_tests
+cargo test -p atomesh --test security_tests
+cargo test -p atomesh --test spec_test
 
 # Run a specific test by name
-cargo test -p atom-mesh test_list_workers
+cargo test -p atomesh test_list_workers
 
 # Run with output
-cargo test -p atom-mesh -- --nocapture
+cargo test -p atomesh -- --nocapture
 ```

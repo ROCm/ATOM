@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Launch the atom-mesh router. Run this script inside the container.
+# Launch the atomesh router. Run this script inside the container.
 #
 # Required env:
 #   PREFILL_IP      - prefill node IP
@@ -10,7 +10,7 @@ set -euo pipefail
 # Optional env (with defaults):
 #   PREFILL_PORT=8010  DECODE_PORT=8020  ROUTER_PORT=8000
 #   BOOTSTRAP_PORT=8998  POLICY=random
-#   MESH_BIN=/usr/local/bin/atom-mesh  WAIT_TIMEOUT=900
+#   MESH_BIN=/usr/local/bin/atomesh  WAIT_TIMEOUT=900
 
 : "${PREFILL_IP:?}"
 : "${DECODE_IP:?}"
@@ -20,7 +20,7 @@ DECODE_PORT="${DECODE_PORT:-8020}"
 ROUTER_PORT="${ROUTER_PORT:-8000}"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 POLICY="${POLICY:-random}"
-MESH_BIN="${MESH_BIN:-/usr/local/bin/atom-mesh}"
+MESH_BIN="${MESH_BIN:-/usr/local/bin/atomesh}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
 
 echo "[router] prefill=${PREFILL_IP}:${PREFILL_PORT} decode=${DECODE_IP}:${DECODE_PORT} router=0.0.0.0:${ROUTER_PORT}"

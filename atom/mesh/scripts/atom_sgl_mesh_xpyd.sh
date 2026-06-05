@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Launch ATOM Mesh SGLang PD disaggregation on a single node.
+# Launch Atomesh SGLang PD disaggregation on a single node.
 #
 # Required env:
 #   MODEL_PATH      - model path
@@ -18,7 +18,7 @@ set -euo pipefail
 #   DECODE_BOOTSTRAP_BASE=9098
 #
 # Optional serving env:
-#   ROUTER_PORT=8000  POLICY=random  MESH_BIN=/usr/local/bin/atom-mesh
+#   ROUTER_PORT=8000  POLICY=random  MESH_BIN=/usr/local/bin/atomesh
 #   MEM_FRACTION=0.85  KV_CACHE_DTYPE=fp8_e4m3
 #   MAX_RUNNING_REQUESTS=128
 #   CUDA_GRAPH_BS_START=1  CUDA_GRAPH_BS_END=64
@@ -64,7 +64,7 @@ CUDA_GRAPH_BS_START="${CUDA_GRAPH_BS_START:-1}"
 CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-64}"
 IB_DEVICE="${IB_DEVICE:-$(detect_ib_devices)}"
 POLICY="${POLICY:-random}"
-MESH_BIN="${MESH_BIN:-/usr/local/bin/atom-mesh}"
+MESH_BIN="${MESH_BIN:-/usr/local/bin/atomesh}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
 LOG_DIR="${LOG_DIR:-/workspace/logs}"
 CLEANUP_EXISTING="${CLEANUP_EXISTING:-0}"
@@ -316,7 +316,7 @@ main() {
     mkdir -p "${LOG_DIR}"
 
     if [[ "${CLEANUP_EXISTING}" == "1" ]]; then
-        echo "[cleanup] stopping existing sglang and atom-mesh processes"
+        echo "[cleanup] stopping existing sglang and atomesh processes"
         pkill -f 'python3 -m sglang.launch_server' || true
         pkill -f "${MESH_BIN} launch" || true
         sleep 3

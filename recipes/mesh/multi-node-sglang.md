@@ -1,6 +1,6 @@
 # Multi-Node PD Disaggregation with SGLang Backend
 
-Two-node Prefill-Decode disaggregation using the SGLang-ATOM backend and atom-mesh router. KV cache transfer via Mooncake RDMA.
+Two-node Prefill-Decode disaggregation using the SGLang-ATOM backend and atomesh router. KV cache transfer via Mooncake RDMA.
 
 ## Prerequisites
 
@@ -22,7 +22,7 @@ docker pull rocm/atom-dev:sglang-latest
 On **each node**, start a container:
 
 ```bash
-docker run -d --name atom_mesh \
+docker run -d --name atomesh \
     --network host --ipc host --privileged \
     --device /dev/kfd --device /dev/dri \
     --group-add video \
@@ -39,7 +39,7 @@ docker run -d --name atom_mesh \
 Enter the container on the prefill node:
 
 ```bash
-docker exec -it atom_mesh bash
+docker exec -it atomesh bash
 ```
 
 Find the node IP and launch:
@@ -88,7 +88,7 @@ Key parameters:
 Enter the container on the decode node:
 
 ```bash
-docker exec -it atom_mesh bash
+docker exec -it atomesh bash
 ```
 
 ```bash
@@ -139,7 +139,7 @@ Wait for both gRPC servers to become healthy, then launch the router:
 ```bash
 export HF_HUB_CACHE=/mnt/hf_hub_cache
 
-atom-mesh launch \
+atomesh launch \
     --host 0.0.0.0 --port 8000 \
     --pd-disaggregation \
     --prefill "grpc://${PREFILL_IP}:8010" 8998 \

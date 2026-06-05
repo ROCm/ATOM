@@ -1,6 +1,6 @@
 # Multi-Node PD Disaggregation with vLLM Backend
 
-Two-node Prefill-Decode disaggregation using the vLLM backend with MooncakeConnector and atom-mesh router.
+Two-node Prefill-Decode disaggregation using the vLLM backend with MooncakeConnector and atomesh router.
 
 ## Prerequisites
 
@@ -22,7 +22,7 @@ docker pull rocm/atom-dev:vllm-latest
 On **each node**, start a container:
 
 ```bash
-docker run -d --name atom_mesh \
+docker run -d --name atomesh \
     --network host --ipc host --privileged \
     --device /dev/kfd --device /dev/dri \
     --group-add video \
@@ -39,7 +39,7 @@ docker run -d --name atom_mesh \
 Enter the container on the prefill node:
 
 ```bash
-docker exec -it atom_mesh bash
+docker exec -it atomesh bash
 ```
 
 ```bash
@@ -79,7 +79,7 @@ For eager mode (debugging), replace the `--async-scheduling --compilation-config
 Enter the container on the decode node:
 
 ```bash
-docker exec -it atom_mesh bash
+docker exec -it atomesh bash
 ```
 
 ```bash
@@ -115,7 +115,7 @@ Key differences from prefill:
 Wait for both servers to report ready (`/v1/models` returns 200), then launch the router:
 
 ```bash
-atom-mesh launch \
+atomesh launch \
     --host 0.0.0.0 --port 8000 \
     --pd-disaggregation \
     --prefill "http://${PREFILL_IP}:8010" 8998 \
