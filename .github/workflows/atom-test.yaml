@@ -10,6 +10,10 @@ on:
       - '**/*.md'
       - 'docs/**'
       - 'atom/plugin/**'
+      - '.github/workflows/atom-vllm-*.yaml'
+      - '.github/workflows/atom-sglang-*.yaml'
+      - '.github/benchmark/oot_models_accuracy.json'
+      - '.github/benchmark/sglang_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
   schedule:
