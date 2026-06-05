@@ -932,7 +932,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if os.environ.get("ATOM_V4_TORCH_MOE"):
             return
 
-        if self.use_a8w4:
+        # a8w4 hardcodes the GPT-OSS SwiGLU behavior, so only mutate weights for
+        # SwiGLU layers; non-SwiGLU MoE stays on the matmul_ogs path even when
+        # ATOM_USE_TRITON_A8W4_MOE is set globally.
+        if (
+            self.use_a8w4
+            and getattr(layer, "activation", None) == ActivationType.Swiglu
+        ):
             self._prepare_a8w4_weights(layer)
             return
 
@@ -1041,8 +1047,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
-        if self.use_a8w4:
+        if self.use_a8w4 and activation == ActivationType.Swiglu:
             # gpt-oss MXFP4 MoE via AITER fp8-act x mxfp4-weight gluon kernel.
+            # Gated on SwiGLU: the a8w4 fast-path hardcodes gpt-oss SwiGLU, so
+            # non-SwiGLU layers fall through to the matmul_ogs path below.
             from atom.model_ops.fused_moe_triton import aiter_a8w4_fused_experts
 
             return aiter_a8w4_fused_experts(

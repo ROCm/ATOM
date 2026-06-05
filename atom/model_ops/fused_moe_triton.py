@@ -445,7 +445,10 @@ def aiter_a8w4_fused_experts(
         scatter_indx=None,
         gammas=None,
         swizzle_mx_scale="GFX1250_SCALE",
-        out_dtype=torch.float8_e4m3fn,
+        # Match the fp8 dtype produced by downcast_to_static_fp8 (arch-dependent:
+        # e4m3fnuz on gfx942, e4m3fn elsewhere) so the re-quantized intermediate
+        # is the same fp8 format gemm2 consumes as its activation input.
+        out_dtype=x_fp8.dtype,
         apply_swiglu=True,
         alpha=_A8W4_SWIGLU_ALPHA,
         limit=_A8W4_SWIGLU_LIMIT,
