@@ -409,7 +409,7 @@ def _generate_atom_config_from_rtpllm_config(config: Any):
 
     return Config(
         model=rtpllm_model_config.ckpt_path,
-        max_num_batched_tokens=max(16384, max_generate_batch_size),
+        max_num_batched_tokens=max(max_model_len, max_generate_batch_size),
         max_num_seqs=max_generate_batch_size,
         max_model_len=max_model_len,
         gpu_memory_utilization=0.9,
