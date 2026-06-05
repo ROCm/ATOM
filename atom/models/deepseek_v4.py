@@ -311,6 +311,7 @@ class DeepseekV4Args:
             scale_fmt=g("scale_fmt", "ue8m0"),
         )
 
+
 def _v4_index_topk_refreshes(args: DeepseekV4Args, layer_id: int) -> bool:
     index_topk_pattern = args.index_topk_pattern
     if index_topk_pattern is not None:
@@ -322,9 +323,9 @@ def _v4_index_topk_refreshes(args: DeepseekV4Args, layer_id: int) -> bool:
     index_topk_freq = int(args.index_topk_freq)
     if index_topk_freq <= 0:
         raise ValueError("index_topk_freq must be a positive integer")
-    csa_ordinal = sum(
-        1 for ratio in args.compress_ratios[: layer_id + 1] if ratio == 4
-    ) - 1
+    csa_ordinal = (
+        sum(1 for ratio in args.compress_ratios[: layer_id + 1] if ratio == 4) - 1
+    )
     if csa_ordinal < 0:
         return False
     return csa_ordinal % index_topk_freq == 0
