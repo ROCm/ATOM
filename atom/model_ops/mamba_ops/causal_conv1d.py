@@ -1874,9 +1874,6 @@ def _causal_conv1d_fn_tile(
                 block_size_to_align % BLOCK_M
             ) == 0, "The mamba block size needs to be divisible by the BLOCK_M"
 
-    # ------------------------------------------------------------------
-    # Metadata / grid dispatch — same lambda-grid protocol as atom kernel
-    # ------------------------------------------------------------------
     args = None
     if metadata is not None:
         nums_dict = metadata.nums_dict
