@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -35,6 +36,7 @@ class _AtomSparseMetadata:
     reduce_partial_map: torch.Tensor
     padded_num_heads: int
     head_repeat_factor: int
+    page_size: int
 
 
 class _ContractSparseMlaImpl:
@@ -100,11 +102,128 @@ class _RealSparseMlaImpl:
         self._cg_workspace_signature: tuple[Any, ...] | None = None
 
     @staticmethod
+    def _resolve_sparse_page_size() -> int:
+        value = os.getenv("ATOM_RTP_GLM5_SPARSE_PAGE_SIZE", "1")
+        try:
+            page_size = int(value)
+        except ValueError as exc:
+            raise _SparseUnavailable(
+                f"Invalid ATOM_RTP_GLM5_SPARSE_PAGE_SIZE={value!r}."
+            ) from exc
+        if page_size <= 0:
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA requires positive page_size, "
+                f"got page_size={page_size}."
+            )
+        return page_size
+
+    @staticmethod
+    def _validate_sparse_index_contract(
+        *,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        num_tokens: int,
+        page_size: int,
+        max_slots: int,
+    ) -> None:
+        if int(paged_kv_indptr.numel()) != num_tokens + 1:
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA invalid paged_kv_indptr length "
+                f"(got={int(paged_kv_indptr.numel())}, expected={num_tokens + 1})."
+            )
+        if int(paged_kv_indptr[0].item()) != 0:
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA paged_kv_indptr[0] must be 0, "
+                f"got {int(paged_kv_indptr[0].item())}."
+            )
+        if num_tokens > 0:
+            deltas = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
+            if bool((deltas < 0).any().item()):
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA paged_kv_indptr must be non-decreasing."
+                )
+        used = int(paged_kv_indptr[-1].item())
+        if used < 0 or used > int(paged_kv_indices.numel()):
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA paged_kv_indptr[-1] out of range "
+                f"(used={used}, capacity={int(paged_kv_indices.numel())})."
+            )
+        if used == 0:
+            return
+        used_indices = paged_kv_indices[:used]
+        min_index = int(used_indices.min().item())
+        max_index = int(used_indices.max().item())
+        if min_index < 0 or max_index >= max_slots:
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA produced out-of-range paged_kv_indices "
+                f"(min={min_index}, max={max_index}, slots={max_slots}, "
+                f"page_size={page_size})."
+            )
+
+    @staticmethod
+    def _validate_sparse_last_page_contract(
+        *,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        num_tokens: int,
+        page_size: int,
+    ) -> None:
+        if int(paged_kv_last_page_len.numel()) != int(num_tokens):
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA invalid paged_kv_last_page_len length "
+                f"(got={int(paged_kv_last_page_len.numel())}, expected={int(num_tokens)})."
+            )
+        if num_tokens <= 0:
+            return
+        deltas = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
+        active_mask = deltas > 0
+        if not bool(active_mask.any().item()):
+            return
+        active_last_page_len = paged_kv_last_page_len[active_mask]
+        min_last_page_len = int(active_last_page_len.min().item())
+        max_last_page_len = int(active_last_page_len.max().item())
+        if min_last_page_len < 1 or max_last_page_len > int(page_size):
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA invalid paged_kv_last_page_len range "
+                f"(min={min_last_page_len}, max={max_last_page_len}, "
+                f"page_size={int(page_size)})."
+            )
+        if int(page_size) == 1 and bool((active_last_page_len != 1).any().item()):
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA expects paged_kv_last_page_len==1 when page_size=1."
+            )
+
+    @staticmethod
+    def _to_page_indices(
+        *, token_indices: torch.Tensor, page_size: int, max_slots: int
+    ) -> torch.Tensor:
+        if page_size == 1:
+            return token_indices.to(dtype=torch.int32)
+        page_indices = torch.div(
+            token_indices.to(dtype=torch.int64),
+            int(page_size),
+            rounding_mode="floor",
+        ).to(dtype=torch.int32)
+        page_indices.clamp_(min=0, max=max(int(max_slots) - 1, 0))
+        return page_indices
+
+    @staticmethod
+    def _kv_token_slot_capacity(kv_cache_base: torch.Tensor) -> int:
+        if kv_cache_base.ndim <= 0:
+            return 0
+        latent_dim = int(kv_cache_base.shape[-1]) if kv_cache_base.ndim >= 1 else 0
+        if latent_dim <= 0:
+            return 0
+        return int(kv_cache_base.numel() // latent_dim)
+
+    @staticmethod
     def _unwrap_linear_output(value: Any) -> torch.Tensor:
         if isinstance(value, tuple):
             value = value[0]
         if not isinstance(value, torch.Tensor):
-            raise TypeError(f"Expected kv_b_proj to return Tensor, got {type(value)!r}.")
+            raise TypeError(
+                f"Expected kv_b_proj to return Tensor, got {type(value)!r}."
+            )
         return value
 
     def _infer_num_heads(self, q: torch.Tensor) -> int:
@@ -139,7 +258,9 @@ class _RealSparseMlaImpl:
         except Exception:
             weight = getattr(self.kv_b_proj, "weight", None)
         if not isinstance(weight, torch.Tensor):
-            raise _SparseUnavailable("GLM5 RTP sparse MLA cannot read kv_b_proj.weight.")
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA cannot read kv_b_proj.weight."
+            )
         if weight.dtype in (
             getattr(torch, "float8_e4m3fn", None),
             getattr(torch, "float8_e4m3fnuz", None),
@@ -164,9 +285,15 @@ class _RealSparseMlaImpl:
             raise _SparseUnavailable(
                 f"GLM5 RTP sparse MLA got invalid kv_b_proj weight shape {tuple(weight.shape)}."
             )
-        if int(weight.shape[0]) == expected_out and int(weight.shape[1]) == self.kv_lora_rank:
+        if (
+            int(weight.shape[0]) == expected_out
+            and int(weight.shape[1]) == self.kv_lora_rank
+        ):
             kv_b_weight = weight.T.contiguous()
-        elif int(weight.shape[1]) == expected_out and int(weight.shape[0]) == self.kv_lora_rank:
+        elif (
+            int(weight.shape[1]) == expected_out
+            and int(weight.shape[0]) == self.kv_lora_rank
+        ):
             kv_b_weight = weight.contiguous()
         else:
             raise _SparseUnavailable(
@@ -180,9 +307,7 @@ class _RealSparseMlaImpl:
             num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
-        w_uk, w_uv = kv_b_weight.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
+        w_uk, w_uv = kv_b_weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         absorbed = _AbsorbedWeights(
             w_kc=w_uk.permute(1, 2, 0).contiguous(),
             w_vc=w_uv.permute(1, 0, 2).contiguous(),
@@ -210,7 +335,9 @@ class _RealSparseMlaImpl:
         in_capture = torch.cuda.is_current_stream_capturing()
         if in_capture:
             if self._cg_sparse_bufs is None:
-                raise _SparseUnavailable("GLM5 RTP sparse MLA capture requires RoPE buffers.")
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires RoPE buffers."
+                )
             if positions.device != q.device or positions.dtype != torch.long:
                 raise _SparseUnavailable(
                     "GLM5 RTP sparse MLA capture requires int64 positions on device."
@@ -219,7 +346,9 @@ class _RealSparseMlaImpl:
                 raise _SparseUnavailable(
                     "GLM5 RTP sparse MLA capture requires contiguous positions."
                 )
-            q_rope = self._cg_sparse_bufs["q_rope"][: q.shape[0], : q.shape[1], : q.shape[2]]
+            q_rope = self._cg_sparse_bufs["q_rope"][
+                : q.shape[0], : q.shape[1], : q.shape[2]
+            ]
             q_rope.copy_(q)
             if k_pe.dim() == 2:
                 k_pe_rope = self._cg_sparse_bufs["k_pe_rope_2d"][
@@ -287,7 +416,9 @@ class _RealSparseMlaImpl:
         try:
             from aiter import concat_and_cache_mla
         except Exception as exc:
-            raise _SparseUnavailable(f"aiter.concat_and_cache_mla unavailable: {exc}") from exc
+            raise _SparseUnavailable(
+                f"aiter.concat_and_cache_mla unavailable: {exc}"
+            ) from exc
 
         scale = self._cache_write_scale.get(compressed_kv.device)
         if scale is None:
@@ -295,7 +426,10 @@ class _RealSparseMlaImpl:
             self._cache_write_scale[compressed_kv.device] = scale
         in_capture = torch.cuda.is_current_stream_capturing()
         if in_capture:
-            if slot_mapping.device != compressed_kv.device or slot_mapping.dtype != torch.int64:
+            if (
+                slot_mapping.device != compressed_kv.device
+                or slot_mapping.dtype != torch.int64
+            ):
                 raise _SparseUnavailable(
                     "GLM5 RTP sparse MLA capture requires int64 slot_mapping on device."
                 )
@@ -332,7 +466,10 @@ class _RealSparseMlaImpl:
             query_start_loc = getattr(plugin_metadata, "rtp_cu_seqlens_q", None)
         if query_start_loc is None:
             query_start_loc = getattr(attn_metadata, "cu_seqlens_q", None)
-        if isinstance(query_start_loc, torch.Tensor) and int(query_start_loc.numel()) >= 2:
+        if (
+            isinstance(query_start_loc, torch.Tensor)
+            and int(query_start_loc.numel()) >= 2
+        ):
             qsl = query_start_loc.to(device=device, dtype=torch.int64)
             lengths = qsl[1:] - qsl[:-1]
             return torch.repeat_interleave(
@@ -360,6 +497,10 @@ class _RealSparseMlaImpl:
         attn_metadata: Any,
         block_size: int,
     ) -> torch.Tensor:
+        if int(block_size) <= 0:
+            raise _SparseUnavailable(
+                f"GLM5 RTP sparse MLA requires positive block_size, got {block_size}."
+            )
         num_tokens, topk = topk_indices.shape
         device = topk_indices.device
         block_table = _RealSparseMlaImpl._block_table(attn_metadata, device)
@@ -374,10 +515,14 @@ class _RealSparseMlaImpl:
             rounding_mode="floor",
         )
         offsets = torch.remainder(torch.clamp(token_indices, min=0), int(block_size))
-        valid = valid & (req_id[:, None] >= 0) & (req_id[:, None] < block_table.shape[0])
+        valid = (
+            valid & (req_id[:, None] >= 0) & (req_id[:, None] < block_table.shape[0])
+        )
         valid = valid & (block_cols >= 0) & (block_cols < block_table.shape[1])
         safe_req = torch.clamp(req_id, min=0, max=max(int(block_table.shape[0]) - 1, 0))
-        safe_cols = torch.clamp(block_cols, min=0, max=max(int(block_table.shape[1]) - 1, 0))
+        safe_cols = torch.clamp(
+            block_cols, min=0, max=max(int(block_table.shape[1]) - 1, 0)
+        )
         block_ids = block_table.to(dtype=torch.long)[safe_req[:, None], safe_cols]
         valid = valid & (block_ids >= 0)
         global_indices = block_ids * int(block_size) + offsets
@@ -393,9 +538,9 @@ class _RealSparseMlaImpl:
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         qo_indptr = torch.arange(num_tokens + 1, device=device, dtype=torch.int32)
-        paged_kv_indptr = (
-            torch.arange(num_tokens + 1, device=device, dtype=torch.int32) * int(topk)
-        )
+        paged_kv_indptr = torch.arange(
+            num_tokens + 1, device=device, dtype=torch.int32
+        ) * int(topk)
         paged_kv_last_page_len = torch.ones(
             (num_tokens,), device=device, dtype=torch.int32
         )
@@ -452,7 +597,9 @@ class _RealSparseMlaImpl:
         return dtypes.d_dtypes["bf16"]
 
     @staticmethod
-    def _aiter_dtype_for_torch_dtype(dtype: torch.dtype, *, assume_fp8: bool = False) -> Any:
+    def _aiter_dtype_for_torch_dtype(
+        dtype: torch.dtype, *, assume_fp8: bool = False
+    ) -> Any:
         try:
             from aiter import dtypes
         except Exception as exc:
@@ -475,6 +622,39 @@ class _RealSparseMlaImpl:
                 return int(value)
         return 2048
 
+    @staticmethod
+    def _metadata_token_budget(*, num_tokens: int, topk: int) -> int:
+        # Sparse decode can materialize up to num_tokens * topk ragged entries.
+        # Use this upper bound to avoid undersized work/reduce metadata buffers.
+        return max(int(num_tokens) * max(int(topk), 1), 1)
+
+    @staticmethod
+    def _validate_capture_sparse_buffer_capacity(
+        *,
+        sparse_bufs: dict[str, torch.Tensor],
+        num_tokens: int,
+        topk: int,
+    ) -> None:
+        needed_indices = int(num_tokens) * int(topk)
+        if int(sparse_bufs["paged_kv_indices"].numel()) < needed_indices:
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA capture paged_kv_indices buffer is too small "
+                f"(buffer={int(sparse_bufs['paged_kv_indices'].numel())}, "
+                f"required={needed_indices})."
+            )
+        if int(sparse_bufs["qo_indptr"].numel()) < int(num_tokens) + 1:
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA capture qo_indptr buffer is too small."
+            )
+        if int(sparse_bufs["paged_kv_indptr"].numel()) < int(num_tokens) + 1:
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA capture paged_kv_indptr buffer is too small."
+            )
+        if int(sparse_bufs["paged_kv_last_page_len"].numel()) < int(num_tokens):
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA capture paged_kv_last_page_len buffer is too small."
+            )
+
     def prewarm_for_cuda_graph(
         self,
         *,
@@ -487,12 +667,16 @@ class _RealSparseMlaImpl:
         try:
             from aiter import get_mla_metadata_info_v1
         except Exception as exc:
-            raise _SparseUnavailable(f"aiter metadata prewarm unavailable: {exc}") from exc
+            raise _SparseUnavailable(
+                f"aiter metadata prewarm unavailable: {exc}"
+            ) from exc
 
         max_tokens = int(max_num_tokens)
         if max_tokens <= 0:
             return
-        num_heads = int(self.num_heads or getattr(self.mla_modules, "num_local_heads", 0) or 0)
+        num_heads = int(
+            self.num_heads or getattr(self.mla_modules, "num_local_heads", 0) or 0
+        )
         if num_heads <= 0:
             # Lazily inferred in eager path; graph capture needs a stable budget.
             num_heads = int(getattr(self.mla_modules, "num_heads", 0) or 1)
@@ -500,11 +684,16 @@ class _RealSparseMlaImpl:
         self.num_heads = num_heads
         padded_num_heads = max(num_heads, 16)
         if padded_num_heads % num_heads != 0:
-            padded_num_heads = ((padded_num_heads + num_heads - 1) // num_heads) * num_heads
+            padded_num_heads = (
+                (padded_num_heads + num_heads - 1) // num_heads
+            ) * num_heads
         topk = self._resolve_topk_for_prewarm()
         latent_dim = self.kv_lora_rank + self.qk_rope_head_dim
         q_dtype = self._aiter_dtype_for_torch_dtype(query_dtype)
         kv_dtype = self._aiter_dtype_for_torch_dtype(query_dtype, assume_fp8=True)
+        metadata_budget_tokens = self._metadata_token_budget(
+            num_tokens=max_tokens, topk=topk
+        )
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -513,7 +702,7 @@ class _RealSparseMlaImpl:
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_mla_metadata_info_v1(
-            max(max_tokens, 1),
+            metadata_budget_tokens,
             1,
             padded_num_heads,
             q_dtype,
@@ -524,9 +713,15 @@ class _RealSparseMlaImpl:
         self._cg_sparse_bufs = {
             "qo_indptr": torch.arange(max_tokens + 1, device=device, dtype=torch.int32),
             "sparse_seqlen": torch.empty(max_tokens, device=device, dtype=torch.int32),
-            "paged_kv_indptr": torch.empty(max_tokens + 1, device=device, dtype=torch.int32),
-            "paged_kv_last_page_len": torch.ones(max_tokens, device=device, dtype=torch.int32),
-            "paged_kv_indices": torch.empty(max_tokens * topk, device=device, dtype=torch.int32),
+            "paged_kv_indptr": torch.empty(
+                max_tokens + 1, device=device, dtype=torch.int32
+            ),
+            "paged_kv_last_page_len": torch.ones(
+                max_tokens, device=device, dtype=torch.int32
+            ),
+            "paged_kv_indices": torch.empty(
+                max_tokens * topk, device=device, dtype=torch.int32
+            ),
             "q_rope": torch.empty(
                 max_tokens,
                 num_heads,
@@ -541,27 +736,51 @@ class _RealSparseMlaImpl:
                 max_tokens, 1, self.qk_rope_head_dim, device=device, dtype=query_dtype
             ),
             "k_pe_rope_heads": torch.empty(
-                max_tokens, num_heads, self.qk_rope_head_dim, device=device, dtype=query_dtype
+                max_tokens,
+                num_heads,
+                self.qk_rope_head_dim,
+                device=device,
+                dtype=query_dtype,
             ),
             "q_latent_nope_t": torch.empty(
-                num_heads, max_tokens, self.kv_lora_rank, device=device, dtype=query_dtype
+                num_heads,
+                max_tokens,
+                self.kv_lora_rank,
+                device=device,
+                dtype=query_dtype,
             ),
             "q_latent": torch.empty(
                 max_tokens, num_heads, latent_dim, device=device, dtype=query_dtype
             ),
             "q_for_kernel": torch.empty(
-                max_tokens, padded_num_heads, latent_dim, device=device, dtype=query_dtype
+                max_tokens,
+                padded_num_heads,
+                latent_dim,
+                device=device,
+                dtype=query_dtype,
             ),
             "latent_output": torch.empty(
-                max_tokens, padded_num_heads, self.kv_lora_rank, device=device, dtype=query_dtype
+                max_tokens,
+                padded_num_heads,
+                self.kv_lora_rank,
+                device=device,
+                dtype=query_dtype,
             ),
             "final_output_t": torch.empty(
                 num_heads, max_tokens, self.v_head_dim, device=device, dtype=query_dtype
             ),
-            "work_meta_data": torch.empty(work_meta_data_size, dtype=work_meta_data_type, device=device),
-            "work_indptr": torch.empty(work_indptr_size, dtype=work_indptr_type, device=device),
-            "work_info_set": torch.empty(work_info_set_size, dtype=work_info_set_type, device=device),
-            "reduce_indptr": torch.empty(reduce_indptr_size, dtype=reduce_indptr_type, device=device),
+            "work_meta_data": torch.empty(
+                work_meta_data_size, dtype=work_meta_data_type, device=device
+            ),
+            "work_indptr": torch.empty(
+                work_indptr_size, dtype=work_indptr_type, device=device
+            ),
+            "work_info_set": torch.empty(
+                work_info_set_size, dtype=work_info_set_type, device=device
+            ),
+            "reduce_indptr": torch.empty(
+                reduce_indptr_size, dtype=reduce_indptr_type, device=device
+            ),
             "reduce_final_map": torch.empty(
                 reduce_final_map_size, dtype=reduce_final_map_type, device=device
             ),
@@ -593,11 +812,12 @@ class _RealSparseMlaImpl:
         try:
             from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
             from atom.plugin.attention_mla_sparse import (
-                generate_sparse_seqlen_triton,
                 triton_convert_req_index_to_global_index,
             )
         except Exception as exc:
-            raise _SparseUnavailable(f"ATOM sparse MLA metadata helpers unavailable: {exc}") from exc
+            raise _SparseUnavailable(
+                f"ATOM sparse MLA metadata helpers unavailable: {exc}"
+            ) from exc
 
         plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
         if plugin_metadata is None:
@@ -614,7 +834,10 @@ class _RealSparseMlaImpl:
         query_start_loc = getattr(plugin_metadata, "query_start_loc", None)
         if query_start_loc is None:
             query_start_loc = getattr(plugin_metadata, "rtp_cu_seqlens_q", None)
-        if not isinstance(query_start_loc, torch.Tensor) or int(query_start_loc.numel()) < 2:
+        if (
+            not isinstance(query_start_loc, torch.Tensor)
+            or int(query_start_loc.numel()) < 2
+        ):
             raise _SparseUnavailable("GLM5 RTP sparse MLA requires query_start_loc.")
         if in_capture:
             if query_start_loc.device != device or query_start_loc.dtype != torch.int32:
@@ -622,7 +845,9 @@ class _RealSparseMlaImpl:
                     "GLM5 RTP sparse MLA capture requires int32 query_start_loc on device."
                 )
         else:
-            query_start_loc = query_start_loc.to(device=device, dtype=torch.int32).contiguous()
+            query_start_loc = query_start_loc.to(
+                device=device, dtype=torch.int32
+            ).contiguous()
 
         seq_lens = getattr(plugin_metadata, "seq_lens", None)
         if seq_lens is None:
@@ -630,7 +855,9 @@ class _RealSparseMlaImpl:
         if not isinstance(seq_lens, torch.Tensor) or int(seq_lens.numel()) + 1 != int(
             query_start_loc.numel()
         ):
-            raise _SparseUnavailable("GLM5 RTP sparse MLA requires seq_lens per request.")
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA requires seq_lens per request."
+            )
         if in_capture:
             if seq_lens.device != device or seq_lens.dtype != torch.int32:
                 raise _SparseUnavailable(
@@ -641,7 +868,9 @@ class _RealSparseMlaImpl:
 
         if in_capture:
             if not isinstance(cg_bufs, dict) or sparse_bufs is None:
-                raise _SparseUnavailable("GLM5 RTP sparse MLA capture requires prewarmed buffers.")
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires prewarmed buffers."
+                )
             req_id = cg_bufs.get("seq_id_i32", None)
             if not isinstance(req_id, torch.Tensor):
                 raise _SparseUnavailable(
@@ -650,13 +879,18 @@ class _RealSparseMlaImpl:
             req_id = req_id[:num_tokens]
             block_table = getattr(plugin_metadata, "block_table", None)
             if not isinstance(block_table, torch.Tensor):
-                raise _SparseUnavailable("GLM5 RTP sparse MLA capture requires block_table.")
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires block_table."
+                )
             if block_table.device != device or block_table.dtype != torch.int32:
                 raise _SparseUnavailable(
                     "GLM5 RTP sparse MLA capture requires int32 block_table on device."
                 )
             topk_indices_i32 = topk_indices
-            if topk_indices_i32.device != device or topk_indices_i32.dtype != torch.int32:
+            if (
+                topk_indices_i32.device != device
+                or topk_indices_i32.dtype != torch.int32
+            ):
                 raise _SparseUnavailable(
                     "GLM5 RTP sparse MLA capture requires int32 topk_indices on device."
                 )
@@ -664,6 +898,11 @@ class _RealSparseMlaImpl:
                 raise _SparseUnavailable(
                     "GLM5 RTP sparse MLA capture requires contiguous topk_indices."
                 )
+            self._validate_capture_sparse_buffer_capacity(
+                sparse_bufs=sparse_bufs,
+                num_tokens=num_tokens,
+                topk=topk,
+            )
             sparse_seqlen = sparse_bufs["sparse_seqlen"][:num_tokens]
             torch.clamp(seq_lens[:num_tokens], min=0, max=topk, out=sparse_seqlen)
             max_query_len_for_sparse = 1
@@ -672,60 +911,78 @@ class _RealSparseMlaImpl:
                 dtype=torch.int32
             )
             block_table = self._block_table(attn_metadata, device).to(dtype=torch.int32)
-            topk_indices_i32 = topk_indices.to(device=device, dtype=torch.int32).contiguous()
-            query_lens = (query_start_loc[1:] - query_start_loc[:-1]).contiguous()
-            max_query_len_for_sparse = (
-                int(torch.max(query_lens).detach().cpu().item()) if num_tokens else 1
-            )
-
-            if device.type == "cpu":
-                sparse_seqlen = self._generate_sparse_seqlen_torch(
-                    query_lens=query_lens,
-                    seq_lens=seq_lens,
-                    query_start_loc=query_start_loc,
-                    topk=topk,
-                    num_tokens=num_tokens,
-                )
-            else:
-                sparse_seqlen = generate_sparse_seqlen_triton(
-                    query_lens,
-                    seq_lens,
-                    query_start_loc,
-                    topk,
-                    num_tokens,
-                    max_query_len_for_sparse,
-                )
+            topk_indices_i32 = topk_indices.to(
+                device=device, dtype=torch.int32
+            ).contiguous()
+            # Keep prefill aligned with ATOM sparse metadata contract: token-ragged
+            # representation always uses max_q_len=1.
+            max_query_len_for_sparse = 1
+            # Derive sparse lengths directly from indexer output validity. This is
+            # robust for chunked prefill where seq_lens may be chunk-local.
+            sparse_seqlen = torch.sum(topk_indices_i32 >= 0, dim=1, dtype=torch.int32)
 
         if in_capture:
             qo_indptr = sparse_bufs["qo_indptr"][: num_tokens + 1]
             paged_kv_indptr = sparse_bufs["paged_kv_indptr"][: num_tokens + 1]
             paged_kv_indptr[0].zero_()
             paged_kv_last_page_len = sparse_bufs["paged_kv_last_page_len"][:num_tokens]
-            if int(sparse_bufs["paged_kv_indices"].numel()) < num_tokens * topk:
-                raise _SparseUnavailable(
-                    "GLM5 RTP sparse MLA capture paged_kv_indices buffer is too small."
-                )
             paged_kv_indices = sparse_bufs["paged_kv_indices"][: num_tokens * topk]
         else:
             qo_indptr = torch.arange(num_tokens + 1, device=device, dtype=torch.int32)
-            paged_kv_indptr = torch.zeros((num_tokens + 1,), device=device, dtype=torch.int32)
-            paged_kv_last_page_len = torch.ones((num_tokens,), device=device, dtype=torch.int32)
-            paged_kv_indices = torch.zeros((num_tokens * topk,), device=device, dtype=torch.int32)
+            paged_kv_indptr = torch.zeros(
+                (num_tokens + 1,), device=device, dtype=torch.int32
+            )
+            paged_kv_last_page_len = torch.ones(
+                (num_tokens,), device=device, dtype=torch.int32
+            )
+            paged_kv_indices = torch.zeros(
+                (num_tokens * topk,), device=device, dtype=torch.int32
+            )
         torch.cumsum(sparse_seqlen, dim=0, out=paged_kv_indptr[1:])
 
-        triton_convert_req_index_to_global_index(
-            req_id,
-            block_table,
-            topk_indices_i32,
-            paged_kv_indptr,
-            paged_kv_indices,
-            BLOCK_SIZE=int(block_size),
-            NUM_TOPK_TOKENS=topk,
-        )
+        if not in_capture and int(block_size) <= 0:
+            raise _SparseUnavailable(
+                f"GLM5 RTP sparse MLA requires positive block_size, got {block_size}."
+            )
+
+        if not in_capture and topk >= 2048:
+            # Debug-safe path for long-context GLM5: avoid Triton req->global
+            # conversion kernel first, because if this step writes invalid data it
+            # can hard-crash GPU before Python can surface an exception.
+            global_topk = self._convert_topk_to_global(
+                topk_indices=topk_indices_i32,
+                attn_metadata=attn_metadata,
+                block_size=int(block_size),
+            )
+            token_k = torch.arange(topk, device=device, dtype=torch.int32).unsqueeze(0)
+            valid_mask = token_k < sparse_seqlen.unsqueeze(1)
+            flattened = global_topk.masked_select(valid_mask)
+            expected = int(paged_kv_indptr[-1].item()) if int(num_tokens) > 0 else 0
+            if int(flattened.numel()) != expected:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA inconsistent sparse metadata size "
+                    f"(flattened={int(flattened.numel())}, expected={expected})."
+                )
+            if expected > 0:
+                paged_kv_indices[:expected].copy_(flattened.to(dtype=torch.int32))
+            if int(paged_kv_indices.numel()) > expected:
+                paged_kv_indices[expected:].zero_()
+        else:
+            triton_convert_req_index_to_global_index(
+                req_id,
+                block_table,
+                topk_indices_i32,
+                paged_kv_indptr,
+                paged_kv_indices,
+                BLOCK_SIZE=int(block_size),
+                NUM_TOPK_TOKENS=topk,
+            )
 
         padded_num_heads = max(num_heads, 16)
         if padded_num_heads % num_heads != 0:
-            padded_num_heads = ((padded_num_heads + num_heads - 1) // num_heads) * num_heads
+            padded_num_heads = (
+                (padded_num_heads + num_heads - 1) // num_heads
+            ) * num_heads
         head_repeat_factor = padded_num_heads // num_heads
         q_dtype = self._aiter_dtype_for_tensor(q_latent)
         kv_dtype = self._aiter_dtype_for_tensor(kv_cache_base)
@@ -737,6 +994,13 @@ class _RealSparseMlaImpl:
             reduce_final_map = sparse_bufs["reduce_final_map"]
             reduce_partial_map = sparse_bufs["reduce_partial_map"]
         else:
+            used_sparse_entries = (
+                int(paged_kv_indptr[-1].item()) if int(num_tokens) > 0 else 0
+            )
+            metadata_budget_tokens = max(
+                self._metadata_token_budget(num_tokens=num_tokens, topk=topk),
+                used_sparse_entries,
+            )
             (
                 (work_meta_data_size, work_meta_data_type),
                 (work_indptr_size, work_indptr_type),
@@ -745,7 +1009,7 @@ class _RealSparseMlaImpl:
                 (reduce_final_map_size, reduce_final_map_type),
                 (reduce_partial_map_size, reduce_partial_map_type),
             ) = get_mla_metadata_info_v1(
-                max(num_tokens, 1),
+                metadata_budget_tokens,
                 1,
                 padded_num_heads,
                 q_dtype,
@@ -753,16 +1017,70 @@ class _RealSparseMlaImpl:
                 is_sparse=True,
                 fast_mode=True,
             )
-            work_meta_data = torch.empty(work_meta_data_size, dtype=work_meta_data_type, device=device)
-            work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
-            work_info_set = torch.empty(work_info_set_size, dtype=work_info_set_type, device=device)
-            reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type, device=device)
+            work_meta_data = torch.empty(
+                work_meta_data_size, dtype=work_meta_data_type, device=device
+            )
+            work_indptr = torch.empty(
+                work_indptr_size, dtype=work_indptr_type, device=device
+            )
+            work_info_set = torch.empty(
+                work_info_set_size, dtype=work_info_set_type, device=device
+            )
+            reduce_indptr = torch.empty(
+                reduce_indptr_size, dtype=reduce_indptr_type, device=device
+            )
             reduce_final_map = torch.empty(
                 reduce_final_map_size, dtype=reduce_final_map_type, device=device
             )
             reduce_partial_map = torch.empty(
                 reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
             )
+        requested_page_size = self._resolve_sparse_page_size()
+        kv_token_slots = self._kv_token_slot_capacity(kv_cache_base)
+        page_size = requested_page_size
+        if (
+            in_capture
+            and requested_page_size > 1
+            and kv_token_slots % int(requested_page_size) != 0
+        ):
+            # CUDA graph capture uses warmup shapes that may not be page-aligned;
+            # keep capture alive by using token page mode.
+            page_size = 1
+        if page_size > 1:
+            max_page_slots = max(
+                (kv_token_slots + int(page_size) - 1) // int(page_size),
+                1,
+            )
+            if in_capture:
+                # Capture-safe: avoid host sync (e.g. item/min/max) in graph capture.
+                if int(paged_kv_indices.numel()) > 0:
+                    paged_kv_indices.floor_divide_(int(page_size))
+                    paged_kv_indices.clamp_(min=0, max=max_page_slots - 1)
+            else:
+                used_now = int(paged_kv_indptr[-1].item()) if num_tokens > 0 else 0
+                if used_now > 0:
+                    paged_kv_indices[:used_now] = self._to_page_indices(
+                        token_indices=paged_kv_indices[:used_now],
+                        page_size=page_size,
+                        max_slots=max_page_slots,
+                    )
+        else:
+            max_page_slots = int(kv_token_slots)
+
+        if in_capture and int(paged_kv_indices.numel()) > 0:
+            # Capture path cannot run host-synced range checks; clamp indices into
+            # the current kv slot range to avoid kernel-side OOB accesses.
+            paged_kv_indices.clamp_(min=0, max=max(int(max_page_slots) - 1, 0))
+
+        if not in_capture:
+            self._validate_sparse_index_contract(
+                paged_kv_indptr=paged_kv_indptr,
+                paged_kv_indices=paged_kv_indices,
+                num_tokens=num_tokens,
+                page_size=page_size,
+                max_slots=max_page_slots,
+            )
+
         get_mla_metadata_v1(
             qo_indptr,
             paged_kv_indptr,
@@ -776,7 +1094,7 @@ class _RealSparseMlaImpl:
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
-            page_size=1,
+            page_size=page_size,
             kv_granularity=16,
             max_seqlen_qo=max_query_len_for_sparse,
             uni_seqlen_qo=max_query_len_for_sparse,
@@ -797,6 +1115,7 @@ class _RealSparseMlaImpl:
             reduce_partial_map=reduce_partial_map,
             padded_num_heads=padded_num_heads,
             head_repeat_factor=head_repeat_factor,
+            page_size=page_size,
         )
 
     def _run_sparse_decode(
@@ -808,50 +1127,14 @@ class _RealSparseMlaImpl:
         attn_metadata: Any,
         block_size: int,
     ) -> torch.Tensor:
-        if torch.cuda.is_current_stream_capturing():
-            return self._run_aiter_sparse_decode(
-                q_latent=q_latent,
-                kv_cache_base=kv_cache_base,
-                topk_indices=topk_indices,
-                attn_metadata=attn_metadata,
-                block_size=block_size,
-            )
-        plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
-        is_prefill = bool(getattr(plugin_metadata, "num_prefills", 0) or 0)
-        try:
-            from flash_mla import flash_mla_sparse_fwd
-        except Exception as exc:
-            if is_prefill:
-                raise _SparseUnavailable(
-                    "GLM5 RTP sparse MLA prefill requires flash_mla_sparse_fwd; "
-                    "refusing to run prefill through the decode kernel."
-                ) from exc
-            return self._run_aiter_sparse_decode(
-                q_latent=q_latent,
-                kv_cache_base=kv_cache_base,
-                topk_indices=topk_indices,
-                attn_metadata=attn_metadata,
-                block_size=block_size,
-            )
-
-        latent_dim = int(q_latent.shape[-1])
-        global_topk = self._convert_topk_to_global(
+        # Keep GLM5 sparse path aligned with ATOM native MLA kernels.
+        return self._run_aiter_sparse_decode(
+            q_latent=q_latent,
+            kv_cache_base=kv_cache_base,
             topk_indices=topk_indices,
             attn_metadata=attn_metadata,
             block_size=block_size,
         )
-        try:
-            kv_buffer = kv_cache_base.reshape(-1, latent_dim)
-            output, _, _ = flash_mla_sparse_fwd(
-                q_latent,
-                kv_buffer,
-                global_topk.contiguous().unsqueeze(1),
-                self.scale,
-                d_v=self.kv_lora_rank,
-            )
-        except Exception as exc:
-            raise _SparseUnavailable(f"flash_mla_sparse_fwd failed: {exc}") from exc
-        return output
 
     def _run_aiter_sparse_decode(
         self,
@@ -865,7 +1148,9 @@ class _RealSparseMlaImpl:
         try:
             from aiter.mla import mla_decode_fwd
         except Exception as exc:
-            raise _SparseUnavailable(f"aiter.mla_decode_fwd unavailable: {exc}") from exc
+            raise _SparseUnavailable(
+                f"aiter.mla_decode_fwd unavailable: {exc}"
+            ) from exc
 
         num_tokens, num_heads, latent_dim = q_latent.shape
         sparse_meta = self._build_atom_sparse_metadata(
@@ -876,6 +1161,7 @@ class _RealSparseMlaImpl:
             block_size=block_size,
         )
         in_capture = torch.cuda.is_current_stream_capturing()
+        page_size = int(sparse_meta.page_size)
         if sparse_meta.head_repeat_factor > 1:
             if in_capture and self._cg_sparse_bufs is not None:
                 q_for_kernel = self._cg_sparse_bufs["q_for_kernel"][
@@ -902,7 +1188,43 @@ class _RealSparseMlaImpl:
                 device=q_latent.device,
             )
         try:
-            kv_buffer = kv_cache_base.reshape(-1, 1, 1, latent_dim)
+            if page_size == 1:
+                kv_buffer = kv_cache_base.reshape(-1, 1, 1, latent_dim)
+            else:
+                kv_slots = int(kv_cache_base.shape[0])
+                padded_slots = (
+                    (kv_slots + int(page_size) - 1) // int(page_size)
+                ) * int(page_size)
+                if padded_slots != kv_slots:
+                    if in_capture:
+                        raise _SparseUnavailable(
+                            "GLM5 RTP sparse MLA kv buffer cannot be reshaped by "
+                            "page_size during capture "
+                            f"(kv_slots={kv_slots}, page_size={page_size})."
+                        )
+                    pad_shape = list(kv_cache_base.shape)
+                    pad_shape[0] = padded_slots - kv_slots
+                    pad = torch.zeros(
+                        pad_shape,
+                        dtype=kv_cache_base.dtype,
+                        device=kv_cache_base.device,
+                    )
+                    kv_cache_base = torch.cat((kv_cache_base, pad), dim=0)
+                kv_buffer = kv_cache_base.reshape(-1, page_size, 1, latent_dim)
+            if not in_capture and int(sparse_meta.paged_kv_indices.numel()) > 0:
+                self._validate_sparse_index_contract(
+                    paged_kv_indptr=sparse_meta.paged_kv_indptr,
+                    paged_kv_indices=sparse_meta.paged_kv_indices,
+                    num_tokens=num_tokens,
+                    page_size=page_size,
+                    max_slots=int(kv_buffer.shape[0]),
+                )
+                self._validate_sparse_last_page_contract(
+                    paged_kv_indptr=sparse_meta.paged_kv_indptr,
+                    paged_kv_last_page_len=sparse_meta.paged_kv_last_page_len,
+                    num_tokens=num_tokens,
+                    page_size=page_size,
+                )
             mla_decode_fwd(
                 q_for_kernel,
                 kv_buffer,
@@ -913,7 +1235,7 @@ class _RealSparseMlaImpl:
                 sparse_meta.paged_kv_last_page_len,
                 1,
                 sm_scale=self.scale,
-                page_size=1,
+                page_size=page_size,
                 work_meta_data=sparse_meta.work_meta_data,
                 work_indptr=sparse_meta.work_indptr,
                 work_info_set=sparse_meta.work_info_set,
@@ -944,7 +1266,9 @@ class _RealSparseMlaImpl:
         del layer_id
         if attn_metadata is None:
             raise _SparseUnavailable("GLM5 RTP sparse MLA requires attn_metadata.")
-        if getattr(getattr(attn_metadata, "plugin_metadata", None), "is_dummy_warmup", False):
+        if getattr(
+            getattr(attn_metadata, "plugin_metadata", None), "is_dummy_warmup", False
+        ):
             return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
         q_rope, k_pe_rope = self._apply_rope(q, k_pe, positions)
         kv_cache_base = self._write_current_to_cache(
@@ -959,7 +1283,9 @@ class _RealSparseMlaImpl:
         in_capture = torch.cuda.is_current_stream_capturing()
         if in_capture:
             if self._cg_sparse_bufs is None:
-                raise _SparseUnavailable("GLM5 RTP sparse MLA capture requires q buffers.")
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires q buffers."
+                )
             if q_nope.dtype != absorbed.w_kc.dtype:
                 raise _SparseUnavailable(
                     "GLM5 RTP sparse MLA capture requires q_nope dtype to match absorbed weights."
@@ -997,7 +1323,9 @@ class _RealSparseMlaImpl:
             plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
             block_size = int(getattr(plugin_metadata, "sparse_block_size", 0) or 0)
         if block_size <= 0:
-            raise _SparseUnavailable("GLM5 RTP sparse MLA requires physical block size.")
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA requires physical block size."
+            )
         latent_output = self._run_sparse_decode(
             q_latent=q_latent,
             kv_cache_base=kv_cache_base,
@@ -1181,16 +1509,27 @@ class RTPSparseMlaBackend:
         positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         attn_metadata = self._get_attn_metadata()
-        if getattr(getattr(attn_metadata, "plugin_metadata", None), "is_dummy_warmup", False):
+        if getattr(
+            getattr(attn_metadata, "plugin_metadata", None), "is_dummy_warmup", False
+        ):
             return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
 
         if topk_indices is None:
+            plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
+            num_prefills = int(getattr(plugin_metadata, "num_prefills", 0) or 0)
+            if num_prefills <= 0:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA decode requires topk_indices; "
+                    "refusing dense fallback."
+                )
             return self._dense_forward(
                 q, compressed_kv, k_pe, kv_cache, layer_id, None, positions
             )
 
         self._validate_topk_indices(q, topk_indices)
-        if self._default_mock or not callable(getattr(self.sparse_impl, "forward", None)):
+        if self._default_mock or not callable(
+            getattr(self.sparse_impl, "forward", None)
+        ):
             raise _SparseUnavailable(
                 "GLM5 RTP sparse MLA is unavailable; refusing dense fallback."
             )
@@ -1210,13 +1549,11 @@ class RTPSparseMlaBackend:
                 layer_id,
                 **kwargs,
             )
-        except _SparseUnavailable:
-            plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
-            if bool(getattr(plugin_metadata, "num_prefills", 0) or 0):
-                return self._dense_forward(
-                    q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices, positions
-                )
-            raise
+        except _SparseUnavailable as exc:
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA unavailable; dense fallback is disabled. "
+                f"root_cause={exc}"
+            ) from exc
 
 
 def rtp_sparse_attn_indexer(

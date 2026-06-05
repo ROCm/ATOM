@@ -8,10 +8,7 @@ from types import SimpleNamespace
 
 import torch
 
-
-_SPARSE_BACKEND_MODULE = (
-    "atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend"
-)
+_SPARSE_BACKEND_MODULE = "atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend"
 _FORBIDDEN_CUDA_SPARSE_MODULES = (
     "flashmla_sparse",
     "flash_mla",
@@ -25,7 +22,9 @@ def _guard_sparse_kernel_imports(monkeypatch):
 
     def _guarded_import(name, *args, **kwargs):
         if any(part in _FORBIDDEN_CUDA_SPARSE_MODULES for part in name.split(".")):
-            raise AssertionError(f"M2 sparse contract must not import CUDA sparse kernel: {name}")
+            raise AssertionError(
+                f"M2 sparse contract must not import CUDA sparse kernel: {name}"
+            )
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _guarded_import)
@@ -183,13 +182,17 @@ def _build_backend(backend_cls, dense_backend, sparse_impl):
     params = inspect.signature(backend_cls).parameters
     kwargs = {}
     if "dense_backend" not in params:
-        raise AssertionError("RTPSparseMlaBackend must accept dense_backend= for dense fallback")
+        raise AssertionError(
+            "RTPSparseMlaBackend must accept dense_backend= for dense fallback"
+        )
     kwargs["dense_backend"] = dense_backend
 
     if "sparse_impl" in params:
         kwargs["sparse_impl"] = sparse_impl
     else:
-        raise AssertionError("RTPSparseMlaBackend must accept a mock sparse impl injection")
+        raise AssertionError(
+            "RTPSparseMlaBackend must accept a mock sparse impl injection"
+        )
 
     if "v_head_dim" in params:
         kwargs["v_head_dim"] = dense_backend.v_head_dim
@@ -228,6 +231,19 @@ def test_sparse_backend_passes_topk_through_unchanged(monkeypatch):
 
 def test_sparse_backend_falls_back_to_dense_when_topk_is_none(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
+    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    fake_forward_context = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=SimpleNamespace(
+            plugin_metadata=SimpleNamespace(num_prefills=1, is_dummy_warmup=False)
+        ),
+    )
+    monkeypatch.setattr(
+        forward_context_mod,
+        "get_forward_context",
+        lambda: fake_forward_context,
+        raising=False,
+    )
     dense_backend = _FakeDenseBackend()
     sparse_impl = _FakeSparseImpl()
     backend = _build_backend(backend_cls, dense_backend, sparse_impl)
@@ -246,6 +262,37 @@ def test_sparse_backend_falls_back_to_dense_when_topk_is_none(monkeypatch):
     assert dense_backend.calls[0]["kv_cache"] is kv_cache
     assert dense_backend.calls[0]["layer_id"] == layer_id
     assert dense_backend.calls[0]["topk_indices"] is None
+
+
+def test_sparse_backend_decode_without_topk_raises(monkeypatch):
+    backend_cls = _load_sparse_backend(monkeypatch)
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    fake_forward_context = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=SimpleNamespace(
+            plugin_metadata=SimpleNamespace(num_prefills=0, is_dummy_warmup=False)
+        ),
+    )
+    monkeypatch.setattr(
+        forward_context_mod,
+        "get_forward_context",
+        lambda: fake_forward_context,
+        raising=False,
+    )
+    dense_backend = _FakeDenseBackend()
+    sparse_impl = _FakeSparseImpl()
+    backend = _build_backend(backend_cls, dense_backend, sparse_impl)
+    q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
+
+    try:
+        backend.forward(q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=None)
+    except module._SparseUnavailable as exc:
+        assert "decode requires topk_indices" in str(exc)
+    else:
+        raise AssertionError("Expected missing decode topk_indices to raise")
+    assert dense_backend.calls == []
+    assert sparse_impl.calls == []
 
 
 def test_sparse_backend_threads_kv_cache_and_layer_id_to_sparse_impl(monkeypatch):
@@ -292,7 +339,7 @@ def test_sparse_backend_pulls_attn_metadata_from_forward_context(monkeypatch):
     assert sparse_impl.calls[0]["attn_metadata"] is attn_metadata
 
 
-def test_sparse_backend_prefill_missing_flashmla_falls_back_to_dense(monkeypatch):
+def test_sparse_backend_prefill_missing_sparse_kernel_raises(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
     forward_context_mod = sys.modules["atom.utils.forward_context"]
@@ -320,11 +367,16 @@ def test_sparse_backend_prefill_missing_flashmla_falls_back_to_dense(monkeypatch
     q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
     topk = torch.tensor([[1, 0], [0, 1], [1, 1]], dtype=torch.int32)
 
-    output = backend.forward(q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=topk)
+    try:
+        backend.forward(q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=topk)
+    except module._SparseUnavailable:
+        pass
+    else:
+        raise AssertionError(
+            "prefill sparse unavailability must not fall back to dense"
+        )
 
-    assert output.shape == (3, 2, dense_backend.v_head_dim)
-    assert len(dense_backend.calls) == 1
-    assert dense_backend.calls[0]["topk_indices"] is topk
+    assert len(dense_backend.calls) == 0
 
 
 def test_sparse_backend_decode_missing_sparse_kernel_still_raises(monkeypatch):
@@ -431,13 +483,24 @@ def test_real_sparse_decode_uses_atom_aiter_metadata(monkeypatch):
     def fake_metadata_v1(*args, **kwargs):
         calls["metadata_v1"] = (args, kwargs)
 
-    monkeypatch.setattr(aiter, "get_mla_metadata_info_v1", fake_metadata_info, raising=False)
+    monkeypatch.setattr(
+        aiter, "get_mla_metadata_info_v1", fake_metadata_info, raising=False
+    )
     monkeypatch.setattr(aiter, "get_mla_metadata_v1", fake_metadata_v1, raising=False)
 
     fake_mla = type(sys)("aiter.mla")
 
-    def fake_mla_decode_fwd(q, kv, output, qo_indptr, paged_kv_indptr, paged_kv_indices,
-                            paged_kv_last_page_len, *args, **kwargs):
+    def fake_mla_decode_fwd(
+        q,
+        kv,
+        output,
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        *args,
+        **kwargs,
+    ):
         calls["mla_decode_fwd"] = {
             "q": q,
             "kv": kv,
@@ -456,12 +519,21 @@ def test_real_sparse_decode_uses_atom_aiter_metadata(monkeypatch):
 
     fake_sparse_helpers = type(sys)("atom.plugin.attention_mla_sparse")
 
-    def fake_generate_sparse_seqlen(query_lens, seq_lens, query_start_loc, topk,
-                                    num_tokens, max_query_len):
+    def fake_generate_sparse_seqlen(
+        query_lens, seq_lens, query_start_loc, topk, num_tokens, max_query_len
+    ):
         return torch.tensor([3, 2], dtype=torch.int32, device=query_lens.device)
 
-    def fake_convert(req_id, block_table, token_indices, cu_seqlens, out,
-                     BLOCK_SIZE=1, NUM_TOPK_TOKENS=0, BLOCK_N=128):
+    def fake_convert(
+        req_id,
+        block_table,
+        token_indices,
+        cu_seqlens,
+        out,
+        BLOCK_SIZE=1,
+        NUM_TOPK_TOKENS=0,
+        BLOCK_N=128,
+    ):
         out[:5] = torch.tensor([0, 1, 2, 4, 5], dtype=torch.int32, device=out.device)
 
     fake_sparse_helpers.generate_sparse_seqlen_triton = fake_generate_sparse_seqlen
@@ -513,3 +585,66 @@ def test_real_sparse_decode_uses_atom_aiter_metadata(monkeypatch):
     assert decode_call["kwargs"]["page_size"] == 1
     assert decode_call["kwargs"]["work_meta_data"] is not None
     assert decode_call["kwargs"]["reduce_final_map"] is not None
+
+
+def test_real_sparse_decode_rejects_oob_paged_kv_indices(monkeypatch):
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    decode_called = {"value": False}
+
+    fake_mla = type(sys)("aiter.mla")
+
+    def fake_mla_decode_fwd(*args, **kwargs):
+        decode_called["value"] = True
+
+    fake_mla.mla_decode_fwd = fake_mla_decode_fwd
+    monkeypatch.setitem(sys.modules, "aiter.mla", fake_mla)
+
+    impl = module._RealSparseMlaImpl(
+        mla_modules=SimpleNamespace(
+            kv_lora_rank=4,
+            qk_nope_head_dim=2,
+            qk_rope_head_dim=1,
+            num_heads=2,
+            rotary_emb=None,
+            kv_b_proj=SimpleNamespace(weight=torch.empty(0)),
+        ),
+        v_head_dim=3,
+    )
+    q_latent = torch.randn(2, 2, 5)
+    kv_cache = torch.randn(8, 1, 5)
+    topk = torch.tensor([[0, 1, 2], [0, 1, -1]], dtype=torch.int32)
+    attn_metadata = SimpleNamespace(plugin_metadata=SimpleNamespace())
+
+    oob_meta = module._AtomSparseMetadata(
+        qo_indptr=torch.tensor([0, 1, 2], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 3, 6], dtype=torch.int32),
+        # kv_buffer has 8 slots, index=8 is out of range.
+        paged_kv_indices=torch.tensor([0, 1, 2, 3, 4, 8], dtype=torch.int32),
+        paged_kv_last_page_len=torch.ones(2, dtype=torch.int32),
+        work_meta_data=torch.zeros(1, dtype=torch.int32),
+        work_indptr=torch.zeros(1, dtype=torch.int32),
+        work_info_set=torch.zeros(1, dtype=torch.int32),
+        reduce_indptr=torch.zeros(1, dtype=torch.int32),
+        reduce_final_map=torch.zeros(1, dtype=torch.int32),
+        reduce_partial_map=torch.zeros(1, dtype=torch.int32),
+        padded_num_heads=2,
+        head_repeat_factor=1,
+        page_size=1,
+    )
+    monkeypatch.setattr(impl, "_build_atom_sparse_metadata", lambda **kwargs: oob_meta)
+
+    try:
+        impl._run_aiter_sparse_decode(
+            q_latent=q_latent,
+            kv_cache_base=kv_cache,
+            topk_indices=topk,
+            attn_metadata=attn_metadata,
+            block_size=4,
+        )
+    except module._SparseUnavailable as exc:
+        assert "out-of-range paged_kv_indices" in str(exc)
+    else:
+        raise AssertionError(
+            "Expected OOB paged_kv_indices to raise _SparseUnavailable"
+        )
+    assert decode_called["value"] is False

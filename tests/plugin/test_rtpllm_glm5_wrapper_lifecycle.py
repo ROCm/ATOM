@@ -137,9 +137,12 @@ def _make_wrapper_instance(cls):
 def test_glm5_load_skip_python_model_does_not_create_atom_model():
     fake_modules = _install_fake_rtp_modules()
 
-    with patch.dict(sys.modules, fake_modules), patch.dict(
-        os.environ,
-        {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+    with (
+        patch.dict(sys.modules, fake_modules),
+        patch.dict(
+            os.environ,
+            {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+        ),
     ):
         sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
         module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
@@ -166,13 +169,19 @@ def test_glm5_create_python_model_lets_prepare_model_own_mla_patching():
     fake_atom_model = MagicMock(name="atom_model")
     fake_atom_model.to.return_value = fake_atom_model
 
-    with patch.dict(
-        sys.modules,
-        fake_modules,
-    ), patch.dict(
-        os.environ,
-        {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
-    ), patch("atom.prepare_model", return_value=fake_atom_model, create=True) as prepare_model:
+    with (
+        patch.dict(
+            sys.modules,
+            fake_modules,
+        ),
+        patch.dict(
+            os.environ,
+            {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+        ),
+        patch(
+            "atom.prepare_model", return_value=fake_atom_model, create=True
+        ) as prepare_model,
+    ):
         sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
         module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
         module = importlib.reload(module)
@@ -180,11 +189,14 @@ def test_glm5_create_python_model_lets_prepare_model_own_mla_patching():
         instance.device = "cpu"
         instance.weight = MagicMock()
 
-        with _patch_optional_attr(
-            module, "apply_attention_mla_rtpllm_patch"
-        ) as mla_patch, _patch_optional_attr(
-            module, "apply_deepseek_mla_rtpllm_patch"
-        ) as deepseek_patch:
+        with (
+            _patch_optional_attr(
+                module, "apply_attention_mla_rtpllm_patch"
+            ) as mla_patch,
+            _patch_optional_attr(
+                module, "apply_deepseek_mla_rtpllm_patch"
+            ) as deepseek_patch,
+        ):
             result = instance._create_python_model()
 
         prepare_model.assert_called_once_with(config=instance, engine="rtpllm")
@@ -200,12 +212,15 @@ def test_glm5_create_python_model_lets_prepare_model_own_mla_patching():
 def test_glm5_support_cuda_graph_honors_eager_env():
     fake_modules = _install_fake_rtp_modules()
 
-    with patch.dict(sys.modules, fake_modules), patch.dict(
-        os.environ,
-        {
-            "RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models",
-            "ENABLE_CUDA_GRAPH": "0",
-        },
+    with (
+        patch.dict(sys.modules, fake_modules),
+        patch.dict(
+            os.environ,
+            {
+                "RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models",
+                "ENABLE_CUDA_GRAPH": "0",
+            },
+        ),
     ):
         sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
         module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
@@ -213,6 +228,30 @@ def test_glm5_support_cuda_graph_honors_eager_env():
         instance = _make_wrapper_instance(module.ATOMGlm5Moe)
 
         assert instance.support_cuda_graph() is False
+
+
+def test_glm5_runtime_uses_mla_forward_context_class():
+    fake_modules = _install_fake_rtp_modules()
+    fake_utils_mod = ModuleType("atom.plugin.rtpllm.utils")
+    marker_context_cls = object()
+    fake_utils_mod.RTPForwardMLAContext = marker_context_cls
+
+    with (
+        patch.dict(sys.modules, fake_modules),
+        patch.dict(sys.modules, {"atom.plugin.rtpllm.utils": fake_utils_mod}),
+        patch.dict(
+            os.environ,
+            {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+        ),
+    ):
+        sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
+        module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
+        module = importlib.reload(module)
+        module.RTPForwardContext = None
+
+        context_cls = module._ATOMGlm5MoeRuntime._get_forward_context_cls()
+
+    assert context_cls is marker_context_cls
 
 
 def test_glm5_runtime_forward_wraps_model_call_in_rtp_context(monkeypatch):
@@ -258,9 +297,12 @@ def test_glm5_runtime_forward_wraps_model_call_in_rtp_context(monkeypatch):
             assert kwargs["positions"].dtype == torch.long
             return _FakeBind()
 
-    with patch.dict(sys.modules, fake_modules), patch.dict(
-        os.environ,
-        {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+    with (
+        patch.dict(sys.modules, fake_modules),
+        patch.dict(
+            os.environ,
+            {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+        ),
     ):
         sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
         module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
@@ -294,9 +336,12 @@ def test_glm5_runtime_prepare_fmha_impl_bypasses_native_mla_factory(monkeypatch)
         def collect_layer_maps(model):
             return ({}, {}, {})
 
-    with patch.dict(sys.modules, fake_modules), patch.dict(
-        os.environ,
-        {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+    with (
+        patch.dict(sys.modules, fake_modules),
+        patch.dict(
+            os.environ,
+            {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+        ),
     ):
         sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
         module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
@@ -322,9 +367,12 @@ def test_glm5_runtime_prepare_fmha_impl_bypasses_native_mla_factory(monkeypatch)
 def test_glm5_runtime_decode_positions_prefer_sequence_lengths_plus_one():
     fake_modules = _install_fake_rtp_modules()
 
-    with patch.dict(sys.modules, fake_modules), patch.dict(
-        os.environ,
-        {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+    with (
+        patch.dict(sys.modules, fake_modules),
+        patch.dict(
+            os.environ,
+            {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+        ),
     ):
         sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
         module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
@@ -348,9 +396,12 @@ def test_glm5_runtime_decode_positions_prefer_sequence_lengths_plus_one():
 def test_glm5_runtime_graph_decode_ignores_stale_position_ids():
     fake_modules = _install_fake_rtp_modules()
 
-    with patch.dict(sys.modules, fake_modules), patch.dict(
-        os.environ,
-        {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+    with (
+        patch.dict(sys.modules, fake_modules),
+        patch.dict(
+            os.environ,
+            {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+        ),
     ):
         sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
         module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
@@ -374,4 +425,3 @@ def test_glm5_runtime_graph_decode_ignores_stale_position_ids():
         )
 
     assert positions.cpu().tolist() == [34, 48, 49]
-

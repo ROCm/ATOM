@@ -626,6 +626,20 @@ class RTPForwardContext:
             )
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         if is_prefill:
+            # For chunked prefill, prefix_lengths can remain per-chunk while
+            # sequence_lengths_plus_1_d tracks the true cumulative context length.
+            sequence_lengths_plus_1 = RTPForwardContext._non_empty_int32(
+                getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
+                device=device,
+            )
+            if sequence_lengths_plus_1 is not None:
+                if int(sequence_lengths_plus_1.numel()) != int(input_lengths.numel()):
+                    raise ValueError(
+                        "RTP plugin sequence_lengths_plus_1_d/input_lengths batch mismatch "
+                        f"(sequence_lengths_plus_1_d={int(sequence_lengths_plus_1.numel())}, "
+                        f"input_lengths={int(input_lengths.numel())})."
+                    )
+                return sequence_lengths_plus_1.contiguous()
             prefix_lengths = RTPForwardContext._non_empty_int32(
                 getattr(attn_inputs, "prefix_lengths_d", None),
                 device=device,
@@ -1221,6 +1235,7 @@ class RTPForwardContext:
         plugin_md.topk_tokens = 0
         plugin_md.sparse_block_size = int(seq_size_per_block)
         plugin_md.cg_bufs = cg_bufs
+        plugin_md.positions = positions
         cu_seqlen_ks = None
         cu_seqlen_ke = None
         if is_prefill:
@@ -1715,8 +1730,15 @@ class RTPForwardContext:
                 getattr(forward_context, "rtp_seq_size_per_block", 0)
                 or getattr(forward_context, "rtp_kernel_seq_size_per_block", 0)
                 or getattr(get_current_atom_config(), "kv_cache_block_size", 0)
-                or 1
             )
+            if block_size <= 0:
+                raise ValueError(
+                    "RTP plugin requires positive block_size for MLA indexer cache "
+                    f"(layer={layer_num}, rtp_seq_size_per_block="
+                    f"{getattr(forward_context, 'rtp_seq_size_per_block', 0)}, "
+                    "rtp_kernel_seq_size_per_block="
+                    f"{getattr(forward_context, 'rtp_kernel_seq_size_per_block', 0)})."
+                )
             indexer_cache_tensor = RTPForwardContext._build_fallback_indexer_cache(
                 cache_owner=cache_owner,
                 layer_cache=layer_cache,

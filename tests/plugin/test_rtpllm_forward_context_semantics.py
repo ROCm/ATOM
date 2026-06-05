@@ -59,6 +59,7 @@ _install_forward_context_stubs()
 from atom.plugin.rtpllm.utils.forward_context import (  # noqa: E402
     RTPForwardContext,
     RTPForwardMLAContext,
+    RTPForwardQwen35HybridContext,
 )
 
 
@@ -210,6 +211,31 @@ def test_plugin_attention_metadata_keeps_indexer_block_table_expanded():
     assert md.block_tables.shape == (1, 128)
     assert md.block_tables[0, :4].cpu().tolist() == [448, 449, 450, 451]
     assert md.block_tables[0, 64:68].cpu().tolist() == [512, 513, 514, 515]
+
+
+def test_qwen35_context_does_not_use_glm5_indexer_block_expansion():
+    block_table = torch.tensor([[7, 8]], dtype=torch.int32)
+
+    qwen_block_tables = RTPForwardQwen35HybridContext._build_indexer_block_tables(
+        block_table_i32=block_table,
+        seq_size_per_block=1024,
+        kernel_seq_size_per_block=16,
+        cg_max_seq_len=0,
+        in_capture=False,
+        cg_bufs=None,
+    )
+    glm5_block_tables = RTPForwardMLAContext._build_indexer_block_tables(
+        block_table_i32=block_table,
+        seq_size_per_block=1024,
+        kernel_seq_size_per_block=16,
+        cg_max_seq_len=0,
+        in_capture=False,
+        cg_bufs=None,
+    )
+
+    assert qwen_block_tables.shape == (1, 2)
+    assert qwen_block_tables.cpu().tolist() == [[7, 8]]
+    assert glm5_block_tables.shape[1] > qwen_block_tables.shape[1]
 
 
 def test_plugin_attention_metadata_keeps_physical_block_table_for_base_context():
