@@ -511,8 +511,6 @@ def _causal_conv1d_fwd_kernel(  # continuous batching (1D per-token)
         tl.store(v_ptrs, acc, mask=mask_token & is_v_block)
 
 
-
-
 def _causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -807,7 +805,6 @@ def _causal_conv1d_fn(
         num_stages=2,
     )
     return query, key, value
-
 
 
 @triton.jit()
@@ -1181,7 +1178,6 @@ def _causal_conv1d_update_kernel(
         tl.store(v_ptrs, acc, mask=mask_token & is_v_block)
 
 
-
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1382,9 +1378,6 @@ def causal_conv1d_update(
     return query, key, value
 
 
-
-
-
 @triton.jit()
 def _causal_conv1d_fwd_kernel_tile(  # 2D tiled prefill
     x_ptr,
@@ -1486,7 +1479,9 @@ def _causal_conv1d_fwd_kernel_tile(  # 2D tiled prefill
 
     valid_feat = idx_feats < dim
 
-    x_feat_base = x_ptr + sequence_start_index * stride_x_token + idx_feats * stride_x_dim
+    x_feat_base = (
+        x_ptr + sequence_start_index * stride_x_token + idx_feats * stride_x_dim
+    )
 
     conv_states_input_coord = tl.load(
         conv_state_indices_ptr + idx_seq * stride_cache_indices + conv_state_init_index
@@ -1593,7 +1588,9 @@ def _causal_conv1d_fwd_kernel_tile(  # 2D tiled prefill
                     conv_states_base
                     + (idx_tokens_conv * stride_conv_state_tok)[:, None]
                 )
-                mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
+                mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
+                    None, :
+                ]
                 tl.store(conv_states_ptrs_target, new_conv_state, mask)
             else:
                 idx_tokens_conv = tl.arange(0, NP2_STATELEN)
@@ -1612,7 +1609,9 @@ def _causal_conv1d_fwd_kernel_tile(  # 2D tiled prefill
                     conv_states_base
                     + (idx_tokens_conv * stride_conv_state_tok)[:, None]
                 )
-                mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
+                mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
+                    None, :
+                ]
                 tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
     else:  # chunk_offset > 0
@@ -1659,23 +1658,27 @@ def _causal_conv1d_fwd_kernel_tile(  # 2D tiled prefill
 
     x_t = tl.load(
         x_feat_base[:, None] + token_global[None, :] * stride_x_token,
-        mask=valid_2d, other=0.0,
+        mask=valid_2d,
+        other=0.0,
     ).to(tl.float32)
 
     if KERNEL_WIDTH >= 2:
         x_s1 = tl.load(
             x_feat_base[:, None] + (token_global[None, :] - 1) * stride_x_token,
-            mask=valid_2d & (token_global[None, :] >= 1), other=0.0,
+            mask=valid_2d & (token_global[None, :] >= 1),
+            other=0.0,
         ).to(tl.float32)
     if KERNEL_WIDTH >= 3:
         x_s2 = tl.load(
             x_feat_base[:, None] + (token_global[None, :] - 2) * stride_x_token,
-            mask=valid_2d & (token_global[None, :] >= 2), other=0.0,
+            mask=valid_2d & (token_global[None, :] >= 2),
+            other=0.0,
         ).to(tl.float32)
     if KERNEL_WIDTH >= 4:
         x_s3 = tl.load(
             x_feat_base[:, None] + (token_global[None, :] - 3) * stride_x_token,
-            mask=valid_2d & (token_global[None, :] >= 3), other=0.0,
+            mask=valid_2d & (token_global[None, :] >= 3),
+            other=0.0,
         ).to(tl.float32)
 
     # --- Blend initial state into boundary tokens ---
@@ -1683,45 +1686,55 @@ def _causal_conv1d_fwd_kernel_tile(  # 2D tiled prefill
         if KERNEL_WIDTH == 2:
             x_s1 = tl.where(
                 (token_global[None, :] == 0) & valid_feat[:, None],
-                col0.to(tl.float32)[:, None], x_s1,
+                col0.to(tl.float32)[:, None],
+                x_s1,
             )
         if KERNEL_WIDTH == 3:
             x_s1 = tl.where(
                 (token_global[None, :] == 0) & valid_feat[:, None],
-                col1.to(tl.float32)[:, None], x_s1,
+                col1.to(tl.float32)[:, None],
+                x_s1,
             )
             x_s2 = tl.where(
                 (token_global[None, :] == 0) & valid_feat[:, None],
-                col0.to(tl.float32)[:, None], x_s2,
+                col0.to(tl.float32)[:, None],
+                x_s2,
             )
             x_s2 = tl.where(
                 (token_global[None, :] == 1) & valid_feat[:, None],
-                col1.to(tl.float32)[:, None], x_s2,
+                col1.to(tl.float32)[:, None],
+                x_s2,
             )
         if KERNEL_WIDTH == 4:
             x_s1 = tl.where(
                 (token_global[None, :] == 0) & valid_feat[:, None],
-                col2.to(tl.float32)[:, None], x_s1,
+                col2.to(tl.float32)[:, None],
+                x_s1,
             )
             x_s2 = tl.where(
                 (token_global[None, :] == 0) & valid_feat[:, None],
-                col1.to(tl.float32)[:, None], x_s2,
+                col1.to(tl.float32)[:, None],
+                x_s2,
             )
             x_s2 = tl.where(
                 (token_global[None, :] == 1) & valid_feat[:, None],
-                col2.to(tl.float32)[:, None], x_s2,
+                col2.to(tl.float32)[:, None],
+                x_s2,
             )
             x_s3 = tl.where(
                 (token_global[None, :] == 0) & valid_feat[:, None],
-                col0.to(tl.float32)[:, None], x_s3,
+                col0.to(tl.float32)[:, None],
+                x_s3,
             )
             x_s3 = tl.where(
                 (token_global[None, :] == 1) & valid_feat[:, None],
-                col1.to(tl.float32)[:, None], x_s3,
+                col1.to(tl.float32)[:, None],
+                x_s3,
             )
             x_s3 = tl.where(
                 (token_global[None, :] == 2) & valid_feat[:, None],
-                col2.to(tl.float32)[:, None], x_s3,
+                col2.to(tl.float32)[:, None],
+                x_s3,
             )
 
     # --- Weights ---
@@ -1749,7 +1762,12 @@ def _causal_conv1d_fwd_kernel_tile(  # 2D tiled prefill
 
     # --- Convolution ---
     if KERNEL_WIDTH == 4:
-        acc += w0[:, None] * x_s3 + w1[:, None] * x_s2 + w2[:, None] * x_s1 + w3[:, None] * x_t
+        acc += (
+            w0[:, None] * x_s3
+            + w1[:, None] * x_s2
+            + w2[:, None] * x_s1
+            + w3[:, None] * x_t
+        )
     elif KERNEL_WIDTH == 3:
         acc += w0[:, None] * x_s2 + w1[:, None] * x_s1 + w2[:, None] * x_t
     elif KERNEL_WIDTH == 2:
@@ -1759,8 +1777,12 @@ def _causal_conv1d_fwd_kernel_tile(  # 2D tiled prefill
     if SILU_ACTIVATION:
         exp_neg = tl.math.exp2(acc * (-1.4426950408889634))
         rcp = tl.inline_asm_elementwise(
-            "v_rcp_f32 $0, $1", "=v,v",
-            args=[1.0 + exp_neg], dtype=tl.float32, is_pure=True, pack=1,
+            "v_rcp_f32 $0, $1",
+            "=v,v",
+            args=[1.0 + exp_neg],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
         )
         acc = acc * rcp
 
@@ -1770,20 +1792,30 @@ def _causal_conv1d_fwd_kernel_tile(  # 2D tiled prefill
 
     q_feat_idx = idx_feats
     is_q_block = idx_feats < k_start_dim
-    q_ptrs = query_ptr + token_pos[None, :] * query_token_stride + q_feat_idx[:, None] * query_dim_stride
+    q_ptrs = (
+        query_ptr
+        + token_pos[None, :] * query_token_stride
+        + q_feat_idx[:, None] * query_dim_stride
+    )
     tl.store(q_ptrs, acc, mask=valid_token_2d & is_q_block[:, None])
 
     k_feat_idx = idx_feats - k_start_dim
     is_k_block = (idx_feats >= k_start_dim) & (idx_feats < v_start_dim)
-    k_ptrs = key_ptr + token_pos[None, :] * key_token_stride + k_feat_idx[:, None] * key_dim_stride
+    k_ptrs = (
+        key_ptr
+        + token_pos[None, :] * key_token_stride
+        + k_feat_idx[:, None] * key_dim_stride
+    )
     tl.store(k_ptrs, acc, mask=valid_token_2d & is_k_block[:, None])
 
     v_feat_idx = idx_feats - v_start_dim
     is_v_block = (idx_feats >= v_start_dim) & (idx_feats < dim)
-    v_ptrs = value_ptr + token_pos[None, :] * value_token_stride + v_feat_idx[:, None] * value_dim_stride
+    v_ptrs = (
+        value_ptr
+        + token_pos[None, :] * value_token_stride
+        + v_feat_idx[:, None] * value_dim_stride
+    )
     tl.store(v_ptrs, acc, mask=valid_token_2d & is_v_block[:, None])
-
-
 
 
 def _causal_conv1d_fn_tile(
@@ -2051,8 +2083,13 @@ def causal_conv1d_fn(
     """
     _impl = _causal_conv1d_fn_tile if _USE_TILE_KERNEL else _causal_conv1d_fn
     return _impl(
-        x, weight, bias, conv_states, query_start_loc,
-        k_dim_size, v_dim_size,
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        k_dim_size,
+        v_dim_size,
         cache_indices=cache_indices,
         has_initial_state=has_initial_state,
         activation=activation,
