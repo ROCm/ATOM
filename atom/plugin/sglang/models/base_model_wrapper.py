@@ -7,7 +7,6 @@ To add a new model, append its architecture class name to _MODEL_NAMES.
 """
 
 import logging
-from contextvars import ContextVar
 from typing import Any, Iterable, Optional, Tuple, Union
 
 import torch
@@ -18,28 +17,26 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
-logger = logging.getLogger("atom.plugin.sglang.models")
-
-# Context for patched DeepSeek attention layers that need wrapper state without
-# changing every intermediate forward signature. ContextVar keeps nested or
-# concurrent forwards isolated and lets us reliably restore the prior value.
-_current_forward_batch: ContextVar[Optional[ForwardBatch]] = ContextVar(
-    "atom_sglang_current_forward_batch", default=None
+from atom.plugin.sglang.runtime import (
+    MODEL_ARCH_SPECS,
+    SGLangForwardBatchMetadata,
+    SGLangPluginRuntime,
+    bind_current_forward_batch,
+    get_current_forward_batch,
+    get_model_arch_spec,
+    plugin_runtime_scope,
 )
 
+logger = logging.getLogger("atom.plugin.sglang.models")
 
-def get_current_forward_batch():
-    return _current_forward_batch.get()
-
-
-_MODEL_NAMES = [
-    "DeepseekV3ForCausalLM",
-    "Qwen3MoeForCausalLM",
+__all__ = [
+    "EntryClass",
+    "SGLangForwardBatchMetadata",
+    "SGLangPluginRuntime",
+    "bind_current_forward_batch",
+    "get_current_forward_batch",
+    "plugin_runtime_scope",
 ]
-
-_DEEPSEEK_ARCHS = {
-    "DeepseekV3ForCausalLM",
-}
 
 
 class _AtomCausalLMBaseForSglang(nn.Module):
@@ -64,33 +61,79 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.unpadded_vocab_size = config.vocab_size
+        self.model_arch = getattr(config, "architectures", [""])[0]
+        self.model_arch_spec = get_model_arch_spec(self.model_arch)
 
-        import atom
+        with plugin_runtime_scope(framework="sglang"):
+            from atom.config import get_current_atom_config
+            from atom.plugin.sglang.prepare import prepare_model
 
-        # TODO: prepare_model() currently handles model construction, config
-        # generation, attention backend registration, and distributed init.
-        # Refactor so this wrapper only dispatches the attention backend
-        # (register_ops_to_sglang + set_attn_cls), and let sglang handle
-        # model construction directly
-        self.model = atom.prepare_model(config=config, engine="sglang")
+            self.model = prepare_model(config=config)
+            self.atom_config = getattr(self.model, "atom_config", None)
+            if self.atom_config is None:
+                self.atom_config = get_current_atom_config()
+                self.model.atom_config = self.atom_config
         if self.model is None:
-            model_arch = getattr(config, "architectures", ["unknown"])[0]
             raise ValueError(
-                f"ATOM failed to create model for architecture {model_arch}"
+                f"ATOM failed to create model for architecture {self.model_arch}"
             )
 
-        self.logits_processor = LogitsProcessor(config)
+        # Under SGLang dp-attention, ATOM runtime interprets non-MoE modules
+        # like lm_head with tp=1 semantics, so plugin logits must not perform
+        # an extra TP all-gather after local lm_head matmul.
+        plugin_skip_all_gather = bool(self.model.atom_config.enable_dp_attention)
+        self.logits_processor = LogitsProcessor(
+            config, skip_all_gather=plugin_skip_all_gather
+        )
 
-        # Apply ds model-specific sglang patches (attn dispatch, weight hooks, etc.)
-        # TODO: will remove this after sglang supports atom attention backend
-        arch = getattr(config, "architectures", [""])[0]
-        self._uses_forward_batch_context = arch in _DEEPSEEK_ARCHS
-        if arch in _DEEPSEEK_ARCHS:
-            from atom.plugin.sglang.attention_backend.sgl_attention_mla import (
-                setup_deepseek_for_sglang,
-            )
+        # Apply model-specific install-time adapters (attn dispatch, weight hooks, etc.).
+        if self.model_arch_spec.install_adapters is not None:
+            with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
+                self.model_arch_spec.install_adapters(self.model)
 
-            setup_deepseek_for_sglang(self.model)
+    def get_embed_and_head(self):
+        if hasattr(self.model, "get_embed_and_head"):
+            return self.model.get_embed_and_head()
+
+        embed_owner = (
+            self.model.model
+            if hasattr(self.model, "model")
+            and hasattr(self.model.model, "embed_tokens")
+            else self.model
+        )
+        return embed_owner.embed_tokens.weight, self.model.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        if hasattr(self.model, "set_embed_and_head"):
+            return self.model.set_embed_and_head(embed, head)
+
+        embed_owner = (
+            self.model.model
+            if hasattr(self.model, "model")
+            and hasattr(self.model.model, "embed_tokens")
+            else self.model
+        )
+        del embed_owner.embed_tokens.weight
+        del self.model.lm_head.weight
+        embed_owner.embed_tokens.weight = embed
+        self.model.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def set_embed(self, embed):
+        if hasattr(self.model, "set_embed"):
+            return self.model.set_embed(embed)
+
+        embed_owner = (
+            self.model.model
+            if hasattr(self.model, "model")
+            and hasattr(self.model.model, "embed_tokens")
+            else self.model
+        )
+        del embed_owner.embed_tokens.weight
+        embed_owner.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     @torch.no_grad()
     def forward(
@@ -103,35 +146,61 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **model_kwargs: Any,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        model_inputs = dict(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=pp_proxy_tensors,
-            inputs_embeds=input_embeds,
-        )
-        if self._uses_forward_batch_context:
-            token = _current_forward_batch.set(forward_batch)
-            try:
-                hidden_states = self.model(**model_inputs)
-            finally:
-                _current_forward_batch.reset(token)
-        else:
-            hidden_states = self.model(
-                **model_inputs,
+        with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
+            with SGLangPluginRuntime(
+                atom_config=self.atom_config,
                 forward_batch=forward_batch,
-                get_embedding=get_embedding,
-                pp_proxy_tensors=pp_proxy_tensors,
-                **model_kwargs,
-            )
+                positions=positions,
+                input_ids=input_ids,
+                input_embeds=input_embeds,
+                set_forward_context=not self.model_arch_spec.wrapper_binds_gdn_context,
+            ) as runtime:
+                metadata = SGLangForwardBatchMetadata.build(
+                    runtime.forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    save_kv_cache=model_kwargs.get("save_kv_cache"),
+                )
+                model_inputs = dict(
+                    input_ids=runtime.input_ids,
+                    positions=runtime.positions,
+                    intermediate_tensors=SGLangForwardBatchMetadata.to_intermediate_tensors(
+                        pp_proxy_tensors, metadata
+                    ),
+                    inputs_embeds=runtime.input_embeds,
+                )
+                uses_context_only_forward = (
+                    self.model_arch_spec.install_adapters is not None
+                    or self.model_arch_spec.wrapper_binds_gdn_context
+                )
+                with SGLangForwardBatchMetadata.bind(metadata):
+                    if self.model_arch_spec.wrapper_binds_gdn_context:
+                        from atom.plugin.sglang.attention_backend.attention_gdn import (
+                            SGLangGDNForwardContext,
+                        )
 
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.model.lm_head,
-                forward_batch,
-            )
-        return hidden_states
+                        with SGLangGDNForwardContext.bind(metadata):
+                            hidden_states = self.model(**model_inputs)
+                    elif uses_context_only_forward:
+                        hidden_states = self.model(**model_inputs)
+                    else:
+                        hidden_states = self.model(
+                            **model_inputs,
+                            forward_batch=runtime.forward_batch,
+                            get_embedding=get_embedding,
+                            pp_proxy_tensors=pp_proxy_tensors,
+                            **model_kwargs,
+                        )
+
+                hidden_states = runtime.trim_output(hidden_states)
+
+                if self.pp_group.is_last_rank:
+                    return self.logits_processor(
+                        input_ids,
+                        hidden_states,
+                        self.model.lm_head,
+                        forward_batch,
+                    )
+                return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # The passed `weights` iterable from sglang is ignored because ATOM
@@ -140,13 +209,14 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         # sglang's default weight iterator.
         from atom.model_loader.loader import load_model_in_plugin_mode
 
-        return load_model_in_plugin_mode(
-            model=self.model, config=self.model.atom_config, prefix="model."
-        )
+        with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
+            return load_model_in_plugin_mode(
+                model=self.model, config=self.atom_config, prefix="model."
+            )
 
 
 EntryClass = []
-for _name in _MODEL_NAMES:
+for _name in MODEL_ARCH_SPECS:
     _cls = type(_name, (_AtomCausalLMBaseForSglang,), {})
     globals()[_name] = _cls
     EntryClass.append(_cls)

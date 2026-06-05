@@ -21,6 +21,7 @@ from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
 from atom.utils.decorators import mark_trace
+from atom.utils import envs
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
@@ -118,51 +119,93 @@ def fused_add_rmsnorm_pad_(
     return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
 
 
-def mxfp4_rms_quant_fuse_fake(
+# ---------------------------------------------------------------------------
+# Aiter dynamic RMSNorm + quant — single dispatch covering per_1x32 (MXFP4),
+# per_1x128 (FP8 block), and per_Token (FP8). All three reach
+# aiter.{rmsnorm_quant, add_rmsnorm_quant} (HIP) which both normalizes and
+# emits a freshly-computed scale, so callers must have x_scale=None
+# (static-scale FP8 stays on its own branch). Per-quant params (out_dtype,
+# scale shape, group_size, shuffle_scale) are derived from quant_type_value
+# inside the fake helper so torch.compile's schema infer sees a single,
+# stable signature.
+#
+# `mutates_args=[]` keeps torch.compile from functionalizing the out-buffers
+# — same pattern as the legacy mxfp4 fuse helper.
+# ---------------------------------------------------------------------------
+
+_QV_PER_1X32 = QuantType.per_1x32.value
+_QV_PER_1X128 = QuantType.per_1x128.value
+_QV_PER_TOKEN = QuantType.per_Token.value
+_AITER_RMS_QUANT_TYPE_VALUES = frozenset({_QV_PER_1X32, _QV_PER_1X128, _QV_PER_TOKEN})
+
+
+def _aiter_rms_quant_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    shuffle: bool = False,
+    quant_type_value: int,
+    transpose_scale: bool,
     res1: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.utility.dtypes import fp8
+
     M, N = x.shape
-    out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
-    MXFP4_QUANT_BLOCK_SIZE = 32
-    SCALE_N_valid = (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-    use_scale_shuffle_padding = shuffle
-    if use_scale_shuffle_padding:
-        SCALE_M = ((M + 255) // 256) * 256
-        SCALE_N = ((SCALE_N_valid + 7) // 8) * 8
-    else:
-        SCALE_M = M
-        SCALE_N = SCALE_N_valid
-    scale = torch.empty(
-        (SCALE_M, SCALE_N),
-        dtype=torch.float8_e8m0fnu,
-        device=x.device,
-    )
-    out_res1 = None
-    if res1 is not None:
-        out_res1 = torch.empty_like(res1)
+    if quant_type_value == _QV_PER_1X32:
+        # MXFP4: out=(M, N/2) fp4x2; scale=(⌈M/256⌉*256, ⌈⌈N/32⌉/8⌉*8) UE8M0
+        # bytes (kernel writes one uint8 per group; passing fp8_e8m0fnu
+        # directly yields the matching byte layout — no fp32 view).
+        out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
+        scale_m = ((M + 255) // 256) * 256
+        scale_n = ((((N + 31) // 32) + 7) // 8) * 8
+        scale = torch.empty(
+            (scale_m, scale_n), dtype=torch.float8_e8m0fnu, device=x.device
+        )
+    elif quant_type_value == _QV_PER_1X128:
+        # FP8 per-block: scale=(M, ⌈N/128⌉) fp32. Preshuffle GEMM expects
+        # column-major; allocate (num_groups, M) row-major then view as
+        # (M, num_groups). Matches GemmaRMSNorm._forward_fused_fp8.
+        out = torch.empty((M, N), dtype=fp8, device=x.device)
+        num_groups = N // 128
+        if transpose_scale:
+            scale = torch.empty(
+                (num_groups, M), dtype=torch.float32, device=x.device
+            ).view(M, num_groups)
+        else:
+            scale = torch.empty((M, num_groups), dtype=torch.float32, device=x.device)
+    else:  # _QV_PER_TOKEN
+        out = torch.empty((M, N), dtype=fp8, device=x.device)
+        scale = torch.empty((M, 1), dtype=torch.float32, device=x.device)
+    out_res1 = torch.empty_like(res1) if res1 is not None else None
     return (out, scale, out_res1)
 
 
-# It's important to use mutates_args=[] to avoid functionized_v2 op generation
-@torch_compile_guard(gen_fake=mxfp4_rms_quant_fuse_fake, mutates_args=[])
-def mxfp4_rms_quant_fuse(
+@torch_compile_guard(gen_fake=_aiter_rms_quant_fake, mutates_args=[])
+def _aiter_rms_quant(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    shuffle: bool = False,
+    quant_type_value: int,
+    transpose_scale: bool,
     res1: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+    from aiter import add_rmsnorm_quant, rmsnorm_quant
 
-    (x_quant, x_scale), _, _, residual_out = fused_rms_mxfp4_quant(
-        x, weight, eps, shuffle=shuffle, res1=res1
+    out, scale, out_res1 = _aiter_rms_quant_fake(
+        x, weight, eps, quant_type_value, transpose_scale, res1
     )
-
-    return x_quant, x_scale, residual_out
+    if quant_type_value == _QV_PER_1X32:
+        group_size, shuffle = 32, True
+    elif quant_type_value == _QV_PER_1X128:
+        group_size, shuffle = 128, transpose_scale
+    else:  # _QV_PER_TOKEN
+        group_size, shuffle = 0, False
+    if res1 is None:
+        rmsnorm_quant(out, x, scale, weight, eps, group_size, shuffle)
+    else:
+        add_rmsnorm_quant(
+            out, x, res1, out_res1, scale, weight, eps, group_size, shuffle
+        )
+    return out, scale, out_res1
 
 
 class RMSNorm(nn.Module):
@@ -194,6 +237,14 @@ class RMSNorm(nn.Module):
         params_dtype = layer_quant_config.quant_dtype
         self.quant_type = quant_type
         self.params_dtype = params_dtype
+        # transpose_scale (column-major scale) only applies to per_1x128 with
+        # the preshuffle GEMM consumer; resolve the env once at init time so
+        # forward sees a hot static bool instead of an env lookup per call.
+        self._aiter_transpose_scale = (
+            fused_quant
+            and quant_type.value == _QV_PER_1X128
+            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
 
     @mark_trace(prefix="rmsnorm", torch_compile=True)
     def forward(
@@ -262,19 +313,24 @@ class RMSNorm(nn.Module):
                         res1=residual,
                     )
                     return (x, x_scale), residual
-            elif self.use_fused_quant and (
-                x_scale is None and self.quant_type.value == QuantType.per_1x32.value
+            elif (
+                self.use_fused_quant
+                and x_scale is None
+                and self.quant_type.value in _AITER_RMS_QUANT_TYPE_VALUES
             ):
+                # Dynamic-scale fused RMSNorm + quant via aiter HIP kernels.
+                # Static FP8 (x_scale provided) stays on the branch above.
+                x, x_scale, residual_out = _aiter_rms_quant(
+                    x,
+                    self.weight,
+                    self.eps,
+                    self.quant_type.value,
+                    self._aiter_transpose_scale,
+                    residual,
+                )
                 if residual is None:
-                    x, x_scale, _ = mxfp4_rms_quant_fuse(
-                        x, self.weight, self.eps, shuffle=True
-                    )
                     return x, x_scale
-                else:
-                    x, x_scale, residual = mxfp4_rms_quant_fuse(
-                        x, self.weight, self.eps, shuffle=True, res1=residual
-                    )
-                    return (x, x_scale), residual
+                return (x, x_scale), residual_out
             else:
                 if residual is None:
                     # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
@@ -347,8 +403,9 @@ class RMSNormGated(nn.Module):
                 # Extract group size from quant type
                 if quant_type == QuantType.per_1x128:
                     self.group_size_quant = 128
-                    # per_1x128 blockscale GEMM requires transposed scale layout
-                    self.transpose_scale = True
+                    # preshuffle GEMM expects column-major x_scale;
+                    # non-preshuffle GEMM expects row-major x_scale
+                    self.transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
                 elif quant_type == QuantType.per_1x32:
                     self.group_size_quant = 32
                     self.transpose_scale = False
@@ -547,27 +604,59 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if torch.compiler.is_compiling():
-            return self.forward_native(x, residual)
+        # Use the aiter HIP fused_qk_rmsnorm_group_quant kernel in no-quant mode
+        # (q_out_scale=None) to perform Gemma RMSNorm + optional residual add.
+        # Same math as the Triton kernel: out = rmsnorm(x [+ residual]) * (1 + w),
+        # but executed by the aiter kernel for higher achieved bandwidth.
+        from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
 
-        if not getattr(self, "_is_compiled", False):
-            self.forward_static = torch.compile(self.forward_static)  # type: ignore
-            self._is_compiled = True
-        return self.forward_native(x, residual)
+        ori_shape = x.shape
+        x_2d = x.view(-1, ori_shape[-1])
+
+        out = torch.empty_like(x_2d)
+        if residual is not None:
+            residual_2d = residual.view(-1, ori_shape[-1])
+            res_out = torch.empty_like(x_2d)
+        else:
+            residual_2d = None
+            res_out = None
+
+        fused_qk_rmsnorm_group_quant(
+            q=x_2d,
+            q_weight=self.weight.data,
+            q_epsilon=self.variance_epsilon,
+            q_out_unquantized=out,
+            q_res_out=res_out,
+            q_residual=residual_2d,
+            gemma_norm=True,
+        )
+
+        out = out.view(ori_shape)
+        if residual is not None:
+            return out, res_out.view(ori_shape)
+        return out
 
     def _forward_fused_fp8(self, x, residual=None):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
         from aiter.utility.dtypes import fp8
 
+        transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         group_size = 128
         M = x.shape[0]
         N = x.shape[1]
         num_groups = N // group_size
 
         out_fp8 = torch.empty((M, N), dtype=fp8, device=x.device)
-        out_scale = torch.empty(
-            (num_groups, M), dtype=torch.float32, device=x.device
-        ).view(M, num_groups)
+        if transpose_scale:
+            # column-major: allocate (num_groups, M) then view as (M, num_groups)
+            out_scale = torch.empty(
+                (num_groups, M), dtype=torch.float32, device=x.device
+            ).view(M, num_groups)
+        else:
+            # row-major: allocate (M, num_groups) directly
+            out_scale = torch.empty(
+                (M, num_groups), dtype=torch.float32, device=x.device
+            )
         out_bf16 = (
             torch.empty((M, N), dtype=x.dtype, device=x.device)
             if self.write_bf16
@@ -585,7 +674,7 @@ class GemmaRMSNorm(nn.Module):
             q_res_out=res_out,
             q_residual=residual,
             group_size=group_size,
-            transpose_scale=True,
+            transpose_scale=transpose_scale,
             gemma_norm=True,
         )
         if residual is not None:
@@ -627,6 +716,7 @@ def _fused_qk_norm_single_kernel(
     num_q_heads,
     num_k_heads,
     ADD_UNIT_OFFSET: tl.constexpr,
+    Q_HAS_WEIGHT: tl.constexpr,
     RBLOCK: tl.constexpr,
     XBLOCK: tl.constexpr,
 ):
@@ -656,15 +746,22 @@ def _fused_qk_norm_single_kernel(
 
     mask = xmask & col_mask
 
-    # Weight: load both, select via is_q
-    qw = tl.load(
-        q_weight_ptr + cols, mask=col_mask, other=0.0, eviction_policy="evict_last"
-    ).to(tl.float32)
+    # Weight: load both (or use ones for Q when Q_HAS_WEIGHT=False), select via is_q.
+    # Q_HAS_WEIGHT=False is for callers whose Q-side norm has implicit identity
+    # weight (e.g. V4's per-head Q normalization, equivalent to the prior
+    # `_rmsnorm_nw` helper) — saves a load + register row.
+    if Q_HAS_WEIGHT:
+        qw = tl.load(
+            q_weight_ptr + cols, mask=col_mask, other=0.0, eviction_policy="evict_last"
+        ).to(tl.float32)
+        if ADD_UNIT_OFFSET:
+            qw = qw + 1.0
+    else:
+        qw = tl.full((RBLOCK,), 1.0, tl.float32)
     kw = tl.load(
         k_weight_ptr + cols, mask=col_mask, other=0.0, eviction_policy="evict_last"
     ).to(tl.float32)
     if ADD_UNIT_OFFSET:
-        qw = qw + 1.0
         kw = kw + 1.0
     w = tl.where(is_q, qw, kw)
 
@@ -706,7 +803,7 @@ def _fused_qk_norm_single_kernel(
 def fused_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_weight: torch.Tensor,
+    q_weight: Optional[torch.Tensor],
     k_weight: torch.Tensor,
     eps: float,
     add_unit_offset: bool = False,
@@ -716,11 +813,18 @@ def fused_qk_norm(
     Args:
         q: [num_tokens, num_heads, head_dim]
         k: [num_tokens, num_kv_heads, head_dim]
-        q_weight, k_weight: [head_dim] norm weights
+        q_weight: [head_dim] norm weight, or None for an implicit ones weight
+                  (skips the Q-side weight load — for callers whose Q norm
+                  is the identity, e.g. V4's per-head Q normalization).
+        k_weight: [head_dim] norm weight (always required)
         eps: epsilon for numerical stability
         add_unit_offset: True for GemmaRMSNorm (w+1), False for standard
     """
-    head_dim = q_weight.shape[0]
+    head_dim = k_weight.shape[0]
+    if q_weight is not None:
+        assert (
+            q_weight.shape[0] == head_dim
+        ), f"q_weight head_dim {q_weight.shape[0]} != k_weight {head_dim}"
     num_tokens = q.shape[0]
     num_q_heads = q.shape[1]
     num_k_heads = k.shape[1]
@@ -737,12 +841,15 @@ def fused_qk_norm(
     # num_warps=1 is universally optimal for head_dim=256 workloads on MI355X.
     XBLOCK = 2 if total_rows > 8192 else 1
     NUM_WARPS = 1
+    # When q_weight is None pass k_weight as a placeholder pointer (the
+    # kernel won't load from it — Q_HAS_WEIGHT=False gates the load).
+    q_weight_arg = q_weight if q_weight is not None else k_weight
     _fused_qk_norm_single_kernel[((total_rows + XBLOCK - 1) // XBLOCK,)](
         q,
         k,
         q_out,
         k_out,
-        q_weight,
+        q_weight_arg,
         k_weight,
         eps,
         num_tokens,
@@ -754,6 +861,7 @@ def fused_qk_norm(
         num_q_heads,
         num_k_heads,
         ADD_UNIT_OFFSET=add_unit_offset,
+        Q_HAS_WEIGHT=q_weight is not None,
         RBLOCK=RBLOCK,
         XBLOCK=XBLOCK,
         num_warps=NUM_WARPS,
@@ -765,6 +873,12 @@ class DualRMSNorm:
     """Fused Q/K RMSNorm — single Triton kernel launch.
 
     Not an nn.Module. References existing q_norm/k_norm for weights.
+
+    Q-side weightless mode: when `q_norm.weight is None`, the Q-side norm
+    is treated as the identity (implicit ones weight). The kernel skips
+    the q_weight load entirely (Q_HAS_WEIGHT=False). Use this when the
+    checkpoint does not ship a Q weight (e.g. V4's per-head Q normalization,
+    equivalent to the prior `_rmsnorm_nw` helper).
     """
 
     def __init__(
@@ -781,7 +895,22 @@ class DualRMSNorm:
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.add_unit_offset = isinstance(q_norm, GemmaRMSNorm)
+        # add_unit_offset only applies when q has a real weight; the kernel's
+        # weightless path (q_norm.weight is None) emits qw=1.0 directly with
+        # no offset, so the GemmaRMSNorm test is gated on weight existence.
+        self.add_unit_offset = getattr(
+            q_norm, "weight", None
+        ) is not None and isinstance(q_norm, GemmaRMSNorm)
+        # Resolve eps once. Different RMSNorm implementations name the
+        # attribute differently — `variance_epsilon` (HF/Gemma style) or
+        # `eps` (ATOM RMSNorm). Cache to avoid the lookup per forward call.
+        self._eps = getattr(q_norm, "variance_epsilon", None) or getattr(
+            q_norm, "eps", None
+        )
+        assert self._eps is not None, (
+            f"q_norm {type(q_norm).__name__} must expose `eps` or "
+            f"`variance_epsilon`"
+        )
         self.prefix = prefix
 
     @mark_trace
@@ -795,12 +924,15 @@ class DualRMSNorm:
         Returns:
             (q_normed, k_normed) same shapes as input
         """
+        # `self.q_norm.weight` is None for weightless q_norm (e.g. V4
+        # `q_norm2`); fused_qk_norm forwards that None to the kernel which
+        # takes the Q_HAS_WEIGHT=False fast path.
         q, k = fused_qk_norm(
             q.view(-1, self.num_q_heads, self.head_dim),
             k.view(-1, self.num_kv_heads, self.head_dim),
             self.q_norm.weight,
             self.k_norm.weight,
-            self.q_norm.variance_epsilon,
+            self._eps,
             add_unit_offset=self.add_unit_offset,
         )
         return (

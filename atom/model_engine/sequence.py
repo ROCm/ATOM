@@ -43,22 +43,48 @@ class Sequence:
         id=None,
         kv_transfer_params: dict = None,
         num_draft_tokens: int = 0,
-        mamba_enabled: bool = False,
+        has_per_req_cache: bool = False,
+        needs_independent_noise: bool = False,
+        parent_request_id: Optional[str] = None,
+        sibling_index: int = 0,
+        request_id: Optional[str] = None,
+        multimodal_data: Optional[dict] = None,
+        mrope_positions: Optional[np.ndarray] = None,
+        mrope_position_delta: int = 0,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
+        self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
         self.type = SequenceType.DUMMY
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
         self.num_draft_tokens = num_draft_tokens
-        self.mamba_enabled = mamba_enabled
+        # `has_per_req_cache=True` means this seq's attention type maintains
+        # a per-request stateful buffer outside the paged KV pool (e.g. GDN
+        # recurrent state, future DeepseekV4 ring-buffer + compressor state).
+        # Triggers BlockManager to allocate a per-req cache slot in
+        # allocate() / free it in deallocate().
+        self.has_per_req_cache = has_per_req_cache
+        self.multimodal_data = multimodal_data
+        self.mrope_positions = mrope_positions
+        self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
         self.num_cached_tokens = 0
+        # True iff this seq is mid-prefill (chunked prefill produced KV for
+        # some prompt tokens but not all). Maintained by the scheduler:
+        # set in postprocess when an advance leaves prompt tokens remaining,
+        # cleared when prefill completes or seq is preempted. Used to discard
+        # garbage sampled tokens from intermediate chunks and to skip the
+        # scheduler's Phase 1 scan when no partials exist.
+        self.is_partial_prefill = False
         self.block_table = []
-        self.mamba_state_slot = -1  # per-request recurrent state slot index
+        # Per-request cache slot index (filled by BlockManager.allocate()).
+        # -1 = unallocated. The slot indexes into the per-req cache tensors
+        # owned by ModelRunner (e.g. mamba_k_cache for GDN).
+        self.per_req_cache_group = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -67,6 +93,16 @@ class Sequence:
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
         self.is_first_decode = False
+        # Set to True by Scheduler.postprocess after BlockManager.hash_blocks
+        # has registered the prompt blocks for prefix caching. The trigger has
+        # to be per-seq because in deferred-output mode the prefill step's
+        # postprocess has no fwd_output entry for the seq (idx is None) — the
+        # prefill output surfaces one step later, at which point seq.type has
+        # already been flipped to DECODE. A seq.type / len(output_tokens) gate
+        # would never fire for the prefill blocks; this flag does.
+        self.prefix_hashes_published = False
+        self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
+        self.logprobs: list[float] = []
         # stream callback
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens
@@ -86,6 +122,17 @@ class Sequence:
 
         # accepted tokens for spec decode
         self.num_bonus_tokens = 0
+
+        # Fan-out bookkeeping for SamplingParams.n > 1. When True, the sampler
+        # must produce fresh, per-row random noise for this sequence instead
+        # of reusing the cached shared exponential tensor, otherwise sibling
+        # sequences with identical logits would emit identical tokens.
+        self.needs_independent_noise = needs_independent_noise
+        # Parent request id (user-facing id from the API layer) and this
+        # sequence's index within the fan-out group [0, n). Both default
+        # to safe values for single-sample requests.
+        self.parent_request_id = parent_request_id
+        self.sibling_index = sibling_index
 
     def __len__(self):
         return self._num_tokens
@@ -121,10 +168,6 @@ class Sequence:
     @property
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens : self.num_tokens]
-
-    @property
-    def num_cached_blocks(self):
-        return self.num_cached_tokens // self.block_size
 
     # @property
     # def num_blocks(self):

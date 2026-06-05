@@ -30,7 +30,9 @@ class KVConnectorBase(ABC):
     is_producer: bool
 
     @abstractmethod
-    def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+    def register_kv_caches(
+        self, kv_caches: dict[str, Any], transfer_tensors: Any = None
+    ) -> None:
         """Register local KV cache tensors for remote access.
 
         Called once after model loading and KV cache allocation.
@@ -52,6 +54,15 @@ class KVConnectorBase(ABC):
         Called by the worker each engine step to report transfer status.
         """
         ...
+
+    def get_finished_recv_blocks(self) -> list[int]:
+        """Return block IDs from recently completed receives for GPU memory fence.
+
+        RDMA writes to HBM may not be immediately visible to GPU compute
+        kernels. Connectors using RDMA should override this to return
+        blocks that need a GPU-side read-write cycle to ensure coherence.
+        """
+        return []
 
 
 class KVConnectorSchedulerBase(ABC):

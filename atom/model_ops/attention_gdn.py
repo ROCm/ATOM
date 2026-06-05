@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-
 import torch
 import triton
 import triton.language as tl
@@ -13,7 +12,9 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
 from atom.model_ops.fla_ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
+    gdn_decode_update_lossy_fast,
 )
+from atom.utils import envs
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -31,17 +32,19 @@ def fused_gdn_gating_kernel(
     dt_bias,
     seq_len,
     NUM_HEADS: tl.constexpr,
+    stride_a_batch,
+    stride_b_batch,
     beta: tl.constexpr,
     threshold: tl.constexpr,
     BLK_HEADS: tl.constexpr,
 ):
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
-    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    out_off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
     mask = head_off < NUM_HEADS
     blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
-    blk_b = tl.load(b + off, mask=mask)
+    blk_a = tl.load(a + i_b * stride_a_batch + head_off, mask=mask)
+    blk_b = tl.load(b + i_b * stride_b_batch + head_off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off, mask=mask)
     # If the model is loaded in fp16, without the .float() here, A might be -inf
     x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
@@ -49,11 +52,13 @@ def fused_gdn_gating_kernel(
         beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    tl.store(g + out_off, blk_g.to(g.dtype.element_ty), mask=mask)
     # compute beta_output = sigmoid(b)
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
     tl.store(
-        beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
+        beta_output + out_off,
+        blk_beta_output.to(beta_output.dtype.element_ty),
+        mask=mask,
     )
 
 
@@ -85,6 +90,8 @@ def fused_gdn_gating(
         dt_bias,
         seq_len,
         num_heads,
+        a.stride(0),
+        b.stride(0),
         beta,
         threshold,
         8,
@@ -157,9 +164,11 @@ class GatedDeltaNet(nn.Module):
         from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 
         fwd_ctx: ForwardContext = get_forward_context()
-        gdn_metadata: GDNAttentionMetadata = fwd_ctx.attn_metadata.gdn_metadata
-
+        gdn_metadata: GDNAttentionMetadata = getattr(
+            fwd_ctx.attn_metadata, "gdn_metadata", None
+        )
         if gdn_metadata is None:
+            core_attn_out.zero_()
             return core_attn_out
 
         gdn_cache = fwd_ctx.kv_cache_data
@@ -177,7 +186,13 @@ class GatedDeltaNet(nn.Module):
             gdn_metadata.non_spec_state_indices_tensor
         )  # noqa: E501
 
-        conv_state = conv_state.transpose(-1, -2)
+        # `causal_conv1d_*` expects the logical shape [slot, conv_dim, state_len].
+        # ModelRunner stores [slot, state_len, conv_dim], so it needs the
+        # transpose below. SGLang already provides [slot, conv_dim, state_len],
+        # and the Triton kernel consumes the original conv_state strides directly.
+        if conv_state.size(1) != self.conv1d.weight.size(0):
+            # transpose for ModelRunner
+            conv_state = conv_state.transpose(-1, -2)
 
         num_actual_tokens = gdn_metadata.num_actual_tokens
         num_accepted_tokens = gdn_metadata.num_accepted_tokens
@@ -201,6 +216,18 @@ class GatedDeltaNet(nn.Module):
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
+
+        use_lossy_gdn_decode = (
+            envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST
+            and spec_sequence_masks is None
+            and gdn_metadata.num_prefills == 0
+            and gdn_metadata.num_decodes > 0
+            and non_spec_state_indices_tensor is not None
+            and non_spec_state_indices_tensor.ndim == 1
+            and a.shape[0] == gdn_metadata.num_decodes
+            and a.shape[1] == self.num_v_heads // self.tp_size
+            and b.shape == a.shape
+        )
 
         # # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
@@ -270,24 +297,30 @@ class GatedDeltaNet(nn.Module):
                 1, num_tokens_nonspec, -1, self.head_v_dim
             )
 
-        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-
-        if spec_sequence_masks is not None:
-            if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
-                g_spec = g
-                beta_spec = beta
-                g_non_spec = None
-                beta_non_spec = None
-            else:
-                g_spec = g.index_select(1, spec_token_indx)
-                beta_spec = beta.index_select(1, spec_token_indx)
-                g_non_spec = g.index_select(1, non_spec_token_indx)
-                beta_non_spec = beta.index_select(1, non_spec_token_indx)
-        else:
+        if use_lossy_gdn_decode:
             g_spec = None
             beta_spec = None
-            g_non_spec = g
-            beta_non_spec = beta
+            g_non_spec = None
+            beta_non_spec = None
+        else:
+            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+
+            if spec_sequence_masks is not None:
+                if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
+                    g_spec = g
+                    beta_spec = beta
+                    g_non_spec = None
+                    beta_non_spec = None
+                else:
+                    g_spec = g.index_select(1, spec_token_indx)
+                    beta_spec = beta.index_select(1, spec_token_indx)
+                    g_non_spec = g.index_select(1, non_spec_token_indx)
+                    beta_non_spec = beta.index_select(1, non_spec_token_indx)
+            else:
+                g_spec = None
+                beta_spec = None
+                g_non_spec = g
+                beta_non_spec = beta
 
         # 2. Recurrent attention
 
@@ -333,20 +366,38 @@ class GatedDeltaNet(nn.Module):
                 ssm_state.dtype
             )
         elif gdn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_recurrent_gated_delta_rule(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[: gdn_metadata.num_decodes + 1],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
+            if use_lossy_gdn_decode:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    gdn_decode_update_lossy_fast(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=ssm_state,
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
                 )
-            )
+            else:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_recurrent_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[
+                            : gdn_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
@@ -365,5 +416,9 @@ class GatedDeltaNet(nn.Module):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+        # Zero padding tail for CUDA graph replay safety
+        if num_actual_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_actual_tokens:].zero_()
 
         return core_attn_out

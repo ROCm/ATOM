@@ -96,7 +96,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
   - `ATOM_ENABLE_DS_QKNORM_QUANT_FUSION` -- fuses QK norm with quantization.
   - `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` -- fuses allreduce with RMSNorm.
   - Dedicated Triton kernels for FP8 MQA logits (`fp8_mqa_logits`), paged MQA logits (`deepgemm_fp8_paged_mqa_logits`), and fused RMSNorm+quantization (`_fuse_rmsnorm_quant`).
-- **V3.2 extension:** `DeepseekV32ForCausalLM` is an alias. The `DeepseekV2Model` detects V3.2 via `config.index_topk` and allocates an `topk_indices_buffer` for index-based routing.
+- **V3.2 extension:** `DeepseekV32ForCausalLM` is an alias. The `DeepseekV2Model` detects V3.2 via `config.index_topk`; the indexer computes top-k rows as per-forward scratch and the MLA path packs them into sparse attention metadata.
 - **Note:** `DeepseekV3ForCausalLM` is a subclass of `DeepseekV2ForCausalLM` (pass-through, no override).
 
 ### DeepSeek MTP (`DeepSeekMTP`)
@@ -133,7 +133,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Architecture:** Hybrid MoE transformer with two attention types: full attention (`Qwen3NextAttention`) and Gated DeltaNet linear attention (`Qwen3NextGatedDeltaNet`). Layer type is determined by `config.layer_types`.
 - **Layer structure:** `Qwen3NextDecoderLayer` containing either full attention or linear attention, plus either `Qwen3NextSparseMoeBlock` (MoE layers) or `Qwen3NextMLP` (dense layers).
 - **Attention:** Full attention layers use `QKVParallelLinear` with QK norm, RoPE, GQA. Linear attention layers use `QKVZBAParallelLinear` for fused QKVZ+BA projections with Gated DeltaNet recurrence.
-- **GDN Recurrent State:** The Gated DeltaNet linear attention layers maintain per-request recurrent state. ATOM manages this state via a dedicated per-request slot pool (separate from KV cache blocks). Each sequence is assigned a `mamba_state_slot` index during allocation, and the state memory is accounted for dynamically as block equivalents within the unified KV pool.
+- **GDN Recurrent State:** The Gated DeltaNet linear attention layers maintain per-request recurrent state. ATOM manages this state via the generic per-request slot pool (separate from KV cache blocks). Each sequence is assigned a `per_req_cache_group` index during allocation, and the state memory is accounted for dynamically as block equivalents within the unified KV pool. The state tensor itself is allocated by `GDNAttentionMetadataBuilder.allocate_per_req_cache()`.
 - **MoE:** `Qwen3NextSparseMoeBlock` with `FusedMoE`, shared expert fusion support.
 - **Normalization:** Uses `GemmaRMSNorm` (aliased as `Qwen3NextRMSNorm`).
 - **MTP:** Separate draft model in `atom/models/qwen3_next_mtp.py` (`Qwen3NextMTP`).

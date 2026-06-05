@@ -43,6 +43,7 @@ class CoreManager:
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[List[Sequence]]()
         self.stream_outputs_queue = queue.Queue()
+        self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
         self.engine_core_processes = []
         self.input_sockets = []
@@ -251,6 +252,8 @@ class CoreManager:
                                 logger.debug(
                                     f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                 )
+                    elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
+                        self.utility_response_queue.put_nowait(data)
                     elif request_type == EngineCoreRequestType.ADD:
                         # logger.info(f"Engine core output sequence id: {seq.id}")
                         seqs = data
@@ -441,6 +444,47 @@ class CoreManager:
                 ],
                 copy=False,
             )
+
+    def broadcast_utility_command(self, cmd: str, **kwargs):
+        payload = {"cmd": cmd, **kwargs}
+        # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
+        serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
+        for rank in range(self.local_engine_count):
+            logger.debug(
+                f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
+            )
+            self.input_sockets[rank].send_multipart(
+                [
+                    self.engine_core_identities[rank],
+                    serialized_payload,
+                ],
+                copy=True,  # Use copy=True since we're reusing the same buffer
+            )
+
+    def broadcast_utility_command_sync(
+        self, cmd: str, timeout: float = 300.0, **kwargs
+    ):
+        # Drain any stale responses that might be left over
+        while not self.utility_response_queue.empty():
+            try:
+                self.utility_response_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.broadcast_utility_command(cmd, **kwargs)
+
+        # Collect one response per DP rank
+        responses = []
+        for _ in range(self.local_engine_count):
+            try:
+                resp = self.utility_response_queue.get(timeout=timeout)
+                responses.append(resp)
+            except queue.Empty:
+                raise TimeoutError(
+                    f"{self.label}: Timed out waiting for UTILITY_RESPONSE "
+                    f"for command '{cmd}' (timeout={timeout}s)"
+                )
+        return responses
 
     def _shutdown_engine_core_rank(self, dp_rank: int):
         if dp_rank >= len(self.engine_core_processes):

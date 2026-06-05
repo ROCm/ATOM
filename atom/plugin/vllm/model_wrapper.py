@@ -1,6 +1,8 @@
 from collections.abc import Iterable
 
+import functools
 import importlib
+import types
 import torch
 import torch.nn as nn
 from aiter.dist.parallel_state import (
@@ -26,25 +28,37 @@ from vllm.forward_context import (
 )
 
 import atom  # noqa: F401
-from atom.plugin.config import generate_atom_config_for_plugin_mode
+from atom.plugin.config import (
+    _generate_atom_config_from_vllm_config,
+    generate_atom_config_for_plugin_mode,
+)
+from atom.plugin.prepare import _set_framework_backbone
 
 import logging
 
 logger = logging.getLogger("atom")
 
-
+_MTP_MASK_INPUT_ARCH: set[str] = {
+    "DeepSeekMTPModel",
+    "Glm4MoeMTPModel",
+}
 _ATOM_MODEL_CLASSES: dict[str, str] = {
     "LlamaForCausalLM": "atom.models.llama:LlamaForCausalLM",
     "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss:GptOssForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
+    "DeepseekV32ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
-    "Qwen3NextForCausalLM": "atom.models.qwen3_next:Qwen3NextForCausalLM",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
+    "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
+    "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
+    "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
+    "Qwen3NextMTP": "atom.models.qwen3_next_mtp:Qwen3NextMTP",
+    "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
+    "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
+    "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
 }
 
 
@@ -70,12 +84,93 @@ def _prepare_env(atom_config) -> None:
     init_aiter_dist(config=atom_config)
 
 
+def _safe_get_first_arch(config_like) -> str | None:
+    if config_like is None:
+        return None
+    architectures = getattr(config_like, "architectures", None)
+    if isinstance(architectures, list) and len(architectures) > 0:
+        return architectures[0]
+    return None
+
+
+def _select_model_arch(vllm_config: VllmConfig) -> str:
+    model_arch = _safe_get_first_arch(getattr(vllm_config, "model_config", None))
+    if model_arch is None:
+        raise ValueError("Cannot determine model architecture from vLLM model_config")
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    draft_arch = _safe_get_first_arch(draft_model_config)
+    if draft_arch is None:
+        return model_arch
+    model_tag = None
+    try:
+        from vllm.compilation import backends as vllm_backends
+
+        model_tag = getattr(vllm_backends, "model_tag", None)
+    except Exception:
+        pass
+    if model_tag is None:
+        model_tag = getattr(
+            getattr(vllm_config, "compilation_config", None), "model_tag", None
+        )
+    if model_tag in {"eagle_head", "draft_model", "drafter"}:
+        logger.info(
+            f"Use draft model architecture {draft_arch} for speculative tag {model_tag}"
+        )
+        return draft_arch
+    return model_arch
+
+
+def _patch_required_act_dtype_post_load_hooks(
+    module: nn.Module,
+    act_dtype: torch.dtype,
+) -> int:
+    """Give vLLM-style post-load hooks a default dtype in plugin mode.
+
+    ATOM's loader invokes module-level post-load hooks without arguments. Some
+    vLLM modules embedded in multimodal ATOM models require an `act_dtype`
+    parameter, so adapt those instances locally instead of changing the generic
+    ATOM loader behavior.
+    """
+    import inspect
+
+    patched = 0
+    for submodule in module.modules():
+        orig = getattr(submodule, "process_weights_after_loading", None)
+        if orig is None or getattr(orig, "_atom_vllm_act_dtype_patched", False):
+            continue
+
+        try:
+            sig = inspect.signature(orig)
+        except (TypeError, ValueError):
+            continue
+
+        act_dtype_param = sig.parameters.get("act_dtype")
+        if act_dtype_param is None or act_dtype_param.default is not inspect._empty:
+            continue
+
+        @functools.wraps(orig)
+        def wrapped(act_dtype: torch.dtype = act_dtype, _orig=orig):
+            return _orig(act_dtype)
+
+        setattr(wrapped, "_atom_vllm_act_dtype_patched", True)
+        submodule.process_weights_after_loading = wrapped
+        patched += 1
+
+    return patched
+
+
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
+    # forced_model_arch: str | None = None
+
     def __init_subclass__(cls, *args, **kwargs):
         super().__init_subclass__(*args, **kwargs)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        from atom.config import get_current_atom_config, use_custom_atom_config
+
+        _set_framework_backbone("vllm")
 
         self.config = vllm_config.model_config.hf_config
         self.text_config = self.config.get_text_config()
@@ -93,11 +188,26 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.ignore_unexpected_suffixes: list[str] = []
 
         self.vllm_config = vllm_config
-        self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
+        self.is_mtp = False
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is not None:
+            spec_method = speculative_config.method
+            self.is_mtp = spec_method == "mtp"
 
+        main_model_arch = vllm_config.model_config.architectures[0]
+        model_arch = _select_model_arch(vllm_config)
+        self.is_mtp_draft_model = self.is_mtp and model_arch != main_model_arch
+        if self.is_mtp_draft_model:
+            # Generate separate config for main model and draft model to make sure
+            # that draft model has its own compilation config rather than carried
+            # over from main model. Also get the mutated hf_config from main model
+            main_atom_config = get_current_atom_config()
+            self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
+            self.atom_config.hf_config = main_atom_config.hf_config
+        else:
+            self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
+        self.model_arch = model_arch
         _prepare_env(atom_config=self.atom_config)
-
-        model_arch = vllm_config.model_config.architectures[0]
         model_cls = _get_atom_model_cls(model_arch)
         module_remapping = getattr(model_cls, "packed_modules_mapping", {})
         weights_mapper = getattr(model_cls, "hf_to_atom_mapper", {})
@@ -111,11 +221,47 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # to ATOM's format. It is invoked in ATOM's model_runner initialization, but
         # lacks correspondences in vLLM. So we invoke the translation here for vLLM OOT.
         exclude_mapping = getattr(model_cls, "quant_exclude_name_mapping", {})
+        # add exclude mapping for mtp layer of GLM5.
+        if model_arch != main_model_arch and main_model_arch == "GlmMoeDsaForCausalLM":
+            exclude_mapping.update(
+                {
+                    "indexers_proj": "indexer.weights_proj",
+                }
+            )
         if exclude_mapping and self.atom_config.quant_config is not None:
             self.atom_config.quant_config.apply_exclude_name_mapping(exclude_mapping)
 
+        default_excludes = getattr(model_cls, "quant_default_exclude_layers", [])
+        if default_excludes and self.atom_config.quant_config is not None:
+            self.atom_config.quant_config.apply_default_exclude_layers(default_excludes)
+
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
-        self.model = model_cls(self.atom_config)
+        if self.is_mtp_draft_model:
+            # Draft model's layers read get_current_atom_config() to register their
+            # static_forward_context, so swap out the global atom_config temporarily
+            # with the draft model's atom_config so that the correct forward context
+            # can be registered
+            with use_custom_atom_config(self.atom_config):
+                self.model = model_cls(self.atom_config)
+        else:
+            self.model = model_cls(self.atom_config)
+
+        num_patched_post_load_hooks = _patch_required_act_dtype_post_load_hooks(
+            self.model,
+            vllm_config.model_config.dtype,
+        )
+        if num_patched_post_load_hooks:
+            logger.info(
+                "Patched %d vLLM post-load hooks with default act_dtype "
+                "inside ATOM vLLM plugin wrapper.",
+                num_patched_post_load_hooks,
+            )
+
+        if model_arch in _MTP_MASK_INPUT_ARCH:
+            self._adapt_mtp_layers_for_vllm()
+        if self.is_mtp:
+            # Mirror nested attributes required by vLLM speculative decoding.
+            self._expose_spec_decode_attrs()
 
         # For sparse MLA, register the Indexer's DeepseekV32IndexerCache as
         # a virtual subclass of vLLM's AttentionLayerBase so vLLM can discover
@@ -123,7 +269,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self._register_indexer_caches_with_vllm()
 
         if self.model is None:
-            model_arch = vllm_config.model_config.architectures[0]
             raise ValueError(
                 f"The model {model_arch} is not supported by model impl backend atom"
             )
@@ -131,6 +276,58 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # here init aiter dist for using aiter custom collective ops
         self.pp_group = get_pp_group()
         self.tp_group = get_tp_group()
+
+    # Attributes whose writes on the outer model must propagate to the
+    # inner model so vLLM's weight-sharing reaches the forward path.
+    _WEIGHT_SHARED_ATTRS = frozenset({"embed_tokens", "embedding", "lm_head"})
+
+    def _expose_spec_decode_attrs(self) -> None:
+        """Bridge the extra nesting level between vLLM and ATOM for spec decode.
+
+        ATOM wraps the HF model with one extra level:
+          vLLM sees:  wrapper.model  (DeepSeekMTP)
+          forward uses:              .model (DeepSeekMultiTokenPredictor)
+
+        vLLM's EagleSpeculator reads/writes embed_tokens, lm_head, layers on
+        the outer model.  The forward path reads them from the inner model.
+
+        We need two things:
+        1. Mirror inner → outer so vLLM can discover the attrs.
+        2. When vLLM later *replaces* embed_tokens / lm_head with shared
+           target-model weights, propagate the write to the inner model
+           so the forward path picks up the shared tensor.
+        """
+        model = self.model
+        inner = getattr(model, "model", None)
+        if inner is None:
+            if hasattr(model, "lm_head") and not hasattr(self, "lm_head"):
+                self.lm_head = model.lm_head
+            return
+
+        # (1) Mirror: make attrs visible on the outer model for vLLM discovery.
+        for attr in (*self._WEIGHT_SHARED_ATTRS, "layers"):
+            if not hasattr(model, attr) and hasattr(inner, attr):
+                setattr(model, attr, getattr(inner, attr))
+
+        if not hasattr(self, "lm_head") and hasattr(model, "lm_head"):
+            self.lm_head = model.lm_head
+
+        # (2) Propagate: future writes on the outer model sync to the inner
+        #     model.  We create a one-off subclass so the hook only affects
+        #     this particular draft-model instance, not the base class.
+        shared = self._WEIGHT_SHARED_ATTRS
+        base_setattr = model.__class__.__setattr__
+
+        def _syncing_setattr(self_model, name, value):
+            base_setattr(self_model, name, value)
+            if name in shared and hasattr(inner, name):
+                base_setattr(inner, name, value)
+
+        model.__class__ = type(
+            model.__class__.__name__,
+            (model.__class__,),
+            {"__setattr__": _syncing_setattr},
+        )
 
     def _register_indexer_caches_with_vllm(self):
         """Register DeepseekV32IndexerCache instances with vLLM so that:
@@ -184,18 +381,66 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # their prefix parameter (e.g. "model.layers.0.self_attn.attn").
         vllm_sfc = self.vllm_compilation_config.static_forward_context
         for module in indexer_caches:
+            # MTP draft models own a separate atom_config/static_forward_context.
+            # Keep that ownership on the cache so metadata builders can bind
+            # sparse buffers back to the draft modules instead of the main model.
+            module.atom_config = self.atom_config
             prefix = module.prefix
             if prefix not in vllm_sfc:
                 vllm_sfc[prefix] = module
                 logger.info(
-                    f"Registered indexer cache in vLLM static_forward_context: "
-                    f"{prefix}"
+                    f"Registered indexer cache in vLLM static_forward_context: {prefix}"
                 )
             else:
                 logger.warning(
                     f"Indexer cache {prefix} already in vLLM "
                     f"static_forward_context, skipping"
                 )
+
+    def _adapt_mtp_layers_for_vllm(self) -> None:
+        """Install vLLM-only MTP input masking without changing model code."""
+        if not self.is_mtp_draft_model:
+            return
+
+        inner_model = getattr(self.model, "model", None)
+        layers = (
+            getattr(inner_model, "layers", None) if inner_model is not None else None
+        )
+        if layers is None:
+            return
+
+        layer_iter = layers.values() if isinstance(layers, nn.ModuleDict) else layers
+        for layer in layer_iter:
+            if getattr(layer, "_atom_vllm_mtp_masked", False):
+                continue
+
+            layer.forward = types.MethodType(
+                self._make_vllm_mtp_layer_forward(layer.forward),
+                layer,
+            )
+            layer._atom_vllm_mtp_masked = True
+
+    @staticmethod
+    def _make_vllm_mtp_layer_forward(original_forward):
+        @functools.wraps(original_forward)
+        def masked_forward(
+            self_layer,
+            input_ids,
+            positions,
+            previous_hidden_states,
+            inputs_embeds,
+            spec_step_index=0,
+        ):
+            inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
+            return original_forward(
+                input_ids,
+                positions,
+                previous_hidden_states,
+                inputs_embeds,
+                spec_step_index,
+            )
+
+        return masked_forward
 
     def forward(
         self,
@@ -212,7 +457,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         # pass positions from vLLM to OOT execution path via vLLM's per-forward context
         if is_forward_context_available():
-            get_vllm_forward_context().additional_kwargs["atom_positions"] = positions
+            forward_context = get_vllm_forward_context()
+            forward_context.additional_kwargs["atom_positions"] = positions
+            # set atom_config into vLLM forward_context in order to
+            # make sure main model and draft model can get their specific
+            # static_forward_context from their own atom_config
+            forward_context.additional_kwargs["atom_config"] = self.atom_config
         elif "positions" in self.atom_config.compilation_config.static_forward_context:
             buf = self.atom_config.compilation_config.static_forward_context[
                 "positions"
@@ -226,7 +476,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
-
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
@@ -239,8 +488,29 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # prevent circular import
         from atom.model_loader.loader import load_model_in_plugin_mode
 
+        is_mtp_draft_model = self.model_arch in {
+            "DeepSeekMTPModel",
+            "Qwen3NextMTP",
+            "Glm4MoeMTPModel",
+        }
+        draft_hf_config = None
+        if is_mtp_draft_model:
+            draft_model_config = getattr(
+                getattr(self.atom_config, "speculative_config", None),
+                "draft_model_config",
+                None,
+            )
+            if draft_model_config is not None:
+                draft_hf_config = getattr(
+                    draft_model_config, "hf_config", draft_model_config
+                )
+
         loaded_weights_record = load_model_in_plugin_mode(
-            model=self.model, config=self.atom_config, prefix="model."
+            model=self.model,
+            config=self.atom_config,
+            prefix="model.",
+            spec_decode=is_mtp_draft_model,
+            hf_config_override=draft_hf_config,
         )
         return loaded_weights_record
 
@@ -261,7 +531,6 @@ class ATOMMoEForCausalLM(ATOMModelBase, VllmModelForTextGeneration): ...
 class ATOMForConditionalGeneration(
     ATOMModelBase, VllmModelForTextGeneration, SupportsMultiModal, SupportsMRoPE
 ):
-
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         """

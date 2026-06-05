@@ -1,8 +1,3 @@
-from typing import Any
-import logging
-
-logger = logging.getLogger("atom")
-
 # all of the supported frameworks, including server mode and plugin mode
 _SUPPORTED_FRAMEWORKS = ["vllm", "sglang", "sgl", "atom"]
 
@@ -33,61 +28,3 @@ def _set_framework_backbone(framework: str) -> None:
         raise ValueError(f"Unsupported framework {framework} for ATOM to plug in")
     global _CURRENT_FRAMEWORK
     _CURRENT_FRAMEWORK = framework
-
-
-def prepare_model(config: Any, engine: str):
-    """
-    Prepare the model to upper framework SGLang
-    """
-    logger.info(f"Prepare model for plugin mode, the upper engine is {engine}")
-
-    _set_framework_backbone(engine)
-
-    if is_sglang():
-        model_arch = config.architectures[0]
-    else:
-        raise ValueError(
-            f"prepare_model does not support engine {engine!r} "
-            f"with config type {type(config)}"
-        )
-
-    # import here to avoid partial initialization
-    from .register import (
-        _ATOM_SUPPORTED_MODELS,
-        # register_ops_to_vllm,
-        register_ops_to_sglang,
-        init_aiter_dist,
-        set_attn_cls,
-    )
-
-    if model_arch not in _ATOM_SUPPORTED_MODELS:
-        supported_archs = list(_ATOM_SUPPORTED_MODELS.keys())
-        raise ValueError(
-            f"ATOM does not support the required model architecture: {model_arch}. "
-            f"For now supported model architectures: {supported_archs}"
-        )
-
-    from atom.plugin.config import generate_atom_config_for_plugin_mode
-
-    atom_config = generate_atom_config_for_plugin_mode(config)
-
-    model_cls = _ATOM_SUPPORTED_MODELS[model_arch]
-    logger.info(f"ATOM model class for {model_arch} is {model_cls}")
-
-    if is_sglang():
-        register_ops_to_sglang(atom_config=atom_config)
-
-    set_attn_cls()
-
-    # init aiter dist for using aiter custom collective ops
-    init_aiter_dist(config=atom_config)
-
-    # Patch SGLang graph_capture to also enter aiter's ca_comm.capture(),
-    # avoiding hipMemcpyAsync in aiter collectives when model uses aiter's
-    # custom all_reduce (same fix as atom/plugin/vllm/graph_capture_patch.py)
-    if is_sglang():
-        from atom.plugin.sglang.graph_capture_patch import apply_graph_capture_patch
-
-        apply_graph_capture_patch()
-
-    return model_cls(atom_config=atom_config)

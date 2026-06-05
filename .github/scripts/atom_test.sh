@@ -121,12 +121,106 @@ if [ "$TYPE" == "accuracy" ]; then
   RUN_TAG=$(date +%Y%m%d%H%M%S)
   OUTPUT_PATH=accuracy_test_results/${RUN_TAG}
   FLAT_RESULT_FILE=accuracy_test_results/${RUN_TAG}.json
-  lm_eval --model local-completions \
-          --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \
-          --tasks gsm8k \
-          --num_fewshot 3 \
-          --output_path "${OUTPUT_PATH}" \
-          2>&1 | tee "$ATOM_CLIENT_LOG"
+  CLIENT_COMMAND="${CLIENT_COMMAND:-}"
+  if [[ "${CLIENT_COMMAND}" == "null" ]]; then
+    CLIENT_COMMAND=""
+  fi
+
+  if [[ -n "${CLIENT_COMMAND}" ]]; then
+    CLIENT_COMMAND_ARGS=()
+    while IFS= read -r -d '' token; do
+      CLIENT_COMMAND_ARGS+=("${token}")
+    done < <(
+      CLIENT_COMMAND="${CLIENT_COMMAND}" \
+      MODEL_PATH_VALUE="${MODEL_PATH}" \
+      OUTPUT_PATH_VALUE="${OUTPUT_PATH}" \
+      python3 - <<'PY'
+import os
+import shlex
+import sys
+
+client_command = os.environ["CLIENT_COMMAND"]
+replacements = {
+    "${MODEL_PATH}": os.environ["MODEL_PATH_VALUE"],
+    "$MODEL_PATH": os.environ["MODEL_PATH_VALUE"],
+    "${OUTPUT_PATH}": os.environ["OUTPUT_PATH_VALUE"],
+    "$OUTPUT_PATH": os.environ["OUTPUT_PATH_VALUE"],
+}
+for src, dst in replacements.items():
+    client_command = client_command.replace(src, dst)
+
+for token in shlex.split(client_command):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
+
+    if [[ ${#CLIENT_COMMAND_ARGS[@]} -eq 0 ]]; then
+      echo "ERROR: CLIENT_COMMAND is set but empty after parsing."
+      exit 2
+    fi
+
+    for arg in "${CLIENT_COMMAND_ARGS[@]}"; do
+      if [[ "${arg}" =~ \$\{[A-Z0-9_]+\} ]] || [[ "${arg}" =~ \$[A-Z_][A-Z0-9_]* ]]; then
+        echo "ERROR: CLIENT_COMMAND contains unresolved placeholder after expansion: ${arg}"
+        exit 2
+      fi
+    done
+
+    echo "Using custom lm-eval command from client_command: ${CLIENT_COMMAND}"
+    # Background the client + tee pipeline in its own process group so
+    # wait_infer_drain.sh can supervise the engine in the foreground and we
+    # can SIGTERM the whole group on hang/fault. `set -m` (job control)
+    # gives each backgrounded pipeline its own pgid == $!.
+    set -m
+    ( "${CLIENT_COMMAND_ARGS[@]}" 2>&1 | tee "$ATOM_CLIENT_LOG" ) &
+    CLIENT_PID=$!
+    set +m
+  else
+    echo "Using default lm-eval command."
+    set -m
+    (
+      lm_eval --model local-completions \
+              --model_args "model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+              --tasks gsm8k \
+              --num_fewshot 3 \
+              --output_path "${OUTPUT_PATH}" \
+              2>&1 | tee "$ATOM_CLIENT_LOG"
+    ) &
+    CLIENT_PID=$!
+    set +m
+  fi
+
+  # Supervise: drain detects engine fault (exit 2 in <=10s), engine hang
+  # (exit 1 in <=60s), clean completion (exit 0 when client gone + no
+  # pending output), or timeout (exit 4 at MAX_MIN). Without this the
+  # accuracy step burns the full `timeout-minutes` whenever an aiter
+  # kernel asserts mid-prefill or a GPU faults — lm_eval just keeps
+  # retrying against a dead engine for 30 min.
+  echo "========== Supervising client with wait_infer_drain.sh =========="
+  # STUCK_POLLS=18 (×10s = 3 min) keeps drain patient through:
+  #   - benchmark warmup phases (tqdm rarely flushes during the initial
+  #     concurrency burst on short ISL configs)
+  #   - DP-attention SHM coordination warnings (`shared memory broadcast
+  #     block found in 60.0 seconds` is CPU-idle waiting, not a hang)
+  # Real GPU hangs / faults still surface in <=30 min (MAX_MIN unchanged).
+  bash scripts/wait_infer_drain.sh 8000 30 10 "$ATOM_CLIENT_LOG" 18
+  DRAIN_RC=$?
+  if [ "$DRAIN_RC" -ne 0 ]; then
+    echo "wait_infer_drain.sh exit=$DRAIN_RC — killing client pgid $CLIENT_PID"
+    # `kill -- -PGID` signals the whole group (set -m made CLIENT_PID == pgid).
+    # Negative target requires `--` separator so bash doesn't parse it as a flag.
+    kill -TERM -- -"$CLIENT_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$CLIENT_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL -- -"$CLIENT_PID" 2>/dev/null || true
+    wait "$CLIENT_PID" 2>/dev/null || true
+    exit "$DRAIN_RC"
+  fi
+  # Drain clean: client should be near-done. Reap exit status.
+  wait "$CLIENT_PID" || true
 
   RESULT_FILENAME=$(
     python3 - <<PY
@@ -291,19 +385,49 @@ if [ "$TYPE" == "benchmark" ]; then
     PROFILE_ARG="--profile"
     echo "Profiling enabled via --profile flag"
   fi
-  python -m atom.benchmarks.benchmark_serving \
-    --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
-    --dataset-name=random \
-    --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
-    --max-concurrency=$CONC \
-    --num-prompts=${NUM_PROMPTS_OVERRIDE:-$(( $CONC * 10 ))} \
-    --trust-remote-code \
-    --num-warmups=$(( $CONC * 2 )) \
-    --request-rate=inf --ignore-eos \
-    --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
-    --result-dir=. --result-filename=${RESULT_FILENAME}.json \
-    $PROFILE_ARG ${BENCH_EXTRA_ARGS:-} \
-    2>&1 | tee "$ATOM_CLIENT_LOG"
+  # Background the benchmark + tee pipeline in its own process group so
+  # wait_infer_drain.sh can supervise the engine in the foreground and
+  # SIGTERM the whole group on hang/fault. Same pattern as the accuracy
+  # block — see comments there.
+  set -m
+  (
+    python -m atom.benchmarks.benchmark_serving \
+      --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
+      --dataset-name=random \
+      --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
+      --max-concurrency=$CONC \
+      --num-prompts=${NUM_PROMPTS_OVERRIDE:-$(( $CONC * 10 ))} \
+      --trust-remote-code \
+      --num-warmups=$(( $CONC * 2 )) \
+      --request-rate=inf --ignore-eos \
+      --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
+      --result-dir=. --result-filename=${RESULT_FILENAME}.json \
+      $PROFILE_ARG ${BENCH_EXTRA_ARGS:-} \
+      2>&1 | tee "$ATOM_CLIENT_LOG"
+  ) &
+  CLIENT_PID=$!
+  set +m
+
+  echo "========== Supervising benchmark with wait_infer_drain.sh =========="
+  # See accuracy block above for STUCK_POLLS=18 rationale.
+  # MAX_MIN=60: high-concurrency long-context runs (e.g. DP-attention 8k/1k
+  # c=1024 with num_prompts=conc*10) take ~48 min wall (warmup + 10240 reqs);
+  # 30 min cut them off mid-run (drain exit 4). Real hangs/faults still
+  # surface fast via STUCK_POLLS / fault detection, not MAX_MIN.
+  bash scripts/wait_infer_drain.sh 8000 60 10 "$ATOM_CLIENT_LOG" 18
+  DRAIN_RC=$?
+  if [ "$DRAIN_RC" -ne 0 ]; then
+    echo "wait_infer_drain.sh exit=$DRAIN_RC — killing benchmark pgid $CLIENT_PID"
+    kill -TERM -- -"$CLIENT_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$CLIENT_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL -- -"$CLIENT_PID" 2>/dev/null || true
+    wait "$CLIENT_PID" 2>/dev/null || true
+    exit "$DRAIN_RC"
+  fi
+  wait "$CLIENT_PID" || true
 
   # Inject ISL/OSL into result JSON for summary table
   if [ -f "${RESULT_FILENAME}.json" ]; then

@@ -113,3 +113,26 @@ class TestGetExitSequence:
         seq = get_exit_sequence()
         assert seq.token_ids == [-1]
         assert seq.status == SequenceStatus.EXIT_ENGINE
+
+
+class TestSequenceFanoutFlags:
+    """Flags added so SamplingParams.n > 1 fan-out siblings can be routed."""
+
+    def test_default_flags(self):
+        seq = Sequence([1, 2, 3], 4, sampling_params=SamplingParams())
+        assert seq.needs_independent_noise is False
+        assert seq.parent_request_id is None
+        assert seq.sibling_index == 0
+
+    def test_fanout_sibling_flags(self):
+        seq = Sequence(
+            [1, 2, 3],
+            4,
+            sampling_params=SamplingParams(n=4, temperature=0.8),
+            needs_independent_noise=True,
+            parent_request_id="chatcmpl-abc",
+            sibling_index=2,
+        )
+        assert seq.needs_independent_noise is True
+        assert seq.parent_request_id == "chatcmpl-abc"
+        assert seq.sibling_index == 2

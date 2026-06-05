@@ -245,8 +245,14 @@ class Step3p5MoE(nn.Module):
         gating_output: torch.Tensor,
         topk: int,
         renormalize: bool,
+        hidden_states: Optional[torch.Tensor] = None,
     ):
         """Sigmoid routing with additive bias and scaling.
+
+        ``hidden_states`` is accepted for compatibility with the framework's
+        custom-routing calling convention (used by per-token hash routing in
+        other models); Step-3.5 routing is computed from ``gating_output`` only
+        and ignores it.
 
         When the shared expert is fused (self._n_shared_fused == 1), topk is
         top_k_routed + 1.  We select top_k_routed routed experts and append

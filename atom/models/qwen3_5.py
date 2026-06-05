@@ -1,5 +1,6 @@
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -21,7 +22,6 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
 )
-from atom.plugin.prepare import is_vllm
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from atom.models.qwen3_next import (
     Qwen3NextAttention,
@@ -40,23 +40,70 @@ from atom.models.utils import (
     maybe_prefix,
     extract_layer_index,
 )
-from atom.model_ops.split_chunk import (
-    fused_split_chunk_zeros,
-    fused_split_chunk_zeros_qwen3_5_qkvzba,
-)
-
-if is_vllm():
-    from vllm.model_executor.layers.mamba.mamba_utils import (
-        MambaStateShapeCalculator,
-        MambaStateDtypeCalculator,
-        MambaStateCopyFunc,
-        MambaStateCopyFuncCalculator,
-    )
 
 
 def get_qwen3_5_text_config(atom_config: Config):
     hf_config = atom_config.hf_config
     return hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
+
+
+def build_qwen3_5_mrope_input_positions(
+    input_tokens: list[int],
+    image_grid_thw,
+    video_grid_thw,
+    image_token_id: int,
+    video_token_id: int,
+    vision_start_token_id: int,
+    vision_end_token_id: int,
+    spatial_merge_size: int,
+) -> tuple[np.ndarray, int]:
+    """Build request-level Qwen3.5-VL MRoPE positions for prompt tokens."""
+    from aiter.rotary_embedding import MRotaryEmbedding
+
+    positions, delta = MRotaryEmbedding.get_input_positions(
+        input_tokens,
+        image_grid_thw,
+        video_grid_thw if video_grid_thw is not None else [],
+        image_token_id,
+        video_token_id,
+        vision_start_token_id,
+        vision_end_token_id,
+        spatial_merge_size,
+    )
+    return np.asarray(positions, dtype=np.int64), int(delta)
+
+
+def _get_qwen3_5_mrope_input_positions(
+    atom_config: Config,
+    input_tokens: list[int],
+    multimodal_data: dict,
+) -> tuple[np.ndarray | None, int]:
+    """Return Qwen3.5 request-level MRoPE positions when applicable."""
+
+    multimodal_config = atom_config.multimodal_config
+    if multimodal_config is None:
+        return None, 0
+
+    model_type = getattr(multimodal_config, "model_type", None)
+    if model_type not in {"qwen3_5", "qwen3_5_moe"}:
+        return None, 0
+
+    vision_config = getattr(multimodal_config, "vision_config", None)
+    if vision_config is None or "image_grid_thw" not in multimodal_data:
+        return None, 0
+
+    return build_qwen3_5_mrope_input_positions(
+        input_tokens,
+        multimodal_data.get("image_grid_thw"),
+        multimodal_data.get("video_grid_thw"),
+        image_token_id=getattr(multimodal_config, "image_token_id", 248056),
+        video_token_id=getattr(multimodal_config, "video_token_id", 248057),
+        vision_start_token_id=getattr(
+            multimodal_config, "vision_start_token_id", 248053
+        ),
+        vision_end_token_id=getattr(multimodal_config, "vision_end_token_id", 248054),
+        spatial_merge_size=getattr(vision_config, "spatial_merge_size", 2),
+    )
 
 
 # Qwen3.5 MoE models have some checkpoints where expert weights are fused together in BF16 format, so we need special handling to load those weights into our per-expert parameters.
@@ -243,7 +290,6 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
         x_fp8=None,
         x_scale=None,
     ):
@@ -251,35 +297,36 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         Forward pass with three parts:
         1. Input projection
         2. Core attention (custom op)
-        3. Output projection
         """
         num_tokens = hidden_states.size(0)
 
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
+        v_heads_tp = self.num_v_heads // self.tp_size
+        qkv_size = self.conv_dim // self.tp_size
+        z_size = v_heads_tp * self.head_v_dim
+        b_size = v_heads_tp
+        a_size = v_heads_tp
+
         if hasattr(self, "in_proj_qkvzba"):
             qkvzba = self.in_proj_qkvzba(hidden_states)
-            k_heads_after_tp = self.num_k_heads // self.tp_size
-            v_heads_after_tp = self.num_v_heads // self.tp_size
-            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_zeros_qwen3_5_qkvzba(
-                qkvzba,
-                k_heads_after_tp,
-                v_heads_after_tp,
-                self.head_k_dim,
-                self.head_v_dim,
+            # Qwen3.5 layout is already contiguous [q|k|v|z|b|a]
+            mixed_qkv, z_flat, b, a = torch.split(
+                qkvzba, [qkv_size, z_size, b_size, a_size], dim=-1
             )
         else:
-            mixed_qkvz = self.in_proj_qkvz(hidden_states)
-            ba = self.in_proj_ba(hidden_states)
+            if x_fp8 is not None:
+                mixed_qkvz = self.in_proj_qkvz(x_fp8, x_scale=x_scale)
+            else:
+                mixed_qkvz = self.in_proj_qkvz(hidden_states)
+            projected_ba = self.in_proj_ba(hidden_states)
+            # Qwen3.5 layout is already contiguous [q|k|v|z] and [b|a]
+            mixed_qkv, z_flat = torch.split(mixed_qkvz, [qkv_size, z_size], dim=-1)
+            b, a = torch.split(projected_ba, [b_size, a_size], dim=-1)
 
-            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-            z_size = self.value_dim // self.tp_size
-            num_v_heads_tp = self.num_v_heads // self.tp_size
-
-            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_zeros(
-                mixed_qkvz, ba, qkv_size, z_size, self.head_v_dim, num_v_heads_tp
-            )
+        z = z_flat.view(num_tokens, v_heads_tp, self.head_v_dim)
+        core_attn_out = torch.empty_like(z)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -290,7 +337,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # Part 3: Output Projection
         # ============================================================
         core_attn_out, maybe_scale = self.norm(core_attn_out, z)
-        output[:num_tokens] = self.out_proj(core_attn_out, x_scale=maybe_scale)
+        output = self.out_proj(core_attn_out, x_scale=maybe_scale)
+        return output
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
@@ -375,7 +423,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         "input_ids": 0,
         # positions is of shape (3, seq_len) if mrope is enabled for qwen2-vl,
         # otherwise (seq_len, ).
-        "positions": -1,
+        "positions": [0, -1],
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
     }
@@ -493,6 +541,25 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
         )
 
 
+_BF16_IN_PROJ_MAPPING = {
+    "in_proj_qkv": ("in_proj_qkvzba", (0, 1, 2)),
+    "in_proj_z": ("in_proj_qkvzba", 3),
+    "in_proj_b": ("in_proj_qkvzba", 4),
+    "in_proj_a": ("in_proj_qkvzba", 5),
+}
+
+
+def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Config) -> dict:
+    if atom_config.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
+        return mapping
+
+    mapping.pop("in_proj_qkvz", None)
+    mapping.pop("in_proj_ba", None)
+    mapping["in_proj_qkvzba"] = ("in_proj_qkvzba", None)
+    mapping.update(_BF16_IN_PROJ_MAPPING)
+    return mapping
+
+
 class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
@@ -520,6 +587,9 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         self.config = atom_config.hf_config
+        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+            dict(self.packed_modules_mapping), atom_config
+        )
         self.visual = PPMissingLayer()
         self.language_model = Qwen3_5ForCausalLM(atom_config=atom_config, prefix="")
         self.make_empty_intermediate_tensors = (
@@ -540,6 +610,8 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
     ):
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -557,6 +629,9 @@ class Qwen3_5MoeForConditionalGenerationTextOnly(
     def __init__(self, atom_config: Config, prefix: str = ""):
         nn.Module.__init__(self)
         self.config = atom_config.hf_config
+        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+            dict(self.packed_modules_mapping), atom_config
+        )
         self.visual = PPMissingLayer()
         self.language_model = Qwen3_5MoeForCausalLM(atom_config=atom_config, prefix="")
         self.make_empty_intermediate_tensors = (
@@ -609,359 +684,145 @@ class Qwen3_5MoeForConditionalGenerationTextOnly(
         return self.language_model.get_expert_mapping()
 
 
-########################################################
-# Qwen3_5-Dense
-########################################################
-
-# ConditionalGeneration model scope should only works on plugin mode
-if is_vllm():
-    from vllm.config import VllmConfig
-    from vllm.model_executor.models.qwen3_vl import (
-        Qwen3VLMultiModalProcessor,
-        Qwen3VLDummyInputsBuilder,
-        Qwen3_VisionTransformer,
-    )
-    from vllm.model_executor.models.qwen3_5 import (
-        Qwen3_5ProcessingInfo,
-        Qwen3_5MoeProcessingInfo,
+class _Qwen3_5MultimodalBase(nn.Module):
+    packed_modules_mapping = (
+        Qwen3_5ForConditionalGenerationTextOnly.packed_modules_mapping.copy()
     )
 
-    from vllm.model_executor.models.qwen3_5 import (
-        Qwen3_5ForConditionalGeneration as vLLMQwen3_5,
-    )
-    from vllm.model_executor.models.qwen3_5 import (
-        Qwen3_5MoeForConditionalGeneration as vLLMQwen3_5Moe,
-    )
-    from vllm.multimodal import MULTIMODAL_REGISTRY
-    from vllm.model_executor.models.interfaces import IsHybrid
-    from atom.model_loader.loader import load_model_in_plugin_mode, WeightsMapper
-    from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
+    # Weight name mapping: checkpoint -> native ATOM module names.
+    hf_to_atom_mapper = {
+        "model.visual.": "visual.",
+        "lm_head.": "language_model.lm_head.",
+        "model.language_model.": "language_model.model.",
+    }
 
-    @MULTIMODAL_REGISTRY.register_processor(
-        Qwen3VLMultiModalProcessor,
-        info=Qwen3_5ProcessingInfo,
-        dummy_inputs=Qwen3VLDummyInputsBuilder,
-    )
-    class Qwen3_5ForConditionalGeneration_(vLLMQwen3_5):
-        packed_modules_mapping = {
-            "q_proj": ("qkv_proj", "q"),
-            "k_proj": ("qkv_proj", "k"),
-            "v_proj": ("qkv_proj", "v"),
-            "gate_proj": ("gate_up_proj", 0),
-            "up_proj": ("gate_up_proj", 1),
-            "gate_up_proj": ["gate_proj", "up_proj"],  # BF16 models: fused → split
-            "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
-            "in_proj_z": ("in_proj_qkvz", 3),
-            "in_proj_b": ("in_proj_ba", 0),
-            "in_proj_a": ("in_proj_ba", 1),
-            ".gate.": (".gate.", 0),
-            "shared_expert_gate": ("gate", 1),
-        }
+    # Remap quant exclude layer names from checkpoint format to native names.
+    quant_exclude_name_mapping = {
+        "model.visual.": "visual.",
+        "lm_head.": "language_model.lm_head.",
+        "model.language_model.": "language_model.model.",
+    }
 
-        hf_to_atom_mapper = WeightsMapper(
-            orig_to_new_prefix={
-                "model.visual.": "visual.",
-                "lm_head.": "language_model.lm_head.",
-                "model.language_model.": "language_model.model.",
-            }
-        )
-        hf_to_vllm_mapper = hf_to_atom_mapper
+    language_model_cls = Qwen3_5ForCausalLM
 
-        def __init__(self, atom_config: Config, prefix: str = "model"):
-            # protocols have not __init__ method, so we need to use nn.Module.__init__
-            nn.Module.__init__(self)
-            config: Qwen3_5Config = atom_config.hf_config
-            vllm_config = atom_config.plugin_config.vllm_config
-            quant_config = vllm_config.quant_config
-            multimodal_config = vllm_config.model_config.multimodal_config
-            self.atom_config = atom_config
-            if (
-                self.atom_config.quant_config.global_quant_config.quant_dtype
-                == torch.bfloat16
-            ):
-                self.packed_modules_mapping.pop("in_proj_qkv")
-                self.packed_modules_mapping.pop("in_proj_b")
-                self.packed_modules_mapping.pop("in_proj_a")
-                self.packed_modules_mapping["in_proj_qkv"] = (
-                    "in_proj_qkvzba",
-                    (0, 1, 2),
-                )
-                self.packed_modules_mapping["in_proj_z"] = ("in_proj_qkvzba", (3))
-                self.packed_modules_mapping["in_proj_b"] = ("in_proj_qkvzba", (4))
-                self.packed_modules_mapping["in_proj_a"] = ("in_proj_qkvzba", (5))
-
-            self.config = config
-            self.multimodal_config = multimodal_config
-            self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-            self.video_pruning_rate = multimodal_config.video_pruning_rate
-            self.is_multimodal_pruning_enabled = (
-                multimodal_config.is_multimodal_pruning_enabled()
-            )
-            with self._mark_tower_model(vllm_config, {"image", "video"}):
-                self.visual = Qwen3_VisionTransformer(
-                    config.vision_config,
-                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, "visual"),
-                )
-
-            with self._mark_language_model(vllm_config):
-                self.language_model = Qwen3_5ForCausalLM(
-                    atom_config=atom_config,
-                    prefix=maybe_prefix("", "language_model"),
-                )
-            self.make_empty_intermediate_tensors = (
-                self.language_model.make_empty_intermediate_tensors
-            )
-
-        def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-            # load weights in plugin mode and discard passed weights generator
-            # here prefix is "model." because Qwen3ForCausalLM is constructed in model
-            # wrapper class, so the name of loaded weights are prefixed with "model.".
-            # The vLLM will check the name of the loaded weights to make sure all the
-            # weights are loaded correctly
-            loaded_weights_record = load_model_in_plugin_mode(
-                model=self,
-                config=self.atom_config,
-                prefix="model.",
-                weights_mapper=self.hf_to_atom_mapper,
-            )
-            return loaded_weights_record
-
-    ########################################################
-    # Qwen3_5-MoE
-    ########################################################
-
-    class Qwen3_5MoeForConditionalGeneration_(vLLMQwen3_5Moe):
-        packed_modules_mapping = {
-            "q_proj": ("qkv_proj", "q"),
-            "k_proj": ("qkv_proj", "k"),
-            "v_proj": ("qkv_proj", "v"),
-            "gate_proj": ("gate_up_proj", 0),
-            "up_proj": ("gate_up_proj", 1),
-            "gate_up_proj": ["gate_proj", "up_proj"],  # BF16 models: fused → split
-            "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
-            "in_proj_z": ("in_proj_qkvz", 3),
-            "in_proj_b": ("in_proj_ba", 0),
-            "in_proj_a": ("in_proj_ba", 1),
-            ".gate.": (".gate.", 0),
-            "shared_expert_gate": ("gate", 1),
-        }
-
-        hf_to_atom_mapper = WeightsMapper(
-            orig_to_new_prefix={
-                "model.visual.": "visual.",
-                "lm_head.": "language_model.lm_head.",
-                "model.language_model.": "language_model.model.",
-            }
+    @staticmethod
+    def get_mrope_input_positions(
+        atom_config: Config,
+        input_tokens: list[int],
+        multimodal_data: dict,
+    ) -> tuple[np.ndarray | None, int]:
+        return _get_qwen3_5_mrope_input_positions(
+            atom_config, input_tokens, multimodal_data
         )
 
-        def __init__(self, atom_config: Config, prefix: str = "model"):
-            # protocols have not __init__ method, so we need to use nn.Module.__init__
-            nn.Module.__init__(self)
-            self.atom_config = atom_config
-            vllm_config = atom_config.plugin_config.vllm_config
-            atom_config.hf_config.text_config.n_shared_experts = 1
-            atom_config.hf_config.text_config.n_routed_experts = (
-                atom_config.hf_config.text_config.num_experts
-            )
-            config: Qwen3_5MoeConfig = atom_config.hf_config
-            quant_config = vllm_config.quant_config
-            multimodal_config = vllm_config.model_config.multimodal_config
-            if (
-                self.atom_config.quant_config.global_quant_config.quant_dtype
-                == torch.bfloat16
-            ):
-                self.packed_modules_mapping.pop("in_proj_qkv")
-                self.packed_modules_mapping.pop("in_proj_b")
-                self.packed_modules_mapping.pop("in_proj_a")
-                self.packed_modules_mapping["in_proj_qkv"] = (
-                    "in_proj_qkvzba",
-                    (0, 1, 2),
-                )
-                self.packed_modules_mapping["in_proj_z"] = ("in_proj_qkvzba", (3))
-                self.packed_modules_mapping["in_proj_b"] = ("in_proj_qkvzba", (4))
-                self.packed_modules_mapping["in_proj_a"] = ("in_proj_qkvzba", (5))
+    def __init__(self, atom_config: Config, prefix: str = ""):
+        super().__init__()
+        from atom.models.qwen3_5_vl import Qwen3VisionTransformer
 
-            self.config = config
-            self.multimodal_config = multimodal_config
-            self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-            self.video_pruning_rate = multimodal_config.video_pruning_rate
-            self.is_multimodal_pruning_enabled = (
-                multimodal_config.is_multimodal_pruning_enabled()
-            )
+        self.config = atom_config.hf_config
+        multimodal_config = atom_config.multimodal_config
+        if multimodal_config is None:
+            raise ValueError("Qwen3.5 multimodal models require multimodal_config")
 
-            with self._mark_tower_model(vllm_config, {"image", "video"}):
-                self.visual = Qwen3_VisionTransformer(
-                    config.vision_config,
-                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, "visual"),
-                )
-
-            with self._mark_language_model(vllm_config):
-                self.language_model = Qwen3_5MoeForCausalLM(
-                    atom_config=atom_config, prefix=maybe_prefix("", "language_model")
-                )
-
-            self.make_empty_intermediate_tensors = (
-                self.language_model.make_empty_intermediate_tensors
-            )
-
-        def detect_fused_expert_format(self, weight_name: str) -> bool:
-            """Detect if weight is from fused expert checkpoint (BF16 format)."""
-            # Qwen3.5 BF16 has: experts.gate_up_proj, experts.down_proj
-            # Qwen3.5 FP8 has: experts.0.gate_proj, experts.0.up_proj, experts.0.down_proj
-            return detect_fused_expert_format(weight_name)
-
-        def get_fused_expert_mapping(self) -> list[tuple[str, str, str]]:
-            """Return mapping for fused expert weights (BF16 format)."""
-            # (param_name, weight_name, shard_id)
-            return get_fused_expert_mapping()
-
-        def load_fused_expert_weights(
-            self,
-            original_name: str,
-            name: str,
-            params_dict: dict,
-            loaded_weight: torch.Tensor,
-            shard_id: str,
-            num_experts: int,
-        ) -> bool:
-            """Load fused expert weights (BF16 format) into per-expert parameters.
-
-            Args:
-                original_name: Original weight name from checkpoint (e.g., "experts.gate_up_proj")
-                name: Mapped parameter name (e.g., "experts.w13_weight")
-                params_dict: Model parameters dict
-                loaded_weight: The weight tensor to load
-                shard_id: Shard identifier ("w1", "w2", "w3")
-                num_experts: Number of experts
-
-            Returns:
-                True if weights were loaded successfully
-            """
-            return load_fused_expert_weights(
-                original_name,
-                name,
-                params_dict,
-                loaded_weight,
-                shard_id,
-                num_experts,
-            )
-
-        def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-            # load weights in plugin mode and discard passed weights generator
-            # here prefix is "model." because Qwen3ForCausalLM is constructed in model
-            # wrapper class, so the name of loaded weights are prefixed with "model.".
-            # The vLLM will check the name of the loaded weights to make sure all the
-            # weights are loaded correctly
-            loaded_weights_record = load_model_in_plugin_mode(
-                model=self,
-                config=self.atom_config,
-                prefix="model.",
-                weights_mapper=self.hf_to_atom_mapper,
-                load_fused_expert_weights_fn=self.load_fused_expert_weights,
-            )
-            return loaded_weights_record
-
-        def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-            return self.language_model.get_expert_mapping()
-
-        def embed_multimodal(self, **kwargs):
-            return super().embed_multimodal(**kwargs)
-
-    @MULTIMODAL_REGISTRY.register_processor(
-        Qwen3VLMultiModalProcessor,
-        info=Qwen3_5ProcessingInfo,
-        dummy_inputs=Qwen3VLDummyInputsBuilder,
-    )
-    class Qwen3_5ForConditionalGeneration(ATOMForConditionalGeneration, IsHybrid):
-        packed_modules_mapping = {
-            "q_proj": ("qkv_proj", "q"),
-            "k_proj": ("qkv_proj", "k"),
-            "v_proj": ("qkv_proj", "v"),
-            "gate_proj": ("gate_up_proj", 0),
-            "up_proj": ("gate_up_proj", 1),
-            "gate_up_proj": ["gate_proj", "up_proj"],  # BF16 models: fused → split
-            "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
-            "in_proj_z": ("in_proj_qkvz", 3),
-            "in_proj_b": ("in_proj_ba", 0),
-            "in_proj_a": ("in_proj_ba", 1),
-            ".gate.": (".gate.", 0),
-            "shared_expert_gate": ("gate", 1),
-        }
-
-        hf_to_atom_mapper = WeightsMapper(
-            orig_to_new_prefix={
-                "lm_head.": "language_model.lm_head.",
-                "model.language_model.": "language_model.model.",
-            }
+        self._prepare_text_config(atom_config)
+        self.visual = Qwen3VisionTransformer(
+            multimodal_config.vision_config,
+            norm_eps=getattr(multimodal_config, "rms_norm_eps", 1e-6),
         )
-        hf_to_vllm_mapper = hf_to_atom_mapper
+        self.language_model = self.language_model_cls(
+            atom_config=atom_config,
+            prefix=maybe_prefix("", "language_model"),
+        )
+        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+            dict(self.packed_modules_mapping), atom_config
+        )
+        self.image_token_id = getattr(multimodal_config, "image_token_id", 248056)
+        self.video_token_id = getattr(multimodal_config, "video_token_id", 248057)
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
 
-        def embed_multimodal(self, **kwargs):
-            return self.model.embed_multimodal(**kwargs)
+    def _prepare_text_config(self, atom_config: Config) -> None:
+        pass
 
-        @classmethod
-        def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-            if modality.startswith("image"):
-                return "<|vision_start|><|image_pad|><|vision_end|>"
-            if modality.startswith("video"):
-                return "<|vision_start|><|video_pad|><|vision_end|>"
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.model.get_input_embeddings(input_ids)
 
-            raise ValueError("Only image or video modality is supported")
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.embed_input_ids(input_ids)
 
-        @classmethod
-        def get_mamba_state_dtype_from_config(
-            cls,
-            vllm_config: "VllmConfig",
-        ) -> tuple[torch.dtype, torch.dtype]:
-            return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-                vllm_config.model_config.dtype,
-                vllm_config.cache_config.mamba_cache_dtype,
-                vllm_config.cache_config.mamba_ssm_cache_dtype,
-            )
+    def get_vision_embeddings(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        return self.visual(pixel_values, grid_thw)
 
-        @classmethod
-        def get_mamba_state_shape_from_config(
-            cls, vllm_config: "VllmConfig"
-        ) -> tuple[tuple[int, int], tuple[int, int]]:
-            parallel_config = vllm_config.parallel_config
-            hf_config = vllm_config.model_config.hf_text_config
-            tp_size = parallel_config.tensor_parallel_size
-            num_spec = (
-                vllm_config.speculative_config.num_speculative_tokens
-                if vllm_config.speculative_config
-                else 0
-            )
-            return MambaStateShapeCalculator.gated_delta_net_state_shape(
-                tp_size,
-                hf_config.linear_num_key_heads,
-                hf_config.linear_num_value_heads,
-                hf_config.linear_key_head_dim,
-                hf_config.linear_value_head_dim,
-                hf_config.linear_conv_kernel_dim,
-                num_spec,
-            )
+    def merge_multimodal_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        vision_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = input_ids == self.image_token_id
+        inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
+        return inputs_embeds
 
-        @classmethod
-        def get_mamba_state_copy_func(
-            cls,
-        ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
-            return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **_: object,
+    ):
+        # Keep the compiled language model on the inputs_embeds path so vision
+        # embeddings are not dropped after text-only warmup.
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
 
-        def load_weights(
-            self,
-            weights: Iterable[tuple[str, torch.Tensor]],
-        ) -> set[str]:
-            return self.model.load_weights(weights)
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.language_model.compute_logits(hidden_states)
 
-    @MULTIMODAL_REGISTRY.register_processor(
-        Qwen3VLMultiModalProcessor,
-        info=Qwen3_5MoeProcessingInfo,
-        dummy_inputs=Qwen3VLDummyInputsBuilder,
-    )
-    class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration, IsHybrid):
-        def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-            return self.model.get_expert_mapping()
+
+class Qwen3_5MultimodalModel(_Qwen3_5MultimodalBase):
+    pass
+
+
+class Qwen3_5MoeMultimodalModel(_Qwen3_5MultimodalBase):
+    language_model_cls = Qwen3_5MoeForCausalLM
+
+    def _prepare_text_config(self, atom_config: Config) -> None:
+        text_config = atom_config.hf_config.text_config
+        if not hasattr(text_config, "n_shared_experts"):
+            text_config.n_shared_experts = 1
+        if not hasattr(text_config, "n_routed_experts"):
+            text_config.n_routed_experts = text_config.num_experts
+
+    def detect_fused_expert_format(self, weight_name: str) -> bool:
+        return detect_fused_expert_format(weight_name)
+
+    def get_fused_expert_mapping(self) -> list[tuple[str, str, str]]:
+        return get_fused_expert_mapping()
+
+    def load_fused_expert_weights(
+        self,
+        original_name: str,
+        name: str,
+        params_dict: dict,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        num_experts: int,
+    ) -> bool:
+        return load_fused_expert_weights(
+            original_name,
+            name,
+            params_dict,
+            loaded_weight,
+            shard_id,
+            num_experts,
+        )
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return self.language_model.get_expert_mapping()

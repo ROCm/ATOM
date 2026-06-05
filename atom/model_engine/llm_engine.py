@@ -5,10 +5,11 @@ import itertools
 import logging
 import time
 from dataclasses import fields
-from typing import List, Union
+from typing import List, Optional, Union
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
+from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -35,6 +36,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
+        data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
@@ -47,6 +49,8 @@ class LLMEngine:
         config.stop_token_ids = list(stop_token_ids)
         # Set data parallel size in config
         config.parallel_config.data_parallel_size = data_parallel_size
+        if data_parallel_master_port is not None:
+            config.parallel_config.data_parallel_master_port = data_parallel_master_port
         self.data_parallel_size = data_parallel_size
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
@@ -80,6 +84,8 @@ class LLMEngine:
         prompt_or_tokens_list: List[Union[str, List[int]]],
         sampling_params_list: SamplingParams | List[SamplingParams],
         stream_callback=None,
+        multimodal_data_list: List[dict] | None = None,
+        request_ids: Optional[list[str]] = None,
     ):
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
@@ -106,12 +112,42 @@ class LLMEngine:
         else:
             stream_callback_iter = itertools.repeat(None)
 
+        # Handle multimodal data
+        if multimodal_data_list is not None:
+            if len(prompt_or_tokens_list) != len(multimodal_data_list):
+                raise ValueError(
+                    f"number of elements in prompt_or_tokens_list and multimodal_data_list is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(multimodal_data_list)=}"
+                )
+            mm_data_iter = multimodal_data_list
+        else:
+            mm_data_iter = itertools.repeat(None)
+
+        # Handle request_ids
+        if request_ids is not None:
+            if len(request_ids) != len(prompt_or_tokens_list):
+                raise ValueError(
+                    "number of elements in prompt_or_tokens_list and request_ids is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(request_ids)=}"
+                )
+            request_id_iter = iter(request_ids)
+        else:
+            request_id_iter = itertools.repeat(None)
+
         reqs = []
-        for prompt, sampling_param, callback in zip(
-            prompt_or_tokens_list, sampling_params_iter, stream_callback_iter
+        for prompt, sampling_param, callback, mm_data, request_id in zip(
+            prompt_or_tokens_list,
+            sampling_params_iter,
+            stream_callback_iter,
+            mm_data_iter,
+            request_id_iter,
         ):
             req = self.io_processor.preprocess(
-                prompt, sampling_param, stream_callback=callback
+                prompt,
+                sampling_param,
+                stream_callback=callback,
+                multimodal_data=mm_data,
+                request_id=request_id,
             )
             reqs.append(req)
         self.core_mgr.add_request(reqs)
@@ -125,14 +161,38 @@ class LLMEngine:
 
     def generate(
         self,
-        # prompts: list[str] | list[list[int]],
         prompts: list[str],
         sampling_params: SamplingParams | list[SamplingParams],
+        request_ids: Optional[list[str]] = None,
     ) -> list[str]:
         # Reset round-robin counter to ensure consistent DP not core dump
         self.core_mgr._rr_counter = 0
 
-        self.add_request(prompts, sampling_params)
+        self.add_request(prompts, sampling_params, request_ids=request_ids)
+        outputs = {}
+        while not self.is_finished() and (
+            self.core_mgr.is_alive() or self.core_mgr.is_rest()
+        ):
+            seqs = self.step()
+            outs = self.io_processor.postprocess(seqs)
+            outputs.update(outs)
+
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
+        return outputs
+
+    def generate_multimodal(
+        self,
+        token_ids_list: list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        multimodal_data_list: list[dict],
+    ) -> list[dict]:
+        """Generate completions for multimodal inputs (token IDs + vision data)."""
+        self.core_mgr._rr_counter = 0
+        self.add_request(
+            token_ids_list,
+            sampling_params,
+            multimodal_data_list=multimodal_data_list,
+        )
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -162,7 +222,14 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
-        self.mamba_enabled = False
+        # `has_per_req_cache` flags model architectures that need a
+        # per-request stateful buffer outside the paged KV pool. Sequences
+        # constructed for these models trigger BlockManager to reserve a
+        # per-req cache slot. Currently: GDN-based models (Qwen3-Next /
+        # Qwen3.5). Future stateful models (DeepseekV4, etc.) extend the set.
+        self._external_to_internal: dict[str, int] = {}
+        self._internal_to_external: dict[int, str] = {}
+        self.has_per_req_cache = False
         self.num_speculative_tokens = 0
         if (
             hasattr(self.config, "speculative_config")
@@ -171,9 +238,27 @@ class InputOutputProcessor:
             self.num_speculative_tokens = (
                 self.config.speculative_config.num_speculative_tokens
             )
-        mamba_model_types = {"qwen3_next", "qwen3_5_text", "qwen3_5_moe_text"}
-        if self.config.hf_config.model_type in mamba_model_types:
-            self.mamba_enabled = True
+        if self.config.hf_config.model_type in self._per_req_cache_model_types():
+            self.has_per_req_cache = True
+
+    @staticmethod
+    def _per_req_cache_model_types() -> frozenset[str]:
+        """Single source of truth for which model_types use per-req cache.
+
+        Read by Sequence-construction (here) AND by ModelRunner's startup
+        sanity check, which asserts that any model whose attention builder
+        returns `compute_per_req_cache_bytes() > 0` has its model_type
+        registered here. Adding a new stateful-attention model means
+        adding its model_type to this set.
+        """
+        return frozenset(
+            {
+                "qwen3_next",
+                "qwen3_5_text",
+                "qwen3_5_moe_text",
+                "deepseek_v4",
+            }
+        )
 
     def preprocess(
         self,
@@ -181,15 +266,73 @@ class InputOutputProcessor:
         sampling_params: SamplingParams,
         stream_callback=None,
         kv_transfer_params=None,
+        multimodal_data=None,
+        request_id: Optional[str] = None,
     ):
         """responsible for:
         1) Tokenize
-        2) Create Sequence object"""
+        2) Create Sequence object
+
+        Single-sequence entry point. Rejects ``sampling_params.n > 1`` so that
+        callers which expect exactly one ``Sequence`` back cannot silently
+        drop the other siblings. Use :meth:`preprocess_fanout` for n > 1.
+        """
+        if getattr(sampling_params, "n", 1) > 1:
+            raise ValueError(
+                "preprocess() returns a single Sequence; for SamplingParams.n > 1 "
+                "call preprocess_fanout() and manage the returned list."
+            )
+        seqs = self.preprocess_fanout(
+            prompt_or_tokens,
+            sampling_params,
+            stream_callback=stream_callback,
+            kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
+            parent_request_id=request_id,
+        )
+        return seqs[0]
+
+    def preprocess_fanout(
+        self,
+        prompt_or_tokens: str | list[int],
+        sampling_params: SamplingParams,
+        stream_callback=None,
+        stream_callbacks: Optional[List] = None,
+        kv_transfer_params=None,
+        multimodal_data=None,
+        parent_request_id: Optional[str] = None,
+    ) -> List[Sequence]:
+        """Tokenize once and materialize ``sampling_params.n`` Sequences.
+
+        Returns a list of length ``n``. For ``n == 1`` this is functionally
+        equivalent to the legacy single-sequence path. For ``n > 1``:
+
+        * The prompt is tokenized a single time and the token list is copied
+          into each sibling (``Sequence`` copies internally, so mutations stay
+          isolated).
+        * Every sibling is marked ``needs_independent_noise=True`` so the
+          sampler generates fresh per-row noise instead of reusing the cached
+          shared exponential tensor. Without this, siblings with identical
+          logits would emit identical tokens.
+        * Per-sibling ``stream_callbacks`` can be supplied to route streaming
+          deltas to independent queues (one per choice index). Falls back to
+          the scalar ``stream_callback`` for every sibling.
+        """
+        n = max(1, int(getattr(sampling_params, "n", 1)))
+
         tokens = (
             self.tokenizer.encode(prompt_or_tokens)
             if isinstance(prompt_or_tokens, str)
             else prompt_or_tokens
         )
+        mrope_positions = None
+        mrope_position_delta = 0
+        if multimodal_data is not None:
+            mrope_positions, mrope_position_delta = get_mrope_input_positions(
+                self.config,
+                tokens,
+                multimodal_data,
+            )
 
         stop_token_sequences = []
         if sampling_params.stop_strings:
@@ -199,28 +342,57 @@ class InputOutputProcessor:
                 else sampling_params.stop_strings
             )
             for stop_str in stops:
-                # Encode the full stop string as a sequence of tokens
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
 
-        seq = Sequence(
-            tokens,
-            self.block_size,
-            sampling_params,
-            stop_token_sequences,
-            stream_callback=stream_callback,
-            num_draft_tokens=self.num_speculative_tokens,
-            mamba_enabled=self.mamba_enabled,
-            kv_transfer_params=kv_transfer_params,
-        )
-        seq.arrive_time = time.time()
-        self.requests[seq.id] = seq
-        logger.info(
-            f"Request {seq.id} arrived, input tokens: {len(tokens)}, pending requests: {len(self.requests)} "
-            # f"<{prompt_or_tokens=}>"
-        )
-        return seq
+        if stream_callbacks is not None and len(stream_callbacks) != n:
+            raise ValueError(
+                f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
+            )
+
+        seqs: List[Sequence] = []
+        for i in range(n):
+            cb = (
+                stream_callbacks[i] if stream_callbacks is not None else stream_callback
+            )
+            seq = Sequence(
+                tokens,
+                self.block_size,
+                sampling_params,
+                stop_token_sequences,
+                stream_callback=cb,
+                num_draft_tokens=self.num_speculative_tokens,
+                has_per_req_cache=self.has_per_req_cache,
+                kv_transfer_params=kv_transfer_params,
+                multimodal_data=multimodal_data,
+                mrope_positions=mrope_positions,
+                mrope_position_delta=mrope_position_delta,
+                needs_independent_noise=(n > 1),
+                parent_request_id=parent_request_id,
+                sibling_index=i,
+                request_id=parent_request_id if n == 1 else None,
+            )
+            seq.arrive_time = time.time()
+            self.requests[seq.id] = seq
+            if seq.external_request_id is not None:
+                self._external_to_internal[seq.external_request_id] = seq.id
+                self._internal_to_external[seq.id] = seq.external_request_id
+            seqs.append(seq)
+
+        if n == 1:
+            logger.info(
+                f"Request {seqs[0].id} arrived, input tokens: {len(tokens)}, "
+                f"pending requests: {len(self.requests)}"
+            )
+        else:
+            logger.info(
+                f"Request {parent_request_id or seqs[0].id} fanned out into "
+                f"{n} siblings ({seqs[0].id}..{seqs[-1].id}), "
+                f"input tokens: {len(tokens)}, "
+                f"pending requests: {len(self.requests)}"
+            )
+        return seqs
 
     def postprocess(self, reqs: List[Sequence]):
         """responsible for:
@@ -229,6 +401,9 @@ class InputOutputProcessor:
         outputs = {}
         for req in reqs:
             self.requests.pop(req.id)
+            external_request_id = self._internal_to_external.pop(req.id, None)
+            if external_request_id is not None:
+                self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
             req.leave_time = time.time()
 
@@ -248,11 +423,11 @@ class InputOutputProcessor:
                 f"Input tokens: {req.num_prompt_tokens}, output tokens: {req.num_completion_tokens}, "
                 f"latency: {req.leave_time - req.arrive_time:.2f}s, "
                 f"TTFT: {ttft:.3f}s, TPOT: {tpot:.3f}s"
-                # f"{req.completion_token_ids}"
             )
             outputs[req.id] = {
                 "text": output_str,
                 "token_ids": req.completion_token_ids,
+                "logprobs": req.logprobs if req.return_logprobs else None,
                 "latency": req.leave_time - req.arrive_time,
                 "finish_reason": req.leave_reason,
                 "num_tokens_input": req.num_prompt_tokens,

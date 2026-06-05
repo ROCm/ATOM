@@ -4,6 +4,7 @@ from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM
+from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
 from atom.config import Config
 from atom.plugin.prepare import is_vllm, is_sglang
 
@@ -14,7 +15,23 @@ _ATOM_SUPPORTED_MODELS = {
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
+    "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
 }
+
+if is_sglang():
+    from atom.models.qwen3_next import Qwen3NextForCausalLM
+    from atom.models.qwen3_5 import (
+        Qwen3_5ForCausalLM,
+        Qwen3_5MoeForCausalLM,
+    )
+
+    _ATOM_SUPPORTED_MODELS.update(
+        {
+            "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
+            "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
+            "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
+        }
+    )
 
 
 def _register_custom_attention_to_sglang() -> None:
@@ -23,8 +40,13 @@ def _register_custom_attention_to_sglang() -> None:
     sglang only accepts pre-registered backend names, so we reuse the "aiter"
     name to inject ATOMAttnBackendForSgl without modifying sglang source.
     """
+    import sglang.srt.layers.attention.aiter_backend as sglang_aiter_backend
+
     from sglang.srt.layers.attention.attention_registry import (
         register_attention_backend,
+    )
+    from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
+        ATOMAttnBackendForSgl,
     )
 
     # here register the custom attention backend with the name "aiter"
@@ -32,12 +54,14 @@ def _register_custom_attention_to_sglang() -> None:
     # in-tree
     logger.info("Register custom attention backend ATOMAttnBackendForSgl to SGLang")
 
+    # Speculative draft paths instantiate AiterAttnBackend directly inside
+    # AiterMultiStepDraftBackend, bypassing the attention registry. Rebind the
+    # module symbol as well so both registry lookup and direct construction use
+    # the plugin backend.
+    sglang_aiter_backend.AiterAttnBackend = ATOMAttnBackendForSgl
+
     @register_attention_backend("aiter")
     def create_atom_backend(runner):
-        from atom.plugin.sglang.attention_backend.sgl_attn_backend import (
-            ATOMAttnBackendForSgl,
-        )
-
         return ATOMAttnBackendForSgl(runner)
 
 
@@ -49,19 +73,19 @@ def register_ops_to_sglang(atom_config: Config) -> None:
 
 
 def set_attn_cls() -> None:
-    """Swap ``atom.model_ops.Attention`` to the framework-appropriate class.
+    """Keep compatibility with old plugin init hooks.
 
-    ATOM models reference ``ops.Attention`` generically; this function binds
-    it to PagedAttention (vLLM) or RadixAttention (sglang) at plugin init time.
+    FIXME: This is a legacy no-op after attention construction moved to the
+    frontend dispatcher. Remove it once downstream plugin init paths stop
+    calling ``set_attn_cls`` for side effects.
+
+    Attention selection now happens in ``atom.model_ops.base_attention.Attention``
+    at construction time, so plugin init no longer mutates ``atom.model_ops``.
     """
-    import atom.model_ops as ops
-
     if is_vllm():
-        ops.Attention = ops.PagedAttention
-        logger.info("Set Attention to PagedAttention for vLLM")
+        logger.info("Use Attention dispatcher for vLLM")
     elif is_sglang():
-        ops.Attention = ops.RadixAttention
-        logger.info("Set Attention to RadixAttention for SGLang")
+        logger.info("Use Attention dispatcher for SGLang")
 
 
 def init_aiter_dist(config: Config) -> None:
@@ -77,6 +101,8 @@ def init_aiter_dist(config: Config) -> None:
     )
 
     rank = config.plugin_config.rank
+    if getattr(config.plugin_config, "is_sglang", False):
+        rank = getattr(config.plugin_config, "sglang_aiter_rank_id", rank)
     tensor_parallel_size = config.tensor_parallel_size
 
     assert (
