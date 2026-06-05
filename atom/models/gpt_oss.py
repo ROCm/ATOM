@@ -239,6 +239,8 @@ class MLPBlock(torch.nn.Module):
         _interleave_swiglu_weights(self.experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+        
         num_tokens = x.shape[0]
 
         g = self.router(x[..., : self.hidden_size])
