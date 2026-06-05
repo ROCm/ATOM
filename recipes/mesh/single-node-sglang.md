@@ -17,7 +17,7 @@ docker pull rocm/atom-dev:sglang-latest
 ## Step 2: Start Docker Container
 
 ```bash
-docker run -d --name atom_mesh \
+docker run -d --name atomesh \
     --network host --ipc host --privileged \
     --device /dev/kfd --device /dev/dri \
     --group-add video \
@@ -30,7 +30,7 @@ docker run -d --name atom_mesh \
 Enter the container:
 
 ```bash
-docker exec -it atom_mesh bash
+docker exec -it atomesh bash
 ```
 
 ## Step 3: Start Prefill Server

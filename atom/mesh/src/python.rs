@@ -80,7 +80,7 @@ fn startup_runtime(server_config: ServerConfig) -> PyResult<()> {
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {e}")))?;
     tokio_runtime
         .block_on(async move { server::startup(server_config).await })
-        .map_err(|e| PyRuntimeError::new_err(format!("ATOM mesh exited with error: {e}")))
+        .map_err(|e| PyRuntimeError::new_err(format!("Atomesh exited with error: {e}")))
 }
 
 fn build_server_config(

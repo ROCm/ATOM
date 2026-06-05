@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Launch ATOM Mesh SGLang PD disaggregation on a single node.
+# Launch Atomesh SGLang PD disaggregation on a single node.
 #
 # Required env:
 #   MODEL_PATH      - model path

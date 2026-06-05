@@ -1,4 +1,4 @@
-//! Load balancing policies for ATOM Mesh
+//! Load balancing policies for Atomesh
 //!
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.

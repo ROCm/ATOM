@@ -22,7 +22,7 @@ docker pull rocm/atom-dev:latest
 On **each node**, start a container:
 
 ```bash
-docker run -d --name atom_mesh \
+docker run -d --name atomesh \
     --network host --ipc host --privileged \
     --device /dev/kfd --device /dev/dri \
     --group-add video \
@@ -38,7 +38,7 @@ docker run -d --name atom_mesh \
 Enter the container on the prefill node:
 
 ```bash
-docker exec -it atom_mesh bash
+docker exec -it atomesh bash
 ```
 
 Find the node IP and launch:
@@ -80,7 +80,7 @@ Key parameters:
 Enter the container on the decode node:
 
 ```bash
-docker exec -it atom_mesh bash
+docker exec -it atomesh bash
 ```
 
 ```bash

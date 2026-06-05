@@ -1,8 +1,8 @@
-# ATOM Mesh
+# Atomesh
 
 High-performance model routing gateway for **PD (Prefill–Decode) disaggregated** LLM serving. It routes inference across heterogeneous worker fleets with cache-aware load balancing, a gRPC pipeline that keeps tokenization in Rust, and built-in reliability primitives.
 
-ATOM Mesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine, tokenizer, and OpenAI-compatible serving semantics, while Rust Mesh provides the HTTP server, request routing, lifecycle management, observability, and PyO3 bridge. This allows the same Mesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
+Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine, tokenizer, and OpenAI-compatible serving semantics, while Atomesh provides the HTTP server, request routing, lifecycle management, observability, and PyO3 bridge. This allows the same Atomesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
 
 ## Features
 
@@ -53,9 +53,9 @@ Artifacts: `target/release/atomesh`, `target/release/libmesh.so`.
 
 ### Build during ATOM package install
 
-ATOM package installation does not build Mesh by default. To compile Mesh during
+ATOM package installation does not build Atomesh by default. To compile Atomesh during
 package installation and include `libmesh.so` in the installed package, enable
-the Mesh build hook:
+the Atomesh build hook:
 
 ```bash
 ATOM_MESH_BUILD=1 python -m pip install .
@@ -87,14 +87,14 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server \
 ```
 
 Do not pass `mesh-only` for standalone mode. The `mesh-only` subcommand is only
-used when the Python entrypoint should run Mesh as a router for external
+used when the Python entrypoint should run Atomesh as a router for external
 workers.
 
 
 ### Regular HTTP routing
 
 Routing mode can be started through either the Rust binary or the Python
-entrypoint. For the Python entrypoint, `mesh-only` selects Mesh routing;
+entrypoint. For the Python entrypoint, `mesh-only` selects Atomesh routing;
 without `mesh-only`, it defaults to ATOM standalone mode.
 
 ```bash
@@ -231,4 +231,4 @@ Clients send `Authorization: Bearer <key>`. Workers declared on the CLI inherit 
 
 ## Acknowledgments and upstream
 
-[**sgl-model-gateway**](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway) remains an excellent reference for disaggregated model routing and high-throughput serving. ATOM Mesh acknowledges that work as useful inspiration, but has since been substantially reworked into an independent serving layer for the **ATOM** stack and **AMD** hardware. Its routing, scheduling, runtime integration, and performance-sensitive paths are designed around AMD accelerator deployments and ATOM-specific serving requirements.
+[**sgl-model-gateway**](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway) remains an excellent reference for disaggregated model routing and high-throughput serving. Atomesh acknowledges that work as useful inspiration, but has since been substantially reworked into an independent serving layer for the **ATOM** stack and **AMD** hardware. Its routing, scheduling, runtime integration, and performance-sensitive paths are designed around AMD accelerator deployments and ATOM-specific serving requirements.

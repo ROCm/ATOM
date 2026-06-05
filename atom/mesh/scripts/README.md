@@ -1,6 +1,6 @@
-# ATOM Mesh PD Disaggregation Scripts
+# Atomesh PD Disaggregation Scripts
 
-End-to-end guide for building, deploying, and benchmarking the ATOM Mesh prefill-decode (PD) disaggregation setup.
+End-to-end guide for building, deploying, and benchmarking the Atomesh prefill-decode (PD) disaggregation setup.
 
 ## Prerequisites
 
