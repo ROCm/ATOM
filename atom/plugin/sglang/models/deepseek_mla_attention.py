@@ -137,6 +137,14 @@ class SGLangDeepseekMLAAttention(nn.Module):
             )
         return _unwrap_linear_output(q).view(-1, attn.num_local_heads, attn.qk_head_dim)
 
+    def _make_dummy_output(self, q_input: torch.Tensor) -> torch.Tensor:
+        attn = self.owner_attn
+        return torch.empty(
+            (q_input.shape[0], attn.hidden_size),
+            device=q_input.device,
+            dtype=torch.bfloat16,
+        )
+
     def _forward_absorbed(
         self,
         q_input: torch.Tensor,
@@ -305,6 +313,11 @@ class SGLangDeepseekMLAAttention(nn.Module):
                     input_scattered=attn_tp_context.input_scattered,
                 )
             )
+
+            from atom.utils.forward_context import get_forward_context
+
+            if get_forward_context().context.is_dummy_run:
+                return self._make_dummy_output(q_input)
 
             use_non_absorbed = (
                 forward_batch.forward_mode.is_extend_without_speculative()

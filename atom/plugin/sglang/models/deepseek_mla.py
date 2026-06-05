@@ -56,6 +56,7 @@ def _patch_mla_attention_for_sglang(
     kv_cache_dtype: str = "bf16",
 ) -> None:
     """Patch one DeepSeek MLA layer for SGLang plugin mode."""
+    _align_qknorm_fusion_for_sglang(attn)
     init_sgl_attrs(attn, config, kv_cache_dtype)
     _patch_attention_projs_for_sglang_mxfp4(attn)
     if not isinstance(attn.mla_attn, SGLangDeepseekMLAAttention):
@@ -63,3 +64,14 @@ def _patch_mla_attention_for_sglang(
     attn.process_weights_after_loading = lambda: process_mla_kv_b_proj_after_loading(
         attn
     )
+
+
+def _align_qknorm_fusion_for_sglang(attn: "DeepseekV2MLAAttention") -> None:
+    """Keep non-quant q/k norm fusion on the BF16 path in SGLang plugin mode."""
+    if getattr(attn, "fuse_qknorm", False) and not getattr(
+        attn, "fuse_qknorm_quant", False
+    ):
+        import torch
+
+        attn.quant_dtype = torch.bfloat16
+        attn.qknorm_quant_type = None

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Start the atomesh vLLM Docker container.
+#
+# Optional env (with defaults):
+#   CONTAINER=atom_vllm_mesh
+#   DOCKER_IMAGE=rocm/atom-dev:mesh-vllm-latest
+
+CONTAINER="${CONTAINER:-atom_vllm_mesh}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-vllm-latest}"
+
+echo "[docker] starting container=${CONTAINER} image=${DOCKER_IMAGE}"
+
+docker rm -f "${CONTAINER}" 2>/dev/null || true
+
+docker run -d --name "${CONTAINER}" \
+    --network host --ipc host --privileged \
+    --device /dev/kfd --device /dev/dri \
+    --group-add video \
+    --cap-add IPC_LOCK --cap-add NET_ADMIN \
+    --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \
+    -v /mnt:/mnt -v /it-share:/it-share \
+    "${DOCKER_IMAGE}" sleep infinity
+
+echo "[docker] container ${CONTAINER} started"
+echo "[docker] exec into it:  docker exec -it ${CONTAINER} bash"

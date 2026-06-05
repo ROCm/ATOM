@@ -13,7 +13,7 @@
     "display": "DeepSeek-V4-Pro",
     "path": "deepseek-ai/DeepSeek-V4-Pro",
     "prefix": "deepseek-v4-pro",
-    "args": "--kv_cache_dtype fp8 -tp 8",
+    "args": "--kv_cache_dtype fp8 -tp 8 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",

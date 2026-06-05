@@ -8,11 +8,9 @@ on:
       base_image:
         description: "Base Docker image for ATOM build"
         type: choice
-        default: "rocm/pytorch:latest"
+        default: "rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0"
         options:
-          - rocm/pytorch:latest
-          - rocm/pytorch-nightly:latest
-          - rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.10.0
+          - rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0
       atom_repo:
         description: "ATOM repo"
         default: "https://github.com/ROCm/ATOM.git"
@@ -35,11 +33,11 @@ on:
         description: "SGLang repo"
         default: "https://github.com/sgl-project/sglang.git"
       sglang_ref:
-        description: "SGLang git ref"
-        default: "v0.5.10"
+        description: "SGLang git ref. Leave empty to use the workflow default."
+        default: ""
       sglang_version:
-        description: "SGLang version used in the published tag"
-        default: "0.5.10"
+        description: "SGLang version used in the published tag. Leave empty to use the workflow default."
+        default: ""
       runner:
         description: "Runner label to use"
         type: choice
@@ -86,7 +84,7 @@ jobs:
       fail-fast: false
       matrix:
         base_image:
-          - ${{ inputs.base_image || 'rocm/pytorch:latest' }}
+          - ${{ inputs.base_image || 'rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0' }}
 
     env:
       ATOM_REPO: "https://github.com/ROCm/ATOM.git"
@@ -99,8 +97,8 @@ jobs:
       VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
       VLLM_VERSION: "0.22.0"
       SGLANG_REPO: "https://github.com/sgl-project/sglang.git"
-      SGLANG_REF: "v0.5.10"
-      SGLANG_VERSION: "0.5.10"
+      SGLANG_REF: "v0.5.12"
+      SGLANG_VERSION: "0.5.12"
 
     steps:
       - name: Set HF_TOKEN
@@ -128,6 +126,7 @@ jobs:
           echo "SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}"
           echo "SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}"
           echo "SGLANG_VERSION: ${{ inputs.sglang_version || env.SGLANG_VERSION }}"
+          echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
 
       - name: Build Docker image
         timeout-minutes: 180

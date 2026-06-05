@@ -838,10 +838,8 @@ class SpeculativeConfig:
         self.hf_config_override(self.draft_model_hf_config, self.model)
 
         if self.method == "eagle3":
-            if getattr(self.draft_model_hf_config, "kv_lora_rank", None):
-                raise NotImplementedError(
-                    "Eagle3 draft model with MLA attention is not supported"
-                )
+            # MLA drafts (kv_lora_rank set) route to Eagle3DeepseekMLAModel
+            # via the arch rewrite in hf_config_override; no early reject.
             # Aux hidden state layers: prefer the draft checkpoint's
             # eagle_config; if absent or the list is empty, ModelRunner
             # falls back to model.get_eagle3_aux_hidden_state_layers(),
@@ -866,6 +864,8 @@ class SpeculativeConfig:
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
         if arch == "LlamaForCausalLMEagle3":
             hf_config.architectures = ["Eagle3LlamaModel"]
+        elif arch == "Eagle3DeepseekV2ForCausalLM":
+            hf_config.architectures = ["Eagle3DeepseekMLAModel"]
 
         # Step 1: resolve model_type → mtp model_type
         mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)
@@ -1018,6 +1018,7 @@ class Config:
     plugin_config: Optional[PluginConfig] = None
     # only for quark_online_quantization
     online_quant_config: Optional[dict] = None
+    hf_overrides: Optional[dict[str, Any]] = None
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -1040,6 +1041,9 @@ class Config:
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        if self.hf_overrides:
+            self.hf_config.update(self.hf_overrides)
+            logger.info("Applied HF config overrides: %s", self.hf_overrides)
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
@@ -1189,6 +1193,13 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(
+            (
+                getattr(self.hf_config, "use_index_cache", False),
+                getattr(self.hf_config, "index_topk_freq", None),
+                getattr(self.hf_config, "index_topk_pattern", None),
+            )
+        )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
