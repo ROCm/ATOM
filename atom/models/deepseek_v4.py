@@ -2416,6 +2416,10 @@ class Block(nn.Module):
             self.hc_eps,
         )
         y = torch.sum(pre.unsqueeze(-1) * residual, dim=-2)  # [num_tokens, dim]
+        if norm_weight is not None:
+            y = F.rms_norm(y.float(), (y.shape[-1],), norm_weight.float(), norm_eps).to(
+                dtype
+            )
         return y.to(dtype), post, comb
 
     def hc_post(
