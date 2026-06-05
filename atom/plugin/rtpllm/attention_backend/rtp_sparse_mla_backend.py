@@ -100,32 +100,9 @@ class _RealSparseMlaImpl:
         self._cache_write_scale: dict[torch.device, torch.Tensor] = {}
         self._cg_sparse_bufs: dict[str, torch.Tensor] | None = None
         self._cg_workspace_signature: tuple[Any, ...] | None = None
-        self._sparse_page_size = self._resolve_sparse_page_size()
-        self._enable_debug_safe_path = (
-            os.getenv("ATOM_RTP_GLM5_SPARSE_DEBUG_SAFE", "0") == "1"
-        )
         self._enable_sparse_validate = (
             os.getenv("ATOM_RTP_GLM5_SPARSE_VALIDATE", "0") == "1"
         )
-        self._enable_capture_metadata_reuse = (
-            os.getenv("ATOM_RTP_GLM5_SPARSE_CAPTURE_META_REUSE", "1") == "1"
-        )
-
-    @staticmethod
-    def _resolve_sparse_page_size() -> int:
-        value = os.getenv("ATOM_RTP_GLM5_SPARSE_PAGE_SIZE", "1")
-        try:
-            page_size = int(value)
-        except ValueError as exc:
-            raise _SparseUnavailable(
-                f"Invalid ATOM_RTP_GLM5_SPARSE_PAGE_SIZE={value!r}."
-            ) from exc
-        if page_size <= 0:
-            raise _SparseUnavailable(
-                "GLM5 RTP sparse MLA requires positive page_size, "
-                f"got page_size={page_size}."
-            )
-        return page_size
 
     @staticmethod
     def _validate_sparse_index_contract(
@@ -202,20 +179,6 @@ class _RealSparseMlaImpl:
             raise _SparseUnavailable(
                 "GLM5 RTP sparse MLA expects paged_kv_last_page_len==1 when page_size=1."
             )
-
-    @staticmethod
-    def _to_page_indices(
-        *, token_indices: torch.Tensor, page_size: int, max_slots: int
-    ) -> torch.Tensor:
-        if page_size == 1:
-            return token_indices.to(dtype=torch.int32)
-        page_indices = torch.div(
-            token_indices.to(dtype=torch.int64),
-            int(page_size),
-            rounding_mode="floor",
-        ).to(dtype=torch.int32)
-        page_indices.clamp_(min=0, max=max(int(max_slots) - 1, 0))
-        return page_indices
 
     @staticmethod
     def _kv_token_slot_capacity(kv_cache_base: torch.Tensor) -> int:
@@ -914,37 +877,15 @@ class _RealSparseMlaImpl:
                 f"GLM5 RTP sparse MLA requires positive block_size, got {block_size}."
             )
 
-        if not in_capture and self._enable_debug_safe_path and topk >= 2048:
-            # Keep a debug-safe fallback for field diagnostics. This path is slower
-            # than Triton and should stay disabled in normal serving.
-            global_topk = self._convert_topk_to_global(
-                topk_indices=topk_indices_i32,
-                attn_metadata=attn_metadata,
-                block_size=int(block_size),
-            )
-            token_k = torch.arange(topk, device=device, dtype=torch.int32).unsqueeze(0)
-            valid_mask = token_k < sparse_seqlen.unsqueeze(1)
-            flattened = global_topk.masked_select(valid_mask)
-            expected = int(paged_kv_indptr[-1].item()) if int(num_tokens) > 0 else 0
-            if int(flattened.numel()) != expected:
-                raise _SparseUnavailable(
-                    "GLM5 RTP sparse MLA inconsistent sparse metadata size "
-                    f"(flattened={int(flattened.numel())}, expected={expected})."
-                )
-            if expected > 0:
-                paged_kv_indices[:expected].copy_(flattened.to(dtype=torch.int32))
-            if int(paged_kv_indices.numel()) > expected:
-                paged_kv_indices[expected:].zero_()
-        else:
-            triton_convert_req_index_to_global_index(
-                req_id,
-                block_table,
-                topk_indices_i32,
-                paged_kv_indptr,
-                paged_kv_indices,
-                BLOCK_SIZE=int(block_size),
-                NUM_TOPK_TOKENS=topk,
-            )
+        triton_convert_req_index_to_global_index(
+            req_id,
+            block_table,
+            topk_indices_i32,
+            paged_kv_indptr,
+            paged_kv_indices,
+            BLOCK_SIZE=int(block_size),
+            NUM_TOPK_TOKENS=topk,
+        )
 
         padded_num_heads = max(num_heads, 16)
         if padded_num_heads % num_heads != 0:
@@ -1008,7 +949,7 @@ class _RealSparseMlaImpl:
             str(device),
         )
         reuse_capture_metadata = False
-        if in_capture and self._enable_capture_metadata_reuse:
+        if in_capture:
             cached_capture_meta = getattr(
                 plugin_metadata, "_rtp_sparse_capture_meta_workspace", None
             )
@@ -1023,37 +964,9 @@ class _RealSparseMlaImpl:
                 reduce_final_map = cached_capture_meta["reduce_final_map"]
                 reduce_partial_map = cached_capture_meta["reduce_partial_map"]
                 reuse_capture_metadata = True
-        requested_page_size = self._sparse_page_size
         kv_token_slots = self._kv_token_slot_capacity(kv_cache_base)
-        page_size = requested_page_size
-        if (
-            in_capture
-            and requested_page_size > 1
-            and kv_token_slots % int(requested_page_size) != 0
-        ):
-            # CUDA graph capture uses warmup shapes that may not be page-aligned;
-            # keep capture alive by using token page mode.
-            page_size = 1
-        if page_size > 1:
-            max_page_slots = max(
-                (kv_token_slots + int(page_size) - 1) // int(page_size),
-                1,
-            )
-            if in_capture:
-                # Capture-safe: avoid host sync (e.g. item/min/max) in graph capture.
-                if int(paged_kv_indices.numel()) > 0:
-                    paged_kv_indices.floor_divide_(int(page_size))
-                    paged_kv_indices.clamp_(min=0, max=max_page_slots - 1)
-            else:
-                used_now = int(paged_kv_indptr[-1].item()) if num_tokens > 0 else 0
-                if used_now > 0:
-                    paged_kv_indices[:used_now] = self._to_page_indices(
-                        token_indices=paged_kv_indices[:used_now],
-                        page_size=page_size,
-                        max_slots=max_page_slots,
-                    )
-        else:
-            max_page_slots = int(kv_token_slots)
+        page_size = 1
+        max_page_slots = int(kv_token_slots)
 
         if in_capture and int(paged_kv_indices.numel()) > 0:
             # Capture path cannot run host-synced range checks; clamp indices into
@@ -1091,7 +1004,7 @@ class _RealSparseMlaImpl:
                 dtype_q=q_dtype,
                 dtype_kv=kv_dtype,
             )
-            if in_capture and self._enable_capture_metadata_reuse:
+            if in_capture:
                 plugin_metadata._rtp_sparse_capture_meta_workspace = {
                     "signature": capture_meta_sig,
                     "work_meta_data": work_meta_data,
@@ -1160,7 +1073,7 @@ class _RealSparseMlaImpl:
             block_size=block_size,
         )
         in_capture = torch.cuda.is_current_stream_capturing()
-        page_size = int(sparse_meta.page_size)
+        page_size = 1
         if sparse_meta.head_repeat_factor > 1:
             if in_capture and self._cg_sparse_bufs is not None:
                 q_for_kernel = self._cg_sparse_bufs["q_for_kernel"][
@@ -1193,29 +1106,7 @@ class _RealSparseMlaImpl:
                 device=q_latent.device,
             )
         try:
-            if page_size == 1:
-                kv_buffer = kv_cache_base.reshape(-1, 1, 1, latent_dim)
-            else:
-                kv_slots = int(kv_cache_base.shape[0])
-                padded_slots = (
-                    (kv_slots + int(page_size) - 1) // int(page_size)
-                ) * int(page_size)
-                if padded_slots != kv_slots:
-                    if in_capture:
-                        raise _SparseUnavailable(
-                            "GLM5 RTP sparse MLA kv buffer cannot be reshaped by "
-                            "page_size during capture "
-                            f"(kv_slots={kv_slots}, page_size={page_size})."
-                        )
-                    pad_shape = list(kv_cache_base.shape)
-                    pad_shape[0] = padded_slots - kv_slots
-                    pad = torch.zeros(
-                        pad_shape,
-                        dtype=kv_cache_base.dtype,
-                        device=kv_cache_base.device,
-                    )
-                    kv_cache_base = torch.cat((kv_cache_base, pad), dim=0)
-                kv_buffer = kv_cache_base.reshape(-1, page_size, 1, latent_dim)
+            kv_buffer = kv_cache_base.reshape(-1, 1, 1, latent_dim)
             if (
                 not in_capture
                 and self._enable_sparse_validate
