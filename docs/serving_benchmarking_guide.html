@@ -1356,11 +1356,15 @@ token if all drafts are accepted.</p></li>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--method</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
-<td><p>Speculative method; currently only <code class="docutils literal notranslate"><span class="pre">mtp</span></code> is supported</p></td>
+<td><p>Speculative method: <code class="docutils literal notranslate"><span class="pre">mtp</span></code> (DeepSeek MTP) or <code class="docutils literal notranslate"><span class="pre">eagle3</span></code> (EAGLE 3 / EAGLE 3.1 — see <a class="reference internal" href="eagle3_speculative_decoding.html"><span class="std std-doc"><code class="docutils literal notranslate"><span class="pre">eagle3_speculative_decoding.md</span></code></span></a>)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--num-speculative-tokens</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Number of draft tokens per iteration (draft model runs this many autoregressive steps)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--draft-model</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Path or HF repo of the speculative draft model. Required for <code class="docutils literal notranslate"><span class="pre">--method</span> <span class="pre">eagle3</span></code>; the draft’s <code class="docutils literal notranslate"><span class="pre">config.json</span></code> drives EAGLE 3 vs EAGLE 3.1 toggles automatically</p></td>
 </tr>
 </tbody>
 </table>
