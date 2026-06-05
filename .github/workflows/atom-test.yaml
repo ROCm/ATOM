@@ -9,6 +9,7 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+      - 'atom/plugin/**'
       - 'LICENSE'
       - '.gitignore'
   schedule:
