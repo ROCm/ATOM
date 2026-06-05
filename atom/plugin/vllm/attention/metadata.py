@@ -519,10 +519,6 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
-        num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
-        if num_computed_tokens_cpu is None:
-            num_computed_tokens_cpu = seq_lens - query_lens_cpu
-
         prefill_max_query_len = decode_max_query_len = (
             common_attn_metadata.max_query_len
         )
@@ -567,7 +563,11 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             num_extends_slice = slice(num_decodes, num_decodes + num_extends)
             query_lens_extend = query_lens_cpu[num_extends_slice]
             seq_lens_extend = seq_lens[num_extends_slice]
-            computed_kv_lens = num_computed_tokens_cpu[num_extends_slice]
+            # In DBO, the second ubatch's continuation request keeps the full
+            # seq_len but has its query_len reduced by split_attn_metadata, so
+            # use seq_len - query_len to correctly count the KV that precedes
+            # this ubatch's queries
+            computed_kv_lens = seq_lens_extend - query_lens_extend
 
             swa_metadata = None
             if self.aot_sliding_window is not None:
