@@ -34,9 +34,6 @@ from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
     build_pa_metadata_for_decode as _build_pa_metadata_for_decode,
     build_pa_metadata_for_prefill as _build_pa_metadata_for_prefill,
 )
-from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
-    triton_convert_req_index_to_global_index,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -47,8 +44,6 @@ try:
     from aiter import (
         flash_attn_varlen_func,
         dtypes,
-        get_mla_metadata_info_v1,
-        get_mla_metadata_v1,
         get_pa_metadata_info_v1,
         mha_batch_prefill_func,
         pa_fwd_asm,
@@ -80,201 +75,6 @@ try:
     from aiter.mla import mla_decode_fwd
 except ImportError:
     pass
-
-
-def _build_sparse_block_table_for_sglang(
-    forward_batch: ForwardBatch, page_size: int
-) -> torch.Tensor:
-    req_to_token = forward_batch.req_to_token_pool.req_to_token
-    req_pool_indices = forward_batch.req_pool_indices
-    token_table = req_to_token[req_pool_indices, :]
-    if not forward_batch.forward_mode.is_decode_or_idle():
-        token_table = token_table.clone()
-        query_lens = getattr(forward_batch, "extend_seq_lens", None)
-        if query_lens is None:
-            query_lens = forward_batch.seq_lens
-        prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
-        if prefix_lens is None:
-            prefix_lens = forward_batch.seq_lens - query_lens
-        query_lens_cpu = query_lens[: int(forward_batch.batch_size)].detach().cpu()
-        prefix_lens_cpu = prefix_lens[: int(forward_batch.batch_size)].detach().cpu()
-        offset = 0
-        for req_idx, (prefix_len_raw, query_len_raw) in enumerate(
-            zip(prefix_lens_cpu, query_lens_cpu)
-        ):
-            prefix_len = int(prefix_len_raw)
-            query_len = int(query_len_raw)
-            if query_len > 0:
-                token_table[
-                    req_idx, prefix_len : prefix_len + query_len
-                ] = forward_batch.out_cache_loc[offset : offset + query_len]
-            offset += query_len
-    if page_size == 1:
-        return token_table
-    return token_table[:, ::page_size] // page_size
-
-
-def _build_sparse_req_id_per_token_for_sglang(
-    forward_batch: ForwardBatch,
-    device: torch.device,
-) -> torch.Tensor:
-    bs = int(forward_batch.batch_size)
-    req_ids = torch.arange(bs, dtype=torch.int32, device=device)
-    if forward_batch.forward_mode.is_decode_or_idle():
-        return req_ids
-    query_lens = getattr(forward_batch, "extend_seq_lens", None)
-    if query_lens is None:
-        query_lens = forward_batch.seq_lens
-    return torch.repeat_interleave(req_ids, query_lens[:bs].to(torch.int32))
-
-
-def forward_sparse_mla_for_sglang(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    layer,
-    forward_batch: ForwardBatch,
-    topk_indices: torch.Tensor,
-    save_kv_cache: bool = True,
-    input_dtype: Optional[torch.dtype] = None,
-    q_scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """ATOM sparse MLA path for SGLang DeepSeek-V3.2, bypassing native NSA backend."""
-    if save_kv_cache and k is not None:
-        assert v is not None
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer, forward_batch.out_cache_loc, k, v
-        )
-
-    q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-    num_tokens = q.shape[0]
-    topk_indices = topk_indices[:num_tokens]
-    topk_tokens = topk_indices.shape[1]
-    page_size = int(getattr(forward_batch.token_to_kv_pool, "page_size", 1))
-
-    req_id_per_token = _build_sparse_req_id_per_token_for_sglang(forward_batch, q.device)
-    block_table = _build_sparse_block_table_for_sglang(forward_batch, page_size).to(
-        dtype=torch.int32
-    )
-    output_dtype = input_dtype or torch.bfloat16
-    o = q.new_empty(
-        (num_tokens, layer.tp_q_head_num, layer.v_head_dim),
-        dtype=output_dtype,
-    )
-    k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-    q_descale = (
-        q_scale if q_scale is not None else getattr(layer, "q_scale", None)
-    ) if q.dtype == dtypes.fp8 else None
-    fp8_sparse_mla = q.dtype == dtypes.fp8 or k_buffer.dtype == dtypes.fp8
-
-    seq_len = (topk_indices != -1).sum(dim=-1).to(dtype=torch.int32)
-    paged_kv_indptr = torch.empty(
-        (num_tokens + 1,), dtype=torch.int32, device=q.device
-    )
-    paged_kv_indptr[0].zero_()
-    torch.cumsum(seq_len, dim=0, out=paged_kv_indptr[1:])
-    paged_kv_indices = torch.empty(
-        (num_tokens * topk_tokens,), dtype=torch.int32, device=q.device
-    )
-    triton_convert_req_index_to_global_index(
-        req_id_per_token,
-        block_table,
-        topk_indices.to(dtype=torch.int32),
-        paged_kv_indptr,
-        paged_kv_indices,
-        BLOCK_SIZE=page_size,
-        NUM_TOPK_TOKENS=topk_tokens,
-    )
-
-    qo_indptr = torch.arange(num_tokens + 1, dtype=torch.int32, device=q.device)
-    last_page_len = torch.ones(num_tokens, dtype=torch.int32, device=q.device)
-
-    work_metadata = None
-    work_indptr = None
-    work_info_set = None
-    reduce_indptr = None
-    reduce_final_map = None
-    reduce_partial_map = None
-
-    if fp8_sparse_mla:
-        (
-            (work_metadata_size, work_metadata_dtype),
-            (work_indptr_size, work_indptr_dtype),
-            (work_info_set_size, work_info_set_dtype),
-            (reduce_indptr_size, reduce_indptr_dtype),
-            (reduce_final_map_size, reduce_final_map_dtype),
-            (reduce_partial_map_size, reduce_partial_map_dtype),
-        ) = get_mla_metadata_info_v1(
-            num_tokens,
-            1,
-            layer.tp_q_head_num,
-            q.dtype,
-            k_buffer.dtype,
-            is_sparse=True,
-            fast_mode=True,
-        )
-        work_metadata = torch.empty(
-            work_metadata_size, dtype=work_metadata_dtype, device=q.device
-        )
-        work_indptr = torch.empty(
-            work_indptr_size, dtype=work_indptr_dtype, device=q.device
-        )
-        work_info_set = torch.empty(
-            work_info_set_size, dtype=work_info_set_dtype, device=q.device
-        )
-        reduce_indptr = torch.empty(
-            reduce_indptr_size, dtype=reduce_indptr_dtype, device=q.device
-        )
-        reduce_final_map = torch.empty(
-            reduce_final_map_size, dtype=reduce_final_map_dtype, device=q.device
-        )
-        reduce_partial_map = torch.empty(
-            reduce_partial_map_size, dtype=reduce_partial_map_dtype, device=q.device
-        )
-        get_mla_metadata_v1(
-            qo_indptr,
-            paged_kv_indptr,
-            last_page_len,
-            layer.tp_q_head_num,
-            1,
-            True,
-            work_metadata,
-            work_info_set,
-            work_indptr,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            kv_granularity=16,
-            page_size=1,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=True,
-            dtype_q=q.dtype,
-            dtype_kv=k_buffer.dtype,
-        )
-
-    mla_decode_fwd(
-        q,
-        k_buffer.view(-1, 1, 1, layer.qk_head_dim),
-        o,
-        qo_indptr,
-        paged_kv_indptr,
-        paged_kv_indices,
-        last_page_len,
-        1,
-        sm_scale=layer.scaling,
-        logit_cap=layer.logit_cap,
-        q_scale=q_descale,
-        kv_scale=layer.k_scale,
-        page_size=1,
-        work_meta_data=work_metadata,
-        work_indptr=work_indptr,
-        work_info_set=work_info_set,
-        reduce_indptr=reduce_indptr,
-        reduce_final_map=reduce_final_map,
-        reduce_partial_map=reduce_partial_map,
-    )
-    return o.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
 
 class ATOMAttnBackendForSgl(AiterAttnBackend):
@@ -1817,25 +1617,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             block_size,
         )
 
-    def _build_sparse_block_table(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
-        req_pool_indices = forward_batch.req_pool_indices
-        if self.page_size == 1:
-            return req_to_token[req_pool_indices, :]
-        return req_to_token[req_pool_indices, :: self.page_size] // self.page_size
-
-    def _build_sparse_req_id_per_token(
-        self, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        bs = int(forward_batch.batch_size)
-        req_ids = torch.arange(bs, dtype=torch.int32, device=self.device)
-        if forward_batch.forward_mode.is_decode_or_idle():
-            return req_ids
-        query_lens = getattr(forward_batch, "extend_seq_lens", None)
-        if query_lens is None:
-            query_lens = forward_batch.seq_lens
-        return torch.repeat_interleave(req_ids, query_lens[:bs].to(torch.int32))
-
     def _forward_sparse_mla(
         self,
         q: torch.Tensor,
@@ -1846,6 +1627,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         topk_indices: torch.Tensor,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
+        from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
+            forward_sparse_mla_for_sglang,
+        )
+
         return forward_sparse_mla_for_sglang(
             q,
             k,

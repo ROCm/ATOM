@@ -180,7 +180,10 @@ class SGLangDeepseekMLAAttention(nn.Module):
         save_kv_cache = True
         topk_indices = None
         q_descale = None
-        if getattr(attn, "use_nsa", False) and getattr(attn, "indexer", None) is not None:
+        if (
+            getattr(attn, "use_nsa", False)
+            and getattr(attn, "indexer", None) is not None
+        ):
             topk_indices = attn.indexer.topk_indices_buffer[: q_input.shape[0]]
         if attn.use_fused_qk_rope_concat_and_cache_mla:
             mla_attn = _get_sglang_radix_attn(self.base_attn)
