@@ -2804,9 +2804,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         # `model.forward` — production runner, warmup, benchmarks — gets
         # correct hash routing without a separate setup step.
         ctx = get_forward_context()
-        if ctx.context.input_ids is not None:
-            pass  # already set (e.g. TBO pre-gathered in UBatchWrapper)
-        elif self._need_ids_gather:
+        if self._need_ids_gather:
+            # DP-attention (no EP) hash routing: input_ids is local but the MoE
+            # gate sees DP-gathered gating_output, so gather ids to match. This
+            # runs for every forward, including each TBO ubatch, which invokes
+            # this same forward with its own local slice + ubatch context.
             ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
         else:
             ctx.context.input_ids = input_ids
