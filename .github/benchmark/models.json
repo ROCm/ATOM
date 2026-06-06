@@ -38,7 +38,7 @@
       "path": "deepseek-ai/DeepSeek-V4-Pro",
       "prefix": "deepseek-v4-pro",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+      "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nATOM_PREFILL_DELAYER_MIN_READY_REQS=12\nATOM_PREFILL_DELAYER_MIN_READY_TOKENS=12288\nATOM_PREFILL_DELAYER_MAX_DELAY_PASSES=600\nATOM_PREFILL_DELAYER_MAX_DELAY_MS=10000",
       "config": {
         "tp": 8,
         "kv_cache_dtype": "fp8",

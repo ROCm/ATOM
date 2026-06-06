@@ -540,6 +540,46 @@ class Scheduler:
             return True
         return False
 
+    def _local_prefill_ready_depth(self) -> tuple[int, int]:
+        """Estimate local waiting-queue depth that could be scheduled now.
+
+        Used by PrefillDelayer's optional deep-queue gate. This mirrors the
+        prefill admission checks without mutating queue or block state.
+        """
+        num_reqs = 0
+        num_tokens = 0
+        for seq in self.waiting:
+            if num_reqs >= self.max_num_seqs:
+                break
+            if num_tokens >= self.max_num_batched_tokens:
+                break
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+
+            num_cached_blocks = self.block_manager.can_allocate(seq)
+            if num_cached_blocks < 0:
+                break
+
+            num_new_tokens = (
+                seq.num_tokens - num_cached_blocks * self.block_manager.block_size
+            )
+            budget_remaining = self.max_num_batched_tokens - num_tokens
+            if self.enable_chunked_prefill:
+                chunk = min(num_new_tokens, budget_remaining)
+            else:
+                if num_new_tokens > budget_remaining and num_tokens > 0:
+                    break
+                chunk = num_new_tokens
+            if chunk <= 0:
+                continue
+
+            num_reqs += 1
+            num_tokens += chunk
+
+        return num_reqs, num_tokens
+
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
 
@@ -700,9 +740,14 @@ class Scheduler:
         # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
         _delayer_allows_prefill = True
         if self.prefill_delayer is not None:
+            local_prefill_reqs, local_prefill_tokens = (
+                self._local_prefill_ready_depth()
+            )
             _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
                 local_prefillable=self._can_admit_head_prefill(),
                 token_usage=self._kv_usage(),
+                local_prefill_reqs=local_prefill_reqs,
+                local_prefill_tokens=local_prefill_tokens,
             )
 
         if not self.running and not self.waiting:

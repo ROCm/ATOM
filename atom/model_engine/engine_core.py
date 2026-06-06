@@ -448,6 +448,8 @@ class DPEngineCoreProc(EngineCore):
                     cpu_group=self.dp_group,
                     max_delay_passes=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES,
                     max_delay_ms=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_MS,
+                    min_ready_reqs=envs.ATOM_PREFILL_DELAYER_MIN_READY_REQS,
+                    min_ready_tokens=envs.ATOM_PREFILL_DELAYER_MIN_READY_TOKENS,
                     token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                 )
             )

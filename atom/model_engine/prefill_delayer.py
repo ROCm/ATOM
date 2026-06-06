@@ -20,6 +20,10 @@ Mechanism (per scheduler tick):
   4. Safety valve: if local KV-cache usage drops below
      `token_usage_low_watermark`, the rank reports "force_allow" and the
      delayer falls through immediately (the GPU is idling, don't delay).
+  5. Optional deep-queue gate: when min_ready_reqs / min_ready_tokens are
+     non-zero, "all" means every rank has enough local prefill depth, not just
+     one prefillable request. This is useful for throughput-only closed-loop
+     benchmarks that can otherwise settle into tiny aligned prefill batches.
 
 Why this fixes our problem:
   Today (no delayer) — when 1 rank has a new prefill and 7 have decodes,
@@ -61,6 +65,8 @@ class PrefillDelayer:
         "cpu_group",
         "max_delay_passes",
         "max_delay_ms",
+        "min_ready_reqs",
+        "min_ready_tokens",
         "token_usage_low_watermark",
         "_reduce_buf",
         "_delayed_count",
@@ -80,11 +86,15 @@ class PrefillDelayer:
         max_delay_passes: int = 30,
         token_usage_low_watermark: Optional[float] = None,
         max_delay_ms: float = 5000.0,
+        min_ready_reqs: int = 0,
+        min_ready_tokens: int = 0,
     ):
         self.dp_size = dp_size
         self.cpu_group = cpu_group
         self.max_delay_passes = max_delay_passes
         self.max_delay_ms = max_delay_ms
+        self.min_ready_reqs = max(0, int(min_ready_reqs))
+        self.min_ready_tokens = max(0, int(min_ready_tokens))
         self.token_usage_low_watermark = token_usage_low_watermark
 
         # 3-slot MAX-reduce buffer (gloo-friendly; mirrors the proven
@@ -97,10 +107,10 @@ class PrefillDelayer:
         # Encoding:
         #   slot 0 = local_prefillable          (MAX → "any rank prefillable")
         #   slot 1 = local_force                (MAX → "any rank forces allow")
-        #   slot 2 = NOT local_prefillable      (MAX → "any rank lacks prefill")
-        # Then prefillable_status:
-        #   any_prefillable AND any_not_prefillable → "mixed"
-        #   any_prefillable AND NOT any_not_prefillable → "all"
+        #   slot 2 = NOT local_ready            (MAX → "any rank lacks depth")
+        # Then ready_status:
+        #   any_prefillable AND any_not_ready → "mixed / not deep enough"
+        #   any_prefillable AND NOT any_not_ready → "all ready"
         #   NOT any_prefillable → "none"
         # Single all_reduce, 3 int64s on cpu — negligible overhead.
         self._reduce_buf = torch.zeros(3, dtype=torch.int64, device="cpu")
@@ -125,6 +135,8 @@ class PrefillDelayer:
             f"PrefillDelayer initialized: dp_size={dp_size} "
             f"max_delay_passes={max_delay_passes} "
             f"max_delay_ms={max_delay_ms} "
+            f"min_ready_reqs={self.min_ready_reqs} "
+            f"min_ready_tokens={self.min_ready_tokens} "
             f"watermark={token_usage_low_watermark}"
         )
 
@@ -132,6 +144,8 @@ class PrefillDelayer:
         self,
         local_prefillable: bool,
         token_usage: float,
+        local_prefill_reqs: int = 0,
+        local_prefill_tokens: int = 0,
     ) -> bool:
         """
         Returns True iff this rank is allowed to admit new prefills this tick.
@@ -142,6 +156,9 @@ class PrefillDelayer:
             token_usage: fraction of KV cache blocks currently in use
                 (used_blocks / total_blocks ∈ [0, 1]). Used by the
                 low-watermark safety valve.
+            local_prefill_reqs: number of locally schedulable waiting prefills.
+            local_prefill_tokens: schedulable prefill tokens from the local
+                waiting queue, capped by the scheduler token budget.
         """
         # Local "force allow" if KV cache is underutilized — don't delay
         # when GPU is starving. Only meaningful if this rank actually has
@@ -154,10 +171,18 @@ class PrefillDelayer:
         ):
             force = True
 
+        local_ready = local_prefillable
+        if self.min_ready_reqs > 0:
+            local_ready = local_ready and local_prefill_reqs >= self.min_ready_reqs
+        if self.min_ready_tokens > 0:
+            local_ready = (
+                local_ready and local_prefill_tokens >= self.min_ready_tokens
+            )
+
         # Cross-DP MAX-reduce: 3 booleans encoded as int64.
         self._reduce_buf[0] = 1 if local_prefillable else 0
         self._reduce_buf[1] = 1 if force else 0
-        self._reduce_buf[2] = 0 if local_prefillable else 1
+        self._reduce_buf[2] = 0 if local_ready else 1
         torch.distributed.all_reduce(
             self._reduce_buf,
             op=torch.distributed.ReduceOp.MAX,
@@ -165,11 +190,7 @@ class PrefillDelayer:
         )
         any_prefillable = int(self._reduce_buf[0].item()) > 0
         force_max = int(self._reduce_buf[1].item())
-        any_not_prefillable = int(self._reduce_buf[2].item()) > 0
-
-        # Derive 3-way status: all / none / mixed.
-        prefillable_max = 1 if any_prefillable else 0
-        prefillable_min = 0 if any_not_prefillable else 1
+        any_not_ready = int(self._reduce_buf[2].item()) > 0
 
         # Watermark short-circuit: ANY rank below the watermark forces all
         # ranks to allow this tick. Without this the delayer can stall a
@@ -188,8 +209,8 @@ class PrefillDelayer:
             self._maybe_log()
             return True
 
-        # status = "all" or "none" → no skew, just allow
-        if prefillable_min == prefillable_max:
+        # status = "all ready" or "none prefillable" → allow.
+        if not any_prefillable or not any_not_ready:
             self._reset_delay()
             self._stat_allow += 1
             self._maybe_log()
@@ -211,7 +232,9 @@ class PrefillDelayer:
                     f"[PrefillDelayer] DELAY: count={self._delayed_count} "
                     f"elapsed={elapsed_ms:.1f}ms "
                     f"any_prefillable={any_prefillable} "
-                    f"any_not_prefillable={any_not_prefillable}"
+                    f"any_not_ready={any_not_ready} "
+                    f"local_reqs={local_prefill_reqs} "
+                    f"local_tokens={local_prefill_tokens}"
                 )
             self._maybe_log()
             return False

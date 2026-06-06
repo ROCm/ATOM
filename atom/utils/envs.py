@@ -209,6 +209,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DELAYER_MAX_DELAY_MS": lambda: float(
         os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_MS", "5000")
     ),
+    # Optional deep-queue gate. When non-zero, a DP rank is not considered
+    # prefill-ready until its local waiting queue can supply at least this many
+    # requests / tokens. This keeps closed-loop benchmarks from falling into
+    # tiny-but-DP-aligned prefill batches.
+    "ATOM_PREFILL_DELAYER_MIN_READY_REQS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_MIN_READY_REQS", "0")
+    ),
+    "ATOM_PREFILL_DELAYER_MIN_READY_TOKENS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_MIN_READY_TOKENS", "0")
+    ),
     # Optional KV-usage low watermark below which delaying is allowed.
     # Empty string => None (use PrefillDelayer's internal default).
     "ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": lambda: (
