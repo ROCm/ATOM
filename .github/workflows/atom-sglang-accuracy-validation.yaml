@@ -432,24 +432,43 @@ jobs:
 
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
-
+            
+      - name: Print runner user and Docker diagnostics
+        run: |
+          echo "=== Docker diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+          echo "docker path: $(command -v docker || true)"
+          ls -l /var/run/docker.sock || true
+          stat -c '%U %G %a %n' /var/run/docker.sock || true
+          echo "docker version:"
+          docker version || true
+          echo "docker info:"
+          docker info || true
+          echo "=== End Docker diagnostics ==="
+        
       - name: Pull SGLANG image
         run: |
           docker pull "${SGLANG_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
+          MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
           MODEL_CACHE_MOUNT=""
-          MODEL_CACHE_DESC="container-local /models (no host cache mount)"
+          MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
 
-          if [ -d "/models" ]; then
-            MODEL_CACHE_MOUNT="-v /models:/models"
-            MODEL_CACHE_DESC="/models (host mount)"
+          if [ -d "$(dirname "${MODEL_CACHE_ROOT}")" ]; then
+            mkdir -p "${MODEL_CACHE_ROOT}"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           else
-            echo "Warning: /models directory not found on runner; using container-local /models."
+            echo "Warning: $(dirname "${MODEL_CACHE_ROOT}") directory not found on runner; using container-local ${MODEL_CACHE_ROOT}."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
@@ -489,6 +508,9 @@ jobs:
             --ulimit stack=67108864 \
             --env-file /tmp/sglang_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
+            -e HF_HOME="${MODEL_CACHE_ROOT}/.cache/huggingface" \
+            -e HUGGINGFACE_HUB_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/hub" \
+            -e TRANSFORMERS_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/transformers" \
             --name "$CONTAINER_NAME" \
             "${SGLANG_IMAGE_TAG}"
         env:
@@ -501,11 +523,12 @@ jobs:
       - name: Download model if needed
         run: |
           set -euo pipefail
-          model_dir="/models/${{ matrix.model_path }}"
+          model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
             if ! docker exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_CACHE_ROOT="${MODEL_CACHE_ROOT}" \
               -e MODEL_PATH="${{ matrix.model_path }}" \
               -e MODEL_DIR="$model_dir" \
               -e RUNNER_NAME="${{ matrix.runner }}" \
@@ -538,7 +561,7 @@ jobs:
                   echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
                   download_model
                 else
-                  lock_dir="/models/.cache/atom-download-locks"
+                  lock_dir="${MODEL_CACHE_ROOT}/.cache/atom-download-locks"
                   mkdir -p "$lock_dir"
                   lock_file="$lock_dir/${LOCK_SUFFIX}.lock"
                   exec 9>"$lock_file"
@@ -559,15 +582,15 @@ jobs:
               exit 1
             fi
           else
-            echo "/models directory not mounted; skipping model download"
+            echo "${MODEL_CACHE_ROOT} directory not mounted; skipping model download"
           fi
 
       - name: Resolve SGLANG model path
         if: success()
         run: |
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "SGLANG_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
-            echo "Using mounted model path: /models/${{ matrix.model_path }}"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_CACHE_ROOT}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using mounted model path: ${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
           else
             echo "SGLANG_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
