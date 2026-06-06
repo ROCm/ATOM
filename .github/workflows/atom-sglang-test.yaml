@@ -76,20 +76,23 @@ jobs:
           }
 
           find_latest_artifact() {
-            local runs_json artifact_json run_id
+            local runs_json artifact_json run_id python_artifact_suffix
 
             if [ -n "$ARTIFACT_ID" ] && [ "$ARTIFACT_ID" != "null" ]; then
               return 0
             fi
 
-            echo "=== Finding latest aiter-whl-* artifact from ROCm/aiter ==="
+            python_artifact_suffix="py${ATOM_PYTHON_TAG#cp}"
+            python_artifact_suffix="${python_artifact_suffix:0:3}.${python_artifact_suffix:3}"
+
+            echo "=== Finding latest aiter-whl-* artifact for ${python_artifact_suffix} from ROCm/aiter ==="
             runs_json=$(curl -fsSL -H "$AUTH_HEADER" \
               "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
 
             for run_id in $(echo "$runs_json" | jq -r '.workflow_runs[].id'); do
               artifact_json=$(curl -fsSL -H "$AUTH_HEADER" \
                 "$API_URL/repos/ROCm/aiter/actions/runs/$run_id/artifacts" \
-                | jq '[.artifacts[] | select(.name | startswith("aiter-whl-")) | select(.expired == false)] | sort_by(.created_at) | last')
+                | jq --arg artifact_suffix "-${python_artifact_suffix}" '[.artifacts[] | select(.name | startswith("aiter-whl-") and endswith($artifact_suffix)) | select(.expired == false)] | sort_by(.created_at) | last')
 
               if [ "$artifact_json" != "null" ] && [ -n "$artifact_json" ]; then
                 ARTIFACT_ID=$(echo "$artifact_json" | jq -r '.id')
@@ -167,9 +170,11 @@ jobs:
           }
 
           download_from_artifact() {
-            echo "=== Falling back to latest aiter-whl-* artifact from ROCm/aiter ==="
+            local fallback_wheel fallback_wheel_name
+
+            echo "=== Falling back to latest ${ATOM_PYTHON_TAG} aiter-whl-* artifact from ROCm/aiter ==="
             find_latest_artifact || {
-              echo "ERROR: No aiter-whl-* artifact found in recent Aiter Test runs"
+              echo "ERROR: No ${ATOM_PYTHON_TAG} aiter-whl-* artifact found in recent Aiter Test runs"
               return 1
             }
 
@@ -180,6 +185,15 @@ jobs:
               -o aiter-whl.zip
             unzip -o aiter-whl.zip -d aiter-whl
             rm -f aiter-whl.zip
+
+            fallback_wheel=$(ls -t aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
+            fallback_wheel_name=$(basename "${fallback_wheel:-}")
+            if [ -z "$fallback_wheel" ] || [[ "$fallback_wheel_name" != *${ATOM_PYTHON_TAG}* ]]; then
+              echo "ERROR: artifact fallback did not produce a ${ATOM_PYTHON_TAG} wheel"
+              ls -la aiter-whl/ || true
+              return 1
+            fi
+            echo "Downloaded artifact-selected wheel: $fallback_wheel"
           }
 
           if download_from_s3_manifest; then
@@ -193,6 +207,10 @@ jobs:
           if [ -z "$AITER_WHL" ]; then
             echo "ERROR: No amd_aiter wheel available after S3/artifact attempts"
             ls -la aiter-whl/ || true
+            exit 1
+          fi
+          if [[ "$(basename "$AITER_WHL")" != *${ATOM_PYTHON_TAG}* ]]; then
+            echo "ERROR: selected wheel $AITER_WHL does not match target Python ${ATOM_PYTHON_TAG}"
             exit 1
           fi
 
