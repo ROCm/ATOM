@@ -1284,11 +1284,14 @@ class ModelRunner:
         # Subtract our own PyTorch usage + CUDA graph estimate + safety.
         # This is independent of other processes on the GPU.
         budget = int(total * config.gpu_memory_utilization)
-        available_for_kv = budget - peak_torch - cudagraph_overhead - safety_margin
+        # Fixed (utilization-independent) overhead of this process: model
+        # weights + peak activations + CUDA graph capture + safety margin.
+        non_kv_overhead = peak_torch + cudagraph_overhead + safety_margin
+        available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
         # This prevents OOM when other processes share the GPU.
-        available_for_kv = min(available_for_kv, free)
+        available_for_kv = min(available_for_kv_budget, free)
 
         torch.set_default_device("cpu")
 
@@ -1306,13 +1309,42 @@ class ModelRunner:
         per_req_cache_tensor_bytes = max_per_req_cache_slots * per_req_cache_bytes
         available_for_pool = available_for_kv - per_req_cache_tensor_bytes
         if available_for_pool <= 0:
-            raise RuntimeError(
+            # Minimum gpu_memory_utilization that makes the budget just cover the
+            # per-request cache tensor (available_for_kv_budget ==
+            # per_req_cache_tensor_bytes). Rounded UP to the next 0.01 so the
+            # printed value is actually sufficient, not the exact threshold.
+            min_util = (non_kv_overhead + per_req_cache_tensor_bytes) / total
+            min_util_hint = math.ceil(min_util * 100) / 100
+            base_msg = (
                 f"Per-request cache tensor "
                 f"({per_req_cache_tensor_bytes / (1 << 30):.2f}GB for "
                 f"{max_per_req_cache_slots} slots) exceeds available KV budget "
-                f"({available_for_kv / (1 << 30):.2f}GB). "
-                f"Reduce --max-num-seqs or increase gpu_memory_utilization."
+                f"({available_for_kv / (1 << 30):.2f}GB) at "
+                f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
+            if available_for_kv_budget > free:
+                # The physical free-memory clamp is the binding limit, not the
+                # utilization budget — raising --gpu-memory-utilization won't help.
+                fix_msg = (
+                    f" Only {free / (1 << 30):.2f}GB is physically free on the GPU "
+                    f"(other processes may be holding memory); raising "
+                    f"--gpu-memory-utilization will NOT help. Free GPU memory or "
+                    f"reduce --max-num-seqs (currently {config.max_num_seqs})."
+                )
+            elif min_util_hint <= 1.0:
+                fix_msg = (
+                    f" Set --gpu-memory-utilization >= {min_util_hint:.2f} "
+                    f"(this only zeroes out the deficit; use a higher value for "
+                    f"actual KV capacity) or reduce --max-num-seqs "
+                    f"(currently {config.max_num_seqs})."
+                )
+            else:
+                fix_msg = (
+                    f" Even --gpu-memory-utilization 1.0 is insufficient "
+                    f"(would need {min_util:.2f}); reduce --max-num-seqs "
+                    f"(currently {config.max_num_seqs}) or free GPU memory."
+                )
+            raise RuntimeError(base_msg + fix_msg)
         per_req_cache_equiv_blocks = (
             math.ceil(per_req_cache_bytes / block_bytes)
             if per_req_cache_bytes > 0

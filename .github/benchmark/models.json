@@ -1,172 +1,188 @@
-[
-  {
-    "display": "DeepSeek-R1-0528",
-    "path": "deepseek-ai/DeepSeek-R1-0528",
-    "prefix": "deepseek-r1-0528",
-    "args": "--kv_cache_dtype fp8 -tp 8",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "DeepSeek-V4-Pro",
-    "path": "deepseek-ai/DeepSeek-V4-Pro",
-    "prefix": "deepseek-v4-pro",
-    "args": "--kv_cache_dtype fp8 -tp 8 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
-  },
-  {
-    "display": "DeepSeek-V4-Pro MTP3",
-    "path": "deepseek-ai/DeepSeek-V4-Pro",
-    "prefix": "deepseek-v4-pro",
-    "args": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3",
-    "bench_args": "--use-chat-template",
-    "suffix": "-mtp3",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
-  },
-  {
-    "display": "DeepSeek-V4-Pro DP",
-    "path": "deepseek-ai/DeepSeek-V4-Pro",
-    "prefix": "deepseek-v4-pro",
-    "args": "--kv_cache_dtype fp8 -tp 8 --enable-dp-attention --gpu-memory-utilization 0.85",
-    "bench_args": "",
-    "suffix": "-dpa",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
-  },
-  {
-    "display": "DeepSeek-R1-0528 MTP3",
-    "path": "deepseek-ai/DeepSeek-R1-0528",
-    "prefix": "deepseek-r1-0528",
-    "args": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3",
-    "bench_args": "--use-chat-template",
-    "suffix": "-mtp3",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "DeepSeek-R1-0528-MXFP4",
-    "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
-    "prefix": "deepseek-r1-0528-mxfp4",
-    "args": "--kv_cache_dtype fp8 -tp 4",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "DeepSeek-R1-0528-MXFP4 MTP3",
-    "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
-    "prefix": "deepseek-r1-0528-mxfp4",
-    "args": "--kv_cache_dtype fp8 -tp 4 --method mtp --num-speculative-tokens 3",
-    "bench_args": "--use-chat-template",
-    "suffix": "-mtp3",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "GLM-5-FP8",
-    "path": "zai-org/GLM-5-FP8",
-    "prefix": "glm-5-fp8",
-    "args": "--kv_cache_dtype fp8 -tp 8",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "GLM-5.1-MXFP4",
-    "path": "amd/GLM-5.1-MXFP4",
-    "prefix": "glm-5.1-fp4",
-    "args": "--kv_cache_dtype fp8 -tp 4",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "gpt-oss-120b",
-    "path": "openai/gpt-oss-120b",
-    "prefix": "gpt-oss-120b",
-    "args": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.9",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "Kimi-K2.5-MXFP4",
-    "path": "amd/Kimi-K2.5-MXFP4",
-    "prefix": "kimi-k25-mxfp4",
-    "args": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "MiniMax-M2.7",
-    "path": "MiniMaxAI/MiniMax-M2.7",
-    "prefix": "MiniMax-M2.7",
-    "args": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "MiniMax-M2.7-MXFP4",
-    "path": "amd/MiniMax-M2.7-MXFP4",
-    "prefix": "MiniMax-M2.7-MXFP4",
-    "args": "--kv_cache_dtype fp8 -tp 1 --trust-remote-code",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "Qwen3.5-397B-A17B-FP8",
-    "path": "Qwen/Qwen3.5-397B-A17B-FP8",
-    "prefix": "qwen35-397b-fp8",
-    "args": "--kv_cache_dtype fp8 -tp 4",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "Qwen3.5-397B-A17B-FP8 MTP3",
-    "path": "Qwen/Qwen3.5-397B-A17B-FP8",
-    "prefix": "qwen35-397b-fp8",
-    "args": "--kv_cache_dtype fp8 -tp 4 --method mtp --num-speculative-tokens 3",
-    "bench_args": "",
-    "suffix": "-mtp3",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "Qwen3.5-397B-A17B-MXFP4",
-    "path": "amd/Qwen3.5-397B-A17B-MXFP4",
-    "prefix": "qwen35-397b-mxfp4",
-    "args": "--kv_cache_dtype fp8 -tp 4",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  },
-  {
-    "display": "Llama-3.3-70B-Instruct-MXFP4",
-    "path": "amd/Llama-3.3-70B-Instruct-MXFP4-Preview",
-    "prefix": "llama-3-3-70b-instruct-mxfp4",
-    "args": "--kv_cache_dtype fp8 -tp 1",
-    "bench_args": "",
-    "suffix": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
-  }
-]
+{
+  "default_scenarios": [
+    {
+      "isl": 1024,
+      "osl": 1024,
+      "concurrency": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
+      "random_range_ratio": 0.8
+    },
+    {
+      "isl": 8192,
+      "osl": 1024,
+      "concurrency": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
+      "random_range_ratio": 0.8
+    }
+  ],
+  "models": [
+    {
+      "display": "DeepSeek-R1-0528",
+      "path": "deepseek-ai/DeepSeek-R1-0528",
+      "prefix": "deepseek-r1-0528",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": { "tp": 8, "kv_cache_dtype": "fp8" },
+      "variants": [
+        { "label": "", "suffix": "", "conc_max": 256 },
+        {
+          "label": "MTP3",
+          "suffix": "-mtp3",
+          "extra_args": "--method mtp --num-speculative-tokens 3",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        }
+      ]
+    },
+    {
+      "display": "DeepSeek-V4-Pro",
+      "path": "deepseek-ai/DeepSeek-V4-Pro",
+      "prefix": "deepseek-v4-pro",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+      "config": {
+        "tp": 8,
+        "kv_cache_dtype": "fp8",
+        "extra_args": "--hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'"
+      },
+      "variants": [
+        { "label": "", "suffix": "", "conc_max": 256 },
+        {
+          "label": "MTP3",
+          "suffix": "-mtp3",
+          "extra_args": "--method mtp --num-speculative-tokens 3",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        },
+        {
+          "label": "DPA",
+          "suffix": "-dpa",
+          "extra_args": "--enable-dp-attention",
+          "conc_min": 64,
+          "conc_max": 1024
+        },
+        {
+          "label": "DPA MTP3",
+          "suffix": "-dpa-mtp3",
+          "extra_args": "--method mtp --num-speculative-tokens 3 --enable-dp-attention",
+          "bench_args": "--use-chat-template",
+          "conc_min": 64,
+          "conc_max": 1024
+        }
+      ]
+    },
+    {
+      "display": "DeepSeek-R1-0528-MXFP4",
+      "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+      "prefix": "deepseek-r1-0528-mxfp4",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": { "tp": 4, "kv_cache_dtype": "fp8" },
+      "variants": [
+        { "label": "", "suffix": "", "conc_max": 256 },
+        {
+          "label": "MTP3",
+          "suffix": "-mtp3",
+          "extra_args": "--method mtp --num-speculative-tokens 3",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        }
+      ]
+    },
+    {
+      "display": "GLM-5-FP8",
+      "path": "zai-org/GLM-5-FP8",
+      "prefix": "glm-5-fp8",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": { "tp": 8, "kv_cache_dtype": "fp8" },
+      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    },
+    {
+      "display": "GLM-5.1-MXFP4",
+      "path": "amd/GLM-5.1-MXFP4",
+      "prefix": "glm-5.1-fp4",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": { "tp": 4, "kv_cache_dtype": "fp8" },
+      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    },
+    {
+      "display": "gpt-oss-120b",
+      "path": "openai/gpt-oss-120b",
+      "prefix": "gpt-oss-120b",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": {
+        "kv_cache_dtype": "fp8",
+        "extra_args": "--gpu-memory-utilization 0.9"
+      },
+      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    },
+    {
+      "display": "Kimi-K2.5-MXFP4",
+      "path": "amd/Kimi-K2.5-MXFP4",
+      "prefix": "kimi-k25-mxfp4",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": { "tp": 4, "kv_cache_dtype": "fp8", "trust_remote_code": true },
+      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    },
+    {
+      "display": "MiniMax-M2.7",
+      "path": "MiniMaxAI/MiniMax-M2.7",
+      "prefix": "MiniMax-M2.7",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": { "tp": 2, "kv_cache_dtype": "fp8", "trust_remote_code": true },
+      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    },
+    {
+      "display": "MiniMax-M2.7-MXFP4",
+      "path": "amd/MiniMax-M2.7-MXFP4",
+      "prefix": "MiniMax-M2.7-MXFP4",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": { "tp": 1, "kv_cache_dtype": "fp8", "trust_remote_code": true },
+      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    },
+    {
+      "display": "Qwen3.5-397B-A17B-FP8",
+      "path": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "prefix": "qwen35-397b-fp8",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": { "tp": 4, "kv_cache_dtype": "fp8" },
+      "variants": [
+        { "label": "", "suffix": "", "conc_max": 256 },
+        {
+          "label": "MTP3",
+          "suffix": "-mtp3",
+          "extra_args": "--method mtp --num-speculative-tokens 3",
+          "bench_args": "",
+          "conc_min": 4,
+          "conc_max": 256
+        }
+      ]
+    },
+    {
+      "display": "Qwen3.5-397B-A17B-MXFP4",
+      "path": "amd/Qwen3.5-397B-A17B-MXFP4",
+      "prefix": "qwen35-397b-mxfp4",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": { "tp": 4, "kv_cache_dtype": "fp8" },
+      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    },
+    {
+      "display": "Llama-3.3-70B-Instruct-MXFP4",
+      "path": "amd/Llama-3.3-70B-Instruct-MXFP4-Preview",
+      "prefix": "llama-3-3-70b-instruct-mxfp4",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": { "tp": 1, "kv_cache_dtype": "fp8" },
+      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    }
+  ]
+}
