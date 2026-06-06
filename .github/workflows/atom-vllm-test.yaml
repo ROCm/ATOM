@@ -16,6 +16,7 @@ concurrency:
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+  ATOM_PYTHON_TAG: "cp310"
   OOT_IMAGE_CACHE_KEEP: "3"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
@@ -119,11 +120,24 @@ jobs:
             manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
             manifest_timestamp=$(jq -r '.timestamp // empty' "$manifest_file")
             manifest_commit=$(jq -r '.commit // empty' "$manifest_file")
-            wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
-            wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+
+            wheel_name=$(jq -r ".wheels.${ATOM_PYTHON_TAG}.wheel_name // empty" "$manifest_file")
+            wheel_url=$(jq -r ".wheels.${ATOM_PYTHON_TAG}.wheel_url // empty" "$manifest_file")
+            if [ -n "$wheel_name" ] && [ -n "$wheel_url" ]; then
+              echo "Selected ${ATOM_PYTHON_TAG} wheel from versioned manifest"
+            else
+              wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
+              wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+              echo "Versioned manifest not available, using top-level wheel fields"
+            fi
 
             if [ "$manifest_branch" != "main" ] || [ -z "$manifest_timestamp" ] || [ -z "$manifest_commit" ] || [ -z "$wheel_name" ] || [ -z "$wheel_url" ]; then
               echo "Invalid latest main wheel manifest"
+              return 1
+            fi
+
+            if [[ "$wheel_name" == *cp* ]] && [[ "$wheel_name" != *${ATOM_PYTHON_TAG}* ]]; then
+              echo "WARNING: wheel $wheel_name does not match target Python ${ATOM_PYTHON_TAG}"
               return 1
             fi
 
