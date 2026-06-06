@@ -68,7 +68,6 @@ runs:
 
     - name: Download model
       shell: bash
-      timeout-minutes: 150
       env:
         HF_TOKEN: ${{ inputs.hf-token }}
         MODEL_DOWNLOAD_TIMEOUT: "30m"
