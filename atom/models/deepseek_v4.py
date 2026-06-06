@@ -2206,47 +2206,13 @@ class MoE(nn.Module):
         topk_weights = sqrtsoftplus(router_logits) gathered at topk_ids
         Then renormalize so weights sum to 1 per token.
         """
-        # input_ids comes from forward_context.context (stashed by
-        # `DeepseekV4ForCausalLM.forward`). This callback runs inside the
-        # FusedMoE expert call, which is wrapped in `maybe_dual_stream_forward`
-        # — a custom op opaque to Dynamo, so context access is safe here.
         fwd_input_ids = get_forward_context().context.input_ids
         assert (
             fwd_input_ids is not None
         ), "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
         ids = fwd_input_ids.flatten()
-        # Under DP-attention gather/scatter, forward_impl_graph gathers
-        # hidden_states and gating_output across DP ranks before calling
-        # select_experts → _hash_topk.  input_ids is still local (not
-        # gathered), so topk_ids would be [local_bs, topk] while the
-        # gathered gating_output is [local_bs*dp, n_experts].  Gather
-        # input_ids to match.
         num_tokens = gating_output.shape[0]
-        if ids.shape[0] < num_tokens:
-            from aiter.dist.parallel_state import get_dp_group as _get_dp_group
-
-            ctx = get_forward_context()
-            dp_eager_mode = (
-                not ctx.context.dp_uniform_decode
-            ) and ctx.dp_metadata is not None
-            if dp_eager_mode:
-                from atom.model_ops.moe import all_gatherv
-
-                sizes = ctx.dp_metadata.get_sizes_across_dp()
-                ids_2d = ids.unsqueeze(-1)
-                ids_2d = all_gatherv(ids_2d, sizes, _get_dp_group())
-                ids = ids_2d.flatten()
-            else:
-                from atom.model_ops.moe import pad_for_all_gather
-
-                ids_2d = ids.unsqueeze(-1)
-                ids_2d, _ = pad_for_all_gather(ids_2d)
-                # use_custom=True: avoid NCCL all_gather recording an event
-                # inside CUDAGraph capture (watchdog would later query it and
-                # trigger hipErrorCapturedEvent).
-                ids_2d = _get_dp_group().all_gather(ids_2d, use_custom=True, dim=0)
-                ids = ids_2d[:num_tokens].flatten()
-            ids = ids.clamp(0, self.gate.tid2eid.shape[0] - 1)
+        ids = ids[:num_tokens].clamp(0, self.gate.tid2eid.shape[0] - 1)
         topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
         scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
         topk_weights = scores.gather(dim=-1, index=topk_ids.long())
@@ -2295,6 +2261,27 @@ class MoE(nn.Module):
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
         return self.experts(hidden_states=x, router_logits=router_logits)
+
+    @staticmethod
+    def _gather_ids_for_dp(ids: torch.Tensor, ctx) -> torch.Tensor:
+        """All-gather input_ids across DP ranks to match gathered hidden_states."""
+        from aiter.dist.parallel_state import get_dp_group
+
+        ids_2d = ids.unsqueeze(-1)
+        dp_eager_mode = (
+            not ctx.context.dp_uniform_decode
+        ) and ctx.dp_metadata is not None
+        if dp_eager_mode:
+            from atom.model_ops.moe import all_gatherv
+
+            sizes = ctx.dp_metadata.get_sizes_across_dp()
+            ids_2d = all_gatherv(ids_2d, sizes, get_dp_group())
+        else:
+            from atom.model_ops.moe import pad_for_all_gather
+
+            ids_2d, _ = pad_for_all_gather(ids_2d)
+            ids_2d = get_dp_group().all_gather(ids_2d, use_custom=False, dim=0)
+        return ids_2d.flatten()
 
     def combine_outputs(
         self,
@@ -2786,6 +2773,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         # default [max_num_batched_tokens, hidden_size]. forward returns
         # the un-reduced mHC residual stack [N, hc, dim].
         self.extra_output_dims: tuple[int, ...] = (self.args.hc_mult,)
+        self._need_ids_gather = (
+            config.enable_dp_attention
+            and not config.enable_expert_parallel
+            and self.args.n_hash_layers > 0
+        )
 
     @property
     def disable_fused_shared_loading(self) -> bool:
@@ -2812,7 +2804,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         # `model.forward` — production runner, warmup, benchmarks — gets
         # correct hash routing without a separate setup step.
         ctx = get_forward_context()
-        ctx.context.input_ids = input_ids
+        if self._need_ids_gather:
+            # DP-attention (no EP) hash routing: input_ids is local but the MoE
+            # gate sees DP-gathered gating_output, so gather ids to match. This
+            # runs for every forward, including each TBO ubatch, which invokes
+            # this same forward with its own local slice + ubatch context.
+            ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
+        else:
+            ctx.context.input_ids = input_ids
         return self.model(input_ids, positions)
 
     def compute_logits(

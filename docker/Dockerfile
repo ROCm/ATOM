@@ -1,5 +1,5 @@
 # Default base images
-ARG BASE_IMAGE="rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0"
+ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0"
 ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
@@ -234,9 +234,13 @@ CMD ["/bin/bash"]
 # ATOM image: multi-stage parallel build
 #
 # BuildKit runs independent builder stages in parallel:
-#   base ──┬── build_rccl   ──┐
-#          ├── build_triton ──┼── atom_image (merge builders + install MORI/ATOM)
-#          └── build_aiter  ──┘
+#   base ──┬── build_rccl  ──┐
+#          └── build_aiter ──┴── atom_image (merge builders + install MORI/ATOM)
+#
+# Triton is NOT built from source: the ROCm PyTorch base image already ships a
+# matching Triton (installed as a torch dependency), and aiter handles its own
+# Triton needs at install time. The previous build_triton stage that compiled
+# ROCm/triton release/internal/3.5.x has been removed.
 # ====================================================================
 
 # --------------------------------------------------------------------
@@ -271,21 +275,7 @@ RUN echo "========== [Parallel] Building RCCL ==========" && \
     ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST
 
 # --------------------------------------------------------------------
-# Stage 2: Triton — parallel
-# --------------------------------------------------------------------
-FROM base AS build_triton
-
-RUN echo "========== [Parallel] Building Triton ==========" && \
-    pip uninstall -y triton && \
-    git clone --depth=1 --branch release/internal/3.5.x \
-        https://github.com/ROCm/triton.git /triton-test && \
-    cd /triton-test && \
-    pip install -r python/requirements.txt && \
-    pip install filecheck && \
-    MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
-
-# --------------------------------------------------------------------
-# Stage 3: Aiter — parallel
+# Stage 2: Aiter — parallel
 # --------------------------------------------------------------------
 FROM base AS build_aiter
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
@@ -304,7 +294,7 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
     GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 
 # --------------------------------------------------------------------
-# Stage 4: Final merge — collect all build artifacts + install MORI/ATOM
+# Stage 3: Final merge — collect all build artifacts + install MORI/ATOM
 # --------------------------------------------------------------------
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
@@ -408,12 +398,8 @@ COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
 RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
     rm -rf /tmp/rccl
 
-# Triton: copy package from build stage into current venv
-# Use RUN --mount to avoid COPY glob issues, and preserve mori already in venv
-RUN --mount=from=build_triton,source=/opt/venv/lib/python3.10/site-packages,target=/triton-pkgs \
-    cp -a /triton-pkgs/triton /opt/venv/lib/python3.10/site-packages/ && \
-    cp -a /triton-pkgs/triton-*.dist-info /opt/venv/lib/python3.10/site-packages/ && \
-    pip show triton
+# Triton ships with the ROCm PyTorch base image (installed as a torch dependency);
+# no separate build/copy step is needed here.
 
 # Aiter: copy compiled source tree + re-register editable install
 # (pip install -e creates egg-link automatically, no need to COPY them)
