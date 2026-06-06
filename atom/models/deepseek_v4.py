@@ -2273,10 +2273,12 @@ class MoE(nn.Module):
         ) and ctx.dp_metadata is not None
         if dp_eager_mode:
             from atom.model_ops.moe import all_gatherv
+
             sizes = ctx.dp_metadata.get_sizes_across_dp()
             ids_2d = all_gatherv(ids_2d, sizes, get_dp_group())
         else:
             from atom.model_ops.moe import pad_for_all_gather
+
             ids_2d, _ = pad_for_all_gather(ids_2d)
             ids_2d = get_dp_group().all_gather(ids_2d, use_custom=False, dim=0)
         return ids_2d.flatten()
@@ -2805,9 +2807,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if ctx.context.input_ids is not None:
             pass  # already set (e.g. TBO pre-gathered in UBatchWrapper)
         elif self._need_ids_gather:
-            ctx.context.input_ids = MoE._gather_ids_for_dp(
-                input_ids.flatten(), ctx
-            )
+            ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
         else:
             ctx.context.input_ids = input_ids
         return self.model(input_ids, positions)
