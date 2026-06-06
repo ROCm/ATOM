@@ -1814,5 +1814,5 @@ jobs:
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
           auto-push: true
-          max-items-in-chart: 90
+          max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}

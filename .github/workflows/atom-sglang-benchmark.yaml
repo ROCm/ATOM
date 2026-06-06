@@ -1658,7 +1658,7 @@ jobs:
           alert-threshold: "80%"
           comment-on-alert: true
           fail-on-alert: false
-          max-items-in-chart: 90
+          max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push dashboard data to gh-pages
