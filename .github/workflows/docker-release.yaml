@@ -13,6 +13,7 @@ on:
           - rocm/pytorch:latest
           - rocm/pytorch-nightly:latest
           - rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.10.0
+          - rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
       atom_repo:
         description: "ATOM repo"
         default: "https://github.com/ROCm/ATOM.git"
