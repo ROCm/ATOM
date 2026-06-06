@@ -1,5 +1,5 @@
 # Default base images
-ARG BASE_IMAGE="rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0"
+ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0"
 ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
