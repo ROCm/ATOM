@@ -36,6 +36,10 @@ if envs.ATOM_USE_TRITON_GEMM:
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
     )
+    from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+        moe_gemm_a4w4,
+        mxfp4_quant,
+    )
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 
 
@@ -274,21 +278,43 @@ def triton_kernel_fused_experts(
                 swizzle_mx_scale=w2_swizzle_layout,
             )
     else:
-        # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation
-        raw_intermediate = moe_gemm_a16w4(
-            hidden_states,
-            w1,
-            None,
-            w13_scale,
-            None,
-            None,
-            w1_bias,
-            routing_data,
-            gather_indx=gather_indx,
-            gammas=gammas if apply_router_weight_on_input else None,
-            swizzle_mx_scale=w13_swizzle_layout,
-            apply_swiglu=False,
-        )
+        # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation.
+        # The activation precision selects the routed GEMM: MXFP4 activations
+        # (a4w4) when x_q_dtype is fp4, otherwise bf16 activations (a16w4).
+        x_q_dtype_base = x_q_dtype.split("_")[0] if x_q_dtype else None
+
+        if x_q_dtype_base == "fp4":
+            # quant to a4 then matmul
+            hidden_states_fp4, hidden_states_mx_scale = mxfp4_quant(hidden_states)
+            raw_intermediate = moe_gemm_a4w4(
+                hidden_states_fp4,
+                w1,
+                hidden_states_mx_scale,
+                w13_scale,
+                None,
+                None,
+                w1_bias,
+                routing_data,
+                gather_indx=gather_indx,
+                gammas=gammas if apply_router_weight_on_input else None,
+                swizzle_mx_scale=w13_swizzle_layout,
+                apply_swiglu=False,
+            )
+        else:
+            raw_intermediate = moe_gemm_a16w4(
+                hidden_states,
+                w1,
+                None,
+                w13_scale,
+                None,
+                None,
+                w1_bias,
+                routing_data,
+                gather_indx=gather_indx,
+                gammas=gammas if apply_router_weight_on_input else None,
+                swizzle_mx_scale=w13_swizzle_layout,
+                apply_swiglu=False,
+            )
 
         raw_2d = raw_intermediate.view(M * topk, N)
         intermediate_cache = intermediate_cache.view(M * topk, half_N)
@@ -300,19 +326,36 @@ def triton_kernel_fused_experts(
             dtype_quant=None,
         )
 
-        output_tensor = moe_gemm_a16w4(
-            intermediate_cache,
-            w2,
-            None,
-            w2_scale,
-            None,
-            None,
-            w2_bias,
-            routing_data,
-            scatter_indx=scatter_indx,
-            gammas=None if apply_router_weight_on_input else gammas,
-            swizzle_mx_scale=w2_swizzle_layout,
-        )
+        if x_q_dtype_base == "fp4":
+            # quant to a4 then matmul
+            intermediate_fp4, intermediate_mx_scale = mxfp4_quant(intermediate_cache)
+            output_tensor = moe_gemm_a4w4(
+                intermediate_fp4,
+                w2,
+                intermediate_mx_scale,
+                w2_scale,
+                None,
+                None,
+                w2_bias,
+                routing_data,
+                scatter_indx=scatter_indx,
+                gammas=None if apply_router_weight_on_input else gammas,
+                swizzle_mx_scale=w2_swizzle_layout,
+            )
+        else:
+            output_tensor = moe_gemm_a16w4(
+                intermediate_cache,
+                w2,
+                None,
+                w2_scale,
+                None,
+                None,
+                w2_bias,
+                routing_data,
+                scatter_indx=scatter_indx,
+                gammas=None if apply_router_weight_on_input else gammas,
+                swizzle_mx_scale=w2_swizzle_layout,
+            )
 
         return output_tensor
 

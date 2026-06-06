@@ -1230,8 +1230,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         through the MoE GEMM as the last expert(s) of ``w13/w2``.
 
         Here we instead apply the shared expert to every token via two dense
-        ``gemm_a16wfp4`` calls (gate_up -> SiLU-and-mul -> down) on the
-        pre-swizzle weight slices stashed in ``process_weights_after_loading``,
+        MXFP4 GEMM calls (gate_up -> SiLU-and-mul -> down) on the pre-swizzle
+        weight slices stashed in ``process_weights_after_loading``. The dense
+        GEMM is ``gemm_afp4wfp4`` (a4w4) when activations are MXFP4, otherwise
+        ``gemm_a16wfp4`` (a16w4), matching the routed-expert activation dtype,
         and return the result so the caller adds it (weight 1.0) to the routed
         output before the TP all-reduce. The shared-expert intermediate is
         TP-partitioned exactly like the routed experts, so both partial outputs
@@ -1250,9 +1252,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         M = x.shape[0]
         swiglu_limit = getattr(layer, "swiglu_limit", 0.0)
 
+        # Match the routed-expert activation precision: MXFP4 activations
+        # (a4w4) when x_q_dtype is fp4, otherwise bf16 activations (a16w4).
+        # The shared-expert weights share the routed (N, K//2) + (N, K//32)
+        # MXFP4 layout, so the only difference is whether the dense activation
+        # is MXFP4-quantized before the GEMM.
+        a_quant_dtype = self.moe.a_quant_dtype
+        use_a4w4 = (
+            a_quant_dtype is not None
+            and isinstance(a_quant_dtype, str)
+            and a_quant_dtype.split("_")[0] == "fp4"
+        )
+        if use_a4w4:
+            from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
+            from aiter.ops.triton.moe.moe_op_gemm_a4w4 import mxfp4_quant
+
+        def _shared_expert_gemm(act, weight, weight_scale):
+            if use_a4w4:
+                act_fp4, act_mx_scale = mxfp4_quant(act)
+                return gemm_afp4wfp4(act_fp4, weight, act_mx_scale, weight_scale)
+            return gemm_a16wfp4(act, weight, weight_scale)
+
         shared_out = None
         for e in range(layer.num_fused_shared_experts):
-            gate_up = gemm_a16wfp4(
+            gate_up = _shared_expert_gemm(
                 x,
                 layer.shared_w13_weight[e],
                 layer.shared_w13_weight_scale[e],
@@ -1266,7 +1289,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 activation="silu",
                 dtype_quant=None,
             )
-            out_e = gemm_a16wfp4(
+            out_e = _shared_expert_gemm(
                 intermediate,
                 layer.shared_w2_weight[e],
                 layer.shared_w2_weight_scale[e],
