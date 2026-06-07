@@ -600,8 +600,14 @@ def _paged_decode_reduce_kernel(
     l_final = l_combined * alpha_kv + alpha_sink
 
     denom = tl.maximum(l_final, 1.0e-30)
-    scale = tl.where(l_final > 0.0, alpha_kv / denom, 0.0)
-    out = acc_combined * scale
+    # Direct divide (acc*alpha_kv)/denom, matching the single-CTA reference.
+    # The prior `acc * (alpha_kv/denom)` precomputed a reciprocal-scaled scalar
+    # (~1 extra ulp per element). Under split-K that per-kv_splits rounding
+    # diverges across batch shapes (T) and, via MTP greedy spec-acceptance,
+    # flips tokens — breaking MTP losslessness. The D-chunked multi-CTA layout
+    # (perf) is untouched; only the final normalize arithmetic changes.
+    acc_final = acc_combined * alpha_kv
+    out = tl.where(l_final > 0.0, acc_final / denom, 0.0)
 
     tl.store(
         out_ptr + t * out_stride_t + h * out_stride_h + d_offs * out_stride_d,
