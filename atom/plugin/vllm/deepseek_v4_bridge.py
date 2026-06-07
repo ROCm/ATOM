@@ -753,24 +753,43 @@ class _V4StateSlotAllocator:
     def assign(self, first_block_ids, num_computed):
         """Return ``(slots: np.int32[num_reqs], reset_slots: set[int])``."""
         self._step += 1
-        n = len(first_block_ids)
-        active = {int(first_block_ids[i]) for i in range(n)}
-        slots = np.empty(n, dtype=np.int32)
+        # Pull both arrays to Python lists in one C call. Per-element
+        # ``int(np_arr[i])`` (a numpy-scalar -> Python-int conversion) was the
+        # dominant cost of this per-decode-step loop; ``.tolist()`` amortizes
+        # it. Local-bind the dict/list fields too -- attribute lookups inside
+        # the ``bs``-length loop add up at large batch (profiled #1 build cost).
+        fb = (
+            first_block_ids.tolist()
+            if hasattr(first_block_ids, "tolist")
+            else list(first_block_ids)
+        )
+        nc = (
+            num_computed.tolist()
+            if hasattr(num_computed, "tolist")
+            else list(num_computed)
+        )
+        n = len(fb)
+        active = set(fb)
+        block_to_slot = self._block_to_slot
+        slot_to_block = self._slot_to_block
+        last_seen = self._last_seen
+        step = self._step
+        slots = [0] * n
         reset: set[int] = set()
         for i in range(n):
-            b = int(first_block_ids[i])
-            slot = self._block_to_slot.get(b)
+            b = fb[i]
+            slot = block_to_slot.get(b)
             if slot is None:
                 slot = self._acquire(active)
-                self._block_to_slot[b] = slot
-                self._slot_to_block[slot] = b
+                block_to_slot[b] = slot
+                slot_to_block[slot] = b
                 reset.add(slot)
-            elif int(num_computed[i]) == 0:
+            elif nc[i] == 0:
                 # Recycled block id now owned by a fresh request.
                 reset.add(slot)
             slots[i] = slot
-            self._last_seen[slot] = self._step
-        return slots, reset
+            last_seen[slot] = step
+        return np.asarray(slots, dtype=np.int32), reset
 
     def _acquire(self, active: set[int]) -> int:
         if self._free:
