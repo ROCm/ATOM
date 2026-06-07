@@ -763,8 +763,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             assert has_triton_kernels(), "triton_kernels is not installed"
         # Opt-in: use AITER's triton/gluon moe_op_gemm_a8w4 (fp8 act x mxfp4 weight) kernel
-        # for the gpt-oss swiglu MoE instead of triton_kernels matmul_ogs. otherwise stays on matmul_ogs.
+        # for the gpt-oss swiglu MoE instead of triton_kernels matmul_ogs.
         self.use_a8w4 = envs.ATOM_USE_TRITON_A8W4_MOE
+        if self.use_a8w4:
+            assert (
+                gfx == "gfx1250"
+            ), "ATOM_USE_TRITON_A8W4_MOE currently requires gfx1250 (swizzle_scales_gfx1250 / GFX1250_SCALE)"
 
     def create_weights(
         self,
