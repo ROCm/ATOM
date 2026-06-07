@@ -420,7 +420,7 @@ jobs:
       actions: read
       contents: write
     env:
-      CONTAINER_NAME: atom_sglang_validation_${{ strategy.job-index }}
+      CONTAINER_NAME: atom_sglang_validation_${{ github.run_id }}_${{ github.run_attempt }}_${{ strategy.job-index }}
       SGLANG_IMAGE_TAG: ${{ needs.prepare-sglang-image.outputs.sglang_image_tag }}
     steps:
       - name: Checkout ATOM repo
@@ -451,7 +451,27 @@ jobs:
         
       - name: Pull SGLANG image
         run: |
-          docker pull "${SGLANG_IMAGE_TAG}"
+          set -euo pipefail
+          if [ -z "${SGLANG_IMAGE_TAG}" ]; then
+            echo "ERROR: SGLANG image reference is empty."
+            exit 1
+          fi
+
+          echo "Pulling SGLANG image: ${SGLANG_IMAGE_TAG}"
+          pull_ok=false
+          for attempt in 1 2 3; do
+            echo "Pull attempt ${attempt}/3: ${SGLANG_IMAGE_TAG}"
+            if docker pull "${SGLANG_IMAGE_TAG}"; then
+              pull_ok=true
+              break
+            fi
+            sleep $((attempt * 10))
+          done
+
+          if [ "${pull_ok}" != "true" ]; then
+            echo "ERROR: Failed to pull SGLANG image: ${SGLANG_IMAGE_TAG}"
+            exit 1
+          fi
 
       - name: Prepare model cache mount
         run: |
@@ -480,8 +500,20 @@ jobs:
           fi
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
+      #- name: Verify old validation container is removed
+      #  run: |
+      #    set -euo pipefail
+      #    echo "Verifying old validation container cleanup for ${CONTAINER_NAME}"
+      #    docker ps -a --filter "name=^/${CONTAINER_NAME}$"
+      #    if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
+      #      echo "ERROR: Old validation container ${CONTAINER_NAME} still exists after cleanup."
+      #      docker inspect "$CONTAINER_NAME" || true
+      #      exit 1
+      #    fi
+
       - name: Start validation container
         run: |
+          set -euo pipefail
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
           else
@@ -495,7 +527,7 @@ jobs:
           ${{ matrix.env_vars }}
           EOF
 
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          container_id="$(docker run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
@@ -512,7 +544,16 @@ jobs:
             -e HUGGINGFACE_HUB_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/hub" \
             -e TRANSFORMERS_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/transformers" \
             --name "$CONTAINER_NAME" \
-            "${SGLANG_IMAGE_TAG}"
+            "${SGLANG_IMAGE_TAG}" \
+            bash -lc "trap : TERM INT; sleep infinity & wait")"
+
+          echo "Started validation container ${CONTAINER_NAME}: ${container_id}"
+          docker ps -a --filter "name=^/${CONTAINER_NAME}$"
+          if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" != "true" ]; then
+            echo "ERROR: Validation container ${CONTAINER_NAME} is not running after docker run."
+            docker logs "$CONTAINER_NAME" || true
+            exit 1
+          fi
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -523,6 +564,14 @@ jobs:
       - name: Download model if needed
         run: |
           set -euo pipefail
+          echo "Checking validation container before model download:"
+          docker ps -a --filter "name=^/${CONTAINER_NAME}$"
+          if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" != "true" ]; then
+            echo "ERROR: Validation container ${CONTAINER_NAME} is missing or not running before model download."
+            docker logs "$CONTAINER_NAME" || true
+            exit 1
+          fi
+
           model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
