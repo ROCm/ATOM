@@ -14,7 +14,7 @@ import torch
 import zmq
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
-from atom.rollout.engine_utility import EngineUtilityHandler
+from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
 from atom.utils import envs, init_exit_handler, make_zmq_socket
@@ -145,7 +145,10 @@ class EngineCore:
             )
 
         self.utility_handler = EngineUtilityHandler(
-            self.runner_mgr, self.output_queue, label=self.label
+            self.runner_mgr,
+            self.output_queue,
+            label=self.label,
+            scheduler=self.scheduler,
         )
 
         self._send_ready_signal()
@@ -364,20 +367,10 @@ class EngineCore:
                         )
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
-                        # Put utility commands into queue for processing in busy_loop
-                        # This ensures all runner_mgr.call_func() calls happen in the same thread
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
-                        if cmd == "start_profile":
-                            self.start_profiler()
-                        elif cmd == "stop_profile":
-                            self.stop_profiler()
-                        elif cmd == "get_mtp_stats":
-                            self.print_mtp_statistics()
-                        else:
-                            # Queue command for processing in busy_loop (main thread)
-                            self.utility_queue.put_nowait((cmd, reqs))
-                            self._has_pending_utility = True
+                        self.utility_queue.put_nowait((cmd, reqs))
+                        self._has_pending_utility = True
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
@@ -434,25 +427,6 @@ class EngineCore:
                         f"{self.label}: output send {EngineCoreRequestType.SHUTDOWN}"
                     )
                     break
-
-    def start_profiler(self):
-        if self.profile_enbaled:
-            self.runner_mgr.call_func("start_profiler", wait_out=True)
-
-    def stop_profiler(self):
-        if self.profile_enbaled:
-            logger.info("Profiler stopping...")
-            t0 = time.monotonic()
-            self.runner_mgr.call_func("stop_profiler", wait_out=True)
-            logger.info("Profiler stopped in %.1fs", time.monotonic() - t0)
-
-    def print_mtp_statistics(self):
-        if self.scheduler.spec_stats is not None:
-            self.scheduler.spec_stats._log()
-        else:
-            logger.info(
-                "\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n"
-            )
 
 
 class DPEngineCoreProc(EngineCore):

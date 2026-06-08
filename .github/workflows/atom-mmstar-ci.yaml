@@ -23,6 +23,7 @@ concurrency:
 
 env:
   ATOM_BASE_IMAGE: rocm/atom-dev:latest
+  ATOM_PYTHON_TAG: "cp310"
 
 jobs:
   prepare-mmstar-matrix:
@@ -138,11 +139,22 @@ jobs:
           manifest_file="$(mktemp)"
           curl -fsSL -H "Cache-Control: no-cache" "${manifest_url}" -o "${manifest_file}"
 
-          wheel_url="$(jq -r '.wheel_url // empty' "${manifest_file}")"
-          wheel_name="$(jq -r '.wheel_name // empty' "${manifest_file}")"
+          wheel_name="$(jq -r ".wheels.${ATOM_PYTHON_TAG}.wheel_name // empty" "${manifest_file}")"
+          wheel_url="$(jq -r ".wheels.${ATOM_PYTHON_TAG}.wheel_url // empty" "${manifest_file}")"
+          if [ -n "${wheel_name}" ] && [ -n "${wheel_url}" ]; then
+            echo "Selected ${ATOM_PYTHON_TAG} wheel from versioned manifest"
+          else
+            wheel_name="$(jq -r '.wheel_name // empty' "${manifest_file}")"
+            wheel_url="$(jq -r '.wheel_url // empty' "${manifest_file}")"
+            echo "Versioned manifest not available, using top-level wheel fields"
+          fi
           if [ -z "${wheel_url}" ] || [ -z "${wheel_name}" ]; then
             echo "Invalid aiter wheel manifest:"
             cat "${manifest_file}"
+            exit 1
+          fi
+          if [[ "${wheel_name}" == *cp* ]] && [[ "${wheel_name}" != *${ATOM_PYTHON_TAG}* ]]; then
+            echo "ERROR: wheel ${wheel_name} does not match target Python ${ATOM_PYTHON_TAG}"
             exit 1
           fi
 
