@@ -1389,48 +1389,20 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self.paged_kv_last_page_len = torch.ones(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
-        self.paged_kv_indices = torch.zeros(
-            [max_num_batched_tokens * self.topk_tokens],
-            dtype=torch.int32,
-            device=device,
-        )
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
-        default_sfc = (
-            get_current_atom_config().compilation_config.static_forward_context
+        # The indexer writes topk indices to paged_kv_indices and sparse MLA reads
+        # from this buffer. The indexer module is shared across ubatches in DBO
+        # settings, so we bind a single shared buffer onto every indexer this builder
+        # serves and let other ubatches for the same layer reuse it so that sparse
+        # MLA doesn't read from unwritten per-builder buffers
+        self.paged_kv_indices = self._bind_shared_sparse_kv_indices(
+            layer_names,
+            config,
+            device,
+            max_num_batched_tokens * self.topk_tokens,
         )
-        vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
-        for layer_name in layer_names or []:
-            attention_prefix = (
-                layer_name[: -len(".attn")]
-                if layer_name.endswith(".attn")
-                else layer_name
-            )
-            indexer_cache = vllm_sfc.get(f"{attention_prefix}.indexer.k_cache")
-            owner_atom_config = getattr(indexer_cache, "atom_config", None)
-            sfc = (
-                owner_atom_config.compilation_config.static_forward_context
-                if owner_atom_config is not None
-                else default_sfc
-            )
-            indexer = sfc.get(f"{attention_prefix}.indexer")
-            if indexer is not None:
-                indexer.sparse_kv_indices_buffer = self.paged_kv_indices
-            sparse_attn = sfc.get(attention_prefix)
-            if sparse_attn is not None and hasattr(
-                sparse_attn, "sparse_kv_indices_buffer"
-            ):
-                sparse_attn.sparse_kv_indices_buffer = self.paged_kv_indices
-            if indexer is None or sparse_attn is None:
-                logger.warning(
-                    "Sparse MLA buffer binding incomplete for %s "
-                    "(indexer=%s, sparse_attn=%s, owner_atom_config=%s)",
-                    attention_prefix,
-                    indexer is not None,
-                    sparse_attn is not None,
-                    owner_atom_config is not None,
-                )
 
         (
             (work_meta_data_size, work_meta_data_type),
@@ -1476,6 +1448,71 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self._prev_req_extent = 0
         self._prev_indices_extent = 0
         self._prev_metadata_key = None
+
+    def _bind_shared_sparse_kv_indices(self, layer_names, config, device, numel):
+        # Resolve and bind a single shared paged_kv_indices buffer.
+        # Reuse the buffer the other ubatch already bound if it exists, otherwise
+        # allocate a new one
+        default_sfc = (
+            get_current_atom_config().compilation_config.static_forward_context
+        )
+        vllm_sfc = getattr(config.compilation_config, "static_forward_context", {})
+
+        def _resolve_indexer(layer_name):
+            attention_prefix = (
+                layer_name[: -len(".attn")]
+                if layer_name.endswith(".attn")
+                else layer_name
+            )
+            indexer_cache = vllm_sfc.get(f"{attention_prefix}.indexer.k_cache")
+            owner_atom_config = getattr(indexer_cache, "atom_config", None)
+            sfc = (
+                owner_atom_config.compilation_config.static_forward_context
+                if owner_atom_config is not None
+                else default_sfc
+            )
+            return (
+                attention_prefix,
+                sfc.get(f"{attention_prefix}.indexer"),
+                sfc.get(attention_prefix),
+                owner_atom_config,
+            )
+
+        # Reuse the buffer a sibling ubatch builder already bound onto the shared
+        # indexer module (the indexer's initial torch.empty(0) has numel 0, so the
+        # first builder allocates and later builders reuse). Reusing -- never
+        # re-allocating -- keeps the tensor identity stable for torch.compile and
+        # the device address stable for CUDA graphs.
+        shared_buffer = None
+        for layer_name in layer_names or []:
+            _, indexer, _, _ = _resolve_indexer(layer_name)
+            existing_buffer = getattr(indexer, "sparse_kv_indices_buffer", None)
+            if existing_buffer is not None and existing_buffer.numel() >= numel:
+                shared_buffer = existing_buffer
+                break
+        if shared_buffer is None:
+            shared_buffer = torch.zeros([numel], dtype=torch.int32, device=device)
+
+        for layer_name in layer_names or []:
+            attention_prefix, indexer, sparse_attn, owner_atom_config = _resolve_indexer(
+                layer_name
+            )
+            if indexer is not None:
+                indexer.sparse_kv_indices_buffer = shared_buffer
+            if sparse_attn is not None and hasattr(
+                sparse_attn, "sparse_kv_indices_buffer"
+            ):
+                sparse_attn.sparse_kv_indices_buffer = shared_buffer
+            if indexer is None or sparse_attn is None:
+                logger.warning(
+                    "Sparse MLA buffer binding incomplete for %s "
+                    "(indexer=%s, sparse_attn=%s, owner_atom_config=%s)",
+                    attention_prefix,
+                    indexer is not None,
+                    sparse_attn is not None,
+                    owner_atom_config is not None,
+                )
+        return shared_buffer
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         num_tokens = common_attn_metadata.num_actual_tokens
