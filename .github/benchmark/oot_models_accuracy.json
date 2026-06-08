@@ -172,6 +172,18 @@
     "_baseline_note": "20-shot gsm8k reference from DeepSeek-V3.2 usage docs; nightly uses 20-shot to exercise sparse MLA."
   },
   {
+    "model_name": "DeepSeek-V3.2-FP8 DP8+EP+DBO",
+    "model_path": "deepseek-ai/DeepSeek-V3.2",
+    "extraArgs": "--data-parallel-size 8 --enable-expert-parallel --enable-dbo",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0\nMORI_SHMEM_MODE=ISOLATION",
+    "runner": "linux-atom-mi35x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.95,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V3.2",
+    "_baseline_note": "20-shot gsm8k reference from DeepSeek-V3.2 usage docs; nightly uses 20-shot to exercise sparse MLA."
+  },
+  {
     "model_name": "gpt-oss-120b TP1",
     "model_path": "openai/gpt-oss-120b",
     "extraArgs": "--tensor-parallel-size 1",

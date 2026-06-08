@@ -19,6 +19,7 @@ def patch_vllm_dbo_backend() -> None:
     as its MoE prepare/finalize is implemented on the contract for the DeepEP
     backends. In ATOM plugin mode where ATOM's own MoE prepare/finalize is used,
     this assertion is over-broad as DeepEP is not used and it rules out mori.
+    (See vllm/config/vllm.py:1375)
 
     Therefore, here we patch VllmConfig.__post_init__ to bypass the assertion by
     spoofing the all2all backend to "deepep_low_latency" during the construction
