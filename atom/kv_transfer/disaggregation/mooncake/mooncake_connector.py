@@ -115,6 +115,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.handshake_port = get_open_port()
+        self.base_handshake_port = kv_transfer_config.get("handshake_port", 6301)
         self.engine_id = "None"
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.parallel_config.data_parallel_size
@@ -224,6 +225,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "remote_engine_id": self.engine_id,
             "remote_host": self.host_ip,
             "remote_port": self.handshake_port,
+            "remote_handshake_port": self.base_handshake_port,
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
             "transfer_id": seq.id,
@@ -1056,6 +1058,10 @@ class MooncakeConnector(KVConnectorBase):
         if self._gather_slot is not None and consumer_staging_addr:
             producer_pool_idx = self._acquire_staging_slot()
             self._gather_slot(src_slot, producer_pool_idx)
+            # Synchronize on the gather kernel before NIC starts reading the
+            # staging buffer. Without this, the RDMA can race the still-in-flight
+            # gather kernel on TBO prefill (page fault under high concurrency).
+            torch.cuda.current_stream().synchronize()
             slot_src.append(
                 self._staging_base_addr + producer_pool_idx * self._staging_slot_bytes
             )

@@ -26,6 +26,14 @@ fallback_version = "0.1.0"
 where = ["."]
 include = ["atom*"]
 
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+atom = [
+    "mesh/target/release/libmesh.so",
+]
+
 [project.entry-points."vllm.platform_plugins"]
 # by default the entry-points will be installed anyway
 # but the plugin mode for platforms can be disabled by 

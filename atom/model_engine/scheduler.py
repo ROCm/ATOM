@@ -345,6 +345,7 @@ class ScheduledBatch:
                 self.multimodal_data[seq.id] = seq.multimodal_data
                 # Clear after first use to avoid re-sending on decode steps
                 seq.multimodal_data = None
+        self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
 
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")

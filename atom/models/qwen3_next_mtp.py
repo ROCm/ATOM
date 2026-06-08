@@ -169,19 +169,14 @@ class Qwen3NextMTP(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        # Mirror target's get_expert_mapping: when shared-expert fusion is on,
-        # the loader rewrites `mlp.shared_expert.*` to `mlp.experts.{N}.*`
-        # (where N == n_routed_experts), so the expert_mapping must include
-        # an extra slot for that fused shared-expert. Without this, MTP's
-        # shared_expert weights get silently dropped during loading.
-        from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
-
+        # Mirror target's get_expert_mapping: the loader may rewrite
+        # `mlp.shared_expert.*` to `mlp.experts.{N}.*` per layer, so the
+        # mapping must always include the extra shared-expert slot.
         n_routed = getattr(self.config, "n_routed_experts", self.config.num_experts)
         n_shared = getattr(self.config, "n_shared_experts", 1)
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=n_routed
-            + (n_shared if is_rocm_aiter_fusion_shared_expert_enabled() else 0),
+            num_experts=n_routed + (n_shared or 0),
         )
