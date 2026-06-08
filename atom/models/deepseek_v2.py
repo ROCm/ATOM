@@ -137,6 +137,33 @@ _FP8_DTYPES = tuple(
 )
 
 
+def _allow_ds_v2_non_triton_fp4_input_norm_quant(
+    config: PretrainedConfig,
+) -> bool:
+    model_type = str(getattr(config, "model_type", "") or "").lower()
+    architectures = getattr(config, "architectures", None) or []
+    architecture_names = {str(arch) for arch in architectures if arch}
+    architecture_text = " ".join(architecture_names).lower()
+
+    # This is only for the PR-added non-Triton FP4 input RMSNorm quant path.
+    # Wrappers that reuse DeepSeek-V2/MLA should keep the original path unless
+    # Triton GEMM is explicitly enabled, which was the pre-existing gate.
+    if model_type in {"glm_moe_dsa", "kimi_k2", "kimi_k25"}:
+        return False
+    if any(name in architecture_text for name in ("glm", "kimi", "qwen", "gpt")):
+        return False
+
+    if architecture_names:
+        return bool(
+            architecture_names
+            & {
+                "DeepseekV2ForCausalLM",
+                "DeepseekV3ForCausalLM",
+            }
+        )
+    return model_type in {"deepseek_v2", "deepseek_v3", "deepseek_v32", "deepseek_v4"}
+
+
 def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
     if not hasattr(config, "index_topk"):
         return False
@@ -2042,12 +2069,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             enable_fp8_input_norm_quant = (
                 self.quant_dtype == dtypes.fp8 and use_triton_gemm()
             )
-            enable_fp4_input_norm_quant = (
-                self.quant_dtype == dtypes.fp4x2
-                and not is_mtp_block
-                and (
-                    use_triton_gemm()
-                    or _is_global_mxfp4_without_layer_overrides(quant_config)
+            enable_fp4_input_norm_quant = self.quant_dtype == dtypes.fp4x2 and (
+                use_triton_gemm()
+                or (
+                    not is_mtp_block
+                    and _allow_ds_v2_non_triton_fp4_input_norm_quant(config)
+                    and _is_global_mxfp4_without_layer_overrides(quant_config)
                 )
             )
             if enable_fp8_input_norm_quant or enable_fp4_input_norm_quant:
