@@ -48,6 +48,27 @@ python -m atom.entrypoints.openai_server \
   --method mtp --num-speculative-tokens 3
 ```
 
+### MXFP4-v2 Quantized
+
+`DeepSeek-R1-0528-MXFP4-v2` uses the same DeepSeek-V3/R1 model structure as `DeepSeek-R1-0528-MXFP4-MTP-MoEFP4`. The main difference is in the quantization config: the MTP-MoEFP4 checkpoint keeps an FP8 per-channel override for self-attention layers, while the v2 checkpoint uses the global MXFP4 per-group quantization config without a separate attention override.
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+# Current ATOM main does not support these DeepSeek fusion paths for MXFP4-v2.
+export ATOM_ENABLE_DS_QKNORM_FUSION=0
+export ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=0
+export ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION=0
+
+python -m atom.entrypoints.openai_server \
+  --model amd/deepseek-ai/DeepSeek-R1-0528-MXFP4-v2 \
+  --host localhost \
+  --server-port 8000 \
+  --tensor-parallel-size 8 \
+  --kv_cache_dtype fp8 \
+  --gpu-memory-utilization 0.9 \
+  --no-enable_prefix_caching
+```
+
 ### Online Quantization from the FP8 Checkpoint
 
 Use `--online_quant_config` to quantize the source checkpoint during weight
