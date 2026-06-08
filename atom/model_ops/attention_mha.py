@@ -224,7 +224,7 @@ class PagedAttentionImpl(nn.Module):
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
                 v = v.view(-1, self.num_kv_heads, self.head_dim)
             self._cache_format = "SHUFFLE"
-        elif use_triton_attn and self.rotary_emb is not None:
+        elif (use_triton_attn or self.use_flash_layout) and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
