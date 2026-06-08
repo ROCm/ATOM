@@ -1862,12 +1862,6 @@ def _causal_conv1d_fn_tile(
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
-    assert width in (
-        2,
-        3,
-        4,
-    ), f"Tiled causal_conv1d only supports KERNEL_WIDTH in {{2, 3, 4}}, got {width}"
-
     BLOCK_M = block_m
     BLOCK_N = block_n
 
@@ -2093,7 +2087,9 @@ def causal_conv1d_fn(
     bias: (dim,)
     activation: None | "silu" | "swish"
     """
-    _impl = _causal_conv1d_fn_tile if _USE_TILE_KERNEL else _causal_conv1d_fn
+    _, width = weight.shape
+    use_tile = _USE_TILE_KERNEL and width in (2, 3, 4)
+    _impl = _causal_conv1d_fn_tile if use_tile else _causal_conv1d_fn
     return _impl(
         x,
         weight,
