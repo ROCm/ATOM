@@ -24,7 +24,6 @@ _ATOM_ENV_VARS = [
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
     "ATOM_DISABLE_VLLM_PLUGIN",
-    "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
 ]
@@ -83,9 +82,6 @@ class TestEnvsDefaults:
     def test_disable_vllm_plugin_default(self):
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN is False
 
-    def test_disable_vllm_plugin_attention_default(self):
-        assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN_ATTENTION is False
-
     def test_atom_enable_relaxed_mtp_default(self):
         assert _get_envs().ATOM_ENABLE_RELAXED_MTP is False
 
@@ -135,10 +131,6 @@ class TestEnvsOverrides:
     def test_disable_vllm_plugin_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN", "1")
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN is True
-
-    def test_disable_vllm_plugin_attention_enabled(self, monkeypatch):
-        monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "1")
-        assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN_ATTENTION is True
 
     def test_atom_enable_relaxed_mtp_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_RELAXED_MTP", "1")

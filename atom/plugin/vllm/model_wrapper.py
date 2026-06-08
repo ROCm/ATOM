@@ -53,10 +53,10 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
-    "Qwen3NextForCausalLM": "atom.models.qwen3_next:Qwen3NextForCausalLM",
+    "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3NextMTP": "atom.models.qwen3_next_mtp:Qwen3NextMTP",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
+    "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
+    "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
 }
@@ -121,6 +121,45 @@ def _select_model_arch(vllm_config: VllmConfig) -> str:
     return model_arch
 
 
+def _patch_required_act_dtype_post_load_hooks(
+    module: nn.Module,
+    act_dtype: torch.dtype,
+) -> int:
+    """Give vLLM-style post-load hooks a default dtype in plugin mode.
+
+    ATOM's loader invokes module-level post-load hooks without arguments. Some
+    vLLM modules embedded in multimodal ATOM models require an `act_dtype`
+    parameter, so adapt those instances locally instead of changing the generic
+    ATOM loader behavior.
+    """
+    import inspect
+
+    patched = 0
+    for submodule in module.modules():
+        orig = getattr(submodule, "process_weights_after_loading", None)
+        if orig is None or getattr(orig, "_atom_vllm_act_dtype_patched", False):
+            continue
+
+        try:
+            sig = inspect.signature(orig)
+        except (TypeError, ValueError):
+            continue
+
+        act_dtype_param = sig.parameters.get("act_dtype")
+        if act_dtype_param is None or act_dtype_param.default is not inspect._empty:
+            continue
+
+        @functools.wraps(orig)
+        def wrapped(act_dtype: torch.dtype = act_dtype, _orig=orig):
+            return _orig(act_dtype)
+
+        setattr(wrapped, "_atom_vllm_act_dtype_patched", True)
+        submodule.process_weights_after_loading = wrapped
+        patched += 1
+
+    return patched
+
+
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # forced_model_arch: str | None = None
 
@@ -167,7 +206,17 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self.atom_config.hf_config = main_atom_config.hf_config
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
+            # root HF config so --hf-overrides survive without losing multimodal
+            # sub-configs such as Kimi-K2.5's vision_config/text_config.
+            self.atom_config.hf_config = self.config
         self.model_arch = model_arch
+        logger.info(
+            "ATOM vLLM hf config overrides: use_index_cache=%s, index_topk_freq=%s, "
+            "index_topk_pattern=%s",
+            getattr(self.atom_config.hf_config, "use_index_cache", None),
+            getattr(self.atom_config.hf_config, "index_topk_freq", None),
+            getattr(self.atom_config.hf_config, "index_topk_pattern", None),
+        )
         _prepare_env(atom_config=self.atom_config)
         model_cls = _get_atom_model_cls(model_arch)
         module_remapping = getattr(model_cls, "packed_modules_mapping", {})
@@ -206,6 +255,17 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 self.model = model_cls(self.atom_config)
         else:
             self.model = model_cls(self.atom_config)
+
+        num_patched_post_load_hooks = _patch_required_act_dtype_post_load_hooks(
+            self.model,
+            vllm_config.model_config.dtype,
+        )
+        if num_patched_post_load_hooks:
+            logger.info(
+                "Patched %d vLLM post-load hooks with default act_dtype "
+                "inside ATOM vLLM plugin wrapper.",
+                num_patched_post_load_hooks,
+            )
 
         if model_arch in _MTP_MASK_INPUT_ARCH:
             self._adapt_mtp_layers_for_vllm()

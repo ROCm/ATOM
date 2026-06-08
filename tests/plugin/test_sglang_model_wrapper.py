@@ -54,8 +54,7 @@ def _make_fake_modules(*, is_last_rank: bool, setup_hook=None) -> dict[str, Modu
     forward_batch_mod.ForwardBatch = object
     forward_batch_mod.PPProxyTensors = object
 
-    attn_backend_pkg = _package("atom.plugin.sglang.attention_backend")
-    mla_mod = ModuleType("atom.plugin.sglang.attention_backend.sgl_attention_mla")
+    mla_mod = ModuleType("atom.plugin.sglang.models.deepseek_mla")
     mla_mod.setup_deepseek_for_sglang = setup_hook or (lambda model: None)
 
     return {
@@ -68,8 +67,7 @@ def _make_fake_modules(*, is_last_rank: bool, setup_hook=None) -> dict[str, Modu
         "sglang.srt.layers.quantization.base_config": quant_base_mod,
         "sglang.srt.model_executor": model_executor_pkg,
         "sglang.srt.model_executor.forward_batch_info": forward_batch_mod,
-        "atom.plugin.sglang.attention_backend": attn_backend_pkg,
-        "atom.plugin.sglang.attention_backend.sgl_attention_mla": mla_mod,
+        "atom.plugin.sglang.models.deepseek_mla": mla_mod,
     }
 
 

@@ -91,130 +91,59 @@ on:
         type: string
         default: ""
 
+permissions:
+  actions: read
+  contents: write
+  issues: write
+
 jobs:
-  parse-param-lists:
-    name: Parse parameter lists
+  # Single source of the benchmark matrix. Expands the structured catalog
+  # (.github/benchmark/models.json) into fully-resolved per-run "cells" — one
+  # matrix dimension — applying model selection and per-variant concurrency
+  # bands in one place. See .github/scripts/{catalog,build_benchmark_matrix}.py
+  # and .github/benchmark/README.md.
+  build-matrix:
+    name: Build benchmark matrix
     runs-on: ubuntu-latest
     outputs:
-      matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
+      cells_json: ${{ steps.build.outputs.cells_json }}
+      has_cells: ${{ steps.build.outputs.has_cells }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.atom_commit || github.ref }}
-
-      - name: Parse parameter lists
-        id: parse-param-lists
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "Using nightly param lists from .github/benchmark/nightly_params.json"
-            # Expand grouped format (isl/osl + concurrency array) into flat matrix
-            MATRIX_JSON=$(jq -c '[.[] | . as $group | .concurrency[] | {input_length: $group.isl, output_length: $group.osl, concurrency: ., random_range_ratio: $group.random_range_ratio}]' .github/benchmark/nightly_params.json)
-          else
-            PARAM_LISTS="${{ inputs.param_lists || '1024,1024,128,0.8' }}"
-            echo "Using param_lists: ${PARAM_LISTS}"
-            IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
-            MATRIX_JSON="["
-            SEP=""
-            for SET in "${SETS[@]}"; do
-              IFS=',' read -ra PARAMS <<< "$SET"
-              MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${PARAMS[0]},\"output_length\":${PARAMS[1]},\"concurrency\":${PARAMS[2]},\"random_range_ratio\":${PARAMS[3]}}"
-              SEP=","
-            done
-            MATRIX_JSON="${MATRIX_JSON}]"
-          fi
-          echo "Matrix JSON: ${MATRIX_JSON}"
-          echo "matrix_json=${MATRIX_JSON}" >> $GITHUB_OUTPUT
-
-  load-models:
-    name: Load model configs
-    runs-on: ubuntu-latest
-    outputs:
-      models_json: ${{ steps.load.outputs.models_json }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ inputs.atom_commit || github.ref }}
-      - id: load
+      - id: build
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUTS_JSON: ${{ toJson(inputs) }}
-        run: |
-          python3 << 'PY'
-          import json, os
-          event = os.environ["EVENT_NAME"]
-          inputs = json.loads(os.environ.get("INPUTS_JSON", "{}"))
-          models = json.load(open(".github/benchmark/models.json", encoding="utf-8"))
-          if event == "schedule":
-              filtered = models
-          else:
-              # Default False: a model whose `prefix` has no matching
-              # workflow_dispatch input must be opted in explicitly,
-              # otherwise an unchecked box silently still ran it (the old
-              # `.get(prefix, True)` returned True for missing keys).
-              filtered = []
-              missing = set()
-              for m in models:
-                  if m["prefix"] in inputs:
-                      if inputs[m["prefix"]]:
-                          filtered.append(m)
-                  else:
-                      missing.add(m["prefix"])
-              if missing:
-                  print(f"WARN: prefixes with no workflow input (skipped): {sorted(missing)}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"models_json={json.dumps(filtered)}\n")
-          print(f"Event={event}: {len(filtered)}/{len(models)} models enabled")
-          PY
+        run: python3 .github/scripts/build_benchmark_matrix.py
 
   benchmark:
-    name: ${{ matrix.model.display }} (isl=${{ matrix.config.input_length }} osl=${{ matrix.config.output_length }} c=${{ matrix.config.concurrency }})
-    needs: [parse-param-lists, load-models]
+    name: ${{ matrix.cell.display }} (isl=${{ matrix.cell.isl }} osl=${{ matrix.cell.osl }} c=${{ matrix.cell.conc }})
+    needs: [build-matrix]
     if: >-
       !cancelled()
-      && needs.parse-param-lists.result == 'success'
-      && needs.load-models.result == 'success'
+      && needs.build-matrix.result == 'success'
+      && needs.build-matrix.outputs.has_cells == 'true'
     strategy:
       fail-fast: false
       matrix:
-        model: ${{ fromJson(needs.load-models.outputs.models_json) }}
-        config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
-        exclude:
-          # Skip low-concurrency MTP runs to limit CI time
-          - model: { suffix: "-mtp3" }
-            config: { concurrency: 1 }
-          - model: { suffix: "-mtp3" }
-            config: { concurrency: 2 }
-          # Skip low-concurrency DP-attention runs (only run c>=64)
-          - model: { suffix: "-dpa" }
-            config: { concurrency: 2 }
-          - model: { suffix: "-dpa" }
-            config: { concurrency: 4 }
-          - model: { suffix: "-dpa" }
-            config: { concurrency: 8 }
-          - model: { suffix: "-dpa" }
-            config: { concurrency: 16 }
-          - model: { suffix: "-dpa" }
-            config: { concurrency: 32 }
-          # High-concurrency (512/1024) only for DP-attention; cap others at 256
-          - model: { suffix: "" }
-            config: { concurrency: 512 }
-          - model: { suffix: "" }
-            config: { concurrency: 1024 }
-          - model: { suffix: "-mtp3" }
-            config: { concurrency: 512 }
-          - model: { suffix: "-mtp3" }
-            config: { concurrency: 1024 }
+        # Single dimension: each cell is one fully-resolved run (model variant ×
+        # scenario × concurrency). Concurrency bands are already applied by
+        # build_benchmark_matrix.py, so out-of-range combos never get scheduled —
+        # no GPU runner is allocated for them (the old exclude/IN_RANGE gate is gone).
+        cell: ${{ fromJson(needs.build-matrix.outputs.cells_json) }}
 
-    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.cell.runner }}
 
     env:
-      MODEL_PATH: ${{ matrix.model.path }}
-      ARGS: ${{ matrix.model.args }}
-      ISL: ${{ matrix.config.input_length }}
-      OSL: ${{ matrix.config.output_length }}
-      CONC: ${{ matrix.config.concurrency }}
-      RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
-      RESULT_FILENAME: ${{ matrix.model.prefix }}${{ matrix.model.suffix }}-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}-${{ matrix.config.random_range_ratio }}
+      MODEL_PATH: ${{ matrix.cell.model_path }}
+      ARGS: ${{ matrix.cell.server_args }}
+      ISL: ${{ matrix.cell.isl }}
+      OSL: ${{ matrix.cell.osl }}
+      CONC: ${{ matrix.cell.conc }}
+      RANDOM_RANGE_RATIO: ${{ matrix.cell.ratio }}
+      RESULT_FILENAME: ${{ matrix.cell.result_filename }}
 
     steps:
       - name: Kill all Docker containers
@@ -234,37 +163,20 @@ jobs:
         with:
           ref: ${{ inputs.atom_commit || github.ref }}
 
-      - name: Start CI container
-        run: |
-          docker ps -aq -f name=atom-benchmark | xargs -r docker stop | xargs -r docker rm
-          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
-          MODEL_MOUNT=""
-          [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
-
-          # Write env_vars via env block (avoids expression injection — newlines
-          # in `matrix.model.env_vars` would otherwise break the host bash).
-          # Empty file when MODEL_ENV_VARS unset is fine — docker --env-file
-          # accepts it.
-          printenv MODEL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_benchmark_env.txt || true
-
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
-            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
-            -w /workspace --ipc=host --group-add video \
-            --shm-size=16G --privileged --cap-add=SYS_PTRACE \
-            -e HF_TOKEN="${HF_TOKEN:-}" \
-            --security-opt seccomp=unconfined \
-            --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
-            -e ATOM_DISABLE_MMAP=true \
-            -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} \
-            -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
-            -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
-            -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
-            --env-file /tmp/atom_benchmark_env.txt \
-            --name atom-benchmark \
-            ${{ inputs.image || 'rocm/atom-dev:latest' }}
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-          MODEL_ENV_VARS: ${{ matrix.model.env_vars }}
+      - name: Start container + download model
+        uses: ./.github/actions/atom-bench-container
+        with:
+          image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
+          container-name: atom-benchmark
+          model-path: ${{ matrix.cell.model_path }}
+          env-vars: ${{ matrix.cell.env_vars }}
+          hf-token: ${{ secrets.AMD_HF_TOKEN }}
+          download-required: "true"
+          container-env: >-
+            -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }}
+            -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
+            -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }}
+            -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }}
 
       - name: Collect GPU info (inside container)
         id: gpu-info
@@ -272,7 +184,7 @@ jobs:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          RUNNER_HINT="${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}"
+          RUNNER_HINT="${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.cell.runner }}"
           bash .github/scripts/collect_gpu_info.sh atom-benchmark docker "$RUNNER_HINT"
           # Resolve latest → nightly_YYYYMMDDHHMMSS for dashboard display
           DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}"
@@ -286,53 +198,34 @@ jobs:
           echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
           echo "Docker: ${DOCKER_IMAGE}"
 
-      - name: Download models
-        timeout-minutes: 150
-        run: |
-          set -euo pipefail
-          if [ -d "/models" ]; then
-            model_dir="/models/${MODEL_PATH}"
-            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
-            if ! docker exec \
-              -e HF_TOKEN="${HF_TOKEN:-}" \
-              -e MODEL_ID="${MODEL_PATH}" \
-              -e TARGET_DIR="${model_dir}" \
-              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
-              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
-              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
-              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
-              atom-benchmark bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
-              echo "Model download failed for '${MODEL_PATH}'. Aborting."
-              exit 1
-            fi
-          else
-            echo "/models directory not found, skipping model download"
-          fi
-        env:
-          HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
-          MODEL_DOWNLOAD_TIMEOUT: "30m"
-          MODEL_LOCK_WAIT_SECONDS: "1800"
-          MODEL_LOCK_POLL_INTERVAL: "30"
-          MODEL_PROGRESS_INTERVAL: "60"
-
       - name: Run benchmark
-        timeout-minutes: 60
+        timeout-minutes: 80
+        env:
+          EXTRA_LAUNCH_ARGS: ${{ inputs.extra_args || '' }}
         run: |
           set -euo pipefail
           if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
           else model_path="${{ env.MODEL_PATH }}"; fi
 
-          docker exec atom-benchmark bash -lc "set -euo pipefail
-            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
-              ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
-              .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
-            echo '========== Running benchmark =========='
-            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
-              RESULT_FILENAME=${{ env.RESULT_FILENAME }} \
-              SERVER_ARGS='${{ env.ARGS }}' \
-              BENCH_EXTRA_ARGS='${{ matrix.model.bench_args }}' \
-              .github/scripts/atom_test.sh benchmark $model_path
-          "
+          # Launch via stdin so the container's bash parses the shell quoting in
+          # ARGS exactly once -- single-quoted JSON values survive intact (e.g.
+          # --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}').
+          # Substituting ${{ env.ARGS }} into a `bash -lc "..."` string instead
+          # collides the JSON's double quotes with the outer quotes and strips
+          # them (argparse: invalid loads value). Mirrors atom-test.yaml.
+          echo "ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+            ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
+            .github/scripts/atom_test.sh launch $model_path $ARGS $EXTRA_LAUNCH_ARGS" \
+            | docker exec -i atom-benchmark bash -l
+
+          echo "========== Running benchmark =========="
+          docker exec \
+            -e ENABLE_TORCH_PROFILER="${{ inputs.enable_profiler && '1' || '0' }}" \
+            -e RESULT_FILENAME="${{ env.RESULT_FILENAME }}" \
+            -e SERVER_ARGS="$ARGS" \
+            -e BENCH_EXTRA_ARGS="${{ matrix.cell.bench_args }}" \
+            -e MP="$model_path" \
+            atom-benchmark bash -lc '.github/scripts/atom_test.sh benchmark "$MP"'
 
       - name: Dump server log
         if: always()
@@ -352,7 +245,7 @@ jobs:
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
             -e DOCKER_IMAGE="${{ steps.gpu-info.outputs.docker_image }}" \
             -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
-            -e DISPLAY_NAME="${{ matrix.model.display }}" \
+            -e DISPLAY_NAME="${{ matrix.cell.display }}" \
             atom-benchmark python3 -c "
           import json, os
           p = os.environ['RESULT_PATH']
@@ -519,7 +412,7 @@ jobs:
           alert-threshold: "80%"
           comment-on-alert: true
           fail-on-alert: false
-          max-items-in-chart: 90
+          max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Deploy custom dashboard to gh-pages
@@ -527,23 +420,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           CURRENT_SHA=$(git rev-parse HEAD)
-          # Generate prefix→display name mapping from models.json
-          python3 -c "
-          import json
-          models = json.loads(open('.github/benchmark/models.json').read())
-          mapping = {}
-          for m in models:
-              display = m.get('display','')
-              path = m.get('path','')
-              suffix = m.get('suffix','')
-              if not display or not path: continue
-              hf_name = path.split('/')[-1].lower()
-              # HF path-derived key (old data used model_id last segment + optional suffix)
-              hf_key = hf_name + suffix.lower() if suffix else hf_name
-              mapping[hf_key] = display
-          with open('/tmp/dashboard_models_map.js','w') as f:
-              f.write('window.MODELS_DISPLAY_MAP = ' + json.dumps(mapping) + ';')
-          "
+          # Generate prefix→display name mapping from the catalog
+          python3 .github/scripts/dashboard_models_map.py \
+            .github/benchmark/models.json /tmp/dashboard_models_map.js
           # Save dashboard assets before switching branches
           cp .github/dashboard/index.html /tmp/dashboard_index.html
           cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
@@ -634,60 +513,19 @@ jobs:
       - name: Docker Login
         run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
-      - name: Start CI container
-        run: |
-          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
-          MODEL_MOUNT=""
-          [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
-
-          # Write env_vars via env block (avoids expression injection — newlines
-          # in `matrix.cell.env_vars` would otherwise break the host bash).
-          printenv CELL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_regression_env.txt || true
-
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
-            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
-            -w /workspace --ipc=host --group-add video \
-            --shm-size=16G --privileged --cap-add=SYS_PTRACE \
-            -e HF_TOKEN="${HF_TOKEN:-}" \
-            --security-opt seccomp=unconfined \
-            --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
-            -e ATOM_DISABLE_MMAP=true \
-            --env-file /tmp/atom_regression_env.txt \
-            --name atom-regression \
-            ${{ inputs.image || 'rocm/atom-dev:latest' }}
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-          CELL_ENV_VARS: ${{ matrix.cell.env_vars }}
-
-      - name: Download model
-        timeout-minutes: 150
-        run: |
-          set -euo pipefail
-          if [ -d "/models" ]; then
-            model_dir="/models/${{ matrix.cell.model_path }}"
-            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
-            if ! docker exec \
-              -e HF_TOKEN="${HF_TOKEN:-}" \
-              -e MODEL_ID="${{ matrix.cell.model_path }}" \
-              -e TARGET_DIR="${model_dir}" \
-              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
-              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
-              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
-              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
-              atom-regression bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
-              echo "::warning::Failed to download ${{ matrix.cell.model_path }}, will use HF online"
-            fi
-          else
-            echo "/models directory not found, skipping model download"
-          fi
-        env:
-          HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
-          MODEL_DOWNLOAD_TIMEOUT: "30m"
-          MODEL_LOCK_WAIT_SECONDS: "1800"
-          MODEL_LOCK_POLL_INTERVAL: "30"
-          MODEL_PROGRESS_INTERVAL: "60"
+      - name: Start container + download model
+        uses: ./.github/actions/atom-bench-container
+        with:
+          image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
+          container-name: atom-regression
+          model-path: ${{ matrix.cell.model_path }}
+          env-vars: ${{ matrix.cell.env_vars }}
+          hf-token: ${{ secrets.AMD_HF_TOKEN }}
+          download-required: "false"
 
       - name: Launch server
+        env:
+          SERVER_ARGS: ${{ matrix.cell.server_args }}
         run: |
           if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
           else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
@@ -697,11 +535,17 @@ jobs:
           # so no need to re-prefix them on the command line (the previous
           # inline form silently dropped the first var when env_vars contained
           # a literal newline).
-          docker exec atom-regression bash -lc "set -euo pipefail
-            ENABLE_TORCH_PROFILER=1 \
-            .github/scripts/atom_test.sh launch $MODEL_DIR ${{ matrix.cell.server_args }}"
+          #
+          # Launch via stdin so the container's bash parses the shell quoting in
+          # SERVER_ARGS exactly once -- single-quoted JSON values survive intact
+          # (e.g. --hf-overrides '{"use_index_cache": true}'). See "Run benchmark".
+          echo "ENABLE_TORCH_PROFILER=1 \
+            .github/scripts/atom_test.sh launch $MODEL_DIR $SERVER_ARGS" \
+            | docker exec -i atom-regression bash -l
 
       - name: Run regression configs with profiler
+        env:
+          SERVER_ARGS: ${{ matrix.cell.server_args }}
         run: |
           set -uo pipefail  # no -e: allow per-config failure without aborting loop
 
@@ -728,15 +572,19 @@ jobs:
             STOP_COUNT_BEFORE=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null) || STOP_COUNT_BEFORE=0
 
             echo "=== Profiling: $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC ==="
-            if ! docker exec atom-regression bash -lc "
-              ${{ matrix.cell.env_vars }} \
+            # cell.env_vars are already in the container env via --env-file
+            # (see "Launch server"); docker exec inherits them, so do NOT
+            # re-prefix them inline -- V4-Pro's env_vars contains a literal
+            # newline that would break the bash -lc string / drop a var.
+            if ! docker exec \
+              -e SERVER_ARGS="$SERVER_ARGS" \
+              atom-regression bash -lc "
               ENABLE_TORCH_PROFILER=1 \
               ISL=$ISL OSL=$OSL CONC=$CONC \
               RANDOM_RANGE_RATIO=0.8 \
               NUM_PROMPTS_OVERRIDE=$((CONC*2)) \
               RESULT_FILENAME=regression-${PREFIX}-${ISL}-${OSL}-${CONC} \
               BENCH_EXTRA_ARGS='$BENCH_ARGS' \
-              SERVER_ARGS='${{ matrix.cell.server_args }}' \
               .github/scripts/atom_test.sh benchmark $MODEL_DIR"; then
               echo "::warning::Benchmark failed for $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC"
               FAIL_COUNT=$((FAIL_COUNT + 1))

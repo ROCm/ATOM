@@ -6,7 +6,6 @@ from atom.config import Config, QuantizationConfig
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.models.utils import IntermediateTensors
 from atom.utils.decorators import support_torch_compile
 from transformers import PretrainedConfig
@@ -191,15 +190,10 @@ class Glm4MoeMTP(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        num_experts = self.config.n_routed_experts
-        if (
-            is_rocm_aiter_fusion_shared_expert_enabled()
-            and self.config.n_shared_experts
-        ):
-            num_experts += self.config.n_shared_experts
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=num_experts,
+            num_experts=self.config.n_routed_experts
+            + (self.config.n_shared_experts or 0),
         )

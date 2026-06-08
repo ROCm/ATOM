@@ -1,12 +1,6 @@
-from .prepare import (
-    prepare_model,
-    is_sglang,
-    is_vllm,
-    is_plugin_mode,
-)
+from .prepare import is_plugin_mode, is_sglang, is_vllm
 
 __all__ = [
-    "prepare_model",
     "is_sglang",
     "is_vllm",
     "is_plugin_mode",

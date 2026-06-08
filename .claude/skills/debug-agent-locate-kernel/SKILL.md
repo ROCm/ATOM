@@ -227,6 +227,30 @@ timeout 90 rocgdb -p $WORKER_PID -x /tmp/rocgdb_cmds.txt -batch
 
 `detach` (not just `quit`) is required or the worker stays SIGSTOP'd after rocgdb exits — kills your repro and leaves zombies.
 
+### Step R3.5: Anchor on the stuck kernel name + PC — BEFORE any theory
+
+**This is the single most important step, and the easiest to skip.** `info dispatches` already prints the demangled kernel name of the in-flight dispatch, and the AMDGPU **wave backtrace prints the exact stuck PC inside that kernel**:
+
+```bash
+# AMDGPU waves show up as rocgdb "threads"; each prints its kernel + PC:
+timeout 90 rocgdb -p $WORKER_PID -batch \
+  -ex "set pagination off" -ex "set confirm off" -ex "info threads" \
+  | grep -iE "AMDGPU Wave|in void|ncclDev|aiter::" | head
+# -> e.g.  #0 0x...b3c in void aiter::allgather_vec<bf16,8>(...)  <-- kernel
+#          all waves at the same PC + threadIdx 0..ngpus-1 = spinning in a barrier
+```
+
+Then map that PC to a **source location inside the kernel** (which loop/barrier), and READ that source, before forming any hypothesis:
+
+```bash
+# pick one wave thread id from `info threads`, then:
+rocgdb -p $WORKER_PID -batch -ex "thread <id>" -ex "info line *\$pc" -ex "bt"
+# no line info? disassemble the kernel and locate the PC offset (kernel+NNNN):
+/opt/rocm/llvm/bin/llvm-objdump -d <module>.so | less   # find the spin loop (s_cbranch back to s_load/atomic)
+```
+
+**Let the kernel name + PC drive the investigation — not a narrative.** The name tells you the exact source file; the PC tells you the exact line. A collective kernel (`ncclDevKernel_*runRing`, `aiter::allgather_vec`, `reduce_scatter_*`) stuck with all sync-lane waves (threadIdx `< ngpus`) at one PC = a **cross-rank barrier spin** (`start_sync`/`end_sync` `while(flag < ...)`): some rank never wrote the expected flag. Open that kernel's `start_sync`/`end_sync` and reason about *why a peer's flag is missing* (grid size differs across ranks, flag counter desynced from unequal call counts, e.g. TBO uneven ubatch splits) — do NOT guess at unrelated fixes (a missing `end_sync` cannot be the cause when the wave is spinning in `start_sync`, which runs first).
+
 ### Step R4: Read the dump
 
 `/app/logs_claude/rocgdb_dump.txt` contains four sections:
@@ -250,6 +274,9 @@ Fix shape (general): make the workspace cache stream-keyed (e.g. `lru_cache` ove
 
 ### rocgdb anti-patterns
 
+- **Do Step R3.5 before any hypothesis.** Anchor on the kernel name (`info dispatches`) + wave PC, map PC → source line, read it. Don't theorize or chase gpucore/debug-agent/other files before the PC is located.
+- **Don't fix before locating the PC.** Spinning in `start_sync` ⇒ `end_sync` (and everything after it) is off the deadlock path; changing it is a wasted edit→rebuild→retest.
+- **Different stuck collectives across runs/ranks = one race, not "just waiting for a dead rank".** Open the named kernel anyway.
 - **Don't attach to the dispatcher** (PPID = openai_server). It has no GPU queues; you'll get "No dispatches" and waste 90s on the timeout.
 - **Don't combine debug-agent + rocgdb on the same process**. The debug-agent's HSA tool hook shadows rocgdb's queue/dispatch visibility — you'll see agents but no dispatches.
 - **Don't run rocgdb interactively** when the worker is in HSA wait — it can take 30+ seconds to attach, and an accidental `^C` SIGSTOPs the worker permanently. Use `-x scriptfile -batch` with `detach` before `quit`.
