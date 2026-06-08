@@ -31,6 +31,14 @@ struct BenchmarkRequestArgs {
     #[arg(long)]
     host: Option<String>,
 
+    /// PEM CA certificate path to trust for HTTPS benchmark requests.
+    #[arg(long, help_heading = "TLS")]
+    tls_ca_cert_path: Option<PathBuf>,
+
+    /// Accept invalid TLS certificates for local HTTPS testing.
+    #[arg(long, default_value_t = false, help_heading = "TLS")]
+    tls_accept_invalid_certs: bool,
+
     /// Number of producer tasks that build VirtualRequest values.
     #[arg(long, default_value_t = 1)]
     producer_threads: usize,
@@ -85,14 +93,17 @@ async fn run_benchmark_request(
         .map(MockCase::from_fixture)
         .collect::<Result<Vec<_>, _>>()?;
     let mode = request_mode_from_base_url(&args.base_url);
-    let pipeline = VirtualRequestPipeline::new(
+    let pipeline = VirtualRequestPipeline::try_new(
         VirtualRequestPipelineConfig::new(args.base_url)
             .mode(mode)
             .host_header(args.host)
+            .tls_ca_cert_path(args.tls_ca_cert_path)
+            .tls_accept_invalid_certs(args.tls_accept_invalid_certs)
             .producer_threads(args.producer_threads)
             .consumer_threads(args.consumer_threads)
             .queue_capacity(args.queue_capacity),
-    );
+    )
+    .map_err(|error| -> Box<dyn std::error::Error> { error })?;
     let results = pipeline
         .run_cases(cases)
         .await

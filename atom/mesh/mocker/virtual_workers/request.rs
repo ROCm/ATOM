@@ -6,6 +6,7 @@
 //! or a real HTTP POST for the standalone mocker CLI.
 
 use std::{
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -232,6 +233,8 @@ pub struct VirtualRequestPipelineConfig {
     pub base_url: String,
     pub mode: VirtualRequestMode,
     pub host_header: Option<String>,
+    pub tls_ca_cert_path: Option<PathBuf>,
+    pub tls_accept_invalid_certs: bool,
     pub producer_threads: usize,
     pub consumer_threads: usize,
     pub queue_capacity: usize,
@@ -243,6 +246,8 @@ impl VirtualRequestPipelineConfig {
             base_url: base_url.into(),
             mode: VirtualRequestMode::Http,
             host_header: None,
+            tls_ca_cert_path: None,
+            tls_accept_invalid_certs: false,
             producer_threads: 1,
             consumer_threads: 1,
             queue_capacity: 64,
@@ -251,6 +256,16 @@ impl VirtualRequestPipelineConfig {
 
     pub fn host_header(mut self, host_header: Option<impl Into<String>>) -> Self {
         self.host_header = host_header.map(Into::into);
+        self
+    }
+
+    pub fn tls_ca_cert_path(mut self, path: Option<impl Into<PathBuf>>) -> Self {
+        self.tls_ca_cert_path = path.map(Into::into);
+        self
+    }
+
+    pub fn tls_accept_invalid_certs(mut self, accept_invalid_certs: bool) -> Self {
+        self.tls_accept_invalid_certs = accept_invalid_certs;
         self
     }
 
@@ -289,10 +304,15 @@ pub struct VirtualRequestPipeline {
 
 impl VirtualRequestPipeline {
     pub fn new(config: VirtualRequestPipelineConfig) -> Self {
-        Self {
+        Self::try_new(config).expect("failed to build virtual request HTTP client")
+    }
+
+    pub fn try_new(config: VirtualRequestPipelineConfig) -> RequestResult<Self> {
+        let client = build_client(&config)?;
+        Ok(Self {
             config,
-            client: reqwest::Client::new(),
-        }
+            client,
+        })
     }
 
     /// Run fixture cases through a producer-consumer request pipeline.
@@ -421,6 +441,42 @@ impl VirtualRequestPipeline {
         }
         Ok(results)
     }
+}
+
+fn build_client(config: &VirtualRequestPipelineConfig) -> RequestResult<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+
+    if config.tls_accept_invalid_certs {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    if let Some(path) = &config.tls_ca_cert_path {
+        let pem = std::fs::read(path).map_err(|error| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "failed to read TLS CA certificate '{}': {}",
+                    path.display(),
+                    error
+                ),
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let certificate = reqwest::Certificate::from_pem(&pem).map_err(|error| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "failed to parse TLS CA certificate '{}': {}",
+                    path.display(),
+                    error
+                ),
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        builder = builder.add_root_certificate(certificate);
+    }
+
+    builder
+        .build()
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
 }
 
 struct VirtualRequestJob {
