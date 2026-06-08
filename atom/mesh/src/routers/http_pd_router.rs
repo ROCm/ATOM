@@ -543,8 +543,14 @@ impl PDRouter {
                 MeshMetrics::record_worker_retry_backoff(attempt, delay);
             },
             || {
-                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
-                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
+                MeshMetrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_PREFILL,
+                    endpoint,
+                );
+                MeshMetrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_DECODE,
+                    endpoint,
+                );
             },
         )
         .await;
@@ -805,8 +811,14 @@ impl PDRouter {
                 MeshMetrics::record_worker_retry_backoff(attempt, delay);
             },
             || {
-                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
-                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
+                MeshMetrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_PREFILL,
+                    endpoint,
+                );
+                MeshMetrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_DECODE,
+                    endpoint,
+                );
             },
         )
         .await;
@@ -1157,8 +1169,14 @@ impl PDRouter {
                 MeshMetrics::record_worker_retry_backoff(attempt, delay);
             },
             || {
-                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
-                MeshMetrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
+                MeshMetrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_PREFILL,
+                    endpoint,
+                );
+                MeshMetrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_DECODE,
+                    endpoint,
+                );
             },
         )
         .await;

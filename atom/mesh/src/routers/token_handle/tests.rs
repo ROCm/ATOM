@@ -379,12 +379,10 @@ mod c_token_handle {
 
     #[tokio::test]
     async fn test_mark_completed_propagates_to_pd_pair() {
-        let p_items = vec![crate::routers::token_handle::test_support::ScriptedItem::Ok(
-            complete_chunk(),
-        )];
-        let d_items = vec![crate::routers::token_handle::test_support::ScriptedItem::Ok(
-            complete_chunk(),
-        )];
+        let p_items =
+            vec![crate::routers::token_handle::test_support::ScriptedItem::Ok(complete_chunk())];
+        let d_items =
+            vec![crate::routers::token_handle::test_support::ScriptedItem::Ok(complete_chunk())];
         let (p_stream, p_mark, _p_drop) =
             crate::routers::token_handle::test_support::scripted_with_mark_completed(p_items);
         let (d_stream, d_mark, _d_drop) =
