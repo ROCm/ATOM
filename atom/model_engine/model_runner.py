@@ -975,9 +975,13 @@ class ModelRunner:
         return True
 
     def stop_profiler(self):
-        """Stop profiling for this rank."""
+        """Stop profiling for this rank.
+
+        Returns a dict with ``trace_dir`` and ``elapsed`` so the caller
+        can report where the trace was written.
+        """
         if self.profiler is None:
-            return True
+            return {"trace_dir": self.profiler_dir, "elapsed": 0.0}
         t0 = time.monotonic()
         logger.info("Rank %d: stopping profiler...", self.rank)
         try:
@@ -986,12 +990,13 @@ class ModelRunner:
             logger.exception("Rank %d: profiler stop failed", self.rank)
         finally:
             self.profiler = None
+        elapsed = round(time.monotonic() - t0, 1)
         logger.info(
             "Rank %d: profiler stop completed in %.1fs",
             self.rank,
-            time.monotonic() - t0,
+            elapsed,
         )
-        return True
+        return {"trace_dir": self.profiler_dir, "elapsed": elapsed}
 
     def debug(self, *args: Any):
         if self.rank == 0:
@@ -1283,11 +1288,14 @@ class ModelRunner:
         # Subtract our own PyTorch usage + CUDA graph estimate + safety.
         # This is independent of other processes on the GPU.
         budget = int(total * config.gpu_memory_utilization)
-        available_for_kv = budget - peak_torch - cudagraph_overhead - safety_margin
+        # Fixed (utilization-independent) overhead of this process: model
+        # weights + peak activations + CUDA graph capture + safety margin.
+        non_kv_overhead = peak_torch + cudagraph_overhead + safety_margin
+        available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
         # This prevents OOM when other processes share the GPU.
-        available_for_kv = min(available_for_kv, free)
+        available_for_kv = min(available_for_kv_budget, free)
 
         torch.set_default_device("cpu")
 
@@ -1305,13 +1313,42 @@ class ModelRunner:
         per_req_cache_tensor_bytes = max_per_req_cache_slots * per_req_cache_bytes
         available_for_pool = available_for_kv - per_req_cache_tensor_bytes
         if available_for_pool <= 0:
-            raise RuntimeError(
+            # Minimum gpu_memory_utilization that makes the budget just cover the
+            # per-request cache tensor (available_for_kv_budget ==
+            # per_req_cache_tensor_bytes). Rounded UP to the next 0.01 so the
+            # printed value is actually sufficient, not the exact threshold.
+            min_util = (non_kv_overhead + per_req_cache_tensor_bytes) / total
+            min_util_hint = math.ceil(min_util * 100) / 100
+            base_msg = (
                 f"Per-request cache tensor "
                 f"({per_req_cache_tensor_bytes / (1 << 30):.2f}GB for "
                 f"{max_per_req_cache_slots} slots) exceeds available KV budget "
-                f"({available_for_kv / (1 << 30):.2f}GB). "
-                f"Reduce --max-num-seqs or increase gpu_memory_utilization."
+                f"({available_for_kv / (1 << 30):.2f}GB) at "
+                f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
+            if available_for_kv_budget > free:
+                # The physical free-memory clamp is the binding limit, not the
+                # utilization budget — raising --gpu-memory-utilization won't help.
+                fix_msg = (
+                    f" Only {free / (1 << 30):.2f}GB is physically free on the GPU "
+                    f"(other processes may be holding memory); raising "
+                    f"--gpu-memory-utilization will NOT help. Free GPU memory or "
+                    f"reduce --max-num-seqs (currently {config.max_num_seqs})."
+                )
+            elif min_util_hint <= 1.0:
+                fix_msg = (
+                    f" Set --gpu-memory-utilization >= {min_util_hint:.2f} "
+                    f"(this only zeroes out the deficit; use a higher value for "
+                    f"actual KV capacity) or reduce --max-num-seqs "
+                    f"(currently {config.max_num_seqs})."
+                )
+            else:
+                fix_msg = (
+                    f" Even --gpu-memory-utilization 1.0 is insufficient "
+                    f"(would need {min_util:.2f}); reduce --max-num-seqs "
+                    f"(currently {config.max_num_seqs}) or free GPU memory."
+                )
+            raise RuntimeError(base_msg + fix_msg)
         per_req_cache_equiv_blocks = (
             math.ceil(per_req_cache_bytes / block_bytes)
             if per_req_cache_bytes > 0
@@ -1502,11 +1539,18 @@ class ModelRunner:
         layer_id = 0
         # Promote to self so the attention builder's build_kv_cache_tensor()
         # can access it without recomputing from drafter state. Heterogeneous
-        # drafts (Eagle3) own their own layer space via their builder, so
-        # leave mtp_start_layer_idx at hf_config.num_hidden_layers in that mode.
+        # drafts (Eagle3 MHA) own their own layer space via their builder.
+        # Eagle3 MLA drafts (K2.6) share the target's MLA pool but still
+        # appear as one extra layer at index num_hidden_layers. In both Eagle3
+        # variants the eagle3 draft model has no `.model.mtp_start_layer_idx`,
+        # so only MTP-style drafts take the first branch.
+        is_eagle3 = (
+            self.config.speculative_config is not None
+            and self.config.speculative_config.method == "eagle3"
+        )
         self.mtp_start_layer_idx = (
             self.drafter.model.model.mtp_start_layer_idx
-            if hasattr(self, "drafter") and not hasattr(self, "eagle3_draft_builder")
+            if hasattr(self, "drafter") and not is_eagle3
             else hf_config.num_hidden_layers
         )
         for model_name, model in models_to_bind:
@@ -2023,11 +2067,7 @@ class ModelRunner:
         sampled_logprobs = None
         if need_logprobs:
             logits_fp32 = logits.float()
-            safe_temps = torch.where(
-                temperatures <= 0, torch.ones_like(temperatures), temperatures
-            )
-            scaled_logits = logits_fp32 / safe_temps.view(-1, 1)
-            log_probs = torch.log_softmax(scaled_logits, dim=-1)
+            log_probs = torch.log_softmax(logits_fp32, dim=-1)
             sampled_logprobs = log_probs.gather(
                 -1, sampled_tokens.to(torch.long).unsqueeze(-1)
             ).squeeze(-1)

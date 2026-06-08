@@ -37,9 +37,10 @@ from atom.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 from atom.model_ops.base_config import QuantizeMethodBase
-from atom.model_ops.moe import (
-    FusedMoEMethodBase,
+from atom.model_ops.moe import FusedMoEMethodBase
+from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled,
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from aiter.dist.parallel_state import get_tp_group
 
@@ -288,11 +289,40 @@ def load_model(
     load_fused_expert_weights_fn=None,
 ):
     def have_shared_expert(name):
-        maybe_matching_list = ["mlp.shared_experts.", "mlp.shared_expert."]
+        # Match both `mlp.` (GLM4, Qwen, ...) and `ffn.` (DeepSeek-V4) module
+        # naming. The matched substring is replaced by the caller with
+        # `<prefix>experts.{n_routed}.` so the shared expert lands in the fused
+        # MoE buffer's extra slot. Returning the full prefix (incl. mlp./ffn.)
+        # lets the rewrite preserve the module-naming style.
+        maybe_matching_list = [
+            "mlp.shared_experts.",
+            "mlp.shared_expert.",
+            "ffn.shared_experts.",
+            "ffn.shared_expert.",
+        ]
         for maybe_matching_name in maybe_matching_list:
             if maybe_matching_name in name:
                 return maybe_matching_name
         return None
+
+    def should_fuse_shared_expert_weight(name: str, matching_name: str) -> bool:
+        layer_prefix = name.split(matching_name, 1)[0]
+        module_prefix = matching_name.split("shared_expert", 1)[0]
+        shared_expert_prefix = layer_prefix + matching_name.rstrip(".")
+        routed_expert_prefix = layer_prefix + f"{module_prefix}experts"
+        model_quant_config = getattr(getattr(model, "args", None), "quant_config", None)
+        if model_quant_config is None:
+            model_quant_config = getattr(model, "quant_config", None)
+        if model_quant_config is not None:
+            return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                model_quant_config,
+                shared_expert_prefix=shared_expert_prefix,
+                routed_expert_prefix=routed_expert_prefix,
+            )
+        return is_rocm_aiter_fusion_shared_expert_enabled(
+            shared_expert_prefix=shared_expert_prefix,
+            routed_expert_prefix=routed_expert_prefix,
+        )
 
     def extract_expert_target_and_id(name: str) -> Tuple[str, int] | None:
         """Extract fused parameter name and expert id from expert checkpoint name.
@@ -428,16 +458,27 @@ def load_model(
                 continue
             maybe_matching_name = have_shared_expert(name)
             if (
-                is_rocm_aiter_fusion_shared_expert_enabled()
-                and maybe_matching_name is not None
+                maybe_matching_name is not None
+                # When the model keeps shared experts unfused (e.g. V4-Pro with
+                # FP4 routed vs FP8 shared, or DP + mori all2all), do NOT rewrite
+                # the shared weights into the fused slot — they must load into the
+                # standalone Expert module. Stays True for models without this
+                # attr (GLM4 etc.) so their fused-shared path is unchanged.
+                and not getattr(model, "disable_fused_shared_loading", False)
+                and should_fuse_shared_expert_weight(name, maybe_matching_name)
             ):
+                # Preserve the module-naming prefix (mlp. / ffn.) so the rewritten
+                # name matches this model's routed-expert param naming.
+                module_prefix = maybe_matching_name.split("shared_expert", 1)[0]
                 name = name.replace(
                     maybe_matching_name,
-                    f"mlp.experts.{hf_config.n_routed_experts}.",
+                    f"{module_prefix}experts.{hf_config.n_routed_experts}.",
                 )
             for k in packed_modules_mapping:
                 # We handle the experts below in expert_params_mapping
-                if "mlp.experts." in name and name not in params_dict:
+                if (
+                    "mlp.experts." in name or "ffn.experts." in name
+                ) and name not in params_dict:
                     continue
                 if k in name:
                     packed_value = packed_modules_mapping[k]

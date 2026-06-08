@@ -64,6 +64,11 @@ on:
         required: false
         type: boolean
         default: false
+      rebuild_atom_base_from_dockerfile:
+        description: "Full build image before validation"
+        required: false
+        type: boolean
+        default: false
       upload_accuracy_to_dashboard:
         description: "Optional: upload SGLANG accuracy results to dashboard after this manual run"
         required: false
@@ -81,7 +86,6 @@ env:
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
   AITER_COMMIT: "HEAD"
-  SGLANG_REF: "v0.5.10"
 
 jobs:
   # ---------- SGLANG full validation path (schedule / workflow_dispatch) ----------
@@ -96,8 +100,11 @@ jobs:
       - name: Checkout selected ATOM branch
         uses: actions/checkout@v6
 
+      - name: Resolve SGLang version metadata
+        run: python3 .github/scripts/resolve_sglang_metadata.py
+
       - name: Docker Login
-        if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name != 'main' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && (github.ref_name != 'main' || inputs.rebuild_atom_base_from_dockerfile) }}
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
@@ -117,6 +124,7 @@ jobs:
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
           RUN_DSR1_FP4_TP8_MTP3: ${{ inputs.run_dsr1_fp4_tp8_mtp3 }}
           RUN_DSR1_FP4_TP8_MTP1: ${{ inputs.run_dsr1_fp4_tp8_mtp1 }}
+          REBUILD_ATOM_BASE_FROM_DOCKERFILE: ${{ inputs.rebuild_atom_base_from_dockerfile }}
         run: |
           set -euo pipefail
 
@@ -136,7 +144,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.91,
                   "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_35B_A3B_FP8_TP2",
@@ -145,7 +153,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "accuracy_test_threshold": 0.76,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_35B_A3B_TP2",
@@ -154,7 +162,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_A17B_FP8_TP4",
@@ -163,7 +171,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_A17B_FP8_TP8",
@@ -172,7 +180,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_DSR1_FP8_TP8",
@@ -181,7 +189,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_DSR1_FP4_TP4",
@@ -190,7 +198,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.91,
                   "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_DSR1_FP4_TP4_DP4_EP4",
@@ -199,7 +207,7 @@ jobs:
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --data-parallel-size 4 --expert-parallel-size 4 --enable-dp-attention --kv-cache-dtype fp8_e4m3 --attention-backend aiter --mem-fraction-static 0.8 --decode-log-interval 1000 --chunked-prefill-size 65536 --max-running-requests 24 --disable-radix-cache",
                   "accuracy_test_threshold": 0.91,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nMORI_SHMEM_MODE=ISOLATION\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=128\nSGLANG_MORI_DISPATCH_DTYPE=bf16\nSGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_DSR1_FP4_TP8",
@@ -208,7 +216,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_DSR1_FP4_TP8_MTP3",
@@ -217,7 +225,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --max-running-requests 256 --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 160 192 224 256",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_ENABLE_SPEC_V2=1",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_DSR1_FP4_TP8_MTP1",
@@ -226,7 +234,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --max-running-requests 256 --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 160 192 224 256",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "SGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_ENABLE_SPEC_V2=1",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
           ]
 
@@ -243,7 +251,18 @@ jobs:
           print(f"model_matrix={json.dumps({'include': selected})}")
           PY
 
-          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF_NAME}" = "main" ]; then
+          REBUILD_FROM_DOCKERFILE="${REBUILD_ATOM_BASE_FROM_DOCKERFILE:-false}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+              echo "Manual run selected full ATOM base rebuild from docker/Dockerfile"
+            elif [ "${GITHUB_REF_NAME}" = "main" ]; then
+              echo "Manual run on main reuses published SGLANG image"
+            else
+              echo "Manual run selected fast overlay rebuild from ${ATOM_BASE_NIGHTLY_IMAGE}"
+            fi
+          fi
+
+          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ] || { [ "${GITHUB_REF_NAME}" = "main" ] && [ "${REBUILD_FROM_DOCKERFILE}" != "true" ]; }; then
             if RESOLUTION_JSON="$(
               python3 .github/scripts/resolve_atom_image.py \
                 --repository "${VALIDATION_IMAGE_REPO}" \
@@ -271,16 +290,58 @@ jobs:
             echo "sglang_image_tag=${RESOLVED_SGLANG_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           MANUAL_BASE_IMAGE_TAG="atom_sglang_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          REBUILT_ATOM_BASE_IMAGE_TAG="atom_sglang_rebuilt_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
           SGLANG_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:sglang-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
+          echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
+          if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+            echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=${REBUILT_ATOM_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
           git archive --format=tar HEAD | tar -xf - -C "${BUILD_CONTEXT}"
+
+          if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+            echo "Manual run rebuilds ATOM base and SGLANG image from branch ${GITHUB_REF_NAME}"
+
+            DOCKER_BUILDKIT=1 docker build --pull --network=host --no-cache \
+              -t "${REBUILT_ATOM_BASE_IMAGE_TAG}" \
+              --target atom_image \
+              --build-arg GPU_ARCH="${GPU_ARCH}" \
+              --build-arg AITER_REPO="${AITER_REPO}" \
+              --build-arg AITER_COMMIT="${AITER_COMMIT}" \
+              --build-arg MAX_JOBS=64 \
+              --build-arg ATOM_REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+              --build-arg ATOM_COMMIT="${GITHUB_SHA}" \
+              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              "${BUILD_CONTEXT}"
+
+            DOCKER_BUILDKIT=1 docker build --network=host --no-cache \
+              -t "${SGLANG_IMAGE_TAG}" \
+              --target atom_sglang \
+              --build-arg SGLANG_BASE_IMAGE="${REBUILT_ATOM_BASE_IMAGE_TAG}" \
+              --build-arg MAX_JOBS=64 \
+              --build-arg SGLANG_REF="${SGLANG_REF}" \
+              --build-arg INSTALL_LM_EVAL=1 \
+              --build-arg INSTALL_FASTSAFETENSORS=1 \
+              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              "${BUILD_CONTEXT}"
+
+            docker push "${SGLANG_IMAGE_TAG}"
+            exit 0
+          fi
 
           cat <<'EOF' > "${BUILD_CONTEXT}/Dockerfile.mod"
           ARG ATOM_BASE_NIGHTLY_IMAGE
@@ -335,15 +396,17 @@ jobs:
 
           docker push "${SGLANG_IMAGE_TAG}"
 
-          echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
-          echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-
       - name: Clean up builder images
         if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}
         run: |
-          docker rmi "${{ steps.meta.outputs.sglang_image_tag }}" || true
-          docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
+          for image in \
+            "${{ steps.meta.outputs.sglang_image_tag }}" \
+            "${{ steps.meta.outputs.manual_base_image_tag }}" \
+            "${{ steps.meta.outputs.rebuilt_atom_base_image_tag }}"; do
+            if [ -n "${image}" ]; then
+              docker rmi "${image}" || true
+            fi
+          done
 
   sglang-model-accuracy:
     name: SGLANG Model Accuracy (${{ matrix.model_name }})
@@ -369,24 +432,43 @@ jobs:
 
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
-
+            
+      - name: Print runner user and Docker diagnostics
+        run: |
+          echo "=== Docker diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+          echo "docker path: $(command -v docker || true)"
+          ls -l /var/run/docker.sock || true
+          stat -c '%U %G %a %n' /var/run/docker.sock || true
+          echo "docker version:"
+          docker version || true
+          echo "docker info:"
+          docker info || true
+          echo "=== End Docker diagnostics ==="
+        
       - name: Pull SGLANG image
         run: |
           docker pull "${SGLANG_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
+          MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
           MODEL_CACHE_MOUNT=""
-          MODEL_CACHE_DESC="container-local /models (no host cache mount)"
+          MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
 
-          if [ -d "/models" ]; then
-            MODEL_CACHE_MOUNT="-v /models:/models"
-            MODEL_CACHE_DESC="/models (host mount)"
+          if [ -d "$(dirname "${MODEL_CACHE_ROOT}")" ]; then
+            mkdir -p "${MODEL_CACHE_ROOT}"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           else
-            echo "Warning: /models directory not found on runner; using container-local /models."
+            echo "Warning: $(dirname "${MODEL_CACHE_ROOT}") directory not found on runner; using container-local ${MODEL_CACHE_ROOT}."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
@@ -426,6 +508,9 @@ jobs:
             --ulimit stack=67108864 \
             --env-file /tmp/sglang_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
+            -e HF_HOME="${MODEL_CACHE_ROOT}/.cache/huggingface" \
+            -e HUGGINGFACE_HUB_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/hub" \
+            -e TRANSFORMERS_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/transformers" \
             --name "$CONTAINER_NAME" \
             "${SGLANG_IMAGE_TAG}"
         env:
@@ -438,11 +523,12 @@ jobs:
       - name: Download model if needed
         run: |
           set -euo pipefail
-          model_dir="/models/${{ matrix.model_path }}"
+          model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
             if ! docker exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_CACHE_ROOT="${MODEL_CACHE_ROOT}" \
               -e MODEL_PATH="${{ matrix.model_path }}" \
               -e MODEL_DIR="$model_dir" \
               -e RUNNER_NAME="${{ matrix.runner }}" \
@@ -475,7 +561,7 @@ jobs:
                   echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
                   download_model
                 else
-                  lock_dir="/models/.cache/atom-download-locks"
+                  lock_dir="${MODEL_CACHE_ROOT}/.cache/atom-download-locks"
                   mkdir -p "$lock_dir"
                   lock_file="$lock_dir/${LOCK_SUFFIX}.lock"
                   exec 9>"$lock_file"
@@ -496,15 +582,15 @@ jobs:
               exit 1
             fi
           else
-            echo "/models directory not mounted; skipping model download"
+            echo "${MODEL_CACHE_ROOT} directory not mounted; skipping model download"
           fi
 
       - name: Resolve SGLANG model path
         if: success()
         run: |
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "SGLANG_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
-            echo "Using mounted model path: /models/${{ matrix.model_path }}"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_CACHE_ROOT}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using mounted model path: ${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
           else
             echo "SGLANG_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
@@ -666,5 +752,5 @@ jobs:
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
           auto-push: true
-          max-items-in-chart: 90
+          max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}

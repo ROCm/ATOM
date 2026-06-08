@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Compute the benchmark cell matrix for the ATOM Benchmark workflow.
+
+Reads the GitHub event name and workflow_dispatch inputs from the environment
+and emits the fully-expanded list of benchmark cells (see ``catalog.build_cells``)
+to ``$GITHUB_OUTPUT`` as ``cells_json`` plus a ``has_cells`` flag.
+
+Behaviour by event:
+- ``schedule``      -> all models, catalog ``default_scenarios`` (nightly grid).
+- ``workflow_dispatch`` -> only models whose checkbox is ticked, workload from
+  the ``param_lists`` input. Also validates that the dispatch model checkboxes
+  stay in sync with the catalog prefixes (fails fast on drift).
+
+This replaces the former inline Python in the ``parse-param-lists`` and
+``load-models`` jobs so the logic is testable (see tests/ci/).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from catalog import build_cells, load_variants, validate_dispatch_inputs  # noqa: E402
+
+CATALOG = ".github/benchmark/models.json"
+DEFAULT_PARAM_LISTS = "1024,1024,128,0.8"
+
+# workflow_dispatch inputs that are NOT model toggles.
+RESERVED_INPUTS = {
+    "extra_args",
+    "image",
+    "runner",
+    "enable_profiler",
+    "enable_rtl",
+    "param_lists",
+    "atom_commit",
+}
+
+
+def _emit(cells: list[dict]) -> None:
+    payload = json.dumps(cells)
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a", encoding="utf-8") as f:
+            f.write(f"cells_json={payload}\n")
+            f.write(f"has_cells={'true' if cells else 'false'}\n")
+    else:
+        print(payload)
+
+
+def main() -> int:
+    event = os.environ.get("EVENT_NAME", "")
+    inputs = json.loads(os.environ.get("INPUTS_JSON") or "{}")
+
+    if event == "schedule":
+        model_filter = None
+        param_lists = None
+    else:
+        model_keys = {k for k in inputs if k not in RESERVED_INPUTS}
+        problems = validate_dispatch_inputs(CATALOG, model_keys)
+        if problems:
+            for p in problems:
+                print(f"ERROR: {p}", file=sys.stderr)
+            print(
+                "workflow_dispatch model checkboxes are out of sync with "
+                f"{CATALOG}; update one to match the other.",
+                file=sys.stderr,
+            )
+            return 1
+        model_filter = {k for k in model_keys if inputs.get(k)}
+        param_lists = inputs.get("param_lists") or DEFAULT_PARAM_LISTS
+
+    cells = build_cells(CATALOG, param_lists=param_lists, model_filter=model_filter)
+    _emit(cells)
+
+    n_models = len({c["prefix"] for c in cells})
+    n_total = len(load_variants(CATALOG))
+    print(
+        f"Event={event}: {len(cells)} cells across {n_models} models "
+        f"({n_total} variants in catalog)",
+        file=sys.stderr,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

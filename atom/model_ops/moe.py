@@ -20,7 +20,7 @@ from atom.config import (
     get_current_atom_config,
 )
 from aiter.ops.flydsl.moe_common import GateMode
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
@@ -38,7 +38,7 @@ from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinaliz
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
     is_rocm_aiter_fuse_routed_scaling_factor,
-    is_rocm_aiter_fusion_shared_expert_enabled,
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
@@ -604,6 +604,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 quant_type=QuantType.No,
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
+                expert_mask=layer.expert_mask,
             )
         return fused_moe(
             hidden_states=x,
@@ -1107,6 +1108,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
+        moe_extra_args = {
+            "gate_mode": (
+                GateMode.INTERLEAVE.value
+                if self.is_guinterleave
+                else GateMode.SEPARATED.value
+            ),
+            "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
+        }
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -1126,12 +1135,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_pad=self.intermediate_pad,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
-                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
-                gate_mode=(
-                    GateMode.INTERLEAVE.value
-                    if self.is_guinterleave
-                    else GateMode.SEPARATED.value
-                ),
+                **moe_extra_args,
             )
         return self.fused_experts(
             hidden_states=x,
@@ -1145,6 +1149,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=apply_router_weight_on_input,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
+            expert_mask=layer.expert_mask,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=a1_scale,
@@ -1153,6 +1158,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             bias2=layer.w2_bias,
             hidden_pad=self.hidden_pad,
             intermediate_pad=self.intermediate_pad,
+            moe_extra_args=moe_extra_args,
         )
 
 
@@ -1517,6 +1523,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 quant_type=self.quant_type,
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
+                expert_mask=layer.expert_mask,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=a1_scale,
@@ -1890,6 +1897,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_type=self.quant_type,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
+            expert_mask=layer.expert_mask,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
@@ -2018,6 +2026,7 @@ class FusedMoE(torch.nn.Module):
         activation: ActivationType = ActivationType.Silu,
         shared_expert_scoring_func: Optional[str] = None,
         config: Optional[PretrainedConfig] = None,
+        shared_expert_prefix: Optional[str] = None,
     ):
         super().__init__()
         self.prefix = prefix
@@ -2058,7 +2067,16 @@ class FusedMoE(torch.nn.Module):
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
-        fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+        if shared_expert_prefix is None and prefix.endswith(".experts"):
+            shared_expert_prefix = prefix[: -len(".experts")] + ".shared_experts"
+
+        fuse_shared_experts = (
+            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                quant_config,
+                shared_expert_prefix=shared_expert_prefix,
+                routed_expert_prefix=prefix,
+            )
+        )
         self.num_fused_shared_experts = (
             config.n_shared_experts
             if config is not None
@@ -2209,9 +2227,13 @@ class FusedMoE(torch.nn.Module):
         )
         online_quant_type = online_quant_config.quant_type
         online_quant_dtype = online_quant_config.quant_dtype
-        quant_func = get_hip_quant(online_quant_type)
-
         source_quant_type = self.layer_quant_config.quant_type
+        if should_skip_online_quant(
+            source_quant_type, self.params_dtype, online_quant_config
+        ):
+            return
+
+        quant_func = get_hip_quant(online_quant_type)
         assert source_quant_type in (QuantType.No, QuantType.per_1x128), (
             f"Unsupported source quant_type for MoE online quantization: "
             f"{source_quant_type} (layer={self.layer_name})"
@@ -2974,15 +2996,44 @@ class FusedMoE(torch.nn.Module):
 
                 topk_ids = topk_ids.to(torch.int32)
             elif scoring_func == "sqrtsoftplus":
-                # # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
-                # # weights gathered from the unbiased sqrt(softplus(.)) values.
+                # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
+                # weights gathered from the unbiased sqrt(softplus(.)) values.
                 tokens_num = router_logits.shape[0]
-                topk_ids = torch.empty(
-                    tokens_num, top_k, dtype=torch.int32, device=router_logits.device
-                )
-                topk_weights = torch.empty(
-                    tokens_num, top_k, dtype=torch.float32, device=router_logits.device
-                )
+                fuse_shared = num_fused_shared_experts > 0
+                if fuse_shared:
+                    import atom.model_ops.topK as _topK_mod
+
+                    assert _topK_mod.aiter_topK_meta_data is not None, (
+                        "AITER topK meta data is not initialized. "
+                        "Please ensure that init_aiter_topK_meta_data is called "
+                        "before this function."
+                    )
+                    total_topk_weights, total_topk_ids = _topK_mod.aiter_topK_meta_data
+                    assert total_topk_weights.shape[0] >= tokens_num
+                    n_extra = total_topk_ids.shape[1] - top_k
+                    topk_ids, _ = torch.split(
+                        total_topk_ids[:tokens_num],
+                        [top_k, n_extra],
+                        dim=1,
+                    )
+                    topk_weights, _ = torch.split(
+                        total_topk_weights[:tokens_num],
+                        [top_k, n_extra],
+                        dim=1,
+                    )
+                else:
+                    topk_ids = torch.empty(
+                        tokens_num,
+                        top_k,
+                        dtype=torch.int32,
+                        device=router_logits.device,
+                    )
+                    topk_weights = torch.empty(
+                        tokens_num,
+                        top_k,
+                        dtype=torch.float32,
+                        device=router_logits.device,
+                    )
                 topk_gating(
                     topk_weights,
                     topk_ids,
@@ -2992,6 +3043,11 @@ class FusedMoE(torch.nn.Module):
                     routed_scaling_factor,
                     score_func="sqrtsoftplus",
                 )
+                if fuse_shared:
+                    # Switch from the stride-7 routed view back to the full
+                    # 7-col buffer (routed + shared cols) for the fused kernel.
+                    topk_weights = total_topk_weights[:tokens_num]
+                    topk_ids = total_topk_ids[:tokens_num]
             else:
                 raise ValueError(
                     f"Unsupported scoring function for non-grouped topk: {scoring_func}"

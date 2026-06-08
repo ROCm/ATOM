@@ -16,6 +16,49 @@ from atom.config import Config
 from atom.utils import compilation_counter, is_torch_equal_or_newer
 
 
+def _patch_triton_cluster_dims_for_rocm() -> None:
+    """Make compile-time Triton autotuning work on ROCm.
+
+    ROCm Triton's ``CompiledKernel.metadata`` namedtuple has no ``cluster_dims``
+    field (thread-block clusters are an NVIDIA Hopper feature). torch Inductor's
+    autotune-at-compile-time launcher
+    (``torch._inductor.runtime.triton_heuristics.*.make_launcher``) reads
+    ``binary.metadata.cluster_dims`` with no fallback, so *any* kernel autotuned
+    at compile time -- which ``torch._inductor.standalone_compile`` forces on by
+    patching ``triton.autotune_at_compile_time=True`` -- crashes on AMD with
+    ``AttributeError: 'KernelMetadata' object has no attribute 'cluster_dims'``.
+
+    Inject a no-op ``cluster_dims=(1, 1, 1)`` (single cluster == AMD's only mode)
+    when the field is absent, so the launcher's ``cta_args`` computation succeeds.
+    No-op on CUDA, where the field already exists. Idempotent.
+    """
+    if getattr(torch.version, "hip", None) is None:
+        return
+    try:
+        import triton.compiler.compiler as _tcc
+    except Exception:
+        return
+    if getattr(_tcc.CompiledKernel, "_atom_cluster_dims_patched", False):
+        return
+
+    _orig_init = _tcc.CompiledKernel.__init__
+
+    def _init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        md = getattr(self, "metadata", None)
+        if md is not None and not hasattr(md, "cluster_dims"):
+            from collections import namedtuple
+
+            extended = namedtuple("KernelMetadata", list(md._fields) + ["cluster_dims"])
+            self.metadata = extended(*md, (1, 1, 1))
+
+    _tcc.CompiledKernel.__init__ = _init
+    _tcc.CompiledKernel._atom_cluster_dims_patched = True
+
+
+_patch_triton_cluster_dims_for_rocm()
+
+
 class CompilerInterface:
     """
     The interface for a compiler that can be used by vLLM.

@@ -27,17 +27,17 @@ two-source paged_prefill layout:
   - pure prefill:     skip = 0                 (no SWA history in `unified_kv`)
   - chunked prefill:  skip = prior_swa_count   (variable per-token)
 
-Correctness equivalence with the prior path:
+Correctness:
   - paged_decode reads `kv_indices_csa[indptr[t] : indptr[t+1]]` whose length
-    is exactly `skip_prefix_len_per_token[t] + valid_k[t]`. The fused kernel
-    writes only `[skip[t], skip[t]+valid_k[t])`, where `valid_k[t]` is
-    recovered as `indptr[t+1] - indptr[t] - skip[t]` (CPU builder packs
-    exactly this much per token). The tail `[valid_k, index_topk)` of
-    `topk_local` is uninitialized garbage from aiter's `top_k_per_row_*`
-    (which only writes `[0, valid_k)` and does NOT fill -1) — the
-    `k_offs < valid_k` mask is the sole correctness barrier; do not rely
-    on a `topk >= 0` check. CG-padded slots (batch_id=-1) bail in the
-    kernel preamble.
+    is exactly `skip_prefix_len_per_token[t] + valid_k[t]`. This kernel writes
+    the CSA topk section at the slice HEAD `[indptr[t], indptr[t]+valid_k[t])`,
+    where `valid_k[t]` is recovered as `indptr[t+1] - indptr[t] - skip[t]`
+    (CPU builder packs exactly this much per token); the SWA prefix (length
+    `skip[t]`) occupies the tail, written by `write_v4_paged_decode_indices`.
+    The tail `[valid_k, index_topk)` of `topk_local` is uninitialized garbage
+    from aiter's `top_k_per_row_*` (writes only `[0, valid_k)`), so the
+    `k_offs < valid_k` mask is the sole correctness barrier. CG-padded slots
+    (batch_id=-1) bail in the kernel preamble.
 """
 
 from typing import Optional
@@ -100,8 +100,11 @@ def _csa_translate_pack_kernel(
         skip = tl.load(skip_prefix_len_per_token_ptr + pid_t)
     indptr_t = tl.load(kv_indptr_csa_ptr + pid_t)
     indptr_t1 = tl.load(kv_indptr_csa_ptr + pid_t + 1)
-    write_base = indptr_t + skip
-    valid_k = indptr_t1 - write_base  # = (skip + valid_k) - skip
+    # CSA topk section occupies the slice HEAD; the SWA prefix (length `skip`)
+    # sits at the tail, written by write_v4_paged_decode_indices. valid_k =
+    # slice_len - skip is unchanged; only write_base moves to the head.
+    write_base = indptr_t
+    valid_k = indptr_t1 - indptr_t - skip
 
     k_offs = pid_kb * BLOCK_K + tl.arange(0, BLOCK_K)
     in_range = k_offs < valid_k
@@ -173,18 +176,19 @@ def csa_translate_pack(
                                    recovered as `indptr[t+1] - indptr[t] - skip[t]`.
       batch_id_per_token:          [T] int32 — token → seq, sentinel -1 for
                                    CG-padded slots.
-      skip_prefix_len_per_token:   [T] int32 OR None — per-token write offset
-                                   within `kv_indices_csa[indptr[t] : indptr[t+1]]`
-                                   where the CSA section starts. Pass None
-                                   with `window_size > 0` to derive skip
-                                   inline as `min(positions[t]+1, window_size)`
+      skip_prefix_len_per_token:   [T] int32 OR None — per-token SWA prefix
+                                   length (the tail segment of each token's
+                                   slice); used only to recover
+                                   `valid_k = slice_len - skip`. Pass None
+                                   with `window_size > 0` to derive it inline
+                                   as `min(positions[t]+1, window_size)`
                                    (decode shortcut). Pure prefill passes a
                                    zero buffer; chunked prefill passes
                                    `prior_swa_count_per_token`.
       kv_indices_csa:              [total_indices] int32 — destination buffer;
-                                   this kernel writes the CSA section
-                                   `[indptr[t]+skip[t],
-                                     indptr[t]+skip[t]+valid_k[t])`.
+                                   this kernel writes the CSA topk section at
+                                   the slice head
+                                   `[indptr[t], indptr[t]+valid_k[t])`.
       swa_pages:                   SWA region size — `num_slots * window_size`,
                                    fixed at CG capture time. Keyword-only.
       csa_block_capacity:          `block_size // ratio = 128 // 4 = 32`
@@ -281,8 +285,9 @@ def csa_translate_pack_reference(
             continue
         pos = int(poses[t].item())
         skip_t = min(pos + 1, window_size) if inline_skip else int(skips[t].item())
-        base = int(indptr[t].item()) + skip_t
-        valid_k = int(indptr[t + 1].item()) - base
+        # CSA topk at slice HEAD (matches kernel); SWA prefix (len skip_t) at tail.
+        base = int(indptr[t].item())
+        valid_k = int(indptr[t + 1].item()) - base - skip_t
         if valid_k <= 0:
             continue
         topk = topk_local[t, :valid_k].to(torch.int64)
