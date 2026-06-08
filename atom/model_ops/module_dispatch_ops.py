@@ -21,6 +21,8 @@ the methods listed in each op's docstring.
 Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward — V2/V3.2/V4 MoE
   - torch.ops.aiter.indexer_score_topk       — V4 sparse indexer
+  - torch.ops.aiter.minimax_m3_bf16_experts_forward
+      — MiniMax-M3 dedicated bf16 routed experts
 """
 
 import torch
@@ -130,5 +132,55 @@ direct_register_custom_op(
     # in, so functionalization stays unaware and skips defensive clones.
     mutates_args=(),
     fake_impl=_indexer_score_topk_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# ---------------------------------------------------------------------------
+# MiniMax-M3 dedicated bf16 experts dispatch
+# ---------------------------------------------------------------------------
+#
+# Caller contract (the expert module looked up by `layer_name`):
+#   - `forward_impl(hidden_states, router_logits, e_score_correction_bias)`
+#
+# The large-prefill fallback groups tokens with `torch.where`, whose nonzero
+# result has data-dependent shape. Keep that Python routing behind a custom op
+# so the ATOM model graph remains single-piece while the module continues to own
+# MiniMax-M3-specific expert execution.
+
+
+def minimax_m3_bf16_experts_forward(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    e_score_correction_bias: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    if e_score_correction_bias.numel() == 0:
+        e_score_correction_bias = None
+    return layer.forward_impl(
+        hidden_states,
+        router_logits,
+        e_score_correction_bias,
+    )
+
+
+def _minimax_m3_bf16_experts_forward_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    e_score_correction_bias: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    del router_logits, e_score_correction_bias, layer_name
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_bf16_experts_forward",
+    op_func=minimax_m3_bf16_experts_forward,
+    mutates_args=(),
+    fake_impl=_minimax_m3_bf16_experts_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )

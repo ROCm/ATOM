@@ -35,11 +35,25 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration",
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "MiniMaxM3SparseForConditionalGeneration": "atom.plugin.vllm.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration",
 }
 
 
 def _set_plugin_mode() -> None:
     _set_framework_backbone("vllm")
+
+
+def _register_minimax_m3_hf_config() -> None:
+    from transformers import AutoConfig
+
+    from atom.plugin.vllm.models.minimax_m3_config import MiniMaxM3Config
+
+    try:
+        AutoConfig.register(MiniMaxM3Config.model_type, MiniMaxM3Config)
+    except ValueError as exc:
+        if "already used by a Transformers config" not in str(exc):
+            raise
 
 
 def register_platform() -> Optional[str]:
@@ -89,12 +103,64 @@ def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
     attention.process_weights_after_loading = wrapped
 
 
+def _patch_vllm_mxfp8_quant_config_for_atom_minimax_m3() -> None:
+    """Let ATOM-owned MiniMax-M3 handle checkpoint MXFP8 metadata itself.
+
+    vLLM's online MXFP8 shorthand is valid for CLI usage, but vLLM currently
+    refuses to build that quant config from a checkpoint-side
+    ``quantization_config``.  MiniMax-M3 is registered to ATOM's model wrapper,
+    whose loader parses the original HF quantization metadata independently, so
+    only vLLM's early quant_config construction needs to skip the checkpoint
+    dict.
+    """
+    import functools
+
+    from vllm.model_executor.model_loader import weight_utils
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+
+    orig = weight_utils.get_quant_config
+    if getattr(orig, "_atom_minimax_m3_mxfp8_patched", False):
+        return
+
+    def is_atom_minimax_m3(model_config) -> bool:
+        architectures = getattr(model_config, "architectures", None)
+        if not architectures:
+            hf_config = getattr(model_config, "hf_config", None)
+            architectures = getattr(hf_config, "architectures", None)
+        return bool(
+            architectures
+            and architectures[0]
+            in {
+                "MiniMaxM3SparseForCausalLM",
+                "MiniMaxM3SparseForConditionalGeneration",
+            }
+        )
+
+    @functools.wraps(orig)
+    def wrapped(model_config, load_config):
+        if (
+            is_atom_minimax_m3(model_config)
+            and getattr(model_config, "quantization", None) == "mxfp8"
+            and getattr(model_config, "quantization_config", None) is not None
+        ):
+            return OnlineQuantizationConfig(
+                args=getattr(model_config, "quantization_config")
+            )
+        return orig(model_config, load_config)
+
+    setattr(wrapped, "_atom_minimax_m3_mxfp8_patched", True)
+    weight_utils.get_quant_config = wrapped
+
+
 def register_model() -> None:
     if disable_vllm_plugin:
         logger.info("Disable ATOM model register")
         return
 
     _set_plugin_mode()
+    _register_minimax_m3_hf_config()
 
     import vllm.model_executor.models.registry as vllm_model_registry
 
@@ -128,6 +194,7 @@ def register_model() -> None:
 
     _patch_vllm_attention_process_weights_after_loading(Attention)
     _patch_vllm_attention_process_weights_after_loading(MLAAttention)
+    _patch_vllm_mxfp8_quant_config_for_atom_minimax_m3()
     # vLLM's speculative decoder keeps an allow-list of attention metadata
     # classes. ATOM-vLLM uses its own metadata classes after attention
     # isolation, so extend that allow-list before MTP/Eagle proposal runs.
