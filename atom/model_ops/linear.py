@@ -265,6 +265,45 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     return y
 
 
+def gemm_a8w8_per_tensor_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
+
+
+@mark_trace(torch_compile=False)
+@torch_compile_guard(gen_fake=gemm_a8w8_per_tensor_fake, mutates_args=[])
+def gemm_a8w8_per_tensor_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    # The triton a8w8 kernel applies a per-row (activation) and per-column
+    # (weight) scale. Per-tensor quantization produces a single scalar scale
+    # for each operand, so broadcast them into the (M,) / (N,) vectors the
+    # kernel expects before launching.
+    M = x.shape[0]
+    N = weight.shape[0]
+    x_scale_vec = x_scale.reshape(-1)[:1].to(torch.float32).expand(M).contiguous()
+    w_scale_vec = w_scale.reshape(-1)[:1].to(torch.float32).expand(N).contiguous()
+    return gemm_a8w8_triton(
+        x,
+        weight,
+        x_scale_vec,
+        w_scale_vec,
+        bias=bias,
+        dtype=dtype,
+    )
+
+
 class LinearBase(nn.Module):
     def __init__(
         self,
@@ -623,14 +662,24 @@ class LinearBase(nn.Module):
                         scale=getattr(self, "input_scale", None),
                     )
             if self.quant_type.value == QuantType.per_Tensor.value:
-                y = tgemm.mm(
-                    x,
-                    self.weight,
-                    self.bias,
-                    otype=otype,
-                    scale_a=x_scale,
-                    scale_b=self.weight_scale,
-                )
+                if use_triton_gemm() and gemm_a8w8_triton is not None:
+                    y = gemm_a8w8_per_tensor_impl(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        bias=self.bias,
+                        dtype=otype,
+                    )
+                else:
+                    y = tgemm.mm(
+                        x,
+                        self.weight,
+                        self.bias,
+                        otype=otype,
+                        scale_a=x_scale,
+                        scale_b=self.weight_scale,
+                    )
             elif self.quant_type.value == QuantType.per_Token.value:
                 if self.params_dtype == dtypes.i8:
                     y = gemm_a8w8(
