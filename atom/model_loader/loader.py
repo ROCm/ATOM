@@ -314,10 +314,6 @@ def load_model(
             getattr(model, "atom_config", None), "quant_config", None
         )
         if model_quant_config is None:
-            model_quant_config = getattr(
-                getattr(model, "args", None), "quant_config", None
-            )
-        if model_quant_config is None:
             model_quant_config = getattr(model, "quant_config", None)
         if model_quant_config is not None and hasattr(
             model_quant_config, "get_layer_quant_config"

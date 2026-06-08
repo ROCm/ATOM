@@ -2767,6 +2767,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             model_path=getattr(config, "model", None),
             online_quant_config=getattr(config, "online_quant_config", None),
         )
+        self.atom_config.quant_config = self.args.quant_config
         self.model = DeepseekV4Model(atom_config=config, args=self.args)
         # Tell ModelRunner to size the CG outputs buffer as
         # [max_num_batched_tokens, hc_mult, hidden_size] instead of the
