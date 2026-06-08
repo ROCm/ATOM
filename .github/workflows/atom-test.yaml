@@ -379,7 +379,7 @@ jobs:
           PULL_FLAG=""
           if [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
             PULL_FLAG=""
-          elif [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+          elif [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ] || [ "${{ matrix.runner }}" = "linux-atom-do-mi350x-8" ]; then
             PULL_FLAG="--pull always"
           fi
 
