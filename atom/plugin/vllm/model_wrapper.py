@@ -59,6 +59,8 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
+    "MiniMaxM3SparseForCausalLM": "atom.plugin.vllm.models.minimax_m3:MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration": "atom.plugin.vllm.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration_",
 }
 
 

@@ -314,8 +314,10 @@ class GenericParser(QuantConfigParser):
 
         quant_dtype = self._infer_dtype(hf_quant_config, config_str)
         quant_type = self._infer_qtype(hf_quant_config, config_str)
-        # MXFP4 (fp4x2) uses microscaling with 1x32 block scaling by definition
-        if quant_dtype == d_dtypes.get("fp4x2") and quant_type not in (
+        # MXFP4/MXFP8 use microscaling with 1x32 block scaling by definition.
+        if quant_method in {"mxfp4", "mxfp8"}:
+            quant_type = QuantType.per_1x32
+        elif quant_dtype == d_dtypes.get("fp4x2") and quant_type not in (
             QuantType.per_1x32,
             QuantType.per_1x128,
         ):
@@ -372,6 +374,12 @@ class GenericParser(QuantConfigParser):
         return torch.bfloat16
 
     def _infer_qtype(self, cfg: dict, config_str: str) -> QuantType:
+        weight_block_size = cfg.get("weight_block_size")
+        if weight_block_size == [1, 32]:
+            return QuantType.per_1x32
+        if weight_block_size == [1, 128]:
+            return QuantType.per_1x128
+
         # Check explicit fields
         for key in ("quant_type", "quantization_type", "scheme"):
             val = cfg.get(key)

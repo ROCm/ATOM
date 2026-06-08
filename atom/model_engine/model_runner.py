@@ -71,6 +71,8 @@ support_model_arch_dict = {
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
+    "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2_flash.MiMoV2FlashForCausalLM",
 }
 # seed = 34567
