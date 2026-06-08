@@ -1058,6 +1058,10 @@ class MooncakeConnector(KVConnectorBase):
         if self._gather_slot is not None and consumer_staging_addr:
             producer_pool_idx = self._acquire_staging_slot()
             self._gather_slot(src_slot, producer_pool_idx)
+            # Synchronize on the gather kernel before NIC starts reading the
+            # staging buffer. Without this, the RDMA can race the still-in-flight
+            # gather kernel on TBO prefill (page fault under high concurrency).
+            torch.cuda.current_stream().synchronize()
             slot_src.append(
                 self._staging_base_addr + producer_pool_idx * self._staging_slot_bytes
             )
