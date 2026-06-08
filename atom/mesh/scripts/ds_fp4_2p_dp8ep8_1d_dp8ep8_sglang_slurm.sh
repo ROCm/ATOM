@@ -177,7 +177,7 @@ export MC_TCP_ENABLE_CONNECTION_POOL=true
 export MORI_SHMEM_MODE=${MORI_SHMEM_MODE}
 export SGLANG_MORI_DISPATCH_DTYPE=${MORI_DISPATCH_DTYPE}
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
 
 python3 -m sglang.launch_server \\
     --model-path "${MODEL_PATH}" \\
@@ -226,7 +226,7 @@ export MC_TCP_ENABLE_CONNECTION_POOL=true
 export MORI_SHMEM_MODE=${MORI_SHMEM_MODE}
 export SGLANG_MORI_DISPATCH_DTYPE=${MORI_DISPATCH_DTYPE}
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
 
 TORCHINDUCTOR_COMPILE_THREADS=128 python3 -m sglang.launch_server \\
     --model-path "${MODEL_PATH}" \\

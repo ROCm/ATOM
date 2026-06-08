@@ -34,7 +34,7 @@ concurrency:
 
 env:
   ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
-  ATOM_PYTHON_TAG: "cp310"
+  ATOM_PYTHON_TAG: "cp312"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)

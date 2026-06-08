@@ -171,7 +171,7 @@ export VLLM_RPC_TIMEOUT=1800000
 export VLLM_CACHE_ROOT=/root/.cache/vllm
 export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
 export VLLM_MOONCAKE_BOOTSTRAP_PORT=${BOOTSTRAP_PORT}
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 rm -rf /root/.cache
 
@@ -204,7 +204,7 @@ export SAFETENSORS_FAST_GPU=1
 export VLLM_RPC_TIMEOUT=1800000
 export VLLM_CACHE_ROOT=/root/.cache/vllm
 export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 rm -rf /root/.cache
 

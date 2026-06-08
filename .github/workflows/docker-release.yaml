@@ -8,10 +8,11 @@ on:
       base_image:
         description: "Base Docker image for ATOM build"
         type: choice
-        default: "rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0"
+        default: "rocm/pytorch:latest"
         options:
-          - rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0
+          - rocm/pytorch:latest
           - rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
+          - rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0
       atom_repo:
         description: "ATOM repo"
         default: "https://github.com/ROCm/ATOM.git"
@@ -85,7 +86,7 @@ jobs:
       fail-fast: false
       matrix:
         base_image:
-          - ${{ inputs.base_image || 'rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0' }}
+          - ${{ inputs.base_image || 'rocm/pytorch:latest' }}
 
     env:
       ATOM_REPO: "https://github.com/ROCm/ATOM.git"
