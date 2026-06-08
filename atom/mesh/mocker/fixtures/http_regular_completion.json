@@ -1,6 +1,6 @@
 {
   "name": "http_regular_completion",
-  "model": "test-model",
+  "model": "hf-internal-testing/llama-tokenizer",
   "endpoint": "/v1/completions",
   "route": {
     "worker_kind": "regular",
@@ -16,7 +16,7 @@
     "body": {
       "id": "cmpl-test",
       "object": "text_completion",
-      "model": "test-model",
+      "model": "hf-internal-testing/llama-tokenizer",
       "choices": [
         {
           "index": 0,
