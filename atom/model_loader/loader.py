@@ -38,10 +38,7 @@ from atom.model_loader.weight_utils import (
 )
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.moe import FusedMoEMethodBase
-from atom.model_ops.topK import (
-    is_rocm_aiter_fusion_shared_expert_enabled,
-    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
-)
+from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.plugin.prepare import is_sglang
@@ -305,25 +302,6 @@ def load_model(
                 return maybe_matching_name
         return None
 
-    def should_fuse_shared_expert_weight(name: str, matching_name: str) -> bool:
-        layer_prefix = name.split(matching_name, 1)[0]
-        module_prefix = matching_name.split("shared_expert", 1)[0]
-        shared_expert_prefix = layer_prefix + matching_name.rstrip(".")
-        routed_expert_prefix = layer_prefix + f"{module_prefix}experts"
-        model_quant_config = getattr(getattr(model, "args", None), "quant_config", None)
-        if model_quant_config is None:
-            model_quant_config = getattr(model, "quant_config", None)
-        if model_quant_config is not None:
-            return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
-                model_quant_config,
-                shared_expert_prefix=shared_expert_prefix,
-                routed_expert_prefix=routed_expert_prefix,
-            )
-        return is_rocm_aiter_fusion_shared_expert_enabled(
-            shared_expert_prefix=shared_expert_prefix,
-            routed_expert_prefix=routed_expert_prefix,
-        )
-
     def extract_expert_target_and_id(name: str) -> Tuple[str, int] | None:
         """Extract fused parameter name and expert id from expert checkpoint name.
         like 'model.layers.10.mlp.experts.100.w2_bias' -> model.layers.10.mlp.experts.w2_bias and 100
@@ -465,7 +443,7 @@ def load_model(
                 # standalone Expert module. Stays True for models without this
                 # attr (GLM4 etc.) so their fused-shared path is unchanged.
                 and not getattr(model, "disable_fused_shared_loading", False)
-                and should_fuse_shared_expert_weight(name, maybe_matching_name)
+                and is_rocm_aiter_fusion_shared_expert_enabled()
             ):
                 # Preserve the module-naming prefix (mlp. / ffn.) so the rewritten
                 # name matches this model's routed-expert param naming.
