@@ -42,7 +42,7 @@ from aiter.dist.communication_op import (
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from aiter.ops.flydsl.kernels.fp8_einsum_ready import fp8_einsum
+from aiter.ops.flydsl.kernels.fp8_einsum import fp8_einsum
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
