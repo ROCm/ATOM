@@ -818,6 +818,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             )));
         }
 
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let tls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
                 .await
