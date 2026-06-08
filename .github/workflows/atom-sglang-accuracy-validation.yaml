@@ -500,17 +500,6 @@ jobs:
           fi
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-      #- name: Verify old validation container is removed
-      #  run: |
-      #    set -euo pipefail
-      #    echo "Verifying old validation container cleanup for ${CONTAINER_NAME}"
-      #    docker ps -a --filter "name=^/${CONTAINER_NAME}$"
-      #    if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
-      #      echo "ERROR: Old validation container ${CONTAINER_NAME} still exists after cleanup."
-      #      docker inspect "$CONTAINER_NAME" || true
-      #      exit 1
-      #    fi
-
       - name: Start validation container
         run: |
           set -euo pipefail
