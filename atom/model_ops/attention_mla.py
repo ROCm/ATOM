@@ -389,41 +389,18 @@ class MLAAttention(nn.Module):
         k_out: torch.Tensor,
         v_out: torch.Tensor,
     ) -> None:
-        if self.kv_b_proj.weight.dtype != dtypes.fp4x2:
-            gather_kv_b_proj(
-                kv_cache,
-                self._k_scale,
-                kv_indptr,
-                kv_indices,
-                cu_seqlens_k,
-                self.kv_b_proj.weight,
-                self.kv_b_proj.weight_scale,
-                k_out,
-                v_out,
-                weight_preshuffle=getattr(self.kv_b_proj.weight, "is_shuffled", False),
-            )
-            return
-
-        flat_cache = kv_cache.view(-1, self.kv_lora_rank + self.qk_rope_head_dim)
-        # ``kv_indices`` is a reusable workspace; only the current k/v output
-        # length is valid for this call.
-        valid_indices = kv_indices[: k_out.shape[0]]
-        cached = flat_cache.index_select(0, valid_indices).to(self.dtype)
-        if self.kv_cache_dtype == "fp8" and self._k_scale is not None:
-            cached = cached * self._k_scale.to(device=cached.device, dtype=cached.dtype)
-
-        kv_c_normed = cached[:, : self.kv_lora_rank]
-        k_rope = cached[:, self.kv_lora_rank :]
-        kv_nope = self.kv_b_proj(kv_c_normed).view(
-            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        gather_kv_b_proj(
+            kv_cache,
+            self._k_scale,
+            kv_indptr,
+            kv_indices,
+            cu_seqlens_k,
+            self.kv_b_proj.weight,
+            self.kv_b_proj.weight_scale,
+            k_out,
+            v_out,
+            weight_preshuffle=getattr(self.kv_b_proj.weight, "is_shuffled", False),
         )
-        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = torch.cat(
-            (k_nope, k_rope.unsqueeze(1).expand(-1, self.num_heads, -1)),
-            dim=-1,
-        )
-        k_out[: k.shape[0]].copy_(k)
-        v_out[: v.shape[0]].copy_(v)
 
     def _forward_prefill_cached_chunked(
         self,
