@@ -1495,8 +1495,6 @@ class Indexer(nn.Module):
                 k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
             q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
-            q[..., : self.rope_dim] = q_pe
-            k[..., : self.rope_dim] = k_pe
 
             q = q.view(-1, self.head_dim)
             q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
