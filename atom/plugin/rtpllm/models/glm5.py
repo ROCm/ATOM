@@ -48,7 +48,6 @@ class _ATOMGlm5AttnPyObj:
         self.is_cuda_graph = False
         self._rtp_mla_layers: list[Any] = []
         self._rtp_sparse_mla_backends: list[Any] = []
-        self._rtp_dense_mla_backends: list[Any] = []
         self._collect_mla_layers()
 
     @staticmethod
@@ -59,12 +58,10 @@ class _ATOMGlm5AttnPyObj:
     def _collect_mla_layers(self) -> None:
         try:
             from atom.plugin.rtpllm.attention_backend import (
-                RTPDenseMlaBackend,
                 RTPMLAAttention,
                 RTPSparseMlaBackend,
             )
         except (ImportError, ModuleNotFoundError):
-            RTPDenseMlaBackend = None
             RTPMLAAttention = None
             RTPSparseMlaBackend = None
 
@@ -80,9 +77,9 @@ class _ATOMGlm5AttnPyObj:
         for candidate in candidates:
             if RTPMLAAttention is not None and isinstance(candidate, RTPMLAAttention):
                 self._append_unique(self._rtp_mla_layers, candidate)
-                backend = getattr(candidate, "dense_backend", None)
+                backend = getattr(candidate, "sparse_backend", None)
             else:
-                backend = getattr(candidate, "dense_backend", None)
+                backend = getattr(candidate, "sparse_backend", None)
                 if (
                     backend is None
                     and RTPSparseMlaBackend is not None
@@ -94,15 +91,6 @@ class _ATOMGlm5AttnPyObj:
                 backend, RTPSparseMlaBackend
             ):
                 self._append_unique(self._rtp_sparse_mla_backends, backend)
-                dense_backend = getattr(backend, "dense_backend", None)
-                if RTPDenseMlaBackend is not None and isinstance(
-                    dense_backend, RTPDenseMlaBackend
-                ):
-                    self._append_unique(self._rtp_dense_mla_backends, dense_backend)
-            elif RTPDenseMlaBackend is not None and isinstance(
-                backend, RTPDenseMlaBackend
-            ):
-                self._append_unique(self._rtp_dense_mla_backends, backend)
 
     @property
     def fmha_params(self):
@@ -113,7 +101,7 @@ class _ATOMGlm5AttnPyObj:
             prepare = getattr(layer, "prepare_cuda_graph", None)
             if callable(prepare):
                 prepare(attn_inputs)
-        for backend in self._rtp_sparse_mla_backends + self._rtp_dense_mla_backends:
+        for backend in self._rtp_sparse_mla_backends:
             prepare = getattr(backend, "prepare_cuda_graph", None)
             if callable(prepare):
                 prepare(attn_inputs)
@@ -235,16 +223,6 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
                     query_dtype=dtype,
                     device=device,
                 )
-        for backend in self._atom_attn_pyobj._rtp_dense_mla_backends:
-            prewarm = getattr(backend, "prewarm_for_cuda_graph", None)
-            if callable(prewarm):
-                prewarm(
-                    max_num_tokens=max_num_tokens,
-                    max_seq_len=max_seq_len,
-                    query_dtype=dtype,
-                    device=device,
-                )
-
         self._cg_meta_bufs: dict[str, torch.Tensor] = {
             "query_start_loc": torch.arange(
                 0, max_num_tokens + 1, device=device, dtype=torch.int32
@@ -289,13 +267,12 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         self._cg_layers_prewarmed = True
         logger.info(
             "ATOM GLM5 cuda-graph prewarmed "
-            "(max_num_tokens=%d, max_seq_len=%d, sparse_layers=%d, dense_layers=%d, "
+            "(max_num_tokens=%d, max_seq_len=%d, sparse_layers=%d, "
             "physical_block_table_i32[%dx%d], block_table_i32[%dx%d], "
             "indexer_block_table_i32[%dx%d])",
             max_num_tokens,
             max_seq_len,
             len(self._atom_attn_pyobj._rtp_sparse_mla_backends),
-            len(self._atom_attn_pyobj._rtp_dense_mla_backends),
             max_num_tokens,
             recovered_physical_max_blocks,
             max_num_tokens,

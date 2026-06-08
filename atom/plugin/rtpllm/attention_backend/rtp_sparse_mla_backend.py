@@ -860,16 +860,48 @@ class _RealSparseMlaImpl:
             paged_kv_last_page_len = sparse_bufs["paged_kv_last_page_len"][:num_tokens]
             paged_kv_indices = sparse_bufs["paged_kv_indices"][: num_tokens * topk]
         else:
-            qo_indptr = torch.arange(num_tokens + 1, device=device, dtype=torch.int32)
-            paged_kv_indptr = torch.zeros(
-                (num_tokens + 1,), device=device, dtype=torch.int32
+            eager_sig = (
+                int(num_tokens),
+                int(topk),
+                str(device),
             )
-            paged_kv_last_page_len = torch.ones(
-                (num_tokens,), device=device, dtype=torch.int32
+            cached_eager = getattr(plugin_metadata, "_rtp_sparse_eager_workspace", None)
+            if (
+                isinstance(cached_eager, dict)
+                and cached_eager.get("signature") == eager_sig
+            ):
+                qo_indptr = cached_eager["qo_indptr"]
+                paged_kv_indptr = cached_eager["paged_kv_indptr"]
+                paged_kv_last_page_len = cached_eager["paged_kv_last_page_len"]
+                paged_kv_indices = cached_eager["paged_kv_indices"]
+            else:
+                qo_indptr = torch.empty(
+                    num_tokens + 1, device=device, dtype=torch.int32
+                )
+                paged_kv_indptr = torch.empty(
+                    num_tokens + 1, device=device, dtype=torch.int32
+                )
+                paged_kv_last_page_len = torch.empty(
+                    num_tokens, device=device, dtype=torch.int32
+                )
+                paged_kv_indices = torch.empty(
+                    num_tokens * topk, device=device, dtype=torch.int32
+                )
+                try:
+                    plugin_metadata._rtp_sparse_eager_workspace = {
+                        "signature": eager_sig,
+                        "qo_indptr": qo_indptr,
+                        "paged_kv_indptr": paged_kv_indptr,
+                        "paged_kv_last_page_len": paged_kv_last_page_len,
+                        "paged_kv_indices": paged_kv_indices,
+                    }
+                except Exception:
+                    pass
+            qo_indptr.copy_(
+                torch.arange(num_tokens + 1, device=device, dtype=torch.int32)
             )
-            paged_kv_indices = torch.zeros(
-                (num_tokens * topk,), device=device, dtype=torch.int32
-            )
+            paged_kv_indptr.zero_()
+            paged_kv_last_page_len.fill_(1)
         torch.cumsum(sparse_seqlen, dim=0, out=paged_kv_indptr[1:])
 
         if not in_capture and int(block_size) <= 0:
@@ -903,43 +935,79 @@ class _RealSparseMlaImpl:
             reduce_final_map = sparse_bufs["reduce_final_map"]
             reduce_partial_map = sparse_bufs["reduce_partial_map"]
         else:
-            metadata_budget_tokens = self._metadata_token_budget(
-                num_tokens=num_tokens, topk=topk
+            eager_meta_sig = (
+                int(num_tokens),
+                int(topk),
+                int(padded_num_heads),
+                str(q_dtype),
+                str(kv_dtype),
+                str(device),
             )
-            (
-                (work_meta_data_size, work_meta_data_type),
-                (work_indptr_size, work_indptr_type),
-                (work_info_set_size, work_info_set_type),
-                (reduce_indptr_size, reduce_indptr_type),
-                (reduce_final_map_size, reduce_final_map_type),
-                (reduce_partial_map_size, reduce_partial_map_type),
-            ) = get_mla_metadata_info_v1(
-                metadata_budget_tokens,
-                1,
-                padded_num_heads,
-                q_dtype,
-                kv_dtype,
-                is_sparse=True,
-                fast_mode=True,
+            cached_eager_meta = getattr(
+                plugin_metadata, "_rtp_sparse_eager_meta_workspace", None
             )
-            work_meta_data = torch.empty(
-                work_meta_data_size, dtype=work_meta_data_type, device=device
-            )
-            work_indptr = torch.empty(
-                work_indptr_size, dtype=work_indptr_type, device=device
-            )
-            work_info_set = torch.empty(
-                work_info_set_size, dtype=work_info_set_type, device=device
-            )
-            reduce_indptr = torch.empty(
-                reduce_indptr_size, dtype=reduce_indptr_type, device=device
-            )
-            reduce_final_map = torch.empty(
-                reduce_final_map_size, dtype=reduce_final_map_type, device=device
-            )
-            reduce_partial_map = torch.empty(
-                reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
-            )
+            if (
+                isinstance(cached_eager_meta, dict)
+                and cached_eager_meta.get("signature") == eager_meta_sig
+            ):
+                work_meta_data = cached_eager_meta["work_meta_data"]
+                work_indptr = cached_eager_meta["work_indptr"]
+                work_info_set = cached_eager_meta["work_info_set"]
+                reduce_indptr = cached_eager_meta["reduce_indptr"]
+                reduce_final_map = cached_eager_meta["reduce_final_map"]
+                reduce_partial_map = cached_eager_meta["reduce_partial_map"]
+            else:
+                metadata_budget_tokens = self._metadata_token_budget(
+                    num_tokens=num_tokens, topk=topk
+                )
+                (
+                    (work_meta_data_size, work_meta_data_type),
+                    (work_indptr_size, work_indptr_type),
+                    (work_info_set_size, work_info_set_type),
+                    (reduce_indptr_size, reduce_indptr_type),
+                    (reduce_final_map_size, reduce_final_map_type),
+                    (reduce_partial_map_size, reduce_partial_map_type),
+                ) = get_mla_metadata_info_v1(
+                    metadata_budget_tokens,
+                    1,
+                    padded_num_heads,
+                    q_dtype,
+                    kv_dtype,
+                    is_sparse=True,
+                    fast_mode=True,
+                )
+                work_meta_data = torch.empty(
+                    work_meta_data_size, dtype=work_meta_data_type, device=device
+                )
+                work_indptr = torch.empty(
+                    work_indptr_size, dtype=work_indptr_type, device=device
+                )
+                work_info_set = torch.empty(
+                    work_info_set_size, dtype=work_info_set_type, device=device
+                )
+                reduce_indptr = torch.empty(
+                    reduce_indptr_size, dtype=reduce_indptr_type, device=device
+                )
+                reduce_final_map = torch.empty(
+                    reduce_final_map_size, dtype=reduce_final_map_type, device=device
+                )
+                reduce_partial_map = torch.empty(
+                    reduce_partial_map_size,
+                    dtype=reduce_partial_map_type,
+                    device=device,
+                )
+                try:
+                    plugin_metadata._rtp_sparse_eager_meta_workspace = {
+                        "signature": eager_meta_sig,
+                        "work_meta_data": work_meta_data,
+                        "work_indptr": work_indptr,
+                        "work_info_set": work_info_set,
+                        "reduce_indptr": reduce_indptr,
+                        "reduce_final_map": reduce_final_map,
+                        "reduce_partial_map": reduce_partial_map,
+                    }
+                except Exception:
+                    pass
         capture_meta_sig = (
             int(num_tokens),
             int(topk),
@@ -1265,18 +1333,18 @@ class RTPSparseMlaBackend:
     def __init__(
         self,
         *,
-        dense_backend: object,
         sparse_impl: Optional[object] = None,
         v_head_dim: Optional[int] = None,
         mla_modules: Optional[object] = None,
         scale: Optional[float] = None,
     ) -> None:
-        self.dense_backend = dense_backend
-        self.v_head_dim = int(
-            v_head_dim
-            if v_head_dim is not None
-            else getattr(dense_backend, "v_head_dim")
-        )
+        if v_head_dim is None:
+            if mla_modules is None or not hasattr(mla_modules, "v_head_dim"):
+                raise ValueError(
+                    "RTPSparseMlaBackend requires v_head_dim or mla_modules.v_head_dim."
+                )
+            v_head_dim = getattr(mla_modules, "v_head_dim")
+        self.v_head_dim = int(v_head_dim)
         if sparse_impl is not None:
             self.sparse_impl = sparse_impl
             self._default_mock = False
@@ -1302,9 +1370,6 @@ class RTPSparseMlaBackend:
         self._sparse_impl_accepts_positions = self._impl_accepts_positions(
             self.sparse_impl
         )
-        self._dense_forward_accepts_positions = self._call_accepts_positions(
-            getattr(self.dense_backend, "forward", None)
-        )
 
     def prepare_cuda_graph(self, attn_inputs) -> None:  # noqa: ANN001
         del attn_inputs
@@ -1317,14 +1382,6 @@ class RTPSparseMlaBackend:
         query_dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        dense_prewarm = getattr(self.dense_backend, "prewarm_for_cuda_graph", None)
-        if callable(dense_prewarm):
-            dense_prewarm(
-                max_num_tokens=max_num_tokens,
-                max_seq_len=max_seq_len,
-                query_dtype=query_dtype,
-                device=device,
-            )
         sparse_prewarm = getattr(self.sparse_impl, "prewarm_for_cuda_graph", None)
         if callable(sparse_prewarm):
             sparse_prewarm(
@@ -1371,39 +1428,6 @@ class RTPSparseMlaBackend:
             for parameter in signature.parameters.values()
         )
 
-    @staticmethod
-    def _call_accepts_positions(callable_obj: object) -> bool:
-        try:
-            signature = inspect.signature(callable_obj)
-        except (TypeError, ValueError):
-            return False
-        return "positions" in signature.parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
-
-    def _dense_forward(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        kv_cache: object,
-        layer_id: int,
-        topk_indices: Optional[torch.Tensor],
-        positions: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        kwargs = {"topk_indices": topk_indices}
-        if self._dense_forward_accepts_positions:
-            kwargs["positions"] = positions
-        return self.dense_backend.forward(
-            q,
-            compressed_kv,
-            k_pe,
-            kv_cache,
-            layer_id,
-            **kwargs,
-        )
-
     def forward(
         self,
         q: torch.Tensor,
@@ -1421,17 +1445,9 @@ class RTPSparseMlaBackend:
             return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
 
         if topk_indices is None:
-            plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
-            num_prefills = int(getattr(plugin_metadata, "num_prefills", 0) or 0)
-            if num_prefills <= 0:
-                raise _SparseUnavailable(
-                    "GLM5 RTP sparse MLA decode requires topk_indices; "
-                    "refusing dense fallback."
-                )
-            return self._dense_forward(
-                q, compressed_kv, k_pe, kv_cache, layer_id, None, positions
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA requires topk_indices; refusing dense fallback."
             )
-
         self._validate_topk_indices(q, topk_indices)
         if self._default_mock or not callable(
             getattr(self.sparse_impl, "forward", None)
@@ -1486,6 +1502,52 @@ def rtp_sparse_attn_indexer(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
+    try:
+        from atom.utils.forward_context import get_forward_context
+
+        forward_context = get_forward_context()
+    except Exception:
+        forward_context = None
+    context = getattr(forward_context, "context", None)
+    attn_metadata = getattr(forward_context, "attn_metadata", None)
+    # For short prefill (ctx <= topk buffer width), DeepSeek indexer returns early and
+    # doesn't write topk buffer. Emit causal full-history indices to keep sparse path valid.
+    if (
+        context is not None
+        and bool(getattr(context, "is_prefill", False))
+        and attn_metadata is not None
+        and topk_indices_buffer is not None
+        and positions is not None
+    ):
+        max_seqlen_k = int(getattr(attn_metadata, "max_seqlen_k", 0) or 0)
+        topk_capacity = int(topk_indices_buffer.shape[1])
+        if max_seqlen_k > 0 and max_seqlen_k <= topk_capacity:
+            num_tokens = int(hidden_states.shape[0])
+            if num_tokens > 0:
+                positions_i32 = positions.to(
+                    device=topk_indices_buffer.device, dtype=torch.int32
+                ).view(-1)
+                row_limits = (
+                    (positions_i32 + 1).clamp(min=0, max=topk_tokens).view(-1, 1)
+                )
+                col_ids = torch.arange(
+                    topk_tokens,
+                    device=topk_indices_buffer.device,
+                    dtype=torch.int32,
+                ).view(1, -1)
+                causal_topk = torch.where(
+                    col_ids < row_limits,
+                    col_ids.expand(num_tokens, topk_tokens),
+                    torch.full(
+                        (num_tokens, topk_tokens),
+                        -1,
+                        device=topk_indices_buffer.device,
+                        dtype=torch.int32,
+                    ),
+                )
+                topk_indices_buffer[:num_tokens, :topk_tokens].copy_(causal_topk)
+            return weights
+
     from atom.models.deepseek_v2 import sparse_attn_indexer
 
     return sparse_attn_indexer(

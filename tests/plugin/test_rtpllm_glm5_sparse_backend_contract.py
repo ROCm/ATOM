@@ -129,23 +129,64 @@ def test_rtp_sparse_attn_indexer_fake_bridge_forwards_to_main_fake(monkeypatch):
     assert calls[0][6:12] == (128, None, 2048, 64, 4096, 1)
 
 
-class _FakeDenseBackend:
-    def __init__(self, v_head_dim: int = 5):
-        self.v_head_dim = v_head_dim
-        self.calls = []
+def test_rtp_sparse_attn_indexer_short_prefill_fills_causal_topk(monkeypatch):
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    fake_forward_context = SimpleNamespace(
+        context=SimpleNamespace(is_prefill=True, is_dummy_run=False),
+        attn_metadata=SimpleNamespace(max_seqlen_k=4),
+    )
+    monkeypatch.setattr(
+        forward_context_mod,
+        "get_forward_context",
+        lambda: fake_forward_context,
+        raising=False,
+    )
 
-    def forward(self, q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=None):
-        self.calls.append(
-            {
-                "q": q,
-                "compressed_kv": compressed_kv,
-                "k_pe": k_pe,
-                "kv_cache": kv_cache,
-                "layer_id": layer_id,
-                "topk_indices": topk_indices,
-            }
+    def _unexpected_call(*args, **kwargs):
+        raise AssertionError(
+            "short prefill path should not call deepseek sparse_attn_indexer"
         )
-        return q.new_full((q.shape[0], q.shape[1], self.v_head_dim), -1)
+
+    fake_deepseek = type(sys)("atom.models.deepseek_v2")
+    fake_deepseek.sparse_attn_indexer = _unexpected_call
+    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
+
+    topk_buffer = torch.full((3, 8), -99, dtype=torch.int32)
+    positions = torch.tensor([0, 1, 3], dtype=torch.int32)
+    tensor = torch.empty(3, 2)
+    weights = torch.randn(3, 4)
+    out = module.rtp_sparse_attn_indexer(
+        tensor,
+        "indexer.prefix",
+        tensor,
+        tensor,
+        tensor,
+        weights,
+        128,
+        None,
+        6,
+        64,
+        4096,
+        3,
+        topk_buffer,
+        tensor,
+        tensor,
+        1e-6,
+        positions,
+        tensor,
+        tensor,
+        1.0,
+        True,
+        False,
+    )
+
+    assert out is weights
+    assert topk_buffer[:3, :6].tolist() == [
+        [0, -1, -1, -1, -1, -1],
+        [0, 1, -1, -1, -1, -1],
+        [0, 1, 2, 3, -1, -1],
+    ]
 
 
 class _FakeSparseImpl:
@@ -178,14 +219,9 @@ class _FakeSparseImpl:
         return q.new_full((q.shape[0], q.shape[1], self.v_head_dim), 7)
 
 
-def _build_backend(backend_cls, dense_backend, sparse_impl):
+def _build_backend(backend_cls, sparse_impl):
     params = inspect.signature(backend_cls).parameters
     kwargs = {}
-    if "dense_backend" not in params:
-        raise AssertionError(
-            "RTPSparseMlaBackend must accept dense_backend= for dense fallback"
-        )
-    kwargs["dense_backend"] = dense_backend
 
     if "sparse_impl" in params:
         kwargs["sparse_impl"] = sparse_impl
@@ -195,7 +231,7 @@ def _build_backend(backend_cls, dense_backend, sparse_impl):
         )
 
     if "v_head_dim" in params:
-        kwargs["v_head_dim"] = dense_backend.v_head_dim
+        kwargs["v_head_dim"] = int(getattr(sparse_impl, "v_head_dim", 5))
     return backend_cls(**kwargs)
 
 
@@ -211,9 +247,8 @@ def _make_inputs():
 
 def test_sparse_backend_passes_topk_through_unchanged(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
-    dense_backend = _FakeDenseBackend()
     sparse_impl = _FakeSparseImpl()
-    backend = _build_backend(backend_cls, dense_backend, sparse_impl)
+    backend = _build_backend(backend_cls, sparse_impl)
     q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
     topk = torch.tensor([[4, 1], [3, 0], [2, 1]], dtype=torch.int32)
 
@@ -222,14 +257,13 @@ def test_sparse_backend_passes_topk_through_unchanged(monkeypatch):
     )
 
     assert output.shape == (3, 2, sparse_impl.v_head_dim)
-    assert dense_backend.calls == []
     assert len(sparse_impl.calls) == 1
     assert sparse_impl.calls[0]["topk_indices"] is topk
     assert sparse_impl.calls[0]["topk_indices"].dtype == torch.int32
     assert sparse_impl.calls[0]["topk_indices"].shape == (3, 2)
 
 
-def test_sparse_backend_falls_back_to_dense_when_topk_is_none(monkeypatch):
+def test_sparse_backend_prefill_without_topk_raises(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
     forward_context_mod = sys.modules["atom.utils.forward_context"]
     fake_forward_context = SimpleNamespace(
@@ -244,24 +278,18 @@ def test_sparse_backend_falls_back_to_dense_when_topk_is_none(monkeypatch):
         lambda: fake_forward_context,
         raising=False,
     )
-    dense_backend = _FakeDenseBackend()
     sparse_impl = _FakeSparseImpl()
-    backend = _build_backend(backend_cls, dense_backend, sparse_impl)
+    backend = _build_backend(backend_cls, sparse_impl)
     q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
 
-    output = backend.forward(
-        q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=None
-    )
-
-    assert output.shape == (3, 2, dense_backend.v_head_dim)
-    assert len(dense_backend.calls) == 1
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    try:
+        backend.forward(q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=None)
+    except module._SparseUnavailable as exc:
+        assert "requires topk_indices" in str(exc)
+    else:
+        raise AssertionError("Expected missing prefill topk_indices to raise")
     assert sparse_impl.calls == []
-    assert dense_backend.calls[0]["q"] is q
-    assert dense_backend.calls[0]["compressed_kv"] is compressed_kv
-    assert dense_backend.calls[0]["k_pe"] is k_pe
-    assert dense_backend.calls[0]["kv_cache"] is kv_cache
-    assert dense_backend.calls[0]["layer_id"] == layer_id
-    assert dense_backend.calls[0]["topk_indices"] is None
 
 
 def test_sparse_backend_decode_without_topk_raises(monkeypatch):
@@ -280,26 +308,23 @@ def test_sparse_backend_decode_without_topk_raises(monkeypatch):
         lambda: fake_forward_context,
         raising=False,
     )
-    dense_backend = _FakeDenseBackend()
     sparse_impl = _FakeSparseImpl()
-    backend = _build_backend(backend_cls, dense_backend, sparse_impl)
+    backend = _build_backend(backend_cls, sparse_impl)
     q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
 
     try:
         backend.forward(q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=None)
     except module._SparseUnavailable as exc:
-        assert "decode requires topk_indices" in str(exc)
+        assert "requires topk_indices" in str(exc)
     else:
         raise AssertionError("Expected missing decode topk_indices to raise")
-    assert dense_backend.calls == []
     assert sparse_impl.calls == []
 
 
 def test_sparse_backend_threads_kv_cache_and_layer_id_to_sparse_impl(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
-    dense_backend = _FakeDenseBackend()
     sparse_impl = _FakeSparseImpl()
-    backend = _build_backend(backend_cls, dense_backend, sparse_impl)
+    backend = _build_backend(backend_cls, sparse_impl)
     q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
     topk = torch.tensor([[1, 0], [0, 1], [1, 1]], dtype=torch.int32)
 
@@ -328,9 +353,8 @@ def test_sparse_backend_pulls_attn_metadata_from_forward_context(monkeypatch):
         lambda: fake_forward_context,
         raising=False,
     )
-    dense_backend = _FakeDenseBackend()
     sparse_impl = _FakeSparseImpl()
-    backend = _build_backend(backend_cls, dense_backend, sparse_impl)
+    backend = _build_backend(backend_cls, sparse_impl)
     q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
     topk = torch.tensor([[1, 0], [0, 1], [1, 1]], dtype=torch.int32)
 
@@ -362,8 +386,8 @@ def test_sparse_backend_prefill_missing_sparse_kernel_raises(monkeypatch):
         def forward(self, *args, **kwargs):
             raise module._SparseUnavailable("flash_mla_sparse_fwd unavailable")
 
-    dense_backend = _FakeDenseBackend()
-    backend = _build_backend(backend_cls, dense_backend, _MissingPrefillSparse())
+    sparse_impl = _MissingPrefillSparse()
+    backend = _build_backend(backend_cls, sparse_impl)
     q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
     topk = torch.tensor([[1, 0], [0, 1], [1, 1]], dtype=torch.int32)
 
@@ -375,8 +399,6 @@ def test_sparse_backend_prefill_missing_sparse_kernel_raises(monkeypatch):
         raise AssertionError(
             "prefill sparse unavailability must not fall back to dense"
         )
-
-    assert len(dense_backend.calls) == 0
 
 
 def test_sparse_backend_decode_missing_sparse_kernel_still_raises(monkeypatch):
@@ -402,7 +424,7 @@ def test_sparse_backend_decode_missing_sparse_kernel_still_raises(monkeypatch):
         def forward(self, *args, **kwargs):
             raise module._SparseUnavailable("flash_mla_sparse_fwd unavailable")
 
-    backend = _build_backend(backend_cls, _FakeDenseBackend(), _MissingDecodeSparse())
+    backend = _build_backend(backend_cls, _MissingDecodeSparse())
     q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
     topk = torch.tensor([[1, 0], [0, 1], [1, 1]], dtype=torch.int32)
 

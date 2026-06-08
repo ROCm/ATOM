@@ -339,7 +339,7 @@ def test_rtpllm_decode_seq_lens_uses_rtp_plus_one_in_graph_and_eager_modes():
 def test_collect_layer_maps_keeps_mla_layers_separate():
     from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
 
-    mla_layer = RTPMLAAttention(dense_backend=object(), layer_num=7)
+    mla_layer = RTPMLAAttention(sparse_backend=object(), layer_num=7)
     model = SimpleNamespace(modules=lambda: [mla_layer])
 
     gdn_map, full_attn_map, mla_map = RTPForwardContext.collect_layer_maps(model)
@@ -352,7 +352,7 @@ def test_collect_layer_maps_keeps_mla_layers_separate():
 def test_collect_layer_maps_keeps_sparse_mla_owner_for_indexer_cache():
     from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
 
-    mla_layer = RTPMLAAttention(dense_backend=object(), layer_num=7)
+    mla_layer = RTPMLAAttention(sparse_backend=object(), layer_num=7)
     sparse_owner = SimpleNamespace(
         layer_num=7,
         indexer=SimpleNamespace(),
@@ -370,7 +370,7 @@ def test_collect_layer_maps_keeps_sparse_mla_owner_for_indexer_cache():
 def test_collect_layer_maps_recognizes_atom_mla_wrapper_by_indexer_and_mla_attn():
     from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
 
-    inner_mla = RTPMLAAttention(dense_backend=object(), layer_num=9)
+    inner_mla = RTPMLAAttention(sparse_backend=object(), layer_num=9)
     atom_wrapper = SimpleNamespace(
         layer_num=9,
         indexer=SimpleNamespace(),
@@ -390,7 +390,7 @@ def test_build_kv_cache_tensors_threads_raw_layer_cache_for_mla():
     runtime = SimpleNamespace(
         kv_cache=SimpleNamespace(get_layer_cache=lambda layer_num: layer_cache)
     )
-    mla_layer = RTPMLAAttention(dense_backend=object(), layer_num=7)
+    mla_layer = RTPMLAAttention(sparse_backend=object(), layer_num=7)
 
     cache_tensors = RTPForwardContext._build_kv_cache_tensors(
         runtime=runtime,
@@ -406,7 +406,9 @@ def test_bind_temporarily_attaches_mla_layer_cache(monkeypatch):
 
     old_cache = SimpleNamespace(name="old-cache")
     new_cache = SimpleNamespace(name="new-cache")
-    mla_layer = RTPMLAAttention(dense_backend=object(), layer_num=7, kv_cache=old_cache)
+    mla_layer = RTPMLAAttention(
+        sparse_backend=object(), layer_num=7, kv_cache=old_cache
+    )
     forward_context = SimpleNamespace(
         attn_metadata=SimpleNamespace(),
         gdn_metadata=SimpleNamespace(),
@@ -451,7 +453,7 @@ def test_bind_writes_kv_cache_to_mla_attn_owner_not_outer_wrapper(monkeypatch):
         k_cache=SimpleNamespace(kv_cache=[torch.empty(0)]),
     )
     mla_layer = RTPMLAAttention(
-        dense_backend=object(),
+        sparse_backend=object(),
         layer_num=7,
         kv_cache=old_inner_cache,
     )
@@ -503,7 +505,7 @@ def test_bind_temporarily_attaches_sparse_mla_indexer_cache(monkeypatch):
         k_cache=SimpleNamespace(kv_cache=[old_index_cache]),
     )
     mla_layer = RTPMLAAttention(
-        dense_backend=object(),
+        sparse_backend=object(),
         layer_num=7,
         kv_cache=old_cache,
         mla_modules=SimpleNamespace(indexer=indexer),

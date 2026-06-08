@@ -8,7 +8,6 @@ import torch
 
 from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
 
-
 _FORBIDDEN_CUDA_SPARSE_MODULES = (
     "flashmla_sparse",
     "flash_mla",
@@ -22,13 +21,15 @@ def _guard_sparse_kernel_imports(monkeypatch):
 
     def _guarded_import(name, *args, **kwargs):
         if any(part in _FORBIDDEN_CUDA_SPARSE_MODULES for part in name.split(".")):
-            raise AssertionError(f"M1.5 tests must not import sparse MLA kernels: {name}")
+            raise AssertionError(
+                f"M1.5 tests must not import sparse MLA kernels: {name}"
+            )
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _guarded_import)
 
 
-class _FakeDenseBackend:
+class _FakeSparseBackend:
     def __init__(self, v_head_dim: int):
         self.v_head_dim = v_head_dim
         self.calls = []
@@ -56,9 +57,9 @@ class _FakeIndexer:
             -1,
             dtype=torch.int32,
         )
-        self.topk_indices_buffer[
-            : topk_values.shape[0], : topk_values.shape[1]
-        ].copy_(topk_values)
+        self.topk_indices_buffer[: topk_values.shape[0], : topk_values.shape[1]].copy_(
+            topk_values
+        )
         self.weights = torch.full(topk_values.shape, 99.0, dtype=torch.float32)
 
     def __call__(self, *args, **kwargs):
@@ -93,7 +94,7 @@ def _make_attention(topk_values):
     projected_q = torch.arange(
         token_count * num_heads * qk_head_dim, dtype=torch.float32
     ).reshape(token_count, num_heads * qk_head_dim)
-    backend = _FakeDenseBackend(v_head_dim=v_head_dim)
+    backend = _FakeSparseBackend(v_head_dim=v_head_dim)
     indexer = _FakeIndexer(topk_values)
     modules = SimpleNamespace(
         q_proj=_FakeQProj(projected_q),
@@ -108,7 +109,7 @@ def _make_attention(topk_values):
     )
     attention = RTPMLAAttention(
         mla_modules=modules,
-        dense_backend=backend,
+        sparse_backend=backend,
         layer_num=7,
         kv_cache="kv-cache",
     )
@@ -134,7 +135,9 @@ def test_constructor_injects_indexer_and_topk_indices_buffer_owner_path():
 def test_constructor_swaps_indexer_to_rtp_sparse_indexer_op(monkeypatch):
     default_op = object()
     rtp_op = object()
-    monkeypatch.setattr(torch.ops.aiter, "rtp_sparse_attn_indexer", rtp_op, raising=False)
+    monkeypatch.setattr(
+        torch.ops.aiter, "rtp_sparse_attn_indexer", rtp_op, raising=False
+    )
     topk_buffer = torch.tensor([[4, 1, 3, 0]], dtype=torch.int32)
     indexer = SimpleNamespace(
         topk_indices_buffer=topk_buffer,
@@ -149,7 +152,7 @@ def test_constructor_swaps_indexer_to_rtp_sparse_indexer_op(monkeypatch):
         v_head_dim=3,
     )
 
-    attention = RTPMLAAttention(mla_modules=modules, dense_backend=object())
+    attention = RTPMLAAttention(mla_modules=modules, sparse_backend=object())
 
     assert attention.indexer is indexer
     assert indexer.sparse_attn_indexer_impl is rtp_op
@@ -168,7 +171,7 @@ def _run_attention(attention, token_count: int):
     )
 
 
-def test_indexer_buffer_topk_is_passed_to_dense_backend_when_emit_allowed(monkeypatch):
+def test_indexer_buffer_topk_is_passed_to_sparse_backend_when_emit_allowed(monkeypatch):
     _guard_sparse_kernel_imports(monkeypatch)
     topk_values = torch.tensor([[4, 1, 3, 0], [2, 0, 1, 3]], dtype=torch.int32)
     attention, modules, backend = _make_attention(topk_values)
@@ -200,7 +203,7 @@ def _patch_forward_context(monkeypatch, *, is_dummy_run, is_prefill, max_seqlen_
     )
 
 
-def test_dummy_run_does_not_emit_topk_to_dense_backend(monkeypatch):
+def test_dummy_run_does_not_emit_topk_to_sparse_backend(monkeypatch):
     _guard_sparse_kernel_imports(monkeypatch)
     _patch_forward_context(
         monkeypatch,
@@ -217,7 +220,7 @@ def test_dummy_run_does_not_emit_topk_to_dense_backend(monkeypatch):
     assert backend.calls[0]["topk_indices"] is None
 
 
-def test_short_prefill_does_not_emit_topk_to_dense_backend(monkeypatch):
+def test_short_prefill_emits_topk_to_sparse_backend(monkeypatch):
     _guard_sparse_kernel_imports(monkeypatch)
     _patch_forward_context(
         monkeypatch,
@@ -231,10 +234,12 @@ def test_short_prefill_does_not_emit_topk_to_dense_backend(monkeypatch):
     _run_attention(attention, token_count=topk_values.shape[0])
 
     assert modules.indexer.calls == []
-    assert backend.calls[0]["topk_indices"] is None
+    topk_indices = backend.calls[0]["topk_indices"]
+    assert topk_indices is not None
+    assert torch.equal(topk_indices, topk_values)
 
 
-def test_prefill_within_topk_buffer_padding_does_not_emit_topk(monkeypatch):
+def test_prefill_within_topk_buffer_padding_still_emits_topk(monkeypatch):
     _guard_sparse_kernel_imports(monkeypatch)
     _patch_forward_context(
         monkeypatch,
@@ -250,5 +255,6 @@ def test_prefill_within_topk_buffer_padding_does_not_emit_topk(monkeypatch):
     assert modules.indexer.index_topk == 4
     assert modules.indexer.topk_indices_buffer.shape[1] == 6
     assert modules.indexer.calls == []
-    assert backend.calls[0]["topk_indices"] is None
-
+    topk_indices = backend.calls[0]["topk_indices"]
+    assert topk_indices is not None
+    assert torch.equal(topk_indices, topk_values)

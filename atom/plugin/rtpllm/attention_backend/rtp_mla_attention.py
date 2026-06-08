@@ -46,14 +46,6 @@ def _should_emit_topk_indices(attn) -> bool:
     context = getattr(forward_context, "context", None)
     if getattr(context, "is_dummy_run", False):
         return False
-    attn_metadata = getattr(forward_context, "attn_metadata", None)
-    if getattr(context, "is_prefill", False) and attn_metadata is not None:
-        max_seqlen_k = getattr(attn_metadata, "max_seqlen_k", None)
-        if max_seqlen_k is not None:
-            try:
-                return int(max_seqlen_k) > _get_topk_indices_buffer(attn).shape[1]
-            except AttributeError:
-                return True
     return True
 
 
@@ -65,7 +57,7 @@ def _use_rtp_sparse_attn_indexer(indexer: object | None) -> None:
 
 
 class RTPMLAAttention:
-    """Dense RTP MLA adapter for the native GLM5 MLA call contract."""
+    """RTP MLA adapter for the native GLM5 MLA call contract."""
 
     use_mla = True
 
@@ -91,30 +83,26 @@ class RTPMLAAttention:
             if self.indexer is not None
             else None
         )
-        injected_backend = kwargs.get("dense_backend")
+        injected_backend = kwargs.get("sparse_backend", kwargs.get("dense_backend"))
         if injected_backend is not None:
-            self.dense_backend = injected_backend
+            self.sparse_backend = injected_backend
         elif mla_modules is not None:
-            from atom.plugin.rtpllm.attention_backend.rtp_dense_mla_backend import (
-                RTPDenseMlaBackend,
-            )
             from atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend import (
                 RTPSparseMlaBackend,
             )
 
-            self.dense_backend = RTPSparseMlaBackend(
-                dense_backend=RTPDenseMlaBackend(mla_modules=mla_modules),
+            self.sparse_backend = RTPSparseMlaBackend(
                 v_head_dim=mla_modules.v_head_dim,
                 mla_modules=mla_modules,
                 scale=kwargs.get("scale"),
             )
         else:
-            self.dense_backend = None
+            self.sparse_backend = None
         self.kv_cache = kwargs.get("kv_cache")
         self.layer_id = int(kwargs.get("layer_id", kwargs.get("layer_num", 0)))
-        self._dense_backend_accepts_positions = (
-            self._backend_accepts_positions(self.dense_backend)
-            if self.dense_backend is not None
+        self._sparse_backend_accepts_positions = (
+            self._backend_accepts_positions(self.sparse_backend)
+            if self.sparse_backend is not None
             else False
         )
 
@@ -179,7 +167,7 @@ class RTPMLAAttention:
         topk_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if self.dense_backend is None:
+        if self.sparse_backend is None:
             raise NotImplementedError(
                 "RTPMLAAttention requires an attention backend for contract execution"
             )
@@ -191,9 +179,9 @@ class RTPMLAAttention:
             kwargs.get("topk_indices", topk_indices),
         )
         forward_kwargs = {"topk_indices": topk_indices}
-        if self._dense_backend_accepts_positions:
+        if self._sparse_backend_accepts_positions:
             forward_kwargs["positions"] = positions
-        attn_output = self.dense_backend.forward(
+        attn_output = self.sparse_backend.forward(
             q,
             compressed_kv,
             k_pe,
