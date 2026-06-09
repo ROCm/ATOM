@@ -2370,6 +2370,12 @@ class MoE(nn.Module):
         return self.single_stream_moe_forward(x)
 
 
+@dataclass
+class HCState:
+    residual: torch.Tensor
+    post_mix: Optional[torch.Tensor] = None
+    comb_mix: Optional[torch.Tensor] = None
+    x_prev: Optional[torch.Tensor] = None
 class Block(nn.Module):
     """Transformer block with Manifold-Constrained Hyper-Connections (mHC).
 
@@ -2431,6 +2437,8 @@ class Block(nn.Module):
         _dim_ok = args.dim % 512 == 0 or args.dim % 256 == 0
         self._mhc_pre = getattr(aiter, "mhc_pre", None) if _dim_ok else None
         self._mhc_post = getattr(aiter, "mhc_post", None) if _dim_ok else None
+        self._mhc_fused_post_pre = getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
+        self.enable_fused_hc = hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
@@ -2527,44 +2535,77 @@ class Block(nn.Module):
         )
         return y.type_as(x)
 
+    def fuse_hc(
+        self,
+        hc_state: HCState,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
+    ) -> HCState:
+        residual = hc_state.residual
+        post = hc_state.post_mix
+        comb = hc_state.comb_mix
+        x = hc_state.x_prev
+        if self.enable_fused_hc and x is not None:
+            post, comb, x, res = self._mhc_fused_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                float(self.norm_eps),
+                float(self.hc_eps),
+                float(self.hc_eps),
+                self.HC_POST_MULT,
+                int(self.hc_sinkhorn_iters),
+                norm_weight,
+                norm_eps,
+            )
+        else:
+            if x is not None:
+                res = self.hc_post(x, residual, post, comb)
+            else:
+                res = residual
+            x, post, comb = self.hc_pre(
+                res, hc_fn, hc_scale, hc_base, norm_weight, norm_eps
+            )
+        return HCState(residual=res, post_mix=post, comb_mix=comb, x_prev=x)
+
     def forward(
         self,
-        x: torch.Tensor,  # [num_tokens, hc, dim]  mHC residual stream
+        hc_state: HCState,
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
-    ) -> torch.Tensor:  # [num_tokens, hc, dim]  updated residual stream
+    ) -> HCState:  # [num_tokens, hc, dim]  updated residual stream
         # ----- Attention sub-layer with mHC mixing -----
-        residual = x  # [num_tokens, hc, dim]
-        (
-            x,
-            post,
-            comb,
-        ) = self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
-            x,
+        hc_state = self.fuse_hc(
+            hc_state,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
             self.attn_norm.weight,
             self.norm_eps,
         )
-        # x = self.attn_norm(x)  # [num_tokens, dim]
+        x = hc_state.x_prev
         x = self.attn(x, positions)  # [num_tokens, dim]
-        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-        # ----- FFN sub-layer with mHC mixing -----
-        residual = x  # [num_tokens, hc, dim]
-        x, post, comb = self.hc_pre(
-            x,
+        hc_state.x_prev = x
+        hc_state = self.fuse_hc(
+            hc_state,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
             self.ffn_norm.weight,
             self.norm_eps,
         )
-        # x = self.ffn_norm(x)  # [num_tokens, dim]
+        x = hc_state.x_prev
         x = self.ffn(
             x
         )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)
-        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-        return x
+        hc_state.x_prev = x
+        return hc_state
 
 
 class ParallelHead(ParallelLMHead):
@@ -2716,10 +2757,11 @@ class DeepseekV4Model(nn.Module):
         h = self.embed(input_ids)  # [num_tokens, dim]
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None)
 
         for layer in self.layers:
-            h = layer(h, positions)  # [num_tokens, hc, dim]
-
+            hc_state = layer(hc_state, positions)  # [num_tokens, hc, dim]
+        h = self.layers[-1].hc_post(hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix)
         return h
 
 
