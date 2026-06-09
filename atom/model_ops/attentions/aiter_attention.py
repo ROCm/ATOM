@@ -12,6 +12,7 @@ from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils import envs
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
@@ -46,6 +47,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         model_runner=None,
     ):
         self.block_size = 1024 if model_runner.block_size == 1024 else 16
+        if envs.ATOM_USE_UNIFIED_ATTN:
+            # activate block_convertor when UA_decode is enabled, set --block-size 1024 for envs.ATOM_USE_UNIFIED_ATTN
+            assert (
+                self.block_size == 1024
+            ), f"When using ATOM_USE_UNIFIED_ATTN=1, block_size will be set to most performant numbers, please set --block-size 1024 to allow proper block size conversion via block_convertor"
+            self.block_size = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
+        assert (
+            model_runner.block_size % self.block_size == 0
+        ), f"model_runner.block_size must be divisible by block_size but got {model_runner.block_size=}, block_size={self.block_size}, please set --block-size (model_runner.block_size) to be divisible by {self.block_size}"
         super().__init__(model_runner)
         config = model_runner.config
         hf_config = config.hf_config

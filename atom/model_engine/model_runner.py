@@ -560,6 +560,7 @@ class ModelRunner:
         set_current_atom_config(config)
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size
+        self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
