@@ -217,6 +217,7 @@ class DeepseekV4MTP(nn.Module):
             self.hf_config,
             online_quant_config=getattr(config, "online_quant_config", None),
         )
+        self.atom_config.quant_config = self.args.quant_config
         self.model = DeepseekV4MTPModel(atom_config=config, args=self.args)
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
