@@ -923,6 +923,7 @@ jobs:
               "DeepSeek-V3.2 FP8 TP4 (AW)",
               "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
               "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
+              "DeepSeek-V4-Pro TP8 (OOB)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
               "GLM-4.7-FP8 TP4 (AW)",
