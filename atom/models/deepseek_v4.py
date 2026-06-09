@@ -2348,6 +2348,8 @@ class HCState:
     post_mix: Optional[torch.Tensor] = None
     comb_mix: Optional[torch.Tensor] = None
     x_prev: Optional[torch.Tensor] = None
+
+
 class Block(nn.Module):
     """Transformer block with Manifold-Constrained Hyper-Connections (mHC).
 
@@ -2409,8 +2411,12 @@ class Block(nn.Module):
         _dim_ok = args.dim % 512 == 0 or args.dim % 256 == 0
         self._mhc_pre = getattr(aiter, "mhc_pre", None) if _dim_ok else None
         self._mhc_post = getattr(aiter, "mhc_post", None) if _dim_ok else None
-        self._mhc_fused_post_pre = getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
-        self.enable_fused_hc = hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
+        self._mhc_fused_post_pre = (
+            getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
+        )
+        self.enable_fused_hc = (
+            hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
+        )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
@@ -2729,7 +2735,9 @@ class DeepseekV4Model(nn.Module):
 
         for layer in self.layers:
             hc_state = layer(hc_state, positions)  # [num_tokens, hc, dim]
-        h = self.layers[-1].hc_post(hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix)
+        h = self.layers[-1].hc_post(
+            hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
+        )
         return h
 
 
