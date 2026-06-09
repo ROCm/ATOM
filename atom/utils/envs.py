@@ -103,6 +103,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
     ),
+    # Experimental GPT-OSS gfx1250 path for AITER PR #3543. Requires
+    # --kv_cache_dtype fp8 and --block-size 256.
+    "ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM": lambda: (
+        os.getenv("ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM", "0") == "1"
+    ),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"

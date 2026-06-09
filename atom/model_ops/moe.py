@@ -612,7 +612,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             w2=layer.w2_weight,
             topk_weight=topk_weights,
             topk_ids=topk_ids,
-            expert_mask=expert_map,
+            expert_mask=layer.expert_mask,
             activation=activation,
         )
 
@@ -1537,7 +1537,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=expert_map,
+                expert_mask=layer.expert_mask,
                 activation=activation.value,
                 quant_type=self.quant_type.value,
                 w1_scale=layer.w13_weight_scale,
@@ -1877,7 +1877,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=expert_map,
+                expert_mask=layer.expert_mask,
                 activation=activation.value,
                 quant_type=self.quant_type.value,
                 w1_scale=layer.w13_weight_scale,
@@ -2680,6 +2680,36 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         expert_id: Optional[int] = None,
     ):
+        def _copy_padded_w13(dst: torch.Tensor, src: torch.Tensor) -> None:
+            # GPT-OSS gate_up checkpoints are stored as [gate | up] without
+            # padding, while the MXFP4 parameter pads each half independently:
+            # [gate, gate_pad, up, up_pad]. Copy the two logical halves
+            # separately so the up projection starts at the padded half boundary.
+            src_half = src.shape[1] // 2
+            dst_half = dst.shape[1] // 2
+            if src.dtype == dtypes.fp4x2 or dst.dtype == dtypes.fp4x2:
+                dst_b = dst.view(torch.uint8)
+                src_b = src.view(torch.uint8)
+                dim2 = src_b.shape[2]
+                dst_b[:, :src_half, :dim2].copy_(src_b[:, :src_half, :dim2])
+                dst_b[:, dst_half : dst_half + src_half, :dim2].copy_(
+                    src_b[:, src_half : 2 * src_half, :dim2]
+                )
+            else:
+                dim2 = src.shape[2]
+                dst[:, :src_half, :dim2].copy_(src[:, :src_half, :dim2])
+                dst[:, dst_half : dst_half + src_half, :dim2].copy_(
+                    src[:, src_half : 2 * src_half, :dim2]
+                )
+
+        def _copy_padded_w13_2d(dst: torch.Tensor, src: torch.Tensor) -> None:
+            src_half = src.shape[1] // 2
+            dst_half = dst.shape[1] // 2
+            dst[:, :src_half].copy_(src[:, :src_half])
+            dst[:, dst_half : dst_half + src_half].copy_(
+                src[:, src_half : 2 * src_half]
+            )
+
         target_param = param
         # single_expert means gate_up_proj.shape=[2880*2, 1440] from quark
         maybe_single_expert_input = loaded_weight.dim() == param.dim() - 1
@@ -2706,8 +2736,7 @@ class FusedMoE(torch.nn.Module):
                     narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
-            dim1 = narrow_weight.shape[1]
-            target_param[:, :dim1].copy_(narrow_weight)
+            _copy_padded_w13_2d(target_param, narrow_weight)
         elif param is getattr(self, "w2_bias", None):
             if self.use_ep:
                 if loaded_weight.shape[0] == target_param.shape[0]:
@@ -2731,10 +2760,7 @@ class FusedMoE(torch.nn.Module):
                 narrow_weight = loaded_weight[
                     :, 2 * tp_rank_start : 2 * tp_rank_end, ...
                 ]
-            dim1, dim2 = narrow_weight.shape[1:]
-            target_param.view(torch.uint8)[:, :dim1, :dim2].copy_(
-                narrow_weight.view(torch.uint8)
-            )
+            _copy_padded_w13(target_param, narrow_weight)
         elif param is getattr(self, "w2_weight", None):
             loaded_weight = loaded_weight.view(*loaded_weight.shape[:2], -1)
             if self.use_ep:
@@ -2760,8 +2786,7 @@ class FusedMoE(torch.nn.Module):
                 narrow_weight = loaded_weight[
                     :, 2 * tp_rank_start : 2 * tp_rank_end, ...
                 ]
-            dim1, dim2 = narrow_weight.shape[1:]
-            target_param[:, :dim1, :dim2].copy_(narrow_weight)
+            _copy_padded_w13(target_param, narrow_weight)
         elif param is getattr(self, "w2_weight_scale", None):
             if self.use_ep:
                 if loaded_weight.shape[0] == target_param.shape[0]:

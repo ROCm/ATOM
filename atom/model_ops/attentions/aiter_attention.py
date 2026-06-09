@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from typing import Type
 
 import aiter
@@ -8,12 +9,14 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+
+logger = logging.getLogger("atom")
 
 
 def cdiv(a, b):
@@ -36,6 +39,7 @@ class AiterBackend(AttentionBackend):
 
 class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
+    _gptoss_hybrid_layout_log_keys: set[str] = set()
 
     def __init__(
         self,
@@ -45,7 +49,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         device=None,
         model_runner=None,
     ):
-        self.block_size = 1024 if model_runner.block_size == 1024 else 16
+        if model_runner.block_size == 1024:
+            self.block_size = 1024
+        elif (
+            envs.ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM
+            and model_runner.block_size == 256
+        ):
+            self.block_size = 256
+        else:
+            self.block_size = 16
         super().__init__(model_runner)
         config = model_runner.config
         hf_config = config.hf_config
@@ -412,6 +424,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         config = runner.config
         hf_config = config.hf_config
+        impl = getattr(module, "impl", None)
 
         # attn_idx: hybrid models (Qwen3-Next) skip linear-attention layers
         # in the kv_cache slot ordering; non-hybrid models use layer_id 1:1.
@@ -468,19 +481,62 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
         else:
             x = 16 // runner.kv_cache.element_size()
-            k_cache = runner.kv_cache[0, attn_idx].view(
-                runner.num_physical_kvcache_blocks,
-                runner.num_kv_heads,
-                hf_config.head_dim // x,
-                runner.physical_block_size,
-                x,
+            use_gptoss_swa_flash_layout = (
+                envs.ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM
+                and impl is not None
+                and getattr(impl, "sliding_window", -1) > 0
             )
-            v_cache = runner.kv_cache[1, attn_idx].view(
-                runner.num_physical_kvcache_blocks,
-                runner.num_kv_heads,
-                hf_config.head_dim,
-                runner.physical_block_size,
-            )
+            if use_gptoss_swa_flash_layout:
+                k_cache = runner.kv_cache[0, attn_idx].view(
+                    runner.num_physical_kvcache_blocks,
+                    runner.physical_block_size,
+                    runner.num_kv_heads,
+                    hf_config.head_dim,
+                )
+                v_cache = runner.kv_cache[1, attn_idx].view(
+                    runner.num_physical_kvcache_blocks,
+                    runner.physical_block_size,
+                    runner.num_kv_heads,
+                    hf_config.head_dim,
+                )
+                impl.use_flash_layout = True
+                log_key = "swa-flash"
+                if log_key not in self._gptoss_hybrid_layout_log_keys:
+                    self._gptoss_hybrid_layout_log_keys.add(log_key)
+                    logger.info(
+                        "ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM: binding GPT-OSS "
+                        "sliding-window MHA layers with flash KV layout for "
+                        "Triton unified_attention"
+                    )
+            else:
+                k_cache = runner.kv_cache[0, attn_idx].view(
+                    runner.num_physical_kvcache_blocks,
+                    runner.num_kv_heads,
+                    hf_config.head_dim // x,
+                    runner.physical_block_size,
+                    x,
+                )
+                v_cache = runner.kv_cache[1, attn_idx].view(
+                    runner.num_physical_kvcache_blocks,
+                    runner.num_kv_heads,
+                    hf_config.head_dim,
+                    runner.physical_block_size,
+                )
+                if impl is not None:
+                    impl.use_flash_layout = False
+                if (
+                    envs.ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM
+                    and impl is not None
+                    and getattr(impl, "sliding_window", -1) == -1
+                ):
+                    log_key = "full-asm"
+                    if log_key not in self._gptoss_hybrid_layout_log_keys:
+                        self._gptoss_hybrid_layout_log_keys.add(log_key)
+                        logger.info(
+                            "ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM: binding GPT-OSS "
+                            "full-attention MHA layers with AITER shuffle KV "
+                            "layout for pa_decode_bf16_asm"
+                        )
             if config.kv_cache_dtype == "fp8":
                 module.k_scale = runner.kv_scale[0, attn_idx]
                 module.v_scale = runner.kv_scale[1, attn_idx]

@@ -405,6 +405,7 @@ class GptOssForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
     }
     weights_mapping = {
+        "model.embed_tokens.": "model.embedding.",
         # MoE MXFP4 weights
         "gate_up_proj_blocks": "w13_weight",
         "down_proj_blocks": "w2_weight",
