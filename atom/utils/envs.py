@@ -30,6 +30,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    # Route unquantized (bf16/fp16) Linear GEMMs (router, attn qkv/o_proj,
+    # lm_head, etc.) through aiter's Triton/gluon gemm_a16w16 instead of
+    # tuned_gemm (which defaults to torch/native on gfx1250). See
+    # atom/model_ops/linear.py.
+    "ATOM_USE_TRITON_GEMM_BF16": lambda: os.getenv("ATOM_USE_TRITON_GEMM_BF16", "0")
+    == "1",
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
