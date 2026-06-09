@@ -22,7 +22,6 @@ from atom.plugin.prepare import is_plugin_mode
 from atom.plugin.attention import AiterAttentionMetadataBuilderDecoratorForPluginMode
 from atom.plugin.attention import AiterBackendDecoratorForPluginMode
 
-
 logger = logging.getLogger("atom")
 
 
@@ -69,10 +68,7 @@ class AiterAttentionMetadataBuilder:
     ):
         if model_runner.block_size == 1024:
             self.block_size = 1024
-        elif (
-            envs.ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM
-            and model_runner.block_size == 256
-        ):
+        elif envs.ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM and model_runner.block_size == 256:
             self.block_size = 256
         else:
             self.block_size = 16
@@ -850,25 +846,67 @@ class AiterAttentionMetadataBuilder:
         )
         return attn
 
+    def _prepare_gptoss_pa_decode_bf16_asm_capture_metadata(self, bs: int) -> int:
+        """Build safe one-page decode metadata for CUDAGraph capture.
+
+        The model runner zeros kv_indptr before capture.  That is fine for kernels
+        that ignore persistent PA metadata during dummy capture, but the gfx1250
+        GPT-OSS asm path consumes context_lens/kv_indptr/kv_indices immediately.
+        Keep those buffers mutually consistent so the asm kernel never sees a
+        nonzero context length with an empty page table.
+        """
+        var = self.model_runner.forward_vars
+        max_q_len = int(var["max_qlen"])
+        capture_context_len = max(1, max_q_len)
+        num_tokens = bs * max_q_len
+
+        num_blocks = max(
+            1, int(getattr(self.model_runner, "num_physical_kvcache_blocks", 1))
+        )
+        block_ids = (np.arange(bs, dtype=np.int32) % num_blocks).astype(np.int32)
+
+        var["context_lens"].np[:bs] = capture_context_len
+        var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
+        var["block_tables"].np[:bs] = 0
+        var["block_tables"].np[:bs, 0] = block_ids
+        var["kv_indices"].np[:bs] = block_ids
+
+        token_block_ids = np.repeat(block_ids.astype(np.int64), max_q_len)
+        token_offsets = np.tile(np.arange(max_q_len, dtype=np.int64), bs)
+        var["slot_mapping"].np[:num_tokens] = (
+            token_block_ids * self.model_runner.block_size + token_offsets
+        )
+
+        var["context_lens"].copy_to_gpu(bs)
+        var["kv_indptr"].copy_to_gpu(bs + 1)
+        var["block_tables"].copy_to_gpu(bs)
+        var["kv_indices"].copy_to_gpu(bs)
+        var["slot_mapping"].copy_to_gpu(num_tokens)
+        return capture_context_len
+
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
+        max_seqlen_k = self.model_runner.config.max_model_len
+        if envs.ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM and self.block_size == 256:
+            max_seqlen_k = self._prepare_gptoss_pa_decode_bf16_asm_capture_metadata(bs)
+
         if self.block_size == 1024:
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            slot_mapping=var["slot_mapping"].gpu[: bs * int(var["max_qlen"])],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=var["max_qlen"],
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu,
-            max_seqlen_k=self.model_runner.config.max_model_len,
+            max_seqlen_k=max_seqlen_k,
             **ctx_pa_ps,
         )
 
-        positions = var["positions"].copy_to_gpu(bs)
+        positions = var["positions"].copy_to_gpu(bs * int(var["max_qlen"]))
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )
