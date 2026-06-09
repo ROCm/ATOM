@@ -93,16 +93,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
-    # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
+    # of pa_decode_gluon. On gfx1250, this also routes eligible non-SWA decode
+    # layers through pa_decode_bf16_asm unless ATOM_FORCE_ATTN_TRITON=1.
     "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
-    # Force the Triton path for V4 sparse-paged-prefill attention; default backend
-    # is aiter's OPUS kernel (gfx950 fast path). Set to 1 to fall back to Triton
+    # Force Triton attention when ATOM has a non-Triton default. This disables
+    # gfx1250 PA decode BF16 ASM and V4 OPUS sparse-paged-prefill.
+    # Set to 1 to fall back to Triton
     # (e.g. for debugging or on non-gfx950 builds).
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
     ),
+    # gfx1250 (or other arches where aiter C++ modules are not built):
+    # route mhc / moe_topk / dsv4_rotate_quant / rope_1c_cached_positions_fwd /
+    # top_k_per_row through torch fallbacks. Smoke-only on gfx950; correctness
+    # only, no perf guarantee.
+    "ATOM_GFX1250_FALLBACK": lambda: (os.getenv("ATOM_GFX1250_FALLBACK", "0") == "1"),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"

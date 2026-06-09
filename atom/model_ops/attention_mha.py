@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from functools import cache
 from typing import Optional
 
 import aiter
 import torch
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
@@ -28,10 +30,21 @@ from atom.model_ops.base_attention import (
 logger = logging.getLogger("atom")
 
 
+@cache
+def use_pa_decode_bf16_asm() -> bool:
+    return (
+        envs.ATOM_USE_UNIFIED_ATTN
+        and not envs.ATOM_FORCE_ATTN_TRITON
+        and get_gfx() == "gfx1250"
+    )
+
+
 class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
     """
+
+    _pa_decode_bf16_asm_log_keys: set[str] = set()
 
     def __init__(
         self,
@@ -73,6 +86,7 @@ class PagedAttentionImpl(nn.Module):
             else 1.0
         )
         self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self._pa_decode_bf16_asm_scale_tensors = None
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
@@ -114,7 +128,6 @@ class PagedAttentionImpl(nn.Module):
         )
 
         attn_impl = self.dispatch_backend(fwd_ctx)
-
         o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
 
         o = o.view(-1, self.num_heads * self.head_dim)
@@ -395,6 +408,224 @@ class PagedAttentionImpl(nn.Module):
 
         return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale
 
+    def _log_pa_decode_bf16_asm_once(self, key: str, msg: str, *args):
+        if key in PagedAttentionImpl._pa_decode_bf16_asm_log_keys:
+            return
+        PagedAttentionImpl._pa_decode_bf16_asm_log_keys.add(key)
+        logger.info(msg, *args)
+
+    def _skip_pa_decode_bf16_asm(self, reason: str) -> bool:
+        if use_pa_decode_bf16_asm():
+            self._log_pa_decode_bf16_asm_once(
+                f"skip:{reason}",
+                "PA decode BF16 ASM fallback: %s",
+                reason,
+            )
+        return False
+
+    def _should_dispatch_pa_decode_bf16_asm(self, fwd_ctx: ForwardContext) -> bool:
+        if not use_pa_decode_bf16_asm():
+            return False
+
+        if fwd_ctx.context.is_prefill:
+            return self._skip_pa_decode_bf16_asm("prefill")
+        if self.use_flash_layout:
+            return self._skip_pa_decode_bf16_asm("flash-layout cache")
+        if self.sliding_window != -1:
+            return self._skip_pa_decode_bf16_asm("sliding-window layer")
+        return True
+
+    def _raise_pa_decode_bf16_asm_requirement(self, reason: str):
+        raise RuntimeError(
+            "pa_decode_bf16_asm requirement failed: "
+            f"{reason}. Set ATOM_FORCE_ATTN_TRITON=1 to run the Triton path instead."
+        )
+
+    def _validate_pa_decode_bf16_asm_inputs(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        fwd_ctx: ForwardContext,
+    ) -> None:
+        attn_metadata = fwd_ctx.attn_metadata
+        if self.kv_cache_dtype != "fp8":
+            self._raise_pa_decode_bf16_asm_requirement("requires fp8 kv cache")
+        if self.head_dim != 64:
+            self._raise_pa_decode_bf16_asm_requirement("requires head_dim=64")
+        if self.num_heads % self.num_kv_heads != 0:
+            self._raise_pa_decode_bf16_asm_requirement(
+                "q heads not divisible by kv heads"
+            )
+
+        gqa = self.num_heads // self.num_kv_heads
+        if gqa != 8:
+            self._raise_pa_decode_bf16_asm_requirement("requires gqa=8")
+
+        max_seqlen_q = int(attn_metadata.max_seqlen_q)
+        if max_seqlen_q < 1 or max_seqlen_q > 4:
+            self._raise_pa_decode_bf16_asm_requirement(
+                f"requires 1 <= max_seqlen_q <= 4, got {max_seqlen_q}"
+            )
+
+        required_metadata = (
+            "cu_seqlens_q",
+            "kv_indptr",
+            "kv_indices",
+            "context_lens",
+        )
+        for name in required_metadata:
+            if getattr(attn_metadata, name, None) is None:
+                self._raise_pa_decode_bf16_asm_requirement(f"missing {name}")
+
+        num_seqs = int(attn_metadata.context_lens.shape[0])
+        if q.shape[0] != num_seqs * max_seqlen_q:
+            self._raise_pa_decode_bf16_asm_requirement(
+                f"q tokens {q.shape[0]} != batch*max_q {num_seqs * max_seqlen_q}"
+            )
+        if k_cache.dim() != 5:
+            self._raise_pa_decode_bf16_asm_requirement("requires 5D K cache")
+        if k_cache.dtype != aiter.dtypes.fp8 or v_cache.dtype != aiter.dtypes.fp8:
+            self._raise_pa_decode_bf16_asm_requirement("requires fp8 K/V tensors")
+
+        page_size = int(k_cache.shape[3])
+        if page_size != 256:
+            self._raise_pa_decode_bf16_asm_requirement(
+                f"requires page_size=256, got {page_size}"
+            )
+        if v_cache.dim() == 4:
+            if int(v_cache.shape[-1]) != page_size:
+                self._raise_pa_decode_bf16_asm_requirement("V cache block mismatch")
+        elif v_cache.dim() == 5:
+            if int(v_cache.shape[2] * v_cache.shape[4]) != page_size:
+                self._raise_pa_decode_bf16_asm_requirement("V shuffle block mismatch")
+        else:
+            self._raise_pa_decode_bf16_asm_requirement("requires 4D/5D V cache")
+
+        self._log_pa_decode_bf16_asm_once(
+            "enabled",
+            "ATOM_USE_UNIFIED_ATTN on gfx1250: routing matching decode "
+            "layers through aiter.pa_decode_bf16_asm",
+        )
+
+    def _view_v_cache_for_pa_decode_bf16_asm(
+        self, v_cache: torch.Tensor, k_cache: torch.Tensor
+    ) -> torch.Tensor:
+        if v_cache.dim() == 5:
+            return v_cache
+        n, nh, head_dim, block_size = v_cache.shape
+        x = int(k_cache.shape[-1])
+        return v_cache.view(n, nh, block_size // x, head_dim, x)
+
+    def _quantize_pa_decode_bf16_asm_query(
+        self, q: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        fp8_dtype = aiter.dtypes.fp8
+        fp8_max = torch.finfo(fp8_dtype).max
+        q_amax = q.abs().max().clamp(min=1e-10)
+        q_scale = (q_amax / fp8_max).float().reshape(1)
+        q_fp8 = (q / q_scale).clamp(min=-fp8_max, max=fp8_max).to(fp8_dtype)
+        return q_fp8.contiguous(), q_scale
+
+    def _get_pa_decode_bf16_asm_scale_tensors(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cached = self._pa_decode_bf16_asm_scale_tensors
+        if cached is not None and cached[0].device == device:
+            return cached
+        key_scale = torch.full(
+            (1,), self.kv_scale_float * self.scale, dtype=torch.float32, device=device
+        )
+        value_scale = torch.full(
+            (1,), self.kv_scale_float, dtype=torch.float32, device=device
+        )
+        cached = (key_scale, value_scale)
+        self._pa_decode_bf16_asm_scale_tensors = cached
+        return cached
+
+    def _get_pa_decode_bf16_asm_metadata(
+        self,
+        attn_metadata,
+        batch_size: int,
+        max_seqlen_q: int,
+        page_size: int,
+    ) -> dict[str, torch.Tensor]:
+        gqa = self.num_heads // self.num_kv_heads
+        cache_key = (
+            batch_size,
+            max_seqlen_q,
+            self.num_kv_heads,
+            gqa,
+            page_size,
+            attn_metadata.cu_seqlens_q.data_ptr(),
+            attn_metadata.kv_indptr.data_ptr(),
+            attn_metadata.context_lens.data_ptr(),
+        )
+        cached = getattr(attn_metadata, "_pa_decode_bf16_asm_metadata", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
+        device = attn_metadata.context_lens.device
+
+        def _empty(spec):
+            shape, dtype = spec
+            return torch.empty(shape, dtype=dtype, device=device)
+
+        (
+            work_meta_data_spec,
+            work_indptr_spec,
+            work_info_spec,
+            reduce_indptr_spec,
+            reduce_final_map_spec,
+            reduce_partial_map_spec,
+        ) = aiter.get_ps_metadata_info_v1(
+            batch_size,
+            self.num_kv_heads,
+            max_seqlen_q,
+            qlen_granularity=max_seqlen_q,
+        )
+
+        work_meta_data = _empty(work_meta_data_spec)
+        work_indptr = _empty(work_indptr_spec)
+        work_info = _empty(work_info_spec)
+        reduce_indptr = _empty(reduce_indptr_spec)
+        reduce_final_map = _empty(reduce_final_map_spec)
+        reduce_partial_map = _empty(reduce_partial_map_spec)
+
+        aiter.get_ps_metadata_v1(
+            attn_metadata.cu_seqlens_q,
+            attn_metadata.kv_indptr,
+            attn_metadata.context_lens,
+            gqa,
+            self.num_kv_heads,
+            work_meta_data,
+            work_indptr,
+            work_info,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            qhead_granularity=gqa,
+            qlen_granularity=max_seqlen_q,
+            kvlen_granularity=page_size,
+            block_size=page_size,
+            is_causal=False,
+        )
+
+        metadata = {
+            "work_meta_data": work_meta_data,
+            "work_indptr": work_indptr,
+            "work_info": work_info,
+            "reduce_indptr": reduce_indptr,
+            "reduce_final_map": reduce_final_map,
+            "reduce_partial_map": reduce_partial_map,
+        }
+        setattr(
+            attn_metadata,
+            "_pa_decode_bf16_asm_metadata",
+            (cache_key, metadata),
+        )
+        return metadata
+
     @mark_trace(prefix="paged_attention_triton", torch_compile=False)
     def paged_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -504,6 +735,91 @@ class PagedAttentionImpl(nn.Module):
             )
 
         return o
+
+    @mark_trace(prefix="paged_attention_pa_decode_bf16_asm", torch_compile=False)
+    def paged_attention_pa_decode_bf16_asm(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        del k, v, k_scale, v_scale
+
+        self._validate_pa_decode_bf16_asm_inputs(q, k_cache, v_cache, fwd_ctx)
+
+        attn_metadata = fwd_ctx.attn_metadata
+        batch_size = int(attn_metadata.context_lens.shape[0])
+        max_seqlen_q = int(attn_metadata.max_seqlen_q)
+        page_size = int(k_cache.shape[3])
+        gqa = self.num_heads // self.num_kv_heads
+
+        q_5d = q.view(batch_size, max_seqlen_q, self.num_kv_heads, gqa, self.head_dim)
+        q_fp8, query_scale = self._quantize_pa_decode_bf16_asm_query(q_5d)
+        key_scale, value_scale = self._get_pa_decode_bf16_asm_scale_tensors(q.device)
+        v_cache_5d = self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
+
+        ps_metadata = self._get_pa_decode_bf16_asm_metadata(
+            attn_metadata,
+            batch_size,
+            max_seqlen_q,
+            page_size,
+        )
+
+        output = torch.empty_like(q_5d)
+        split_rows = max(
+            1,
+            int(ps_metadata["reduce_partial_map"].numel()) * max_seqlen_q,
+        )
+        split_o = torch.empty(
+            (split_rows, 1, self.num_heads, self.head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        split_lse = torch.empty(
+            (split_rows, 1, self.num_heads, 1),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        split_o.zero_()
+        split_lse.fill_(float("-inf"))
+
+        aiter.pa_decode_bf16_asm(
+            Q=q_fp8,
+            K=k_cache,
+            V=v_cache_5d,
+            kv_indices=attn_metadata.kv_indices,
+            context_lens=attn_metadata.context_lens,
+            softmax_scale=1.0,
+            kv_indptr=attn_metadata.kv_indptr,
+            gqa=gqa,
+            mtp=max_seqlen_q - 1,
+            query_scale=query_scale,
+            key_scale=key_scale,
+            value_scale=value_scale,
+            qo_indptr=attn_metadata.cu_seqlens_q,
+            work_indptr=ps_metadata["work_indptr"],
+            work_info=ps_metadata["work_info"],
+            split_o=split_o,
+            split_lse=split_lse,
+            sink=self.sinks,
+            out=output,
+        )
+
+        if int(attn_metadata.max_seqlen_k) > page_size:
+            final_lse = torch.empty(
+                (batch_size * max_seqlen_q, self.num_heads),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            aiter.pa_reduce_v1(
+                split_o,
+                split_lse,
+                ps_metadata["reduce_indptr"],
+                ps_metadata["reduce_final_map"],
+                ps_metadata["reduce_partial_map"],
+                max_seqlen_q,
+                output.view(batch_size * max_seqlen_q, self.num_heads, self.head_dim),
+                final_lse,
+            )
+
+        return output.view(batch_size * max_seqlen_q, self.num_heads, self.head_dim)
 
     @mark_trace(prefix="paged_attention_asm", torch_compile=False)
     def paged_attention_asm(
@@ -670,6 +986,8 @@ class PagedAttentionImpl(nn.Module):
                 return self.prefill_attention_triton
             return self.prefill_attention
         else:
+            if self._should_dispatch_pa_decode_bf16_asm(fwd_ctx):
+                return self.paged_attention_pa_decode_bf16_asm
             if use_unified_attn or self.use_triton_attn or self.use_flash_layout:
                 return self.paged_attention_triton
             else:
