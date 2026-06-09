@@ -839,10 +839,10 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
+        self.dtype_kv = get_aiter_kv_cache_dtype(config)
         # MLA decode path in ATOM-vLLM quantizes Q to FP8 when the KV cache is FP8,
         # so aiter metadata must be sized/generated with the same dtype.
         self.dtype_q = dtypes.fp8 if self.dtype_kv == dtypes.fp8 else torch.bfloat16
-        self.dtype_kv = get_aiter_kv_cache_dtype(config)
 
         self.paged_kv_last_page_len = torch.ones(
             max_num_reqs, dtype=torch.int32, device=device
