@@ -37,10 +37,7 @@ def _masked_embedding_kernel(
 
     token_id = tl.load(x_ptr + pid_row)
     in_range = (token_id >= vocab_start_idx) & (token_id < vocab_end_idx)
-    # int64 row offsets: with large token counts (e.g. profiling/prefill at a
-    # big max_model_len) `row * stride` exceeds INT32_MAX and would wrap to a
-    # negative offset, causing an out-of-bounds (illegal memory) access.
-    local_idx = (token_id - vocab_start_idx).to(tl.int64)
+    local_idx = token_id - vocab_start_idx
 
     col_start = pid_col * BLOCK_D
     cols = col_start + tl.arange(0, BLOCK_D)
@@ -52,7 +49,7 @@ def _masked_embedding_kernel(
         other=0.0,
     )
 
-    tl.store(out_ptr + pid_row.to(tl.int64) * stride_out_row + cols, emb, mask=col_mask)
+    tl.store(out_ptr + pid_row * stride_out_row + cols, emb, mask=col_mask)
 
 
 def _masked_embedding_launcher(
