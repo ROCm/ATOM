@@ -46,6 +46,23 @@ def local_tbo_precompute(
         return False, 0, 0
     if is_prefill:
         n_pref = batch.total_seqs_num_prefill
+        # token-midpoint split: cut at exact total//2 even
+        # inside a request, so bs==1 can still split. MUST mirror
+        # `_split_prefill_token_midpoint` in ubatch_splitting.py exactly, or
+        # the cross-DP MAX-reduced ub0/ub1 will disagree with the realised
+        # slices → all_gather size mismatch → RCCL hang.
+        from atom.utils import envs
+
+        if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
+            if n_pref < 1:
+                return False, 0, 0
+            toks = np.asarray(num_scheduled_tokens[:n_pref], dtype=np.int64)
+            total = int(toks.sum())
+            if total < 2:
+                return False, 0, 0
+            ub0 = total // 2
+            ub1 = total - ub0
+            return True, ub0, ub1
         if n_pref < 2:
             return False, 0, 0
         # Mirror _split_prefill_balanced: pick boundary closest to total/2

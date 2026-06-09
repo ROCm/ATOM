@@ -216,6 +216,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
     ),
+    # --- TBO prefill ubatch splitting ---
+    # When "1", split prefill ubatches at the exact token midpoint 
+    "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
+        os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "0") == "1"
+    ),
 }
 
 
