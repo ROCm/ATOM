@@ -26,11 +26,10 @@ vllm serve "${MODEL}" \
     --host localhost \
     --port 8001 \
     --dtype auto \
-    --kv-cache-dtype fp8 \
     --tensor-parallel-size "${TP}" \
     --distributed-executor-backend mp \
     --trust-remote-code \
-    --gpu-memory-utilization 0.9 \
+    --gpu-memory-utilization 0.8 \
     --tokenizer-mode deepseek_v4 \
     --async-scheduling \
     --no-enable-prefix-caching \
