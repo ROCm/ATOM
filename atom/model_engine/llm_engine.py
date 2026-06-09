@@ -4,8 +4,9 @@
 import itertools
 import logging
 import time
+from collections import Counter
 from dataclasses import fields
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
@@ -38,6 +39,7 @@ class LLMEngine:
         data_parallel_size = kwargs.get("data_parallel_size", 1)
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
+        self.config = config
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
         )
@@ -205,14 +207,62 @@ class LLMEngine:
         return outputs
 
     def start_profile(self):
-        self.core_mgr.send_utility_command("start_profile")
+        self.core_mgr.broadcast_utility_command_sync("start_profile")
         logger.info("Profiling started")
 
-    def stop_profile(self):
-        self.core_mgr.send_utility_command("stop_profile")
+    def stop_profile(self) -> List[Dict[str, Any]]:
+        responses = self.core_mgr.broadcast_utility_command_sync("stop_profile")
+        return [resp.get("result", {}) for resp in responses]
 
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")
+
+    def get_mtp_statistics(self, timeout: float = 30.0) -> Dict[str, Any]:
+        """Return aggregated speculative decoding statistics across DP ranks."""
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_mtp_statistics", timeout=timeout
+        )
+        rank_stats = [
+            resp.get("result", resp)
+            for resp in responses
+            if resp.get("result", resp).get("enabled", False)
+        ]
+
+        distribution: Counter[int] = Counter()
+        for stats in rank_stats:
+            distribution.update(
+                {
+                    int(accepted): int(steps)
+                    for accepted, steps in stats.get("distribution", {}).items()
+                }
+            )
+
+        total_draft_tokens = sum(
+            int(stats.get("total_draft_tokens", 0)) for stats in rank_stats
+        )
+        total_accepted_tokens = sum(
+            int(stats.get("total_accepted_tokens", 0)) for stats in rank_stats
+        )
+        total_steps = sum(distribution.values())
+
+        return {
+            "enabled": bool(rank_stats),
+            "total_draft_tokens": total_draft_tokens,
+            "total_accepted_tokens": total_accepted_tokens,
+            "acceptance_rate": (
+                total_accepted_tokens / total_draft_tokens
+                if total_draft_tokens
+                else 0.0
+            ),
+            "average_tokens_per_forward": (
+                1 + total_accepted_tokens / total_steps if total_steps else 0.0
+            ),
+            "distribution": dict(sorted(distribution.items())),
+            "distribution_percent": {
+                k: v / total_steps if total_steps else 0.0
+                for k, v in sorted(distribution.items())
+            },
+        }
 
 
 class InputOutputProcessor:

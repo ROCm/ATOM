@@ -201,10 +201,16 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
+        self.is_rocm_aiter_fusion_shared_expert_enabled = (
+            is_rocm_aiter_fusion_shared_expert_enabled(
+                shared_expert_prefix=f"{prefix}.shared_expert",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
+        )
 
         if (
             config.shared_expert_intermediate_size > 0
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             # When shared expert fusion is disabled (e.g. MXFP4 where shared
             # experts are BF16 while routed experts are FP4), run the shared
@@ -234,10 +240,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
             has_bias=False,
             shared_expert_scoring_func=(
-                "sigmoid" if self.shared_expert is None else None
+                "sigmoid" if self.is_rocm_aiter_fusion_shared_expert_enabled else None
             ),
             prefix=f"{prefix}.experts",
             config=config,
+            shared_expert_prefix=f"{prefix}.shared_expert",
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -248,14 +255,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts + 1)
         logits = self.gate(hidden_states)
-        if not is_rocm_aiter_fusion_shared_expert_enabled():
+        if not self.is_rocm_aiter_fusion_shared_expert_enabled:
             router_logits = logits[:, : self.n_routed_experts]
         else:
             router_logits = logits
         routed_output = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        if not is_rocm_aiter_fusion_shared_expert_enabled():
+        if not self.is_rocm_aiter_fusion_shared_expert_enabled:
             shared_output = self.shared_expert(hidden_states)
             # Apply shared expert gate: the merged gate output contains
             # [routed_logits, shared_expert_gate_logits], extract the tail
@@ -962,12 +969,7 @@ class Qwen3NextModel(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
-                else 0
-            ),
+            num_experts=self.config.n_routed_experts + self.config.n_shared_experts,
         )
 
 

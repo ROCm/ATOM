@@ -123,6 +123,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
     ),
+    # --- Atomesh ---
+    # Build atomesh when installing ATOM from source.
+    "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",
+    # Route the OpenAI-compatible server entrypoint through Atomesh.
+    "USE_ATOMESH_ENTRYPOINTS": lambda: (
+        os.getenv("USE_ATOMESH_ENTRYPOINTS", "0") == "1"
+    ),
     # --- Gradient Control ---
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
     # is correct for inference; set to "1" only for training / fine-tuning.

@@ -249,15 +249,45 @@ class Eagle3LlamaModel(nn.Module):
         cache_config = atom_config.kv_cache_dtype
         self.config = config
 
+        # EAGLE 3.1 toggles (backward-compatible defaults match EAGLE 3).
+        # target_hidden_size: aux chunk width. Defaults to hidden_size
+        # (i.e. target hidden == drafter hidden, as in K2.5).
+        # num_aux_hidden_states: how many target layers feed the FC.
+        # Prefer explicit, else infer from eagle_config layer ids, else 3.
+        target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
+        num_aux = getattr(config, "num_aux_hidden_states", None)
+        if num_aux is None:
+            eagle_cfg = getattr(config, "eagle_config", None)
+            if eagle_cfg:
+                aux_ids = eagle_cfg.get("eagle_aux_hidden_state_layer_ids", [])
+                num_aux = len(aux_ids) if aux_ids else 3
+            else:
+                num_aux = 3
+        self.target_hidden_size = target_hidden_size
+        self.num_aux_hidden_states = num_aux
+        self.norm_output = getattr(config, "norm_output", False)
+
         # Independent embedding (vocab matches target model)
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
 
-        # Aux fusion: concatenated aux hidden states [N, hidden*3] -> [N, hidden]
+        # Aux fusion: [N, target_hidden_size * num_aux] -> [N, hidden_size]
         self.fc = ReplicatedLinear(
-            config.hidden_size * 3, config.hidden_size, bias=False
+            target_hidden_size * num_aux, config.hidden_size, bias=False
         )
+
+        # EAGLE 3.1: optional per-chunk RMSNorm applied to each aux chunk
+        # before fc. When absent, identity (matches EAGLE 3 / K2.5 path).
+        if getattr(config, "fc_norm", False):
+            self.fc_norm = nn.ModuleList(
+                [
+                    RMSNorm(target_hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(num_aux)
+                ]
+            )
+        else:
+            self.fc_norm = None
 
         # Draft attention layer_num must start from the target model's layer
         # count so kv_cache_data["layer_N"] maps to the correct cache entry.
@@ -278,11 +308,17 @@ class Eagle3LlamaModel(nn.Module):
         """Project concatenated aux hidden states through fc.
 
         Args:
-            hidden_states: [N, hidden_size * 3] (3 aux layers concatenated)
+            hidden_states: [N, target_hidden_size * num_aux_hidden_states]
 
         Returns:
             [N, hidden_size] projected hidden states
         """
+        if self.fc_norm is not None:
+            chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
+            hidden_states = torch.cat(
+                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                dim=-1,
+            )
         return self.fc(hidden_states)
 
     def forward(
@@ -291,10 +327,19 @@ class Eagle3LlamaModel(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        """Return the single hidden state carried to the next speculative step.
+
+        EAGLE 3.1 (norm_output=True): post-norm hidden state.
+        EAGLE 3   (default):          pre-norm hidden state (legacy behavior).
+        compute_logits() is norm-aware, so EagleProposer only sees one tensor.
+        """
         embeds = self.embed_tokens(input_ids)
         hidden_states = self.midlayer(positions, embeds, hidden_states)
-        return hidden_states
+        return self.norm(hidden_states) if self.norm_output else hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.norm(hidden_states)
+        # Only norm the legacy pre-norm path; norm_output already normed in
+        # forward(). Avoids double-norm and stays byte-equivalent to EAGLE 3.
+        if not self.norm_output:
+            hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)

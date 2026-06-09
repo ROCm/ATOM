@@ -20,7 +20,7 @@ from atom.config import (
     get_current_atom_config,
 )
 from aiter.ops.flydsl.moe_common import GateMode
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
@@ -38,7 +38,7 @@ from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinaliz
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
     is_rocm_aiter_fuse_routed_scaling_factor,
-    is_rocm_aiter_fusion_shared_expert_enabled,
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
@@ -640,6 +640,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 quant_type=QuantType.No,
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
+                expert_mask=layer.expert_mask,
             )
         return fused_moe(
             hidden_states=x,
@@ -647,7 +648,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             w2=layer.w2_weight,
             topk_weight=topk_weights,
             topk_ids=topk_ids,
-            expert_mask=expert_map,
+            expert_mask=layer.expert_mask,
             activation=activation,
         )
 
@@ -1159,6 +1160,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
+        moe_extra_args = {
+            "gate_mode": (
+                GateMode.INTERLEAVE.value
+                if self.is_guinterleave
+                else GateMode.SEPARATED.value
+            ),
+            "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
+        }
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -1178,12 +1187,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_pad=self.intermediate_pad,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
-                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
-                gate_mode=(
-                    GateMode.INTERLEAVE.value
-                    if self.is_guinterleave
-                    else GateMode.SEPARATED.value
-                ),
+                **moe_extra_args,
             )
         return self.fused_experts(
             hidden_states=x,
@@ -1197,6 +1201,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=apply_router_weight_on_input,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
+            expert_mask=layer.expert_mask,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=a1_scale,
@@ -1205,6 +1210,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             bias2=layer.w2_bias,
             hidden_pad=self.hidden_pad,
             intermediate_pad=self.intermediate_pad,
+            moe_extra_args=moe_extra_args,
         )
 
 
@@ -1569,6 +1575,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 quant_type=self.quant_type,
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
+                expert_mask=layer.expert_mask,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=a1_scale,
@@ -1576,20 +1583,13 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
         else:
-            # aiter expects a BINARY 0/1 expert_mask (1 = local expert), NOT the index
-            # map; pass binary like the Fp8MoEMethod path above. (Defensive: not hit by
-            # Step-3.5 but same index-map-into-mask bug pattern.)
             return torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=(
-                    (expert_map > -1).to(torch.int32)
-                    if expert_map is not None
-                    else None
-                ),
+                expert_mask=layer.expert_mask,
                 activation=activation.value,
                 quant_type=self.quant_type.value,
                 w1_scale=layer.w13_weight_scale,
@@ -1969,21 +1969,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # per_Tensor doesn't support num_local_tokens, so fallback to
         # rocm_aiter_fused_moe when using per-tensor or no modular kernel.
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
-            # aiter expects a BINARY 0/1 expert_mask (1 = local expert), NOT the index
-            # map. merged ATOM forwards the index-map expert_map (-1 / 0..N-1) here, which
-            # aiter mis-reads -> ck_moe_stage1 OOB (HIP illegal memory access). Convert to
-            # binary (matches the pre-merge mask that ran clean on this same aiter).
             return torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=(
-                    (expert_map > -1).to(torch.int32)
-                    if expert_map is not None
-                    else None
-                ),
+                expert_mask=layer.expert_mask,
                 activation=activation.value,
                 quant_type=self.quant_type.value,
                 w1_scale=layer.w13_weight_scale,
@@ -2003,6 +1995,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_type=self.quant_type,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
+            expert_mask=layer.expert_mask,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
@@ -2131,6 +2124,7 @@ class FusedMoE(torch.nn.Module):
         activation: ActivationType = ActivationType.Silu,
         shared_expert_scoring_func: Optional[str] = None,
         config: Optional[PretrainedConfig] = None,
+        shared_expert_prefix: Optional[str] = None,
     ):
         super().__init__()
         self.prefix = prefix
@@ -2171,7 +2165,16 @@ class FusedMoE(torch.nn.Module):
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
-        fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+        if shared_expert_prefix is None and prefix.endswith(".experts"):
+            shared_expert_prefix = prefix[: -len(".experts")] + ".shared_experts"
+
+        fuse_shared_experts = (
+            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                quant_config,
+                shared_expert_prefix=shared_expert_prefix,
+                routed_expert_prefix=prefix,
+            )
+        )
         self.num_fused_shared_experts = (
             config.n_shared_experts
             if config is not None
@@ -2322,9 +2325,13 @@ class FusedMoE(torch.nn.Module):
         )
         online_quant_type = online_quant_config.quant_type
         online_quant_dtype = online_quant_config.quant_dtype
-        quant_func = get_hip_quant(online_quant_type)
-
         source_quant_type = self.layer_quant_config.quant_type
+        if should_skip_online_quant(
+            source_quant_type, self.params_dtype, online_quant_config
+        ):
+            return
+
+        quant_func = get_hip_quant(online_quant_type)
         assert source_quant_type in (QuantType.No, QuantType.per_1x128), (
             f"Unsupported source quant_type for MoE online quantization: "
             f"{source_quant_type} (layer={self.layer_name})"
@@ -3135,10 +3142,7 @@ class FusedMoE(torch.nn.Module):
                 # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
                 # weights gathered from the unbiased sqrt(softplus(.)) values.
                 tokens_num = router_logits.shape[0]
-                fuse_shared = (
-                    is_rocm_aiter_fusion_shared_expert_enabled()
-                    and num_fused_shared_experts > 0
-                )
+                fuse_shared = num_fused_shared_experts > 0
                 if fuse_shared:
                     import atom.model_ops.topK as _topK_mod
 

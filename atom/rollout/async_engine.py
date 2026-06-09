@@ -94,6 +94,66 @@ class AsyncLLMEngine(LLMEngine):
         else:
             load_weights_via_shm(self.core_mgr, weights, bucket_size_mb)
 
+    def configure_hidden_states(self, aux_layer_ids, mooncake_config):
+        """Configure hidden states extraction on all model runners.
+
+        Args:
+            aux_layer_ids: Layer indices to capture (e.g. ``[1, 15, 28]``).
+            mooncake_config: Dict passed to ``EagleMooncakeStore.__init__``.
+        """
+        self.core_mgr.broadcast_utility_command_sync(
+            "configure_hidden_states",
+            aux_layer_ids=aux_layer_ids,
+            mooncake_config=mooncake_config,
+        )
+        logger.info(
+            f"AsyncLLMEngine: hidden states extraction configured, "
+            f"aux_layers={aux_layer_ids}"
+        )
+
+    def generate_hidden_states(self, input_ids_list, data_ids):
+        """Run prefill-only forward and extract hidden states to Mooncake.
+
+        Each request's hidden states are written to Mooncake by the
+        ``RLHFModelRunner`` during forward. This method drives the
+        engine loop until all requests complete, then returns metadata.
+
+        Args:
+            input_ids_list: List of token id lists.
+            data_ids: List of data IDs used as Mooncake keys.
+
+        Returns:
+            List of dicts with metadata for each completed request.
+        """
+        from atom.sampling_params import SamplingParams
+
+        sampling_params = SamplingParams(max_tokens=1, temperature=0.0)
+
+        prompts = [
+            ids if isinstance(ids, list) else ids.tolist() for ids in input_ids_list
+        ]
+
+        self.core_mgr._rr_counter = 0
+        self.add_request(prompts, sampling_params, request_ids=data_ids)
+
+        outputs = {}
+        while not self.is_finished() and (
+            self.core_mgr.is_alive() or self.core_mgr.is_rest()
+        ):
+            seqs = self.step()
+            outs = self.io_processor.postprocess(seqs)
+            outputs.update(outs)
+
+        results = []
+        for data_id in data_ids:
+            results.append(
+                {
+                    "mooncake_key": data_id,
+                    "data_id": data_id,
+                }
+            )
+        return results
+
     def shutdown(self):
         """Shutdown engine and release all resources."""
         self.core_mgr.close()

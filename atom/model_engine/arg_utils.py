@@ -57,6 +57,7 @@ class EngineArgs:
     draft_model: Optional[str] = None
     mark_trace: bool = False
     online_quant_config: Optional[dict] = None
+    hf_overrides: Optional[dict] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -259,6 +260,16 @@ class EngineArgs:
                 """  '{"global_quant_config": "ptpc_fp8", """
                 """"layer_quant_config": {"*expert*": "mxfp4"}, """
                 """"exclude_layer": "lm_head"}'"""
+            ),
+        )
+        parser.add_argument(
+            "--hf-overrides",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON object of HF config attributes to override after loading "
+                "the model config. Example: "
+                '\'{"use_index_cache": true, "index_topk_freq": 4}\''
             ),
         )
 
