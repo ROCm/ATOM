@@ -168,34 +168,6 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
     return rmsnorm2d_fwd_(x, ones, eps, dim)
 
 
-def _hc_head_reduce_fake(
-    x: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_eps: float,
-    hc_eps: float,
-) -> torch.Tensor:
-    return torch.empty(x.shape[0], x.shape[-1], dtype=x.dtype, device=x.device)
-
-
-@torch_compile_guard(gen_fake=_hc_head_reduce_fake, mutates_args=[])
-def _hc_head_reduce(
-    x: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_eps: float,
-    hc_eps: float,
-) -> torch.Tensor:
-    x_flat = x.flatten(-2)
-    x_normed = _rmsnorm_nw(x_flat, norm_eps, x_flat.shape[-1])
-    mixes = F.linear(x_normed.float(), hc_fn)
-    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
-    y = torch.sum(pre.unsqueeze(-1) * x, dim=-2)
-    return y.to(x.dtype)
-
-
 def _v4_attention_fake(
     x: torch.Tensor,
     positions: torch.Tensor,
@@ -2656,14 +2628,10 @@ class ParallelHead(ParallelLMHead):
         """Reduce mHC residual `[num_tokens, hc, dim]` → `[num_tokens, dim]`
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
-        return _hc_head_reduce(
-            x,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            self.norm_eps,
-            self.hc_eps,
+        _, _, y = aiter.mhc_pre(
+            x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0
         )
+        return y
 
     def forward(
         self,
