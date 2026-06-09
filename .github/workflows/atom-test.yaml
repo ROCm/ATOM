@@ -72,6 +72,8 @@ jobs:
           echo "=== Trying latest main aiter wheel manifest from S3 first ==="
 
           S3_MAIN_MANIFEST_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json"
+          PINNED_AITER_WHEEL_NAME="amd_aiter-0.1.1.dev1+gff903093a-cp312-cp312-linux_x86_64.whl"
+          PINNED_AITER_WHEEL_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/amd_aiter-0.1.1.dev1%2Bgff903093a-cp312-cp312-linux_x86_64.whl"
           API_URL="https://api.github.com"
           AUTH_HEADER="Authorization: token ${{ secrets.GITHUB_TOKEN }}"
           AITER_TEST_WORKFLOW_ID=179476100
@@ -128,6 +130,11 @@ jobs:
 
             mkdir -p aiter-whl
             rm -f aiter-whl/amd_aiter*.whl
+
+            echo "Using pinned aiter wheel for linux-atom-do-mi350x-8 A/B test: ${PINNED_AITER_WHEEL_NAME}"
+            curl -fsSL "$PINNED_AITER_WHEEL_URL" -o "aiter-whl/$PINNED_AITER_WHEEL_NAME"
+            echo "Downloaded pinned wheel: aiter-whl/$PINNED_AITER_WHEEL_NAME"
+            return 0
 
             manifest_file=$(mktemp)
             trap 'rm -f "$manifest_file"' RETURN
