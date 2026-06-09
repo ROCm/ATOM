@@ -69,6 +69,23 @@ def is_rocm_aiter_fp4bmm_enabled() -> bool:
     return envs.ATOM_USE_TRITON_MXFP4_BMM
 
 
+def _maybe_view_mxfp4_weight_for_gather(
+    kv_b_proj: nn.Module, weight: torch.Tensor
+) -> torch.Tensor:
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is None or weight.dtype != torch.uint8:
+        return weight
+
+    layer_quant_config = getattr(kv_b_proj, "layer_quant_config", None)
+    is_mxfp4 = getattr(kv_b_proj, "params_dtype", None) == dtypes.fp4x2 or (
+        layer_quant_config is not None
+        and getattr(layer_quant_config, "quant_dtype", None) == dtypes.fp4x2
+    )
+    if is_mxfp4:
+        return weight.view(fp4_dtype)
+    return weight
+
+
 if is_rocm_aiter_fp4bmm_enabled():
     # from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import  batched_gemm_afp4wfp4_pre_quant
     from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
@@ -389,17 +406,18 @@ class MLAAttention(nn.Module):
         k_out: torch.Tensor,
         v_out: torch.Tensor,
     ) -> None:
+        weight = self.kv_b_proj.weight
         gather_kv_b_proj(
             kv_cache,
             self._k_scale,
             kv_indptr,
             kv_indices,
             cu_seqlens_k,
-            self.kv_b_proj.weight,
-            self.kv_b_proj.weight_scale,
+            _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight),
+            getattr(self.kv_b_proj, "weight_scale", None),
             k_out,
             v_out,
-            weight_preshuffle=getattr(self.kv_b_proj.weight, "is_shuffled", False),
+            weight_preshuffle=getattr(weight, "is_shuffled", False),
         )
 
     def _forward_prefill_cached_chunked(
