@@ -8,6 +8,25 @@ from atom.plugin.prepare import _set_framework_backbone
 logger = logging.getLogger("atom")
 
 
+def _remap_quant_config_for_sglang_plugin(atom_config: Any, model_cls: type) -> None:
+    quant_config = getattr(atom_config, "quant_config", None)
+    if quant_config is None:
+        return
+
+    quant_config.remap_layer_name(
+        atom_config.hf_config,
+        packed_modules_mapping=getattr(model_cls, "packed_modules_mapping", {}),
+        weights_mapper=getattr(model_cls, "hf_to_atom_mapper", {}),
+        quant_exclude_name_mapping=getattr(
+            model_cls, "quant_exclude_name_mapping", {}
+        ),
+    )
+
+    default_excludes = getattr(model_cls, "quant_default_exclude_layers", [])
+    if default_excludes:
+        quant_config.apply_default_exclude_layers(default_excludes)
+
+
 def prepare_model(config: Any):
     """Prepare an ATOM model for SGLang plugin mode."""
     logger.info("Prepare model for plugin mode, the upper engine is sglang")
@@ -42,6 +61,8 @@ def prepare_model(config: Any):
     model_adapter = get_model_arch_spec(model_arch)
     if model_adapter.prepare_config is not None:
         model_adapter.prepare_config(atom_config, model_arch)
+    else:
+        _remap_quant_config_for_sglang_plugin(atom_config, model_cls)
 
     register_ops_to_sglang(atom_config=atom_config)
     set_attn_cls()
