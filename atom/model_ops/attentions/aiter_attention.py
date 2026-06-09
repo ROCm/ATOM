@@ -49,14 +49,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         super().__init__(model_runner)
         config = model_runner.config
         hf_config = config.hf_config
-        # Token-midpoint TBO prefill split
-        from atom.utils import envs
-
-        self._tbo_token_split = bool(
-            config.enable_tbo and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
-        )
-        self._tbo_prefill_block_tables = None
-        self._tbo_prefill_cu_tokens = None
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
         # For speculative decode (MTP), max_qlen = num_speculative_tokens + 1
         if (
@@ -552,114 +544,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             slot_regions=[],
             num_blocks=runner.num_physical_kvcache_blocks,
         )
-
-    def prepare_prefill(self, batch: ScheduledBatch):
-        attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
-        # Only the token-split TBO path needs the per-request block tables stashed
-        if self._tbo_token_split:
-            self._stash_tbo_prefill_block_tables(batch)
-        return attn_metadata, positions
-
-    def _stash_tbo_prefill_block_tables(self, batch: ScheduledBatch):
-        """Stash host-side per-request block tables + cumulative token offsets so
-        build_ubatch_prefill_metadata can expose a straddled request's first half
-        (already in the paged KV cache) as a cached prefix for ubatch 1."""
-        self._tbo_prefill_block_tables = None
-        self._tbo_prefill_cu_tokens = None
-        if not batch.block_tables:
-            return
-        bs = batch.total_seqs_num_prefill
-        self._tbo_prefill_block_tables = [
-            np.asarray(bt, dtype=np.int32) for bt in batch.block_tables[:bs]
-        ]
-        self._tbo_prefill_cu_tokens = np.asarray(
-            self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
-            dtype=np.int64,
-        ).copy()
-
-    def build_ubatch_prefill_metadata(
-        self,
-        attn_metadata: AttentionMetaData,
-        ub_slice,
-        padded_bs: int,
-        ubatch_idx: int = 0,
-    ) -> AttentionMetaData:
-        """Split prefill metadata for MHA, handling token-midpoint straddle.
-
-        When the ubatch's first request is cut from a previous ubatch (its
-        token slice starts inside the request), expose the prior portion — already
-        written to the paged KV cache by the earlier ubatch on the same compute
-        stream — as a cached prefix so dense MHA attention can attend to it via
-        the existing `_gather_prefix_and_concat_kv` path.
-        """
-        del ubatch_idx
-        from atom.utils.tbo.ubatch_splitting import split_attn_metadata
-
-        ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
-
-        # Only set when token-split TBO is active (see prepare_prefill). For the
-        # request-boundary split or non-TBO this is None → plain split.
-        block_tables_host = self._tbo_prefill_block_tables
-        cu_tokens = self._tbo_prefill_cu_tokens
-        if block_tables_host is None or cu_tokens is None:
-            return ub_attn
-
-        rs = ub_slice.request_slice
-        ts = ub_slice.token_slice
-        first_req = rs.start
-        req_global_start = int(cu_tokens[first_req])
-        prefix_len = ts.start - req_global_start
-        if prefix_len <= 0:
-            return ub_attn  # not straddling
-
-        ub_num_reqs = rs.stop - rs.start
-        block_size = self.model_runner.block_size
-        device = self.device
-
-        # Per-request K length for the gather/attn: the straddled first request
-        # contributes prefix+new (full visible context up to its last token in
-        # this ubatch); every other request contributes only its own new tokens.
-        new_lens = (
-            cu_tokens[rs.start + 1 : rs.stop + 1] - cu_tokens[rs.start : rs.stop]
-        ).astype(np.int64)
-        # ub1's portion of the straddled request = (ts covers [ts.start, req_end))
-        # but its visible K starts at the request's position 0 (the prefix).
-        ctx_lens = new_lens.copy()
-        ctx_lens[0] = prefix_len + new_lens[0]
-        total_kv = int(ctx_lens.sum())
-
-        # Block tables: row 0 = the straddled request's full block list (covers
-        # the cached prefix + its new tokens); other rows = their own blocks.
-        max_blocks = max(
-            (
-                len(block_tables_host[first_req + i])
-                for i in range(ub_num_reqs)
-            ),
-            default=1,
-        )
-        bt = np.zeros((ub_num_reqs, max_blocks), dtype=np.int32)
-        for i in range(ub_num_reqs):
-            row = block_tables_host[first_req + i]
-            bt[i, : len(row)] = row
-
-        cu_k = np.zeros(ub_num_reqs + 1, dtype=np.int32)
-        np.cumsum(ctx_lens.astype(np.int32), out=cu_k[1:])
-
-        ub_attn.has_cached = True
-        ub_attn.total_kv = total_kv
-        ub_attn.context_lens = torch.from_numpy(
-            ctx_lens.astype(np.int32)
-        ).to(device, non_blocking=True)
-        ub_attn.block_tables = torch.from_numpy(bt).to(device, non_blocking=True)
-        ub_attn.cu_seqlens_k = torch.from_numpy(cu_k).to(device, non_blocking=True)
-        ub_attn.seq_starts = torch.zeros(
-            ub_num_reqs, dtype=torch.int32, device=device
-        )
-        ub_attn.num_cached_tokens = torch.from_numpy(
-            ctx_lens.astype(np.int32)
-        ).to(device, non_blocking=True)
-        ub_attn.max_seqlen_k = int(ctx_lens.max())
-        return ub_attn
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode

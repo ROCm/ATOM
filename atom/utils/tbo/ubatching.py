@@ -52,8 +52,11 @@ def local_tbo_precompute(
         # the cross-DP MAX-reduced ub0/ub1 will disagree with the realised
         # slices → all_gather size mismatch → RCCL hang.
         from atom.utils import envs
+        from atom.utils.tbo.ubatch_splitting import _token_split_supported
 
-        if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
+        # MUST mirror maybe_create_ubatch_slices' gating exactly, or the
+        # cross-DP MAX-reduced ub0/ub1 disagree with the realised slices → hang.
+        if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT and _token_split_supported():
             if n_pref < 1:
                 return False, 0, 0
             toks = np.asarray(num_scheduled_tokens[:n_pref], dtype=np.int64)

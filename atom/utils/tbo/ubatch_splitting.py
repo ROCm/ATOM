@@ -14,6 +14,34 @@ from atom.utils.forward_context import AttentionMetaData
 logger = logging.getLogger("atom")
 
 
+def _token_split_supported() -> bool:
+    """Whether the active attention backend can serve a straddled request's
+    first half from the paged KV cache, which the token-midpoint split requires.
+
+    Only MLA (DeepSeek-R1 / V2 / V3) and DeepSeek-V4 are supported today; dense
+    MHA backends (e.g. GPT-OSS) fall back to the request-boundary split. Remove
+    this gate once MHA straddle gather is fixed.
+    """
+    try:
+        from atom.config import get_current_atom_config
+
+        hf = get_current_atom_config().hf_config
+        model_type = getattr(hf, "model_type", "") or ""
+        arches = getattr(hf, "architectures", None) or []
+        is_v4 = any("DeepseekV4" in str(a) for a in arches)
+        is_mla = model_type in (
+            "deepseek_v2",
+            "deepseek_v3",
+            "deepseek_mtp",
+            "kimi_k2",
+            "glm_moe_dsa",
+        )
+        return bool(is_v4 or is_mla)
+    except Exception:
+        # If we can't determine the backend, be safe: no token-split.
+        return False
+
+
 @dataclass
 class UBatchSlice:
     """Describes which portion of a batch belongs to a micro-batch."""
@@ -46,7 +74,11 @@ def maybe_create_ubatch_slices(
     # even with a single request (bs=1) — only require that there are at
     # least `num_ubatches` tokens to go around. The request-boundary path
     # below still needs num_reqs >= num_ubatches.
-    token_split = num_scheduled_tokens is not None and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+    token_split = (
+        num_scheduled_tokens is not None
+        and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+        and _token_split_supported()
+    )
     if not token_split and num_reqs < num_ubatches:
         return None
 
