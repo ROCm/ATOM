@@ -74,6 +74,7 @@ class PagedAttentionImpl(nn.Module):
             else 1.0
         )
         self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self._gptoss_pa_decode_bf16_asm_scale_tensors = None
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
@@ -419,13 +420,29 @@ class PagedAttentionImpl(nn.Module):
 
     def _quantize_gptoss_pa_decode_bf16_asm_query(
         self, q: torch.Tensor
-    ) -> tuple[torch.Tensor, float]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         fp8_dtype = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_dtype).max
         q_amax = q.abs().max().clamp(min=1e-10)
-        q_scale = (q_amax / fp8_max).float()
+        q_scale = (q_amax / fp8_max).float().reshape(1)
         q_fp8 = (q / q_scale).clamp(min=-fp8_max, max=fp8_max).to(fp8_dtype)
-        return q_fp8.contiguous(), float(q_scale.item())
+        return q_fp8.contiguous(), q_scale
+
+    def _get_gptoss_pa_decode_bf16_asm_scale_tensors(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cached = self._gptoss_pa_decode_bf16_asm_scale_tensors
+        if cached is not None and cached[0].device == device:
+            return cached
+        key_scale = torch.full(
+            (1,), self.kv_scale_float * self.scale, dtype=torch.float32, device=device
+        )
+        value_scale = torch.full(
+            (1,), self.kv_scale_float, dtype=torch.float32, device=device
+        )
+        cached = (key_scale, value_scale)
+        self._gptoss_pa_decode_bf16_asm_scale_tensors = cached
+        return cached
 
     def _get_gptoss_pa_decode_bf16_asm_metadata(
         self,
@@ -727,6 +744,9 @@ class PagedAttentionImpl(nn.Module):
 
         q_5d = q.view(batch_size, max_seqlen_q, self.num_kv_heads, gqa, self.head_dim)
         q_fp8, query_scale = self._quantize_gptoss_pa_decode_bf16_asm_query(q_5d)
+        key_scale, value_scale = self._get_gptoss_pa_decode_bf16_asm_scale_tensors(
+            q.device
+        )
         v_cache_5d = self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
         ps_metadata = self._get_gptoss_pa_decode_bf16_asm_metadata(
@@ -760,13 +780,13 @@ class PagedAttentionImpl(nn.Module):
             V=v_cache_5d,
             kv_indices=attn_metadata.kv_indices,
             context_lens=attn_metadata.context_lens,
-            softmax_scale=self.scale,
+            softmax_scale=1.0,
             kv_indptr=attn_metadata.kv_indptr,
             gqa=gqa,
             mtp=max_seqlen_q - 1,
             query_scale=query_scale,
-            key_scale=self.kv_scale_float,
-            value_scale=self.kv_scale_float,
+            key_scale=key_scale,
+            value_scale=value_scale,
             qo_indptr=attn_metadata.cu_seqlens_q,
             work_indptr=ps_metadata["work_indptr"],
             work_info=ps_metadata["work_info"],
