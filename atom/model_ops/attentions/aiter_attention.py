@@ -51,7 +51,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # activate block_convertor when UA_decode is enabled, set --block-size 1024 for envs.ATOM_USE_UNIFIED_ATTN
             assert (
                 self.block_size == 1024
-            ), "When using ATOM_USE_UNIFIED_ATTN=1, block_size will be set to most performant numbers, please set --block-size 1024 to allow proper block size conversion via block_convertor"
+            ), "When using ATOM_USE_UNIFIED_ATTN=1, block_size will be set to the most performant numbers, please set --block-size 1024 to allow proper block size conversion via block_convertor"
             self.block_size = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
         assert (
             model_runner.block_size % self.block_size == 0
