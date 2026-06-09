@@ -46,9 +46,7 @@ def maybe_create_ubatch_slices(
     # even with a single request (bs=1) — only require that there are at
     # least `num_ubatches` tokens to go around. The request-boundary path
     # below still needs num_reqs >= num_ubatches.
-    token_split = (
-        num_scheduled_tokens is not None and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
-    )
+    token_split = num_scheduled_tokens is not None and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
     if not token_split and num_reqs < num_ubatches:
         return None
 
@@ -152,9 +150,7 @@ def _split_prefill_token_midpoint(
     num_ubatches: int,
     max_tokens_per_ubatch: Optional[int],
 ) -> Optional[list[UBatchSlice]]:
-    """split prefill at the exact token midpoint.
-
-    """
+    """split prefill at the exact token midpoint."""
     toks = np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64)
     total_tokens = int(toks.sum())
     # Exclusive-prefix cumulative token offsets: cu[i] = first token of req i.
@@ -162,9 +158,7 @@ def _split_prefill_token_midpoint(
     np.cumsum(toks, out=cu[1:])
 
     # Token split points at exact fractions of the total.
-    split_points = [
-        (total_tokens * i) // num_ubatches for i in range(1, num_ubatches)
-    ]
+    split_points = [(total_tokens * i) // num_ubatches for i in range(1, num_ubatches)]
 
     slices: list[UBatchSlice] = []
     tok_start = 0
