@@ -1,5 +1,5 @@
 # Default base images
-ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0"
+ARG BASE_IMAGE="rocm/pytorch:latest"
 ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
@@ -18,7 +18,6 @@ LABEL com.rocm.atom.vllm_commit="${VLLM_COMMIT}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV MAX_JOBS=${MAX_JOBS}
-ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH}"
 ENV VLLM_TARGET_DEVICE=rocm
 ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 
@@ -31,7 +30,10 @@ RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     mkdir -p /usr/local/bin && \
     ln -sf "$(command -v ninja)" /usr/local/bin/ninja && \
     /usr/local/bin/ninja --version && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    TORCH_LIB=$("${VENV_PYTHON}" -c "import os,torch; print(os.path.join(os.path.dirname(torch.__file__),'lib'))") && \
+    echo "${TORCH_LIB}" > /etc/ld.so.conf.d/torch.conf && \
+    ldconfig
 
 # Keep OOT aligned with the Triton that the ATOM base image ships.
 # vLLM/OOT installs can perturb Triton; back up everything and restore after.
@@ -40,10 +42,11 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
     "${VENV_PYTHON}" -m pip show amd-aiter || true && \
     "${VENV_PYTHON}" -m pip show amd-mori-nightly || true && \
     echo "========== [OOT 2/7] Back up base image triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
     BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
     mkdir -p /tmp/triton-base-backup && \
-    cp -a /opt/venv/lib/python3.10/site-packages/triton /tmp/triton-base-backup/ && \
-    for f in /opt/venv/lib/python3.10/site-packages/triton-*.dist-info; do \
+    cp -a "${SITE_PACKAGES}/triton" /tmp/triton-base-backup/ && \
+    for f in "${SITE_PACKAGES}"/triton-*.dist-info; do \
       [ -d "$f" ] || continue; \
       cp -a "$f" /tmp/triton-base-backup/; \
     done && \
@@ -102,25 +105,19 @@ RUN echo "========== [VLLM-ATOM] Validate vision/audio wheels ==========" && \
 
 # Restore the exact base-image Triton after all OOT installs finish.
 RUN echo "========== [OOT] Restore base image triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
     "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
-    rm -rf /opt/venv/lib/python3.10/site-packages/triton \
-           /opt/venv/lib/python3.10/site-packages/triton-*.dist-info && \
-    cp -a /tmp/triton-base-backup/triton /opt/venv/lib/python3.10/site-packages/ && \
+    rm -rf "${SITE_PACKAGES}/triton" \
+           "${SITE_PACKAGES}"/triton-*.dist-info && \
+    cp -a /tmp/triton-base-backup/triton "${SITE_PACKAGES}/" && \
     for f in /tmp/triton-base-backup/triton-*.dist-info; do \
       [ -d "$f" ] || continue; \
-      cp -a "$f" /opt/venv/lib/python3.10/site-packages/; \
+      cp -a "$f" "${SITE_PACKAGES}/"; \
     done && \
     rm -rf /tmp/triton-base-backup && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     "${VENV_PYTHON}" -m pip show triton || true
 
-# Qwen3-next encounter accuracy issue with the triton from base image
-# we install verified good version triton==3.6.0 here as a temporary fix
-# this should be removed after the triton issue is resolved  
-RUN echo "========== [OOT] Reinstall known good triton ==========" && \
-    pip uninstall -y triton amd-triton && \
-    pip install triton==3.6.0
-RUN pip show triton || true
 
 RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
     "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \

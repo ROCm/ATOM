@@ -310,10 +310,14 @@ def load_model(
         module_prefix = matching_name.split("shared_expert", 1)[0]
         shared_expert_prefix = layer_prefix + matching_name.rstrip(".")
         routed_expert_prefix = layer_prefix + f"{module_prefix}experts"
-        model_quant_config = getattr(getattr(model, "args", None), "quant_config", None)
+        model_quant_config = getattr(
+            getattr(model, "atom_config", None), "quant_config", None
+        )
         if model_quant_config is None:
             model_quant_config = getattr(model, "quant_config", None)
-        if model_quant_config is not None:
+        if model_quant_config is not None and hasattr(
+            model_quant_config, "get_layer_quant_config"
+        ):
             return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
                 model_quant_config,
                 shared_expert_prefix=shared_expert_prefix,

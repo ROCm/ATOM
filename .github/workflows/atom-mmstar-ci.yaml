@@ -23,7 +23,7 @@ concurrency:
 
 env:
   ATOM_BASE_IMAGE: rocm/atom-dev:latest
-  ATOM_PYTHON_TAG: "cp310"
+  ATOM_PYTHON_TAG: "cp312"
 
 jobs:
   prepare-mmstar-matrix:

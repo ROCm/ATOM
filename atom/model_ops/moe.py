@@ -612,7 +612,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             w2=layer.w2_weight,
             topk_weight=topk_weights,
             topk_ids=topk_ids,
-            expert_mask=expert_map,
+            expert_mask=layer.expert_mask,
             activation=activation,
         )
 
@@ -1537,7 +1537,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=expert_map,
+                expert_mask=layer.expert_mask,
                 activation=activation.value,
                 quant_type=self.quant_type.value,
                 w1_scale=layer.w13_weight_scale,
@@ -1877,7 +1877,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=expert_map,
+                expert_mask=layer.expert_mask,
                 activation=activation.value,
                 quant_type=self.quant_type.value,
                 w1_scale=layer.w13_weight_scale,
