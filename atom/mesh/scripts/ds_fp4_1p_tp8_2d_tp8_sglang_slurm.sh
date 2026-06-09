@@ -170,7 +170,7 @@ export ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
 export SGLANG_HOST_IP=${PREFILL_IP}
 export SGLANG_MOONCAKE_SEND_AUX_TCP=1
 export MC_TCP_ENABLE_CONNECTION_POOL=true
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
@@ -213,7 +213,7 @@ export ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
 export SGLANG_HOST_IP=__DECODE_HANDSHAKE_IP__
 export SGLANG_MOONCAKE_SEND_AUX_TCP=1
 export MC_TCP_ENABLE_CONNECTION_POOL=true
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 TORCHINDUCTOR_COMPILE_THREADS=128 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \

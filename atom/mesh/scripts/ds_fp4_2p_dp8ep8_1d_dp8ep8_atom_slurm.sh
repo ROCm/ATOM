@@ -158,7 +158,7 @@ export HIP_VISIBLE_DEVICES=${PREFILL_GPU_IDS}
 export PYTHONUNBUFFERED=1
 export AITER_LOG_LEVEL=WARNING
 export ATOM_HOST_IP=${P_IP}
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
 
 export MORI_SHMEM_MODE=${MORI_SHMEM_MODE}
 export MORI_DISPATCH_DTYPE=${MORI_DISPATCH_DTYPE}
@@ -195,7 +195,7 @@ export HIP_VISIBLE_DEVICES=${DECODE_GPU_IDS}
 export PYTHONUNBUFFERED=1
 export AITER_LOG_LEVEL=WARNING
 export ATOM_HOST_IP=${DECODE_IP}
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}
 
 export MORI_SHMEM_MODE=${MORI_SHMEM_MODE}
 export MORI_DISPATCH_DTYPE=${MORI_DISPATCH_DTYPE}

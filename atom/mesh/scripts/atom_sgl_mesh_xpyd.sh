@@ -180,7 +180,7 @@ launch_prefill() {
     SGLANG_HOST_IP="${NODE_IP}" \
     SGLANG_MOONCAKE_SEND_AUX_TCP=1 \
     MC_TCP_ENABLE_CONNECTION_POOL=true \
-    LD_LIBRARY_PATH="/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}" \
     python3 -m sglang.launch_server \
         --model-path "${MODEL_PATH}" \
         --host 0.0.0.0 --port "${port}" \
@@ -220,7 +220,7 @@ launch_decode() {
     SGLANG_HOST_IP="${NODE_IP}" \
     SGLANG_MOONCAKE_SEND_AUX_TCP=1 \
     MC_TCP_ENABLE_CONNECTION_POOL=true \
-    LD_LIBRARY_PATH="/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}" \
     TORCHINDUCTOR_COMPILE_THREADS=128 \
     python3 -m sglang.launch_server \
         --model-path "${MODEL_PATH}" \
