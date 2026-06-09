@@ -10,7 +10,10 @@ from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.chip_info import get_gfx
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
-from atom.plugin.vllm.attention.layer_mla import disabled_mla_persistent_metadata
+from atom.plugin.vllm.attention.layer_mla import (
+    disabled_mla_persistent_metadata,
+    mla_fold_kv_metadata_triton,
+)
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import kv_indices_generate_triton
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -134,11 +137,12 @@ class AiterMlaDecodeMetadataForVllm:
     attn_out_dtype: torch.dtype = torch.bfloat16
     # The max query output length: int
     max_qo_len: int | None = None
+    # Whether dense MLA persistent metadata was built for this decode batch.
+    use_persistent_metadata: bool = False
     # The fold factor for handling mqa_ratio=64 in non-persistent mode
     fold_factor: int | None = None
-    # Fold buffers for 64-head MLA workaround. These are populated at the
-    # fwd of the first MLA layer so they stay inside the cudagraph capture
-    # region, and then reused by subsequent layers
+    # Fold buffers for the MLA nhead-fold workaround. These are populated by
+    # the metadata builder outside the CUDA graph capture region
     fold_kv_indptr: torch.Tensor | None = None
     fold_kv_indices: torch.Tensor | None = None
     fold_qo_indptr: torch.Tensor | None = None
@@ -171,6 +175,7 @@ class AiterMlaPrefillMetadataForVllm:
         workspace: torch.Tensor
         token_to_seq: torch.Tensor
         chunk_total_token: list[int]
+        prefill_tokens_with_context: int | None = None
 
         # for mla DCP
         padded_local_chunk_seq_lens: list[list[int]] | None = None
@@ -834,7 +839,9 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
-        self.dtype_q = torch.bfloat16
+        # MLA decode path in ATOM-vLLM quantizes Q to FP8 when the KV cache is FP8,
+        # so aiter metadata must be sized/generated with the same dtype.
+        self.dtype_q = dtypes.fp8 if self.dtype_kv == dtypes.fp8 else torch.bfloat16
         self.dtype_kv = get_aiter_kv_cache_dtype(config)
 
         self.paged_kv_last_page_len = torch.ones(
@@ -859,8 +866,8 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             max_num_reqs,
             1,
             self.padded_num_attention_heads,
-            torch.bfloat16,
-            get_aiter_kv_cache_dtype(config),
+            self.dtype_q,
+            self.dtype_kv,
             is_sparse=False,
             fast_mode=True,
         )
@@ -900,6 +907,32 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         self._mla_fold_factor = (
             self.padded_num_attention_heads // 8 if self._mla_fold_enabled else 1
         )
+        # For 64-head fp8/fp8 qseqlen=1 MLA, use native persistent instead of fold
+        self._mla_dp_native_persistent_enabled = (
+            self._mla_fold_enabled
+            and self.padded_num_attention_heads == 64
+            and self.dtype_q == dtypes.fp8
+            and self.dtype_kv == dtypes.fp8
+        )
+
+        # Allocate the fold buffers for the nhead-folding workaround outside CUDA
+        # graph capture and refill them in `_build_decode`.
+        if self._mla_fold_enabled and not self._mla_dp_native_persistent_enabled:
+            fold_factor = self._mla_fold_factor
+            max_fold_bs = max_num_reqs * fold_factor
+            self.fold_kv_indptr = torch.zeros(
+                max_fold_bs + 1, dtype=torch.int32, device=device
+            )
+            self.fold_kv_indices = torch.empty(
+                max_num_pages * fold_factor, dtype=torch.int32, device=device
+            )
+            # qo_indptr and last_page_len are constant for qseqlen==1 decode.
+            self.fold_qo_indptr = torch.arange(
+                max_fold_bs + 1, dtype=torch.int32, device=device
+            )
+            self.fold_kv_last_page_len = torch.ones(
+                max_fold_bs, dtype=torch.int32, device=device
+            )
 
     # TODO: support mtp and sparse
     def _set_mla_persistent_worker_buffers(
@@ -1012,7 +1045,10 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         # Disable persistent MLA in DP mode: pre-computed metadata buffers
         # are invalid when request counts vary across DP ranks each step.
         dp_enabled = get_dp_group().world_size > 1
-        if not dp_enabled:
+        use_persistent_metadata = (not dp_enabled) or (
+            self._mla_dp_native_persistent_enabled and max_qo_len == 1
+        )
+        if use_persistent_metadata:
             ctx_mla_ps = self._set_mla_persistent_worker_buffers(
                 num_reqs,
                 qo_indptr,
@@ -1022,9 +1058,41 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 
         fold_factor = (
             self._mla_fold_factor
-            if self._mla_fold_enabled and dp_enabled and max_qo_len == 1
+            if (
+                self._mla_fold_enabled
+                and dp_enabled
+                and max_qo_len == 1
+                and not use_persistent_metadata
+            )
             else None
         )
+
+        fold_kv_indptr = fold_kv_indices = None
+        fold_qo_indptr = fold_kv_last_page_len = None
+        if fold_factor is not None and fold_factor > 1:
+            new_bs = num_reqs * fold_factor
+            # Keep the view sized to this step's worst case so aiter's
+            # non-persistent split heuristic sees avg_kv == max_seq_len.
+            # During full CUDA graph capture max_seq_len is max_model_len,
+            # which is the replay upper bound.
+            fold_kv_indices_len = num_reqs * max_seq_len * fold_factor
+            assert fold_kv_indices_len <= self.fold_kv_indices.numel(), (
+                f"fold_kv_indices overflow: need {fold_kv_indices_len}, "
+                f"have {self.fold_kv_indices.numel()}"
+            )
+            fold_kv_indptr = self.fold_kv_indptr[: new_bs + 1]
+            fold_kv_indices = self.fold_kv_indices[:fold_kv_indices_len]
+            fold_qo_indptr = self.fold_qo_indptr[: new_bs + 1]
+            fold_kv_last_page_len = self.fold_kv_last_page_len[:new_bs]
+
+            mla_fold_kv_metadata_triton(
+                paged_kv_indptr,
+                paged_kv_indices,
+                fold_kv_indptr,
+                fold_kv_indices,
+                fold_factor=fold_factor,
+                num_reqs=num_reqs,
+            )
 
         attn_metadata = AiterMlaDecodeMetadataForVllm(
             block_table=block_table_tensor,
@@ -1036,7 +1104,12 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
             max_qo_len=max_qo_len,
             attn_out_dtype=self.decode_attn_out_dtype,
+            use_persistent_metadata=use_persistent_metadata,
             fold_factor=fold_factor,
+            fold_kv_indptr=fold_kv_indptr,
+            fold_kv_indices=fold_kv_indices,
+            fold_qo_indptr=fold_qo_indptr,
+            fold_kv_last_page_len=fold_kv_last_page_len,
         )
 
         return attn_metadata
@@ -1092,17 +1165,29 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 
         prefill_metadata = None
         if num_prefills > 0:
-            num_computed_tokens_cpu = (
-                common_attn_metadata.compute_num_computed_tokens().cpu()
-            )
-
             reqs_start = num_decodes  # prefill_start
 
-            context_lens_cpu = num_computed_tokens_cpu[reqs_start:num_reqs]
+            # In DBO, an ubatch can contain only part of a prefill request.
+            # Derive context lengths from the sliced CPU query lengths and
+            # seq_lens upper bound to match upstream vLLM's MLA builder,
+            # instead of forcing a device->host sync through
+            # compute_num_computed_tokens().
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            assert seq_lens_cpu is not None
+            prefill_query_lens_cpu = (
+                query_start_loc_cpu[reqs_start + 1 : num_reqs + 1]
+                - query_start_loc_cpu[reqs_start:num_reqs]
+            )
+            context_lens_cpu = (
+                seq_lens_cpu[reqs_start:num_reqs] - prefill_query_lens_cpu
+            )
             max_context_len_cpu = context_lens_cpu.max().item()
             num_prefills_with_context_cpu = (context_lens_cpu > 0).sum().item()
             prefill_query_start_loc = (
                 query_start_loc[reqs_start:] - query_start_loc[reqs_start]
+            )
+            prefill_query_start_loc_cpu = (
+                query_start_loc_cpu[reqs_start:] - query_start_loc_cpu[reqs_start]
             )
 
             chunked_context_metadata = None
@@ -1229,6 +1314,11 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 chunked_context_metadata_cls = (
                     AiterMlaPrefillMetadataForVllm.AiterMlaChunkedContextMetadataForVllm
                 )
+                prefill_tokens_with_context = None
+                if num_prefills_with_context_cpu > 0:
+                    prefill_tokens_with_context = prefill_query_start_loc_cpu[
+                        num_prefills_with_context_cpu
+                    ].item()
                 if self.dcp_world_size > 1:
                     chunked_context_metadata = chunked_context_metadata_cls(
                         cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
@@ -1248,6 +1338,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         ),
                         cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
                         chunk_size=padded_local_max_context_chunk_across_ranks,
+                        prefill_tokens_with_context=prefill_tokens_with_context,
                     )
                 else:
                     chunked_context_metadata = chunked_context_metadata_cls(
@@ -1261,6 +1352,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         ),
                         chunk_total_token=chunk_total_token,
                         workspace=self.chunked_prefill_workspace,
+                        prefill_tokens_with_context=prefill_tokens_with_context,
                     )
 
                 assert (
@@ -1319,10 +1411,12 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         )
 
         # TODO: support mtp
-        dp_enabled = get_dp_group().world_size > 1
+        use_persistent_metadata = (
+            decode_metadata is not None and decode_metadata.use_persistent_metadata
+        )
         ctx_mla_ps = (
             self.mla_persistent_metadata
-            if not dp_enabled
+            if not use_persistent_metadata
             else disabled_mla_persistent_metadata()
         )
         persistent_metadata = AiterMlaPersistentMetadataForVllm(**ctx_mla_ps)

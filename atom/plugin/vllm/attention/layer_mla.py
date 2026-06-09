@@ -6,7 +6,6 @@ import logging
 import aiter
 import torch
 from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
-from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton import (
     batched_gemm_a16wfp4 as _fp4_bmm_module,
@@ -162,10 +161,10 @@ def mla_fold_kv_metadata_kernel(
     FOLD_FACTOR: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Build folded kv metadata for the MLA nhead=64 -> nhead=16 workaround.
-    Each original batch's KV-index segment is replicated FOLD_FACTOR times
-    back-to-back in `fold_kv_indices`, and `fold_kv_indptr` gets the matching
-    expanded indptr.
+    """Build folded kv metadata for the MLA nhead -> nhead/FOLD_FACTOR
+    workaround. Each original batch's KV-index segment is replicated
+    FOLD_FACTOR times back-to-back in `fold_kv_indices`, and `fold_kv_indptr`
+    gets the matching expanded indptr.
     """
     orig_batch = tl.program_id(0)
     fold_idx = tl.program_id(1)
@@ -206,7 +205,7 @@ def mla_fold_kv_metadata_triton(
         paged_kv_indices: [paged_kv_indptr[-1]] int32, original kv indices.
         fold_kv_indptr: [num_reqs*fold_factor + 1] int32, output indptr.
         fold_kv_indices: [fold_factor * paged_kv_indptr[-1]] int32.
-        fold_factor: integer fold factor (e.g. 4 for nhead 64 → 16).
+        fold_factor: integer fold factor (e.g. 4 for nhead 64 -> 16).
         num_reqs: number of decode requests (size of `paged_kv_indptr` - 1).
     """
     if num_reqs == 0:
@@ -793,6 +792,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 prefix_lse=context_lse,
                 suffix_output=suffix_output,
                 suffix_lse=suffix_lse,
+                prefill_tokens_with_context=(
+                    attn_metadata.prefill.chunked_context.prefill_tokens_with_context
+                ),
             )
         else:
             output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
@@ -818,11 +820,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        # Persistent MLA pre-computes fixed work/reduce metadata buffers at init
-        # time, but DP splits requests across ranks with varying counts per step,
-        # making those fixed buffers invalid. Disable when dp_size > 1.
-        dp_size = get_dp_group().world_size
-        use_persistent_mode = dp_size <= 1 and not (
+        use_persistent_mode = attn_metadata.decode.use_persistent_metadata and not (
             self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
         )
         if not use_persistent_mode:
@@ -852,43 +850,13 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         do_fold = fold_factor is not None and fold_factor > 1
         if do_fold:
             decode_md = attn_metadata.decode
-            if decode_md.fold_kv_indptr is None:
-                num_reqs = paged_kv_indptr.shape[0] - 1
-                new_bs = num_reqs * fold_factor
-                # Capture-time worst-case seq_len per request - vLLM's
-                # dummy_run uses max_model_len, so this sets an upper bound
-                # for the buffer length that's preserved at replay (the
-                # captured allocation has this exact size).
-                max_seq_len = attn_metadata.max_seq_len
-                fold_kv_indices_len = num_reqs * max_seq_len * fold_factor
 
-                new_kv_indptr = torch.zeros(
-                    new_bs + 1, dtype=torch.int32, device=q.device
-                )
-                new_kv_indices = torch.empty(
-                    fold_kv_indices_len, dtype=torch.int32, device=q.device
-                )
-                new_qo_indptr = torch.arange(
-                    new_bs + 1, dtype=torch.int32, device=q.device
-                )
-                new_kv_last_page_lens = torch.ones(
-                    new_bs, dtype=torch.int32, device=q.device
-                )
-
-                mla_fold_kv_metadata_triton(
-                    paged_kv_indptr,
-                    paged_kv_indices,
-                    new_kv_indptr,
-                    new_kv_indices,
-                    fold_factor=fold_factor,
-                    num_reqs=num_reqs,
-                )
-
-                decode_md.fold_kv_indptr = new_kv_indptr
-                decode_md.fold_kv_indices = new_kv_indices
-                decode_md.fold_qo_indptr = new_qo_indptr
-                decode_md.fold_kv_last_page_len = new_kv_last_page_lens
-
+            # Fold buffers are populated by the metadata builder outside the
+            # CUDA graph capture region
+            assert decode_md.fold_kv_indptr is not None
+            assert decode_md.fold_kv_indices is not None
+            assert decode_md.fold_qo_indptr is not None
+            assert decode_md.fold_kv_last_page_len is not None
             paged_kv_indptr = decode_md.fold_kv_indptr
             paged_kv_indices = decode_md.fold_kv_indices
             qo_indptr = decode_md.fold_qo_indptr
