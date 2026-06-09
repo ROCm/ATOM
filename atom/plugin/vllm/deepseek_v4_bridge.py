@@ -21,6 +21,8 @@ ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
 
 
 def _aligned_index_dim(index_head_dim: int) -> int:
+    # extra 4 Bytes for scale.
+    # 16 Bytes aligned.
     return ((index_head_dim + 4 + 15) // 16) * 16
 
 
@@ -170,21 +172,6 @@ def slice_deepseek_v4_proxy_cache_views(
     }
 
 
-class _CpuGpuPlanBuffer:
-    def __init__(self, rows: int, device: torch.device):
-        self.np = np.empty((max(rows, 1), 4), dtype=np.int32)
-        self.gpu = torch.empty((max(rows, 1), 4), dtype=torch.int32, device=device)
-
-    def copy_to_gpu(self, n: int | None = None):
-        if n is None:
-            n = self.np.shape[0]
-        if n > 0:
-            self.gpu[:n].copy_(
-                torch.from_numpy(self.np[:n]).to(self.gpu.device), non_blocking=True
-            )
-        return self.gpu[:n]
-
-
 class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
     # Decode (query_len == 1) is the only shape we capture in a full CUDA/HIP
     # graph: it has a fixed per-step kernel grid and the per-fwd index/indptr/
@@ -211,68 +198,64 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
             raise ValueError(
                 "ATOM DeepSeek V4 proxy does not support cascade attention"
             )
-        return _build_and_attach_atom_v4_md(
-            common_attn_metadata, self.vllm_config, capturing=False
-        )
+        return self._build_and_attach_atom_v4_md(common_attn_metadata, capturing=False)
 
     def build_for_cudagraph_capture(self, common_attn_metadata):
         # vLLM builds the metadata for a synthetic uniform-decode batch here,
         # OUTSIDE the captured region, then captures the model forward. Stage
         # into the persistent decode buffers with arange slots (the dummy
         # batch's NULL block ids must not pollute the real slot allocator).
-        return _build_and_attach_atom_v4_md(
-            common_attn_metadata, self.vllm_config, capturing=True
+        return self._build_and_attach_atom_v4_md(common_attn_metadata, capturing=True)
+
+    def _build_and_attach_atom_v4_md(self, common_attn_metadata, *, capturing):
+        """Build the ATOM V4 attention metadata OUTSIDE the captured graph and
+        attach it to the vLLM ``CommonAttentionMetadata`` the model forward reads.
+
+        vLLM calls ``builder.build()`` / ``build_for_cudagraph_capture()`` once
+        per step, before ``set_forward_context`` + the (possibly
+        CUDA/HIP-graph-wrapped) model forward. Building here -- rather than
+        inside the forward -- is what makes a captured decode graph correct:
+        for decode this refreshes the per-fwd index/indptr/slot/compress-plan
+        tensors *in place* in persistent fixed-address buffers (allocated at
+        cache-bind time), so the captured kernels replay against stable
+        addresses. The per-request selective state reset also runs here
+        (outside any capture). Prefill stays on the eager fresh-tensor path and
+        is never captured.
+
+        Returns the same ``common_attn_metadata`` (now carrying ``atom_v4_md``)
+        so it flows through vLLM's per-layer attn-metadata dict to the forward,
+        which consumes the prebuilt metadata instead of rebuilding it.
+        """
+        if common_attn_metadata is None:
+            return common_attn_metadata
+        sfc = self.vllm_config.compilation_config.static_forward_context
+        proxy = sfc.get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
+        model = getattr(proxy, "_atom_v4_model", None) if proxy is not None else None
+        meta_params = getattr(model, "_atom_v4_meta_params", None)
+        if model is None or meta_params is None:
+            # Pre-bind (profiling / first warmup forward, before the proxy cache is
+            # bound): leave common untouched. The forward detects the missing
+            # atom_v4_md and falls back to an inline eager build (force_dummy).
+            return common_attn_metadata
+        slot_allocator = (
+            None if capturing else getattr(model, "_atom_v4_slot_allocator", None)
         )
-
-
-def _build_and_attach_atom_v4_md(common_attn_metadata, vllm_config, *, capturing):
-    """Build the ATOM V4 attention metadata OUTSIDE the captured graph and
-    attach it to the vLLM ``CommonAttentionMetadata`` the model forward reads.
-
-    vLLM calls ``builder.build()`` / ``build_for_cudagraph_capture()`` once per
-    step, before ``set_forward_context`` + the (possibly CUDA/HIP-graph-wrapped)
-    model forward. Building here -- rather than inside the forward -- is what
-    makes a captured decode graph correct: for decode this refreshes the
-    per-fwd index/indptr/slot/compress-plan tensors *in place* in persistent
-    fixed-address buffers (allocated at cache-bind time), so the captured
-    kernels replay against stable addresses. The per-request selective state
-    reset also runs here (outside any capture). Prefill stays on the eager
-    fresh-tensor path and is never captured.
-
-    Returns the same ``common_attn_metadata`` (now carrying ``atom_v4_md``) so
-    it flows through vLLM's per-layer attn-metadata dict to the forward, which
-    consumes the prebuilt metadata instead of rebuilding it.
-    """
-    if common_attn_metadata is None:
+        decode_bufs = getattr(model, "_atom_v4_decode_bufs", None)
+        md = build_atom_v4_attention_metadata(
+            common_attn_metadata,
+            meta_params=meta_params,
+            slot_allocator=slot_allocator,
+            decode_bufs=decode_bufs,
+            capturing=capturing,
+        )
+        # Selective per-slot reset OUTSIDE the captured region. For decode this
+        # is empty (no fresh slots are bound mid-generation); it fires for the
+        # prefill chunk that first allocates a request's slot, which is eager.
+        reset_slots = getattr(md, "reset_slots", None)
+        if reset_slots:
+            reset_deepseek_v4_state_slots(model, reset_slots)
+        common_attn_metadata.atom_v4_md = md
         return common_attn_metadata
-    sfc = vllm_config.compilation_config.static_forward_context
-    proxy = sfc.get(ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME)
-    model = getattr(proxy, "_atom_v4_model", None) if proxy is not None else None
-    meta_params = getattr(model, "_atom_v4_meta_params", None)
-    if model is None or meta_params is None:
-        # Pre-bind (profiling / first warmup forward, before the proxy cache is
-        # bound): leave common untouched. The forward detects the missing
-        # atom_v4_md and falls back to an inline eager build (force_dummy).
-        return common_attn_metadata
-    slot_allocator = (
-        None if capturing else getattr(model, "_atom_v4_slot_allocator", None)
-    )
-    decode_bufs = getattr(model, "_atom_v4_decode_bufs", None)
-    md = build_atom_v4_attention_metadata(
-        common_attn_metadata,
-        meta_params=meta_params,
-        slot_allocator=slot_allocator,
-        decode_bufs=decode_bufs,
-        capturing=capturing,
-    )
-    # Selective per-slot reset OUTSIDE the captured region. For decode this is
-    # empty (no fresh slots are bound mid-generation); it fires for the prefill
-    # chunk that first allocates a request's slot, which is eager.
-    reset_slots = getattr(md, "reset_slots", None)
-    if reset_slots:
-        reset_deepseek_v4_state_slots(model, reset_slots)
-    common_attn_metadata.atom_v4_md = md
-    return common_attn_metadata
 
 
 class AtomDeepseekV4ProxyBackend(AttentionBackend):
@@ -588,33 +571,6 @@ def bind_deepseek_v4_proxy_cache_views(model, vllm_config) -> bool:
     return True
 
 
-def reset_deepseek_v4_state_caches(model) -> None:
-    """Clear V4 per-request state before a real fresh prefill.
-
-    vLLM may run dummy/profile forwards after KV binding; unlike native ATOM,
-    those dummy forwards are not marked as ATOM dummy runs, so they can dirty
-    SWA and compressor state. A real prompt starts at position 0 and must see
-    clean state.
-    """
-    layers = getattr(getattr(model, "model", None), "layers", [])
-    for block in layers:
-        attn = getattr(block, "attn", None)
-        if attn is None:
-            continue
-        if isinstance(getattr(attn, "swa_kv", None), torch.Tensor):
-            attn.swa_kv.zero_()
-        for compressor in (
-            getattr(attn, "compressor", None),
-            getattr(getattr(attn, "indexer", None), "compressor", None),
-        ):
-            if compressor is None:
-                continue
-            if isinstance(getattr(compressor, "kv_state", None), torch.Tensor):
-                compressor.kv_state.zero_()
-            if isinstance(getattr(compressor, "score_state", None), torch.Tensor):
-                compressor.score_state.fill_(float("-inf"))
-
-
 def reset_deepseek_v4_state_slots(model, slots) -> None:
     """Clear V4 per-request SWA + compressor state for specific state slots.
 
@@ -682,39 +638,31 @@ def _counts_to_indptr(counts: np.ndarray) -> np.ndarray:
 def _make_compress_plans(
     extend_lens_cpu, context_lens_cpu, ratios, device, decode: bool
 ):
-    batch_ids = np.repeat(
-        np.arange(len(extend_lens_cpu), dtype=np.int32), extend_lens_cpu
-    )
     total = int(extend_lens_cpu.sum())
-    ragged = np.arange(total, dtype=np.int32)
-    cu = np.zeros(len(extend_lens_cpu) + 1, dtype=np.int32)
-    np.cumsum(extend_lens_cpu, out=cu[1:])
-    j = ragged - cu[batch_ids]
-    positions = (context_lens_cpu - extend_lens_cpu)[batch_ids] + j
-    plans = {}
-    for ratio, overlap in ratios:
-        kpool = ratio * (2 if overlap else 1)
-        win_lens = np.maximum(0, kpool - np.minimum(j + 1, kpool)).astype(np.int32)
-        rows = np.stack([ragged, batch_ids, positions, win_lens], axis=1).astype(
-            np.int32
-        )
-        comp = rows[(positions + 1) % ratio == 0]
-        write_starts = np.maximum(0, context_lens_cpu - kpool).astype(np.int32)
-        write = rows[positions >= write_starts[batch_ids]]
-        comp_t = torch.from_numpy(
-            comp if len(comp) else np.full((0, 4), -1, dtype=np.int32)
-        ).to(device)
-        write_t = torch.from_numpy(
-            write if len(write) else np.full((0, 4), -1, dtype=np.int32)
-        ).to(device)
-        plans[ratio] = SimpleNamespace(
-            compress_plan_gpu=comp_t,
-            write_plan_gpu=write_t,
-            num_compress=int(len(comp)),
-            num_write=int(len(write)),
-            cu_compress_cpu=None,
-            compress_plan_cpu=comp if len(comp) else None,
-        )
+    from atom.model_ops.v4_kernels import make_compress_plans
+    from atom.utils import CpuGpuBuffer
+
+    capacity = max(1, total)
+    plan_buffers = {
+        int(ratio): {
+            "compress": CpuGpuBuffer(capacity, 4, dtype=torch.int32, device=device),
+            "write": CpuGpuBuffer(capacity, 4, dtype=torch.int32, device=device),
+        }
+        for ratio, _ in ratios
+    }
+    plans = make_compress_plans(
+        extend_lens_cpu,
+        context_lens_cpu,
+        ratios,
+        plan_buffers=plan_buffers,
+        decode_capacity_per_ratio=None,
+    )
+    # Preserve the bridge eager path's old variable-grid behavior. Native
+    # make_compress_plans returns a sentinel-padded write buffer, while the
+    # previous bridge helper launched update_compressor_states with exactly
+    # num_write rows. Graph decode uses _make_decode_compress_plans instead.
+    for plan in plans.values():
+        plan.write_plan_gpu = plan.write_plan_gpu[: plan.num_write]
     return plans
 
 
@@ -726,9 +674,7 @@ class _V4StateSlotAllocator:
     across requests). This hands back the same state slot for every
     chunked-prefill step and every decode step of a request, so its SWA ring and
     compressor state accumulate in one place -- matching native ATOM's
-    per-request cache slots. The old ``arange(num_reqs)`` mapping was only stable
-    when vLLM never reordered/compacted the batch, which breaks under chunked
-    prefill + continuous batching.
+    per-request cache slots.
 
     A slot is reported as freshly allocated (caller resets it) when it is newly
     bound to an unseen block id, or when its block id reappears for a brand-new
@@ -1199,132 +1145,52 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     csa_indptr = torch.from_numpy(csa_indptr_np).to(device)
     hca_indptr = torch.from_numpy(hca_indptr_np).to(device)
 
-    if device.type == "cuda":
-        # Production path: scatter on-GPU with native ATOM's Triton kernel (one
-        # program per token; avoids an O(T) Python loop). Imported lazily so the
-        # CPU/unit-test path never pulls in the heavy atom.model_ops package.
-        from atom.model_ops.v4_kernels import write_v4_paged_prefill_indices
+    # scatter on-GPU with native ATOM's Triton kernel (one
+    # program per token; avoids an O(T) Python loop).
+    from atom.model_ops.v4_kernels import write_v4_paged_prefill_indices
 
-        ext_indices = torch.empty(max(ext_total, 1), dtype=torch.int32, device=device)
-        swa_indices = torch.empty(max(swa_total, 1), dtype=torch.int32, device=device)
-        csa_indices = torch.empty(max(csa_total, 1), dtype=torch.int32, device=device)
-        hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
-        chunk_start_g = torch.from_numpy(
-            np.ascontiguousarray(md.chunk_start_per_seq_cpu[:num_reqs])
-        ).to(device)
-        cu_q_g = torch.from_numpy(np.ascontiguousarray(q_np[:num_reqs])).to(device)
-        n_hca_seq_g = torch.from_numpy(
-            np.ascontiguousarray(md.n_committed_hca_per_seq_cpu[:num_reqs])
-        ).to(device)
-        write_v4_paged_prefill_indices(
-            positions=positions_gpu[:T].to(torch.int32),
-            bid_per_token=md.batch_id_per_token[:T],
-            chunk_start_per_seq=chunk_start_g,
-            cu_seqlens_q_per_seq=cu_q_g,
-            state_slot_per_seq=md.state_slot_mapping[:num_reqs],
-            n_committed_hca_per_seq=n_hca_seq_g,
-            block_tables=common.block_table_tensor[:num_reqs],
-            extend_indptr=ext_indptr,
-            prefix_swa_indptr=swa_indptr,
-            prefix_csa_indptr=csa_indptr,
-            prefix_hca_indptr=hca_indptr,
-            extend_indices=ext_indices,
-            prefix_swa_indices=swa_indices,
-            prefix_csa_indices=csa_indices,
-            prefix_hca_indices=hca_indices,
-            T=T,
-            win=win,
-            cs=cs,
-            swa_pages=swa_pages,
-        )
-        md.kv_indices_extend = ext_indices[:ext_total]
-        md.kv_indices_prefix_swa = swa_indices[:swa_total]
-        md.kv_indices_prefix_csa = csa_indices[:csa_total]
-        md.kv_indices_prefix_hca = hca_indices[:hca_total]
-    else:
-        ext_arr, swa_arr, csa_arr, hca_arr = _prefill_scatter_reference(
-            T=T,
-            batch_np=batch_np,
-            pos_np=pos_np,
-            q_np=q_np,
-            chunk_start_np=md.chunk_start_per_seq_cpu,
-            state_slot_np=md.state_slot_mapping_cpu,
-            n_hca_seq_np=md.n_committed_hca_per_seq_cpu,
-            block_tables_np=common.block_table_tensor[:num_reqs].detach().cpu().numpy(),
-            ext_indptr_np=ext_indptr_np,
-            swa_indptr_np=swa_indptr_np,
-            csa_indptr_np=csa_indptr_np,
-            hca_indptr_np=hca_indptr_np,
-            win=win,
-            cs=cs,
-            swa_pages=swa_pages,
-        )
-        md.kv_indices_extend = torch.from_numpy(ext_arr[:ext_total]).to(device)
-        md.kv_indices_prefix_swa = torch.from_numpy(swa_arr[:swa_total]).to(device)
-        md.kv_indices_prefix_csa = torch.from_numpy(csa_arr[:csa_total]).to(device)
-        md.kv_indices_prefix_hca = torch.from_numpy(hca_arr[:hca_total]).to(device)
+    ext_indices = torch.empty(max(ext_total, 1), dtype=torch.int32, device=device)
+    swa_indices = torch.empty(max(swa_total, 1), dtype=torch.int32, device=device)
+    csa_indices = torch.empty(max(csa_total, 1), dtype=torch.int32, device=device)
+    hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
+    chunk_start_g = torch.from_numpy(
+        np.ascontiguousarray(md.chunk_start_per_seq_cpu[:num_reqs])
+    ).to(device)
+    cu_q_g = torch.from_numpy(np.ascontiguousarray(q_np[:num_reqs])).to(device)
+    n_hca_seq_g = torch.from_numpy(
+        np.ascontiguousarray(md.n_committed_hca_per_seq_cpu[:num_reqs])
+    ).to(device)
+    write_v4_paged_prefill_indices(
+        positions=positions_gpu[:T].to(torch.int32),
+        bid_per_token=md.batch_id_per_token[:T],
+        chunk_start_per_seq=chunk_start_g,
+        cu_seqlens_q_per_seq=cu_q_g,
+        state_slot_per_seq=md.state_slot_mapping[:num_reqs],
+        n_committed_hca_per_seq=n_hca_seq_g,
+        block_tables=common.block_table_tensor[:num_reqs],
+        extend_indptr=ext_indptr,
+        prefix_swa_indptr=swa_indptr,
+        prefix_csa_indptr=csa_indptr,
+        prefix_hca_indptr=hca_indptr,
+        extend_indices=ext_indices,
+        prefix_swa_indices=swa_indices,
+        prefix_csa_indices=csa_indices,
+        prefix_hca_indices=hca_indices,
+        T=T,
+        win=win,
+        cs=cs,
+        swa_pages=swa_pages,
+    )
+    md.kv_indices_extend = ext_indices[:ext_total]
+    md.kv_indices_prefix_swa = swa_indices[:swa_total]
+    md.kv_indices_prefix_csa = csa_indices[:csa_total]
+    md.kv_indices_prefix_hca = hca_indices[:hca_total]
 
     md.kv_indptr_extend = ext_indptr
     md.kv_indptr_prefix_swa = swa_indptr
     md.kv_indptr_prefix_csa = csa_indptr
     md.kv_indptr_prefix_hca = hca_indptr
     md.skip_prefix_len_csa = torch.from_numpy(prefix_swa_count).to(device)
-
-
-def _prefill_scatter_reference(
-    *,
-    T,
-    batch_np,
-    pos_np,
-    q_np,
-    chunk_start_np,
-    state_slot_np,
-    n_hca_seq_np,
-    block_tables_np,
-    ext_indptr_np,
-    swa_indptr_np,
-    csa_indptr_np,
-    hca_indptr_np,
-    win,
-    cs,
-    swa_pages,
-):
-    """Pure-numpy equivalent of native ``write_v4_paged_prefill_indices`` (CPU
-    test path). Same per-token contract: writes the extend rows, the paged SWA
-    prefix into all three prefix buffers, and the HCA compress tail; the CSA
-    topk tail is left to the per-layer ``csa_translate_pack`` (so its cells hold
-    uninitialized values here, matching the kernel)."""
-    ext_arr = np.empty(max(int(ext_indptr_np[-1]), 1), dtype=np.int32)
-    swa_arr = np.empty(max(int(swa_indptr_np[-1]), 1), dtype=np.int32)
-    csa_arr = np.empty(max(int(csa_indptr_np[-1]), 1), dtype=np.int32)
-    hca_arr = np.empty(max(int(hca_indptr_np[-1]), 1), dtype=np.int32)
-    for t in range(T):
-        bid = int(batch_np[t])
-        pos = int(pos_np[t])
-        chunk_start = int(chunk_start_np[bid])
-        cu_q = int(q_np[bid])
-        state_slot = int(state_slot_np[bid])
-        n_hca = int(n_hca_seq_np[bid])
-        token_pos_in_chunk = pos - chunk_start
-        swa_low = max(pos - win + 1, 0)
-        extend_count = min(token_pos_in_chunk + 1, win)
-        prefix_swa_count = max(chunk_start - swa_low, 0)
-        eb = int(ext_indptr_np[t])
-        ext_start = cu_q + token_pos_in_chunk - extend_count + 1
-        ext_arr[eb : eb + extend_count] = np.arange(ext_start, ext_start + extend_count)
-        sb_swa = int(swa_indptr_np[t])
-        sb_csa = int(csa_indptr_np[t])
-        sb_hca = int(hca_indptr_np[t])
-        if prefix_swa_count > 0:
-            gp = np.arange(swa_low, swa_low + prefix_swa_count)
-            paged = state_slot * cs + (gp % cs)
-            swa_arr[sb_swa : sb_swa + prefix_swa_count] = paged
-            csa_arr[sb_csa : sb_csa + prefix_swa_count] = paged
-            hca_arr[sb_hca : sb_hca + prefix_swa_count] = paged
-        if n_hca > 0:
-            hd = sb_hca + prefix_swa_count
-            hca_arr[hd : hd + n_hca] = swa_pages + block_tables_np[bid, :n_hca]
-    return ext_arr, swa_arr, csa_arr, hca_arr
 
 
 def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
@@ -1354,94 +1220,51 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     hca_indptr = torch.from_numpy(hca_indptr_np).to(device)
     T = len(batch_np)
 
-    if device.type == "cuda":
-        # On-GPU build (mirrors the persistent decode path): one kernel writes
-        # the shared SWA window prefix into all three buffers, a second appends
-        # the HCA compress tail straight from the GPU block table -- no Python
-        # per-token loop, no block-table D2H. The CSA topk tail is filled per
-        # layer by `csa_translate_pack` (left untouched here).
-        from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
+    # On-GPU build (mirrors the persistent decode path): one kernel writes
+    # the shared SWA window prefix into all three buffers, a second appends
+    # the HCA compress tail straight from the GPU block table
+    from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
 
-        from atom.plugin.vllm.deepseek_v4_ops import (
-            write_v4_decode_hca_compress_tail,
-        )
+    from atom.plugin.vllm.deepseek_v4_ops import (
+        write_v4_decode_hca_compress_tail,
+    )
 
-        swa_indices = torch.empty(max(swa_total, 1), dtype=torch.int32, device=device)
-        csa_indices = torch.empty(max(csa_total, 1), dtype=torch.int32, device=device)
-        hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
-        write_v4_paged_decode_indices(
-            state_slot_per_seq=md.state_slot_mapping,
-            batch_id_per_token=md.batch_id_per_token,
-            positions=positions_gpu,
-            swa_indptr=swa_indptr,
-            csa_indptr=csa_indptr,
-            hca_indptr=hca_indptr,
-            swa_indices=swa_indices,
-            csa_indices=csa_indices,
-            hca_indices=hca_indices,
-            T=T,
-            win=win,
-            cs=cs,
-        )
-        write_v4_decode_hca_compress_tail(
-            batch_id_per_token=md.batch_id_per_token,
-            positions=positions_gpu,
-            hca_indptr=hca_indptr,
-            n_committed_hca_per_seq=md.n_committed_hca_per_seq,
-            block_tables=common.block_table_tensor,
-            hca_indices=hca_indices,
-            T=T,
-            win=win,
-            swa_pages=swa_pages,
-        )
-        md.kv_indices_swa = swa_indices[:swa_total]
-        md.kv_indices_csa = csa_indices[:csa_total]
-        md.kv_indices_hca = hca_indices[:hca_total]
-    else:
-        # CPU reference path (unit tests / standalone): numpy build. `csa`'s
-        # topk tail is left uninitialized (filled per layer by
-        # `csa_translate_pack`), matching the GPU branch.
-        swa_vals = []
-        csa = np.empty(csa_total, dtype=np.int32)
-        hca = np.empty(hca_total, dtype=np.int32)
-        for t, bid in enumerate(batch_np):
-            slot = int(md.state_slot_mapping[int(bid)].item())
-            pos = int(pos_np[t])
-            n = int(swa_counts[t])
-            vals = [slot * win + ((pos - n + 1 + i) % win) for i in range(n)]
-            swa_vals.extend(vals)
-            csa[csa_indptr_np[t] : csa_indptr_np[t] + n] = vals
-            hca[hca_indptr_np[t] : hca_indptr_np[t] + n] = vals
-        # `hca` already holds the per-token SWA window prefix; append the HCA
-        # compress tail in place so the window prefix is preserved (the sparse
-        # decode kernel reads window-prefix + compress as one ragged segment).
-        _fill_hca_compress_tail(hca, md, common, hca_indptr_np, swa_counts, swa_pages)
-        md.kv_indices_swa = torch.tensor(swa_vals, dtype=torch.int32, device=device)
-        md.kv_indices_csa = torch.from_numpy(csa).to(device)
-        md.kv_indices_hca = torch.from_numpy(hca).to(device)
+    swa_indices = torch.empty(max(swa_total, 1), dtype=torch.int32, device=device)
+    csa_indices = torch.empty(max(csa_total, 1), dtype=torch.int32, device=device)
+    hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
+    write_v4_paged_decode_indices(
+        state_slot_per_seq=md.state_slot_mapping,
+        batch_id_per_token=md.batch_id_per_token,
+        positions=positions_gpu,
+        swa_indptr=swa_indptr,
+        csa_indptr=csa_indptr,
+        hca_indptr=hca_indptr,
+        swa_indices=swa_indices,
+        csa_indices=csa_indices,
+        hca_indices=hca_indices,
+        T=T,
+        win=win,
+        cs=cs,
+    )
+    write_v4_decode_hca_compress_tail(
+        batch_id_per_token=md.batch_id_per_token,
+        positions=positions_gpu,
+        hca_indptr=hca_indptr,
+        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+        block_tables=common.block_table_tensor,
+        hca_indices=hca_indices,
+        T=T,
+        win=win,
+        swa_pages=swa_pages,
+    )
+    md.kv_indices_swa = swa_indices[:swa_total]
+    md.kv_indices_csa = csa_indices[:csa_total]
+    md.kv_indices_hca = hca_indices[:hca_total]
 
     md.kv_indptr_swa = swa_indptr
     md.kv_indptr_csa = csa_indptr
     md.kv_indptr_hca = hca_indptr
     md.swa_pages = swa_pages
-
-
-def _fill_hca_compress_tail(out, md, common, indptr, prefix_counts, swa_pages):
-    """Write HCA compress-tail paged offsets into ``out`` in place.
-
-    Per token the tail occupies ``[indptr[t] + prefix_counts[t], +n_committed_hca)``;
-    the j-th committed HCA entry maps to physical block ``block_tables[seq, j]``
-    in the proxy compress region (``swa_pages + block_id``). The window-prefix
-    region ``[indptr[t], indptr[t] + prefix_counts[t])`` is left untouched so the
-    caller's own SWA-ring offsets survive (decode), or stays empty (prefill).
-    """
-    bt = common.block_table_tensor.detach().cpu().numpy()
-    batch_np = md.batch_id_per_token_cpu
-    hca_counts = md.n_committed_hca_per_seq_cpu[batch_np]
-    for t, bid in enumerate(batch_np):
-        start = int(indptr[t] + prefix_counts[t])
-        for j in range(int(hca_counts[t])):
-            out[start + j] = int(swa_pages + bt[int(bid), j])
 
 
 def get_deepseek_v4_proxy_metadata_from_vllm_context():
