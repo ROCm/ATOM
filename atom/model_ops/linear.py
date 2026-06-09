@@ -42,6 +42,10 @@ def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
 
+def use_triton_gemm_bf16() -> bool:
+    return envs.ATOM_USE_TRITON_GEMM_BF16
+
+
 def use_fp4_non_shuffle_triton_gemm() -> bool:
     return envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM
 
@@ -77,6 +81,73 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
+
+# bf16 (a16w16) Triton/gluon GEMM for gfx1250. When ATOM_USE_TRITON_GEMM_BF16=1,
+# the unquantized Linear path routes here instead of aiter tuned_gemm (which
+# defaults to torch/native on gfx1250). backend=None auto-selects the gfx1250
+# gluon kernel (and the pure-Triton kernel on other archs).
+if use_triton_gemm_bf16():
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
+            gemm_a16w16 as gemm_a16w16_triton,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton BF16 GEMM not available: {e}")
+        gemm_a16w16_triton = None
+else:
+    gemm_a16w16_triton = None
+
+
+# Decide the bf16 triton route ONCE at import. Reading the env (os.getenv) inside
+# the torch.compiled forward would be untraceable and force a dynamo graph break
+# (=> 'VllmBackend can only be called once'). A module-level bool is dynamo-safe.
+_USE_TRITON_GEMM_BF16 = use_triton_gemm_bf16() and gemm_a16w16_triton is not None
+
+
+def triton_bf16_mm_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    otype: Optional[torch.dtype],
+) -> torch.Tensor:
+    return torch.empty(
+        *x.shape[:-1], weight.shape[0], dtype=otype or x.dtype, device=x.device
+    )
+
+
+@torch_compile_guard(gen_fake=triton_bf16_mm_fake, mutates_args=[])
+def triton_bf16_mm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    otype: Optional[torch.dtype],
+) -> torch.Tensor:
+    """Route an unquantized (bf16/fp16) Linear through aiter's Triton/gluon
+    gemm_a16w16, wrapped as an opaque custom op so torch.compile does not trace
+    into the kernel (which graph-breaks and trips VllmBackend). The kernel
+    expects a 2D activation (M, K); flatten leading dims and restore them.
+
+    When the weight K is a 256-multiple (gfx1250 TDM route) force BLOCK_K=256 --
+    the lever that lifts this GEMM off the ~600 GB/s plateau -- and pad the
+    activation up to the weight K if it arrived narrower (a no-op when the
+    feeding RMSNorm already emitted the padded width)."""
+    Kw = weight.shape[-1]
+
+    def _mm(x2d):
+        # Weight may be pre-padded to a 256-multiple (gfx1250 TDM BLOCK_K=256
+        # route); pad the (small) activation to match -- a no-op when it already
+        # arrived padded. The GEMM config (incl. the BLOCK_K=256 decode tile vs
+        # the BLOCK_K=64 prefill tile) is loaded by aiter from the per-shape JSON
+        # in configs/gemm keyed on (N, K) and the M-bound, so nothing is forced
+        # here.
+        if x2d.shape[-1] < Kw:
+            x2d = torch.nn.functional.pad(x2d, (0, Kw - x2d.shape[-1]))
+        return gemm_a16w16_triton(x2d, weight, bias=bias, dtype=otype)
+
+    if x.dim() > 2:
+        y = _mm(x.reshape(-1, x.shape[-1]))
+        return y.reshape(*x.shape[:-1], y.shape[-1])
+    return _mm(x)
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 
@@ -591,17 +662,37 @@ class LinearBase(nn.Module):
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
+        # gfx1250 bf16 TDM BLOCK_K=256 route: pad the (un-sharded) K dim of
+        # flagged bf16 weights up to a 256-multiple, zero-filled. The matching
+        # activation arrives pre-padded from the feeding RMSNorm (qkv) or is
+        # padded defensively in triton_bf16_mm (router).
+        _pad_mult = getattr(self, "pad_input_to_multiple", 0)
+        if (
+            _pad_mult > 0
+            and self.quant_type.value == QuantType.No.value
+            and self.weight.dim() == 2
+        ):
+            _K = self.weight.shape[1]
+            _Kp = ((_K + _pad_mult - 1) // _pad_mult) * _pad_mult
+            if _Kp != _K:
+                self.weight.data = torch.nn.functional.pad(
+                    self.weight.data, (0, _Kp - _K)
+                ).contiguous()
+
     @mark_trace
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
-            y = tgemm.mm(
-                x,
-                self.weight,
-                self.bias,
-                otype=otype,
-            )
+            if _USE_TRITON_GEMM_BF16:
+                y = triton_bf16_mm(x, self.weight, self.bias, otype)
+            else:
+                y = tgemm.mm(
+                    x,
+                    self.weight,
+                    self.bias,
+                    otype=otype,
+                )
         else:
             if x_scale is None:
                 quant_func = self.quant_func
