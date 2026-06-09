@@ -1416,7 +1416,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         )
         ctx_mla_ps = (
             self.mla_persistent_metadata
-            if not use_persistent_metadata
+            if use_persistent_metadata
             else disabled_mla_persistent_metadata()
         )
         persistent_metadata = AiterMlaPersistentMetadataForVllm(**ctx_mla_ps)
