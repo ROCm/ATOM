@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from typing import Type
 
 import aiter
@@ -8,7 +9,7 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
 import atom.model_ops as ops
 from atom.model_ops.paged_attention import PagedAttention
@@ -20,6 +21,9 @@ from .backends import AttentionBackend, CommonAttentionBuilder
 from atom.plugin.prepare import is_plugin_mode
 from atom.plugin.attention import AiterAttentionMetadataBuilderDecoratorForPluginMode
 from atom.plugin.attention import AiterBackendDecoratorForPluginMode
+
+
+logger = logging.getLogger("atom")
 
 
 def cdiv(a, b):
@@ -53,6 +57,7 @@ class AiterBackend(AttentionBackend):
 )
 class AiterAttentionMetadataBuilder:
     BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
+    _gptoss_hybrid_layout_log_keys: set[str] = set()
 
     def __init__(
         self,
@@ -62,7 +67,15 @@ class AiterAttentionMetadataBuilder:
         device=None,
         model_runner=None,
     ):
-        self.block_size = 1024 if model_runner.block_size == 1024 else 16
+        if model_runner.block_size == 1024:
+            self.block_size = 1024
+        elif (
+            envs.ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM
+            and model_runner.block_size == 256
+        ):
+            self.block_size = 256
+        else:
+            self.block_size = 16
         # Note: Cannot use super() here because the class is dynamically created by decorator
         # Use explicit parent class call instead
         CommonAttentionBuilder.__init__(self, model_runner)
@@ -431,6 +444,7 @@ class AiterAttentionMetadataBuilder:
         runner = self.model_runner
         config = runner.config
         hf_config = config.hf_config
+        impl = getattr(module, "impl", None)
 
         # attn_idx: hybrid models (Qwen3-Next) skip linear-attention layers
         # in the kv_cache slot ordering; non-hybrid models use layer_id 1:1.
@@ -503,6 +517,21 @@ class AiterAttentionMetadataBuilder:
                 hf_config.head_dim,
                 x,
             )
+            if impl is not None:
+                impl.use_flash_layout = False
+            if (
+                envs.ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM
+                and impl is not None
+                and getattr(impl, "sliding_window", -1) == -1
+            ):
+                log_key = "full-asm-shuffle"
+                if log_key not in self._gptoss_hybrid_layout_log_keys:
+                    self._gptoss_hybrid_layout_log_keys.add(log_key)
+                    logger.info(
+                        "ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM: binding GPT-OSS "
+                        "full-attention MHA layers with AITER shuffle KV "
+                        "layout for pa_decode_bf16_asm"
+                    )
             if config.kv_cache_dtype == "fp8":
                 module.k_scale = runner.kv_scale[0, attn_idx]
                 module.v_scale = runner.kv_scale[1, attn_idx]
