@@ -283,6 +283,9 @@ class ForwardMode:
         """
         if self.is_prefill or self.attn_tensors_are_padded:
             return
+        # Dummy runs doesn't apply there.
+        if attn_metadata.slot_mapping is None:
+            return
         max_q = attn_metadata.max_seqlen_q
         expected = self.effective_bs * max_q
         actual_in = input_ids.shape[0]
