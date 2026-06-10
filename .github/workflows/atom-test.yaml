@@ -467,7 +467,7 @@ jobs:
         timeout-minutes: 90
         env:
           RCCL_REPO: https://github.com/ROCm/rccl.git
-          RCCL_REF: a70e4c37543a7cad8286ced536bac75b08bd5c5a
+          RCCL_REF: 96a25b5fd6f73fba58c7d83eb57cf19a50230aa4
         run: |
           docker exec \
             -e RCCL_REPO="${RCCL_REPO}" \
