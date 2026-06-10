@@ -78,10 +78,31 @@ if use_triton_gemm():
     except ImportError as e:
         logger.warning(f"Triton w8a8 GEMM not available: {e}")
         gemm_a8w8_blockscale_bpreshuffle_triton = None
+
+    # Plain (non-preshuffle) Triton blockscale GEMM. Consumes an unshuffled
+    # (N, K) weight with row-major x_scale (M, scale_k) and w_scale
+    # (scale_n, scale_k) -- the same layout the non-preshuffle path produces.
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale as gemm_a8w8_blockscale_triton,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton w8a8 blockscale GEMM not available: {e}")
+        gemm_a8w8_blockscale_triton = None
+
+    # Per-tensor / per-token a8w8 (per-row activation x per-column weight scale).
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
+            gemm_a8w8 as gemm_a8w8_triton,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton a8w8 GEMM not available: {e}")
+        gemm_a8w8_triton = None
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
-
+    gemm_a8w8_blockscale_triton = None
+    gemm_a8w8_triton = None
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 
@@ -268,6 +289,31 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     else:
         y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
     return y
+
+
+def gemm_a8w8_blockscale_triton_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
+
+
+@mark_trace(torch_compile=False)
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_triton_fake, mutates_args=[])
+def gemm_a8w8_blockscale_triton_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    # Wrap the raw Triton launcher in a custom-op boundary so Dynamo treats it
+    # as opaque (otherwise tracing into the Triton kernel launch causes a graph
+    # break that splits the compiled model into >1 graph).
+    return gemm_a8w8_blockscale_triton(x, weight, x_scale, w_scale, dtype)
 
 
 def gemm_a8w8_per_tensor_fake(
@@ -732,13 +778,22 @@ class LinearBase(nn.Module):
                         prefix=self.prefix,
                     )
                 else:
-                    y = gemm_a8w8_blockscale(
-                        x,
-                        self.weight,
-                        x_scale,
-                        self.weight_scale,
-                        dtype=otype,
-                    )
+                    if use_triton_gemm() and gemm_a8w8_blockscale_triton is not None:
+                        y = gemm_a8w8_blockscale_triton_impl(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            dtype=otype,
+                        )
+                    else:
+                        y = gemm_a8w8_blockscale(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            dtype=otype,
+                        )
                 if self.bias is not None:
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
