@@ -599,6 +599,10 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
                     token_to_seq, swa_seqlen_for_extend
                 )
                 fetched_shape = cu_seq_lens[-1].item()
+                assert self.swa_max_num_heads_kv > 0, (
+                    "SWA is enabled but no per-layer num_kv_heads was found on any "
+                    "attention layer; swa_workspace would be zero-sized."
+                )
                 swa_workspace = torch.empty(
                     (2, fetched_shape, self.swa_max_num_heads_kv, self.head_dim),
                     dtype=self.vllm_config.model_config.dtype,
