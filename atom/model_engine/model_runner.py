@@ -45,6 +45,7 @@ from atom.utils.tbo import (
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
+    ForwardMode,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
@@ -1784,34 +1785,42 @@ class ModelRunner:
             ub_max_tokens_across_dp,
         ) = self._preprocess(batch, num_scheduled_tokens=num_scheduled_tokens)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
+
+        forward_mode = ForwardMode.decide(
+            is_prefill=is_prefill,
+            total_seqs_num=batch.total_seqs_num,
+            scheduled_bs_decode=batch.total_seqs_num_decode,
+            num_input_tokens=num_input_tokens,
+            dp_uniform_decode=dp_uniform_decode,
+            enforce_eager=self.enforce_eager,
+            graph_bs=self.graph_bs,
+            mtp_step=(self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1,
+        )
+
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
-            # num_pad, num_tokens_across_dp = self.get_dp_padding(scheduled_bs)
-            # padded_scheduled_bs = scheduled_bs + num_pad
-            # TODO rename num_input_tokens to actual bs in currrent rank?
-            padded_scheduled_bs = num_input_tokens
-            # for MTP, we need to divide by (mtp_k + 1) to get the actual batch size
-            if hasattr(self, "drafter"):
-                mtp_step = self.drafter.mtp_k + 1
-                padded_scheduled_bs = (padded_scheduled_bs + mtp_step - 1) // mtp_step
-            bs = (
-                padded_scheduled_bs
-                if self.enforce_eager
-                else next(
-                    (x for x in self.graph_bs if x >= padded_scheduled_bs),
-                    padded_scheduled_bs,
+            bs = forward_mode.effective_bs  # single source of truth
+            assert bs >= scheduled_bs, (
+                f"effective_bs={bs} < scheduled_bs={scheduled_bs}; "
+                f"ForwardMode.decide invariant violated"
+            )
+            # Only pad cu_seqlens_q out to the cudagraph capture size if we
+            # actually grew bs. Eager (bs == scheduled_bs) leaves the slice
+            # empty so no overwrite happens.
+            if bs > scheduled_bs:
+                self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
+                    self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
                 )
-            )
-            assert (
-                bs >= padded_scheduled_bs
-            ), f"current decode {padded_scheduled_bs=} > max graph_bs{bs}"
-            self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
-                self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
-            )
         attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
 
-        graph_bs = num_input_tokens if is_prefill else bs
+        # MoE's pad_for_all_gather reads context.graph_bs to pad hidden_states
+        # before a cross-DP all_gather, so it must be unified across DP ranks
+        # under uniform decode (where pad path is taken). Use forward_mode's
+        # moe_pad_bs, which equals effective_bs except in the uniform-eager
+        # corner (enforce_eager / bs>graph_bs[-1]) where attention needs local
+        # but MoE pad needs the DP-unified padded_scheduled_bs.
+        graph_bs = num_input_tokens if is_prefill else forward_mode.moe_pad_bs
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
@@ -1819,6 +1828,7 @@ class ModelRunner:
             batch_size=context_bs,
             graph_bs=graph_bs,
             dp_uniform_decode=dp_uniform_decode,
+            forward_mode=forward_mode,
         )
 
         actual_num_tokens = batch.total_tokens_num
@@ -1930,12 +1940,21 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
 
-        if (
-            is_prefill
-            or self.enforce_eager
-            or not context.dp_uniform_decode
-            or bs > self.graph_bs[-1]
-        ):
+        # Dispatch is owned by ForwardMode.decide() (called in prepare_inputs).
+        # Every run_model caller MUST go through prepare_inputs first, so
+        # forward_mode is always set here.
+        forward_mode = context.forward_mode
+        assert forward_mode is not None, (
+            "context.forward_mode is None; run_model invoked without going "
+            "through prepare_inputs. Add ForwardMode.decide() at the new "
+            "entry point instead of re-deriving the 4-OR dispatch here."
+        )
+
+        # Single canonical shape check; contract owned by ForwardMode, which
+        # internally short-circuits for prefill / cudagraph.
+        forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
+
+        if not forward_mode.use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             if is_prefill:

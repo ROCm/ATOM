@@ -31,10 +31,13 @@ class TritonMHABackend(AttentionBackend):
 
 
 class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
-    """MHA metadata builder that allocates KV cache in flash layout.
+    """MHA metadata builder that allocates KV cache in 5D SHUFFLE layout.
 
-    Flash layout: K/V both [num_blocks, block_size, num_kv_heads, head_dim].
-    Consumed directly by aiter triton `unified_attention` for prefill+decode.
+    SHUFFLE layout (x = 16 // itemsize):
+      K [num_blocks, num_kv_heads, head_dim // x, block_size, x]
+      V [num_blocks, num_kv_heads, block_size // x, head_dim, x]
+    Consumed by aiter triton `unified_attention` with `shuffled_kv_cache=True`
+    for both prefill and decode.
     """
 
     def prepare_prefill(self, batch: ScheduledBatch):
@@ -93,17 +96,22 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         else:
             attn_idx = layer_id
 
+        # 5D SHUFFLE layout, identical to AiterAttentionMetadataBuilder's
+        # standard MHA path, consumed by unified_attention(shuffled_kv_cache=True).
+        x = 16 // runner.kv_cache.element_size()
         k_cache = runner.kv_cache[0, attn_idx].view(
             runner.num_physical_kvcache_blocks,
-            runner.physical_block_size,
             runner.num_kv_heads,
-            hf_config.head_dim,
+            hf_config.head_dim // x,
+            runner.physical_block_size,
+            x,
         )
         v_cache = runner.kv_cache[1, attn_idx].view(
             runner.num_physical_kvcache_blocks,
-            runner.physical_block_size,
             runner.num_kv_heads,
+            runner.physical_block_size // x,
             hf_config.head_dim,
+            x,
         )
         if config.kv_cache_dtype == "fp8":
             module.k_scale = runner.kv_scale[0, attn_idx]
@@ -113,7 +121,9 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         module.k_cache = k_cache
         module.v_cache = v_cache
         if impl is not None:
-            impl.use_flash_layout = True
+            # KV cache is no longer in flash (4D) layout; unified_attention is
+            # selected via ATOM_USE_UNIFIED_ATTN, and reads the SHUFFLE layout.
+            impl.use_flash_layout = False
 
         return KVCacheTensor(
             layer_num=layer_id,
