@@ -14,6 +14,7 @@ from aiter import (
 )
 from aiter.dist.communication_op import (
     tensor_model_parallel_fused_allreduce_rmsnorm,
+    tensor_model_parallel_fused_allreduce_rmsnorm_fp32,
     tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
@@ -219,6 +220,7 @@ class RMSNorm(nn.Module):
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
         fused_quant: bool = False,
+        emit_fp32: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -229,6 +231,10 @@ class RMSNorm(nn.Module):
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
         self.use_fused_quant = fused_quant
+        # When True (only valid on the fused_allreduce path), forward returns an
+        # extra fp32 mirror of the normed output so consumers (e.g. the MoE
+        # router gate) can skip a separate .float() cast.
+        self.emit_fp32 = emit_fp32
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.prefix = prefix
@@ -360,6 +366,19 @@ class RMSNorm(nn.Module):
                 residual is not None
             ), "fused_allreduce_rmsnorm requires residual input!"
             # tensor_model_parallel_fused_allreduce_rmsnorm does not support non-contiguous input
+            if self.emit_fp32:
+                # Also emit an fp32 mirror of the normed output; return the
+                # normed output as an (bf16, fp32) tuple so the consumer can use
+                # the fp32 copy without a separate .float() cast.
+                x_bf16, residual, x_fp32 = (
+                    tensor_model_parallel_fused_allreduce_rmsnorm_fp32(
+                        x.contiguous(),
+                        residual,
+                        self.weight,
+                        self.eps,
+                    )
+                )
+                return (x_bf16, x_fp32), residual
             x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
                 x.contiguous(),
                 residual,

@@ -83,26 +83,41 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        # Match vLLM: gate weights in fp32 for routing precision
-        old_wlp = self.gate.weight.weight_loader_process
-        self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
-        self.gate.weight.weight_loader_process = old_wlp
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def process_weights_after_loading(self):
+        # Keep the router gate weight in fp32 for routing precision (matches
+        # vLLM). Converting here -- after the checkpoint has been loaded --
+        # means forward() can use self.gate.weight directly with no per-call
+        # .float() cast on the weight. The loader invokes this hook once after
+        # weight loading completes.
+        if self.gate.weight.dtype != torch.float32:
+            self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp32: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         assert (
             hidden_states.dim() <= 2
         ), "MiniMaxM2SparseMoeBlock only supports 1D or 2D inputs"
         is_input_1d = hidden_states.dim() == 1
 
-        num_tokens, hidden_dim = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # Use fp32 for gate computation to match reference precision.
         # With 256 experts + sigmoid scoring + bias correction, bf16
         # gate precision causes enough routing errors to degrade accuracy.
-        router_logits = torch.nn.functional.linear(
-            hidden_states.float(), self.gate.weight.float()
-        )
+        # gate.weight is converted to fp32 in process_weights_after_loading.
+        # When the upstream RMSNorm already produced an fp32 mirror of the
+        # normed activation (hidden_states_fp32), use it directly to also skip
+        # the per-token hidden_states.float() cast; otherwise fall back to it.
+        if hidden_states_fp32 is not None:
+            gate_input = hidden_states_fp32.view(-1, hidden_dim)
+        else:
+            gate_input = hidden_states.float()
+        router_logits = torch.nn.functional.linear(gate_input, self.gate.weight)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -323,6 +338,9 @@ class MiniMaxM2DecoderLayer(nn.Module):
         # fuse the activation quant into input_layernorm's AllReduce+RMSNorm so
         # qkv_proj receives (fp8, scale) directly and skips a separate quant
         # kernel. Only meaningful on the fused-allreduce path (tp>1, layer>0).
+        # NOTE: quant_config + the qkv_proj prefix MUST be passed so RMSNorm
+        # resolves quant_type=per_1x128 (matching the Linear); without them it
+        # defaults to quant_type=No and the fused-quant branch is never taken.
         qkv = self.self_attn.qkv_proj
         qkv_group_quant = (
             qkv.quant_type.value == QuantType.per_1x128.value
@@ -337,10 +355,15 @@ class MiniMaxM2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn.qkv_proj",
         )
+        # Request an fp32 mirror of the normed output on the fused-allreduce
+        # path so the MoE router gate can consume fp32 hidden_states directly
+        # (skips a per-token hidden_states.float() cast). Only meaningful when
+        # the fused AR+RMSNorm path is actually taken (tp>1 checked at runtime).
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            emit_fp32=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
     def forward(
@@ -369,7 +392,14 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
-        hidden_states = self.block_sparse_moe(hidden_states)
+        # On the fused AR+RMSNorm path with emit_fp32, post_attention_layernorm
+        # returns the normed output as a (bf16, fp32) tuple. The MoE experts
+        # consume the bf16 view; the router gate consumes the fp32 view.
+        hidden_states_fp32 = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_fp32 = hidden_states
+
+        hidden_states = self.block_sparse_moe(hidden_states, hidden_states_fp32)
 
         return hidden_states, residual
 
