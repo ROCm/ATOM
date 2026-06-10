@@ -227,7 +227,7 @@ class PagedAttentionImpl(nn.Module):
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
-            if self.kv_cache_dtype.startswith("fp8"):
+            if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
                 q_out = torch.empty(*q.shape, dtype=k_cache.dtype, device=q.device)
             else:
                 q_out = q
@@ -402,7 +402,11 @@ class PagedAttentionImpl(nn.Module):
 
         attn_metadata = fwd_ctx.attn_metadata
 
-        o = torch.empty_like(q)
+        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+            o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
+        else:
+            o = torch.empty_like(q)
+
         num_seqs = attn_metadata.context_lens.shape[0]
 
         if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
@@ -598,7 +602,11 @@ class PagedAttentionImpl(nn.Module):
 
         attn_metadata = fwd_ctx.attn_metadata
 
-        o = torch.empty_like(q)
+        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+            o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
+        else:
+            o = torch.empty_like(q)
+
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
