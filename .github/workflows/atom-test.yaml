@@ -487,6 +487,15 @@ jobs:
             pip show amd-aiter
           "
 
+      - name: Pin Triton to 3.6.0
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc "
+            set -euo pipefail
+            echo '=== Pinning Triton to 3.6.0 ==='
+            pip install --timeout 60 --retries 10 --force-reinstall --no-deps 'triton==3.6.0'
+            pip show triton | grep -E '^(Name|Version):'
+          "
+
       - name: Install ATOM and dependencies
         run: |
           docker exec "$CONTAINER_NAME" bash -lc "
