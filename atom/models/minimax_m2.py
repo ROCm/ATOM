@@ -248,14 +248,18 @@ class MiniMaxM2Attention(nn.Module):
                 if cos_sin_cache.dtype != qkv.dtype or cos_sin_cache.device != qkv.device:
                     cos_sin_cache = cos_sin_cache.to(device=qkv.device, dtype=qkv.dtype)
                 fwd_ctx = get_forward_context()
+                fwd_context = getattr(fwd_ctx, "context", None)
+                kv_cache_data = getattr(fwd_ctx, "kv_cache_data", None)
                 use_fused_cache_quant = (
                     self.kv_cache_dtype == "fp8"
                     and hasattr(self.attn, "impl")
-                    and not fwd_ctx.context.is_dummy_run
-                    and f"layer_{self.layer_num}" in fwd_ctx.kv_cache_data
+                    and fwd_context is not None
+                    and not fwd_context.is_dummy_run
+                    and kv_cache_data is not None
+                    and f"layer_{self.layer_num}" in kv_cache_data
                 )
                 if use_fused_cache_quant:
-                    kv_cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+                    kv_cache = kv_cache_data[f"layer_{self.layer_num}"]
                     k_cache = kv_cache.k_cache
                     v_cache = kv_cache.v_cache
                     k_scale = kv_cache.k_scale
