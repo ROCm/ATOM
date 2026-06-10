@@ -248,6 +248,10 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
             decode_bufs=decode_bufs,
             capturing=capturing,
         )
+        # Native ATOM enables V4 compressor side-stream launches only while the
+        # forward is being captured into a HIP/CUDA graph. vLLM builds this metadata
+        # on the capture path, so carry the signal into ATOM's forward context.
+        md.in_hipgraph = bool(capturing)
         # Selective per-slot reset OUTSIDE the captured region. For decode this
         # is empty (no fresh slots are bound mid-generation); it fires for the
         # prefill chunk that first allocates a request's slot, which is eager.
@@ -1280,6 +1284,28 @@ def get_deepseek_v4_proxy_metadata_from_vllm_context():
     return None
 
 
+def _is_vllm_decode_graph_warmup(attn_metadata) -> bool:
+    """True for vLLM's eager warmup immediately before FULL decode capture.
+
+    Native ATOM sets ``in_hipgraph=True`` for both the eager warmup on the graph
+    stream and the following ``torch.cuda.graph`` capture. vLLM labels the
+    warmup forward as ``CUDAGraphMode.NONE`` even though it runs on the same
+    graph stream and is preparing a concrete capture bucket. ATOM patches vLLM's
+    ``_warmup_and_capture`` at runtime to expose that phase without modifying
+    vLLM sources.
+    """
+    if getattr(getattr(attn_metadata, "state", None), "value", None) != "decode":
+        return False
+    try:
+        from atom.plugin.vllm.cudagraph_phase_patch import (
+            is_vllm_graph_capture_phase,
+        )
+
+        return is_vllm_graph_capture_phase()
+    except Exception:
+        return False
+
+
 @contextmanager
 def atom_deepseek_v4_forward_context(
     *,
@@ -1322,28 +1348,9 @@ def atom_deepseek_v4_forward_context(
             reset_slots = getattr(attn_metadata, "reset_slots", None)
             if reset_slots:
                 reset_deepseek_v4_state_slots(state_model, reset_slots)
-    import os
-
-    if os.environ.get("ATOM_VLLM_V4_DEBUG") == "1":
-        try:
-            import torch.distributed as dist
-
-            rank = dist.get_rank() if dist.is_initialized() else 0
-        except Exception:
-            rank = 0
-        if rank == 0:
-            ids = None if input_ids is None else input_ids[:8].detach().cpu().tolist()
-            pos = positions[:8].detach().cpu().tolist()
-            seq = (
-                None
-                if common_attn_metadata is None
-                else common_attn_metadata.seq_lens[:8].detach().cpu().tolist()
-            )
-            n_csa = getattr(attn_metadata, "n_committed_csa_per_seq_cpu", None)
-            print(
-                f"[ATOM_VLLM_V4_DEBUG] state={attn_metadata.state} max_q={attn_metadata.max_seqlen_q} ids={ids} pos={pos} seq={seq} n_csa={None if n_csa is None else n_csa[:8].tolist()}",
-                flush=True,
-            )
+    in_hipgraph = bool(getattr(attn_metadata, "in_hipgraph", False)) or (
+        _is_vllm_decode_graph_warmup(attn_metadata)
+    )
     is_prefill = attn_metadata.state.value.startswith("prefill")
     batch_size = int(
         getattr(common_attn_metadata, "num_reqs", 0)
@@ -1362,6 +1369,7 @@ def atom_deepseek_v4_forward_context(
         atom_config=atom_config,
         context=context,
         num_tokens=int(positions.numel()),
+        in_hipgraph=in_hipgraph,
     )
     try:
         yield

@@ -138,3 +138,9 @@ def register_model() -> None:
     from atom.plugin.vllm.graph_capture_patch import apply_graph_capture_patch
 
     apply_graph_capture_patch()
+
+    from atom.plugin.vllm.cudagraph_phase_patch import (
+        apply_vllm_cudagraph_phase_patch,
+    )
+
+    apply_vllm_cudagraph_phase_patch()
