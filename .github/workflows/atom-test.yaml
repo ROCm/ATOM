@@ -417,6 +417,9 @@ jobs:
 
           # Write env_vars via env block (avoids expression injection)
           printenv MODEL_ENV_VARS | grep -v '^$' > /tmp/env_file.txt || true
+          if [ "${{ matrix.runner }}" = "linux-atom-do-mi350x-8" ]; then
+            echo "NCCL_P2P_DISABLE=1" >> /tmp/env_file.txt
+          fi
 
           IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
           echo "Starting container with image: $IMAGE_TAG"
