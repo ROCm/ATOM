@@ -227,6 +227,10 @@ class PagedAttentionImpl(nn.Module):
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
+            if self.kv_cache_dtype.startswith("fp8"):
+                q_out = torch.empty(*q.shape, dtype=k_cache.dtype, device=q.device)
+            else:
+                q_out = q
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                 q,
                 k,
@@ -243,7 +247,7 @@ class PagedAttentionImpl(nn.Module):
                 flash_layout=self.use_flash_layout,
                 apply_scale=self.kv_cache_dtype.startswith("fp8"),
                 offs=None,
-                q_out=q,
+                q_out=q_out,
                 k_out=k,
                 output_zeros=False,
             )
