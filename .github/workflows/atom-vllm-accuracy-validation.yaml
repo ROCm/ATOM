@@ -669,7 +669,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 1",
                   "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
                   "accuracy_test_threshold": 0.88,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1\nVLLM_USE_V2_MODEL_RUNNER=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -833,7 +833,7 @@ jobs:
               },
               "gpt-oss-120b TP1": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1\nVLLM_USE_V2_MODEL_RUNNER=1",
               },
               "gpt-oss-120b TP2": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 2 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
