@@ -97,7 +97,7 @@
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": ""
+    "env_vars": "VLLM_USE_V2_MODEL_RUNNER=1"
   },
   {
     "display": "Kimi-K2.5-MXFP4",

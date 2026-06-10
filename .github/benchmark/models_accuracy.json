@@ -64,7 +64,7 @@
     "model_path": "openai/gpt-oss-120b",
     "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5",
     "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
-    "env_vars": "",
+    "env_vars": "VLLM_USE_V2_MODEL_RUNNER=1",
     "runner": "linux-atom-mi35x-1",
     "test_level": "pr",
     "accuracy_threshold": 0.88,

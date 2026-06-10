@@ -17,6 +17,7 @@ All the operations below will be executed inside the container.
 GPT-OSS-120B fits on a single MI300X/MI355X GPU:
 
 ```bash
+VLLM_USE_V2_MODEL_RUNNER=1 \
 python -m atom.entrypoints.openai_server \
   --model openai/gpt-oss-120b \
   --kv_cache_dtype fp8 \
