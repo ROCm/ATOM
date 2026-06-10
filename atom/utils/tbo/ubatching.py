@@ -161,21 +161,21 @@ def sync_dp_for_tbo(
     sync = torch.stack(gathered, dim=1)  # [n_fields, dp_size]
 
     num_tokens_across_dp = sync[0]
-    any_rank_has_prefill = bool(sync[1].any().item())
+    any_rank_has_prefill = bool(sync[1].any())
     tbo_collective_active = False
     ub_max_tokens_across_dp: Optional[tuple[int, int]] = None
     if tbo_on:
-        tbo_collective_active = bool(sync[2].all().item())
+        tbo_collective_active = bool(sync[2].all())
         # Mixed-mode guard — only needed when `require_uniform_mode` is set
         # (i.e. prefill token-split + TBO decode, see call site).
         if tbo_collective_active and require_uniform_mode:
-            prefill_rank_count = int(sync[1].sum().item())
+            prefill_rank_count = int(sync[1].sum())
             uniform_mode = prefill_rank_count == 0 or prefill_rank_count == dp_size
             tbo_collective_active = uniform_mode
         if tbo_collective_active:
             ub_max_tokens_across_dp = (
-                int(sync[3].max().item()),
-                int(sync[4].max().item()),
+                int(sync[3].max()),
+                int(sync[4].max()),
             )
 
     return DPSyncResult(

@@ -1640,9 +1640,9 @@ class ModelRunner:
         num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
             num_tokens, dp_size, dp_rank
         )
-        max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp).item()
+        max_tokens_across_dp = int(torch.max(num_tokens_across_dp))
 
-        return max_tokens_across_dp_cpu - num_tokens, num_tokens_across_dp
+        return max_tokens_across_dp - num_tokens, num_tokens_across_dp
 
     def _maybe_create_tbo_slices(
         self,
@@ -1736,7 +1736,7 @@ class ModelRunner:
             require_uniform_mode=require_uniform_mode,
         )
 
-        max_tokens = int(sync.num_tokens_across_dp.max().item())
+        max_tokens = int(sync.num_tokens_across_dp.max())
         dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention
         )
