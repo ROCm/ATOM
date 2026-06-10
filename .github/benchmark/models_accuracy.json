@@ -60,6 +60,18 @@
     "_baseline_note": "Same base model as DeepSeek-R1-0528 FP8"
   },
   {
+    "model_name": "DeepSeek-R1-0528 MTP Online-Quant",
+    "model_path": "deepseek-ai/DeepSeek-R1-0528",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --online_quant_config '{\"global_quant_config\":\"ptpc_fp8\",\"layer_quant_config\":{\"*expert*\":\"mxfp4\"},\"exclude_layer\":[\"lm_head\",\"*.gate.*\"]}' --method mtp --num-speculative-tokens 3",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.9553,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528",
+    "_baseline_note": "Online quantization on top of DeepSeek-R1-0528 MTP (FP8 native): global ptpc_fp8 + expert layers mxfp4, excluding lm_head and *.gate.*. Threshold set to 0.93 (same headroom as DeepSeek-R1-0528-FP4 MTP) as a conservative placeholder for the MoE-MXFP4 accuracy drop; refresh after the first CI measurement."
+  },
+  {
     "model_name": "gpt-oss-120b",
     "model_path": "openai/gpt-oss-120b",
     "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5",
