@@ -49,6 +49,7 @@ def test_generate_from_vllm_translates_core_fields(monkeypatch):
         ),
         compilation_config=_Obj(mode=3),
         quant_config=_Obj(name="q"),
+        additional_config={},
     )
 
     cfg = plugin_config._generate_atom_config_from_vllm_config(vllm_cfg)
@@ -63,6 +64,89 @@ def test_generate_from_vllm_translates_core_fields(monkeypatch):
     assert cfg.plugin_config.is_plugin_mode is True
     assert cfg.plugin_config.is_vllm is True
     assert cfg.plugin_config.is_sglang is False
+
+
+def test_generate_from_vllm_reads_namespaced_online_quant_config(monkeypatch):
+    _patch_atom_config_module(monkeypatch)
+    online_quant_config = {
+        "global_quant_config": "ptpc_fp8",
+        "layer_quant_config": {"*expert*": "mxfp4"},
+        "exclude_layer": "lm_head",
+    }
+
+    vllm_cfg = _Obj(
+        model_config=_Obj(model="m1", max_model_len=4096),
+        scheduler_config=_Obj(max_num_batched_tokens=2048, max_num_seqs=8),
+        cache_config=_Obj(
+            gpu_memory_utilization=0.5,
+            block_size=16,
+            num_gpu_blocks=1024,
+            cache_dtype="auto",
+            enable_prefix_caching=True,
+        ),
+        parallel_config=_Obj(
+            rank=1, tensor_parallel_size=2, enable_expert_parallel=False
+        ),
+        compilation_config=_Obj(mode=3),
+        quant_config=_Obj(name="q"),
+        additional_config={"atom": {"online_quant_config": online_quant_config}},
+    )
+
+    cfg = plugin_config._generate_atom_config_from_vllm_config(vllm_cfg)
+
+    assert cfg.online_quant_config == online_quant_config
+
+
+def test_generate_from_vllm_reads_top_level_online_quant_config(monkeypatch):
+    _patch_atom_config_module(monkeypatch)
+    online_quant_config = {"global_quant_config": "ptpc_fp8"}
+
+    vllm_cfg = _Obj(
+        model_config=_Obj(model="m1", max_model_len=4096),
+        scheduler_config=_Obj(max_num_batched_tokens=2048, max_num_seqs=8),
+        cache_config=_Obj(
+            gpu_memory_utilization=0.5,
+            block_size=16,
+            num_gpu_blocks=1024,
+            cache_dtype="auto",
+            enable_prefix_caching=True,
+        ),
+        parallel_config=_Obj(
+            rank=1, tensor_parallel_size=2, enable_expert_parallel=False
+        ),
+        compilation_config=_Obj(mode=3),
+        quant_config=_Obj(name="q"),
+        additional_config={"online_quant_config": online_quant_config},
+    )
+
+    cfg = plugin_config._generate_atom_config_from_vllm_config(vllm_cfg)
+
+    assert cfg.online_quant_config == online_quant_config
+
+
+def test_generate_from_vllm_rejects_invalid_online_quant_config(monkeypatch):
+    _patch_atom_config_module(monkeypatch)
+
+    vllm_cfg = _Obj(
+        model_config=_Obj(model="m1", max_model_len=4096),
+        scheduler_config=_Obj(max_num_batched_tokens=2048, max_num_seqs=8),
+        cache_config=_Obj(
+            gpu_memory_utilization=0.5,
+            block_size=16,
+            num_gpu_blocks=1024,
+            cache_dtype="auto",
+            enable_prefix_caching=True,
+        ),
+        parallel_config=_Obj(
+            rank=1, tensor_parallel_size=2, enable_expert_parallel=False
+        ),
+        compilation_config=_Obj(mode=3),
+        quant_config=_Obj(name="q"),
+        additional_config={"atom": {"online_quant_config": "ptpc_fp8"}},
+    )
+
+    with pytest.raises(ValueError, match="online_quant_config"):
+        plugin_config._generate_atom_config_from_vllm_config(vllm_cfg)
 
 
 def test_generate_atom_config_requires_plugin_mode(monkeypatch):

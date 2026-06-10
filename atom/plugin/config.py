@@ -109,7 +109,36 @@ def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
     )
 
 
-def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
+def _extract_vllm_online_quant_config(config: Any) -> Optional[dict]:
+    additional_config = getattr(config, "additional_config", None) or {}
+    if not isinstance(additional_config, dict):
+        raise ValueError(
+            "vLLM additional_config must be a dict when used with ATOM plugin "
+            f"settings, got {type(additional_config).__name__}."
+        )
+
+    atom_config = additional_config.get("atom")
+    if atom_config is not None:
+        if not isinstance(atom_config, dict):
+            raise ValueError(
+                'vLLM additional_config["atom"] must be a dict when provided, '
+                f"got {type(atom_config).__name__}."
+            )
+        online_quant_config = atom_config.get("online_quant_config")
+    else:
+        online_quant_config = additional_config.get("online_quant_config")
+
+    if online_quant_config is None:
+        return None
+    if not isinstance(online_quant_config, dict):
+        raise ValueError(
+            "ATOM vLLM online_quant_config must be a JSON object/dict, "
+            f"got {type(online_quant_config).__name__}."
+        )
+    return online_quant_config
+
+
+def _generate_atom_config_from_vllm_config(config: Any) -> Any:
     from atom.config import Config, CompilationConfig
 
     vllm_model_config = config.model_config
@@ -156,6 +185,11 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     atom_speculative_config = _build_atom_speculative_config_from_vllm(
         getattr(config, "speculative_config", None)
     )
+    online_quant_config = _extract_vllm_online_quant_config(config)
+    if online_quant_config is not None:
+        logger.info(
+            "Using ATOM online quantization config from vLLM additional_config."
+        )
 
     return Config(
         model=vllm_model_config.model,
@@ -181,6 +215,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         enable_dp_attention=False,
         plugin_config=plugin_config,
         speculative_config=atom_speculative_config,
+        online_quant_config=online_quant_config,
     )
 
 

@@ -237,6 +237,15 @@ vllm serve ${model} \
     --no-enable-prefix-caching
 ```
 
+ATOM-specific plugin options should be passed through vLLM's official
+`--additional-config` argument. For example, to enable ATOM online
+quantization in plugin mode:
+
+```bash
+vllm serve ${model} \
+    --additional-config '{"atom": {"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config": {"*expert*": "mxfp4"}, "exclude_layer": "lm_head"}}}'
+```
+
 ATOM will log its activation at startup:
 
 ```
