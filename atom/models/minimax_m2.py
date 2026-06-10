@@ -26,6 +26,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
@@ -182,6 +183,12 @@ class MiniMaxM2Attention(nn.Module):
         )
         self.rotary_dim = rotary_dim
         self.kv_cache_dtype = kv_cache_dtype
+        self.delegate_qknorm_rope_to_vllm = (
+            is_vllm()
+            and self.use_qk_norm
+            and self.tp_size > 1
+            and self.kv_cache_dtype == "fp8"
+        )
         cos = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
         sin = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
         self.register_buffer(
@@ -215,7 +222,9 @@ class MiniMaxM2Attention(nn.Module):
             kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
             use_mla=False,
-            rotary_emb=None,
+            rotary_emb=self.rotary_emb if self.delegate_qknorm_rope_to_vllm else None,
+            q_norm=self.q_norm if self.delegate_qknorm_rope_to_vllm else None,
+            k_norm=self.k_norm if self.delegate_qknorm_rope_to_vllm else None,
             prefix=f"{prefix}.attn",
         )
 
@@ -239,7 +248,11 @@ class MiniMaxM2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
 
-        if self.use_qk_norm:
+        if self.delegate_qknorm_rope_to_vllm:
+            q, k, v = torch.split(
+                qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+        elif self.use_qk_norm:
             # TP-aware RMSNorm: all-reduce variance across TP ranks so
             # normalization uses the global variance (over 6144/1024 dims)
             # rather than per-rank variance (768/128 dims).
