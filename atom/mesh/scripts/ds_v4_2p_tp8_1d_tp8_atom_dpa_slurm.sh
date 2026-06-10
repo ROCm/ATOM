@@ -26,7 +26,7 @@ set -euo pipefail
 
 # ======================== configuration ========================
 MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-V4-Pro/}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:nightly_202606071111-Jasen-fix_dockerfile}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:latest}"
 CONTAINER="${CONTAINER:-atom_mesh_dsv4_2p1d_dpa_${SLURM_JOB_ID}}"
 
 PREFILL_TP="${PREFILL_TP:-8}"
@@ -136,7 +136,7 @@ export AITER_LOG_LEVEL=WARNING
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
 export ATOM_HOST_IP=__PREFILL_HANDSHAKE_IP__
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 rm -rf /root/.cache/atom/* 2>/dev/null || true
 
@@ -175,7 +175,7 @@ export AITER_LOG_LEVEL=WARNING
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
 export ATOM_HOST_IP=${DECODE_IP}
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 rm -rf /root/.cache/atom/* 2>/dev/null || true
 
