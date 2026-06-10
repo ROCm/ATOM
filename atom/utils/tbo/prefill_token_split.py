@@ -17,8 +17,22 @@ processed across two micro-batches:
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
-__all__ = ["StraddleSplitInfo", "compute_straddle_split_info"]
+import numpy as np
+
+__all__ = [
+    "StraddleSplitInfo",
+    "TokenSplitPrefillState",
+    "compute_straddle_split_info",
+]
+
+
+@dataclass
+class TokenSplitPrefillState:
+    block_tables: list
+    cu_tokens: np.ndarray
+    num_cached: Optional[np.ndarray]
 
 
 @dataclass

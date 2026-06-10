@@ -12,6 +12,7 @@ from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
@@ -54,9 +55,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         self._tbo_token_split = bool(
             config.enable_tbo and _envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
         )
-        self._tbo_prefill_block_tables = None
-        self._tbo_prefill_cu_tokens = None
-        self._tbo_prefill_num_cached = None
+        # Snapshot of the current prefill batch, set by
+        # `_stash_tbo_token_split_prefill_state`; None when not token-splitting.
+        self._tbo_prefill_state = None
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
         # For speculative decode (MTP), max_qlen = num_speculative_tokens + 1
         if (
@@ -559,29 +560,29 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self._stash_tbo_token_split_prefill_state(batch)
         return attn_metadata, positions
 
+    # ================================================================
     # TBO PREFILL TOKEN-SPLIT (ATOM_TBO_PREFILL_TOKEN_SPLIT) — MHA path
+    # ================================================================
 
     def _stash_tbo_token_split_prefill_state(self, batch: ScheduledBatch):
-        """Snapshot full-batch paged block_tables / cu_tokens / num_cached so a
-        later micro-batch can rebuild the straddled request's cached prefix."""
-        self._tbo_prefill_block_tables = None
-        self._tbo_prefill_cu_tokens = None
-        self._tbo_prefill_num_cached = None
+        """Snapshot full-batch block_tables / cu_tokens / num_cached so a later
+        micro-batch can rebuild the straddled request's cached prefix."""
+        self._tbo_prefill_state = None
         if not batch.block_tables:
             return
         bs = batch.total_seqs_num_prefill
-        self._tbo_prefill_block_tables = [
-            np.asarray(bt, dtype=np.int32) for bt in batch.block_tables[:bs]
-        ]
-        self._tbo_prefill_cu_tokens = np.asarray(
-            self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
-            dtype=np.int64,
-        ).copy()
         # Per-request prefix-cache hit length (tokens already in the paged cache
         # from previous steps). A straddled/ubatch request's FULL visible K is
         # num_cached + (its tokens in this ubatch), so the gather must include it.
-        self._tbo_prefill_num_cached = np.asarray(
-            batch.num_cached_tokens[:bs], dtype=np.int64
+        self._tbo_prefill_state = TokenSplitPrefillState(
+            block_tables=[
+                np.asarray(bt, dtype=np.int32) for bt in batch.block_tables[:bs]
+            ],
+            cu_tokens=np.asarray(
+                self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
+                dtype=np.int64,
+            ).copy(),
+            num_cached=np.asarray(batch.num_cached_tokens[:bs], dtype=np.int64),
         )
 
     def build_ubatch_prefill_metadata(
@@ -604,10 +605,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         attention sees the tokens ubatch 0 wrote. No-op when not straddling."""
         from atom.utils.tbo import compute_straddle_split_info
 
-        block_tables_host = self._tbo_prefill_block_tables
-        cu_tokens = self._tbo_prefill_cu_tokens
-        if block_tables_host is None or cu_tokens is None:
+        state = self._tbo_prefill_state
+        if state is None:
             return
+        block_tables_host = state.block_tables
+        cu_tokens = state.cu_tokens
 
         info = compute_straddle_split_info(cu_tokens, ub_slice)
         if not info.is_straddling:
@@ -627,9 +629,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # straddle prefix written by ubatch 0 (only req0) + this ubatch's new
         # tokens. Missing the num_cached term made the gather read from the
         # cached-prefix blocks instead of the freshly-written new blocks.
-        num_cached = self._tbo_prefill_num_cached
-        if num_cached is not None:
-            cached = num_cached[rs.start : rs.stop].astype(np.int64)
+        if state.num_cached is not None:
+            cached = state.num_cached[rs.start : rs.stop].astype(np.int64)
         else:
             cached = np.zeros(ub_num_reqs, dtype=np.int64)
         ctx_lens = cached + new_lens

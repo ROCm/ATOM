@@ -3,6 +3,7 @@
 
 from .prefill_token_split import (
     StraddleSplitInfo,
+    TokenSplitPrefillState,
     compute_straddle_split_info,
 )
 from .ubatch_splitting import (
@@ -37,6 +38,7 @@ __all__ = [
     "DPSyncResult",
     "StraddleSplitInfo",
     "TBOContext",
+    "TokenSplitPrefillState",
     "UBatchSlice",
     "UBatchWrapper",
     "compute_straddle_split_info",

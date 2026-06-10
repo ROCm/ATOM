@@ -1394,7 +1394,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         return ub_attn
 
+    # ================================================================
     # TBO PREFILL TOKEN-SPLIT (ATOM_TBO_PREFILL_TOKEN_SPLIT) — MLA path
+    # ================================================================
 
     def _attach_tbo_token_split_straddle_prefix(self, attn_metadata, ub_attn, ub_slice):
         """If this ubatch's first request is cut from a previous ubatch, attach
