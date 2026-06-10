@@ -25,7 +25,14 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         return False
 
     if quant_config is not None and shared_expert_prefix is not None:
-        shared_spec = quant_config.get_layer_quant_config(shared_expert_prefix)
+        # shared_expert_prefix points at the shared expert module, while quant
+        # exclude entries are usually leaf weights under that module
+        # (e.g. shared_expert.down_proj).  Match children here; otherwise a
+        # BF16 shared expert can be mistaken for the global routed expert dtype.
+        shared_spec = quant_config.get_layer_quant_config(
+            shared_expert_prefix,
+            check_children=True,
+        )
         routed_spec = (
             quant_config.get_layer_quant_config(routed_expert_prefix)
             if routed_expert_prefix is not None
@@ -137,7 +144,8 @@ def rocm_aiter_topk_softmax_impl(
 
     token = gating_output.shape[0]
     device = gating_output.device
-    if num_fused_shared_experts > 0:
+    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+    if fuse_shared_experts and num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
             "AITER topK meta data is not initialized. "
             "Please ensure that init_aiter_topK_meta_data is called before this function."
@@ -172,7 +180,7 @@ def rocm_aiter_topk_softmax_impl(
         fused_shared_experts_for_kernel,
         fused_shared_experts_scoring_func,
     )
-    if num_fused_shared_experts > 0:
+    if fuse_shared_experts and num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
 
@@ -206,7 +214,8 @@ def rocm_aiter_biased_grouped_topk_impl(
 
     token = gating_output.shape[0]
     device = gating_output.device
-    if num_fused_shared_experts > 0:
+    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+    if fuse_shared_experts and num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
             "AITER topK meta data is not initialized. "
             "Please ensure that init_aiter_topK_meta_data is called before this function."
@@ -237,7 +246,7 @@ def rocm_aiter_biased_grouped_topk_impl(
         need_renorm,
         routed_scaling_factor,
     )
-    if num_fused_shared_experts > 0:
+    if fuse_shared_experts and num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
 
@@ -254,7 +263,8 @@ def rocm_aiter_biased_grouped_topk_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = gating_output.shape[0]
     device = gating_output.device
-    if num_fused_shared_experts > 0:
+    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+    if fuse_shared_experts and num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
             "AITER topK meta data is not initialized. "
             "Please ensure that init_aiter_topK_meta_data is called before this function."
@@ -285,7 +295,7 @@ def rocm_aiter_biased_grouped_topk_fake(
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-    if num_fused_shared_experts > 0:
+    if fuse_shared_experts and num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
 
@@ -307,7 +317,8 @@ def rocm_aiter_grouped_topk_impl(
 
     token = gating_output.shape[0]
     device = gating_output.device
-    if num_fused_shared_experts > 0:
+    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+    if fuse_shared_experts and num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
             "AITER topK meta data is not initialized. "
             "Please ensure that init_aiter_topK_meta_data is called before this function."
@@ -338,7 +349,7 @@ def rocm_aiter_grouped_topk_impl(
         scoring_func,
         routed_scaling_factor,
     )
-    if num_fused_shared_experts > 0:
+    if fuse_shared_experts and num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
 
@@ -357,7 +368,8 @@ def rocm_aiter_grouped_topk_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = gating_output.shape[0]
     device = gating_output.device
-    if num_fused_shared_experts > 0:
+    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+    if fuse_shared_experts and num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
             "AITER topK meta data is not initialized. "
             "Please ensure that init_aiter_topK_meta_data is called before this function."
@@ -388,7 +400,7 @@ def rocm_aiter_grouped_topk_fake(
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-    if num_fused_shared_experts > 0:
+    if fuse_shared_experts and num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
 

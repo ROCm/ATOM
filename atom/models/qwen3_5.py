@@ -7,6 +7,7 @@ from torch import nn
 
 from atom.config import QuantizationConfig, Config
 
+from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import atom_parameter
 from atom.utils.decorators import support_torch_compile
 
@@ -532,7 +533,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-            + (self.config.n_shared_experts or 0),
+            + (
+                self.config.n_shared_experts
+                if is_rocm_aiter_fusion_shared_expert_enabled()
+                else 0
+            ),
         )
 
 

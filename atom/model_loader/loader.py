@@ -323,7 +323,8 @@ def load_model(
                 shared_expert_prefix=shared_expert_prefix,
                 routed_expert_prefix=routed_expert_prefix,
             )
-        return is_rocm_aiter_fusion_shared_expert_enabled(
+        return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+            None,
             shared_expert_prefix=shared_expert_prefix,
             routed_expert_prefix=routed_expert_prefix,
         )
