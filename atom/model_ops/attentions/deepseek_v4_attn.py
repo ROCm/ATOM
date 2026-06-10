@@ -2083,9 +2083,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ),
             index_topk,
         ).astype(np.int32)
-        n_hca_per_token_np = n_committed_hca_per_seq_np[batch_id_per_token_np].astype(
-            np.int32
-        )
+        # Per-token CAUSAL HCA visibility (mirrors CSA above and the reference
+        # `get_compress_topk_idxs` prefill mask): token at `pos` sees only the
+        # `(pos+1)//128` HCA groups committed up to its own position, capped by
+        # the per-seq committed count. Without `(pos+1)//128`, every token used
+        # the per-seq `ctx_end//128`, over-reading FUTURE groups and making a
+        # token's output depend on the forward's total length (chunked breaks).
+        # MUST stay in sync with the kernel's inline cap in
+        # `_v4_paged_prefill_indices_kernel` (HCA_RATIO).
+        n_hca_per_token_np = np.minimum(
+            (positions_arr + 1) // 128,
+            n_committed_hca_per_seq_np[batch_id_per_token_np],
+        ).astype(np.int32)
 
         # 4 indptrs on CPU; last element = total (no D2H to size buffers).
         ext_indptr_np = np.zeros(T + 1, dtype=np.int32)
