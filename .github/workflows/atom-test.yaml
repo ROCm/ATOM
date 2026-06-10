@@ -417,9 +417,6 @@ jobs:
 
           # Write env_vars via env block (avoids expression injection)
           printenv MODEL_ENV_VARS | grep -v '^$' > /tmp/env_file.txt || true
-          if [ "${{ matrix.runner }}" = "linux-atom-do-mi350x-8" ]; then
-            echo "NCCL_P2P_DISABLE=1" >> /tmp/env_file.txt
-          fi
 
           IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
           echo "Starting container with image: $IMAGE_TAG"
@@ -464,6 +461,44 @@ jobs:
       - name: Collect GPU info (inside container)
         id: gpu-info
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
+
+      - name: Install newer RCCL
+        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        timeout-minutes: 90
+        env:
+          RCCL_REPO: https://github.com/ROCm/rccl.git
+          RCCL_REF: a70e4c37543a7cad8286ced536bac75b08bd5c5a
+        run: |
+          docker exec \
+            -e RCCL_REPO="${RCCL_REPO}" \
+            -e RCCL_REF="${RCCL_REF}" \
+            "$CONTAINER_NAME" bash -lc '
+              set -euo pipefail
+              echo "========== RCCL before =========="
+              ldconfig -p | grep -E "librccl|libnccl" || true
+
+              apt-get update
+              apt --fix-broken install -y
+              apt-get install -y --no-install-recommends \
+                git cmake build-essential pkg-config libpci-dev
+              python -m pip install --upgrade cmake
+
+              rm -rf /tmp/rccl-src /tmp/rccl-debs
+              git clone "${RCCL_REPO}" /tmp/rccl-src
+              cd /tmp/rccl-src
+              git checkout "${RCCL_REF}"
+              git rev-parse HEAD
+              ./install.sh -p --amdgpu_targets=gfx950
+
+              mkdir -p /tmp/rccl-debs
+              cp build/release/*.deb /tmp/rccl-debs/
+              DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl-debs/*.deb
+              rm -rf /tmp/rccl-src /tmp/rccl-debs
+              ldconfig
+
+              echo "========== RCCL after =========="
+              ldconfig -p | grep -E "librccl|libnccl" || true
+            '
 
       - name: Install aiter from wheel
         run: |
