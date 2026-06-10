@@ -722,7 +722,7 @@ class Scheduler:
                     break
                 if not seq.is_partial_prefill:
                     continue
-                remaining = seq.num_prompt_tokens - seq.num_cached_tokens
+                remaining = seq.num_tokens - seq.num_cached_tokens
                 if 0 < self.long_prefill_token_threshold < remaining:
                     remaining = self.long_prefill_token_threshold
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -891,22 +891,6 @@ class Scheduler:
                 f"(cached: {cached_per_req}, new: {num_scheduled_tokens}), "
                 f"req_ids: {tuple(scheduled_seqs.keys())}"
             )
-            # [MULTI-CHUNK-DEBUG] disabled — kept for re-enabling when investigating
-            # batch-invariance regressions under --long-prefill-token-threshold.
-            # n_partial = sum(
-            #     1
-            #     for s, c in zip(scheduled_seqs.values(), num_scheduled_tokens)
-            #     if s.num_cached_tokens + c < s.num_prompt_tokens
-            # )
-            # if n_partial >= 2:
-            #     logger.warning(
-            #         f"[MULTI-CHUNK-DEBUG] {n_partial}/{num_seqs_prefill} partial-prefill in batch, "
-            #         f"req_ids={list(scheduled_seqs.keys())}, "
-            #         f"cached={num_cached_tokens_list}, "
-            #         f"chunks={num_scheduled_tokens}, "
-            #         f"prompt_lens={[s.num_prompt_tokens for s in scheduled_seqs.values()]}, "
-            #         f"block_table_lens={[len(s.block_table) for s in scheduled_seqs.values()]}"
-            #     )
             self.prev_prompt = True
             # lip: TODO for prefill/decode mixed batch
 
@@ -1060,7 +1044,7 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
-                now_partial = seq.num_cached_tokens < seq.num_prompt_tokens
+                now_partial = seq.num_cached_tokens < seq.num_tokens
                 if now_partial != seq.is_partial_prefill:
                     self._partial_prefill_count += 1 if now_partial else -1
                     seq.is_partial_prefill = now_partial
@@ -1421,8 +1405,8 @@ class Scheduler:
     def get_next_batch_info(self) -> tuple[bool, int, int]:
         # Check for partial prefills in running (chunked prefill resume)
         for seq in self.running:
-            if seq.num_cached_tokens < seq.num_prompt_tokens:
-                remaining = seq.num_prompt_tokens - seq.num_cached_tokens
+            if seq.num_cached_tokens < seq.num_tokens:
+                remaining = seq.num_tokens - seq.num_cached_tokens
                 chunk = min(remaining, self.max_num_batched_tokens)
                 return (True, chunk, 1)
         # Only consider waiting seqs that are not blocked on a remote KV
