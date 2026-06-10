@@ -181,6 +181,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         enable_dp_attention=False,
         plugin_config=plugin_config,
         speculative_config=atom_speculative_config,
+        online_quant_config=(getattr(config, "additional_config", None) or {}).get(
+            "online_quant_config"
+        ),
     )
 
 
