@@ -71,6 +71,7 @@ def _v4_paged_prefill_indices_kernel(
     win: tl.constexpr,
     cs,  # win_with_spec — SWA ring stride (NOT constexpr because varies w/ mtp_k)
     swa_pages,  # state_slot count * cs — boundary into HCA compress section
+    HCA_RATIO: tl.constexpr,  # HCA compress ratio (128) for per-token causal cap
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
 ):
     """One program per token. Writes four per-token segments:
@@ -92,7 +93,15 @@ def _v4_paged_prefill_indices_kernel(
     chunk_start = tl.load(chunk_start_per_seq_ptr + bid)
     cu_q = tl.load(cu_seqlens_q_per_seq_ptr + bid)
     state_slot = tl.load(state_slot_per_seq_ptr + bid)
-    n_hca = tl.load(n_committed_hca_per_seq_ptr + bid)
+    # Per-token CAUSAL HCA visibility: token at `pos` may see only the
+    # `(pos+1)//HCA_RATIO` compressed groups committed up to its own position
+    # (matches the reference `get_compress_topk_idxs` prefill mask, and mirrors
+    # the CSA `(pos+1)//4` cap). Without this cap every token saw the per-seq
+    # `n_committed_hca = ctx_end//128`, which over-reads FUTURE groups and makes
+    # a token's output depend on the forward's total length (chunked != single).
+    n_hca = tl.minimum(
+        (pos + 1) // HCA_RATIO, tl.load(n_committed_hca_per_seq_ptr + bid)
+    )
 
     # Per-token derived quantities (single-pass arithmetic).
     token_pos_in_chunk = pos - chunk_start
@@ -159,6 +168,7 @@ def write_v4_paged_prefill_indices(
     win: int,
     cs: int,
     swa_pages: int,
+    hca_ratio: int = 128,
 ) -> None:
     """One-shot GPU build of the V4 paged-prefill index buffers.
 
@@ -247,6 +257,7 @@ def write_v4_paged_prefill_indices(
         win=win,
         cs=cs,
         swa_pages=swa_pages,
+        HCA_RATIO=hca_ratio,
         BLOCK_N=BLOCK_N,
     )
 
@@ -272,6 +283,7 @@ def write_v4_paged_prefill_indices_reference(
     win: int,
     cs: int,
     swa_pages: int,
+    hca_ratio: int = 128,
 ) -> None:
     """Pure-Python equivalent of ``write_v4_paged_prefill_indices``.
     Per-token Python loop — slow but readable; used for unit-test bit-exact
@@ -301,7 +313,8 @@ def write_v4_paged_prefill_indices_reference(
         chunk_start = cs_per_seq_cpu[bid]
         cu_q = cu_q_cpu[bid]
         state_slot = state_slot_cpu[bid]
-        n_hca = n_hca_cpu[bid]
+        # Per-token causal HCA cap (mirrors kernel + reference get_compress_topk_idxs).
+        n_hca = min((pos + 1) // hca_ratio, n_hca_cpu[bid])
 
         token_pos_in_chunk = pos - chunk_start
         swa_low = max(pos - win + 1, 0)
