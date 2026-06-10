@@ -883,8 +883,29 @@ jobs:
                   return "P1"
               return "P2"
 
+          def merge_env_vars(base, override):
+              # Merge two newline-separated "VAR=VALUE" strings. Values from the
+              # override win on key conflicts, but keys only present in the base
+              # entry are preserved instead of being silently dropped. Without
+              # this, BENCHMARK_OVERRIDES["env_vars"] replaces the matrix entry
+              # wholesale and loses vars such as GATED_DELTA_RULE_TRITON_AUTOTUNE.
+              merged = {}
+              for chunk in (base, override):
+                  for line in (chunk or "").split("\n"):
+                      line = line.strip()
+                      if not line or "=" not in line:
+                          continue
+                      key, value = line.split("=", 1)
+                      merged[key] = value
+              return "\n".join(f"{key}={value}" for key, value in merged.items())
+
           for model in models:
-              model.update(BENCHMARK_OVERRIDES.get(model["model_name"], {}))
+              override = dict(BENCHMARK_OVERRIDES.get(model["model_name"], {}))
+              if "env_vars" in override:
+                  override["env_vars"] = merge_env_vars(
+                      model.get("env_vars", ""), override["env_vars"]
+                  )
+              model.update(override)
               model["priority"] = priority_for(model["model_name"])
 
           def matrix_entry(model):
