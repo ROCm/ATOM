@@ -2696,10 +2696,16 @@ class FusedMoE(torch.nn.Module):
             expert_data = expert_data.narrow(
                 shard_dim, expert_shard_size, expert_shard_size
             )
-        # When expert_data is padded beyond the actual weight size, narrow to
-        # the loaded weight size so the copy shape matches.
-        if load_shard_size != expert_shard_size:
-            expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
+        # Narrow expert_data to the actually-loaded `size` so copy_ matches
+        # loaded_weight, and zero any remainder of this rank's slot (the
+        # trailing partial rank where size < load_shard_size, or padded
+        # expert_data). Without this, a non-evenly-divisible split (e.g. tp=4
+        # with D=10) hits a copy_ shape mismatch and leaves the tail at its
+        # init value. No-op for tp=8 (D divides evenly; size == slot).
+        slot = expert_data.shape[shard_dim]
+        if size < slot:
+            expert_data.narrow(shard_dim, size, slot - size).zero_()
+            expert_data = expert_data.narrow(shard_dim, 0, size)
         if expert_data.dtype != dtypes.fp4x2:
             # Dtype glue: V4 stores per-1x32 weight scales as float8_e8m0fnu but
             # FusedMoE allocates them as uint8 (raw byte storage). PyTorch's
@@ -2759,8 +2765,13 @@ class FusedMoE(torch.nn.Module):
                 return
             size = min(load_shard_size, loaded_weight.shape[shard_dim] - start)
             loaded_weight = loaded_weight.narrow(shard_dim, start, size)
-            if load_shard_size != shard_size:
-                expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
+            # Narrow expert_data to the actually-loaded `size` so copy_ matches
+            # loaded_weight, and zero any remainder of this rank's slot (see
+            # _load_w13 for full rationale). No-op for tp=8 (size == slot).
+            slot = expert_data.shape[shard_dim]
+            if size < slot:
+                expert_data.narrow(shard_dim, size, slot - size).zero_()
+                expert_data = expert_data.narrow(shard_dim, 0, size)
         # w2, down_proj: Load into only logical weight of w2.
         if expert_data.dtype == dtypes.fp4x2:
             expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
