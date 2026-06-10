@@ -139,6 +139,20 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             per_layer_sliding_window if per_layer_sliding_window is not None else -1
         )
         self.rotary_emb = rotary_emb
+        if rotary_emb is not None and hasattr(rotary_emb, "cos_cache"):
+            cos = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+            sin = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+            self.register_buffer(
+                "qknorm_rope_cos_sin_cache",
+                torch.cat([cos, sin], dim=-1).contiguous(),
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "qknorm_rope_cos_sin_cache",
+                None,
+                persistent=False,
+            )
         self.q_norm = q_norm
         self.k_norm = k_norm
         self.use_flash_layout = False
@@ -297,7 +311,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                     and v_scale is not None
                     and get_tensor_model_parallel_world_size() > 1
                 ):
-                    cos_sin_cache = self.rotary_emb.cos_sin_cache
+                    cos_sin_cache = self.qknorm_rope_cos_sin_cache
+                    if cos_sin_cache is None:
+                        raise RuntimeError(
+                            "MiniMax M2 fused qknorm rope cache requires packed cos/sin cache"
+                        )
                     if (
                         cos_sin_cache.dtype != qkv.dtype
                         or cos_sin_cache.device != qkv.device
