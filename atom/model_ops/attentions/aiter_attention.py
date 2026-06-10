@@ -59,15 +59,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         else:
             max_qlen = 1
 
-        num_head_k = max(
-            1,
-            getattr(
-                hf_config,
-                "num_key_value_heads",
-                getattr(hf_config, "num_attention_groups", None),
-            )
-            // get_tp_group().world_size,
+        num_kv_heads_cfg = getattr(
+            hf_config,
+            "num_key_value_heads",
+            getattr(hf_config, "num_attention_groups", None),
         )
+        if num_kv_heads_cfg is None:
+            raise ValueError(
+                "Model config has neither 'num_key_value_heads' nor "
+                "'num_attention_groups'; cannot determine number of KV heads "
+                f"for {getattr(hf_config, 'architectures', hf_config)}"
+            )
+        num_head_k = max(1, num_kv_heads_cfg // get_tp_group().world_size)
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -217,15 +220,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         config = self.model_runner.config
         hf_config = config.hf_config
         num_query_heads = self.num_attention_heads
-        num_kv_heads = max(
-            1,
-            getattr(
-                hf_config,
-                "num_key_value_heads",
-                getattr(hf_config, "num_attention_groups", None),
-            )
-            // get_tp_group().world_size,
+        num_kv_heads_cfg = getattr(
+            hf_config,
+            "num_key_value_heads",
+            getattr(hf_config, "num_attention_groups", None),
         )
+        if num_kv_heads_cfg is None:
+            raise ValueError(
+                "Model config has neither 'num_key_value_heads' nor "
+                "'num_attention_groups'; cannot determine number of KV heads "
+                f"for {getattr(hf_config, 'architectures', hf_config)}"
+            )
+        num_kv_heads = max(1, num_kv_heads_cfg // get_tp_group().world_size)
         block_size = self.block_size
 
         var = self.model_runner.forward_vars
@@ -755,15 +761,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         config = self.model_runner.config
         hf_config = config.hf_config
         num_query_heads = self.num_attention_heads
-        num_kv_heads = max(
-            1,
-            getattr(
-                hf_config,
-                "num_key_value_heads",
-                getattr(hf_config, "num_attention_groups", None),
-            )
-            // get_tp_group().world_size,
+        num_kv_heads_cfg = getattr(
+            hf_config,
+            "num_key_value_heads",
+            getattr(hf_config, "num_attention_groups", None),
         )
+        if num_kv_heads_cfg is None:
+            raise ValueError(
+                "Model config has neither 'num_key_value_heads' nor "
+                "'num_attention_groups'; cannot determine number of KV heads "
+                f"for {getattr(hf_config, 'architectures', hf_config)}"
+            )
+        num_kv_heads = max(1, num_kv_heads_cfg // get_tp_group().world_size)
         p = f"ub{ubatch_idx}_"
         var = self.model_runner.forward_vars
 

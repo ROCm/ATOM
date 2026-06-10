@@ -443,7 +443,7 @@ class Step3p5Attention(nn.Module):
             # enables attention sinks (False/0 -> no sinks).
             sink_size = getattr(config, "sink", 0)
             if sink_size > 0:
-                sinks = nn.Parameter(torch.empty(self.num_heads, requires_grad=False))
+                sinks = nn.Parameter(torch.zeros(self.num_heads, requires_grad=False))
 
         self.attn = Attention(
             self.num_heads,
