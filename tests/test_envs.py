@@ -26,6 +26,10 @@ _ATOM_ENV_VARS = [
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
+    "ATOM_ENABLE_EPLB_LOAD_STATS",
+    "ATOM_EPLB_LOAD_WINDOW_SIZE",
+    "ATOM_EPLB_LOG_INTERVAL",
+    "ATOM_EPLB_OFFLINE_REBALANCE_AFTER_STEPS",
 ]
 
 
@@ -88,6 +92,18 @@ class TestEnvsDefaults:
     def test_atom_enable_gdn_decode_lossy_fast_default(self):
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is False
 
+    def test_eplb_load_stats_default(self):
+        assert _get_envs().ATOM_ENABLE_EPLB_LOAD_STATS is False
+
+    def test_eplb_window_size_default(self):
+        assert _get_envs().ATOM_EPLB_LOAD_WINDOW_SIZE == 100
+
+    def test_eplb_log_interval_default(self):
+        assert _get_envs().ATOM_EPLB_LOG_INTERVAL == 50
+
+    def test_eplb_offline_after_steps_default(self):
+        assert _get_envs().ATOM_EPLB_OFFLINE_REBALANCE_AFTER_STEPS == 0
+
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
             _ = _get_envs().ATOM_NONEXISTENT_VAR
@@ -139,6 +155,22 @@ class TestEnvsOverrides:
     def test_atom_enable_gdn_decode_lossy_fast_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "1")
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is True
+
+    def test_eplb_load_stats_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENABLE_EPLB_LOAD_STATS", "1")
+        assert _get_envs().ATOM_ENABLE_EPLB_LOAD_STATS is True
+
+    def test_eplb_window_size_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_EPLB_LOAD_WINDOW_SIZE", "16")
+        assert _get_envs().ATOM_EPLB_LOAD_WINDOW_SIZE == 16
+
+    def test_eplb_log_interval_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_EPLB_LOG_INTERVAL", "9")
+        assert _get_envs().ATOM_EPLB_LOG_INTERVAL == 9
+
+    def test_eplb_offline_after_steps_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_EPLB_OFFLINE_REBALANCE_AFTER_STEPS", "25")
+        assert _get_envs().ATOM_EPLB_OFFLINE_REBALANCE_AFTER_STEPS == 25
 
 
 class TestIsSet:

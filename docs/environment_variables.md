@@ -58,6 +58,10 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_ENABLE_DS_QKNORM_FUSION** | bool | 1 (true) | If set to `1`, use the fused Q/K RMSNorm path (`fused_qk_rmsnorm`) in the DeepSeek MLA attention module when Q-LoRA is enabled and QK norm+quant fusion is not used. If set to `0`, apply separate RMSNorm for the Q and KV branches instead. |
 | **ATOM_ENABLE_DS_QKNORM_QUANT_FUSION** | bool | 1 (true) | If set to `1`, fuse QK norm with quantization in MLA attention module. |
 | **ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD** | int | 1024 | Upper bound on MoE token count (`num_tokens` in the MoE forward) for using the dual-stream path: shared experts on a secondary CUDA stream while routed experts run on the default stream. If `num_tokens` exceeds this value, that forward uses single-stream MoE instead. Set to `0` to disable dual-stream setup entirely (no alt stream, no `maybe_dual_stream_forward` registration). |
+| **ATOM_ENABLE_EPLB_LOAD_STATS** | bool | 0 (false) | If set to `1`, enable EPLB-style local expert-load statistics collection for the MORI EP dispatch path. |
+| **ATOM_EPLB_LOAD_WINDOW_SIZE** | int | 100 | Ring-buffer length (number of steps) for per-layer expert-load windows when `ATOM_ENABLE_EPLB_LOAD_STATS=1`. |
+| **ATOM_EPLB_LOG_INTERVAL** | int | 50 | Log interval (in forward steps) for per-layer `avg_tokens`, `max_tokens`, and `balancedness`. |
+| **ATOM_EPLB_OFFLINE_REBALANCE_AFTER_STEPS** | int | 0 (disabled) | If `> 0`, trigger a one-shot offline EPLB rebalance planning pass after this many **real** forward steps (dummy/warmup batches are excluded). Current implementation generates and logs the plan only (no automatic weight remap). |
 
 ### Qwen3-MoE style
 

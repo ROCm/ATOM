@@ -41,6 +41,7 @@ class EngineUtilityHandler:
         "stop_profile": "_handle_stop_profile",
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
+        "offline_eplb_rebalance": "_handle_offline_eplb_rebalance",
     }
 
     def __init__(
@@ -268,3 +269,11 @@ class EngineUtilityHandler:
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_mtp_statistics", "result": result})
         )
+
+    # ------------------------------------------------------------------
+    # EPLB expert-load statistics
+    # ------------------------------------------------------------------
+
+    def _handle_offline_eplb_rebalance(self, args: dict):
+        """Trigger a one-shot offline EPLB rebalance plan (fire-and-forget)."""
+        self.runner_mgr.call_func("trigger_offline_eplb_rebalance", wait_out=True)

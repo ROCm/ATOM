@@ -26,6 +26,7 @@ from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.model_ops.eplb_stats import get_expert_load_monitor
 from atom.spec_decode.eagle import EagleProposer
 from atom.utils import (
     CpuGpuBuffer,
@@ -994,6 +995,11 @@ class ModelRunner:
             elapsed,
         )
         return {"trace_dir": self.profiler_dir, "elapsed": elapsed}
+
+    def trigger_offline_eplb_rebalance(self):
+        """Generate a one-shot offline EPLB rebalance plan from collected stats."""
+        get_expert_load_monitor().trigger_offline_rebalance(reason="utility_command")
+        return True
 
     def debug(self, *args: Any):
         if self.rank == 0:
@@ -2166,6 +2172,7 @@ class ModelRunner:
             hidden_states,
             needs_independent_noise=needs_independent_noise,
         )
+        get_expert_load_monitor().step(is_dummy_run=batch.is_dummy_run)
         reset_forward_context()
         return fwd_output
 

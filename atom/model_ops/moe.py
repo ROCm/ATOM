@@ -486,6 +486,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # logger.debug(
             #     "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
             # )
+            if hasattr(prepare_finalize, "set_layer_name") and hasattr(
+                layer, "layer_name"
+            ):
+                prepare_finalize.set_layer_name(layer.layer_name)
             assert self.topk_indices_dtype is None
             assert (
                 self.fused_experts is None

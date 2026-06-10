@@ -264,6 +264,9 @@ class LLMEngine:
             },
         }
 
+    def offline_eplb_rebalance(self):
+        self.core_mgr.send_utility_command("offline_eplb_rebalance")
+
 
 class InputOutputProcessor:
 

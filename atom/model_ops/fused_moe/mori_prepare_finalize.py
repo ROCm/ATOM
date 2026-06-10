@@ -9,6 +9,7 @@ import torch
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.model_ops.eplb_stats import get_expert_load_monitor
 from atom.utils.forward_context import get_forward_context
 from aiter import QuantType, dtypes
 
@@ -129,6 +130,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.quant_dtype = quant_dtype
         self._is_async = is_async
         self._low_latency = low_latency
+        self.layer_name: str | None = None
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -159,6 +161,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if context.is_prefill:
             return 128, 16
         return 64, 4
+
+    def set_layer_name(self, layer_name: str) -> None:
+        self.layer_name = layer_name
+
+    def _record_expert_load_pass(self, dispatch_recv_token_num: torch.Tensor) -> None:
+        get_expert_load_monitor().record_expert_load_pass(
+            self.layer_name, dispatch_recv_token_num
+        )
 
     # ---- Synchronous (non-TBO) path ----
 
@@ -204,6 +214,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         ) = self._sync_mori_op.dispatch(
             a1, topk_weights, scale, topk_ids, block_num, warp_per_block
         )
+        self._record_expert_load_pass(dispatch_recv_token_num)
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=dispatch_recv_token_num, expert_num_tokens_cpu=None
@@ -299,6 +310,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             mori_op.dispatch_recv()
 
         def receiver() -> mk.PrepareResultType:
+            self._record_expert_load_pass(dispatch_recv_token_num)
             expert_tokens_meta = mk.ExpertTokensMetadata(
                 expert_num_tokens=dispatch_recv_token_num,
                 expert_num_tokens_cpu=None,
@@ -346,6 +358,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         tbo_switch_to_compute_sync()
 
         def receiver() -> mk.PrepareResultType:
+            self._record_expert_load_pass(dispatch_recv_token_num)
             expert_tokens_meta = mk.ExpertTokensMetadata(
                 expert_num_tokens=dispatch_recv_token_num,
                 expert_num_tokens_cpu=None,

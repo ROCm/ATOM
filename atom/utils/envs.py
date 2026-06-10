@@ -116,6 +116,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # EPLB-style per-layer expert-load statistics collection (ATOM local monitor).
+    "ATOM_ENABLE_EPLB_LOAD_STATS": lambda: (
+        os.getenv("ATOM_ENABLE_EPLB_LOAD_STATS", "0") == "1"
+    ),
+    "ATOM_EPLB_LOAD_WINDOW_SIZE": lambda: int(
+        os.getenv("ATOM_EPLB_LOAD_WINDOW_SIZE", "100")
+    ),
+    "ATOM_EPLB_LOG_INTERVAL": lambda: int(os.getenv("ATOM_EPLB_LOG_INTERVAL", "50")),
+    # Trigger one offline EPLB rebalance planning pass after N forward steps.
+    # 0 disables auto trigger.
+    "ATOM_EPLB_OFFLINE_REBALANCE_AFTER_STEPS": lambda: int(
+        os.getenv("ATOM_EPLB_OFFLINE_REBALANCE_AFTER_STEPS", "0")
+    ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
