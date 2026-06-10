@@ -17,9 +17,7 @@ def _remap_quant_config_for_sglang_plugin(atom_config: Any, model_cls: type) -> 
         atom_config.hf_config,
         packed_modules_mapping=getattr(model_cls, "packed_modules_mapping", {}),
         weights_mapper=getattr(model_cls, "hf_to_atom_mapper", {}),
-        quant_exclude_name_mapping=getattr(
-            model_cls, "quant_exclude_name_mapping", {}
-        ),
+        quant_exclude_name_mapping=getattr(model_cls, "quant_exclude_name_mapping", {}),
     )
 
     default_excludes = getattr(model_cls, "quant_default_exclude_layers", [])
