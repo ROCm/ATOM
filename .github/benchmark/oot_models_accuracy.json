@@ -149,6 +149,18 @@
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528"
   },
   {
+    "model_name": "DeepSeek-V4-Pro TP8",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--tensor-parallel-size 8 --gpu-memory-utilization 0.8 --tokenizer-mode deepseek_v4",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "runner": "linux-atom-mi35x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.94,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "20-shot GSM8K local-completions coverage aligned with launch.sh/lm_eval.sh."
+  },
+  {
     "model_name": "DeepSeek-V3.2-FP8 TP8",
     "model_path": "deepseek-ai/DeepSeek-V3.2",
     "extraArgs": "--tensor-parallel-size 8 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",

@@ -1626,7 +1626,40 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             block_size,
         )
 
-    def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
+    def _forward_sparse_mla(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        topk_indices: torch.Tensor,
+        save_kv_cache: bool = True,
+    ) -> torch.Tensor:
+        from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
+            forward_sparse_mla_for_sglang,
+        )
+
+        return forward_sparse_mla_for_sglang(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            topk_indices,
+            save_kv_cache=save_kv_cache,
+            input_dtype=self.input_dtype,
+        )
+
+    def forward_extend(
+        self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
+    ):
+        topk_indices = kwargs.get("topk_indices")
+        if self.use_mla and topk_indices is not None:
+            return self._forward_sparse_mla(
+                q, k, v, layer, forward_batch, topk_indices, save_kv_cache
+            )
+
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -2148,7 +2181,14 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        **kwargs,
     ):
+        topk_indices = kwargs.get("topk_indices")
+        if self.use_mla and topk_indices is not None:
+            return self._forward_sparse_mla(
+                q, k, v, layer, forward_batch, topk_indices, save_kv_cache
+            )
+
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         batch_size = q.shape[0]
         head_dim_out = (

@@ -10,6 +10,7 @@ from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
 from atom.config import get_current_atom_config
+from atom.utils import envs
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 
@@ -400,15 +401,13 @@ class PagedAttentionImpl(nn.Module):
         o = torch.empty_like(q)
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        if self.use_flash_layout:
+        if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
+            # print(q.shape, k_cache.shape, v_cache.shape)
             sliding_window = (
                 (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
             )
 
-            # KV cache is already in flash layout (4D), allocated by
-            # TritonMHAMetadataBuilder.build_kv_cache_tensor.
-            nkv = k_cache.shape[2]
-            descale_shape = (num_seqs, nkv)
+            shuffled_kv_cache = not self.use_flash_layout
 
             unified_attention(
                 q,
@@ -426,9 +425,10 @@ class PagedAttentionImpl(nn.Module):
                 block_table=attn_metadata.block_tables,
                 softcap=0,
                 q_descale=None,
-                k_descale=self.kv_scale.expand(descale_shape),
-                v_descale=self.kv_scale.expand(descale_shape),
+                k_descale=self.kv_scale,
+                v_descale=self.kv_scale,
                 sinks=self.sinks,
+                shuffled_kv_cache=shuffled_kv_cache,
             )
         else:
             _, num_q_heads_total, head_size = q.shape
@@ -578,24 +578,23 @@ class PagedAttentionImpl(nn.Module):
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
 
-        # the unified_attention supports both prefill attention and decode attention, but it only support
-        # flash-layout kv_cache.
+        # unified_attention supports both prefill and decode, over either the 4D
+        # flash layout (shuffled_kv_cache=False) or the 5D SHUFFLE layout
+        # (shuffled_kv_cache=True):
         #
-        # key_cache:   [num_blocks, block_size, num_kv_heads, head_size]
-        # value_cache: [num_blocks, num_kv_heads, head_size, block_size]
+        # flash    K/V: [num_blocks, block_size, num_kv_heads, head_size]
+        # shuffle  K:   [num_blocks, num_kv_heads, head_size // x, block_size, x]
+        # shuffle  V:   [num_blocks, num_kv_heads, block_size // x, head_size, x]
         #
-        # if the paged_attention supports only non-flash-layout kv_cache and kv_cache is also cached as
-        # non-flash-layout in rope_cache phase, the unified_attention should use key and value as kv_cache
-        # with block_size 1 and fake block_table.
+        # For pure prefill (no cached tokens), raw key/value are passed as a
+        # block_size=1 flash-layout cache with a fake block_table:
         #
-        # key:    [num_blocks, 1, num_kv_heads, head_size]
-        # value:  [num_blocks, 1, num_kv_heads, head_size]
+        # key:    [num_tokens, 1, num_kv_heads, head_size]
+        # value:  [num_tokens, 1, num_kv_heads, head_size]
 
         attn_metadata = fwd_ctx.attn_metadata
 
         o = torch.empty_like(q)
-        num_seqs = attn_metadata.cu_seqlens_q.shape[0] - 1
-        descale_shape = (num_seqs, k.shape[1])
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
@@ -608,11 +607,16 @@ class PagedAttentionImpl(nn.Module):
         if attn_metadata.has_cached:
             k_for_attn = k_cache
             v_for_attn = v_cache
+            # Cached path reads the paged KV cache, which is 5D SHUFFLE unless
+            # the (legacy) 4D flash layout is in use.
+            shuffled_kv_cache = not self.use_flash_layout
         else:
             #   k: [total_tokens, num_kv_heads, head_size]
             #     -> [total_tokens, 1, num_kv_heads, head_size]
             k_for_attn = k.unsqueeze(1)
             v_for_attn = v.unsqueeze(1)
+            # Raw K/V is fed as a block_size=1 flash-layout cache, never shuffled.
+            shuffled_kv_cache = False
 
         unified_attention(
             q,
@@ -630,9 +634,10 @@ class PagedAttentionImpl(nn.Module):
             block_table=attn_metadata.block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self.kv_scale.expand(descale_shape),
-            v_descale=self.kv_scale.expand(descale_shape),
+            k_descale=self.kv_scale,
+            v_descale=self.kv_scale,
             sinks=self.sinks,
+            shuffled_kv_cache=shuffled_kv_cache,
         )
 
         return o
@@ -641,12 +646,13 @@ class PagedAttentionImpl(nn.Module):
 
         ctx = fwd_ctx.context
 
+        use_unified_attn = envs.ATOM_USE_UNIFIED_ATTN
         if ctx.is_prefill:
-            if self.use_flash_layout:
+            if use_unified_attn or self.use_flash_layout:
                 return self.prefill_attention_triton
             return self.prefill_attention
         else:
-            if self.use_triton_attn or self.use_flash_layout:
+            if use_unified_attn or self.use_triton_attn or self.use_flash_layout:
                 return self.paged_attention_triton
             else:
                 # Only use pa persistent when block_size == 1024

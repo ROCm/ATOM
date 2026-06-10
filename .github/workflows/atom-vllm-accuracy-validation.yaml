@@ -33,6 +33,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
@@ -71,6 +72,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
@@ -109,6 +111,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
@@ -147,6 +150,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
@@ -185,6 +189,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
@@ -223,6 +228,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
@@ -261,6 +267,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
@@ -299,6 +306,7 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
@@ -605,6 +613,16 @@ jobs:
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
+                  "toggle_env": "RUN_DSV4_PRO_TP8",
+                  "model_name": "DeepSeek-V4-Pro TP8",
+                  "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+                  "extra_args": "--tensor-parallel-size 8 --gpu-memory-utilization 0.8 --tokenizer-mode deepseek_v4",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.94,
+                  "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
                   "toggle_env": "RUN_DSV32_FP8_TP4",
                   "model_name": "DeepSeek-V3.2-FP8 TP4",
                   "model_path": "deepseek-ai/DeepSeek-V3.2",
@@ -863,6 +881,7 @@ jobs:
               "MiniMax-M2.5 TP2",
               "DeepSeek-V3.2-FP8 TP4",
               "DeepSeek-V3.2-FP8 PTPC TP4",
+              "DeepSeek-V4-Pro TP8",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1",
               "GLM-4.7-FP8 TP8",
               "GLM-4.7-FP8 MTP TP4",
@@ -1387,6 +1406,10 @@ jobs:
                   "/models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
                   "/models/deepseek-ai/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
                   "/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+              ],
+              "deepseek-ai/DeepSeek-V4-Pro": [
+                  "/models/deepseek-ai/DeepSeek-V4-Pro",
+                  "/models/DeepSeek-V4-Pro",
               ],
               "deepseek-ai/DeepSeek-V3.2": [
                   "/models/deepseek-ai/DeepSeek-V3.2",

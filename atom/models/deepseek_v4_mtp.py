@@ -43,6 +43,7 @@ from atom.utils.forward_context import get_forward_context
 from .deepseek_v4 import (
     Block,
     DeepseekV4Args,
+    HCState,
     ParallelHead,
     make_v4_quant_config,
 )
@@ -127,7 +128,14 @@ class MTPBlock(Block):
         n_tok, hc, d = x.shape
         h_proj_out = self.h_proj(x.reshape(n_tok * hc, d)).reshape(n_tok, hc, d)
         x = self.e_proj(e).unsqueeze(-2) + h_proj_out  # [num_tokens, hc, dim]
-        return super().forward(x, positions)  # [num_tokens, hc, dim]
+        hc_state = HCState(residual=x, post_mix=None, comb_mix=None, x_prev=None)
+        hc_state = super().forward(hc_state, positions)
+        return self.hc_post(
+            hc_state.x_prev,
+            hc_state.residual,
+            hc_state.post_mix,
+            hc_state.comb_mix,
+        )
 
 
 class DeepseekV4MTPModel(nn.Module):

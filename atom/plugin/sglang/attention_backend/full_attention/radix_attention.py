@@ -147,6 +147,31 @@ class RadixAttention(BaseAttention):
             if self.rotary_emb is not None and positions is not None:
                 query, key = self.rotary_emb(positions, query, key)
 
+            topk_indices = kwargs.get("topk_indices", None)
+            if topk_indices is not None:
+                if key is not None:
+                    value = value.view(
+                        -1, self.attn.tp_v_head_num, self.attn.v_head_dim
+                    )
+                    key = key.view(-1, self.attn.tp_k_head_num, self.attn.qk_head_dim)
+                from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
+                    forward_sparse_mla_for_sglang,
+                )
+
+                return forward_sparse_mla_for_sglang(
+                    query,
+                    key,
+                    value,
+                    self.attn,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    topk_indices=topk_indices,
+                    input_dtype=getattr(
+                        forward_batch.attn_backend, "input_dtype", torch.bfloat16
+                    ),
+                    q_scale=q_scale,
+                )
+
             return self.attn(
                 query,
                 key,

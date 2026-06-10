@@ -475,11 +475,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 runner.physical_block_size,
                 x,
             )
+            # V cache uses the same 5D SHUFFLE layout as the MiMo-V2 per-module
+            # allocator above: [num_blocks, num_kv_heads, block_size//x, head_dim, x].
             v_cache = runner.kv_cache[1, attn_idx].view(
                 runner.num_physical_kvcache_blocks,
                 runner.num_kv_heads,
+                runner.physical_block_size // x,
                 hf_config.head_dim,
-                runner.physical_block_size,
+                x,
             )
             if config.kv_cache_dtype == "fp8":
                 module.k_scale = runner.kv_scale[0, attn_idx]
