@@ -1,6 +1,7 @@
 from typing import Optional, Union
 
 import torch
+from aiter import QuantType, dtypes
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_qknorm_allreduce,
@@ -225,8 +226,12 @@ class MiniMaxM2Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        hidden_states_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        # hidden_states_scale is non-None when input_layernorm already emitted a
+        # per-group-quantized (fp8, scale) activation; qkv_proj then skips its
+        # internal quant and feeds the GEMM directly.
+        qkv = self.qkv_proj(hidden_states, hidden_states_scale)
 
         if self.use_qk_norm:
             # TP-aware RMSNorm: all-reduce variance across TP ranks so
@@ -314,10 +319,23 @@ class MiniMaxM2DecoderLayer(nn.Module):
             prefix=f"{prefix}.block_sparse_moe",
         )
 
+        # When the downstream qkv_proj consumes per-group FP8 (per_1x128) input,
+        # fuse the activation quant into input_layernorm's AllReduce+RMSNorm so
+        # qkv_proj receives (fp8, scale) directly and skips a separate quant
+        # kernel. Only meaningful on the fused-allreduce path (tp>1, layer>0).
+        qkv = self.self_attn.qkv_proj
+        qkv_group_quant = (
+            qkv.quant_type.value == QuantType.per_1x128.value
+            and qkv.params_dtype == dtypes.fp8
+        )
+        fuse_input_allreduce = ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0,
+            fused_allreduce=fuse_input_allreduce,
+            fused_quant=fuse_input_allreduce and qkv_group_quant,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn.qkv_proj",
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
@@ -331,13 +349,23 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states_scale = None
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            # The fused AllReduce+RMSNorm+per_group_quant path returns the
+            # normed activation as a (fp8, scale) tuple for qkv_proj to consume
+            # directly; the plain path returns a bf16 tensor.
+            if isinstance(hidden_states, tuple):
+                hidden_states, hidden_states_scale = hidden_states
 
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+        )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 

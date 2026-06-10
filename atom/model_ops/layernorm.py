@@ -12,7 +12,10 @@ from aiter import (
     rmsnorm2d_fwd,
     rmsnorm2d_fwd_with_add,
 )
-from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
+from aiter.dist.communication_op import (
+    tensor_model_parallel_fused_allreduce_rmsnorm,
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
+)
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
@@ -328,6 +331,30 @@ class RMSNorm(nn.Module):
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
                 )
                 return x, residual
+        if (
+            self.fused_allreduce
+            and self.tp_size > 1
+            and self.use_fused_quant
+            and residual is not None
+            and self.quant_type.value == _QV_PER_1X128
+        ):
+            # Combined AllReduce + RMSNorm + per-group FP8 quant: the downstream
+            # GEMM (e.g. qkv_proj) consumes the (fp8, scale) output directly,
+            # skipping a separate per-group quant kernel. _aiter_transpose_scale
+            # (resolved at init) selects the scale layout matching that GEMM
+            # (column-major for the preshuffle path, row-major otherwise).
+            # The fused kernel does not support non-contiguous input.
+            x_fp8, residual, x_scale = (
+                tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+                    x.contiguous(),
+                    residual,
+                    self.weight,
+                    self.eps,
+                    group_size=128,
+                    transpose_scale=self._aiter_transpose_scale,
+                )
+            )
+            return (x_fp8, x_scale), residual
         if self.fused_allreduce and self.tp_size > 1:
             assert (
                 residual is not None
