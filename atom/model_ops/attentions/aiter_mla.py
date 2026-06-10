@@ -1441,14 +1441,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             c_lo = c * chunk_size
             c_hi = min(c_lo + chunk_size, prefix_len)
             c_len = c_hi - c_lo
-            per_seq = torch.zeros(ub_num_reqs, dtype=torch.int32, device=device)
-            per_seq[0] = c_len
-            cu_k = torch.zeros(ub_num_reqs + 1, dtype=torch.int32, device=device)
-            torch.cumsum(per_seq, dim=0, out=cu_k[1:])
-            kv_indptr_list.append(cu_k)
+            cu = np.full(ub_num_reqs + 1, c_len, dtype=np.int32)
+            cu[0] = 0
+            kv_indptr_list.append(
+                torch.from_numpy(cu).pin_memory().to(device, non_blocking=True)
+            )
             kv_indices_list.append(prefix_slots[c_lo:c_hi])
-            total_tokens_list.append(int(c_len))
-            max_seqlen_k_list.append(int(c_len))
+            total_tokens_list.append(c_len)
+            max_seqlen_k_list.append(c_len)
 
         ub_attn.has_cached = True
         # total_kv = this ubatch's new tokens + the straddle prefix it now reads
