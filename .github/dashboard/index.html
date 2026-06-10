@@ -73,7 +73,8 @@
     .filter-dropdown.open { display: block; }
     .filter-dropdown label { display: flex; align-items: center; gap: 8px; padding: 4px 12px; font-size: 12px; cursor: pointer; color: var(--text-secondary); }
     .filter-dropdown label:hover { background: var(--bg-tertiary); }
-    .filter-dropdown input[type="checkbox"] { accent-color: var(--ui); }
+    .filter-dropdown input[type="checkbox"],
+    .filter-dropdown input[type="radio"] { accent-color: var(--ui); }
     .filter-dropdown .sep { border-top: 1px solid var(--border); margin: 4px 0; }
     .filter-reset { background: none; color: var(--text-tertiary); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
     .filter-reset:hover { color: var(--text-secondary); background: var(--bg-tertiary); }
@@ -824,7 +825,7 @@ const allModels = [...new Set(Object.keys(historyMap).map(k => k.split('|')[1]))
 const allIslOsl = [...new Set(Object.keys(historyMap).map(k => k.split('|')[2]))].sort();
 const allConc = [...new Set(Object.keys(historyMap).map(k => +k.split('|')[3]))].sort((a, b) => a - b);
 const allHardware = [...new Set(Object.values(latestConfigs).map(cfg => cfg.hardware || 'unknown'))].sort(_lc);
-const defaultHardwareFilter = allHardware.includes('mi355x') ? ['mi355x'] : [...allHardware];
+const defaultHardware = allHardware.includes('mi355x') ? 'mi355x' : (allHardware[0] || 'unknown');
 const allTrendModelKeys = [...new Set(Object.values(latestConfigs).map(cfg => `${cfg.backend}|${cfg.model}`))].sort(_lc);
 
 /* ================================================================
@@ -837,7 +838,7 @@ const PERF_METRICS = [
   { key: 'TTFT',        label: 'TTFT',              unit: 'ms',    lower: true },
 ];
 const state = {
-  filters: { backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc], hardware: [...defaultHardwareFilter] },
+  filters: { backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc], hardware: [defaultHardware] },
   activeTab: 'performance',
   perfMetric: 'Total Tput',
   trendModelKey: allTrendModelKeys[0] || '',
@@ -864,6 +865,10 @@ function filteredConfigs() {
 // ISL/OSL compact format: "1024/1024" → "1k/1k", "8192/1024" → "8k/1k"
 function fmtIslOsl(s) { return s.replace(/\d+/g, n => +n >= 1024 ? parseFloat((+n / 1024).toPrecision(3)) + 'k' : n); }
 function fmtHardware(s) { return s === 'unknown' ? 'Unknown' : String(s).toUpperCase(); }
+function selectedHardware() {
+  const hw = state.filters.hardware[0];
+  return hw && allHardware.includes(hw) ? hw : defaultHardware;
+}
 
 // Model family grouping: "DeepSeek-R1-0528-mtp3" → family "DeepSeek-R1-0528", variant "mtp3"
 function modelFamily(name) {
@@ -1113,13 +1118,22 @@ _updateEl.textContent = 'Updated ' + relTime(rawData.lastUpdate);
 if (_isStale) { _updateEl.classList.add('stale'); _updateEl.textContent += ' — data may be stale'; }
 const repoLink = document.getElementById('repo-link');
 repoLink.href = rawData.repoUrl; repoLink.textContent = rawData.repoUrl.replace('https://github.com/', '');
-// Append GPU platform info to header meta from first available config
-const _firstCfgWithGpu = Object.values(latestConfigs).find(c => c._gpu_name);
-if (_firstCfgWithGpu) {
-  const metaEl = document.querySelector('.meta');
-  const gpuSpan = document.createElement('span');
-  gpuSpan.textContent = ' · ' + _firstCfgWithGpu._gpu_name + (_firstCfgWithGpu._rocm_version ? ' · ROCm ' + _firstCfgWithGpu._rocm_version : '');
-  metaEl.appendChild(gpuSpan);
+const _headerGpuMeta = document.createElement('span');
+_headerGpuMeta.id = 'header-gpu-meta';
+document.querySelector('.meta').appendChild(_headerGpuMeta);
+
+function updateHeaderGpuMeta() {
+  const span = document.getElementById('header-gpu-meta');
+  if (!span) return;
+  const entries = Object.values(filteredConfigs());
+  if (!entries.length) { span.textContent = ''; return; }
+
+  const newest = entries.reduce((a, b) => (a.date >= b.date ? a : b));
+
+  const hw = selectedHardware();
+  let text = hw !== 'unknown' ? ' · ' + fmtHardware(hw) : '';
+  if (newest._rocm_version) text += ' · ROCm ' + newest._rocm_version;
+  span.textContent = text;
 }
 document.getElementById('dl-btn').onclick = () => {
   const a = document.createElement('a');
@@ -1147,6 +1161,10 @@ function updateFilterBadge(id) {
   const btn = document.querySelector(`.filter-btn[data-filter="${id}"]`);
   if (!btn) return;
   const def = filterDefs.find(d => d.id === id);
+  if (id === 'hardware') {
+    btn.innerHTML = `${fmtHardware(selectedHardware())} ▾`;
+    return;
+  }
   const sel = getFilterState(id);
   const allSelected = sel.length === def.options.length;
   btn.innerHTML = allSelected ? `${def.label} ▾` : `${def.label} ▾<span class="count">${sel.length}</span>`;
@@ -1160,12 +1178,20 @@ function renderFilters() {
     const allSelected = sel.length === d.options.length;
     const group = document.createElement('div');
     group.className = 'filter-group';
-    group.innerHTML = `<button class="filter-btn" data-filter="${d.id}">${d.label} ▾${allSelected ? '' : '<span class="count">' + sel.length + '</span>'}</button>
-      <div class="filter-dropdown" id="fd-${d.id}">
-        <label><input type="checkbox" value="__all__" ${allSelected ? 'checked' : ''}> All</label>
-        <div class="sep"></div>
-        ${d.options.map(o => `<label><input type="checkbox" value="${o}" ${sel.includes(o) ? 'checked' : ''}> ${d.format ? d.format(o) : o}</label>`).join('')}
-      </div>`;
+    if (d.id === 'hardware') {
+      const selected = selectedHardware();
+      group.innerHTML = `<button class="filter-btn" data-filter="${d.id}">${fmtHardware(selected)} ▾</button>
+        <div class="filter-dropdown" id="fd-${d.id}">
+          ${d.options.map(o => `<label><input type="radio" name="hardware-filter" value="${o}" ${selected === o ? 'checked' : ''}> ${d.format ? d.format(o) : o}</label>`).join('')}
+        </div>`;
+    } else {
+      group.innerHTML = `<button class="filter-btn" data-filter="${d.id}">${d.label} ▾${allSelected ? '' : '<span class="count">' + sel.length + '</span>'}</button>
+        <div class="filter-dropdown" id="fd-${d.id}">
+          <label><input type="checkbox" value="__all__" ${allSelected ? 'checked' : ''}> All</label>
+          <div class="sep"></div>
+          ${d.options.map(o => `<label><input type="checkbox" value="${o}" ${sel.includes(o) ? 'checked' : ''}> ${d.format ? d.format(o) : o}</label>`).join('')}
+        </div>`;
+    }
     bar.appendChild(group);
   }
   // Filter summary
@@ -1190,8 +1216,9 @@ function renderFilters() {
     state.filters.models = [...allModels];
     state.filters.islOsl = [...allIslOsl];
     state.filters.conc = [...allConc];
-    state.filters.hardware = [...allHardware];
+    state.filters.hardware = [defaultHardware];
     renderFilters();
+    updateHeaderGpuMeta();
     renderActiveTab();
     renderKPICards();
     syncToHash();
@@ -1230,6 +1257,16 @@ function renderFilters() {
   bar.querySelectorAll('.filter-dropdown').forEach(dd => {
     dd.addEventListener('change', (e) => {
       const filterId = dd.id.replace('fd-', '');
+      if (filterId === 'hardware') {
+        if (e.target.type !== 'radio') return;
+        state.filters.hardware = [e.target.value];
+        updateFilterBadge('hardware');
+        updateHeaderGpuMeta();
+        renderActiveTab();
+        renderKPICards();
+        syncToHash();
+        return;
+      }
       const allCb = dd.querySelector('input[value="__all__"]');
       const itemCbs = [...dd.querySelectorAll('input:not([value="__all__"])')];
       if (e.target.value === '__all__') {
@@ -1243,8 +1280,8 @@ function renderFilters() {
       } else {
         state.filters[filterId] = selected;
       }
-      // Only update badge — dropdown stays open
       updateFilterBadge(filterId);
+      updateHeaderGpuMeta();
       renderActiveTab();
       renderKPICards();
       syncToHash();
@@ -2601,7 +2638,7 @@ function syncToHash() {
   if (state.filters.models.length !== allModels.length) parts.push('model=' + state.filters.models.join(','));
   if (state.filters.islOsl.length !== allIslOsl.length) parts.push('isl=' + state.filters.islOsl.join(','));
   if (state.filters.conc.length !== allConc.length) parts.push('conc=' + state.filters.conc.join(','));
-  if (state.filters.hardware.length !== allHardware.length) parts.push('hardware=' + state.filters.hardware.join(','));
+  parts.push('hardware=' + selectedHardware());
   if (state.activeTab !== 'performance') parts.push('tab=' + state.activeTab);
   hashUpdateFromCode = true;
   window.location.hash = parts.join('&');
@@ -2617,7 +2654,10 @@ function readFromHash() {
     if (k === 'model') state.filters.models = v.split(',').filter(m => allModels.includes(m));
     if (k === 'isl') state.filters.islOsl = v.split(',').filter(i => allIslOsl.includes(i));
     if (k === 'conc') state.filters.conc = v.split(',').map(Number).filter(c => allConc.includes(c));
-    if (k === 'hardware') state.filters.hardware = v.split(',').filter(h => allHardware.includes(h));
+    if (k === 'hardware') {
+      const hw = v.split(',')[0];
+      state.filters.hardware = hw && allHardware.includes(hw) ? [hw] : [defaultHardware];
+    }
     if (k === 'tab') {
       state.activeTab = v;
       document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === v));
@@ -3012,6 +3052,7 @@ function renderMtpAcceptanceMiniChart(key) {
 
 // Re-render everything (used by theme toggle)
 function renderAll() {
+  updateHeaderGpuMeta();
   renderKPICards();
   renderActiveTab();
 }
@@ -3021,6 +3062,7 @@ function renderAll() {
    ================================================================ */
 readFromHash();
 renderFilters();
+updateHeaderGpuMeta();
 renderKPICards();
 renderActiveTab();
 
@@ -3031,6 +3073,7 @@ window.addEventListener('hashchange', () => {
   if (hashUpdateFromCode) { hashUpdateFromCode = false; return; }
   readFromHash();
   renderFilters();
+  updateHeaderGpuMeta();
   renderKPICards();
   renderActiveTab();
 });
