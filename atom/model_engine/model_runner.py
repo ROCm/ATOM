@@ -1720,6 +1720,11 @@ class ModelRunner:
                 None,
             )
 
+        # Mixed prefill+decode DP steps only deadlock under prefill
+        # token-split + TBO-decode
+        require_uniform_mode = (
+            self.config.enable_tbo_decode and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+        )
         sync = sync_dp_for_tbo(
             dp_group=get_dp_group().cpu_group,
             dp_size=dp_size,
@@ -1728,6 +1733,7 @@ class ModelRunner:
             tbo_on=tbo_on,
             local_tbo_eligible=local_eligible,
             local_ub_tokens=(local_ub0, local_ub1),
+            require_uniform_mode=require_uniform_mode,
         )
 
         max_tokens = int(sync.num_tokens_across_dp.max().item())

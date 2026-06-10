@@ -1390,27 +1390,31 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         # ── Token-midpoint split straddle handling ──────────────────────
-        self._maybe_attach_straddle_prefix(attn_metadata, ub_attn, ub_slice)
+        self._attach_tbo_token_split_straddle_prefix(attn_metadata, ub_attn, ub_slice)
 
         return ub_attn
 
-    def _maybe_attach_straddle_prefix(self, attn_metadata, ub_attn, ub_slice):
+    # TBO PREFILL TOKEN-SPLIT (ATOM_TBO_PREFILL_TOKEN_SPLIT) — MLA path
+
+    def _attach_tbo_token_split_straddle_prefix(self, attn_metadata, ub_attn, ub_slice):
         """If this ubatch's first request is cut from a previous ubatch, attach
-        the prior portion's KV-cache slots as a single-chunk cached prefix so
-        dense MLA attention can see it (token-midpoint split correctness)."""
+        the prior portion's KV-cache slots as chunked cached prefixes so dense
+        MLA attention can see it (token-midpoint split correctness). No-op when
+        not straddling."""
+        from atom.utils.tbo import compute_straddle_split_info
+
         if self.k_chunk_workspace is None:
             return  # chunked workspace disabled → cannot serve a prefix
-        cu = attn_metadata.cu_seqlens_q
-        if cu is None:
-            return
-        rs = ub_slice.request_slice
-        ts = ub_slice.token_slice
-        first_req = rs.start
-        # Global token offset where this ubatch's first request actually began.
-        req_global_start = int(cu[first_req].item())
-        prefix_len = ts.start - req_global_start
-        if prefix_len <= 0:
+
+        cu_np = self.model_runner.forward_vars["cu_seqlens_q"].np
+        info = compute_straddle_split_info(cu_np, ub_slice)
+        if not info.is_straddling:
             return  # not straddling — first request starts at the slice edge
+
+        ts = ub_slice.token_slice
+        req_global_start = info.req_global_start
+        prefix_len = info.prefix_len
+        ub_num_reqs = info.ub_num_reqs
 
         slot_mapping = attn_metadata.slot_mapping
         if slot_mapping is None:
@@ -1420,7 +1424,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # the gather kv_indices directly.
         prefix_slots = slot_mapping[req_global_start : ts.start].to(torch.int32)
 
-        ub_num_reqs = rs.stop - rs.start
         device = prefix_slots.device
         # Only the first (straddled) request has a cached prefix; all other
         # requests in this ubatch contribute 0 cached tokens. Chunk the prefix
@@ -1449,8 +1452,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # total_kv = this ubatch's new tokens + the straddle prefix it now reads
         # from cache. Only referenced by the chunked-prefill debug log, but keep
         # it consistent to avoid a None in "%d" formatting.
-        ub_num_tokens = ts.stop - ts.start
-        ub_attn.total_kv = int(ub_num_tokens + prefix_len)
+        ub_attn.total_kv = int(info.ub_num_tokens + prefix_len)
         ub_attn.mla_chunk_meta = MLAChunkContextMetadata(
             kv_indptr=kv_indptr_list,
             kv_indices=kv_indices_list,

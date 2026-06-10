@@ -125,6 +125,7 @@ def sync_dp_for_tbo(
     tbo_on: bool,
     local_tbo_eligible: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
+    require_uniform_mode: bool = False,
 ) -> DPSyncResult:
     """Single packed DP all_gather over the per-rank scalars needed to
     decide DP padding, the prefill fan-out, and the cross-DP TBO gate.
@@ -165,6 +166,12 @@ def sync_dp_for_tbo(
     ub_max_tokens_across_dp: Optional[tuple[int, int]] = None
     if tbo_on:
         tbo_collective_active = bool(sync[2].all().item())
+        # Mixed-mode guard — only needed when `require_uniform_mode` is set
+        # (i.e. prefill token-split + TBO decode, see call site).
+        if tbo_collective_active and require_uniform_mode:
+            prefill_rank_count = int(sync[1].sum().item())
+            uniform_mode = prefill_rank_count == 0 or prefill_rank_count == dp_size
+            tbo_collective_active = uniform_mode
         if tbo_collective_active:
             ub_max_tokens_across_dp = (
                 int(sync[3].max().item()),

@@ -556,10 +556,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
         if self._tbo_token_split:
-            self._stash_tbo_prefill_block_tables(batch)
+            self._stash_tbo_token_split_prefill_state(batch)
         return attn_metadata, positions
 
-    def _stash_tbo_prefill_block_tables(self, batch: ScheduledBatch):
+    # TBO PREFILL TOKEN-SPLIT (ATOM_TBO_PREFILL_TOKEN_SPLIT) — MHA path
+
+    def _stash_tbo_token_split_prefill_state(self, batch: ScheduledBatch):
+        """Snapshot full-batch paged block_tables / cu_tokens / num_cached so a
+        later micro-batch can rebuild the straddled request's cached prefix."""
         self._tbo_prefill_block_tables = None
         self._tbo_prefill_cu_tokens = None
         self._tbo_prefill_num_cached = None
@@ -591,21 +595,28 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+        self._attach_tbo_token_split_straddle_prefix(ub_attn, ub_slice)
+        return ub_attn
+
+    def _attach_tbo_token_split_straddle_prefix(self, ub_attn, ub_slice):
+        """Re-attach the straddled request's already-cached first half as a
+        paged cached prefix (block_tables + context_lens) so ubatch 1's dense
+        attention sees the tokens ubatch 0 wrote. No-op when not straddling."""
+        from atom.utils.tbo import compute_straddle_split_info
 
         block_tables_host = self._tbo_prefill_block_tables
         cu_tokens = self._tbo_prefill_cu_tokens
         if block_tables_host is None or cu_tokens is None:
-            return ub_attn
+            return
+
+        info = compute_straddle_split_info(cu_tokens, ub_slice)
+        if not info.is_straddling:
+            return
 
         rs = ub_slice.request_slice
-        ts = ub_slice.token_slice
-        first_req = rs.start
-        req_global_start = int(cu_tokens[first_req])
-        prefix_len = ts.start - req_global_start
-        if prefix_len <= 0:
-            return ub_attn  # not straddling
-
-        ub_num_reqs = rs.stop - rs.start
+        first_req = info.first_req
+        ub_num_reqs = info.ub_num_reqs
+        prefix_len = info.prefix_len
         device = self.device
 
         new_lens = (
@@ -649,7 +660,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             device, non_blocking=True
         )
         ub_attn.max_seqlen_k = int(ctx_lens.max())
-        return ub_attn
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
