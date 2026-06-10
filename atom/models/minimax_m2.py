@@ -3,7 +3,7 @@ from typing import Optional, Union
 import torch
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
-    tensor_model_parallel_fused_qknorm_allreduce,
+    tensor_model_parallel_fused_qknorm_allreduce_rope,
 )
 from aiter.dist.parallel_state import (
     get_pp_group,
@@ -178,6 +178,14 @@ class MiniMaxM2Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        self.rotary_dim = rotary_dim
+        cos = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+        sin = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+        self.register_buffer(
+            "qknorm_rope_cos_sin_cache",
+            torch.cat([cos, sin], dim=-1).contiguous(),
+            persistent=False,
+        )
 
         self.use_qk_norm = use_qk_norm
         if self.use_qk_norm:
@@ -204,7 +212,7 @@ class MiniMaxM2Attention(nn.Module):
             kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
             use_mla=False,
-            rotary_emb=self.rotary_emb,
+            rotary_emb=None,
             prefix=f"{prefix}.attn",
         )
 
@@ -233,8 +241,18 @@ class MiniMaxM2Attention(nn.Module):
             # normalization uses the global variance (over 6144/1024 dims)
             # rather than per-rank variance (768/128 dims).
             if self.tp_size > 1:
-                q, k, v = tensor_model_parallel_fused_qknorm_allreduce(
-                    qkv, self.q_norm.weight, self.k_norm.weight, self.rms_norm_eps
+                cos_sin_cache = self.qknorm_rope_cos_sin_cache
+                if cos_sin_cache.dtype != qkv.dtype or cos_sin_cache.device != qkv.device:
+                    cos_sin_cache = cos_sin_cache.to(device=qkv.device, dtype=qkv.dtype)
+                q, k, v = tensor_model_parallel_fused_qknorm_allreduce_rope(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos_sin_cache,
+                    positions,
+                    self.head_dim,
+                    self.rotary_dim,
+                    self.rms_norm_eps,
                 )
             else:
                 q, k, v = torch.split(
@@ -255,10 +273,12 @@ class MiniMaxM2Attention(nn.Module):
                 k = (
                     k * torch.rsqrt(k_var + self.rms_norm_eps) * self.k_norm.weight
                 ).to(orig_dtype)
+                q, k = self.rotary_emb(positions, q, k)
         else:
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
+            q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(
             query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
