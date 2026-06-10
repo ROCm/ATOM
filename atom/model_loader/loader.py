@@ -752,9 +752,7 @@ def load_model(
         # does not flag them as uninitialized.
         if getattr(module, "_online_quant_info", None) is not None:
             for param_name, _ in module.named_parameters(recurse=False):
-                full_name = (
-                    f"{module_name}.{param_name}" if module_name else param_name
-                )
+                full_name = f"{module_name}.{param_name}" if module_name else param_name
                 loaded_weights_record.add(prefix + full_name)
 
     if has_online_quant:
