@@ -1103,22 +1103,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     global_num_experts=n_expts_tot,
                     expert_map=expert_map,
                 )
-                _tp_size = (
-                    getattr(self, "tp_size", getattr(self.moe, "tp_size", 1))
-                    if hasattr(self, "moe")
-                    else getattr(self, "tp_size", 1)
-                )
-                _ep_size = (
-                    getattr(self, "ep_size", getattr(self.moe, "ep_size", 1))
-                    if hasattr(self, "moe")
-                    else getattr(self, "ep_size", 1)
-                )
-                if layer.reduce_results and (_tp_size > 1 or _ep_size > 1):
-                    from aiter.dist.parallel_state import get_tp_group
-
-                    _moe_result = get_tp_group().all_reduce(
-                        _moe_result, ca_fp8_quant=False
-                    )
+                # NOTE: do NOT all_reduce here. FusedMoE.forward_impl /
+                # forward_impl_graph already all-reduce the apply() output when
+                # reduce_results is set (like every other quant method's apply,
+                # which never reduces internally). Reducing here too would double
+                # reduce the mxfp4 output (scaled by the group size).
                 return _moe_result
 
             assert (
