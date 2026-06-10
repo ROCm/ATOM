@@ -48,11 +48,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     ):
         self.block_size = 1024 if model_runner.block_size == 1024 else 16
         if envs.ATOM_USE_UNIFIED_ATTN:
-            # activate block_convertor when UA_decode is enabled, set --block-size 1024 for envs.ATOM_USE_UNIFIED_ATTN
-            assert (
-                self.block_size == 1024
-            ), "When using ATOM_USE_UNIFIED_ATTN=1, block_size will be set to the most performant numbers, please set --block-size 1024 to allow proper block size conversion via block_convertor"
-            self.block_size = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
+            # SHUFFLE (pre-shuffled) KV cache: use the logical block size directly
+            # as the physical block size so block_ratio == 1 and
+            # unified_attention's block_table needs no logical->physical
+            # conversion. Pass --block-size equal to the performant physical
+            # page: fp8 packs x=16 - 128; bf16 packs x=8 - 64 (both keep a
+            # 128-byte physical page, i.e. block_size // x == 8).
+            expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
+            assert model_runner.block_size == expected, (
+                f"ATOM_USE_UNIFIED_ATTN=1 expects --block-size {expected} "
+                f"for {model_runner.kv_cache_dtype} KV cache (so block_ratio == 1), "
+                f"got --block-size {model_runner.block_size}"
+            )
+            self.block_size = model_runner.block_size
         assert (
             model_runner.block_size % self.block_size == 0
         ), f"model_runner.block_size must be divisible by block_size but got {model_runner.block_size=}, block_size={self.block_size}, please set --block-size (model_runner.block_size) to be divisible by {self.block_size}"

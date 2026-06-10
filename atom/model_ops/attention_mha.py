@@ -600,15 +600,21 @@ class PagedAttentionImpl(nn.Module):
         )
 
         # `block_tables` is always populated by TritonMHAMetadataBuilder.
-        # For pure prefill (no cached tokens) it is the fake table built in
-        # prepare_prefill that maps seq i to token indices
+        # For pure prefill (no cached tokens) it is, by default, the fake table
+        # built in prepare_prefill that maps seq i to token indices
         # [cu_seqlens_k[i], ..., cu_seqlens_k[i+1]-1], paired with raw K/V
         # treated as kv_cache with block_size=1.
-        if attn_metadata.has_cached:
+        #
+        # Under ATOM_USE_UNIFIED_ATTN, prepare_prefill instead uploads the real
+        # per-seq block_table and sets `prefill_from_cache`, so the new tokens
+        # already written into the paged flash-layout cache during rope_cache
+        # are read straight from `k_cache`/`v_cache`, identical to the
+        # prefix-cache-hit path.
+        if attn_metadata.has_cached or attn_metadata.prefill_from_cache:
             k_for_attn = k_cache
             v_for_attn = v_cache
-            # Cached path reads the paged KV cache, which is 5D SHUFFLE unless
-            # the (legacy) 4D flash layout is in use.
+            # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
+            # 4D flash layout is in use.
             shuffled_kv_cache = not self.use_flash_layout
         else:
             #   k: [total_tokens, num_kv_heads, head_size]
