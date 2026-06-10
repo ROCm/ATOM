@@ -7,9 +7,9 @@ concurrency:
 on:
   schedule:
     # Nightly at 23:00 Beijing time (15:00 UTC).
-    - cron: '0 15 * * 1,3'  # Mon/Wed: SGLang-OOB DeepSeek group A, 6 models x 10 params = 60 cases
-    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB DeepSeek MTP group B, 2 models x 10 params = 20 cases
-    - cron: '0 15 * * 5'    # Fri: SGLang-OOB all, 10 models x 10 params = 100 cases
+    - cron: '0 15 * * 1,3'  # Mon/Wed: SGLang-OOB DeepSeek group A, 12 models x 10 params = 120 cases
+    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB DeepSeek MTP group B, 4 models x 10 params = 40 cases
+    - cron: '0 15 * * 5'    # Fri: SGLang-OOB all, 20 models x 10 params = 200 cases
     - cron: '0 15 * * 6'  # Sat: SGLang-Mesh all, 8 configs = 62 cases
   workflow_dispatch:
     inputs:
@@ -26,18 +26,28 @@ on:
         options:
           - "none (do not run SGLang-OOB models)"
           - "deepseek-r1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp8-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp8-tp4-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp4-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp4-dp4-ep4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp4-dp4-ep4-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp8-ep8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-mtp3 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp8-mtp3-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-mtp1 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp8-mtp1-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-5-397b-a17b-fp8-tp4-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
-          - "all-deepseek (8 DeepSeek configs x 10 default params)"
-          - "all-qwen (2 Qwen configs x 10 default params)"
-          - "all-oob (all SGLang-OOB configs x 10 default params)"
+          - "qwen3-5-397b-a17b-fp8-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "all-deepseek (16 DeepSeek configs x 10 default params)"
+          - "all-qwen (4 Qwen configs x 10 default params)"
+          - "all-oob (all 20 SGLang-OOB configs x 10 default params)"
         default: "none (do not run SGLang-OOB models)"
       mesh_config_preset:
         description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"
@@ -685,6 +695,7 @@ jobs:
       contents: write
     env:
       MODEL_NAME: ${{ matrix.model.display }}
+      CI_RUNNER: ${{ matrix.model.runner }}
       DASHBOARD_MODEL_NAME: ${{ matrix.model.dashboard_model || '' }}
       MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
       MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
@@ -715,6 +726,20 @@ jobs:
       PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
     steps:
+      - name: Print runner user
+        run: |
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "PATH=$PATH"
+          command -v docker || true
+          docker version || true
+          docker info || true
+          ls -l /var/run/docker.sock || true
+          groups || true
+          command -v podman || true
+          podman info || true
+          echo "=== End container engine diagnostics ==="
+          
       - name: Detect container engine
         run: |
           if docker info > /dev/null 2>&1; then
@@ -1164,6 +1189,7 @@ jobs:
             GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            CI_RUNNER="${CI_RUNNER}" \
             RESULT_PATH="$f" \
             python3 -c "
           import json, os
@@ -1173,6 +1199,7 @@ jobs:
           d['gpu_name'] = os.environ.get('GPU_NAME', '')
           d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
           d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
+          d['ci_runner'] = os.environ.get('CI_RUNNER', '')
           with open(p, 'w') as f:
               json.dump(d, f, indent=2)
           "
@@ -1350,6 +1377,25 @@ jobs:
           def slugify(text: str) -> str:
               return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "unknown"
 
+          def hardware_from_payload(payload: dict) -> str:
+              text = " ".join(
+                  str(payload.get(key, ""))
+                  for key in ("gpu_name", "ci_runner", "benchmark_runner")
+              ).lower()
+              if "mi355" in text or "mi35x" in text:
+                  return "mi355x"
+              if "mi325" in text:
+                  return "mi325x"
+              if "mi308" in text:
+                  return "mi308x"
+              if "mi300" in text:
+                  return "mi300x"
+              if "mi250" in text:
+                  return "mi250x"
+              if "mi210" in text:
+                  return "mi210"
+              return "unknown"
+
           def precision_from_model(model: str):
               upper = model.upper()
               if "MXFP4" in upper or "FP4" in upper:
@@ -1403,12 +1449,13 @@ jobs:
               atom_source_sha = str(payload.get("atom_source_sha", "")) or "unknown"
               sha7 = atom_source_sha[:7] if atom_source_sha else "unknown"
               day = time.strftime("%Y-%m-%d", time.gmtime())
-              grouped[(day, sha7, backend, model, isl, osl)].append(
+              hardware = hardware_from_payload(payload)
+              grouped[(day, sha7, hardware, backend, model, isl, osl)].append(
                   (path, payload, precision, concurrency, ratio)
               )
 
           written_files = set()
-          for (day, sha7, backend, model, isl, osl), entries in sorted(grouped.items()):
+          for (day, sha7, hardware, backend, model, isl, osl), entries in sorted(grouped.items()):
               entries.sort(key=lambda item: (item[3], item[4]))
               timestamp_ms = int(time.time() * 1000)
               precision = entries[0][2]
@@ -1434,7 +1481,7 @@ jobs:
               model_slug = slugify(model)
               backend_slug = slugify(backend)
               run_id = (
-                  f"atom_sglang_{backend_slug}_{day.replace('-', '')}_{model_slug}_"
+                  f"atom_sglang_{hardware}_{backend_slug}_{day.replace('-', '')}_{model_slug}_"
                   f"isl{isl}_osl{osl}_{sha7}_{os.environ['GITHUB_RUN_ID']}"
               )
               config_label = f"atom-sglang_{backend_slug}_{model_slug}"
@@ -1490,7 +1537,7 @@ jobs:
                           "model_path": payload.get("model_id"),
                           "point_date": day,
                           "precision": precision,
-                          "hardware": "mi355x",
+                          "hardware": hardware,
                       }
                   )
 
@@ -1504,7 +1551,7 @@ jobs:
                   "precision": precision,
                   "source": "ATOM SGLang Benchmark",
                   "client_bench": "sglang bench_serving",
-                  "hardware": "mi355x",
+                  "hardware": hardware,
                   "commit": {
                       "id": first_payload.get("atom_source_sha"),
                       "message": f"ATOM benchmark run {os.environ['GITHUB_RUN_ID']}",
