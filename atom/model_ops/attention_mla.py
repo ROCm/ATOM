@@ -671,7 +671,17 @@ class MLAAttention(nn.Module):
             )
             if chunked_out is None:
                 chunked_out = suf_out
-                chunked_lse = suf_lse
+                # A seq with no cached tokens in this (first) chunk gets
+                # lse=-inf from flash_attn. If that -inf seeds the running
+                # accumulator, a later merge against another -inf suffix (the
+                # same seq absent again) computes -inf-(-inf)=NaN in
+                # merge_attn_states, permanently poisoning that seq's output.
+                # Replace -inf with a large finite sentinel so the seq carries
+                # ~zero weight (exp(sentinel-max)=0) without producing NaN; its
+                # real prefix contribution is merged in once a later chunk
+                # covers it. Only the seed needs sanitizing — once the prefix
+                # side is finite, max_lse stays finite for all later merges.
+                chunked_lse = torch.nan_to_num(suf_lse, neginf=-1e30)
             else:
                 tmp_out = torch.empty_like(new_out)
                 tmp_lse = torch.empty_like(new_lse)
