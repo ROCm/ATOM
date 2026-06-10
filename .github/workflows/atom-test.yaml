@@ -24,7 +24,7 @@ on:
       atom_base_image:
         description: 'Docker image used as the ATOM test base image'
         required: false
-        default: 'rocm/atom-dev@sha256:e5247dd93046ae988b1ae0d4d64b9a00b8fc8ecf2e399b60ebec8f18d1133a5e'
+        default: 'rocm/atom-dev:latest'
         type: string
 
 concurrency:
@@ -33,7 +33,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev@sha256:e5247dd93046ae988b1ae0d4d64b9a00b8fc8ecf2e399b60ebec8f18d1133a5e' }}
+  ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
   ATOM_PYTHON_TAG: "cp312"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
