@@ -495,10 +495,11 @@ async def generate_async_multimodal(
 
 
 async def generate_async_fanout(
-    prompt: str,
+    prompt_or_tokens: str | List[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    multimodal_data: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
@@ -543,10 +544,11 @@ async def generate_async_fanout(
 
     def do_preprocess():
         return engine.io_processor.preprocess_fanout(
-            prompt,
+            prompt_or_tokens,
             sampling_params,
             stream_callbacks=stream_callbacks,
             kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
             parent_request_id=request_id,
         )
 
@@ -615,10 +617,11 @@ def validate_model(requested_model: Optional[str]) -> None:
 
 
 async def setup_streaming_request(
-    prompt: str,
+    prompt_or_tokens: str | List[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    multimodal_data: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, asyncio.Queue]:
     """Set up a streaming request with the engine."""
     global engine, _stream_queues, _seq_id_to_request_id
@@ -637,10 +640,11 @@ async def setup_streaming_request(
 
     def do_preprocess():
         seq = engine.io_processor.preprocess(
-            prompt,
+            prompt_or_tokens,
             sampling_params,
             stream_callback=stream_callback,
             kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -672,10 +676,11 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
 
 
 async def setup_streaming_request_fanout(
-    prompt: str,
+    prompt_or_tokens: str | List[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    multimodal_data: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[int], asyncio.Queue]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
@@ -707,10 +712,11 @@ async def setup_streaming_request_fanout(
 
     def do_preprocess():
         seqs = engine.io_processor.preprocess_fanout(
-            prompt,
+            prompt_or_tokens,
             sampling_params,
             stream_callbacks=stream_callbacks,
             kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
             parent_request_id=request_id,
         )
         for seq in seqs:
@@ -810,10 +816,6 @@ async def chat_completions(request: ChatCompletionRequest):
 
         is_multimodal = _has_multimodal_content(messages)
         if is_multimodal:
-            if request.stream:
-                raise ValueError("Streaming multimodal chat is not supported yet")
-            if effective_n > 1:
-                raise ValueError("Multimodal chat currently supports n=1 only")
             token_ids, multimodal_data = _prepare_multimodal_inputs(
                 messages,
                 merged_kwargs,
@@ -829,14 +831,20 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # Streaming
         if request.stream:
+            stream_input = token_ids if is_multimodal else prompt
+            stream_multimodal_data = multimodal_data if is_multimodal else None
             if effective_n > 1:
                 seq_ids, stream_queue = await setup_streaming_request_fanout(
-                    prompt, sampling_params, request_id
+                    stream_input,
+                    sampling_params,
+                    request_id,
+                    multimodal_data=stream_multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
                 )
                 gen = stream_chat_response_fanout(
                     request_id,
                     model_name,
-                    prompt,
+                    stream_input,
                     stream_queue,
                     seq_ids,
                     tokenizer,
@@ -844,12 +852,16 @@ async def chat_completions(request: ChatCompletionRequest):
                 )
             else:
                 seq_id, stream_queue = await setup_streaming_request(
-                    prompt, sampling_params, request_id
+                    stream_input,
+                    sampling_params,
+                    request_id,
+                    multimodal_data=stream_multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
                 )
                 gen = stream_chat_response(
                     request_id,
                     model_name,
-                    prompt,
+                    stream_input,
                     stream_queue,
                     seq_id,
                     tokenizer,
@@ -861,7 +873,18 @@ async def chat_completions(request: ChatCompletionRequest):
             )
 
         # Non-streaming
-        if is_multimodal:
+        if is_multimodal and effective_n > 1:
+            outputs = await generate_async_fanout(
+                token_ids,
+                sampling_params,
+                request_id,
+                multimodal_data=multimodal_data,
+                kv_transfer_params=request.kv_transfer_params,
+            )
+            if not outputs:
+                raise RuntimeError("No output generated")
+            resp = build_chat_response_multi(request_id, model_name, outputs)
+        elif is_multimodal:
             final_output = None
             async for output in generate_async_multimodal(
                 token_ids,
@@ -876,13 +899,23 @@ async def chat_completions(request: ChatCompletionRequest):
                 request_id, model_name, final_output["text"], final_output
             )
         elif effective_n > 1:
-            outputs = await generate_async_fanout(prompt, sampling_params, request_id)
+            outputs = await generate_async_fanout(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=request.kv_transfer_params,
+            )
             if not outputs:
                 raise RuntimeError("No output generated")
             resp = build_chat_response_multi(request_id, model_name, outputs)
         else:
             final_output = None
-            async for output in generate_async(prompt, sampling_params, request_id):
+            async for output in generate_async(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=request.kv_transfer_params,
+            ):
                 final_output = output
             if final_output is None:
                 raise RuntimeError("No output generated")
@@ -1011,6 +1044,34 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/debug/mtp_stats")
+async def get_mtp_stats():
+    """Return current speculative decoding acceptance statistics."""
+    global engine
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        return engine.get_mtp_statistics()
+    except Exception as e:
+        logger.error(f"Failed to get MTP statistics: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get MTP statistics: {str(e)}"
+        )
+
+
+@app.get("/kv_transfer_info")
+async def kv_transfer_info():
+    global engine
+    cfg = engine.config
+    kv_cfg = cfg.kv_transfer_config or {}
+    return {
+        "tp_size": cfg.tensor_parallel_size,
+        "dp_size": cfg.parallel_config.data_parallel_size,
+        "kv_role": kv_cfg.get("kv_role"),
+        "handshake_port": kv_cfg.get("handshake_port", 6301),
+    }
+
+
 @app.post("/start_profile")
 async def start_profile():
     """Start profiling the engine."""
@@ -1030,10 +1091,11 @@ async def stop_profile():
     """Stop profiling the engine."""
     global engine
     try:
-        engine.stop_profile()
+        traces = engine.stop_profile()
         return {
             "status": "success",
             "message": "Profiling stopped. Trace files generated.",
+            "traces": traces,
         }
     except Exception as e:
         logger.error(f"Failed to stop profiling: {e}", exc_info=True)

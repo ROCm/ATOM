@@ -46,27 +46,27 @@ def _expected_cases(matrix_payload: dict) -> list[dict]:
     cases: list[dict] = []
     for cell in matrix_payload.get("include", []):
         model = cell["model"]
-        params = cell["params"]
-        ratio_text = str(params["random_range_ratio"])
-        result_filename = (
-            f'{model["prefix"]}-'
-            f'{params["input_length"]}-'
-            f'{params["output_length"]}-'
-            f'{params["concurrency"]}-'
-            f"{ratio_text}.json"
-        )
-        cases.append(
-            {
-                "display": model.get("display", model["prefix"]),
-                "prefix": model["prefix"],
-                "isl": int(params["input_length"]),
-                "osl": int(params["output_length"]),
-                "concurrency": int(params["concurrency"]),
-                "ratio": ratio_text,
-                "tensor_parallel_size": _expected_tensor_parallel(model),
-                "result_filename": result_filename,
-            }
-        )
+        for params in cell.get("cases") or [cell["params"]]:
+            ratio_text = str(params["random_range_ratio"])
+            result_filename = (
+                f'{model["prefix"]}-'
+                f'{params["input_length"]}-'
+                f'{params["output_length"]}-'
+                f'{params["concurrency"]}-'
+                f"{ratio_text}.json"
+            )
+            cases.append(
+                {
+                    "display": model.get("display", model["prefix"]),
+                    "prefix": model["prefix"],
+                    "isl": int(params["input_length"]),
+                    "osl": int(params["output_length"]),
+                    "concurrency": int(params["concurrency"]),
+                    "ratio": ratio_text,
+                    "tensor_parallel_size": _expected_tensor_parallel(model),
+                    "result_filename": result_filename,
+                }
+            )
     return cases
 
 
@@ -199,7 +199,7 @@ def main() -> int:
     parser.add_argument(
         "--matrix-json-file",
         default=None,
-        help="Path to a file containing benchmark matrix JSON",
+        help="Path to a benchmark matrix JSON file. Prefer this for large matrices.",
     )
     parser.add_argument(
         "--run-url",
@@ -218,15 +218,14 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    matrix_json_text = None
     if args.matrix_json_file:
-        matrix_json_text = Path(args.matrix_json_file).read_text(encoding="utf-8")
+        matrix_payload = json.loads(
+            Path(args.matrix_json_file).read_text(encoding="utf-8")
+        )
     elif args.matrix_json:
-        matrix_json_text = args.matrix_json
+        matrix_payload = json.loads(args.matrix_json)
     else:
-        raise ValueError("Either --matrix-json or --matrix-json-file must be provided")
-
-    matrix_payload = json.loads(matrix_json_text)
+        parser.error("one of --matrix-json or --matrix-json-file is required")
     rows = _build_rows(Path(args.result_dir), matrix_payload)
 
     _print_markdown_table(rows, args.run_url, args.title)

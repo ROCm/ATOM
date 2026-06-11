@@ -252,6 +252,8 @@ class CompilationConfig:
             self.splitting_ops = [
                 "aiter.unified_attention_with_output",
                 "aiter.mla_attention",
+                "aiter.atom_vllm_mha_attention",
+                "aiter.atom_vllm_mla_attention",
             ]
 
 
@@ -794,6 +796,40 @@ class ParallelConfig:
         # self.data_parallel_master_port = get_open_port()
 
 
+def _normalize_moe_config_fields(
+    hf_config: PretrainedConfig,
+    model_path: Optional[str] = None,
+) -> None:
+    """Normalize common MoE config field names across model families."""
+    moe_config = getattr(hf_config, "text_config", hf_config)
+    updates: dict[str, Any] = {}
+
+    n_routed = getattr(
+        moe_config,
+        "n_routed_experts",
+        getattr(moe_config, "num_experts", None),
+    )
+    if n_routed is not None:
+        updates["n_routed_experts"] = n_routed
+
+    existing_n_shared = getattr(moe_config, "n_shared_experts", None)
+    if existing_n_shared is not None:
+        updates["n_shared_experts"] = existing_n_shared
+    elif n_routed is not None and model_path is not None:
+        from atom.models.utils import ckpt_shared_expert_count
+
+        n_shared = ckpt_shared_expert_count(model_path)
+        if n_shared > 0:
+            updates["n_shared_experts"] = n_shared
+
+    if not updates:
+        return
+
+    moe_config.update(updates)
+    if moe_config is not hf_config:
+        hf_config.update(updates)
+
+
 @dataclass
 class SpeculativeConfig:
     method: Optional[str] = ""
@@ -814,7 +850,8 @@ class SpeculativeConfig:
         "qwen3_5_moe": "qwen3_5_mtp",
         "qwen3_5_text": "qwen3_5_mtp",
         "qwen3_5_moe_text": "qwen3_5_mtp",
-        "mimo_v2_flash": "mimo_v2_flash_mtp",
+        "mimo_v2": "mimo_v2_mtp",
+        "mimo_v2_flash": "mimo_v2_mtp",
     }
 
     # mtp_model_type → (n_predict_attr, architecture)
@@ -836,10 +873,8 @@ class SpeculativeConfig:
         self.hf_config_override(self.draft_model_hf_config, self.model)
 
         if self.method == "eagle3":
-            if getattr(self.draft_model_hf_config, "kv_lora_rank", None):
-                raise NotImplementedError(
-                    "Eagle3 draft model with MLA attention is not supported"
-                )
+            # MLA drafts (kv_lora_rank set) route to Eagle3DeepseekMLAModel
+            # via the arch rewrite in hf_config_override; no early reject.
             # Aux hidden state layers: prefer the draft checkpoint's
             # eagle_config; if absent or the list is empty, ModelRunner
             # falls back to model.get_eagle3_aux_hidden_state_layers(),
@@ -864,6 +899,8 @@ class SpeculativeConfig:
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
         if arch == "LlamaForCausalLMEagle3":
             hf_config.architectures = ["Eagle3LlamaModel"]
+        elif arch == "Eagle3DeepseekV2ForCausalLM":
+            hf_config.architectures = ["Eagle3DeepseekMLAModel"]
 
         # Step 1: resolve model_type → mtp model_type
         mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)
@@ -887,39 +924,11 @@ class SpeculativeConfig:
                 "num_nextn_predict_layers": n_predict,
                 "architectures": [arch],
             }
-            # Naming differs across families:
-            #   DeepSeek / GLM       → already have `n_routed_experts`
-            #   Qwen3.5 / Qwen3-Next → only carry `num_experts`
-            #   non-MoE / unknown    → leave unset (no MoE = no field)
-            n_routed = getattr(
-                hf_config,
-                "n_routed_experts",
-                getattr(hf_config, "num_experts", None),
-            )
-            if n_routed is not None:
-                updates["n_routed_experts"] = n_routed
-            # n_shared_experts: prefer the field's own value if it exists
-            # (DeepSeek / GLM ship it natively); else scan the checkpoint
-            # for `shared_expert` weights and use the parsed count (1 for
-            # the flat-block layout every released model uses). Leaving
-            # the field unset for ckpts without shared experts avoids
-            # fabricating a phantom shared block (e.g. R1 MTP eh_proj
-            # would otherwise pull a stale BF16 weight_scale).
-            existing_n_shared = getattr(hf_config, "n_shared_experts", None)
-            if existing_n_shared is not None:
-                updates["n_shared_experts"] = existing_n_shared
-            else:
-                from atom.models.utils import ckpt_shared_expert_count
-
-                n_shared = ckpt_shared_expert_count(model_path)
-                if n_shared > 0:
-                    updates["n_shared_experts"] = n_shared
-
             hf_config.update(updates)
 
         # MiMo-V2 has not MTP related information in HF config.json,
         # override n_predict with the actual layer count (default 3).
-        if hf_config.model_type == "mimo_v2_flash_mtp":
+        if hf_config.model_type == "mimo_v2_mtp":
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 3)
             hf_config.update(
                 {
@@ -929,12 +938,42 @@ class SpeculativeConfig:
                 }
             )
 
+        _normalize_moe_config_fields(hf_config, model_path)
         logger.info(f"hf config is: {hf_config}")
 
     def __repr__(self) -> str:
         method = self.method
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({method=}, {num_spec_tokens=})"
+
+
+@dataclass
+class KVEventsConfig:
+    """Configuration for KV cache event publishing."""
+
+    enable: bool = False
+    publisher: str = "zmq"  # "null" | "zmq"
+    endpoint: str = "tcp://127.0.0.1:5557"
+    topic: str = ""
+    # ZMQ high-water-mark on the PUB socket (0 = unlimited).
+    hwm: int = 0
+    # Bounded in-process queue between scheduler and sender thread. When full,
+    # oldest batch is dropped — KV events are advisory, never stall inference.
+    buffer_steps: int = 10_000
+
+    @classmethod
+    def from_env(cls) -> "KVEventsConfig":
+        """Build a config from `ATOM_KV_EVENTS_*` env vars. Provides an env-only
+        opt-in path so containerized deployments can enable events without a
+        CLI flag (see `atom/utils/envs.py`)."""
+        return cls(
+            enable=envs.ATOM_KV_EVENTS_ENABLE,
+            publisher=envs.ATOM_KV_EVENTS_PUBLISHER,
+            endpoint=envs.ATOM_KV_EVENTS_ENDPOINT,
+            topic=envs.ATOM_KV_EVENTS_TOPIC,
+            hwm=envs.ATOM_KV_EVENTS_HWM,
+            buffer_steps=envs.ATOM_KV_EVENTS_BUFFER_STEPS,
+        )
 
 
 @dataclass
@@ -959,6 +998,7 @@ class Config:
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
     enable_prefix_caching: bool = True
+    enable_chunked_prefill: bool = True
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -975,15 +1015,18 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
+    kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
+    runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
     # only for quark_online_quantization
     online_quant_config: Optional[dict] = None
+    hf_overrides: Optional[dict[str, Any]] = None
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -998,14 +1041,20 @@ class Config:
                 self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
+        if isinstance(self.compilation_config, dict):
+            self.compilation_config = CompilationConfig(**self.compilation_config)
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        if self.hf_overrides:
+            self.hf_config.update(self.hf_overrides)
+            logger.info("Applied HF config overrides: %s", self.hf_overrides)
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
+        _normalize_moe_config_fields(self.hf_config, self.model)
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:
@@ -1153,6 +1202,13 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(
+            (
+                getattr(self.hf_config, "use_index_cache", False),
+                getattr(self.hf_config, "index_topk_freq", None),
+                getattr(self.hf_config, "index_topk_pattern", None),
+            )
+        )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

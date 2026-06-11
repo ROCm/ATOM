@@ -11,7 +11,11 @@ from atom.config import CompilationLevel, Config, KVCacheTensor
 from atom.model_loader.loader import load_model
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils import envs
-from atom.utils.forward_context import SpecDecodeMetadata, get_forward_context
+from atom.utils.forward_context import (
+    DPMetadata,
+    SpecDecodeMetadata,
+    get_forward_context,
+)
 from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
@@ -21,9 +25,11 @@ support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
     "DeepseekV4MTPModel": "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
-    "MiMoV2FlashMTPModel": "atom.models.mimo_v2_flash_mtp.MiMoV2FlashMTP",
+    "MiMoV2MTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
+    "MiMoV2FlashMTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
+    "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
 }
 
 
@@ -184,12 +190,19 @@ class EagleProposer:
         model_class = resolve_obj_by_qualname(support_eagle_model_arch_dict[draft_model_hf_config.architectures[0]])  # type: ignore
 
         if self.speculative_config.method == "eagle3":
-            # Eagle3 draft model has its own architecture (Llama, not MLA),
-            # so it must be constructed with the draft model's hf_config.
-            # Also disable torch.compile for the draft model to avoid
+            # Eagle3 draft has its own architecture, so build it from the
+            # draft hf_config. Disable torch.compile for the draft to avoid
             # Dynamo tracing issues with the separate KV cache binding.
-            draft_atom_config = copy.deepcopy(atom_config)
+            # Shallow-copy instead of deepcopy: with MLA targets (K2.6), the
+            # atom_config holds non-picklable cuda.Stream objects under
+            # downstream fields that deepcopy can't traverse. We only mutate
+            # hf_config and compilation_config.level on the draft, so
+            # isolating just those two attrs is sufficient.
+            draft_atom_config = copy.copy(atom_config)
             draft_atom_config.hf_config = draft_model_hf_config
+            draft_atom_config.compilation_config = copy.copy(
+                atom_config.compilation_config
+            )
             draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
             # Draft attention layer_num must continue from the target model's
             # layer count so it maps to the correct kv_cache_data entry.
@@ -197,13 +210,16 @@ class EagleProposer:
                 draft_atom_config,
                 layer_offset=atom_config.hf_config.num_hidden_layers,
             )
-            # Attach the draft's KV-cache builder to the runner. ModelRunner
-            # consults `runner.eagle3_draft_builder` from `_compute_block_bytes`
-            # / `allocate_kv_cache` to size + allocate + bind the draft's
-            # independent non-MLA cache through the standard builder protocol.
-            runner.eagle3_draft_builder = Eagle3DraftBuilder(
-                runner, draft_model_hf_config
-            )
+            # MHA draft (e.g. K2.5 LlamaForCausalLMEagle3): owns an independent
+            # non-MLA KV cache via Eagle3DraftBuilder, attached to the runner.
+            # MLA draft (e.g. K2.6 EAGLE 3.1): same MLA shape as target, so
+            # it piggybacks on the target's MLA pool (model_runner accounts
+            # for the +1 draft layer via num_nextn_predict_layers default).
+            draft_is_mla = bool(getattr(draft_model_hf_config, "kv_lora_rank", None))
+            if not draft_is_mla:
+                runner.eagle3_draft_builder = Eagle3DraftBuilder(
+                    runner, draft_model_hf_config
+                )
         else:
             self.model = model_class(self.config)
 
@@ -313,6 +329,16 @@ class EagleProposer:
             "lm_head",
         )
 
+    def _refresh_dp_metadata(self, forward_context, num_local_tokens: int) -> None:
+        parallel_config = self.config.parallel_config
+        if parallel_config.data_parallel_size <= 1:
+            return
+        forward_context.context.dp_uniform_decode = False
+        forward_context.dp_metadata = DPMetadata.make(
+            parallel_config,
+            num_local_tokens,
+        )
+
     def propose(
         self,
         # [num_tokens]
@@ -376,6 +402,8 @@ class EagleProposer:
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
+                # Re-sync DP token
+                self._refresh_dp_metadata(forward_context, input_ids.shape[0])
                 ret_hidden_states = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -428,7 +456,17 @@ class EagleProposer:
                             kv_indptr[1 : bs + 1] -= torch.cumsum(
                                 num_reject_tokens, dim=0
                             )
-                        positions = torch.gather(positions, 0, last_token_indices)
+                        if positions.ndim == 1:
+                            positions = torch.index_select(
+                                positions, 0, last_token_indices
+                            )
+                        else:
+                            # MRoPE positions keep the token axis last (e.g.
+                            # [3, num_tokens] for Qwen3.5), so select columns
+                            # instead of indexing dim 0.
+                            positions = torch.index_select(
+                                positions, positions.ndim - 1, last_token_indices
+                            )
                         context.is_prefill = False
 
                     # update metadata

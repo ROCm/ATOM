@@ -37,9 +37,10 @@ from atom.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 from atom.model_ops.base_config import QuantizeMethodBase
-from atom.model_ops.moe import (
-    FusedMoEMethodBase,
+from atom.model_ops.moe import FusedMoEMethodBase
+from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled,
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from aiter.dist.parallel_state import get_tp_group
 
@@ -288,11 +289,44 @@ def load_model(
     load_fused_expert_weights_fn=None,
 ):
     def have_shared_expert(name):
-        maybe_matching_list = ["mlp.shared_experts.", "mlp.shared_expert."]
+        # Match both `mlp.` (GLM4, Qwen, ...) and `ffn.` (DeepSeek-V4) module
+        # naming. The matched substring is replaced by the caller with
+        # `<prefix>experts.{n_routed}.` so the shared expert lands in the fused
+        # MoE buffer's extra slot. Returning the full prefix (incl. mlp./ffn.)
+        # lets the rewrite preserve the module-naming style.
+        maybe_matching_list = [
+            "mlp.shared_experts.",
+            "mlp.shared_expert.",
+            "ffn.shared_experts.",
+            "ffn.shared_expert.",
+        ]
         for maybe_matching_name in maybe_matching_list:
             if maybe_matching_name in name:
                 return maybe_matching_name
         return None
+
+    def should_fuse_shared_expert_weight(name: str, matching_name: str) -> bool:
+        layer_prefix = name.split(matching_name, 1)[0]
+        module_prefix = matching_name.split("shared_expert", 1)[0]
+        shared_expert_prefix = layer_prefix + matching_name.rstrip(".")
+        routed_expert_prefix = layer_prefix + f"{module_prefix}experts"
+        model_quant_config = getattr(
+            getattr(model, "atom_config", None), "quant_config", None
+        )
+        if model_quant_config is None:
+            model_quant_config = getattr(model, "quant_config", None)
+        if model_quant_config is not None and hasattr(
+            model_quant_config, "get_layer_quant_config"
+        ):
+            return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                model_quant_config,
+                shared_expert_prefix=shared_expert_prefix,
+                routed_expert_prefix=routed_expert_prefix,
+            )
+        return is_rocm_aiter_fusion_shared_expert_enabled(
+            shared_expert_prefix=shared_expert_prefix,
+            routed_expert_prefix=routed_expert_prefix,
+        )
 
     def extract_expert_target_and_id(name: str) -> Tuple[str, int] | None:
         """Extract fused parameter name and expert id from expert checkpoint name.
@@ -335,13 +369,6 @@ def load_model(
     if weights_mapper is None:
         weights_mapper = getattr(model, "weights_mapper", None)
     params_dict = dict(model.named_parameters())
-    # Load `mtp.*` ckpt entries only when this is a spec-decode draft model
-    # AND it actually carries `mtp.*` params. The two-condition gate handles
-    # both directions: target loads (spec_decode=False) skip mtp regardless,
-    # and spec drafts that don't use the standard `mtp.*` param naming
-    # (e.g. Eagle3 with its own arch) also skip cleanly.
-    need_load_mtp: bool = spec_decode and any("mtp" in n for n in params_dict)
-
     # Pre-index expert_mapping by weight_name_part for O(1) lookup.
     # Original code does O(N) scan of expert_mapping (768 entries) per tensor,
     # causing ~19s of CPU time for 90k expert tensors. This reduces it to O(1).
@@ -398,7 +425,12 @@ def load_model(
                 name = mapped_name
             if load_dummy:
                 continue
-            if "mtp" in name and not need_load_mtp:
+            # Draft models may remap ckpt-side `mtp.*` entries into params
+            # whose names do not themselves contain `mtp` (e.g. Qwen3.5 MTP
+            # rewrites `mtp.*` -> `model.*`). Gate only on `spec_decode`,
+            # otherwise we can drop the entire drafter checkpoint before the
+            # model-specific remap logic has a chance to run.
+            if "mtp" in name and not spec_decode:
                 continue
             if name.endswith("kv_scale") or "inv_freq" in name:
                 continue
@@ -430,16 +462,27 @@ def load_model(
                 continue
             maybe_matching_name = have_shared_expert(name)
             if (
-                is_rocm_aiter_fusion_shared_expert_enabled()
-                and maybe_matching_name is not None
+                maybe_matching_name is not None
+                # When the model keeps shared experts unfused (e.g. V4-Pro with
+                # FP4 routed vs FP8 shared, or DP + mori all2all), do NOT rewrite
+                # the shared weights into the fused slot — they must load into the
+                # standalone Expert module. Stays True for models without this
+                # attr (GLM4 etc.) so their fused-shared path is unchanged.
+                and not getattr(model, "disable_fused_shared_loading", False)
+                and should_fuse_shared_expert_weight(name, maybe_matching_name)
             ):
+                # Preserve the module-naming prefix (mlp. / ffn.) so the rewritten
+                # name matches this model's routed-expert param naming.
+                module_prefix = maybe_matching_name.split("shared_expert", 1)[0]
                 name = name.replace(
                     maybe_matching_name,
-                    f"mlp.experts.{hf_config.n_routed_experts}.",
+                    f"{module_prefix}experts.{hf_config.n_routed_experts}.",
                 )
             for k in packed_modules_mapping:
                 # We handle the experts below in expert_params_mapping
-                if "mlp.experts." in name and name not in params_dict:
+                if (
+                    "mlp.experts." in name or "ffn.experts." in name
+                ) and name not in params_dict:
                     continue
                 if k in name:
                     packed_value = packed_modules_mapping[k]
@@ -530,7 +573,7 @@ def load_model(
                         ) and name not in params_dict:
                             matched = True
                             break
-                        if "mtp" in name and not need_load_mtp:
+                        if "mtp" in name and not spec_decode:
                             matched = True
                             break
                         try:
@@ -553,7 +596,7 @@ def load_model(
                         matched = True
                         break
                     if not matched:
-                        if "mtp" in name and not need_load_mtp:
+                        if "mtp" in name and not spec_decode:
                             continue
                         if merged_target := extract_expert_target_and_id(name):
                             fused_name, expert_id = merged_target
@@ -573,7 +616,8 @@ def load_model(
                                 "",
                                 expert_id,
                             )
-                            loaded_weights_record.add(prefix + name)
+                            loaded_weights_record.add(prefix + fused_name)
+                            continue
                         try:
                             param = model.get_parameter(name)
                         except AttributeError:
@@ -690,7 +734,7 @@ def load_model(
         logger.info("Weight post-processing started (includes online quantization)")
     pp_start = time.perf_counter()
 
-    for _, module in model.named_modules():
+    for module_name, module in model.named_modules():
         if hasattr(module, "process_weights_after_loading"):
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
@@ -701,6 +745,15 @@ def load_model(
             quant_method.process_weights_after_loading(module)
         if isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)
+
+        # Online quantization creates new params (e.g. weight_scale) that are
+        # not present in the source checkpoint. Record them as "loaded" so the
+        # plugin host's strict weight tracking (e.g. vLLM's default loader)
+        # does not flag them as uninitialized.
+        if getattr(module, "_online_quant_info", None) is not None:
+            for param_name, _ in module.named_parameters(recurse=False):
+                full_name = f"{module_name}.{param_name}" if module_name else param_name
+                loaded_weights_record.add(prefix + full_name)
 
     if has_online_quant:
         pp_elapsed = time.perf_counter() - pp_start

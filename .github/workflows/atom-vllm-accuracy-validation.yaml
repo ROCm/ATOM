@@ -25,7 +25,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -33,9 +33,11 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -62,7 +64,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -70,9 +72,11 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -99,7 +103,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -107,9 +111,11 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -136,7 +142,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -144,9 +150,11 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -173,7 +181,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -181,9 +189,11 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -210,7 +220,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -218,9 +228,11 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -247,7 +259,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -255,9 +267,11 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -284,7 +298,7 @@ on:
           - Qwen3.5-397B-A17B-FP8 TP4
           - Qwen3.5-397B-A17B TP8
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - Meta-Llama-3.1-405B-Instruct-FP8/ TP8
+          - Meta-Llama-3.1-405B-Instruct-FP8 TP8
           - Llama-3.1-8B-Instruct TP1
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
@@ -292,9 +306,11 @@ on:
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-0528-MXFP4 TP8
+          - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
+          - DeepSeek-V3.2-FP8 PTPC TP4
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -310,6 +326,11 @@ on:
         required: false
         type: string
         default: ""
+      rebuild_atom_base_from_dockerfile:
+        description: "Full build image before validation"
+        required: false
+        type: boolean
+        default: false
       upload_accuracy_to_dashboard:
         description: "Optional: upload OOT accuracy results to dashboard after this manual run"
         required: false
@@ -327,7 +348,7 @@ env:
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
   AITER_COMMIT: "HEAD"
-  VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
+  VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
 
 jobs:
   # ---------- OOT full validation path (schedule / workflow_dispatch) ----------
@@ -371,6 +392,7 @@ jobs:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
+          REBUILD_ATOM_BASE_FROM_DOCKERFILE: ${{ inputs.rebuild_atom_base_from_dockerfile }}
         run: |
           set -euo pipefail
 
@@ -520,7 +542,7 @@ jobs:
               },
               {
                   "toggle_env": "RUN_LLAMA405_FP8_TP8",
-                  "model_name": "Meta-Llama-3.1-405B-Instruct-FP8/ TP8",
+                  "model_name": "Meta-Llama-3.1-405B-Instruct-FP8 TP8",
                   "model_path": "Meta-Llama-3.1-405B-Instruct-FP8/",
                   "extra_args": "--tensor-parallel-size 8 --load-format safetensors --allow-deprecated-quantization",
                   "accuracy_test_threshold": 0.93,
@@ -591,23 +613,33 @@ jobs:
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
+                  "toggle_env": "RUN_DSV4_PRO_TP8",
+                  "model_name": "DeepSeek-V4-Pro TP8",
+                  "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+                  "extra_args": "--tensor-parallel-size 8 --gpu-memory-utilization 0.8 --tokenizer-mode deepseek_v4",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.94,
+                  "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
                   "toggle_env": "RUN_DSV32_FP8_TP4",
                   "model_name": "DeepSeek-V3.2-FP8 TP4",
                   "model_path": "deepseek-ai/DeepSeek-V3.2",
-                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
                   "toggle_env": "RUN_DSV32_FP8_TP8",
                   "model_name": "DeepSeek-V3.2-FP8 TP8",
                   "model_path": "deepseek-ai/DeepSeek-V3.2",
-                  "extra_args": "--tensor-parallel-size 8",
+                  "extra_args": "--tensor-parallel-size 8 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -621,13 +653,23 @@ jobs:
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
+                  "toggle_env": "RUN_DSV32_FP8_PTPC_TP4",
+                  "model_name": "DeepSeek-V3.2-FP8 PTPC TP4",
+                  "model_path": "amd/DeepSeek-V3.2-mtp-ptpc",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
+                  "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
                   "toggle_env": "RUN_GPT_OSS_120B_TP1",
                   "model_name": "gpt-oss-120b TP1",
                   "model_path": "openai/gpt-oss-120b",
                   "extra_args": "--tensor-parallel-size 1",
                   "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
                   "accuracy_test_threshold": 0.88,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1\nVLLM_USE_V2_MODEL_RUNNER=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -637,7 +679,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 2",
                   "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
                   "accuracy_test_threshold": 0.88,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -647,7 +689,7 @@ jobs:
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
                   "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}",
                   "accuracy_test_threshold": 0.88,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -656,7 +698,7 @@ jobs:
                   "model_path": "MiniMaxAI/MiniMax-M2.5",
                   "extra_args": "--tensor-parallel-size 2 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
                   "accuracy_test_threshold": 0.92,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -665,7 +707,7 @@ jobs:
                   "model_path": "MiniMaxAI/MiniMax-M2.5",
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
                   "accuracy_test_threshold": 0.92,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -674,7 +716,7 @@ jobs:
                   "model_path": "zai-org/GLM-4.7-FP8",
                   "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
                   "accuracy_test_threshold": 0.92,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -683,7 +725,7 @@ jobs:
                   "model_path": "zai-org/GLM-4.7-FP8",
                   "extra_args": "--tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
                   "accuracy_test_threshold": 0.92,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -692,7 +734,7 @@ jobs:
                   "model_path": "zai-org/GLM-4.7-FP8",
                   "extra_args": "--tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
                   "accuracy_test_threshold": 0.92,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -701,7 +743,7 @@ jobs:
                   "model_path": "zai-org/GLM-4.7-FP8",
                   "extra_args": "--tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
                   "accuracy_test_threshold": 0.92,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -774,52 +816,56 @@ jobs:
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
               },
               "DeepSeek-V3.2-FP8 TP4": {
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
               },
               "DeepSeek-V3.2-FP8 TP8": {
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
               },
               "DeepSeek-V3.2-FP8 MTP TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "env_vars": "",
               },
+              "DeepSeek-V3.2-FP8 PTPC TP4": {
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
+              },
               "gpt-oss-120b TP1": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1\nVLLM_USE_V2_MODEL_RUNNER=1",
               },
               "gpt-oss-120b TP2": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 2 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1",
               },
               "gpt-oss-120b TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --gpu-memory-utilization 0.5 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1",
               },
               "MiniMax-M2.5 TP2": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 2 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1",
               },
               "MiniMax-M2.5 TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1",
               },
               "GLM-4.7-FP8 TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1",
               },
               "GLM-4.7-FP8 TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1",
               },
               "GLM-4.7-FP8 MTP TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
               },
               "GLM-4.7-FP8 MTP TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
               },
               "GLM-5.1-FP8 TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}' --max-num-batched-tokens 16384 --max-model-len 16384",
@@ -834,6 +880,8 @@ jobs:
               "gpt-oss-120b TP1",
               "MiniMax-M2.5 TP2",
               "DeepSeek-V3.2-FP8 TP4",
+              "DeepSeek-V3.2-FP8 PTPC TP4",
+              "DeepSeek-V4-Pro TP8",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1",
               "GLM-4.7-FP8 TP8",
               "GLM-4.7-FP8 MTP TP4",
@@ -939,6 +987,15 @@ jobs:
           print(f"scheduled_beijing_date={run_date}")
           PY
 
+          REBUILD_FROM_DOCKERFILE="${REBUILD_ATOM_BASE_FROM_DOCKERFILE:-false}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+              echo "Manual run selected full ATOM base rebuild from docker/Dockerfile"
+            else
+              echo "Manual run selected fast overlay rebuild from ${ATOM_BASE_NIGHTLY_IMAGE}"
+            fi
+          fi
+
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
             if RESOLUTION_JSON="$(
               python3 .github/scripts/resolve_atom_image.py \
@@ -962,6 +1019,7 @@ jobs:
             echo "oot_image_tag=${RESOLVED_OOT_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -975,11 +1033,52 @@ jobs:
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           MANUAL_BASE_IMAGE_TAG="atom_oot_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          REBUILT_ATOM_BASE_IMAGE_TAG="atom_oot_rebuilt_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
           OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:vllm-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
+          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
+          if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+            echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=${REBUILT_ATOM_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
           git archive --format=tar HEAD | tar -xf - -C "${BUILD_CONTEXT}"
+
+          if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+            echo "Manual run rebuilds ATOM base and OOT image from branch ${GITHUB_REF_NAME}"
+
+            DOCKER_BUILDKIT=1 docker build --pull --network=host --no-cache \
+              -t "${REBUILT_ATOM_BASE_IMAGE_TAG}" \
+              --target atom_image \
+              --build-arg GPU_ARCH="${GPU_ARCH}" \
+              --build-arg AITER_REPO="${AITER_REPO}" \
+              --build-arg AITER_COMMIT="${AITER_COMMIT}" \
+              --build-arg MAX_JOBS=64 \
+              --build-arg ATOM_REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+              --build-arg ATOM_COMMIT="${GITHUB_SHA}" \
+              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              "${BUILD_CONTEXT}"
+
+            DOCKER_BUILDKIT=1 docker build --network=host --no-cache \
+              -t "${OOT_IMAGE_TAG}" \
+              --target atom_oot \
+              --build-arg OOT_BASE_IMAGE="${REBUILT_ATOM_BASE_IMAGE_TAG}" \
+              --build-arg MAX_JOBS=64 \
+              --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+              --build-arg INSTALL_LM_EVAL=1 \
+              --build-arg INSTALL_FASTSAFETENSORS=1 \
+              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              "${BUILD_CONTEXT}"
+
+            docker push "${OOT_IMAGE_TAG}"
+            exit 0
+          fi
 
           cat <<'EOF' > "${BUILD_CONTEXT}/Dockerfile.mod"
           ARG ATOM_BASE_NIGHTLY_IMAGE
@@ -1034,15 +1133,17 @@ jobs:
 
           docker push "${OOT_IMAGE_TAG}"
 
-          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
-          echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-
       - name: Clean up builder images
         if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}
         run: |
-          docker rmi "${{ steps.meta.outputs.oot_image_tag }}" || true
-          docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
+          for image in \
+            "${{ steps.meta.outputs.oot_image_tag }}" \
+            "${{ steps.meta.outputs.manual_base_image_tag }}" \
+            "${{ steps.meta.outputs.rebuilt_atom_base_image_tag }}"; do
+            if [ -n "${image}" ]; then
+              docker rmi "${image}" || true
+            fi
+          done
 
   oot-model-accuracy-priority-1:
     name: Model Accuracy ${{ matrix.priority }} (${{ matrix.model_name }})
@@ -1306,6 +1407,10 @@ jobs:
                   "/models/deepseek-ai/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
                   "/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
               ],
+              "deepseek-ai/DeepSeek-V4-Pro": [
+                  "/models/deepseek-ai/DeepSeek-V4-Pro",
+                  "/models/DeepSeek-V4-Pro",
+              ],
               "deepseek-ai/DeepSeek-V3.2": [
                   "/models/deepseek-ai/DeepSeek-V3.2",
                   "/models/DeepSeek-V3.2",
@@ -1453,18 +1558,102 @@ jobs:
             echo "Using model id: ${{ matrix.model_path }}"
           fi
 
-      - name: Run OOT launch and gsm8k accuracy via script (full mode)
+      - name: Start OOT accuracy server
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
+        timeout-minutes: 10
+        env:
+          OOT_MODEL_NAME: ${{ matrix.model_name }}
+          OOT_MODEL_PATH: ${{ matrix.model_path }}
+          OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
+        run: |
+          $CONTAINER_ENGINE exec -d \
+            -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
+            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
+            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              bash .github/scripts/atom_oot_test.sh start full
+            "
+
+      - name: Wait for OOT accuracy server
+        if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
         timeout-minutes: 120
+        env:
+          MAX_WAIT_RETRIES: "120"
+          WAIT_INTERVAL_SEC: "30"
+          STREAM_VLLM_LOGS: "1"
+        run: |
+          last_vllm_log_line=0
+
+          emit_new_vllm_logs() {
+            if [ "${STREAM_VLLM_LOGS}" != "1" ]; then
+              return 0
+            fi
+
+            current_line_count=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'if [ -f /tmp/vllm_oot.log ]; then wc -l < /tmp/vllm_oot.log; else echo 0; fi' 2>/dev/null || echo 0)
+            current_line_count=${current_line_count//$'\r'/}
+            if [ "${current_line_count:-0}" -le "${last_vllm_log_line}" ]; then
+              return 0
+            fi
+
+            echo ""
+            echo "========== New vLLM log output =========="
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "sed -n '$((last_vllm_log_line + 1)),${current_line_count}p' /tmp/vllm_oot.log" || true
+            last_vllm_log_line=${current_line_count}
+          }
+
+          for ((i=1; i<=MAX_WAIT_RETRIES; i++)); do
+            if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'curl -fsS http://127.0.0.1:8000/v1/models >/dev/null 2>&1'; then
+              emit_new_vllm_logs
+              echo "vLLM server is ready."
+              exit 0
+            fi
+
+            emit_new_vllm_logs
+
+            server_status=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '
+              if [ -f /tmp/vllm_oot.pid ]; then
+                pid=$(cat /tmp/vllm_oot.pid)
+                if kill -0 "$pid" 2>/dev/null; then
+                  echo running
+                else
+                  echo dead
+                fi
+              elif pgrep -f "vllm serve" >/dev/null 2>&1; then
+                echo running
+              else
+                echo starting
+              fi
+            ' 2>/dev/null || echo unknown)
+
+            if [ "${server_status}" = "dead" ]; then
+              echo "vLLM server process exited before becoming ready."
+              $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/vllm_oot.log || true' || true
+              exit 1
+            fi
+
+            echo "Waiting for vLLM server... (${i}/${MAX_WAIT_RETRIES}; status=${server_status})"
+            sleep "${WAIT_INTERVAL_SEC}"
+          done
+
+          echo "vLLM server did not become ready in time."
+          emit_new_vllm_logs
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/vllm_oot.log || true' || true
+          exit 1
+
+      - name: Run OOT gsm8k accuracy client
+        id: run_accuracy_client
+        if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
+        timeout-minutes: 120
+        continue-on-error: true
         env:
           OOT_MODEL_NAME: ${{ matrix.model_name }}
           OOT_MODEL_PATH: ${{ matrix.model_path }}
           OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
           OOT_CLIENT_COMMAND: ${{ matrix.client_command || '' }}
           LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
-          MAX_WAIT_RETRIES: "120"
-          STREAM_VLLM_LOGS: "1"
         run: |
+          set -o pipefail
           $CONTAINER_ENGINE exec \
             -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
@@ -1475,15 +1664,13 @@ jobs:
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
             -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
-            -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
-            -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_oot_test.sh accuracy full
-            "
+              bash .github/scripts/atom_oot_test.sh client full
+            " 2>&1 | tee ./oot_accuracy_client.log
 
       - name: Check OOT accuracy test results
-        if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
+        if: ${{ steps.validation-window.outputs.should_run == 'true' && success() && steps.run_accuracy_client.outcome == 'success' }}
         run: |
           $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
           result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
@@ -1518,6 +1705,7 @@ jobs:
           $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
           $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
           $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          if [ ! -f ./oot_accuracy_client.log ]; then : > ./oot_accuracy_client.log; fi
 
       - name: Upload model artifacts
         if: ${{ always() && steps.validation-window.outputs.should_run == 'true' }}
@@ -1526,8 +1714,13 @@ jobs:
           name: oot-validation-${{ matrix.model_name }}-${{ github.run_id }}
           path: |
             vllm_oot.log
+            oot_accuracy_client.log
             oot_accuracy_output.txt
             oot_accuracy_results
+
+      - name: Fail if OOT accuracy client failed
+        if: ${{ always() && steps.validation-window.outputs.should_run == 'true' && steps.run_accuracy_client.outcome == 'failure' }}
+        run: exit 1
 
       - name: Upload accuracy results for dashboard
         if: ${{ always() && steps.validation-window.outputs.should_run == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
@@ -1644,5 +1837,5 @@ jobs:
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
           auto-push: true
-          max-items-in-chart: 90
+          max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}

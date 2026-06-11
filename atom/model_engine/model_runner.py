@@ -45,6 +45,7 @@ from atom.utils.tbo import (
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
+    ForwardMode,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
@@ -71,7 +72,8 @@ support_model_arch_dict = {
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
-    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2_flash.MiMoV2FlashForCausalLM",
+    "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
+    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -116,13 +118,20 @@ class tokenIDProcessor:
         cpu_tensor_handle,
         data_ready: torch.cuda.Event,
         copy_done: Optional[torch.cuda.Event] = None,
+        gpu_logprobs: Optional[torch.Tensor] = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
+            cpu_logprobs = (
+                gpu_logprobs.to("cpu", non_blocking=True)
+                if gpu_logprobs is not None
+                else None
+            )
             copy_done.record(self.async_copy_stream)
         cpu_tensor_handle.append((cpu_tensor, copy_done))
+        self.logprobs_cpu.append(cpu_logprobs)
 
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
@@ -130,6 +139,17 @@ class tokenIDProcessor:
         cpu_tensor, event = cpu_tensor_handle.pop(0)
         event.synchronize()
         return cpu_tensor
+
+    def recv_logprobs(self) -> Optional[list[float]]:
+        """Pop and return the earliest logprobs from the async copy queue.
+        Must be called after recv_async_output (which synchronizes the event).
+        """
+        if not self.logprobs_cpu:
+            return None
+        logprob_tensor = self.logprobs_cpu.pop(0)
+        if logprob_tensor is not None:
+            return logprob_tensor.tolist()
+        return None
 
     def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
         default_stream = torch.cuda.current_stream()
@@ -184,6 +204,7 @@ class tokenIDProcessor:
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
+        self.logprobs_cpu: list[Optional[torch.Tensor]] = []
 
         self.prev_batch: Optional[ScheduledBatch] = None
         self.prev_token_ids: Optional[torch.Tensor] = None
@@ -229,7 +250,8 @@ class tokenIDProcessor:
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
-    ) -> tuple[list[int], list[tuple[int, ...]]]:
+        sampled_logprobs: Optional[torch.Tensor] = None,
+    ) -> tuple[dict[int, tuple[int, ...]], Optional[dict[int, float]]]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
@@ -237,25 +259,51 @@ class tokenIDProcessor:
                 processed = self._batch_process_token_ids(token_ids)
             else:
                 processed = [(tid,) for tid in token_ids]
-            return req_ids, processed
+            ret = dict(zip(req_ids, processed))
+            ret[-1] = 0  # is_deferred_out flag
+            logprobs_map = None
+            if sampled_logprobs is not None:
+                logprobs = sampled_logprobs.tolist()
+                logprobs_map = {
+                    seq_id: logprob for seq_id, logprob in zip(req_ids, logprobs)
+                }
+            return ret, logprobs_map
 
-        token_ids = self.recv_async_output(self.token_ids_cpu).tolist()
-        self.send_to_cpu_async(sampled_token_ids, self.token_ids_cpu, sync_event)
-        req_ids_out: list[int] = []
-        processed_out: list[tuple[int, ...]] = []
+        token_ids = self.recv_async_output(self.token_ids_cpu)
+        logprobs = self.recv_logprobs()
+        self.send_to_cpu_async(
+            sampled_token_ids,
+            self.token_ids_cpu,
+            sync_event,
+            gpu_logprobs=sampled_logprobs,
+        )
+        token_id_dict = {}
+        logprobs_map = None
         self.prev_req_ids = None
         if self.prev_batch is not None:
             self.prev_req_ids = self.prev_batch.req_ids
-            req_ids_out = self.prev_req_ids
-            if token_ids and isinstance(token_ids[0], list):
-                processed_out = self._batch_process_token_ids(token_ids)
+            token_ids_list = (
+                token_ids.tolist() if hasattr(token_ids, "tolist") else token_ids
+            )
+            if token_ids_list and isinstance(token_ids_list[0], list):
+                processed = self._batch_process_token_ids(token_ids_list)
             else:
-                processed_out = [(tid,) for tid in token_ids]
+                processed = [(tid,) for tid in token_ids_list]
+            token_id_dict = dict(zip(self.prev_req_ids, processed))
+            if logprobs is not None:
+                logprobs_map = {
+                    seq_id: logprob
+                    for seq_id, logprob in zip(self.prev_req_ids, logprobs)
+                }
+        else:
+            # first time, no previous tokens
+            token_ids = {}
+            logprobs_map = None
 
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
-
-        return req_ids_out, processed_out
+        token_id_dict[-1] = 1
+        return token_id_dict, logprobs_map
 
     def get_token_locations(
         self, batch: ScheduledBatch
@@ -461,12 +509,16 @@ class tokenIDProcessor:
             else:
                 # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
                 if num_new_tokens > 0:
-                    new_token_ids = scheduled_tokens[new_curr_indices].reshape(
+                    # Convert seq-level indices to token-level indices
+                    new_token_indices = (
+                        new_curr_indices[:, None] * tokens_per_seq
+                        + np.arange(tokens_per_seq)
+                    ).flatten()
+                    new_token_ids = scheduled_tokens[new_token_indices].reshape(
                         num_new_seqs, tokens_per_seq
                     )
                     if self.use_spec:
                         # MTP mode: combine scheduled_tokens and draft_tokens
-                        # For new_decode_front=False, use new_curr_indices to get the right sequences
                         draft_tokens = batch.scheduled_spec_decode_tokens[
                             new_curr_indices
                         ]
@@ -527,30 +579,12 @@ class ModelRunner:
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
-        # Calculate local device rank considering both TP and DP
-        # When data parallelism is enabled on the same node, different DP ranks
-        # need to use different sets of GPUs
-        dp_rank_local = config.parallel_config.data_parallel_rank_local
-        if dp_rank_local is None:
-            dp_rank_local = 0
-        local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
-        num_gpus = torch.cuda.device_count()
-        if local_device_rank >= num_gpus:
-            raise ValueError(
-                f"Calculated local_device_rank={local_device_rank} exceeds available GPUs ({num_gpus}). "
-            )
-
-        device = torch.device(f"cuda:{local_device_rank}")
-        logger.info(
-            f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, local_device_rank={local_device_rank}, device={device}"
-        )
-        self.device = device
-
-        # Initialize profiler for this rank
+        # Initialize profiler for this rank (before _setup_device_and_distributed
+        # so that dp config fields are still at their original values)
         self.profiler = None
         self.profiler_dir = None
         if config.torch_profiler_dir is not None:
-            # Create rank-specific profiler directory
+            dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
             if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
                 rank_name = f"dp{dp_rank_local}_tp{rank}"
             else:
@@ -558,23 +592,10 @@ class ModelRunner:
             self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
+        self._setup_device_and_distributed(rank, config)
+
         self.graph_bs = [0]  # for eager fallback
 
-        torch.cuda.set_device(self.device)
-        os.environ["MASTER_ADDR"] = self.config.master_addr
-        os.environ["MASTER_PORT"] = str(self.config.port)
-        distributed_init_method = get_distributed_init_method(
-            config.parallel_config.data_parallel_master_ip,
-            config.parallel_config.data_parallel_base_port,
-        )
-        init_dist_env(
-            config.tensor_parallel_size,
-            rankID=rank,
-            backend="nccl",
-            distributed_init_method=distributed_init_method,
-            data_parallel_size=config.parallel_config.data_parallel_size,
-            data_parallel_rank=config.parallel_config.data_parallel_rank,
-        )
         init_exit_handler(self)
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
@@ -772,9 +793,46 @@ class ModelRunner:
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("mimo_v2_flash"):
+        elif self.hf_text_config.model_type in (
+            "mimo_v2",
+            "mimo_v2_flash",
+        ):
             return True
         return False
+
+    def _setup_device_and_distributed(self, rank: int, config: Config):
+        # Calculate local device rank considering both TP and DP
+        # When data parallelism is enabled on the same node, different DP ranks
+        # need to use different sets of GPUs
+        dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
+        local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
+        num_gpus = torch.cuda.device_count()
+        if local_device_rank >= num_gpus:
+            raise ValueError(
+                f"Calculated local_device_rank={local_device_rank} exceeds available GPUs ({num_gpus}). "
+            )
+
+        self.device = torch.device(f"cuda:{local_device_rank}")
+        logger.info(
+            f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, "
+            f"local_device_rank={local_device_rank}, device={self.device}"
+        )
+
+        torch.cuda.set_device(self.device)
+        os.environ["MASTER_ADDR"] = self.config.master_addr
+        os.environ["MASTER_PORT"] = str(self.config.port)
+        distributed_init_method = get_distributed_init_method(
+            config.parallel_config.data_parallel_master_ip,
+            config.parallel_config.data_parallel_base_port,
+        )
+        init_dist_env(
+            config.tensor_parallel_size,
+            rankID=rank,
+            backend="nccl",
+            distributed_init_method=distributed_init_method,
+            data_parallel_size=config.parallel_config.data_parallel_size,
+            data_parallel_rank=config.parallel_config.data_parallel_rank,
+        )
 
     def _make_buffer(
         self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
@@ -918,9 +976,13 @@ class ModelRunner:
         return True
 
     def stop_profiler(self):
-        """Stop profiling for this rank."""
+        """Stop profiling for this rank.
+
+        Returns a dict with ``trace_dir`` and ``elapsed`` so the caller
+        can report where the trace was written.
+        """
         if self.profiler is None:
-            return True
+            return {"trace_dir": self.profiler_dir, "elapsed": 0.0}
         t0 = time.monotonic()
         logger.info("Rank %d: stopping profiler...", self.rank)
         try:
@@ -929,12 +991,13 @@ class ModelRunner:
             logger.exception("Rank %d: profiler stop failed", self.rank)
         finally:
             self.profiler = None
+        elapsed = round(time.monotonic() - t0, 1)
         logger.info(
             "Rank %d: profiler stop completed in %.1fs",
             self.rank,
-            time.monotonic() - t0,
+            elapsed,
         )
-        return True
+        return {"trace_dir": self.profiler_dir, "elapsed": elapsed}
 
     def debug(self, *args: Any):
         if self.rank == 0:
@@ -949,6 +1012,7 @@ class ModelRunner:
         if draft_bs is None:
             draft_bs = forward_context.context.graph_bs
         for i in range(self.drafter.mtp_k):
+            self.drafter._refresh_dp_metadata(forward_context, hidden_states.shape[0])
             hidden_states = self.drafter.model(
                 input_ids=torch.zeros(
                     hidden_states.shape[0],
@@ -971,7 +1035,9 @@ class ModelRunner:
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
         # num_tokens_original = 1
-        mtp_factor = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
+        has_drafter = hasattr(self, "drafter")
+        mtp_k = self.drafter.mtp_k if has_drafter else 0
+        mtp_factor = mtp_k + 1
         num_tokens_original = mtp_factor
 
         seq = Sequence([0] * num_tokens_original, block_size=self.block_size, id=-1)
@@ -979,6 +1045,7 @@ class ModelRunner:
         seq.type = SequenceType.DECODE
         seq.block_table = [0]
 
+        spec_tokens = {seq.id: np.zeros(mtp_k, dtype=np.int32)} if mtp_k > 0 else None
         dummy_batch = ScheduledBatch(
             seqs={seq.id: seq},
             num_scheduled_tokens=np.array([num_tokens_original], dtype=np.int32),
@@ -987,6 +1054,8 @@ class ModelRunner:
             total_seqs_num=1,
             total_seqs_num_decode=1,
             is_dummy_run=True,
+            num_spec_step=mtp_k,
+            scheduled_spec_decode_tokens=spec_tokens,
         )
 
         self.forward(dummy_batch)
@@ -1047,7 +1116,10 @@ class ModelRunner:
             self.config.max_model_len,
         )
         dp_size = get_dp_group().world_size
-        warmup_max_tokens = max_num_batched_tokens // dp_size
+        if self.config.enable_dp_attention:
+            warmup_max_tokens = max_num_batched_tokens
+        else:
+            warmup_max_tokens = max_num_batched_tokens // dp_size
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -1057,7 +1129,8 @@ class ModelRunner:
             if seq_len == 0:
                 seq_len = 1
             logger.warning(
-                f"{self.label}: DP size={dp_size} too large, warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
+                f"{self.label}: dp_size={dp_size}, dp_attn={self.config.enable_dp_attention}, "
+                f"warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
                 f"Using {num_seqs} seq with length {seq_len} for warmup."
             )
         else:
@@ -1216,11 +1289,14 @@ class ModelRunner:
         # Subtract our own PyTorch usage + CUDA graph estimate + safety.
         # This is independent of other processes on the GPU.
         budget = int(total * config.gpu_memory_utilization)
-        available_for_kv = budget - peak_torch - cudagraph_overhead - safety_margin
+        # Fixed (utilization-independent) overhead of this process: model
+        # weights + peak activations + CUDA graph capture + safety margin.
+        non_kv_overhead = peak_torch + cudagraph_overhead + safety_margin
+        available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
         # This prevents OOM when other processes share the GPU.
-        available_for_kv = min(available_for_kv, free)
+        available_for_kv = min(available_for_kv_budget, free)
 
         torch.set_default_device("cpu")
 
@@ -1238,13 +1314,42 @@ class ModelRunner:
         per_req_cache_tensor_bytes = max_per_req_cache_slots * per_req_cache_bytes
         available_for_pool = available_for_kv - per_req_cache_tensor_bytes
         if available_for_pool <= 0:
-            raise RuntimeError(
+            # Minimum gpu_memory_utilization that makes the budget just cover the
+            # per-request cache tensor (available_for_kv_budget ==
+            # per_req_cache_tensor_bytes). Rounded UP to the next 0.01 so the
+            # printed value is actually sufficient, not the exact threshold.
+            min_util = (non_kv_overhead + per_req_cache_tensor_bytes) / total
+            min_util_hint = math.ceil(min_util * 100) / 100
+            base_msg = (
                 f"Per-request cache tensor "
                 f"({per_req_cache_tensor_bytes / (1 << 30):.2f}GB for "
                 f"{max_per_req_cache_slots} slots) exceeds available KV budget "
-                f"({available_for_kv / (1 << 30):.2f}GB). "
-                f"Reduce --max-num-seqs or increase gpu_memory_utilization."
+                f"({available_for_kv / (1 << 30):.2f}GB) at "
+                f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
+            if available_for_kv_budget > free:
+                # The physical free-memory clamp is the binding limit, not the
+                # utilization budget — raising --gpu-memory-utilization won't help.
+                fix_msg = (
+                    f" Only {free / (1 << 30):.2f}GB is physically free on the GPU "
+                    f"(other processes may be holding memory); raising "
+                    f"--gpu-memory-utilization will NOT help. Free GPU memory or "
+                    f"reduce --max-num-seqs (currently {config.max_num_seqs})."
+                )
+            elif min_util_hint <= 1.0:
+                fix_msg = (
+                    f" Set --gpu-memory-utilization >= {min_util_hint:.2f} "
+                    f"(this only zeroes out the deficit; use a higher value for "
+                    f"actual KV capacity) or reduce --max-num-seqs "
+                    f"(currently {config.max_num_seqs})."
+                )
+            else:
+                fix_msg = (
+                    f" Even --gpu-memory-utilization 1.0 is insufficient "
+                    f"(would need {min_util:.2f}); reduce --max-num-seqs "
+                    f"(currently {config.max_num_seqs}) or free GPU memory."
+                )
+            raise RuntimeError(base_msg + fix_msg)
         per_req_cache_equiv_blocks = (
             math.ceil(per_req_cache_bytes / block_bytes)
             if per_req_cache_bytes > 0
@@ -1435,11 +1540,18 @@ class ModelRunner:
         layer_id = 0
         # Promote to self so the attention builder's build_kv_cache_tensor()
         # can access it without recomputing from drafter state. Heterogeneous
-        # drafts (Eagle3) own their own layer space via their builder, so
-        # leave mtp_start_layer_idx at hf_config.num_hidden_layers in that mode.
+        # drafts (Eagle3 MHA) own their own layer space via their builder.
+        # Eagle3 MLA drafts (K2.6) share the target's MLA pool but still
+        # appear as one extra layer at index num_hidden_layers. In both Eagle3
+        # variants the eagle3 draft model has no `.model.mtp_start_layer_idx`,
+        # so only MTP-style drafts take the first branch.
+        is_eagle3 = (
+            self.config.speculative_config is not None
+            and self.config.speculative_config.method == "eagle3"
+        )
         self.mtp_start_layer_idx = (
             self.drafter.model.model.mtp_start_layer_idx
-            if hasattr(self, "drafter") and not hasattr(self, "eagle3_draft_builder")
+            if hasattr(self, "drafter") and not is_eagle3
             else hf_config.num_hidden_layers
         )
         for model_name, model in models_to_bind:
@@ -1532,9 +1644,9 @@ class ModelRunner:
         num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
             num_tokens, dp_size, dp_rank
         )
-        max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp).item()
+        max_tokens_across_dp = int(torch.max(num_tokens_across_dp))
 
-        return max_tokens_across_dp_cpu - num_tokens, num_tokens_across_dp
+        return max_tokens_across_dp - num_tokens, num_tokens_across_dp
 
     def _maybe_create_tbo_slices(
         self,
@@ -1612,6 +1724,11 @@ class ModelRunner:
                 None,
             )
 
+        # Mixed prefill+decode DP steps only deadlock under prefill
+        # token-split + TBO-decode
+        require_uniform_mode = (
+            self.config.enable_tbo_decode and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+        )
         sync = sync_dp_for_tbo(
             dp_group=get_dp_group().cpu_group,
             dp_size=dp_size,
@@ -1620,9 +1737,10 @@ class ModelRunner:
             tbo_on=tbo_on,
             local_tbo_eligible=local_eligible,
             local_ub_tokens=(local_ub0, local_ub1),
+            require_uniform_mode=require_uniform_mode,
         )
 
-        max_tokens = int(sync.num_tokens_across_dp.max().item())
+        max_tokens = int(sync.num_tokens_across_dp.max())
         dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention
         )
@@ -1654,34 +1772,42 @@ class ModelRunner:
             ub_max_tokens_across_dp,
         ) = self._preprocess(batch, num_scheduled_tokens=num_scheduled_tokens)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
+
+        forward_mode = ForwardMode.decide(
+            is_prefill=is_prefill,
+            total_seqs_num=batch.total_seqs_num,
+            scheduled_bs_decode=batch.total_seqs_num_decode,
+            num_input_tokens=num_input_tokens,
+            dp_uniform_decode=dp_uniform_decode,
+            enforce_eager=self.enforce_eager,
+            graph_bs=self.graph_bs,
+            mtp_step=(self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1,
+        )
+
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
-            # num_pad, num_tokens_across_dp = self.get_dp_padding(scheduled_bs)
-            # padded_scheduled_bs = scheduled_bs + num_pad
-            # TODO rename num_input_tokens to actual bs in currrent rank?
-            padded_scheduled_bs = num_input_tokens
-            # for MTP, we need to divide by (mtp_k + 1) to get the actual batch size
-            if hasattr(self, "drafter"):
-                mtp_step = self.drafter.mtp_k + 1
-                padded_scheduled_bs = (padded_scheduled_bs + mtp_step - 1) // mtp_step
-            bs = (
-                padded_scheduled_bs
-                if self.enforce_eager
-                else next(
-                    (x for x in self.graph_bs if x >= padded_scheduled_bs),
-                    padded_scheduled_bs,
+            bs = forward_mode.effective_bs  # single source of truth
+            assert bs >= scheduled_bs, (
+                f"effective_bs={bs} < scheduled_bs={scheduled_bs}; "
+                f"ForwardMode.decide invariant violated"
+            )
+            # Only pad cu_seqlens_q out to the cudagraph capture size if we
+            # actually grew bs. Eager (bs == scheduled_bs) leaves the slice
+            # empty so no overwrite happens.
+            if bs > scheduled_bs:
+                self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
+                    self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
                 )
-            )
-            assert (
-                bs >= padded_scheduled_bs
-            ), f"current decode {padded_scheduled_bs=} > max graph_bs{bs}"
-            self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
-                self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
-            )
         attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
 
-        graph_bs = num_input_tokens if is_prefill else bs
+        # MoE's pad_for_all_gather reads context.graph_bs to pad hidden_states
+        # before a cross-DP all_gather, so it must be unified across DP ranks
+        # under uniform decode (where pad path is taken). Use forward_mode's
+        # moe_pad_bs, which equals effective_bs except in the uniform-eager
+        # corner (enforce_eager / bs>graph_bs[-1]) where attention needs local
+        # but MoE pad needs the DP-unified padded_scheduled_bs.
+        graph_bs = num_input_tokens if is_prefill else forward_mode.moe_pad_bs
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
@@ -1689,6 +1815,7 @@ class ModelRunner:
             batch_size=context_bs,
             graph_bs=graph_bs,
             dp_uniform_decode=dp_uniform_decode,
+            forward_mode=forward_mode,
         )
 
         actual_num_tokens = batch.total_tokens_num
@@ -1800,12 +1927,21 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
 
-        if (
-            is_prefill
-            or self.enforce_eager
-            or not context.dp_uniform_decode
-            or bs > self.graph_bs[-1]
-        ):
+        # Dispatch is owned by ForwardMode.decide() (called in prepare_inputs).
+        # Every run_model caller MUST go through prepare_inputs first, so
+        # forward_mode is always set here.
+        forward_mode = context.forward_mode
+        assert forward_mode is not None, (
+            "context.forward_mode is None; run_model invoked without going "
+            "through prepare_inputs. Add ForwardMode.decide() at the new "
+            "entry point instead of re-deriving the 4-OR dispatch here."
+        )
+
+        # Single canonical shape check; contract owned by ForwardMode, which
+        # internally short-circuits for prefill / cudagraph.
+        forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
+
+        if not forward_mode.use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             if is_prefill:
@@ -1951,12 +2087,27 @@ class ModelRunner:
         if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
+        # Compute logprobs if any sequence requested them
+        need_logprobs = any(batch.return_logprobs)
+        sampled_logprobs = None
+        if need_logprobs:
+            logits_fp32 = logits.float()
+            log_probs = torch.log_softmax(logits_fp32, dim=-1)
+            sampled_logprobs = log_probs.gather(
+                -1, sampled_tokens.to(torch.long).unsqueeze(-1)
+            ).squeeze(-1)
+            if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
+                sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
+
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
-        req_ids_out, token_ids_out = self.tokenID_processor.prepare_sampled_ids(
-            batch, sampled_tokens, self.forward_done_event
+        token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
+            batch, sampled_tokens, self.forward_done_event, sampled_logprobs
         )
+        # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
+        req_ids_out = [k for k in token_id_dict if k != -1]
+        token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
         draft_token_ids: Optional[np.ndarray] = None
         if self.tokenID_processor.is_deferred_out:
@@ -2001,6 +2152,7 @@ class ModelRunner:
             is_deferred_out=self.tokenID_processor.is_deferred_out,
             num_rejected=prev_rejected_num,
             num_bonus=prev_bonus_num,
+            logprobs=logprobs_map,
         )
 
     @torch.inference_mode()

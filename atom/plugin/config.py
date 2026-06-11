@@ -1,11 +1,10 @@
 import copy
+import json
 from typing import Any, Optional
 from dataclasses import dataclass
 
 import torch
 import logging
-
-from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -24,7 +23,6 @@ class PluginConfig:
     vllm_scheduler_config: Any = None
     vllm_cache_config: Any = None
     vllm_quant_config: Any = None
-    vllm_use_atom_attention: bool = False
 
     # sglang specific
     sglang_model_opt_config: Any = None
@@ -119,7 +117,6 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     vllm_scheduler_config = config.scheduler_config
     vllm_cache_config = config.cache_config
     vllm_parallel_config = config.parallel_config
-    vllm_use_atom_attention = not envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 
     # here use the ATOM compilation config, as the ATOM compile policy is used
     # instead of vLLM one for torch compile, while for cuda graph capture,
@@ -148,7 +145,6 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         vllm_scheduler_config=vllm_scheduler_config,
         vllm_cache_config=vllm_cache_config,
         vllm_quant_config=vllm_quant_config,
-        vllm_use_atom_attention=vllm_use_atom_attention,
     )
 
     # specific
@@ -186,6 +182,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         enable_dp_attention=False,
         plugin_config=plugin_config,
         speculative_config=atom_speculative_config,
+        online_quant_config=(getattr(config, "additional_config", None) or {}).get(
+            "online_quant_config"
+        ),
     )
 
 
@@ -218,6 +217,14 @@ def _generate_atom_config_from_sglang_config(config: Any):
             "function is called after SGLang has parsed and set its "
             "server arguments."
         )
+
+    sglang_model_loader_extra_config = json.loads(
+        getattr(server_args, "model_loader_extra_config", None) or "{}"
+    )
+    online_quant_config = sglang_model_loader_extra_config.pop(
+        "online_quant_config", None
+    )
+    server_args.model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
 
     sgl_model_config = SglangModelConfig.from_server_args(server_args)
     sgl_model_opt_config = ModelOptConfig(
@@ -316,7 +323,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     return Config(
         model=server_args.model_path,
         max_num_batched_tokens=16384,
-        max_num_seqs=server_args.max_running_requests,
+        max_num_seqs=server_args.max_running_requests or 512,
         max_model_len=server_args.context_length,
         gpu_memory_utilization=server_args.mem_fraction_static,
         tensor_parallel_size=atom_tensor_parallel_size,
@@ -337,6 +344,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         master_addr=None,
         enable_dp_attention=server_args.enable_dp_attention,
         plugin_config=plugin_config,
+        online_quant_config=online_quant_config,
     )
 
 

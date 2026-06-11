@@ -39,6 +39,7 @@ class EngineArgs:
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
     attn_prefill_chunk_size: int = 16384
+    enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -56,6 +57,7 @@ class EngineArgs:
     draft_model: Optional[str] = None
     mark_trace: bool = False
     online_quant_config: Optional[dict] = None
+    hf_overrides: Optional[dict] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -200,6 +202,13 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--enable_chunked_prefill",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Enable chunked prefill (default: enabled). "
+            "Use --no-enable_chunked_prefill to disable.",
+        )
+        parser.add_argument(
             "--max-num-seqs",
             type=int,
             default=512,
@@ -251,6 +260,16 @@ class EngineArgs:
                 """  '{"global_quant_config": "ptpc_fp8", """
                 """"layer_quant_config": {"*expert*": "mxfp4"}, """
                 """"exclude_layer": "lm_head"}'"""
+            ),
+        )
+        parser.add_argument(
+            "--hf-overrides",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON object of HF config attributes to override after loading "
+                "the model config. Example: "
+                '\'{"use_index_cache": true, "index_topk_freq": 4}\''
             ),
         )
 

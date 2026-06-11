@@ -294,6 +294,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         quant_type: QuantType = QuantType.No,
         global_num_experts: int = -1,
         expert_map: torch.Tensor | None = None,
+        expert_mask: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         w1_scale: Optional[torch.Tensor] = None,
         w2_scale: Optional[torch.Tensor] = None,
@@ -303,6 +304,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         bias2: Optional[torch.Tensor] = None,
         hidden_pad: Optional[int] = 0,
         intermediate_pad: Optional[int] = 0,
+        moe_extra_args: Optional[dict] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         if inplace and self.shared_experts is None and not disable_inplace():
@@ -337,20 +339,30 @@ class FusedMoEModularKernel(torch.nn.Module):
         topk = topk_ids.shape[1]
         # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay)
         total_valid_tokens = context.graph_bs * topk * dp_size
-        if total_valid_tokens < dispatch_a1.shape[0] and not context.is_prefill:
+        all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
+        if total_valid_tokens < dispatch_a1.shape[0] and all_ranks_decode:
             dispatch_a1 = dispatch_a1[:total_valid_tokens]
             dispatch_ids = dispatch_ids[:total_valid_tokens]
             dispatch_weights = dispatch_weights[:total_valid_tokens]
             if dispatch_scale is not None:
                 dispatch_scale = dispatch_scale[:total_valid_tokens]
 
+        # aiter fused_moe expects a *binary* (0/1) expert_mask in this slot, not
+        # the index-style expert_map (which carries -1 sentinels for non-local
+        # experts). Passing expert_map here makes moe_sorting mis-classify
+        # routing and compute out-of-range expert ids -> illegal memory access.
+        # See PR #887 which fixed the same bug on the non-modular path.
+        # Extra, model-/method-specific kwargs (e.g. DeepSeek-V4 MXFP4 needs
+        # gate_mode=INTERLEAVE + swiglu_limit) are forwarded verbatim from the
+        # quant method's apply() via `moe_extra_args`.
+        extra_kwargs = dict(moe_extra_args or {})
         fused_out = fused_moe(
             dispatch_a1,
             w1,
             w2,
             dispatch_weights,
             dispatch_ids,
-            expert_map,
+            expert_mask,
             activation,
             quant_type=quant_type,
             num_local_tokens=expert_tokens_meta.expert_num_tokens,
@@ -364,6 +376,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             bias1=bias1,
             bias2=bias2,
             dtype=hidden_states.dtype,
+            **extra_kwargs,
         )
         return self._finalize(
             output,
