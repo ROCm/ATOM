@@ -93,7 +93,7 @@ jobs:
 
           duration = "3m"
           consumer_threads = [1, 2, 4, 8, 16]
-          topologies = [(1, 1), (2, 1), (2, 2), (3, 1)]
+          topologies = [(1, 1), (2, 1), (3, 1)]
 
           cells = []
 
@@ -251,3 +251,21 @@ jobs:
           auto-push: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy mocker benchmark dashboard to gh-pages
+        if: hashFiles('atomesh-mocker-dashboard-input.json') != ''
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          DASHBOARD_TEMPLATE=$(mktemp)
+          cp .github/dashboard/atomesh_mocker_index.html "$DASHBOARD_TEMPLATE"
+          CURRENT_SHA=$(git rev-parse HEAD)
+          git fetch origin gh-pages
+          git checkout gh-pages
+          mkdir -p atomesh-mocker-dashboard
+          cp "$DASHBOARD_TEMPLATE" atomesh-mocker-dashboard/index.html
+          git add atomesh-mocker-dashboard/
+          git diff --cached --quiet || git commit -m "Update Atomesh mocker benchmark dashboard"
+          git push origin gh-pages
+          git checkout "$CURRENT_SHA"
