@@ -280,6 +280,7 @@ jobs:
       VLLM_COMMIT: 0b3ba88f165976e77ca5e6a7a3f5bba4562b80af
       VLLM_VERSION: "0.22.0"
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
+      DOCKER_CONFIG: /it-share/action_runner/docker
 
     steps:
       - name: Clean up containers and workspace
@@ -348,10 +349,15 @@ jobs:
           RUN pip show amd-aiter atom vllm torch triton mori || true
           EOF
 
+      - name: Ensure Docker client config dir
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
+      
       - name: Build OOT image locally
         run: |
           echo "DOCKER_CONFIG=${DOCKER_CONFIG:-<unset>}"
-          echo "Effective: ${DOCKER_CONFIG:-$HOME/.docker}"
+          echo "Effective: ${DOCKER_CONFIG:-$HOME/.docker}"        
       
           set -euo pipefail
           docker rmi "atom_oot_base:ci" || true
