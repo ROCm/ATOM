@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Launch the prefill server. Run this script inside the container.
+#
+# Required env:
+#   PREFILL_IP      - this node's IP
+#   MODEL_PATH      - model path
+#   PREFILL_TP      - tensor parallel size
+#
+# Optional env (with defaults):
+#   PREFILL_PORT=8010  BOOTSTRAP_PORT=8998  MEM_FRACTION=0.85
+#   KV_CACHE_DTYPE=fp8_e4m3  CHUNKED_PREFILL_SIZE=16384
+#   MAX_RUNNING_REQUESTS=128  IB_DEVICE=rdma0,...
+#   LOAD_DUMMY=1            skip weight loading (for benchmarking infra)
+
+: "${PREFILL_IP:?}"
+: "${MODEL_PATH:?}"
+: "${PREFILL_TP:?}"
+
+PREFILL_PORT="${PREFILL_PORT:-8010}"
+BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
+MEM_FRACTION="${MEM_FRACTION:-0.85}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
+IB_DEVICE="${IB_DEVICE:-rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7}"
+LOAD_DUMMY="${LOAD_DUMMY:-}"
+
+GPU_IDS=$(seq -s, 0 $((PREFILL_TP - 1)))
+
+echo "[prefill] IP=${PREFILL_IP} TP=${PREFILL_TP} GPUs=${GPU_IDS} port=${PREFILL_PORT}"
+
+mkdir -p /workspace/logs
+export HIP_VISIBLE_DEVICES=${GPU_IDS}
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+export SGLANG_USE_AITER=1
+export SGLANG_AITER_FP8_PREFILL_ATTN=0
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
+export SGLANG_HOST_IP=${PREFILL_IP}
+export SGLANG_MOONCAKE_SEND_AUX_TCP=1
+export MC_TCP_ENABLE_CONNECTION_POOL=true
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+
+EXTRA_ARGS=()
+if [[ -n "${LOAD_DUMMY}" ]]; then
+    EXTRA_ARGS+=(--load-format dummy)
+    export LOAD_DUMMY=1
+    echo "[prefill] LOAD_DUMMY enabled — skipping weight loading"
+fi
+
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH}" \
+    --host 0.0.0.0 --port "${PREFILL_PORT}" \
+    --trust-remote-code \
+    --tp-size "${PREFILL_TP}" \
+    --kv-cache-dtype "${KV_CACHE_DTYPE}" \
+    --attention-backend aiter \
+    --mem-fraction-static "${MEM_FRACTION}" \
+    --page-size 1 \
+    --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
+    --max-running-requests "${MAX_RUNNING_REQUESTS}" \
+    --disable-radix-cache \
+    --log-level info \
+    --watchdog-timeout 3600 \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend mooncake \
+    --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
+    --disaggregation-ib-device "${IB_DEVICE}" \
+    "${EXTRA_ARGS[@]}" \
+    2>&1 | tee /workspace/logs/prefill.log

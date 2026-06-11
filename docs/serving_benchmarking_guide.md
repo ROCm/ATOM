@@ -472,8 +472,9 @@ python -m atom.entrypoints.openai_server \
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--method` | `None` | Speculative method; currently only `mtp` is supported |
+| `--method` | `None` | Speculative method: `mtp` (DeepSeek MTP) or `eagle3` (EAGLE 3 / EAGLE 3.1 — see [`eagle3_speculative_decoding.md`](eagle3_speculative_decoding.md)) |
 | `--num-speculative-tokens` | `1` | Number of draft tokens per iteration (draft model runs this many autoregressive steps) |
+| `--draft-model` | `None` | Path or HF repo of the speculative draft model. Required for `--method eagle3`; the draft's `config.json` drives EAGLE 3 vs EAGLE 3.1 toggles automatically |
 
 ### 6.3 MTP Statistics
 

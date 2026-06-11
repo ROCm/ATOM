@@ -80,9 +80,8 @@ vllm serve <model_path> \
 
 Common plugin toggles:
 
-- Default plugin-on: do not set `ATOM_DISABLE_VLLM_PLUGIN` or `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION` (or set them to `0`)
+- Default plugin-on: do not set `ATOM_DISABLE_VLLM_PLUGIN` (or set it to `0`)
 - Optional plugin-off control: set `ATOM_DISABLE_VLLM_PLUGIN=1`
-- Optional attention-off control: set `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`
 - Always set `VLLM_ROCM_USE_AITER=1` in both ATOM plugin and upstream vLLM runs.
 
 ### 2) Run smoke validation

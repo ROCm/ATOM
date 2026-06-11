@@ -47,6 +47,19 @@ class LayerQuantConfig:
         return cls(quant_type=QuantType.No, quant_dtype=dtype)
 
 
+def should_skip_online_quant(cur_type, cur_dtype, online_cfg) -> bool:
+    """Skip online re-quant when the layer is excluded (No) or already in target.
+
+    Shared by ``LinearBase.online_quantize_weight``, ``FusedMoE._online_quant``
+    and ``RMSNorm.online_quantize_activation``: re-quantizing is a no-op (and may
+    corrupt already-quantized weights) when the online target is ``No`` or the
+    layer already matches the target ``(quant_type, quant_dtype)``.
+    """
+    return online_cfg.quant_type == QuantType.No or (
+        cur_type == online_cfg.quant_type and cur_dtype == online_cfg.quant_dtype
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Structured parsed config
 # ──────────────────────────────────────────────────────────────────────

@@ -45,27 +45,25 @@ vLLM startup
 │     └─ return "atom.plugin.vllm.platform.ATOMPlatform"
 │
 ├─ 2. register_model()
-│     ├─ Override ModelRegistry for supported architectures
-│     ├─ patch_vllm_mla_attention()
-│     └─ Patch Attention.process_weights_after_loading
+│     └─ Override ModelRegistry for supported architectures
 │
 ├─ 3. vLLM loads model → ATOMModelBase.__init__()
 │     ├─ generate_atom_config_for_plugin_mode(vllm_config)
 │     │     └─ _generate_atom_config_from_vllm_config()
 │     │           ├─ Build PluginConfig (vLLM-specific fields)
 │     │           └─ Build ATOM Config (model, TP, KV cache, etc.)
-│     ├─ set_attn_cls() → ops.Attention = PagedAttention
+│     ├─ Attention dispatcher selects AttentionForVllm
 │     ├─ init_aiter_dist() → initialize AITER distributed env
 │     └─ Construct ATOM model (e.g., DeepseekV3ForCausalLM)
 │
-├─ 4. ATOMPlatform.get_attn_backend_cls()
-│     ├─ MLA model → AiterMLABackend
-│     └─ MHA model → AiterBackend
+├─ 4. AttentionForVllm layer construction
+│     ├─ MLA model → AiterMlaBackendForVllm
+│     └─ MHA model → AiterMhaBackendForVllm
 │
 └─ 5. Forward pass
       ├─ vLLM calls ATOMModelBase.forward()
       ├─ Delegates to self.model(input_ids, positions, ...)
-      └─ Attention uses ATOM's AITER kernels via plugin decorators
+      └─ AttentionForVllm uses ATOM's AITER kernels
 ```
 
 ### 1.4 Key Modules
@@ -75,8 +73,7 @@ vLLM startup
 | `atom.plugin.vllm.register` | vLLM plugin entry points for platform and model registration |
 | `atom.plugin.vllm.platform` | The ATOM platform class exposed to vLLM |
 | `atom.plugin.vllm.model_wrapper` | ATOM model wrappers used by vLLM model construction |
-| `atom.model_ops.attentions.aiter_attention` | ATOM MHA attention backend for vLLM plugin mode |
-| `atom.model_ops.attentions.aiter_mla` | ATOM MLA attention backend for vLLM plugin mode |
+| `atom.plugin.vllm.attention` | vLLM-specific ATOM attention layers, backends, metadata, and impls |
 
 ### 1.5 Component Diagram
 
@@ -86,16 +83,13 @@ atom/plugin/
 ├── prepare.py               # Framework detection and state management
 ├── config.py                # PluginConfig + vLLM-to-ATOM config translation
 ├── register.py              # set_attn_cls, init_aiter_dist
-├── attention.py             # vLLM attention metadata builders and backend decorators
-├── attention_mha.py         # MHA (PagedAttention) plugin-mode decorator
-├── attention_mla.py         # MLA plugin-mode methods and decorator
-├── moe.py                   # FusedMoE decorator for plugin mode
 └── vllm/
     ├── __init__.py           # vLLM sub-package exports
     ├── register.py           # register_platform(), register_model()
     ├── platform.py           # ATOMPlatform (RocmPlatform subclass)
     ├── model_wrapper.py      # ATOMModelBase, ATOMForCausalLM, ATOMMoEForCausalLM
-    └── mla_patch.py          # Patches vLLM MLAAttention for ATOM MLA integration
+    ├── moe.py                # vLLM-specific FusedMoE name adaptation
+    └── attention/            # vLLM-specific ATOM attention stack
 ```
 
 ---
@@ -118,7 +112,6 @@ compilation and plugin settings.
 | `vllm_scheduler_config` | `Any` | `None` | vLLM scheduler config |
 | `vllm_cache_config` | `Any` | `None` | vLLM cache config |
 | `vllm_quant_config` | `Any` | `None` | vLLM quantization config |
-| `vllm_use_atom_attention` | `bool` | `False` | Whether ATOM attention is active |
 
 ### 2.2 vLLM Config Mapping
 
@@ -168,25 +161,23 @@ The following table shows how vLLM config fields map to ATOM `Config` fields:
 
 ## 3. Attention Integration
 
-vLLM's OOT plugin interface allows an external platform to supply its own
-attention backend. ATOM hooks into this by overriding
-`ATOMPlatform.get_attn_backend_cls()` — the only contract point between vLLM and
-the plugin for attention dispatch.
+ATOM's vLLM plugin constructs ATOM-owned attention layers directly from the
+ATOM model implementation. These layers implement vLLM's `AttentionLayerBase`
+contract and return their ATOM-vLLM backend via `get_attn_backend()`.
 
 ### 3.1 How the Backend Is Selected
 
-When vLLM resolves the attention backend for a model, it calls the platform's
-`get_attn_backend_cls()`. ATOM's implementation returns one of two backends based
-on the model's attention type:
+When vLLM discovers attention-like layers through `static_forward_context`, each
+ATOM-vLLM attention layer returns its backend based on the model's attention type:
 
 | Model Attention Type | Returned Backend | Example Models |
 |---|---|---|
-| MLA (`use_mla == True`) | `AiterMLABackend` | DeepSeek-R1, Kimi-K2 |
-| Standard MHA | `AiterBackend` | Qwen3, Llama |
+| MLA (`use_mla == True`) | `AiterMlaBackendForVllm` | DeepSeek-R1, Kimi-K2 |
+| Standard MHA | `AiterMhaBackendForVllm` | Qwen3, Llama |
 
-Setting `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1` causes `ATOMPlatform` to delegate
-back to the parent `RocmPlatform.get_attn_backend_cls()`, restoring vLLM's
-built-in ROCm attention path.
+ATOM-vLLM no longer constructs vLLM's standard `Attention` / `MLAAttention`, so
+there is no supported mode to disable only ATOM attention while keeping ATOM
+models active. Use `ATOM_DISABLE_VLLM_PLUGIN=1` for pure vLLM.
 
 ## 4. Supported Models
 Currently, the plugin backend supports the following model architectures:
@@ -292,8 +283,6 @@ set environment variables before launching:
 # Disable the entire ATOM plugin (platform + models)
 export ATOM_DISABLE_VLLM_PLUGIN=1
 
-# Or disable only ATOM attention (keep ATOM models but use vLLM attention)
-export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
 ```
 
 ---
@@ -303,5 +292,4 @@ export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `ATOM_DISABLE_VLLM_PLUGIN` | bool | `0` (false) | Set to `1` to disable the entire ATOM vLLM plugin (platform + model registration). vLLM runs in pure ROCm mode. |
-| `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION` | bool | `0` (false) | Set to `1` to disable only ATOM's attention backends. ATOM models are still used, but attention falls back to vLLM's default ROCm backend. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `0` (false) | Enable QK-norm + RoPE + cache + quant fusion in attention. Recommended for Qwen3-MoE models. |

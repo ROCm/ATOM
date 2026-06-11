@@ -6,14 +6,11 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Union
+from typing import Any, Dict, Optional, Set, Union
 
 import numpy as np
 import torch
 from atom.config import Config, KVCacheTensor, ParallelConfig
-
-if TYPE_CHECKING:
-    from atom.plugin.attention import MetadataForPluginMode
 
 
 class AttnState(Enum):
@@ -244,9 +241,6 @@ class AttentionMetaData:
     num_cached_tokens: Optional[torch.Tensor] = None
     seq_starts: Optional[torch.Tensor] = None
 
-    # only used for plugin mode to store the metadata for attn
-    plugin_metadata: Optional["MetadataForPluginMode"] = None
-
     def __init__(
         self,
         cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -273,7 +267,6 @@ class AttentionMetaData:
         reduce_partial_map: Optional[torch.Tensor] = None,
         sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
         token_to_seq_idxs: Optional[torch.Tensor] = None,
-        plugin_metadata: Optional["MetadataForPluginMode"] = None,
         has_cached: bool = False,
         total_kv: Optional[int] = None,
         num_cached_tokens: Optional[torch.Tensor] = None,
@@ -307,8 +300,6 @@ class AttentionMetaData:
         self.reduce_partial_map = reduce_partial_map
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs
-        if plugin_metadata is not None:
-            self.plugin_metadata = plugin_metadata
 
     def asdict_zerocopy(self, skip_fields: Optional[Set[str]] = None) -> Dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""

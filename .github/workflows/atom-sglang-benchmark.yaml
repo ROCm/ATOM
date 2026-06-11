@@ -849,7 +849,9 @@ jobs:
             --env-file /tmp/oot_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
+            --entrypoint /bin/bash \
+            "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" \
+            -lc 'trap "exit 0" TERM INT; sleep infinity & wait'
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -955,7 +957,7 @@ jobs:
             if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && -n "${MESH_TP_SIZE}" ]]; then
               EFFECTIVE_SGLANG_EXTRA_ARGS="--tensor-parallel-size ${MESH_TP_SIZE} ${SGLANG_EXTRA_ARGS}"
             fi
-            $CONTAINER_ENGINE exec \
+            $CONTAINER_ENGINE exec -d \
               -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
               -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
               -e SGLANG_EXTRA_ARGS="${EFFECTIVE_SGLANG_EXTRA_ARGS}" \
@@ -964,8 +966,68 @@ jobs:
               -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
               "$CONTAINER_NAME" bash -lc "
                 set -euo pipefail
-                bash .github/scripts/atom_sglang_test.sh launch
+                bash .github/scripts/atom_sglang_test.sh start
               "
+
+            last_sglang_log_line=0
+
+            emit_new_sglang_logs() {
+              if [ "${STREAM_SGLANG_LOGS}" != "1" ]; then
+                return 0
+              fi
+
+              current_line_count=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'if [ -f /tmp/atom_sglang.log ]; then wc -l < /tmp/atom_sglang.log; else echo 0; fi' 2>/dev/null || echo 0)
+              current_line_count=${current_line_count//$'\r'/}
+              if [ "${current_line_count:-0}" -le "${last_sglang_log_line}" ]; then
+                return 0
+              fi
+
+              echo ""
+              echo "========== New SGLang log output =========="
+              $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "sed -n '$((last_sglang_log_line + 1)),${current_line_count}p' /tmp/atom_sglang.log" || true
+              last_sglang_log_line=${current_line_count}
+            }
+
+            for ((i=1; i<=MAX_WAIT_RETRIES; i++)); do
+              if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'curl -fsS http://127.0.0.1:8000/v1/models >/dev/null 2>&1'; then
+                emit_new_sglang_logs
+                echo "SGLang server is ready."
+                break
+              fi
+
+              emit_new_sglang_logs
+
+              server_status=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '
+                if [ -f /tmp/atom_sglang.pid ]; then
+                  pid=$(cat /tmp/atom_sglang.pid)
+                  if kill -0 "$pid" 2>/dev/null; then
+                    echo running
+                  else
+                    echo dead
+                  fi
+                elif pgrep -f "sglang.launch_server" >/dev/null 2>&1; then
+                  echo running
+                else
+                  echo starting
+                fi
+              ' 2>/dev/null || echo unknown)
+
+              if [ "${server_status}" = "dead" ]; then
+                echo "SGLang server process exited before becoming ready."
+                $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/atom_sglang.log || true' || true
+                exit 1
+              fi
+
+              echo "Waiting for SGLang server... (${i}/${MAX_WAIT_RETRIES}; status=${server_status})"
+              sleep "${WAIT_INTERVAL_SEC:-30}"
+            done
+
+            if ! $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'curl -fsS http://127.0.0.1:8000/v1/models >/dev/null 2>&1'; then
+              echo "SGLang server did not become ready in time."
+              emit_new_sglang_logs
+              $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/atom_sglang.log || true' || true
+              exit 1
+            fi
 
             TRUST_REMOTE_CODE_ARG=""
             if [[ "${EFFECTIVE_SGLANG_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
@@ -1598,7 +1660,7 @@ jobs:
           alert-threshold: "80%"
           comment-on-alert: true
           fail-on-alert: false
-          max-items-in-chart: 90
+          max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push dashboard data to gh-pages

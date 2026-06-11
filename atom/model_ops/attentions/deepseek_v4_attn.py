@@ -39,7 +39,6 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Type, cast
 
-
 import numpy as np
 import torch
 from aiter import dtypes
@@ -143,23 +142,26 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     # overrides it. Below buffers are populated only when state is DECODE
     # (built by `_attach_v4_paged_decode_meta`).
     kv_indices_swa: Optional[torch.Tensor] = None
-    """[T*win] int32 GPU — flat paged offsets into `unified_kv` for SWA path."""
+    """[swa_indptr[T]] int32 GPU — ragged-packed paged offsets into `unified_kv`
+    for the SWA path (per-token length `min(positions[t]+1, win)`)."""
     kv_indices_csa: Optional[torch.Tensor] = None
     """[csa_indptr[T]] int32 GPU — packed paged offsets for CSA layers
-    (window prefix + per-token compress entries via csa_translate_pack)."""
+    (CSA topk compress at slice head + SWA window prefix at tail; topk section
+    filled per-layer by csa_translate_pack)."""
     kv_indices_hca: Optional[torch.Tensor] = None
     """[hca_indptr[T]] int32 GPU — packed paged offsets for HCA layers
-    (window prefix + n_committed_hca compress entries; layer-invariant)."""
+    (HCA compress at slice head + SWA window prefix at tail; layer-invariant)."""
     kv_indptr_swa: Optional[torch.Tensor] = None
-    """[padded_T+1] int32 GPU — uniform stride `win` cumsum;
-    `[T+1:padded_T+1]` = T*win (last value repeated → kv_len=0 sentinel)."""
+    """[padded_T+1] int32 GPU — ragged cumsum of per-token SWA length
+    `min(positions[t]+1, win)`. Padded tail repeats last value → kv_len=0
+    sentinel for CG-padded slots."""
     kv_indptr_csa: Optional[torch.Tensor] = None
     """[padded_T+1] int32 GPU — packed cumsum of per-token CSA kv_len
-    (= `win + min(n_committed_csa[bid], index_topk)`).
+    (= `min(positions[t]+1, win) + min(n_committed_csa[bid], index_topk)`).
     Padded tail = last value."""
     kv_indptr_hca: Optional[torch.Tensor] = None
     """[padded_T+1] int32 GPU — packed cumsum of per-token HCA kv_len
-    (= `win + n_committed_hca[bid]`). Padded tail = last value."""
+    (= `min(positions[t]+1, win) + n_committed_hca[bid]`). Padded tail = last value."""
     swa_pages: int = 0
     """Boundary in `unified_kv`: index < swa_pages → SWA region; index >=
     swa_pages → compress region. Equal to
@@ -188,13 +190,14 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     needed.
     """
     skip_prefix_len_csa: Optional[torch.Tensor] = None
-    """[padded_T] int32 GPU — per-token write offset for csa_translate_pack
-    within the per-token prefix region. Decode path: filled with
-    `window_size` (full SWA prefix occupies the head of each region).
-    Prefill path: equals `prefix_swa_count_per_token[t]` — 0 for pure
-    prefill (no prior chunk), or the `< chunk_start` portion of the SWA
-    window for chunked prefill. CG-padded tail slots: 0 (kernel bails on
-    `bid<0` so the value is irrelevant)."""
+    """[padded_T] int32 GPU — per-token SWA prefix length within each token's
+    region. Decode path: filled with `window_size`; csa_translate_pack uses it
+    to recover the CSA topk length (`valid_k = slice_len - skip`) and writes
+    the topk section at the slice head (SWA prefix occupies the tail). Prefill
+    path: equals `prefix_swa_count_per_token[t]` — 0 for pure prefill (no prior
+    chunk), or the `< chunk_start` portion of the SWA window for chunked
+    prefill (prefill keeps the SWA prefix at the head). CG-padded tail slots:
+    0 (kernel bails on `bid<0` so the value is irrelevant)."""
 
     # ----- Prefill-only paged-prefill index buffers (set in `_build_paged_prefill_meta`) -----
     # Two-source paged_prefill kernel reads:
@@ -595,11 +598,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         standard MHA path uses.
         """
         # Local imports to avoid circular dependency at module load time.
-        from atom.models.deepseek_v4 import (
-            Compressor as _V4Compressor,
-            DeepseekV4Attention as _V4Attention,
-            Indexer as _V4Indexer,
-        )
+        from atom.models.deepseek_v4 import Compressor as _V4Compressor
+        from atom.models.deepseek_v4 import DeepseekV4Attention as _V4Attention
+        from atom.models.deepseek_v4 import Indexer as _V4Indexer
 
         runner = self.model_runner
         num_slots = self.model_runner.max_per_req_cache_slots
@@ -1104,11 +1105,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         var["positions"].np[:sum_scheduled_tokens] = positions_np
 
-        cu_seqlens_q_np = np.arange(
-            0, (scheduled_bs + 1) * max_seqlen_q, max_seqlen_q, dtype=np.int32
-        )
-        var["cu_seqlens_q"].np[: scheduled_bs + 1] = cu_seqlens_q_np
-
         var["context_lens"].np[:scheduled_bs] = context_lens_np
 
         # Inline block_tables CPU fill (H2D deferred to prep_stream).
@@ -1130,7 +1126,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         prep_stream.wait_stream(current_stream)
         with torch.cuda.stream(prep_stream):
             positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
-            cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(scheduled_bs + 1)
+            cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(bs + 1)
             context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
             block_tables_gpu = var["block_tables"].copy_to_gpu(scheduled_bs)
             state_slot_gpu = ss_buf.copy_to_gpu(scheduled_bs)
@@ -1572,17 +1568,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         Writes into stable forward_vars buffers (attn_metadata fields are
         the V4-namespaced counterparts on `AttentionMetaData_DSV4`):
           - kv_indices_swa : per-token SWA paged offsets, ragged-packed
-          - kv_indices_csa : SWA prefix written here; CSA compress section
-                             left UNINITIALIZED — V4Attention.forward fills
-                             it per-layer via csa_translate_pack (Phase C)
-          - kv_indices_hca : SWA prefix + HCA compress section, both fully
-                             written (HCA is layer-invariant)
+          - kv_indices_csa : SWA prefix at slice TAIL; CSA compress section
+                             (slice head) left UNINITIALIZED — V4Attention.
+                             forward fills it per-layer via csa_translate_pack
+                             (Phase C)
+          - kv_indices_hca : HCA compress section (head) + SWA prefix (tail),
+                             both fully written (HCA is layer-invariant)
           - kv_indptr_{swa,csa,hca} : 3 ragged cumsums. Padded tail repeats
                              last value → kv_len=0 sentinel for CG-padded slots.
-          - skip_prefix_len_csa : per-token actual_swa_count (offset where
-                             csa_translate_pack starts writing CSA topk
-                             within each token's region). Matches prefill
-                             semantics (where it equals prefix_swa_count[t]).
+          - skip_prefix_len_csa : per-token SWA prefix length (the tail
+                             segment); csa_translate_pack uses it to recover
+                             the CSA topk length valid_k = slice_len - skip.
+                             Decode derives it inline from positions.
 
         Reuses (built earlier in `_attach_v4_per_fwd_meta`):
           - batch_id_per_token : single per-token mapping (with -1 sentinel)
@@ -1709,19 +1706,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             entry_offsets = np.arange(total_hca_entries, dtype=np.int32) - np.repeat(
                 cu_n_h[:T], n_h_per_token
             )
-            # HCA compress section starts at `actual_swa_count[t]` (was `win`
-            # under the old uniform layout) — ragged-packed offset matches
-            # what the kernel writes for the SWA prefix segment.
-            write_pos = (
-                hca_indptr_np[token_indices]
-                + actual_swa_count_np[token_indices]
-                + entry_offsets
-            )
+            # HCA compress section occupies the slice HEAD (offset 0); the SWA
+            # prefix segment sits at the tail, written below by
+            # write_v4_paged_decode_indices.
+            write_pos = hca_indptr_np[token_indices] + entry_offsets
             bid_expanded = batch_id_per_token_np[token_indices]
             hca_indices_np[write_pos] = (
                 swa_pages + block_tables_np_full[bid_expanded, entry_offsets]
             ).astype(np.int32)
-        # Stage to GPU (HCA compress tail; window prefix scattered below).
+        # Stage to GPU (HCA compress section at head; SWA prefix scattered below).
         hca_indices_gpu = self._stage("v4_kv_indices_hca", hca_indices_np)
 
         # ----- Write SWA / CSA / HCA window-prefix paged offsets (1 kernel) -----

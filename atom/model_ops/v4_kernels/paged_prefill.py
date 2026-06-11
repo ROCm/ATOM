@@ -369,22 +369,24 @@ def sparse_attn_v4_paged_prefill(
     Returns:
       out: [T, H, D] same dtype as q.
     """
-    # Backend selection: OPUS (gfx950) is the default; set
-    # `ATOM_FORCE_ATTN_TRITON=1` to fall back to the Triton kernel. When the
-    # OPUS module isn't importable on this build, we silently use Triton.
-    if envs.ATOM_FORCE_ATTN_TRITON or not _HAS_OPUS:
-        return _sparse_attn_v4_paged_prefill_triton(
-            q,
-            unified_kv,
-            kv_indices_prefix,
-            kv_indptr_prefix,
-            kv,
-            kv_indices_extend,
-            kv_indptr_extend,
-            attn_sink,
-            softmax_scale,
-        )
-    return pa_sparse_prefill_opus(
+    # Backend selection: prefer OPUS when available; fall back to Triton on
+    # import failure, env override, or runtime error (e.g. unsupported GPU).
+    if not envs.ATOM_FORCE_ATTN_TRITON and _HAS_OPUS:
+        try:
+            return pa_sparse_prefill_opus(
+                q,
+                unified_kv,
+                kv_indices_prefix,
+                kv_indptr_prefix,
+                kv,
+                kv_indices_extend,
+                kv_indptr_extend,
+                attn_sink,
+                softmax_scale,
+            )
+        except RuntimeError:
+            pass
+    return _sparse_attn_v4_paged_prefill_triton(
         q,
         unified_kv,
         kv_indices_prefix,

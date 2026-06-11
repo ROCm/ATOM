@@ -953,6 +953,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.handshake_port = get_open_port()
+        self.base_handshake_port = kv_transfer_config.get(
+            "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
+        )
         self.engine_id = "None"
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.parallel_config.data_parallel_size
@@ -1049,6 +1052,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "remote_engine_id": self.engine_id,
             "remote_host": self.host_ip,
             "remote_port": self.handshake_port,
+            "remote_handshake_port": self.base_handshake_port,
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
             "transfer_id": seq.id,

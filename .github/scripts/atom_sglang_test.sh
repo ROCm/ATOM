@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # Usage:
+#   .github/scripts/atom_sglang_test.sh start
 #   .github/scripts/atom_sglang_test.sh launch
 #   .github/scripts/atom_sglang_test.sh accuracy
 #
@@ -28,8 +29,8 @@ set -euo pipefail
 #   LM_EVAL_NUM_CONCURRENT
 
 TYPE=${1:-launch}
-if [[ "${TYPE}" != "launch" && "${TYPE}" != "accuracy" ]]; then
-  echo "Invalid TYPE: ${TYPE}. Expected: launch or accuracy"
+if [[ "${TYPE}" != "start" && "${TYPE}" != "launch" && "${TYPE}" != "accuracy" ]]; then
+  echo "Invalid TYPE: ${TYPE}. Expected: start, launch, or accuracy"
   exit 2
 fi
 
@@ -144,6 +145,7 @@ stop_server() {
 }
 
 launch_server() {
+  local wait_for_ready="${1:-1}"
   local resolved_model_path
   resolved_model_path=$(resolve_model_path "${MODEL_PATH}")
 
@@ -210,7 +212,9 @@ PY
   echo $! > "${SGLANG_PID_FILE}"
   echo "Server PID: $(cat "${SGLANG_PID_FILE}")"
 
-  wait_server_ready
+  if [[ "${wait_for_ready}" == "1" ]]; then
+    wait_server_ready
+  fi
 }
 
 run_accuracy() {
@@ -330,7 +334,7 @@ PY
 }
 
 cleanup_on_exit() {
-  if [[ "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ]]; then
+  if [[ "${TYPE}" == "start" || ( "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ) ]]; then
     echo "Keeping SGLang server alive for follow-up steps."
     return 0
   fi
@@ -339,7 +343,9 @@ cleanup_on_exit() {
 
 trap 'cleanup_on_exit' EXIT
 
-if [[ "${TYPE}" == "launch" ]]; then
+if [[ "${TYPE}" == "start" ]]; then
+  launch_server "0"
+elif [[ "${TYPE}" == "launch" ]]; then
   launch_server
 else
   launch_server

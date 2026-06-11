@@ -89,7 +89,7 @@ from atom.utils.custom_register import direct_register_custom_op
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.plugin.attention_mla_sparse import (
+from atom.plugin.vllm.attention.layer_sparse_mla import (
     IndexerDecoratorForPluginMode,
     DeepseekV32IndexerCacheDecoratorForPluginMode,
 )
@@ -167,6 +167,31 @@ def _can_fuse_indexer_wk_weights_proj(
         ):
             return False
     return True
+
+
+def _extract_layer_index_from_prefix(prefix: str) -> int:
+    for part in reversed(prefix.split(".")):
+        if part.isdigit():
+            return int(part)
+    return 0
+
+
+def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
+    if not getattr(config, "use_index_cache", False):
+        return False
+
+    layer_id = _extract_layer_index_from_prefix(prefix)
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is not None:
+        return (
+            0 <= layer_id < len(index_topk_pattern)
+            and index_topk_pattern[layer_id] == "S"
+        )
+
+    index_topk_freq = int(getattr(config, "index_topk_freq", 1))
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    return max(layer_id - 1, 0) % index_topk_freq != 0
 
 
 def _fuse_rmsnorm_fp4_quant_fake(
@@ -870,9 +895,15 @@ class DeepseekV2MoE(nn.Module):
         self._use_dual_stream = False
         self.alt_stream = alt_stream
         self.prefix = prefix
+        self.is_rocm_aiter_fusion_shared_expert_enabled = (
+            is_rocm_aiter_fusion_shared_expert_enabled(
+                shared_expert_prefix=f"{prefix}.shared_experts",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
+        )
 
         if config.n_shared_experts is not None:
-            if not is_rocm_aiter_fusion_shared_expert_enabled():
+            if not self.is_rocm_aiter_fusion_shared_expert_enabled:
                 tbo_active = get_current_atom_config().enable_tbo
                 if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                     self._use_dual_stream = True
@@ -945,7 +976,7 @@ class DeepseekV2MoE(nn.Module):
         shared_output = None
         if (
             self.n_shared_experts is not None
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             shared_output = self.shared_experts(hidden_states)
 
@@ -1252,19 +1283,40 @@ def _dequant_fp8_block_to_bf16(
     scale: torch.Tensor,
     block_size: int = 128,
 ) -> torch.Tensor:
-    """Dequantize block-scaled FP8 weights to BF16 for BF16-only fused GEMMs."""
+    """Dequantize FP8 wk weights to BF16 for BF16-only fused GEMMs.
+
+    DeepSeek-V3.2 stores indexer.wk with block scales, while some PTPC
+    quantized checkpoints store a per-output-channel scale vector.
+    """
     out_dim, in_dim = weight_fp8.shape
+    scale = scale.float()
+    if scale.dim() == 1:
+        if scale.numel() != out_dim:
+            raise ValueError(
+                "FP8 per-channel dequant expects one scale per output row, "
+                f"got scale {tuple(scale.shape)} for weight {tuple(weight_fp8.shape)}"
+            )
+        return (weight_fp8.float() * scale[:, None]).bfloat16()
+    if scale.dim() == 2 and tuple(scale.shape) == (out_dim, 1):
+        return (weight_fp8.float() * scale).bfloat16()
+
     if out_dim % block_size != 0 or in_dim % block_size != 0:
         raise ValueError(
             "FP8 block dequant expects dimensions divisible by "
             f"{block_size}, got {tuple(weight_fp8.shape)}"
+        )
+    expected_scale_shape = (out_dim // block_size, in_dim // block_size)
+    if tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "FP8 block dequant scale shape mismatch: expected "
+            f"{expected_scale_shape}, got {tuple(scale.shape)} for weight "
+            f"{tuple(weight_fp8.shape)}"
         )
     weight = (
         weight_fp8.unflatten(0, (-1, block_size))
         .unflatten(-1, (-1, block_size))
         .float()
     )
-    scale = scale.float()
     return (weight * scale[:, None, :, None]).flatten(2, 3).flatten(0, 1).bfloat16()
 
 
@@ -1288,9 +1340,9 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
             quant_config=None,
             prefix=prefix,
         )
-        # Checkpoints may store indexer.wk as FP8 plus weight_scale_inv.  The
-        # fused GEMM runs in BF16, so this parameter only receives the scale
-        # during loading and is not consumed in forward.
+        # Checkpoints may store indexer.wk as FP8 plus block or per-channel
+        # scales. The fused GEMM runs in BF16, so this parameter only helps
+        # collect the scale during loading and is not consumed in forward.
         self.weight_scale = atom_parameter(
             torch.empty(
                 ((head_dim + 127) // 128, (hidden_size + 127) // 128),
@@ -1323,8 +1375,9 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
     ):
         if param is self.weight_scale:
             if loaded_shard_id == 0:
-                param.weight_loader_process(param.data, loaded_weight)
-                self._wk_pending_scale = param.data.detach().clone()
+                if param.data.shape == loaded_weight.shape:
+                    param.weight_loader_process(param.data, loaded_weight)
+                self._wk_pending_scale = loaded_weight.detach().clone()
                 self._maybe_load_pending_wk()
             return
 
@@ -1575,8 +1628,20 @@ class DeepseekV2MLAAttention(nn.Module):
         if layer_quant_dtype == dtypes.fp4x2:
             if not use_triton_gemm():
                 source_quant_dtype = None
-                quant_config = None
-                base_quant_config = None
+                # Full-MXFP4 V2 checkpoints store attention weights/scales on disk.
+                # Keep their quant_config only for this narrow static Quark path.
+                q_a_proj_quant_config = quant_config.get_layer_quant_config(
+                    f"{prefix}.{q_a_proj_name}"
+                )
+                is_quark_static_mxfp4 = (
+                    q_a_proj_quant_config.quant_method == "quark"
+                    and layer_quant_type == QuantType.per_1x32
+                )
+                if is_quark_static_mxfp4:
+                    base_quant_config = quant_config
+                else:
+                    quant_config = None
+                    base_quant_config = None
             else:
                 source_quant_dtype = torch.bfloat16
                 base_quant_config = None
@@ -1689,8 +1754,10 @@ class DeepseekV2MLAAttention(nn.Module):
             self.scaling = self.scaling * mscale * mscale
 
         self.is_v32 = hasattr(config, "index_topk")
+        self.skip_topk = False
 
         if self.is_v32:
+            self.skip_topk = _should_skip_index_topk(config, prefix)
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
@@ -1753,7 +1820,9 @@ class DeepseekV2MLAAttention(nn.Module):
             prefix=prefix,
         )
 
-        # When ATOM_ENABLE_DS_QKNORM_QUANT_FUSION is turned on, self.fuse_qknorm_quant is turned on only if FP8 or (use_triton_gemm() and FP4),
+        # Enable q/k RMSNorm + q quant fusion for FP8 and FP4. The larger
+        # qkv_a_proj + reduce + RMSNorm + quant fusion remains gated by
+        # use_triton_gemm() in forward(), because that path depends on Triton GEMM.
         self.prefix = prefix
         self.quant_dtype = layer_quant_dtype
         self.qknorm_quant_type = layer_quant_type_value
@@ -1761,9 +1830,7 @@ class DeepseekV2MLAAttention(nn.Module):
         # always fuse qknorm
         self.fuse_qknorm = ENABLE_DS_QKNORM_FUSION
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
-            if layer_quant_dtype == dtypes.fp8 or (
-                layer_quant_dtype == dtypes.fp4x2 and use_triton_gemm()
-            ):
+            if layer_quant_dtype in (dtypes.fp8, dtypes.fp4x2):
                 self.fuse_qknorm_quant = True
 
     def forward(
@@ -1843,7 +1910,7 @@ class DeepseekV2MLAAttention(nn.Module):
         if not self.fuse_qknorm_quant and not self.fuse_qknorm:
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
-        if self.is_v32 and self.indexer is not None:
+        if self.is_v32 and self.indexer is not None and not self.skip_topk:
             self.indexer(
                 hidden_states,
                 hidden_states_or_q_c,
@@ -2173,11 +2240,7 @@ class DeepseekV2Model(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
-                else 0
-            ),
+            + (self.config.n_shared_experts or 0),
         )
 
 

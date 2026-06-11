@@ -1,14 +1,9 @@
-from .paged_attention import PagedAttention
-from atom.plugin.sglang.attention_backend.radix_attention import RadixAttention
+from .base_attention import Attention
 
-# This global class is used to construct the attention op in model,
-# it can be assigned to different attention ops.
-# By default, PagedAttention is used.
-# For sglang, RadixAttention will be assigned to Attention
-Attention = PagedAttention
+# This frontend class is used to construct the attention op in model files.
+# It dispatches to the mode-specific attention implementation at construction
+# time instead of mutating this module-level symbol during plugin init.
 
 __all__ = [
     "Attention",
-    "PagedAttention",
-    "RadixAttention",
 ]
