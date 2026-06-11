@@ -282,10 +282,6 @@ jobs:
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
-      # Build OOT on atom-mi355-8gpu.predownload (DeepSeek-V4-Pro TP8) can exhaust
-      # $HOME/.docker/buildx; use shared disk for Docker *client* config only on
-      # that label. Example failure without this split:
-      # https://github.com/ROCm/ATOM/actions/runs/27260403328/job/80537699993?pr=1154
       - name: Configure Docker client config path
         run: |
           if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
