@@ -3,10 +3,6 @@ from typing import TYPE_CHECKING, Optional
 import aiter
 import torch
 from aiter import dtypes, fused_qk_norm_rope_cache_quant_shuffle
-from aiter.dist.communication_op import (
-    tensor_model_parallel_fused_qknorm_allreduce_rope_cache_quant,
-)
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from atom.config import get_current_atom_config
@@ -139,20 +135,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             per_layer_sliding_window if per_layer_sliding_window is not None else -1
         )
         self.rotary_emb = rotary_emb
-        if rotary_emb is not None and hasattr(rotary_emb, "cos_cache"):
-            cos = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
-            sin = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
-            self.register_buffer(
-                "qknorm_rope_cos_sin_cache",
-                torch.cat([cos, sin], dim=-1).contiguous(),
-                persistent=False,
-            )
-        else:
-            self.register_buffer(
-                "qknorm_rope_cos_sin_cache",
-                None,
-                persistent=False,
-            )
         self.q_norm = q_norm
         self.k_norm = k_norm
         self.use_flash_layout = False
@@ -303,48 +285,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
                 v = v.view(-1, self.num_kv_heads, self.head_dim)
             else:
-                if (
-                    self.model_type == "minimax_m2"
-                    and qkv is not None
-                    and self.kv_cache_dtype == "fp8"
-                    and k_scale is not None
-                    and v_scale is not None
-                    and get_tensor_model_parallel_world_size() > 1
-                ):
-                    cos_sin_cache = self.qknorm_rope_cos_sin_cache
-                    if cos_sin_cache is None:
-                        raise RuntimeError(
-                            "MiniMax M2 fused qknorm rope cache requires packed cos/sin cache"
-                        )
-                    if (
-                        cos_sin_cache.dtype != qkv.dtype
-                        or cos_sin_cache.device != qkv.device
-                    ):
-                        cos_sin_cache = cos_sin_cache.to(
-                            device=qkv.device, dtype=qkv.dtype
-                        )
-                    q_flat, k_flat, v_flat = (
-                        tensor_model_parallel_fused_qknorm_allreduce_rope_cache_quant(
-                            qkv,
-                            self.q_norm.weight,
-                            self.k_norm.weight,
-                            cos_sin_cache,
-                            position,
-                            new_key_cache,
-                            new_value_cache,
-                            k_scale,
-                            v_scale,
-                            slot_mapping,
-                            self.head_dim,
-                            cos_sin_cache.shape[-1],
-                            self.q_norm.eps,
-                        )
-                    )
-                    q = q_flat.view(-1, self.num_heads, self.head_dim)
-                    k = k_flat.view(-1, self.num_kv_heads, self.head_dim)
-                    v = v_flat.view(-1, self.num_kv_heads, self.head_dim)
-                    return q, k, v, k_cache, v_cache, k_scale, v_scale
-
                 # Standard RMSNorm — use existing aiter kernel
                 fused_qk_norm_rope_cache_quant_shuffle(
                     q=q,
