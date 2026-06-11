@@ -286,6 +286,10 @@ jobs:
       - name: Clean up containers and workspace
         if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: |
+          echo "Ensure Docker client config dir for DeepSeek-V4-Pro"
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
+
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
           if [ -n "$containers" ]; then
@@ -348,17 +352,9 @@ jobs:
               echo "=== ATOM version AFTER installation ===" && pip show atom || true
           RUN pip show amd-aiter atom vllm torch triton mori || true
           EOF
-
-      - name: Ensure Docker client config dir
-        run: |
-          mkdir -p "$DOCKER_CONFIG"
-          chmod 700 "$DOCKER_CONFIG"
       
       - name: Build OOT image locally
         run: |
-          echo "DOCKER_CONFIG=${DOCKER_CONFIG:-<unset>}"
-          echo "Effective: ${DOCKER_CONFIG:-$HOME/.docker}"        
-      
           set -euo pipefail
           docker rmi "atom_oot_base:ci" || true
           docker rmi "atom_oot:ci" || true
