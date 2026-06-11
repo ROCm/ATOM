@@ -28,6 +28,7 @@ set -uo pipefail
 CONTAINER="${1:-}"
 ENGINE="${2:-docker}"
 RUNNER_HINT="${3:-${RUNNER_HINT:-}}"
+COLLECT_VERBOSE_GPU_INFO="${COLLECT_VERBOSE_GPU_INFO:-0}"
 
 if [ -n "$CONTAINER" ]; then
     exec_in() { "$ENGINE" exec "$CONTAINER" bash -lc "$1" 2>/dev/null; }
@@ -119,43 +120,80 @@ GPU_VRAM_GB="${GPU_VRAM_GB:-0}"
 ROCM_VERSION=$(exec_in 'cat /opt/rocm/.info/version' | trim)
 ROCM_VERSION="${ROCM_VERSION:-unknown}"
 
-print_probe "ROCm version files" '
-    set +e
-    cat /opt/rocm/.info/version 2>/dev/null || true
-    cat /opt/rocm/.info/version-dev 2>/dev/null || true
-    cat /opt/rocm/.info/version-utils 2>/dev/null || true
-'
+if [ "$COLLECT_VERBOSE_GPU_INFO" = "1" ]; then
+    print_probe "ROCm version files" '
+        set +e
+        cat /opt/rocm/.info/version 2>/dev/null || true
+        cat /opt/rocm/.info/version-dev 2>/dev/null || true
+        cat /opt/rocm/.info/version-utils 2>/dev/null || true
+    '
 
-print_probe "rocminfo" '
-    command -v rocminfo >/dev/null 2>&1 || { echo "rocminfo not found"; exit 127; }
-    rocminfo
-'
+    print_probe "PyTorch HIP device mapping" '
+        python3 - <<'"'"'PY'"'"'
+import os
 
-print_probe "rocm-smi" '
-    command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
-    rocm-smi
-'
+keys = [
+    "HIP_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "LOCAL_RANK",
+    "RANK",
+    "WORLD_SIZE",
+]
+for key in keys:
+    print(f"{key}={os.environ.get(key)}")
 
-print_probe "rocm-smi product and driver details" '
-    command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
-    rocm-smi --showproductname --showdriverversion --showvbios
-'
+try:
+    import torch
+except Exception as exc:
+    print(f"torch import failed: {type(exc).__name__}: {exc}")
+    raise SystemExit(0)
 
-print_probe "rocm-smi topology" '
-    command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
-    rocm-smi --showtopo
-'
+print(f"torch.version.hip={getattr(torch.version, '"'"'hip'"'"', None)}")
+print(f"torch.cuda.is_available={torch.cuda.is_available()}")
+try:
+    count = torch.cuda.device_count()
+    print(f"torch.cuda.device_count={count}")
+    for index in range(count):
+        print(f"device[{index}]={torch.cuda.get_device_name(index)}")
+except Exception as exc:
+    print(f"torch cuda probe failed: {type(exc).__name__}: {exc}")
+PY
+    '
 
-print_probe "rocm-smi memory and processes" '
-    command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
-    rocm-smi --showmemuse
-    rocm-smi --showpids
-    rocm-smi --showpidgpus
-'
+    print_probe "rocminfo" '
+        command -v rocminfo >/dev/null 2>&1 || { echo "rocminfo not found"; exit 127; }
+        rocminfo
+    '
 
-print_probe "ROCm device nodes" '
-    ls -l /dev/kfd /dev/dri 2>/dev/null || true
-'
+    print_probe "rocm-smi" '
+        command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
+        rocm-smi
+    '
+
+    print_probe "rocm-smi product and driver details" '
+        command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
+        rocm-smi --showproductname || true
+        rocm-smi --showdriverversion || true
+        rocm-smi --showvbios || true
+    '
+
+    print_probe "rocm-smi topology" '
+        command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
+        rocm-smi --showtopo || true
+    '
+
+    print_probe "rocm-smi memory and processes" '
+        command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
+        rocm-smi --showmemuse || true
+        rocm-smi --showpids || true
+        rocm-smi --showpidgpus || true
+    '
+
+    print_probe "ROCm device nodes" '
+        ls -l /dev/kfd /dev/dri 2>/dev/null || true
+    '
+fi
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
     {
