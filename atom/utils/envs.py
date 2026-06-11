@@ -35,6 +35,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    # --- Debug: dump decode MLA inputs/outputs for offline unit testing ---
+    # When enabled, the AITER decode-MLA path saves the exact mla_decode_fwd
+    # inputs (compacted KV) + output to ATOM_DUMP_MLA_DECODE_DIR, one .pt per
+    # (layer, first decode step, rank). Use with --enforce-eager and
+    # ATOM_USE_TRITON_MLA=0 so the python dump code actually runs.
+    "ATOM_DUMP_MLA_DECODE": lambda: os.getenv("ATOM_DUMP_MLA_DECODE", "0") == "1",
+    "ATOM_DUMP_MLA_DECODE_DIR": lambda: os.getenv(
+        "ATOM_DUMP_MLA_DECODE_DIR", os.path.expanduser("~/mla_decode_dump")
+    ),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
