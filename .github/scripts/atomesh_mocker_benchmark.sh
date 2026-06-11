@@ -161,6 +161,7 @@ python3 - <<'PY' \
   "${BENCHMARK_NAME}" "${PREFILL_WORKERS}" "${DECODE_WORKERS}"
 from datetime import UTC, datetime
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -250,18 +251,45 @@ payload = {
 }
 Path(result_json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-entries = [
-    {
-        "name": f"Atomesh-Mocker::{benchmark_name} request throughput",
-        "unit": "req/s",
-        "value": round(request_throughput, 2),
-        "extra": (
-            f"cell={benchmark_name} router={router_mode} policy={policy} "
-            f"workers={workers} prefill={prefill_workers} decode={decode_workers} "
-            f"producers={producer_threads} consumers={consumer_threads}"
-        ),
-    }
+run_url = ""
+server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+repository = os.environ.get("GITHUB_REPOSITORY")
+run_id = os.environ.get("GITHUB_RUN_ID")
+if repository and run_id:
+    run_url = f"{server_url}/{repository}/actions/runs/{run_id}"
+
+extra_parts = [
+    f"cell={benchmark_name}",
+    f"router={router_mode}",
+    f"policy={policy}",
+    f"workers={workers}",
+    f"prefill={prefill_workers}",
+    f"decode={decode_workers}",
+    f"producers={producer_threads}",
+    f"consumers={consumer_threads}",
+    f"duration_seconds={duration_seconds}",
+    f"request_number={success}",
 ]
+if run_url:
+    extra_parts.append(f"Run: {run_url}")
+extra = " ".join(extra_parts)
+
+entries = []
+for metric_name, unit, value in [
+    ("request throughput", "req/s", request_throughput),
+    ("avg latency", "ms", avg_ms),
+    ("p99 latency", "ms", p99_ms),
+    ("p999 latency", "ms", p999_ms),
+    ("failed requests", "count", failed),
+]:
+    entries.append(
+        {
+            "name": f"Atomesh-Mocker::{benchmark_name} {metric_name}",
+            "unit": unit,
+            "value": round(float(value), 2),
+            "extra": extra,
+        }
+    )
 Path(action_json).write_text(json.dumps(entries, indent=2), encoding="utf-8")
 
 summary = f"""### Atomesh Mocker Benchmark: {benchmark_name}
