@@ -229,7 +229,7 @@ class MiniMaxM2Attention(nn.Module):
             kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
             use_mla=False,
-            rotary_emb=self.rotary_emb,
+            rotary_emb=None,
             prefix=f"{prefix}.attn",
         )
 
