@@ -69,6 +69,23 @@ def is_rocm_aiter_fp4bmm_enabled() -> bool:
     return envs.ATOM_USE_TRITON_MXFP4_BMM
 
 
+def _maybe_view_mxfp4_weight_for_gather(
+    kv_b_proj: nn.Module, weight: torch.Tensor
+) -> torch.Tensor:
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is None or weight.dtype != torch.uint8:
+        return weight
+
+    layer_quant_config = getattr(kv_b_proj, "layer_quant_config", None)
+    is_mxfp4 = getattr(kv_b_proj, "params_dtype", None) == dtypes.fp4x2 or (
+        layer_quant_config is not None
+        and getattr(layer_quant_config, "quant_dtype", None) == dtypes.fp4x2
+    )
+    if is_mxfp4:
+        return weight.view(fp4_dtype)
+    return weight
+
+
 if is_rocm_aiter_fp4bmm_enabled():
     # from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import  batched_gemm_afp4wfp4_pre_quant
     from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
@@ -357,17 +374,13 @@ class MLAAttention(nn.Module):
             device=prefill_q.device,
             dtype=self.dtype,
         )
-        gather_kv_b_proj(
+        self._gather_cached_kv_b_proj(
             kv_cache,
-            self._k_scale,
             attn_metadata.kv_indptr,
             attn_metadata.kv_indices,
             attn_metadata.cu_seqlens_k,
-            self.kv_b_proj.weight,
-            self.kv_b_proj.weight_scale,
             k_full,
             v_full,
-            weight_preshuffle=getattr(self.kv_b_proj.weight, "is_shuffled", False),
         )
         output = flash_attn_varlen_func(
             q=prefill_q,
@@ -383,6 +396,29 @@ class MLAAttention(nn.Module):
             causal=True,
         )
         return self.o_proj(output.flatten(start_dim=-2))
+
+    def _gather_cached_kv_b_proj(
+        self,
+        kv_cache: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+    ) -> None:
+        weight = self.kv_b_proj.weight
+        gather_kv_b_proj(
+            kv_cache,
+            self._k_scale,
+            kv_indptr,
+            kv_indices,
+            cu_seqlens_k,
+            _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight),
+            getattr(self.kv_b_proj, "weight_scale", None),
+            k_out,
+            v_out,
+            weight_preshuffle=getattr(weight, "is_shuffled", False),
+        )
 
     def _forward_prefill_cached_chunked(
         self,
@@ -403,9 +439,9 @@ class MLAAttention(nn.Module):
 
         Step 1 — new-tokens self-attention (causal). New k/v come from
         kv_b_proj on the input latent kv_c_normed; cu_seqlens_k = cu_seqlens_q.
-        Step 2 — per chunk c of the cached prefix: gather_kv_b_proj into the
-        shared workspace, flash_attn(causal=False, return_lse), merge into a
-        running (chunked_out, chunked_lse).
+        Step 2 — per chunk c of the cached prefix: gather expanded K/V into
+        the shared workspace, flash_attn(causal=False, return_lse), merge
+        into a running (chunked_out, chunked_lse).
         Step 3 — final merge of (chunked_out, chunked_lse) with (new_out,
         new_lse). The cached prefix is the "prefix" side (smaller token
         positions), new tokens are the "suffix".
@@ -429,8 +465,6 @@ class MLAAttention(nn.Module):
                 attn_metadata.total_kv,
                 int(attn_metadata.cu_seqlens_q[-1].item()),
             )
-
-        weight_preshuffle = getattr(self.kv_b_proj.weight, "is_shuffled", False)
 
         # Step 1: new-tokens self-attn via kv_b_proj on the latent.
         if k_rope_new.dim() == 2:
@@ -470,17 +504,13 @@ class MLAAttention(nn.Module):
                 continue
             k_chunk = k_workspace[:n_tok]
             v_chunk = v_workspace[:n_tok]
-            gather_kv_b_proj(
+            self._gather_cached_kv_b_proj(
                 kv_cache,
-                self._k_scale,
                 chunk_meta.kv_indptr[c],
                 chunk_meta.kv_indices[c],
                 chunk_meta.cu_seqlens_k[c],
-                self.kv_b_proj.weight,
-                self.kv_b_proj.weight_scale,
                 k_chunk,
                 v_chunk,
-                weight_preshuffle=weight_preshuffle,
             )
             suf_out, suf_lse = flash_attn_varlen_func(
                 q=prefill_q,
