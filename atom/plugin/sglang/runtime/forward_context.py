@@ -141,8 +141,16 @@ def _set_atom_forward_context(
             maybe_get_proxy_pool_from_sglang_backend,
         )
 
+        try:
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            attn_metadata = getattr(backend, "atom_v4_graph_metadata", None)
+        except Exception:
+            attn_metadata = None
+
         proxy_pool, req_to_token_pool = maybe_get_proxy_pool_from_sglang_backend()
-        if getattr(proxy_pool, "is_atom_v4_proxy_pool", False):
+        if attn_metadata is None and getattr(proxy_pool, "is_atom_v4_proxy_pool", False):
             attn_metadata = build_atom_v4_attention_metadata_from_sglang(
                 forward_batch,
                 positions,

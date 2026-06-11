@@ -24,7 +24,7 @@ export SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false
 export SGLANG_ROCM_USE_MULTI_STREAM=false
 export SGLANG_DSV4_FP4_EXPERTS=true
 
-model_path=/workspace/shared/data/amd_int/models/deepseek-ai/DeepSeek-V4-Pro-FP8
+model_path=/workspace/shared/data/amd_int/models/deepseek-ai/DeepSeek-V4-Pro
 
 NUM_GPU=8
 if [ $NUM_GPU -eq 8 ]; then
@@ -35,8 +35,8 @@ elif [ $NUM_GPU -eq 4 ]; then
     TP_SIZE=4
 fi
 
-export ATOM_SGLANG_V4_DEBUG=1
-export PYTHONPATH=/home/qichu_qle/zhiwei/dsv4/sglang/python:/home/qichu_qle/zhiwei/dsv4/ATOM
+export ATOM_SGLANG_V4_DEBUG=${ATOM_SGLANG_V4_DEBUG:-0}
+export PYTHONPATH=/home/qichu_qle/zhiwei/dsv4/sglang/python:/home/qichu_qle/zhiwei/dsv4/atom-main
 export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
 
 TORCHINDUCTOR_COMPILE_THREADS=128 \
@@ -54,7 +54,6 @@ python3 -m sglang.launch_server \
     --page-size 256 \
     --attention-backend dsv4 \
     --disable-radix-cache \
-    --disable-cuda-graph \
     --disable-shared-experts-fusion \
     --tool-call-parser deepseekv4 \
     --reasoning-parser deepseek-v4 \

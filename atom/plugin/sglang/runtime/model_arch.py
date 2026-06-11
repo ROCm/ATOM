@@ -1,4 +1,4 @@
-atom/plugin/sglang/runtime/model_arch.py"""SGLang plugin model adapter registry."""
+"""SGLang plugin model adapter registry."""
 
 from __future__ import annotations
 
