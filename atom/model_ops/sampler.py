@@ -109,14 +109,27 @@ class Sampler(nn.Module):
     ) -> torch.Tensor:
         """Temperature-based Gumbel-max sampling.
 
-        ATOM_GFX1250_WORKAROUND (ported from ce1809f8473f): aiter HIP
-        mixed_sample_outer_exponential faults on gfx1250 (opus::gmem
-        buffer-resource issue). Use torch-native equivalent. Simplification:
-        always do greedy argmax for now; bring-up uses temperature=0.
-        Revisit when non-greedy sampling is needed.
+        When ``needs_independent_noise`` is True the per-row exponential noise
+        tensor is freshly drawn with shape ``(num_tokens, vocab_size)`` so that
+        fan-out siblings produced by ``SamplingParams.n > 1`` diverge instead
+        of collapsing onto the same token when they share logits. Otherwise we
+        keep the cached ``(1, vocab_size)`` row broadcasted across the batch,
+        which preserves the existing run-to-run determinism optimization.
         """
-        del needs_independent_noise  # noqa: F841 — unused on the workaround path
-        return logits.argmax(dim=-1).to(torch.int)
+        num_tokens, vocab_size = logits.shape
+        sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
+        if needs_independent_noise:
+            exponential = torch.empty(
+                (num_tokens, vocab_size), dtype=torch.float, device=logits.device
+            ).exponential_(1)
+        else:
+            exponential = get_per_token_exponential(vocab_size, logits.device).expand(
+                num_tokens, vocab_size
+            )
+        mixed_sample_outer_exponential(
+            sampled_tokens, logits, exponential, temperatures, eps=self.eps
+        )
+        return sampled_tokens
 
     def _topk_topp_sample(
         self,

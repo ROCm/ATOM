@@ -1154,23 +1154,6 @@ class Config:
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_dp_attention)
 
-        # ATOM_DEPTH_AWARE_COMPILE_CACHE: the piecewise torch.compile graph's structure
-        # (and its input count) depends on the model depth/shape. These
-        # are NOT covered by the vllm/compilation/parallel sub-hashes
-        # above, so without them a graph compiled for one num_hidden_layers
-        # is silently reused for another (e.g. a 7-layer debug copy of a
-        # 61-layer model), tripping IndexError in inductor
-        # copy_misaligned_inputs at warmup. Fold the structural HF fields
-        # into the cache key so each shape gets its own compiled-graph dir.
-        hf_config = getattr(self, "hf_config", None)
-        if hf_config is not None:
-            for _attr in (
-                "num_hidden_layers",
-                "first_k_dense_replace",
-                "num_nextn_predict_layers",
-            ):
-                factors.append(getattr(hf_config, _attr, None))
-
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
         ).hexdigest()[:10]

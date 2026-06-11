@@ -41,16 +41,6 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
 
-# ATOM_GFX1250_WORKAROUND (ported from ce1809f8473f): aiter's HIP
-# concat_and_cache_mla and fused_qk_rope_concat_and_cache_mla use opus::gmem
-# buffer-resource intrinsics that fault on gfx1250 ("Memory access fault on
-# (nil)") regardless of dtype. The call sites below swap them (plus the
-# preceding self.rotary_emb call) for aiter's Triton fused_qk_rope_cat_and_cache_mla
-# which lowers to plain global_load/global_store.
-from aiter.ops.triton.fusions.fused_kv_cache import (
-    fused_qk_rope_cat_and_cache_mla as _atom_triton_fused_rope_cat_and_cache_mla,
-)
-
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
 )
@@ -878,55 +868,21 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
-            prefill_q_proj = self.q_proj(q, x_scale=q_scale).view(
+            prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )
-            prefill_q_nope = prefill_q_proj[..., : self.qk_nope_head_dim]
-            prefill_q_pe = prefill_q_proj[..., self.qk_nope_head_dim :]
+            prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+            self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
-                # ATOM_GFX1250_WORKAROUND (ported from ce1809f8473f): aiter's HIP
-                # concat_and_cache_mla faults on gfx1250. Use the aiter Triton
-                # fused RoPE+concat+cache kernel, which also subsumes the
-                # standalone rotary_emb call.
-                #
-                # k_pe rotation: the HIP path rotated k_rope IN PLACE via
-                # self.rotary_emb(positions, prefill_q_pe, k_rope) before the
-                # cache write, so downstream consumers (_forward_prefill_mha,
-                # _forward_prefill_cached_chunked) saw the rotated k_rope. The
-                # Triton kernel does NOT rotate the input k_pe in place — it
-                # returns the rotated copy as _k_pe_out. We must rebind k_rope
-                # to that copy so the new-tokens attention uses rotated k_pe
-                # against rotated q_pe. (The cached-prefix path reads from
-                # kv_cache, which already holds the rotated k_pe.)
-                _k_nope_3d = k_nope.unsqueeze(1) if k_nope.dim() == 2 else k_nope
-                _k_rope_3d = k_rope.unsqueeze(1) if k_rope.dim() == 2 else k_rope
-                # Return tuple order: (q_out, decode_q_pe_out, k_pe_out,
-                # q_nope_zeros_out). We want the third (rotated k_pe).
-                prefill_q, _decode_q_pe_out, _k_pe_out, _q_nope_zeros_out = (
-                    _atom_triton_fused_rope_cat_and_cache_mla(
-                        prefill_q_nope,
-                        prefill_q_pe,
-                        _k_nope_3d,
-                        _k_rope_3d,
-                        kv_cache,
-                        attn_metadata.slot_mapping.flatten(),
-                        positions,
-                        self.rotary_emb.cos_cache,
-                        self.rotary_emb.sin_cache,
-                        self._k_scale,
-                        is_neox=self.rotary_emb.is_neox_style,
-                        apply_scale=(self.kv_cache_dtype == "fp8"),
-                        q_out_dtype=prefill_q_proj.dtype,
-                    )
+                concat_and_cache_mla(
+                    k_nope,
+                    k_rope.squeeze(1),
+                    kv_cache,
+                    attn_metadata.slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
                 )
-                k_rope = _k_pe_out
-            else:
-                # No kv-cache write needed (e.g. dummy run); apply RoPE the
-                # old way so prefill_q has the rotated pe slice. rotary_emb
-                # rotates k_rope in place here, matching the HIP behaviour.
-                self.rotary_emb(positions, prefill_q_pe, k_rope)
-                prefill_q = prefill_q_proj
 
             if attn_metadata.has_cached:
                 chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
@@ -955,31 +911,23 @@ class MLAAttention(nn.Module):
                 device=q_nope.device,
             )
             if kv_cache.numel() > 0:
-                # ATOM_GFX1250_WORKAROUND (ported from ce1809f8473f): aiter's HIP
-                # fused_qk_rope_concat_and_cache_mla
-                # ('fuse_qk_rope_concat_and_cache_mla_per_head_kernel') faults
-                # inside captured cudagraphs on gfx1250 (opus::gmem
-                # buffer-resource issue). Swap to the equivalent aiter Triton
-                # kernel.
-                _kv_cache_v = kv_cache.view(
-                    kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                )
-                _k_nope_3d = k_nope.unsqueeze(1) if k_nope.dim() == 2 else k_nope
-                _k_rope_3d = k_rope.unsqueeze(1) if k_rope.dim() == 2 else k_rope
-                _atom_triton_fused_rope_cat_and_cache_mla(
+                fused_qk_rope_concat_and_cache_mla(
                     q_nope,
                     q_rope,
-                    _k_nope_3d,
-                    _k_rope_3d,
-                    _kv_cache_v,
+                    k_nope,
+                    k_rope,
+                    kv_cache.view(
+                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                    ),
+                    q_out,
                     attn_metadata.slot_mapping,
+                    self._k_scale,
+                    self._q_scale,
                     positions,
                     self.rotary_emb.cos_cache,
                     self.rotary_emb.sin_cache,
-                    self._k_scale,
                     is_neox=self.rotary_emb.is_neox_style,
-                    apply_scale=(self.kv_cache_dtype == "fp8"),
-                    q_out=q_out,
+                    is_nope_first=True,
                 )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
