@@ -733,11 +733,21 @@ def load_model(
         if hasattr(module, "process_weights_after_loading"):
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
+        module_ppl = getattr(module, "process_weights_after_loading", None)
 
-        # when running plugin mode for sglang, don't do the post process here
-        # since sglang will call this func automatically after finishing loading
-        if isinstance(quant_method, QuantizeMethodBase) and not is_sglang():
-            quant_method.process_weights_after_loading(module)
+        if quant_method is not None and hasattr(
+            quant_method, "process_weights_after_loading"
+        ):
+            if isinstance(quant_method, QuantizeMethodBase):
+                if callable(module_ppl):
+                    module_ppl()
+                if not is_sglang():
+                    quant_method.process_weights_after_loading(module)
+            else:
+                quant_method.process_weights_after_loading(module)
+        elif callable(module_ppl):
+            module_ppl()
+
         if isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)
 

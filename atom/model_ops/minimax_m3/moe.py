@@ -6,8 +6,10 @@
 This module intentionally does not depend on ATOM's generic ``FusedMoE``.  It
 keeps the same checkpoint-facing parameter layout (``w13_weight`` and
 ``w2_weight``) so ATOM's existing expert weight mapping can load MiniMax-M3
-checkpoints, while the forward path uses the same vLLM bf16 MoE Triton helper
-kernels as the pure vLLM MiniMax-M3 implementation.
+checkpoints.
+
+Default forward is ``_forward_graph_safe``: routed w13 GEMV + ``swiglu_oai_split`` +
+routed w2 reduce (batch-invariant, cudagraph-friendly).
 """
 
 from __future__ import annotations
@@ -286,7 +288,7 @@ class MiniMaxM3Bf16Experts(nn.Module):
             scores_for_choice,
             self.top_k,
             dim=-1,
-            sorted=False,
+            sorted=True,
         ).indices
         topk_weights = routing_weights.gather(dim=-1, index=topk_ids)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
@@ -628,6 +630,128 @@ class MiniMaxM3Bf16Experts(nn.Module):
             BLOCK_I=block_i,
         )
         return output
+
+
+    def _apply_routed_w13_gemv(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        gate_up: torch.Tensor,
+    ) -> None:
+        """MiniMax per-route w13 GEMV (batch-invariant, cudagraph-safe)."""
+        n_tokens = hidden_states.shape[0]
+        top_k = topk_ids.shape[1]
+        hidden_size = self.hidden_size
+        two_intermediate_size = self.w13_weight.shape[1]
+        block_n = 64
+        block_k = 64
+        _routed_w13_kernel[
+            (n_tokens * top_k, triton.cdiv(two_intermediate_size, block_n))
+        ](
+            hidden_states,
+            self.w13_weight,
+            topk_ids,
+            gate_up,
+            hidden_size,
+            two_intermediate_size,
+            top_k,
+            hidden_states.stride(0),
+            hidden_states.stride(1),
+            self.w13_weight.stride(0),
+            self.w13_weight.stride(1),
+            self.w13_weight.stride(2),
+            topk_ids.stride(0),
+            topk_ids.stride(1),
+            gate_up.stride(0),
+            gate_up.stride(1),
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+        )
+
+    def _apply_routed_w2_reduce(
+        self,
+        activated: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """MiniMax per-route weighted w2 reduce (deterministic, cudagraph-safe)."""
+        n_tokens = output.shape[0]
+        top_k = topk_ids.shape[1]
+        hidden_size = self.hidden_size
+        intermediate_size = self.intermediate_size_per_partition
+        block_h = 64
+        block_i = 64
+        _routed_w2_reduce_kernel[(n_tokens, triton.cdiv(hidden_size, block_h))](
+            activated,
+            self.w2_weight,
+            topk_ids,
+            topk_weights,
+            output,
+            hidden_size,
+            intermediate_size,
+            top_k,
+            activated.stride(0),
+            activated.stride(1),
+            self.w2_weight.stride(0),
+            self.w2_weight.stride(1),
+            self.w2_weight.stride(2),
+            topk_ids.stride(0),
+            topk_ids.stride(1),
+            topk_weights.stride(0),
+            topk_weights.stride(1),
+            output.stride(0),
+            output.stride(1),
+            BLOCK_H=block_h,
+            BLOCK_I=block_i,
+        )
+
+    def _forward_routed_core(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Routed w13 GEMV + SwiGLU-OAI + routed w2 reduce."""
+        n_tokens = hidden_states.shape[0]
+        if not hidden_states.is_contiguous():
+            hidden_states = hidden_states.contiguous()
+        if topk_ids.dtype != torch.int32:
+            topk_ids = topk_ids.to(torch.int32)
+        topk_ids = topk_ids.contiguous()
+        topk_weights = topk_weights.contiguous()
+
+        top_k = topk_ids.shape[1]
+        two_intermediate_size = self.w13_weight.shape[1]
+
+        gate_up = torch.empty(
+            n_tokens * top_k,
+            two_intermediate_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        self._apply_routed_w13_gemv(hidden_states, topk_ids, gate_up)
+
+        activated = swiglu_oai_split(
+            gate_up,
+            alpha=self.swiglu_alpha,
+            beta=self.swiglu_beta,
+            limit=self.swiglu_limit,
+            out_dtype=hidden_states.dtype,
+        )
+
+        output = torch.empty_like(hidden_states)
+        self._apply_routed_w2_reduce(activated, topk_ids, topk_weights, output)
+        return output
+
+    # def _forward_graph_safe(
+    #     self,
+    #     hidden_states: torch.Tensor,
+    #     topk_weights: torch.Tensor,
+    #     topk_ids: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     """Default MoE: routed w13 + SwiGLU-OAI + routed w2 (batch-invariant)."""
+    #     return self._forward_routed_core(hidden_states, topk_weights, topk_ids)
 
     def forward_impl(
         self,
