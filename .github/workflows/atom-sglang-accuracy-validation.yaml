@@ -14,6 +14,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_dsr1_fp8_tp4_online_quant:
+        description: "DeepSeek-R1-FP8 TP4 Online Quant"
+        required: false
+        type: boolean
+        default: false
       run_qwen35_35b_a3b_fp8_tp2:
         description: "Qwen3.5-35B-A3B-FP8 TP2"
         required: false
@@ -134,6 +139,7 @@ jobs:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           RUN_DSR1_FP8_TP4: ${{ inputs.run_dsr1_fp8_tp4 }}
+          RUN_DSR1_FP8_TP4_ONLINE_QUANT: ${{ inputs.run_dsr1_fp8_tp4_online_quant }}
           RUN_QWEN35_35B_A3B_FP8_TP2: ${{ inputs.run_qwen35_35b_a3b_fp8_tp2 }}
           RUN_QWEN35_35B_A3B_TP2: ${{ inputs.run_qwen35_35b_a3b_tp2 }}
           RUN_QWEN35_397B_A17B_FP8_TP4: ${{ inputs.run_qwen35_397b_a17b_fp8_tp4 }}
@@ -166,6 +172,15 @@ jobs:
                   "model_name": "DeepSeek-R1-FP8 TP4",
                   "model_path": "deepseek-ai/DeepSeek-R1-0528",
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache",
+                  "accuracy_test_threshold": 0.91,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
+                  "runner": "linux-atom-mi35x-4",
+              },
+              {
+                  "toggle_env": "RUN_DSR1_FP8_TP4_ONLINE_QUANT",
+                  "model_name": "DeepSeek-R1-FP8 TP4 Online Quant",
+                  "model_path": "deepseek-ai/DeepSeek-R1-0528",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"mxfp4\",\"exclude_layer\":[\"model.layers.*.self_attn.*\",\"model.layers.61.*\",\"lm_head\"]}}'",
                   "accuracy_test_threshold": 0.91,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
                   "runner": "linux-atom-mi35x-4",
