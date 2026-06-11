@@ -19,6 +19,7 @@ from aiter import (
 )
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
@@ -585,8 +586,17 @@ class MLAAttention(nn.Module):
                 fused_gemm_a8w8_blockscale_preshuffle_split_cat is not None
                 and weight.dtype == dtypes.fp8
             ):  # FP8 GEMM + split + cat
-                weight_shuffled = weight.reshape(
-                    weight.shape[0] // 16, weight.shape[1] * 16
+                # The preshuffle split-cat GEMM consumes a 16x16-shuffled weight.
+                # When ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE is enabled the loader
+                # already shuffled kv_b_proj.weight, so only reshape. Otherwise the
+                # weight is still in its raw (unshuffled) layout, so shuffle it here
+                # before the GEMM to keep the PRESHUFFLE=0 + triton path correct.
+                if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE and use_triton_gemm() and envs.ATOM_USE_TRITON_MLA:
+                    weight_for_gemm = weight
+                else:
+                    weight_for_gemm = shuffle_weight(weight, layout=(16, 16))
+                weight_shuffled = weight_for_gemm.reshape(
+                    weight_for_gemm.shape[0] // 16, weight_for_gemm.shape[1] * 16
                 )
 
                 output_dtype = kv_c_normed.dtype
