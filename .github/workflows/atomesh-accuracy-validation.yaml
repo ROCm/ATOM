@@ -3,14 +3,19 @@ name: Atomesh Accuracy Validation
 on:
   push:
     branches: [main]
+    paths:
+      - 'atom/mesh/**'
+      - '.github/workflows/atomesh-accuracy-validation.yaml'
+      - '.github/scripts/accuracy_to_dashboard.py'
+      - '.github/benchmark/models_accuracy.json'
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
+    paths:
+      - 'atom/mesh/**'
+      - '.github/workflows/atomesh-accuracy-validation.yaml'
+      - '.github/scripts/accuracy_to_dashboard.py'
+      - '.github/benchmark/models_accuracy.json'
   schedule:
     # Nightly at 00:00 Beijing time (16:00 UTC)
     - cron: '0 16 * * *'
