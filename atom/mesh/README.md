@@ -229,6 +229,6 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only --a
 
 Clients send `Authorization: Bearer <key>`. Workers declared on the CLI inherit the router key.
 
-## Acknowledgments and upstream
+## Acknowledgments
 
-[**sgl-model-gateway**](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway) remains an excellent reference for disaggregated model routing and high-throughput serving. Atomesh acknowledges that work as useful inspiration, but has since been substantially reworked into an independent serving layer for the **ATOM** stack and **AMD** hardware. Its routing, scheduling, runtime integration, and performance-sensitive paths are designed around AMD accelerator deployments and ATOM-specific serving requirements.
+Atomesh was derived from [sgl-model-gateway](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway) and has since been substantially reworked into an independent serving layer for the **ATOM** stack and **AMD** hardware. Its routing, scheduling, runtime integration, and performance-sensitive paths are designed around AMD accelerator deployments and ATOM-specific serving requirements.

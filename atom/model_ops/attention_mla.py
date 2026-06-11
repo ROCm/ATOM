@@ -422,7 +422,7 @@ class MLAAttention(nn.Module):
         if n == 1 or n % 500 == 0:
             logger.info(
                 "MLA chunked-prefill #%d: layer=%d num_chunks=%d "
-                "total_kv=%d cu_seqlens_q[-1]=%d",
+                "total_kv=%s cu_seqlens_q[-1]=%d",
                 n,
                 self.layer_num,
                 chunk_meta.num_chunks,

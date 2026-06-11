@@ -15,7 +15,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from aiter import dtypes
+from aiter import QuantType, dtypes, get_hip_quant
 from aiter.utility import fp4_utils
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mla import (
@@ -47,6 +47,13 @@ try:
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 except ImportError:
     gemm_afp4wfp4 = None
+
+try:
+    from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import (
+        fused_gemm_afp4wfp4_preshuffle_split_cat,
+    )
+except ImportError:
+    fused_gemm_afp4wfp4_preshuffle_split_cat = None
 
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
@@ -100,6 +107,62 @@ def _unwrap_linear_output(output: Any) -> torch.Tensor:
     if isinstance(output, tuple):
         return output[0]
     return output
+
+
+def use_sglang_fp8_prefill_attn() -> bool:
+    return (
+        get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
+    )
+
+
+def try_fused_mxfp4_kv_b_proj_fp8(
+    kv_b_proj: Any,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    *,
+    num_heads: int,
+    qk_nope_head_dim: int,
+    v_head_dim: int,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Return FP8 k/v from MXFP4 kv_b_proj when the fused split-cat path fits."""
+    if fused_gemm_afp4wfp4_preshuffle_split_cat is None:
+        return None
+    weight = getattr(kv_b_proj, "weight", None)
+    weight_scale = getattr(kv_b_proj, "weight_scale", None)
+    if weight is None or weight_scale is None:
+        return None
+    if weight.dtype not in (torch.uint8, getattr(dtypes, "fp4x2", None)):
+        return None
+    if weight.dim() != 2 or weight.shape[0] % 16 != 0:
+        return None
+    if weight_scale.shape[0] % 32 != 0:
+        return None
+
+    kvc_for_gemm = kv_c_normed.reshape(-1, kv_c_normed.shape[-1]).contiguous()
+    if k_pe.dim() == 2:
+        k_pe = k_pe.unsqueeze(1)
+
+    m = kvc_for_gemm.shape[0]
+    q_input, x_scale = get_hip_quant(QuantType.per_1x32)(
+        kvc_for_gemm,
+        quant_dtype=dtypes.fp4x2,
+        shuffle=(m >= 32),
+    )
+    if m >= 32:
+        x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+    else:
+        x_scale = x_scale[:m, ...].view(torch.uint8)
+
+    return fused_gemm_afp4wfp4_preshuffle_split_cat(
+        q_input.view(torch.uint8),
+        weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+        k_pe.expand((-1, num_heads, -1)),
+        x_scale,
+        weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1),
+        qk_nope_head_dim,
+        v_head_dim,
+        dtypes.fp8,
+    )
 
 
 def _linear_quant_type_value(linear: Any) -> Optional[int]:

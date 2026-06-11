@@ -9,9 +9,16 @@ live alongside the bridge instead of in ``atom.model_ops.v4_kernels``.
 
 ``write_v4_decode_hca_compress_tail`` is the decode-time companion to
 ``atom.model_ops.v4_kernels.write_v4_paged_decode_indices``: that core kernel
-fills the SWA window prefix shared by the SWA / CSA / HCA index buffers; this
-one appends the HCA compress tail straight from the GPU block table, so the
-whole decode HCA index segment is built on-GPU with no per-step host round trip.
+fills the SWA window prefix (placed at the slice TAIL) shared by the SWA / CSA /
+HCA index buffers; this one fills the HCA compress section at the slice HEAD
+straight from the GPU block table, so the whole decode HCA index segment is
+built on-GPU with no per-step host round trip.
+
+Layout note: since the MI355 decode-kernel retune (#1116) the ragged-packed
+decode slices place the compress section at the head and the SWA window prefix
+at the tail (the kernels read the whole slice and are permutation-invariant
+over keys). This kernel must match: it writes HCA entries at ``[hca_indptr[t],
++n_hca)``. (The ``_tail`` in the name is historical.)
 """
 
 import torch
@@ -27,35 +34,34 @@ def _v4_decode_hca_compress_tail_kernel(
     n_committed_hca_per_seq_ptr,  # [num_reqs] int32 — per-seq HCA entry count
     block_tables_ptr,  # [num_reqs, MAX_BLOCKS] int — per-seq paged block ids
     bt_stride_bs,  # block_tables row stride (elements)
-    hca_indices_ptr,  # [>=hca_indptr[T]] int32 OUT — HCA compress tail written
+    hca_indices_ptr,  # [>=hca_indptr[T]] int32 OUT — HCA compress section (head)
     swa_pages,  # num_slots * cs — boundary into the compress region
     win: tl.constexpr,  # SWA window — per-token prefix length cap
     BLOCK_J: tl.constexpr,  # next_pow2(win) — HCA loop chunk size
 ):
-    """One program per token. Writes the HCA *compress-tail* segment
-    ``[hca_indptr[t] + n_swa, +n_hca)`` where ``n_swa = min(pos+1, win)`` is the
-    SWA window-prefix length (filled separately by
-    ``write_v4_paged_decode_indices``) and the j-th committed HCA entry maps to
+    """One program per token. Writes the HCA compress segment at the slice
+    HEAD ``[hca_indptr[t], +n_hca)``; the j-th committed HCA entry maps to
     physical page ``swa_pages + block_tables[bid, j]``.
 
-    The window-prefix region ``[hca_indptr[t], +n_swa)`` is left untouched here
-    (the sibling kernel writes it); together they cover the full per-token HCA
-    segment ``[hca_indptr[t], hca_indptr[t+1])``, so no ``-1`` pre-fill is
-    needed. CG-padded tail tokens (batch_id == -1) carry a zero-length segment
-    and are skipped.
+    Ragged-packed layout (since the MI355 decode-kernel retune, #1116): the
+    compress section occupies the head of each token's slice and the SWA
+    window-prefix (length ``n_swa = min(pos+1, win)``) sits at the TAIL,
+    written separately by ``write_v4_paged_decode_indices``. The two together
+    cover the full per-token HCA segment ``[hca_indptr[t], hca_indptr[t+1])``,
+    so no ``-1`` pre-fill is needed. CG-padded tail tokens (batch_id == -1)
+    carry a zero-length segment and are skipped.
 
     Decode analogue of the HCA compress section in
-    ``_v4_paged_prefill_indices_kernel`` (``prefix_swa_count`` there is the
-    decode ``n_swa`` here).
+    ``_v4_paged_prefill_indices_kernel``.
     """
     t = tl.program_id(0)
     bid = tl.load(batch_id_per_token_ptr + t)
     if bid < 0:
         return  # CG-padded sentinel — leave outputs untouched
-    pos = tl.load(positions_ptr + t)
-    n_swa = tl.minimum(pos + 1, win)
     n_hca = tl.load(n_committed_hca_per_seq_ptr + bid)
-    base = tl.load(hca_indptr_ptr + t) + n_swa
+    # HCA compress section occupies the slice HEAD (offset 0); the SWA window
+    # prefix sits at the tail, written by `write_v4_paged_decode_indices`.
+    base = tl.load(hca_indptr_ptr + t)
     bt_row_base = bid * bt_stride_bs
     i = tl.arange(0, BLOCK_J)
     for j in tl.range(0, n_hca, BLOCK_J):
@@ -77,13 +83,13 @@ def write_v4_decode_hca_compress_tail(
     win: int,
     swa_pages: int,
 ) -> None:
-    """In-place GPU fill of the decode HCA compress-tail paged offsets.
+    """In-place GPU fill of the decode HCA compress-section paged offsets.
 
     Companion to ``write_v4_paged_decode_indices``: that kernel fills the SWA
-    window-prefix of the SWA / CSA / HCA index buffers; this one appends the HCA
-    compress tail (``swa_pages + block_tables[bid, j]``) after each token's SWA
-    prefix in ``hca_indices``. Together they write the full per-token HCA
-    segment, so the caller need not pre-fill ``-1``.
+    window-prefix (at the slice TAIL) of the SWA / CSA / HCA index buffers; this
+    one fills the HCA compress section (``swa_pages + block_tables[bid, j]``) at
+    the slice HEAD ``[hca_indptr[t], +n_hca)`` in ``hca_indices``. Together they
+    write the full per-token HCA segment, so the caller need not pre-fill ``-1``.
 
     Replaces the prior CPU scatter in the bridge's decode metadata build
     (block-table D2H + numpy ``repeat``/``cumsum``/fancy-index + H2D), so the
@@ -95,14 +101,16 @@ def write_v4_decode_hca_compress_tail(
 
     Args:
       batch_id_per_token:      ``[>=T]``   int — token→seq map; -1 skipped.
-      positions:               ``[>=T]``   int — global token positions; the
-                                           SWA prefix length is ``min(pos+1, win)``.
+      positions:               ``[>=T]``   int — global token positions (unused
+                                           since the compress section moved to the
+                                           slice head; kept for call-site parity).
       hca_indptr:              ``[>=T+1]`` int32 — ragged HCA indptr (same one
                                            passed to ``write_v4_paged_decode_indices``).
       n_committed_hca_per_seq: ``[num_reqs]`` int32 — per-seq HCA entry count.
       block_tables:            ``[num_reqs, mnbs]`` int — per-seq paged blocks.
-      hca_indices:             ``[>=hca_indptr[T]]`` int32 OUT — compress tail
-                                           written; SWA prefix left to sibling.
+      hca_indices:             ``[>=hca_indptr[T]]`` int32 OUT — compress section
+                                           (slice head) written; SWA prefix
+                                           (slice tail) left to sibling.
       T:                       int — real token count (grid size).
       win:                     int — SWA window size.
       swa_pages:               int — ``num_slots * cs`` boundary in unified_kv.

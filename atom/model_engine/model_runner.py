@@ -72,7 +72,8 @@ support_model_arch_dict = {
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
-    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2_flash.MiMoV2FlashForCausalLM",
+    "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
+    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -792,7 +793,10 @@ class ModelRunner:
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("mimo_v2_flash"):
+        elif self.hf_text_config.model_type in (
+            "mimo_v2",
+            "mimo_v2_flash",
+        ):
             return True
         return False
 
@@ -1646,9 +1650,9 @@ class ModelRunner:
         num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
             num_tokens, dp_size, dp_rank
         )
-        max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp).item()
+        max_tokens_across_dp = int(torch.max(num_tokens_across_dp))
 
-        return max_tokens_across_dp_cpu - num_tokens, num_tokens_across_dp
+        return max_tokens_across_dp - num_tokens, num_tokens_across_dp
 
     def _maybe_create_tbo_slices(
         self,
@@ -1726,6 +1730,11 @@ class ModelRunner:
                 None,
             )
 
+        # Mixed prefill+decode DP steps only deadlock under prefill
+        # token-split + TBO-decode
+        require_uniform_mode = (
+            self.config.enable_tbo_decode and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+        )
         sync = sync_dp_for_tbo(
             dp_group=get_dp_group().cpu_group,
             dp_size=dp_size,
@@ -1734,9 +1743,10 @@ class ModelRunner:
             tbo_on=tbo_on,
             local_tbo_eligible=local_eligible,
             local_ub_tokens=(local_ub0, local_ub1),
+            require_uniform_mode=require_uniform_mode,
         )
 
-        max_tokens = int(sync.num_tokens_across_dp.max().item())
+        max_tokens = int(sync.num_tokens_across_dp.max())
         dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention
         )
