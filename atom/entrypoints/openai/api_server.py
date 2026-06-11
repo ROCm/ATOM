@@ -839,6 +839,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     sampling_params,
                     request_id,
                     multimodal_data=stream_multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
                 )
                 gen = stream_chat_response_fanout(
                     request_id,
@@ -855,6 +856,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     sampling_params,
                     request_id,
                     multimodal_data=stream_multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
                 )
                 gen = stream_chat_response(
                     request_id,
@@ -877,6 +879,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 sampling_params,
                 request_id,
                 multimodal_data=multimodal_data,
+                kv_transfer_params=request.kv_transfer_params,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
@@ -896,13 +899,23 @@ async def chat_completions(request: ChatCompletionRequest):
                 request_id, model_name, final_output["text"], final_output
             )
         elif effective_n > 1:
-            outputs = await generate_async_fanout(prompt, sampling_params, request_id)
+            outputs = await generate_async_fanout(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=request.kv_transfer_params,
+            )
             if not outputs:
                 raise RuntimeError("No output generated")
             resp = build_chat_response_multi(request_id, model_name, outputs)
         else:
             final_output = None
-            async for output in generate_async(prompt, sampling_params, request_id):
+            async for output in generate_async(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=request.kv_transfer_params,
+            ):
                 final_output = output
             if final_output is None:
                 raise RuntimeError("No output generated")

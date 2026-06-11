@@ -1659,6 +1659,11 @@ jobs:
             fi
           fi
 
+          TEMPERATURE_ARG=""
+          if [[ "${MODEL_NAME}" == *"MTP"* ]]; then
+            TEMPERATURE_ARG="--temperature 0"
+          fi
+
           python3 - <<'PY' > /tmp/benchmark_cases.tsv
           import json
           import os
@@ -1781,6 +1786,7 @@ jobs:
                       --percentile-metrics ttft,tpot,itl,e2el \
                       --result-dir \"${CONTAINER_RESULT_DIR}\" \
                       --result-filename \"${RESULT_FILENAME}.json\" \
+                      ${TEMPERATURE_ARG} \
                       ${BENCH_EXTRA_ARGS:-}
                   "
               fi

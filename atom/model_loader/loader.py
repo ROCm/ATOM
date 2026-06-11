@@ -616,7 +616,8 @@ def load_model(
                                 "",
                                 expert_id,
                             )
-                            loaded_weights_record.add(prefix + name)
+                            loaded_weights_record.add(prefix + fused_name)
+                            continue
                         try:
                             param = model.get_parameter(name)
                         except AttributeError:

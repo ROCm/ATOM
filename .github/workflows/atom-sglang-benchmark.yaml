@@ -6,11 +6,11 @@ concurrency:
 
 on:
   schedule:
-    # Nightly at 23:00 Beijing time (15:00 UTC).
-    - cron: '0 15 * * 1,3'  # Mon/Wed: SGLang-OOB DeepSeek group A, 6 models x 10 params = 60 cases
-    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB DeepSeek MTP group B, 2 models x 10 params = 20 cases
-    - cron: '0 15 * * 5'    # Fri: SGLang-OOB all, 10 models x 10 params = 100 cases
-    - cron: '0 15 * * 6'  # Sat: SGLang-Mesh all, 8 configs = 62 cases
+    # Nightly at 22:00 Beijing time (14:00 UTC).
+    - cron: '0 14 * * 1,3'  # Mon/Wed: SGLang-OOB non-MTP DeepSeek configs
+    - cron: '0 14 * * 2,4'  # Tue/Thu: SGLang-OOB MTP + Qwen configs
+    - cron: '0 14 * * 5'    # Fri: SGLang-Mesh all configs
+    - cron: '0 14 * * 6'    # Sat: SGLang-OOB all configs
   workflow_dispatch:
     inputs:
       benchmark_suite:
@@ -31,30 +31,40 @@ on:
           - "deepseek-r1-fp4-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp4-dp4-ep4 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp4-dp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-mtp3 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-mtp1 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-mtp3-tp4-dp4-ep4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-mtp3-tp8-dp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
-          - "all-deepseek (8 DeepSeek configs x 10 default params)"
+          - "all-deepseek (11 DeepSeek configs x 10 default params)"
+          - "all-deepseek-non-mtp (7 DeepSeek non-MTP configs x 10 default params)"
+          - "all-deepseek-mtp (4 DeepSeek MTP configs x 10 default params)"
           - "all-qwen (2 Qwen configs x 10 default params)"
-          - "all-oob (all SGLang-OOB configs x 10 default params)"
+          - "all-oob (13 SGLang-OOB configs x 10 default params)"
         default: "none (do not run SGLang-OOB models)"
       mesh_config_preset:
         description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"
         type: choice
         options:
-          - "ds-fp4-all (all Mesh configs: 62 cases)"
-          - "ds-fp4-tp8 (8192x1/1x1024: [2,4,8,16,32,64,128,256])"
-          - "ds-fp4-tp8-mtp (8192x1/1x1024: [2,4,8,16,32,64,128,256])"
-          - "ds-fp4-tp4 (8192x1/1x1024: [64,128,256])"
-          - "ds-fp4-tp4-mtp (8192x1/1x1024: [64,128,256])"
-          - "ds-fp4-dpa4-ep4 (8192x1: [256,512,1024])"
-          - "ds-fp4-dpa4-ep4-mtp (8192x1: [256,512,1024])"
-          - "ds-fp4-dpa8-ep8 (8192x1: [512,1024,2048]; 1x1024: [1024,2048,4096])"
-          - "ds-fp4-dpa8-ep8-mtp (8192x1: [512,1024,2048]; 1x1024: [1024,2048,4096])"
-          - "ds-fp4-non-mtp (tp8 + tp4 + dpa4-ep4 + dpa8-ep8)"
-          - "ds-fp4-mtp (tp8-mtp + tp4-mtp + dpa4-ep4-mtp + dpa8-ep8-mtp)"
-        default: "ds-fp4-all (all Mesh configs: 62 cases)"
+          - "ds-all (all DeepSeek Mesh configs: 71 cases)"
+          - "ds-fp4-all (all FP4 Mesh configs: 62 cases)"
+          - "ds-fp4-tp8 (FP4 8192x1/1x1024: [2,4,8,16,32,64,128,256])"
+          - "ds-fp4-tp8-mtp (FP4 8192x1/1x1024: [2,4,8,16,32,64,128,256])"
+          - "ds-fp4-tp4 (FP4 8192x1/1x1024: [64,128,256])"
+          - "ds-fp4-tp4-mtp (FP4 8192x1/1x1024: [64,128,256])"
+          - "ds-fp4-dpa4-ep4 (FP4 8192x1: [256,512,1024])"
+          - "ds-fp4-dpa4-ep4-mtp (FP4 8192x1: [256,512,1024])"
+          - "ds-fp4-dpa8-ep8 (FP4 8192x1: [512,1024,2048]; 1x1024: [1024,2048,4096])"
+          - "ds-fp4-dpa8-ep8-mtp (FP4 8192x1: [512,1024,2048]; 1x1024: [1024,2048,4096])"
+          - "ds-fp4-non-mtp (FP4 tp8 + tp4 + dpa4-ep4 + dpa8-ep8)"
+          - "ds-fp4-mtp (FP4 tp8-mtp + tp4-mtp + dpa4-ep4-mtp + dpa8-ep8-mtp)"
+          - "ds-fp8-all (all FP8 Mesh configs: 9 cases)"
+          - "ds-fp8-dpa4-ep4 (FP8 8192x1: [256,512,1024])"
+          - "ds-fp8-dpa8-ep8 (FP8 8192x1: [512,1024,2048]; 1x1024: [1024,2048,4096])"
+          - "ds-fp8-non-mtp (FP8 dpa4-ep4 + dpa8-ep8)"
+        default: "ds-all (all DeepSeek Mesh configs: 71 cases)"
       mesh_server_mode:
         description: "SGLang-Mesh server launch mode. Use sglang-mori only with lmsysorg/sglang-rocm images."
         type: choice
@@ -149,7 +159,8 @@ jobs:
           WORKLOAD_LABEL="${INPUT_WORKLOAD_LABEL:-SGLang-OOB}"
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             case "${SCHEDULE_CRON}" in
-              "0 15 * * 6") WORKLOAD_LABEL="SGLang-Mesh" ;;
+              "0 14 * * 5") WORKLOAD_LABEL="SGLang-Mesh" ;;
+              "0 14 * * 1,3"|"0 14 * * 2,4"|"0 14 * * 6") WORKLOAD_LABEL="SGLang-OOB" ;;
               *) WORKLOAD_LABEL="SGLang-OOB" ;;
             esac
           fi
@@ -373,11 +384,38 @@ jobs:
           import sys
           from pathlib import Path
 
-          models = json.loads(
-              Path(".github/benchmark/sglang_benchmark_models.json").read_text(
-                  encoding="utf-8"
-              )
-          )
+          def expand_template_parts(value, templates, separator):
+              if isinstance(value, str):
+                  return templates.get(value, value)
+              if isinstance(value, list):
+                  return separator.join(
+                      templates.get(str(part), str(part))
+                      for part in value
+                      if str(part)
+                  )
+              return value
+
+          def load_model_catalog(path):
+              catalog = json.loads(path.read_text(encoding="utf-8"))
+              if isinstance(catalog, list):
+                  return catalog
+
+              templates = catalog.get("templates", {})
+              extra_arg_templates = templates.get("extra_args", {})
+              env_var_templates = templates.get("env_vars", {})
+              models = []
+              for model in catalog.get("models", []):
+                  expanded = dict(model)
+                  expanded["extra_args"] = expand_template_parts(
+                      expanded.get("extra_args", ""), extra_arg_templates, " "
+                  )
+                  expanded["env_vars"] = expand_template_parts(
+                      expanded.get("env_vars", ""), env_var_templates, "\n"
+                  )
+                  models.append(expanded)
+              return models
+
+          models = load_model_catalog(Path(".github/benchmark/sglang_benchmark_models.json"))
 
           event = os.environ["GITHUB_EVENT_NAME"]
           workload_label = os.environ.get("WORKLOAD_LABEL") or "SGLang-OOB"
@@ -395,8 +433,10 @@ jobs:
 
           def normalize_mesh_preset(value):
               preset = str(value or "all").split(" (", 1)[0].split(" / ", 1)[0]
-              if preset.startswith("ds-fp4-"):
-                  return preset.removeprefix("ds-fp4-")
+              if preset == "ds-all":
+                  return "all"
+              if preset.startswith("ds-fp4-") or preset.startswith("ds-fp8-"):
+                  return preset.removeprefix("ds-")
               return preset
 
           def oob_selected_by_preset(model, preset):
@@ -407,34 +447,42 @@ jobs:
                   return True
               if preset == "all-deepseek":
                   return prefix.startswith("deepseek-")
+              if preset == "all-deepseek-non-mtp":
+                  return prefix.startswith("deepseek-") and "mtp" not in prefix
+              if preset == "all-deepseek-mtp":
+                  return prefix.startswith("deepseek-") and "mtp" in prefix
               if preset == "all-qwen":
                   return prefix.startswith("qwen")
               return prefix == preset
 
+          def is_oob_mtp(model):
+              return matches_workload(model) and "mtp" in str(model.get("prefix", ""))
+
+          def is_oob_qwen(model):
+              return matches_workload(model) and str(model.get("prefix", "")).startswith("qwen")
+
+          def is_oob_non_mtp_deepseek(model):
+              prefix = str(model.get("prefix", ""))
+              return matches_workload(model) and prefix.startswith("deepseek-") and "mtp" not in prefix
+
           if event == "schedule":
               schedule_cron = os.environ.get("SCHEDULE_CRON", "")
-              if schedule_cron == "0 15 * * 1,3":
-                  selected_group = "A-DEEPSEEK"
-                  selected = [m for m in models if m.get("nightly_group", "A") == "A" and matches_workload(m)]
-              elif schedule_cron == "0 15 * * 2,4":
-                  selected_group = "B-DEEPSEEK-MTP"
-                  selected = [
-                      m
-                      for m in models
-                      if m.get("nightly_group") == "B"
-                      and matches_workload(m)
-                      and str(m.get("prefix", "")).startswith("deepseek-")
-                  ]
-              elif schedule_cron == "0 15 * * 5":
-                  selected_group = "C-ALL"
-                  selected = [m for m in models if matches_workload(m)]
-              elif schedule_cron == "0 15 * * 6":
-                  selected_group = "WEEKEND-MESH"
+              if schedule_cron == "0 14 * * 1,3":
+                  selected_group = "OOB-NON-MTP-DEEPSEEK"
+                  selected = [m for m in models if is_oob_non_mtp_deepseek(m)]
+              elif schedule_cron == "0 14 * * 2,4":
+                  selected_group = "OOB-MTP-QWEN"
+                  selected = [m for m in models if is_oob_mtp(m) or is_oob_qwen(m)]
+              elif schedule_cron == "0 14 * * 5":
+                  selected_group = "MESH-ALL"
                   selected = [
                       m
                       for m in models
                       if matches_workload(m) and has_mesh_preset(m, "all")
                   ]
+              elif schedule_cron == "0 14 * * 6":
+                  selected_group = "OOB-ALL"
+                  selected = [m for m in models if matches_workload(m)]
               else:
                   selected_group = "SKIP-UNKNOWN-DAY"
                   selected = []
@@ -695,6 +743,8 @@ jobs:
       MESH_TP_SIZE: ${{ matrix.model.tp_size || '' }}
       MESH_DP_SIZE: ${{ matrix.model.dp_size || '' }}
       MESH_EP_SIZE: ${{ matrix.model.ep_size || '' }}
+      CASE_EXTRA_ARGS_BY_PAIR: ${{ toJson(matrix.model.case_extra_args_by_pair) }}
+      CASE_ENV_VARS_BY_PAIR: ${{ toJson(matrix.model.case_env_vars_by_pair) }}
       RESULT_PREFIX: ${{ matrix.model.prefix }}
       ISL: ${{ matrix.params.input_length }}
       OSL: ${{ matrix.params.output_length }}
@@ -835,6 +885,26 @@ jobs:
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
           printf '%s\n' "${{ matrix.model.env_vars }}" | sed 's/^[[:space:]]*//' > /tmp/oot_env_file.txt
+          CASE_KEY="${ISL}x${OSL}"
+          CASE_ENV_VARS="$(
+            CASE_ENV_VARS_BY_PAIR="${CASE_ENV_VARS_BY_PAIR:-null}" CASE_KEY="${CASE_KEY}" python3 - <<'PY'
+          import json
+          import os
+
+          raw = os.environ.get("CASE_ENV_VARS_BY_PAIR") or "null"
+          try:
+              mapping = json.loads(raw)
+          except json.JSONDecodeError:
+              mapping = None
+          if isinstance(mapping, dict):
+              value = mapping.get(os.environ["CASE_KEY"], "")
+              if value:
+                  print(value)
+          PY
+          )"
+          if [[ -n "${CASE_ENV_VARS}" ]]; then
+            printf '%s\n' "${CASE_ENV_VARS}" >> /tmp/oot_env_file.txt
+          fi
 
           $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
@@ -921,6 +991,32 @@ jobs:
           echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
           EFFECTIVE_BENCHMARK_RUNNER="sglang_atom"
           EFFECTIVE_SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}"
+          CASE_KEY="${ISL}x${OSL}"
+          CASE_EXTRA_ARGS="$(
+            CASE_EXTRA_ARGS_BY_PAIR="${CASE_EXTRA_ARGS_BY_PAIR:-null}" CASE_KEY="${CASE_KEY}" python3 - <<'PY'
+          import json
+          import os
+
+          raw = os.environ.get("CASE_EXTRA_ARGS_BY_PAIR") or "null"
+          try:
+              mapping = json.loads(raw)
+          except json.JSONDecodeError:
+              mapping = None
+          if isinstance(mapping, dict):
+              value = mapping.get(os.environ["CASE_KEY"], "")
+              if value:
+                  print(value)
+          PY
+          )"
+          if [[ -n "${CASE_EXTRA_ARGS}" ]]; then
+            EFFECTIVE_SGLANG_EXTRA_ARGS="${EFFECTIVE_SGLANG_EXTRA_ARGS} ${CASE_EXTRA_ARGS}"
+          fi
+          BENCH_NUM_PROMPTS="$(( CONC * 10 ))"
+          BENCH_NUM_WARMUPS="$(( 2 * CONC ))"
+          if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && "${MESH_DP_SIZE:-1}" -gt 1 && "${MESH_EP_SIZE:-1}" -gt 1 ]]; then
+            BENCH_NUM_PROMPTS="$(( CONC * 3 ))"
+            BENCH_NUM_WARMUPS="${CONC}"
+          fi
           if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && "${MESH_SERVER_MODE}" == "sglang-mori" ]]; then
             case "${SGLANG_IMAGE_TAG}" in
               lmsysorg/sglang-rocm*|docker.io/lmsysorg/sglang-rocm*) ;;
@@ -944,7 +1040,7 @@ jobs:
               -e RESULT_FILENAME="${RESULT_FILENAME}" \
               -e RESULT_DIR="${CONTAINER_RESULT_DIR}" \
               -e BENCH_SERVING_DIR="${CONTAINER_BENCH_SERVING_DIR}" \
-              -e SERVER_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
+              -e SERVER_EXTRA_ARGS="${EFFECTIVE_SGLANG_EXTRA_ARGS}" \
               -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
               -e SPEC_MODE="${MESH_SPEC_MODE}" \
               -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
@@ -955,7 +1051,7 @@ jobs:
               "
           else
             if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && -n "${MESH_TP_SIZE}" ]]; then
-              EFFECTIVE_SGLANG_EXTRA_ARGS="--tensor-parallel-size ${MESH_TP_SIZE} ${SGLANG_EXTRA_ARGS}"
+              EFFECTIVE_SGLANG_EXTRA_ARGS="--tensor-parallel-size ${MESH_TP_SIZE} ${EFFECTIVE_SGLANG_EXTRA_ARGS}"
             fi
             $CONTAINER_ENGINE exec -d \
               -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
@@ -1053,10 +1149,10 @@ jobs:
                   --random-input-len=\"${ISL}\" \
                   --random-output-len=\"${OSL}\" \
                   --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
-                  --num-prompts=\"$(( CONC * 10 ))\" \
+                  --num-prompts=\"${BENCH_NUM_PROMPTS}\" \
                   --max-concurrency=\"${CONC}\" \
                   ${TRUST_REMOTE_CODE_ARG} \
-                  --num-warmups=\"$(( 2 * CONC ))\" \
+                  --num-warmups=\"${BENCH_NUM_WARMUPS}\" \
                   --request-rate=inf \
                   --ignore-eos \
                   --save-result \
@@ -1341,11 +1437,38 @@ jobs:
           sys.path.insert(0, str(llm_booster_dashboard))
           from update_data import index_root_for, rebuild_index  # noqa: E402
 
-          catalog = json.loads(
-              (root / ".github" / "benchmark" / "sglang_benchmark_models.json").read_text(
-                  encoding="utf-8"
-              )
-          )
+          def expand_template_parts(value, templates, separator):
+              if isinstance(value, str):
+                  return templates.get(value, value)
+              if isinstance(value, list):
+                  return separator.join(
+                      templates.get(str(part), str(part))
+                      for part in value
+                      if str(part)
+                  )
+              return value
+
+          def load_model_catalog(path):
+              catalog = json.loads(path.read_text(encoding="utf-8"))
+              if isinstance(catalog, list):
+                  return catalog
+
+              templates = catalog.get("templates", {})
+              extra_arg_templates = templates.get("extra_args", {})
+              env_var_templates = templates.get("env_vars", {})
+              models = []
+              for model in catalog.get("models", []):
+                  expanded = dict(model)
+                  expanded["extra_args"] = expand_template_parts(
+                      expanded.get("extra_args", ""), extra_arg_templates, " "
+                  )
+                  expanded["env_vars"] = expand_template_parts(
+                      expanded.get("env_vars", ""), env_var_templates, "\n"
+                  )
+                  models.append(expanded)
+              return models
+
+          catalog = load_model_catalog(root / ".github" / "benchmark" / "sglang_benchmark_models.json")
 
           def slugify(text: str) -> str:
               return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "unknown"
