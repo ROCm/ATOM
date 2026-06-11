@@ -391,12 +391,6 @@ class AttentionMetaData:
     num_cached_tokens: Optional[torch.Tensor] = None
     seq_starts: Optional[torch.Tensor] = None
 
-    # TritonMHA pure-prefill only: set by TritonMHAMetadataBuilder.prepare_prefill
-    # when ATOM_TRITON_MHA_PREFILL_USE_CACHE is enabled, signalling that
-    # `block_tables` is the real per-seq paged table and the new tokens should
-    # be read from the flash-layout KV cache rather than from raw K/V.
-    prefill_from_cache: bool = False
-
     def __init__(
         self,
         cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -427,13 +421,11 @@ class AttentionMetaData:
         total_kv: Optional[int] = None,
         num_cached_tokens: Optional[torch.Tensor] = None,
         seq_starts: Optional[torch.Tensor] = None,
-        prefill_from_cache: bool = False,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.num_cached_tokens = num_cached_tokens
         self.seq_starts = seq_starts
-        self.prefill_from_cache = prefill_from_cache
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_k = cu_seqlens_k
         self.max_seqlen_q = max_seqlen_q

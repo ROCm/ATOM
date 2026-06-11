@@ -387,7 +387,6 @@ def split_attn_metadata(
         total_kv=ub_total_kv,
         num_cached_tokens=ub_num_cached_tokens,
         seq_starts=ub_seq_starts,
-        prefill_from_cache=attn_metadata.prefill_from_cache,
         work_meta_data=None,
         work_indptr=None,
         work_info_set=None,

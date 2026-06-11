@@ -65,7 +65,6 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
                 attn_metadata.block_tables = self.model_runner.forward_vars[
                     "block_tables"
                 ].copy_to_gpu(bs)
-                attn_metadata.prefill_from_cache = True
             else:
                 # Fallback: build a fake block_size=1 block_table that treats
                 # raw K/V as a kv_cache. row i = [cu_seqlens_k[i], ...,

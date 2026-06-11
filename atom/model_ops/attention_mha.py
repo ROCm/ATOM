@@ -618,11 +618,11 @@ class PagedAttentionImpl(nn.Module):
         # treated as kv_cache with block_size=1.
         #
         # Under ATOM_USE_UNIFIED_ATTN, prepare_prefill instead uploads the real
-        # per-seq block_table and sets `prefill_from_cache`, so the new tokens
+        # per-seq block_table and reads from KV cache, the new tokens
         # already written into the paged flash-layout cache during rope_cache
         # are read straight from `k_cache`/`v_cache`, identical to the
         # prefix-cache-hit path.
-        if attn_metadata.has_cached or attn_metadata.prefill_from_cache:
+        if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
             k_for_attn = k_cache
             v_for_attn = v_cache
             # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
