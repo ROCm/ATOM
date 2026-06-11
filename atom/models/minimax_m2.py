@@ -26,10 +26,8 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
-from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -222,14 +220,7 @@ class MiniMaxM2Attention(nn.Module):
                 self.k_norm.weight.weight_loader = self._make_tp_norm_loader(
                     self.total_num_kv_heads * self.head_dim
                 )
-
-        self.delegate_qknorm_rope_to_vllm = (
-            is_vllm()
-            and self.use_qk_norm
-            and self.tp_size > 1
-            and self.kv_cache_dtype == "fp8"
-        )
-
+        
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -238,9 +229,7 @@ class MiniMaxM2Attention(nn.Module):
             kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
             use_mla=False,
-            rotary_emb=self.rotary_emb if self.delegate_qknorm_rope_to_vllm else None,
-            q_norm=self.q_norm if self.delegate_qknorm_rope_to_vllm else None,
-            k_norm=self.k_norm if self.delegate_qknorm_rope_to_vllm else None,
+            rotary_emb=self.rotary_emb,
             prefix=f"{prefix}.attn",
         )
 
