@@ -34,6 +34,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    # Use the block_size=64 *shuffled* KV-cache Triton/Gluon MLA kernels
+    # (aiter.ops.triton.attention.mla.mla_decode_fwd + the shuffled cat/cache
+    # write kernels) instead of the SGLang-style page_size=1 decode path.
+    # Requires ATOM_USE_TRITON_MLA=1 (selects TritonMLABackend).
+    "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
+        os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
