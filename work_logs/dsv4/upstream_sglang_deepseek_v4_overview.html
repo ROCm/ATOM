@@ -1,0 +1,1323 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Upstream SGLang DeepSeek V4 Attention 学习概览</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #171b25;
+      --panel-2: #1f2633;
+      --text: #e8edf7;
+      --muted: #a8b3c7;
+      --line: #334155;
+      --accent: #7dd3fc;
+      --accent-2: #a7f3d0;
+      --warn: #facc15;
+      --hot: #fda4af;
+      --code: #111827;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      line-height: 1.6;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    header {
+      padding: 48px 32px 28px;
+      border-bottom: 1px solid var(--line);
+      background: #111827;
+    }
+
+    header h1 {
+      margin: 0 0 12px;
+      font-size: 34px;
+      line-height: 1.15;
+      letter-spacing: -0.03em;
+    }
+
+    header p {
+      max-width: 980px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 28px 24px 64px;
+    }
+
+    section {
+      margin: 28px 0 44px;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 24px;
+      letter-spacing: -0.02em;
+    }
+
+    h3 {
+      margin: 22px 0 10px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 10px 0;
+      color: var(--muted);
+    }
+
+    code {
+      padding: 2px 5px;
+      border-radius: 5px;
+      background: var(--code);
+      color: #dbeafe;
+      font-size: 0.92em;
+    }
+
+    .grid {
+      display: grid;
+      gap: 18px;
+    }
+
+    .grid.two {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+      padding: 18px;
+    }
+
+    .card h3 {
+      margin-top: 0;
+    }
+
+    .small {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 3px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel-2);
+      color: var(--text);
+      font-size: 12px;
+      margin: 3px 4px 3px 0;
+      white-space: nowrap;
+    }
+
+    .diagram {
+      position: relative;
+      overflow: hidden;
+      min-height: 360px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #111827;
+      padding: 22px;
+    }
+
+    .lane {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(140px, 1fr));
+      gap: 14px;
+      align-items: stretch;
+    }
+
+    .node {
+      position: relative;
+      z-index: 2;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel);
+      padding: 14px;
+      min-height: 105px;
+    }
+
+    .node strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .node span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .flow-line {
+      position: absolute;
+      left: 7%;
+      right: 7%;
+      top: 190px;
+      height: 2px;
+      background: var(--line);
+      z-index: 1;
+    }
+
+    .step-number {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      margin-right: 8px;
+      border-radius: 999px;
+      background: var(--accent);
+      color: #082f49;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .pool-wrap {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 20px;
+      align-items: stretch;
+    }
+
+    .pool-stack {
+      display: grid;
+      grid-template-rows: 1.2fr 1fr 0.55fr 0.75fr;
+      gap: 10px;
+      min-height: 390px;
+    }
+
+    .pool {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+
+    .pool-title {
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+
+    .token-row {
+      display: grid;
+      grid-template-columns: repeat(16, 1fr);
+      gap: 4px;
+      margin-top: 18px;
+    }
+
+    .token {
+      height: 20px;
+      border-radius: 4px;
+      background: #334155;
+    }
+
+    .token.hot {
+      background: var(--accent);
+    }
+
+    .token.c4 {
+      background: var(--accent-2);
+    }
+
+    .token.c128 {
+      background: var(--warn);
+    }
+
+    .svg-panel {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #111827;
+      padding: 16px;
+      overflow-x: auto;
+    }
+
+    svg {
+      max-width: 100%;
+      height: auto;
+    }
+
+    .svg-text {
+      fill: var(--text);
+      font: 13px ui-sans-serif, system-ui, sans-serif;
+    }
+
+    .svg-muted {
+      fill: var(--muted);
+      font: 12px ui-sans-serif, system-ui, sans-serif;
+    }
+
+    .svg-box {
+      fill: var(--panel);
+      stroke: var(--line);
+      stroke-width: 1.5;
+      rx: 12;
+    }
+
+    .svg-arrow {
+      stroke: var(--accent);
+      stroke-width: 2;
+      fill: none;
+      marker-end: url(#arrow);
+    }
+
+    .code-block {
+      overflow-x: auto;
+      padding: 14px;
+      border-radius: 12px;
+      background: #0b1020;
+      border: 1px solid var(--line);
+      color: #dbeafe;
+      font: 13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      white-space: pre;
+    }
+
+    .timeline {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 12px 18px;
+      align-items: start;
+    }
+
+    .time {
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .callout {
+      border-left: 4px solid var(--accent);
+      padding: 12px 16px;
+      background: var(--panel);
+      border-radius: 0 12px 12px 0;
+    }
+
+    .amd-note {
+      margin-top: 16px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--hot);
+      border-radius: 0 14px 14px 0;
+      background: #151b28;
+    }
+
+    .amd-note h3 {
+      margin: 0 0 8px;
+      color: var(--text);
+      font-size: 15px;
+    }
+
+    .amd-note p,
+    .amd-note li {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .toc {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .toc a {
+      display: block;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      color: var(--text);
+      font-size: 13px;
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .table th,
+    .table td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .table th {
+      color: var(--text);
+      background: var(--panel-2);
+      font-weight: 700;
+    }
+
+    .table tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .lead {
+      font-size: 16px;
+      color: #cbd5e1;
+      max-width: 980px;
+    }
+
+    .quote {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #101826;
+      color: #dbeafe;
+      font-size: 15px;
+    }
+
+    .checklist {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .check {
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .check strong {
+      color: var(--text);
+    }
+
+    @media (max-width: 980px) {
+      .grid.two,
+      .grid.three,
+      .pool-wrap,
+      .toc {
+        grid-template-columns: 1fr;
+      }
+
+      .lane {
+        grid-template-columns: 1fr;
+      }
+
+      .flow-line {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Upstream SGLang DeepSeek V4 Attention 学习概览</h1>
+    <p>
+      这是一份面向工程适配的可视化笔记，聚焦 upstream SGLang 的 DeepSeek V4 attention、kernel dispatch、KV cache pool
+      管理，并结合 DeepSeek V4 technical report 中的混合注意力设计来理解代码。
+    </p>
+  </header>
+
+  <main>
+    <section>
+      <h2>阅读入口</h2>
+      <div class="callout" style="margin-bottom:18px">
+        文档位置：<code>ATOM/work_logs/dsv4/upstream_sglang_deepseek_v4_overview.md</code> 和
+        <code>ATOM/work_logs/dsv4/upstream_sglang_deepseek_v4_overview.html</code>。源码根目录：
+        <code>/shared/amdgpu/home/qichu_qle/zhiwei/dsv4/sglang</code>；ATOM 根目录：
+        <code>/shared/amdgpu/home/qichu_qle/zhiwei/dsv4/ATOM</code>。
+      </div>
+      <p class="lead">
+        这份 HTML 是完整学习文档，不只是 Markdown 的图形补充。阅读目标是回答三个工程问题：
+        upstream SGLang 的 DeepSeek V4 attention 怎么组织、kernel 是如何被调度的、KV cache 为什么必须用 V4 专用 pool。
+      </p>
+      <div class="toc">
+        <a href="#mental-model">1. 心智模型</a>
+        <a href="#source-map">2. 源码地图</a>
+        <a href="#report-map">3. Report 到实现</a>
+        <a href="#metadata">4. Metadata</a>
+        <a href="#kv-cache">5. KV Cache</a>
+        <a href="#kernel-path">6. Kernel Path</a>
+        <a href="#modes">7. Decode / Prefill</a>
+        <a href="#atom">8. ATOM 适配</a>
+      </div>
+      <div class="grid three">
+        <div class="card">
+          <h3>模型层</h3>
+          <p><code>sglang/srt/models/deepseek_v4.py</code></p>
+          <span class="pill">MQALayer</span>
+          <span class="pill">Compressor</span>
+          <span class="pill">C4Indexer</span>
+          <p class="small">根据 <code>compress_ratios[layer_id]</code> 选择 Dense/SWA、C4、C128 路径。</p>
+        </div>
+        <div class="card">
+          <h3>Attention Backend</h3>
+          <p><code>sglang/srt/layers/attention/deepseek_v4_backend.py</code></p>
+          <span class="pill">DSV4Metadata</span>
+          <span class="pill">FlashMLA</span>
+          <span class="pill">Sparse Prefill</span>
+          <p class="small">负责 per-forward metadata、index、compress plan 和最终 kernel dispatch。</p>
+        </div>
+        <div class="card">
+          <h3>KV Cache</h3>
+          <p><code>sglang/srt/mem_cache/deepseek_v4_memory_pool.py</code></p>
+          <span class="pill">SWA pool</span>
+          <span class="pill">C4 pool</span>
+          <span class="pill">C128 pool</span>
+          <span class="pill">State pool</span>
+          <p class="small">V4 使用专用 pool，不是普通 paged KV，也不是 V3 MLA KV。</p>
+        </div>
+      </div>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          在 AMD 路径上，阅读入口要额外关注 <code>deepseek_v4_backend_hip_radix.py</code>、
+          <code>hip_flash_mla</code>、<code>aiter</code> 相关 import 和 <code>SGLANG_HACK_FLASHMLA_BACKEND</code>。
+          这些决定最终是走 HIP FlashMLA kernel、Triton fallback，还是 AITER 提供的 fused op。
+        </p>
+      </div>
+    </section>
+
+    <section id="mental-model">
+      <h2>1. 先建立心智模型</h2>
+      <div class="quote">
+        Upstream SGLang 的 DeepSeek V4 不是“一个模型类 + 一个普通 paged attention backend”，而是一套围绕
+        <code>compress_ratios</code> 展开的系统：模型层决定当前 layer 的 attention 类型，backend 负责为每个
+        forward 生成 V4 专用 metadata，KV pool 负责承载 SWA/C4/C128/indexer/state 多种物理存储，kernel path
+        再根据平台和 batch mode 选择 FlashMLA、HIP FlashMLA 或 sparse prefill。
+      </div>
+      <div class="grid three" style="margin-top:18px">
+        <div class="card">
+          <h3>Layer 视角</h3>
+          <p>每层读取 <code>compress_ratios[layer_id]</code>，值为 <code>0</code>、<code>4</code> 或 <code>128</code>。这决定该层只看 SWA，还是额外读取 C4/C128 压缩历史。</p>
+        </div>
+        <div class="card">
+          <h3>Batch 视角</h3>
+          <p><code>ForwardBatch</code> 提供 request、seq length、cache slot。DSV4 backend 将它翻译成 <code>DSV4Metadata</code>，模型 forward 后续只消费 metadata。</p>
+        </div>
+        <div class="card">
+          <h3>Cache 视角</h3>
+          <p>full KV slot 只是 scheduler 的统一地址空间；SWA pool 是缩小窗口空间，C4/C128 是压缩空间，不能互相直接替代。</p>
+        </div>
+      </div>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          AMD 侧的心智模型可以再加一层：同一个 DSV4 抽象下面，kernel 选择会被 HIP backend 改写。
+          <code>DeepseekV4HipRadixBackend</code> 保留 upstream metadata/cache 结构，但最终 attention dispatch 进入
+          <code>flash_mla_with_kvcache_entrypoint(..., backend=os.environ["SGLANG_HACK_FLASHMLA_BACKEND"])</code>。
+        </p>
+      </div>
+    </section>
+
+    <section id="source-map">
+      <h2>2. 源码地图和阅读顺序</h2>
+      <p>
+        建议从 cache sizing 和 backend metadata 开始读，再回到模型层。直接从 <code>MQALayer.forward</code> 读会容易迷失，
+        因为很多关键状态已经在 backend 的 <code>init_forward_metadata()</code> 中准备好了。
+      </p>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>阅读顺序</th>
+            <th>文件</th>
+            <th>重点符号</th>
+            <th>要理解的问题</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td><code>sglang/python/sglang/srt/configs/deepseek_v4.py</code></td>
+            <td><code>DeepSeekV4Config</code></td>
+            <td>HF config 里哪些字段决定 V4 attention：<code>compress_ratios</code>、<code>qk_nope_head_dim</code>、<code>qk_rope_head_dim</code>、<code>index_head_dim</code>、<code>window_size</code>。</td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td><code>sglang/python/sglang/srt/model_executor/pool_configurator.py</code></td>
+            <td><code>DSV4PoolConfigurator</code></td>
+            <td>显存预算如何被拆成 SWA、C4、C128、compress state 几类 pool。</td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td><code>sglang/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py</code></td>
+            <td><code>DeepSeekV4TokenToKVPool</code></td>
+            <td>为什么 V4 cache 不是普通 K/V cache，以及 full slot 如何映射到 SWA slot。</td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td><code>sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py</code></td>
+            <td><code>DSV4AttnMetadata</code>, <code>DeepseekV4AttnBackend</code></td>
+            <td>每个 forward 前如何生成 page table、SWA indices、C4/C128 indices 和 compressor metadata。</td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td><code>sglang/python/sglang/srt/models/deepseek_v4.py</code></td>
+            <td><code>MQALayer</code></td>
+            <td>Q/KV prepare、cache write、compressor、indexer 和 backend forward 怎么串起来。</td>
+          </tr>
+          <tr>
+            <td>6</td>
+            <td><code>sglang/python/sglang/srt/layers/attention/dsv4/</code></td>
+            <td><code>compressor.py</code>, <code>indexer.py</code>, <code>metadata_kernel.py</code></td>
+            <td>C4/C128 压缩计划、C4 top-k indexer、FP8 paged MQA logits 的 kernel 辅助逻辑。</td>
+          </tr>
+          <tr>
+            <td>7</td>
+            <td><code>sglang/python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py</code></td>
+            <td><code>DeepseekV4HipRadixBackend</code></td>
+            <td>ROCm/HIP 下如何选择 FlashMLA entrypoint 和 fused kernel 分支。</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          AMD 阅读顺序建议把 <code>deepseek_v4_backend_hip_radix.py</code> 提前到 backend 之后阅读。
+          它和 <code>deepseek_v4_backend.py</code> 的 metadata 结构基本一致，但 core attention dispatch、fused store、
+          FP8 dtype 和部分 kernel fallback 路径不同。调试时优先搜索 <code>_is_hip</code>、<code>SGLANG_USE_AITER</code>、
+          <code>is_gfx95_supported()</code>、<code>SGLANG_HACK_FLASHMLA_BACKEND</code>。
+        </p>
+      </div>
+    </section>
+
+    <section id="report-map">
+      <h2>Report 概念到 SGLang 实现</h2>
+      <div class="callout">
+        DeepSeek V4 technical report 中的关键思想是：不要让所有层都保存并读取完整历史 KV，而是组合近邻窗口、压缩历史和稀疏检索。
+        SGLang 把这个思想落成 <code>compress_ratio = 0 / 4 / 128</code> 三类 layer path。
+      </div>
+      <table class="table" style="margin-top:16px">
+        <thead>
+          <tr>
+            <th>Technical report 概念</th>
+            <th>SGLang 对应实现</th>
+            <th>工程含义</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>近邻窗口注意力</td>
+            <td><code>SWA_WINDOW = 128</code>，<code>swa_kv_pool</code>，<code>swa_page_indices</code></td>
+            <td>所有 layer 都保留最近窗口，decode 时每个 query 至少读 SWA cache。</td>
+          </tr>
+          <tr>
+            <td>C4 压缩历史</td>
+            <td><code>compress_ratio == 4</code>，<code>c4_kv_pool</code>，<code>C4Indexer</code></td>
+            <td>C4 不是全量读取压缩历史，而是先通过 indexer 选 top-k，再给 FlashMLA 作为 extra cache。</td>
+          </tr>
+          <tr>
+            <td>C128 高压缩历史</td>
+            <td><code>compress_ratio == 128</code>，<code>c128_kv_pool</code></td>
+            <td>保存更稀疏、更便宜的长历史，page size 派生为 <code>page_size / 128</code>。</td>
+          </tr>
+          <tr>
+            <td>在线/分块压缩状态</td>
+            <td><code>CompressStatePool</code>，<code>get_compress_state_ring_size()</code></td>
+            <td>compressor 需要跨 forward 维护窗口状态，因此 cache 不只是最终 KV，还包括 rolling state。</td>
+          </tr>
+          <tr>
+            <td>高吞吐 serving</td>
+            <td><code>DSV4Metadata</code> + FlashMLA scheduler metadata</td>
+            <td>把动态 request 转成 kernel 友好的 page/index/length 张量，减少模型层临时逻辑。</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="svg-panel" style="margin-top:16px">
+        <svg width="980" height="260" viewBox="0 0 980 260" role="img" aria-label="DeepSeek V4 attention abstraction">
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L8,3 z" fill="#7dd3fc"></path>
+            </marker>
+          </defs>
+          <rect class="svg-box" x="30" y="40" width="180" height="72"></rect>
+          <text class="svg-text" x="54" y="72">Technical Report</text>
+          <text class="svg-muted" x="54" y="94">混合注意力 / 压缩历史</text>
+
+          <rect class="svg-box" x="290" y="22" width="190" height="58"></rect>
+          <text class="svg-text" x="315" y="55">SWA window</text>
+          <text class="svg-muted" x="315" y="73">最近 128 token</text>
+
+          <rect class="svg-box" x="290" y="102" width="190" height="58"></rect>
+          <text class="svg-text" x="315" y="135">C4 compressed history</text>
+          <text class="svg-muted" x="315" y="153">稀疏 top-k + indexer</text>
+
+          <rect class="svg-box" x="290" y="182" width="190" height="58"></rect>
+          <text class="svg-text" x="315" y="215">C128 compressed history</text>
+          <text class="svg-muted" x="315" y="233">高压缩 dense history</text>
+
+          <rect class="svg-box" x="600" y="72" width="170" height="104"></rect>
+          <text class="svg-text" x="625" y="108">DSV4Metadata</text>
+          <text class="svg-muted" x="625" y="130">page indices</text>
+          <text class="svg-muted" x="625" y="150">top-k lengths</text>
+
+          <rect class="svg-box" x="820" y="72" width="130" height="104"></rect>
+          <text class="svg-text" x="850" y="112">FlashMLA</text>
+          <text class="svg-muted" x="850" y="135">kernel dispatch</text>
+
+          <path class="svg-arrow" d="M210 76 C245 76, 250 51, 290 51"></path>
+          <path class="svg-arrow" d="M210 76 C245 76, 250 131, 290 131"></path>
+          <path class="svg-arrow" d="M210 76 C245 76, 250 211, 290 211"></path>
+          <path class="svg-arrow" d="M480 51 C535 51, 535 124, 600 124"></path>
+          <path class="svg-arrow" d="M480 131 L600 131"></path>
+          <path class="svg-arrow" d="M480 211 C535 211, 535 145, 600 145"></path>
+          <path class="svg-arrow" d="M770 124 L820 124"></path>
+        </svg>
+      </div>
+      <p class="small">
+        Source: DeepSeek V4 technical report and local SGLang implementation. Report link:
+        <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf">DeepSeek_V4.pdf</a>
+      </p>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          Report 描述的是算法结构，AMD 实现要额外处理硬件友好的 layout：FP8 packed KV、RoPE 部分 BF16 保留、
+          scale padding、以及 HIP kernel 对 page/index 对齐的要求。因此在 AMD 上不要只看 attention 公式，
+          还要追踪 <code>DeepSeekV4SingleKVPool.create_buffer()</code> 中的 bytes-per-token layout 断言。
+        </p>
+      </div>
+    </section>
+
+    <section id="metadata">
+      <h2>Forward Metadata 构建路径</h2>
+      <div class="diagram">
+        <div class="flow-line"></div>
+        <div class="lane">
+          <div class="node">
+            <strong><span class="step-number">1</span>ForwardBatch</strong>
+            <span>req_pool_indices</span>
+            <span>seq_lens / out_cache_loc</span>
+            <span>forward_mode</span>
+          </div>
+          <div class="node">
+            <strong><span class="step-number">2</span>init_forward_metadata</strong>
+            <span>decode / prefill / verify</span>
+            <span>选择分支</span>
+          </div>
+          <div class="node">
+            <strong><span class="step-number">3</span>make_core_attn_metadata</strong>
+            <span>page_table</span>
+            <span>swa_page_indices</span>
+            <span>raw_out_loc</span>
+          </div>
+          <div class="node">
+            <strong><span class="step-number">4</span>compression metadata</strong>
+            <span>C4 indexer metadata</span>
+            <span>C4/C128 compress plan</span>
+          </div>
+          <div class="node">
+            <strong><span class="step-number">5</span>FlashMLA metadata</strong>
+            <span>tile scheduler metadata</span>
+            <span>64-aligned indices</span>
+          </div>
+        </div>
+      </div>
+      <p>
+        上面的流程图表示每个 forward 之前 metadata 从 SGLang scheduler 的 batch 信息流向 DSV4 backend。关键是：
+        attention kernel 并不直接读 request 对象，而是读 backend 预先构造好的 <code>DSV4Metadata</code>。
+      </p>
+      <h3>Metadata 字段速查</h3>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>字段</th>
+            <th>来源</th>
+            <th>消费者</th>
+            <th>作用</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>page_table</code></td>
+            <td><code>req_to_token[req_pool_indices, ::page_size]</code></td>
+            <td>C4 indexer / compression metadata / FlashMLA helpers</td>
+            <td>把 request 级 token history 转成 paged KV block 视图。</td>
+          </tr>
+          <tr>
+            <td><code>raw_out_loc</code></td>
+            <td><code>forward_batch.out_cache_loc</code></td>
+            <td>compress metadata、SWA mapping</td>
+            <td>当前 forward 新 token 在 full KV address space 中的写入位置。</td>
+          </tr>
+          <tr>
+            <td><code>swa_page_indices</code></td>
+            <td><code>get_swa_page_indices()</code></td>
+            <td><code>flash_mla_with_kvcache</code></td>
+            <td>每个 query 要读取的 SWA window cache 索引，最后一维会 pad 到 64 对齐。</td>
+          </tr>
+          <tr>
+            <td><code>swa_topk_lengths</code></td>
+            <td><code>clamp(seq_lens_casual, max=128)</code></td>
+            <td>FlashMLA</td>
+            <td>告诉 kernel 每个 query 的 SWA 有效长度。</td>
+          </tr>
+          <tr>
+            <td><code>c4_sparse_page_indices</code></td>
+            <td>C4 indexer + <code>init_flashmla_related()</code></td>
+            <td>FlashMLA extra cache path</td>
+            <td>C4 压缩历史中被 indexer 选中的稀疏位置。</td>
+          </tr>
+          <tr>
+            <td><code>c128_page_indices</code></td>
+            <td><code>init_compression_metadata()</code></td>
+            <td>FlashMLA extra cache path</td>
+            <td>C128 压缩历史页索引。</td>
+          </tr>
+          <tr>
+            <td><code>swa_out_cache_loc</code></td>
+            <td><code>translate_loc_from_full_to_swa(out_cache_loc)</code></td>
+            <td>SWA cache writer</td>
+            <td>将 full KV slot 转换到 SWA pool 的真实写入位置。</td>
+          </tr>
+          <tr>
+            <td><code>c4_compress_metadata</code> / <code>c128_compress_metadata</code></td>
+            <td><code>create_paged_compressor_data()</code></td>
+            <td><code>CompressorBackendMixin.forward_compress()</code></td>
+            <td>压缩写入计划，包含写入 loc、extra data 和 compressor plan。</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout" style="margin-top:16px">
+        看源码时可以把 <code>init_forward_metadata()</code> 当成 DSV4 attention 的“编译阶段”：
+        它把 request 动态状态编译成 kernel 可直接消费的 page/index/length 张量。
+      </div>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          AMD backend 复用这套 <code>DSV4Metadata</code> 思路，但更依赖 graph/capture 友好的张量生命周期。
+          如果打开 <code>SGLANG_PREP_IN_CUDA_GRAPH</code> 或类似 graph 路径，raw metadata 会在 graph 内升级成 full metadata。
+          ROCm debug 初期建议先关闭 graph，确保 <code>swa_page_indices</code>、<code>extra_indices</code> 和
+          <code>swa_out_cache_loc</code> 在 eager 路径下正确，再考虑 capture。
+        </p>
+      </div>
+    </section>
+
+    <section id="kv-cache">
+      <h2>KV Cache 分层</h2>
+      <div class="pool-wrap">
+        <div class="pool-stack">
+          <div class="pool">
+            <div class="pool-title">SWA Pool</div>
+            <p class="small">所有 layer 都用；保存最近窗口。full slot 需要映射到 SWA slot。</p>
+            <div class="token-row">
+              <span class="token hot"></span><span class="token hot"></span><span class="token hot"></span><span class="token hot"></span>
+              <span class="token hot"></span><span class="token hot"></span><span class="token"></span><span class="token"></span>
+              <span class="token"></span><span class="token"></span><span class="token"></span><span class="token"></span>
+              <span class="token"></span><span class="token"></span><span class="token"></span><span class="token"></span>
+            </div>
+          </div>
+          <div class="pool c4">
+            <div class="pool-title">C4 KV + C4 Indexer Pool</div>
+            <p class="small">C4 layer 使用。Indexer 先选 sparse positions，再读 compressed KV。</p>
+            <div class="token-row">
+              <span class="token c4"></span><span class="token"></span><span class="token"></span><span class="token"></span>
+              <span class="token c4"></span><span class="token"></span><span class="token"></span><span class="token"></span>
+              <span class="token c4"></span><span class="token"></span><span class="token"></span><span class="token"></span>
+              <span class="token c4"></span><span class="token"></span><span class="token"></span><span class="token"></span>
+            </div>
+          </div>
+          <div class="pool c128">
+            <div class="pool-title">C128 KV Pool</div>
+            <p class="small">C128 layer 使用。高压缩比历史，page size 派生为 <code>page_size / 128</code>。</p>
+          </div>
+          <div class="pool state">
+            <div class="pool-title">Compress State Pools</div>
+            <p class="small">跨 forward 维护 compressor rolling state，C4/C128 ring size 不同。</p>
+          </div>
+        </div>
+        <div class="card">
+          <h3>为什么不能用普通 KV Pool</h3>
+          <p>
+            DeepSeek V4 的 attention 不是 <code>K cache + V cache</code> 的单一结构。
+            它需要同时表达 SWA 窗口、C4 compressed history、C128 compressed history、C4 indexer cache 和 compressor state。
+          </p>
+          <div class="code-block">DeepSeekV4TokenToKVPool
+├── swa_kv_pool
+├── c4_kv_pool
+├── c128_kv_pool
+├── c4_indexer_kv_pool
+├── compress_state_pools
+├── indexer_compress_state_pools
+└── full_to_swa_index_mapping</div>
+          <p>
+            因此 <code>forward_batch.out_cache_loc</code> 只是 full KV slot。
+            写入 SWA cache 时必须先经 <code>translate_loc_from_full_to_swa()</code> 得到 <code>swa_out_cache_loc</code>。
+          </p>
+        </div>
+      </div>
+      <h3>Pool sizing 逻辑</h3>
+      <p>
+        <code>DSV4PoolConfigurator</code> 会根据可用显存计算一个 full token budget，然后按 V4 attention 的压缩结构拆分成多类 pool。
+        这一步发生在模型实际 forward 之前，因此 launch 参数会直接影响后续所有 cache layout。
+      </p>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Pool</th>
+            <th>近似大小</th>
+            <th>配置/常量</th>
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>SWA pool</td>
+            <td><code>full_token * swa_full_tokens_ratio</code></td>
+            <td><code>--swa-full-tokens-ratio</code></td>
+            <td>只保存滑窗部分，不需要和 full token budget 等大。</td>
+          </tr>
+          <tr>
+            <td>C4 pool</td>
+            <td><code>full_token / 4</code></td>
+            <td><code>compress_ratio == 4</code></td>
+            <td>HiSparse 打开时 device 侧 C4 pool 还可能按 host/device ratio 进一步缩小。</td>
+          </tr>
+          <tr>
+            <td>C128 pool</td>
+            <td><code>full_token / 128</code></td>
+            <td><code>compress_ratio == 128</code></td>
+            <td>高压缩比历史，单位 token 成本低，但不能替代 C4/SWA。</td>
+          </tr>
+          <tr>
+            <td>C4 state pool</td>
+            <td><code>swa_tokens / window * c4_ring_size</code></td>
+            <td><code>get_compress_state_ring_size(4)</code></td>
+            <td>维护 C4 compressor 的 rolling state。</td>
+          </tr>
+          <tr>
+            <td>C128 state pool</td>
+            <td><code>swa_tokens / window * c128_ring_size</code></td>
+            <td><code>get_compress_state_ring_size(128)</code></td>
+            <td>维护 C128 compressor 的 rolling state；online compress 会改变 ring size 约束。</td>
+          </tr>
+        </tbody>
+      </table>
+      <h3>Full slot 与 SWA slot 的关系</h3>
+      <div class="code-block">forward_batch.out_cache_loc          # scheduler 分配的 full KV slot
+  -> token_to_kv_pool.translate_loc_from_full_to_swa(...)
+  -> DSV4AttnMetadata.swa_out_cache_loc
+  -> token_to_kv_pool.set_swa_key_buffer_radix_fused(...)</div>
+      <p>
+        如果 debug 时看到 SWA cache 读写错位，优先检查 <code>full_to_swa_index_mapping</code> 是否已注册，
+        以及 <code>swa_out_cache_loc</code> shape 是否和当前 forward 的 <code>out_cache_loc</code> 对齐。
+      </p>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          AMD 上的 KV cache layout 需要重点看 <code>DeepSeekV4SingleKVPool</code>：
+          storage dtype 是按 FP8 packed layout 管理的，代码中断言默认 token layout 为
+          <code>qk_nope_head_dim FP8(448) + qk_rope_head_dim BF16(64*2) + scale/pad(8)</code>。
+          这会影响 fused store、FlashMLA 读取和 HiSparse/HICache 传输区域划分。
+        </p>
+      </div>
+    </section>
+
+    <section id="kernel-path">
+      <h2>Attention Kernel Dispatch</h2>
+      <div class="grid two">
+        <div class="card">
+          <h3>模型层 prepare</h3>
+          <p>入口是 <code>MQALayer.forward()</code>。它先完成 Q/KV projection、norm、RoPE 和 cache write。</p>
+          <div class="code-block">MQALayer.forward
+  -> _forward_prepare / _forward_prepare_multi_stream
+  -> fused_q_norm_rope / fused_norm_rope_inplace
+  -> SWA store
+  -> C4/C128 compressor
+  -> C4 indexer
+  -> attn_backend.forward(..., save_kv_cache=False)</div>
+        </div>
+        <div class="card">
+          <h3>Backend kernel</h3>
+          <p>入口是 <code>DeepseekV4AttnBackend.forward()</code> 或 HIP 版本。</p>
+          <div class="code-block">DeepseekV4AttnBackend.forward
+  -> get_swa_key_buffer_radix(layer_id)
+  -> get_extra_key_buffer(layer_id)
+  -> choose indices by compress_ratio
+  -> flash_mla_with_kvcache
+  -> flash_mla_sparse_fwd for large prefill</div>
+        </div>
+      </div>
+
+      <div class="svg-panel" style="margin-top:18px">
+        <svg width="1100" height="340" viewBox="0 0 1100 340" role="img" aria-label="Kernel dispatch flow">
+          <defs>
+            <marker id="arrow2" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L8,3 z" fill="#7dd3fc"></path>
+            </marker>
+          </defs>
+          <rect class="svg-box" x="30" y="50" width="180" height="72"></rect>
+          <text class="svg-text" x="58" y="82">Q/KV projection</text>
+          <text class="svg-muted" x="58" y="104">wqkv / wq_b</text>
+
+          <rect class="svg-box" x="270" y="30" width="210" height="72"></rect>
+          <text class="svg-text" x="302" y="62">Fused norm + RoPE</text>
+          <text class="svg-muted" x="302" y="84">Q and KV prepare</text>
+
+          <rect class="svg-box" x="270" y="135" width="210" height="84"></rect>
+          <text class="svg-text" x="302" y="166">Cache writers</text>
+          <text class="svg-muted" x="302" y="188">SWA / C4 / C128 / indexer</text>
+
+          <rect class="svg-box" x="555" y="78" width="210" height="96"></rect>
+          <text class="svg-text" x="590" y="110">DSV4Metadata</text>
+          <text class="svg-muted" x="590" y="132">swa indices + extra indices</text>
+          <text class="svg-muted" x="590" y="152">FlashMLA scheduler metadata</text>
+
+          <rect class="svg-box" x="840" y="30" width="220" height="78"></rect>
+          <text class="svg-text" x="880" y="63">flash_mla_with_kvcache</text>
+          <text class="svg-muted" x="880" y="85">decode / small extend</text>
+
+          <rect class="svg-box" x="840" y="150" width="220" height="78"></rect>
+          <text class="svg-text" x="888" y="183">flash_mla_sparse_fwd</text>
+          <text class="svg-muted" x="888" y="205">large sparse prefill</text>
+
+          <path d="M210 86 L270 66" stroke="#7dd3fc" stroke-width="2" marker-end="url(#arrow2)" fill="none"></path>
+          <path d="M210 86 L270 177" stroke="#7dd3fc" stroke-width="2" marker-end="url(#arrow2)" fill="none"></path>
+          <path d="M480 66 C520 66, 520 126, 555 126" stroke="#7dd3fc" stroke-width="2" marker-end="url(#arrow2)" fill="none"></path>
+          <path d="M480 177 C520 177, 520 126, 555 126" stroke="#7dd3fc" stroke-width="2" marker-end="url(#arrow2)" fill="none"></path>
+          <path d="M765 126 C810 126, 810 69, 840 69" stroke="#7dd3fc" stroke-width="2" marker-end="url(#arrow2)" fill="none"></path>
+          <path d="M765 126 C810 126, 810 189, 840 189" stroke="#7dd3fc" stroke-width="2" marker-end="url(#arrow2)" fill="none"></path>
+        </svg>
+      </div>
+      <h3>Kernel path 分解</h3>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>阶段</th>
+            <th>典型函数/模块</th>
+            <th>触发条件</th>
+            <th>产物</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Q prepare</td>
+            <td><code>fused_q_norm_rope</code>, <code>fused_qk_norm_rope_swa_store</code></td>
+            <td>取决于 <code>SGLANG_OPT_USE_FUSED_QK_NORM_ROPE</code>、平台和 capture mode</td>
+            <td>FlashMLA 可用的 Q tensor。</td>
+          </tr>
+          <tr>
+            <td>SWA KV write</td>
+            <td><code>set_swa_key_buffer_radix_fused_norm_rope</code>, <code>set_swa_key_buffer_radix_fused</code></td>
+            <td>每个 layer 都需要；写入位置来自 <code>swa_out_cache_loc</code></td>
+            <td>SWA pool 中的 FP8/BF16 packed KV。</td>
+          </tr>
+          <tr>
+            <td>C4/C128 compressor</td>
+            <td><code>forward_core_compressor</code>, <code>hip_compress_forward</code></td>
+            <td><code>compress_ratio</code> 为 4 或 128</td>
+            <td>写入 C4/C128 extra KV pool。</td>
+          </tr>
+          <tr>
+            <td>C4 indexer</td>
+            <td><code>C4Indexer</code>, <code>topk_transform_512</code></td>
+            <td>仅 C4 layer</td>
+            <td><code>c4_sparse_page_indices</code> 和 top-k length。</td>
+          </tr>
+          <tr>
+            <td>Core attention</td>
+            <td><code>flash_mla_with_kvcache</code>, <code>flash_mla_with_kvcache_entrypoint</code></td>
+            <td>decode 或普通 extend</td>
+            <td>attention output。</td>
+          </tr>
+          <tr>
+            <td>Sparse prefill</td>
+            <td><code>flash_mla_sparse_fwd</code></td>
+            <td>large extend 或 <code>SGLANG_OPT_FLASHMLA_SPARSE_PREFILL</code></td>
+            <td>将 SWA + compressed cache gather 到 workspace 后计算 prefill attention。</td>
+          </tr>
+        </tbody>
+      </table>
+      <h3>环境变量对路径的影响</h3>
+      <div class="grid two">
+        <div class="card">
+          <h3>ROCm/HIP 常见调试组合</h3>
+          <div class="code-block">export SGLANG_HACK_FLASHMLA_BACKEND=triton
+export SGLANG_OPT_USE_FUSED_COMPRESS=true
+export SGLANG_OPT_USE_FUSED_COMPRESS_TRITON=true
+export SGLANG_ROCM_USE_MULTI_STREAM=false</div>
+          <p>先把 multi-stream 和 CUDA graph 类变量关掉，缩小 debug 面。</p>
+        </div>
+        <div class="card">
+          <h3>需要小心的性能开关</h3>
+          <p><code>SGLANG_OPT_USE_MULTI_STREAM_OVERLAP</code>、<code>SGLANG_PREP_IN_CUDA_GRAPH</code>、MTP、HiSparse/HiCache 都会改变 metadata 生命周期或 cache 访问模式。基础 correctness 没过前不要一起打开。</p>
+        </div>
+      </div>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          AMD kernel path 的核心分歧在 <code>DeepseekV4HipRadixBackend.forward()</code>：
+          它最终调用 <code>flash_mla_with_kvcache_entrypoint</code>，并用
+          <code>SGLANG_HACK_FLASHMLA_BACKEND</code> 选择 backend。若怀疑 kernel 正确性，先固定
+          <code>backend=triton</code>，再逐步切换到 kernel/AITER 路径比较结果。
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>关键约束</h2>
+      <div class="grid three">
+        <div class="card">
+          <h3>Page Size</h3>
+          <p><code>page_size == 256</code> 是当前 upstream V4 路径的硬约束。</p>
+          <p class="small">C4 page size = 64；C128 page size = 2。</p>
+        </div>
+        <div class="card">
+          <h3>SWA Window</h3>
+          <p>SGLang backend 中 <code>SWA_WINDOW = 128</code>。</p>
+          <p class="small">SWA visible length 由 <code>clamp(seq_lens, max=128)</code> 得到。</p>
+        </div>
+        <div class="card">
+          <h3>Index Alignment</h3>
+          <p>FlashMLA index last dimension 需要 64 对齐。</p>
+          <p class="small"><code>_pad_last_dim(..., multiples_of=64)</code> 负责补齐。</p>
+        </div>
+      </div>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          AMD 上这些约束更像 correctness 前置条件，而不是性能建议。特别是 <code>--page-size 256</code>、
+          <code>--kv-cache-dtype fp8_e4m3</code>、indices 64 对齐和 SWA window 128。
+          任一项偏离，都可能不是“慢一点”，而是直接导致 HIP FlashMLA 或 fused store 读错 layout。
+        </p>
+      </div>
+    </section>
+
+    <section id="modes">
+      <h2>Decode、Prefill、Verify 的差异</h2>
+      <p>
+        Upstream SGLang 的 DSV4 backend 不是所有 forward 都走同一套 metadata 初始化。理解 forward mode 很重要，
+        因为它决定 <code>seq_lens</code> 如何展开、<code>out_cache_loc</code> shape 如何解释，以及 compressor metadata 如何构造。
+      </p>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Forward mode</th>
+            <th>入口函数</th>
+            <th>关键输入</th>
+            <th>主要差异</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Decode / Idle</td>
+            <td><code>init_forward_metadata_decode</code></td>
+            <td><code>req_pool_indices</code>, <code>seq_lens</code>, <code>out_cache_loc</code></td>
+            <td>通常每个 request 一个新 token，metadata shape 接近 batch size。Idle 会走 dummy/padded 分支以保持图和张量形状稳定。</td>
+          </tr>
+          <tr>
+            <td>Prefill / Extend</td>
+            <td><code>init_forward_metadata_prefill</code></td>
+            <td><code>extend_seq_lens</code>, <code>seq_lens_cpu</code>, <code>out_cache_loc</code></td>
+            <td>一个 request 可展开成多个 query token，需要 <code>expand_prefill_casually()</code> 生成 token-level causal seq lens。</td>
+          </tr>
+          <tr>
+            <td>Target Verify</td>
+            <td><code>init_forward_metadata_target_verify</code></td>
+            <td>speculative draft token 数、verify batch</td>
+            <td>用于 MTP/spec decode 验证阶段，可能先生成 raw metadata，再在 graph 内升级成 full metadata。</td>
+          </tr>
+          <tr>
+            <td>Draft Extend</td>
+            <td><code>init_forward_metadata_draft_extend</code></td>
+            <td>draft token per batch</td>
+            <td>当前 V4 MTP top-k 有限制：代码中断言 <code>MTP Topk &gt; 1 not supported for DeepSeek V4</code>。</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="grid two" style="margin-top:18px">
+        <div class="card">
+          <h3>为什么 prefill 更复杂</h3>
+          <p>
+            Decode 的每个 request 基本只新增一个位置；prefill/extend 会在一个 request 内新增一段 token。
+            因此 DSV4 backend 必须把 request-level 的 <code>seq_lens</code> 展开成 token-level 的
+            <code>seq_lens_casual</code>，这样每个 query token 都有正确的可见历史。
+          </p>
+        </div>
+        <div class="card">
+          <h3>为什么 graph 内还有 raw metadata</h3>
+          <p>
+            CUDA graph / HIP graph replay 要求张量 shape 和内存位置稳定。SGLang 会在 out-of-graph 阶段保存 raw metadata，
+            再在 <code>init_forward_metadata_in_graph()</code> 里升级，确保 replay 时读取 live buffer。
+          </p>
+        </div>
+      </div>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          ROCm 调试建议按 mode 分开验证：先 decode，再短 prefill，再长 prefill，最后 target verify/MTP。
+          HIP graph 和 multi-stream 会让 metadata 的准备位置从 Python eager 迁移到 graph 内或 stream overlap 中，
+          问题定位难度会明显上升。
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Debug 时间线</h2>
+      <div class="timeline">
+        <div class="time">Step 1</div>
+        <div>
+          <strong>确认进入 DSV4 backend</strong>
+          <p>日志中应能看到 DSV4 pool sizing、DeepSeekV4TokenToKVPool 初始化、attention backend 初始化。</p>
+        </div>
+        <div class="time">Step 2</div>
+        <div>
+          <strong>确认 metadata 完整</strong>
+          <p>检查 <code>DSV4Metadata.core_attn_metadata</code>，尤其是 <code>swa_page_indices</code>、<code>page_table</code>、C4/C128 indices。</p>
+        </div>
+        <div class="time">Step 3</div>
+        <div>
+          <strong>确认 cache 写入</strong>
+          <p>SWA 写入使用 <code>swa_out_cache_loc</code>；C4/C128 写入使用 <code>c4_out_loc/c128_out_loc</code>。</p>
+        </div>
+        <div class="time">Step 4</div>
+        <div>
+          <strong>确认 FlashMLA dispatch</strong>
+          <p>短 decode 走 <code>flash_mla_with_kvcache</code>；大 prefill 可能走 <code>flash_mla_sparse_fwd</code>。</p>
+        </div>
+      </div>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          AMD debug 日志建议额外打印：是否进入 <code>DeepseekV4HipRadixBackend</code>、当前
+          <code>SGLANG_HACK_FLASHMLA_BACKEND</code>、是否启用 AITER、<code>kv_cache_total_dim</code>、
+          <code>swa_page_indices.shape</code>、<code>extra_indices.shape</code> 和 <code>swa_out_cache_loc</code>。
+          这些比只看最终 token 是否异常更快定位 layout 或 metadata 问题。
+        </p>
+      </div>
+    </section>
+
+    <section id="atom">
+      <h2>ATOM Plugin 适配提醒</h2>
+      <div class="callout">
+        Upstream SGLang 的 <code>DSV4Metadata</code> 与 ATOM V4 的 <code>AttentionMetaData_DSV4</code> 不是同一套对象。
+        如果模型替换为 ATOM V4，就必须显式桥接 metadata/cache ownership；仅注册 <code>dsv4</code> backend 不足以让 ATOM V4 attention 正确运行。
+      </div>
+      <div class="grid two" style="margin-top:18px">
+        <div class="card">
+          <h3>Upstream 原生路线</h3>
+          <div class="code-block">SGLang scheduler
+  -> DeepSeekV4TokenToKVPool
+  -> DSV4Metadata
+  -> sglang.models.deepseek_v4
+  -> FlashMLA</div>
+        </div>
+        <div class="card">
+          <h3>ATOM plugin 路线</h3>
+          <div class="code-block">SGLang scheduler
+  -> ForwardBatch / token_to_kv_pool
+  -> bridge to ATOM AttentionMetaData_DSV4
+  -> atom.models.deepseek_v4
+  -> ATOM kernels</div>
+        </div>
+      </div>
+      <h3>适配时最容易混淆的对象</h3>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Upstream SGLang V4</th>
+            <th>ATOM V4</th>
+            <th>为什么不能直接互换</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>DSV4Metadata</code> / <code>DSV4AttnMetadata</code></td>
+            <td><code>AttentionMetaData_DSV4</code></td>
+            <td>字段集合和语义不同。SGLang 用 page/index/top-k metadata；ATOM 当前 V4 还需要 <code>state_slot_mapping</code>、<code>compress_plans</code>、<code>block_tables</code> 等。</td>
+          </tr>
+          <tr>
+            <td><code>DeepSeekV4TokenToKVPool</code></td>
+            <td>ATOM per-request/unified V4 cache 设计</td>
+            <td>Upstream 拆 SWA/C4/C128/indexer/state pools；ATOM V4 attention 代码里有自己的 state/cache 绑定假设。</td>
+          </tr>
+          <tr>
+            <td><code>DeepseekV4HipRadixBackend</code></td>
+            <td><code>atom.models.deepseek_v4.DeepseekV4Attention</code></td>
+            <td>前者是 SGLang backend；后者是 ATOM 模型内 attention。注册 backend 不会自动填充 ATOM forward context。</td>
+          </tr>
+          <tr>
+            <td>SGLang logits processor</td>
+            <td><code>DeepseekV4ForCausalLM.compute_logits()</code></td>
+            <td>V4 forward 返回 mHC residual stack，不是普通 <code>[N, hidden]</code>；不能直接套 <code>lm_head</code> 路径。</td>
+          </tr>
+        </tbody>
+      </table>
+      <h3>ATOM enable V4 推荐检查顺序</h3>
+      <div class="checklist">
+        <div class="check"><strong>1. 模型注册：</strong>确认 <code>SGLANG_EXTERNAL_MODEL_PACKAGE</code> 命中 ATOM wrapper，而不是 upstream SGLang 原生模型。</div>
+        <div class="check"><strong>2. Config 映射：</strong>确认 <code>compress_ratios</code>、<code>window_size</code>、<code>index_topk</code>、<code>page_size=256</code> 都保留下来。</div>
+        <div class="check"><strong>3. Weight load：</strong>确认 V4 权重映射和 <code>prefix="model."</code> 对齐，特别是 compressor/indexer/head 权重。</div>
+        <div class="check"><strong>4. Logits path：</strong>ATOM V4 必须调用 <code>compute_logits()</code>，不要走通用 <code>lm_head</code>。</div>
+        <div class="check"><strong>5. Metadata bridge：</strong>把 SGLang <code>ForwardBatch</code> 和 cache 信息桥接成 ATOM <code>AttentionMetaData_DSV4</code>。</div>
+        <div class="check"><strong>6. Cache ownership：</strong>明确是复用 upstream <code>DeepSeekV4TokenToKVPool</code>，还是让 ATOM 管理自己的 V4 cache。不要两边同时写。</div>
+        <div class="check"><strong>7. Kernel alignment：</strong>固定 FP8 layout、page size、SWA window、C4/C128 page derivation，再逐步打开性能开关。</div>
+      </div>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          ATOM 在 AMD 上接 V4 时，最容易混合两套“AMD 实现”：upstream SGLang 的 HIP DSV4 backend 与 ATOM 自己的
+          V4 attention/kernel。前者围绕 <code>DeepSeekV4TokenToKVPool + DSV4Metadata</code>，
+          后者围绕 ATOM 的 <code>AttentionMetaData_DSV4</code> 和 ATOM kernel。二者都面向 AMD，
+          但 metadata/cache ownership 不同，不能因为都是 ROCm kernel 就直接拼接。
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>建议 Launch Baseline</h2>
+      <div class="code-block">python3 -m sglang.launch_server \
+  --model-path &lt;DeepSeek-V4-Pro-or-Flash&gt; \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.1 \
+  --chunked-prefill-size 8192 \
+  --attention-backend dsv4 \
+  --disable-radix-cache \
+  --disable-cuda-graph</div>
+      <p>
+        基础路径正确后，再逐步打开 radix cache、cuda graph、multi-stream overlap、MTP、HiSparse/HiCache。
+      </p>
+      <div class="amd-note">
+        <h3>AMD/ROCm 实现补充</h3>
+        <p>
+          AMD baseline 建议固定 <code>SGLANG_HACK_FLASHMLA_BACKEND=triton</code>、关闭
+          <code>SGLANG_ROCM_USE_MULTI_STREAM</code>，并暂时关闭 graph。等单请求 decode 和短 prefill 都过后，
+          再单独评估 fused compress、AITER indexer、multi-stream 和 graph capture。
+        </p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
