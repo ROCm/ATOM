@@ -17,6 +17,7 @@ from aiter import (
     fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
 )
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
@@ -614,6 +615,7 @@ class MLAAttention(nn.Module):
             elif (
                 fused_gemm_a8w8_blockscale_preshuffle_split_cat is not None
                 and weight.dtype == dtypes.fp8
+                and get_gfx() != "gfx1250"
             ):  # FP8 GEMM + split + cat
                 weight_shuffled = weight.reshape(
                     weight.shape[0] // 16, weight.shape[1] * 16
