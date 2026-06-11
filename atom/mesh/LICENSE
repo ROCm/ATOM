@@ -186,7 +186,10 @@
       same "printed page" as the copyright notice for easier
       identification within third-party archives.
 
-   Copyright 2023-2024 SGLang Team
+   Copyright 2025 Advanced Micro Devices, Inc.
+
+   Portions of this software are derived from sgl-model-gateway,
+   Copyright 2023-2024 SGLang Team, licensed under the Apache License 2.0.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
