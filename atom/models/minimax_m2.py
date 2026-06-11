@@ -4,7 +4,8 @@ import torch
 from aiter import QuantType, dtypes
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
-    tensor_model_parallel_fused_qknorm_allreduce,
+    tensor_model_parallel_fused_qknorm_allreduce_rope,
+    tensor_model_parallel_fused_qknorm_allreduce_rope_cache_quant,
 )
 from aiter.dist.parallel_state import (
     get_pp_group,
@@ -26,8 +27,10 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -194,6 +197,15 @@ class MiniMaxM2Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        self.rotary_dim = rotary_dim
+        self.kv_cache_dtype = kv_cache_dtype
+        cos = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+        sin = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+        self.register_buffer(
+            "qknorm_rope_cos_sin_cache",
+            torch.cat([cos, sin], dim=-1).contiguous(),
+            persistent=False,
+        )
 
         self.use_qk_norm = use_qk_norm
         if self.use_qk_norm:
@@ -212,6 +224,13 @@ class MiniMaxM2Attention(nn.Module):
                     self.total_num_kv_heads * self.head_dim
                 )
 
+        self.delegate_qknorm_rope_to_vllm = (
+            is_vllm()
+            and self.use_qk_norm
+            and self.tp_size > 1
+            and self.kv_cache_dtype == "fp8"
+        )
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -220,7 +239,9 @@ class MiniMaxM2Attention(nn.Module):
             kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
             use_mla=False,
-            rotary_emb=self.rotary_emb,
+            rotary_emb=self.rotary_emb if self.delegate_qknorm_rope_to_vllm else None,
+            q_norm=self.q_norm if self.delegate_qknorm_rope_to_vllm else None,
+            k_norm=self.k_norm if self.delegate_qknorm_rope_to_vllm else None,
             prefix=f"{prefix}.attn",
         )
 
@@ -248,14 +269,80 @@ class MiniMaxM2Attention(nn.Module):
         # internal quant and feeds the GEMM directly.
         qkv = self.qkv_proj(hidden_states, hidden_states_scale)
 
-        if self.use_qk_norm:
+        if self.delegate_qknorm_rope_to_vllm:
+            q, k, v = torch.split(
+                qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+        elif self.use_qk_norm:
             # TP-aware RMSNorm: all-reduce variance across TP ranks so
             # normalization uses the global variance (over 6144/1024 dims)
             # rather than per-rank variance (768/128 dims).
             if self.tp_size > 1:
-                q, k, v = tensor_model_parallel_fused_qknorm_allreduce(
-                    qkv, self.q_norm.weight, self.k_norm.weight, self.rms_norm_eps
+                cos_sin_cache = self.qknorm_rope_cos_sin_cache
+                if cos_sin_cache.dtype != qkv.dtype or cos_sin_cache.device != qkv.device:
+                    cos_sin_cache = cos_sin_cache.to(device=qkv.device, dtype=qkv.dtype)
+                fwd_ctx = get_forward_context()
+                fwd_context = getattr(fwd_ctx, "context", None)
+                kv_cache_data = getattr(fwd_ctx, "kv_cache_data", None)
+                use_fused_cache_quant = (
+                    self.kv_cache_dtype == "fp8"
+                    and hasattr(self.attn, "impl")
+                    and fwd_context is not None
+                    and not fwd_context.is_dummy_run
+                    and kv_cache_data is not None
+                    and f"layer_{self.layer_num}" in kv_cache_data
                 )
+                if use_fused_cache_quant:
+                    kv_cache = kv_cache_data[f"layer_{self.layer_num}"]
+                    k_cache = kv_cache.k_cache
+                    v_cache = kv_cache.v_cache
+                    k_scale = kv_cache.k_scale
+                    v_scale = kv_cache.v_scale
+                    if k_scale is not None and v_scale is not None:
+                        x = 16 // k_cache.element_size()
+                        if k_cache.dim() == 5 and v_cache.dim() == 4:
+                            n, nh, hd, bs = v_cache.shape
+                            v_cache = v_cache.view(n, nh, bs // x, hd, x)
+                        q, k, v = (
+                            tensor_model_parallel_fused_qknorm_allreduce_rope_cache_quant(
+                                qkv,
+                                self.q_norm.weight,
+                                self.k_norm.weight,
+                                cos_sin_cache,
+                                positions,
+                                k_cache,
+                                v_cache,
+                                k_scale,
+                                v_scale,
+                                fwd_ctx.attn_metadata.slot_mapping,
+                                self.head_dim,
+                                self.rotary_dim,
+                                self.rms_norm_eps,
+                            )
+                        )
+                        self.attn.impl._skip_next_kv_cache_write = True
+                    else:
+                        q, k, v = tensor_model_parallel_fused_qknorm_allreduce_rope(
+                            qkv,
+                            self.q_norm.weight,
+                            self.k_norm.weight,
+                            cos_sin_cache,
+                            positions,
+                            self.head_dim,
+                            self.rotary_dim,
+                            self.rms_norm_eps,
+                        )
+                else:
+                    q, k, v = tensor_model_parallel_fused_qknorm_allreduce_rope(
+                        qkv,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        cos_sin_cache,
+                        positions,
+                        self.head_dim,
+                        self.rotary_dim,
+                        self.rms_norm_eps,
+                    )
             else:
                 q, k, v = torch.split(
                     qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
@@ -275,10 +362,12 @@ class MiniMaxM2Attention(nn.Module):
                 k = (
                     k * torch.rsqrt(k_var + self.rms_norm_eps) * self.k_norm.weight
                 ).to(orig_dtype)
+                q, k = self.rotary_emb(positions, q, k)
         else:
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
+            q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(
             query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv

@@ -213,6 +213,30 @@ def test_deepseek_wrapper_sets_and_clears_forward_batch_context(monkeypatch):
     assert module.get_current_forward_batch() is None
 
 
+def test_glm_dsa_wrapper_is_registered_with_deepseek_adapter(monkeypatch):
+    """GLM5 should be discoverable by SGLang and reuse the DeepSeek MLA adapter."""
+    fake_model = MagicMock(return_value="hidden_states")
+    fake_model.lm_head = object()
+    setup_hook = MagicMock()
+
+    module, patcher = _import_wrapper_module(
+        monkeypatch,
+        fake_model,
+        is_last_rank=False,
+        setup_hook=setup_hook,
+    )
+    try:
+        wrapper = module.GlmMoeDsaForCausalLM(
+            _Obj(vocab_size=154880, architectures=["GlmMoeDsaForCausalLM"])
+        )
+    finally:
+        patcher.stop()
+
+    assert wrapper.model is fake_model
+    assert module.GlmMoeDsaForCausalLM in module.EntryClass
+    setup_hook.assert_called_once_with(fake_model)
+
+
 def test_deepseek_wrapper_resets_forward_batch_context_on_exception(monkeypatch):
     """DeepSeek ContextVar should not leak across failed forwards."""
     fake_model = MagicMock(side_effect=RuntimeError("boom"))
