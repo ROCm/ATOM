@@ -42,9 +42,11 @@ if TYPE_CHECKING:
 
 try:
     from aiter import (
+        QuantType,
         flash_attn_varlen_func,
         dtypes,
         get_pa_metadata_info_v1,
+        get_hip_quant,
         mha_batch_prefill_func,
         pa_fwd_asm,
         pa_persistent_fwd,
@@ -62,6 +64,7 @@ mla_prefill_ps_asm_fwd = None
 mla_reduce_v1 = None
 mla_prefill_fwd = None
 mla_decode_fwd = None
+fused_gemm_afp4wfp4_preshuffle_split_cat = None
 try:
     from aiter import mla_prefill_ps_asm_fwd
 except ImportError:
@@ -73,6 +76,12 @@ except ImportError:
 try:
     from aiter.mla import mla_prefill_fwd
     from aiter.mla import mla_decode_fwd
+except ImportError:
+    pass
+try:
+    from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import (
+        fused_gemm_afp4wfp4_preshuffle_split_cat,
+    )
 except ImportError:
     pass
 
@@ -600,6 +609,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         max_q_len = self.mla_indices_updater_prefill.max_q_len
         qo_indptr = self.mla_indices_updater_prefill.qo_indptr
+        kv_indptr = self.mla_indices_updater_prefill.kv_indptr
 
         work_metadata = None
         work_indptr = None
@@ -630,7 +640,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
             self.make_mla_prefill_ps_meta_data(
                 qo_indptr,
-                qo_indptr,
+                kv_indptr,
                 forward_batch.seq_lens,
                 work_metadata,
                 work_indptr,
@@ -640,13 +650,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 reduce_partial_map,
                 is_causal=True,
             )
-            total_s = int(forward_batch.extend_seq_lens.sum())
+            total_s = int(forward_batch.seq_lens_sum)
             fp8_prefill_kv_indices = torch.arange(
                 total_s, device=self.device, dtype=torch.int32
             )
 
         self.forward_metadata = ForwardMetadata(
-            self.mla_indices_updater_prefill.kv_indptr,
+            kv_indptr,
             self.mla_indices_updater_prefill.kv_indices,
             qo_indptr,
             self.kv_last_page_len[:bs],
@@ -1883,6 +1893,49 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 qo_indptr,
             )
 
+    def _try_fused_mxfp4_kv_b_proj_fp8(
+        self,
+        layer,
+        kvc_for_gemm,
+        k_pe,
+        qk_nope_head_dim,
+    ):
+        """Return FP8 k/v from MXFP4 kv_b_proj when the fused split-cat path fits."""
+        if fused_gemm_afp4wfp4_preshuffle_split_cat is None:
+            return None
+        weight = getattr(layer.kv_b_proj, "weight", None)
+        weight_scale = getattr(layer.kv_b_proj, "weight_scale", None)
+        if weight is None or weight_scale is None:
+            return None
+        if weight.dtype not in (torch.uint8, getattr(dtypes, "fp4x2", None)):
+            return None
+        if weight.dim() != 2 or weight.shape[0] % 16 != 0:
+            return None
+        if weight_scale.shape[0] % 32 != 0:
+            return None
+
+        m = kvc_for_gemm.shape[0]
+        q_input, x_scale = get_hip_quant(QuantType.per_1x32)(
+            kvc_for_gemm,
+            quant_dtype=dtypes.fp4x2,
+            shuffle=(m >= 32),
+        )
+        if m >= 32:
+            x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+        else:
+            x_scale = x_scale[:m, ...].view(torch.uint8)
+
+        return fused_gemm_afp4wfp4_preshuffle_split_cat(
+            q_input.view(torch.uint8),
+            weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+            k_pe.expand((-1, layer.tp_k_head_num, -1)),
+            x_scale,
+            weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1),
+            qk_nope_head_dim,
+            layer.v_head_dim,
+            dtypes.fp8,
+        )
+
     def _extend_mla_no_prefix(
         self,
         q,
@@ -1938,12 +1991,14 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             causal=True,
         )
 
-    def _extend_mla_fp8_prefill(self, q, k, v, layer, max_q_len, qo_indptr):
+    def _extend_mla_fp8_prefill(self, q, k, v, layer, max_q_len, qo_indptr=None):
         """FP8 prefill path using mla_prefill_ps_asm_fwd + mla_reduce_v1."""
         total_s = q.shape[0]
         nhead = layer.tp_q_head_num
         v_head_dim = layer.v_head_dim
         md = self.forward_metadata
+        if qo_indptr is None:
+            qo_indptr = md.qo_indptr
 
         if q.dtype != dtypes.fp8:
             q = q.to(dtypes.fp8)
@@ -1972,7 +2027,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             k,
             v,
             qo_indptr,
-            qo_indptr,
+            md.kv_indptr,
             md.fp8_prefill_kv_indices,
             md.work_indptr,
             md.work_info_set,
@@ -2029,6 +2084,20 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 kvc.shape[1] == 1
             ), f"Unexpected prefix latent shape for kv_b_proj: {tuple(kvc.shape)}"
         kvc_for_gemm = kvc.reshape(-1, kv_lora_rank).contiguous()
+
+        if self.forward_metadata.fp8_prefill_kv_indices is not None:
+            fused_kv = self._try_fused_mxfp4_kv_b_proj_fp8(
+                layer,
+                kvc_for_gemm,
+                k_pe,
+                qk_nope_head_dim,
+            )
+            if fused_kv is not None:
+                k_prefix, v_prefix = fused_kv
+                return self._extend_mla_fp8_prefill(
+                    q, k_prefix, v_prefix, layer, max_q_len
+                )
+
         kvprefix = layer.kv_b_proj(kvc_for_gemm)
         if isinstance(kvprefix, tuple):
             kvprefix = kvprefix[0]
@@ -2048,6 +2117,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             ],
             dim=-1,
         )
+
+        if self.forward_metadata.fp8_prefill_kv_indices is not None:
+            return self._extend_mla_fp8_prefill(q, k_prefix, v_prefix, layer, max_q_len)
 
         extend_prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
         if extend_prefix_lens is not None:

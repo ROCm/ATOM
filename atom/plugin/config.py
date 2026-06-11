@@ -1,4 +1,5 @@
 import copy
+import json
 from typing import Any, Optional
 from dataclasses import dataclass
 
@@ -181,6 +182,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         enable_dp_attention=False,
         plugin_config=plugin_config,
         speculative_config=atom_speculative_config,
+        online_quant_config=(getattr(config, "additional_config", None) or {}).get(
+            "online_quant_config"
+        ),
     )
 
 
@@ -213,6 +217,14 @@ def _generate_atom_config_from_sglang_config(config: Any):
             "function is called after SGLang has parsed and set its "
             "server arguments."
         )
+
+    sglang_model_loader_extra_config = json.loads(
+        getattr(server_args, "model_loader_extra_config", None) or "{}"
+    )
+    online_quant_config = sglang_model_loader_extra_config.pop(
+        "online_quant_config", None
+    )
+    server_args.model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
 
     sgl_model_config = SglangModelConfig.from_server_args(server_args)
     sgl_model_opt_config = ModelOptConfig(
@@ -332,6 +344,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         master_addr=None,
         enable_dp_attention=server_args.enable_dp_attention,
         plugin_config=plugin_config,
+        online_quant_config=online_quant_config,
     )
 
 

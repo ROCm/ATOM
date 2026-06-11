@@ -177,6 +177,36 @@ the `--online_quant_config` JSON.
 
 ---
 
+## 3.5 Plugin mode (`vllm serve`)
+
+In the [vLLM out-of-tree plugin backend](vllm_plugin_backend_guide.md) you launch
+with `vllm serve`, whose CLI does not understand ATOM's `--online_quant_config`
+flag. Instead, pass the **same JSON object** through vLLM's official plugin
+escape hatch `--additional-config`, under the `online_quant_config` key. ATOM
+reads it during the vLLM→ATOM config translation and routes it through the
+identical load-time quantization path (`process_weights_after_loading`),
+including the `online_quant_info_*.json` dump described in § 4.
+
+```bash
+vllm serve deepseek-ai/DeepSeek-R1-0528 \
+  --tensor-parallel-size 8 \
+  --trust-remote-code \
+  --no-enable-prefix-caching \
+  --additional-config '{"online_quant_config": {
+    "global_quant_config": "ptpc_fp8",
+    "layer_quant_config": {"*expert*": "mxfp4"},
+    "exclude_layer": ["lm_head", "*.gate.*"]
+  }}'
+```
+
+The schema, target formats, pattern semantics, and resolution order are
+identical to the `--online_quant_config` flag documented in § 2. Omitting it
+leaves weights at their source precision. As with the standalone flag, online
+quantization only activates when the source checkpoint's `quant_method` is
+unquantized or per-block FP8 (see § 1).
+
+---
+
 ## 4. Verifying the result
 
 When online quantization runs, rank 0 writes
