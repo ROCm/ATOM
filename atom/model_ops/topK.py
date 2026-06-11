@@ -9,6 +9,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
 from atom.utils.custom_register import direct_register_custom_op
+from atom.plugin.prepare import is_vllm
 
 
 def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
@@ -21,6 +22,10 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         quant_config = config.quant_config
 
     dp_size = config.parallel_config.data_parallel_size
+    # when vllm-atom, the shared expert fusion will be disabled under
+    # DP+EP mode
+    if dp_size > 1 and is_vllm() and config.enable_expert_parallel:
+        return False
     if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
         return False
 

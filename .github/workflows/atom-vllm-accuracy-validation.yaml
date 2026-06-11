@@ -32,12 +32,14 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -71,12 +73,14 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -110,12 +114,14 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -149,12 +155,14 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -188,12 +196,14 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -227,12 +237,14 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -266,12 +278,14 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -305,12 +319,14 @@ on:
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
           - DeepSeek-R1-FP8 TP8
+          - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V3.2-FP8 TP4
           - DeepSeek-V3.2-FP8 TP8
           - DeepSeek-V3.2-FP8 MTP TP4
           - DeepSeek-V3.2-FP8 PTPC TP4
+          - DeepSeek-V3.2-FP8 DP8+EP+DBO
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
           - gpt-oss-120b TP8
@@ -604,6 +620,15 @@ jobs:
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
+                  "toggle_env": "RUN_DSR1_FP8_DP8_EP8",
+                  "model_name": "DeepSeek-R1-FP8 DP8+EP8",
+                  "model_path": "deepseek-ai/DeepSeek-R1-0528",
+                  "extra_args": "--data-parallel-size 8 --enable-expert-parallel",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "MORI_SHMEM_MODE=ISOLATION",
+                  "runner": "linux-atom-mi35x-8",
+              },
+              {
                   "toggle_env": "RUN_DSR1_FP4_TP8",
                   "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
                   "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
@@ -661,6 +686,16 @@ jobs:
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
                   "runner": "atom-plugin-acc-validation-runner",
+              },
+              {
+                  "toggle_env": "RUN_DSV32_FP8_DP8_EP8_DBO",
+                  "model_name": "DeepSeek-V3.2-FP8 DP8+EP+DBO",
+                  "model_path": "deepseek-ai/DeepSeek-V3.2",
+                  "extra_args": "--data-parallel-size 8 --enable-expert-parallel --enable-dbo",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0\nMORI_SHMEM_MODE=ISOLATION",
+                  "runner": "linux-atom-mi35x-8",
               },
               {
                   "toggle_env": "RUN_GPT_OSS_120B_TP1",
