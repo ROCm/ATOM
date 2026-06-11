@@ -2,11 +2,14 @@ name: Atomesh Mocker Benchmark
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - zwan/feat-mesh-ci
     paths:
       - 'atom/mesh/**'
       - '.github/scripts/atomesh_mocker_benchmark.sh'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
+      - '.github/dashboard/atomesh_mocker_index.html'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -14,6 +17,7 @@ on:
       - 'atom/mesh/**'
       - '.github/scripts/atomesh_mocker_benchmark.sh'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
+      - '.github/dashboard/atomesh_mocker_index.html'
   schedule:
     # Nightly at 02:00 Beijing time (18:00 UTC)
     - cron: '0 18 * * *'
