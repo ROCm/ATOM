@@ -492,6 +492,20 @@ class MoRIIOConnector(KVConnectorBase):
         if remote_engine_id not in self._built_sessions:
             nk = self.num_k_chunks
             per_layer_sessions: list[tuple[dict, dict]] = []
+            local_layers = set(self.layer_name_to_local_kv_cache_metadata)
+            remote_layers = set(
+                self.layer_name_to_remote_kv_cache_metadata[remote_engine_id]
+            )
+            if local_layers != remote_layers:
+                # Fail fast on P/D layer-set asymmetry (likely MTP config
+                # mismatch) instead of a bare KeyError on the missing layer.
+                raise RuntimeError(
+                    "P/D KV layer-set mismatch (likely MTP config asymmetry): "
+                    f"local-only={sorted(local_layers - remote_layers)} "
+                    f"remote-only={sorted(remote_layers - local_layers)}. Both "
+                    "prefill and decode must launch with identical "
+                    "--method / --num-speculative-tokens."
+                )
             for ln, local_metas in self.layer_name_to_local_kv_cache_metadata.items():
                 remote_metas = self.layer_name_to_remote_kv_cache_metadata[
                     remote_engine_id
@@ -1045,6 +1059,12 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         """
         # Attach output metadata for the proxy to relay
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
+        # MTP drafts for the consumer's first-decode priming (empty when off);
+        # see mooncake_connector.request_finished for the rationale.
+        drafts = getattr(seq, "spec_token_ids", None)
+        draft_token_ids = (
+            [int(x) for x in drafts] if drafts is not None and len(drafts) else []
+        )
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
@@ -1057,6 +1077,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "dp_rank": self.dp_rank,
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
+            "draft_token_ids": draft_token_ids,
         }
 
         # Clean up transfer ID mapping on the consumer side
