@@ -610,12 +610,14 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         win=win,
         cs=cs,
     )
-    # Append HCA compressed tail on CPU for the first-cut eager bridge.
+    # Fill HCA compressed section on CPU for the first-cut eager bridge.
+    # `write_v4_paged_decode_indices` writes the SWA prefix at the TAIL of each
+    # per-token slice, so HCA compressed entries must occupy the HEAD starting
+    # at hca_indptr[t].  This mirrors native ATOM's _attach_v4_paged_decode_meta.
     hca_cpu = hca_indices.detach().cpu().numpy()
     for t, bid in enumerate(batch_np):
-        n_swa = int(swa_counts[t])
         n_hca = int(hca_counts[t])
-        base = int(hca_indptr_np[t]) + n_swa
+        base = int(hca_indptr_np[t])
         if n_hca:
             hca_cpu[base : base + n_hca] = (
                 int(md.swa_pages)
