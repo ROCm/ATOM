@@ -79,7 +79,19 @@ class ChunkGatedDeltaRule(nn.Module):
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         o: torch.Tensor | None = None,
+        num_decodes: int = 0,
+        num_decode_tokens: int = 0,
     ):
+        # `num_decodes` / `num_decode_tokens`: GDN mixed-batch hint that
+        # `cu_seqlens` is the ORIGINAL non-spec cumulative sequence lengths
+        # with a leading decode-only prefix of `num_decodes` sequences /
+        # `num_decode_tokens` tokens to skip. Passing them all the way
+        # down lets the chunk_vk prologue (`prepare_chunk_indices`,
+        # `prepare_chunk_offsets`, `prepare_rebased_cu_seqlens`) reuse
+        # its `@tensor_cache` entries across forward calls — the cache
+        # key is keyed on `cu_seqlens` identity, not content, so handing
+        # in the cache-stable metadata tensor avoids the D2H syncs that
+        # `.tolist()` inside the prologue would otherwise trigger.
         return self._fla_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -91,6 +103,8 @@ class ChunkGatedDeltaRule(nn.Module):
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             o=o,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
         )
 
 
@@ -238,6 +252,168 @@ class GatedDeltaNet(nn.Module):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
+    # ----- Recurrent-attention path helpers -------------------------------
+    # Three call sites for the gated-delta-rule recurrence, one per request
+    # type. Splitting them out (instead of the prior single if/elif/else
+    # block inside `forward`) lets `forward` route a mixed batch — spec +
+    # decode + prefill in the same call — to all three in turn, then
+    # concatenate their outputs token-wise. Each helper owns its own
+    # ssm_state plumbing so the dispatcher stays simple.
+    #
+    # Signature difference vs `atom.model_ops.attention_gdn.GatedDeltaNet`:
+    # the decode and spec kernels here (`fused_sigmoid_gating_delta_rule_update`)
+    # fuse the `g`/`beta` computation inside the kernel, so those helpers
+    # take `a`/`b` directly. The prefill kernel (`chunk_gated_delta_rule_vk`)
+    # does not fuse gating, so `gdr_prefill` consumes the pre-computed
+    # `g`/`beta` from `fused_gdn_gating`.
+
+    def gdr_prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_state: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        non_spec_state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        o: torch.Tensor | None = None,
+        num_decodes: int = 0,
+        num_decode_tokens: int = 0,
+    ) -> torch.Tensor:
+        """Chunked-prefill path. Python-side gather of the initial state
+        out of `ssm_state`, zero out slots whose sequences have no prior
+        state, run the chunk kernel, scatter the final state back.
+
+        `o` is an optional pre-allocated inplace output buffer; pass it
+        only when the prefill output can be written straight into the
+        caller's `core_attn_out` slice without an intermediate copy.
+
+        `query_start_loc` is the ORIGINAL non-spec cumulative sequence
+        lengths (cache-stable across forward calls). `num_decodes` and
+        `num_decode_tokens` tell the chunk-vk prologue to skip the
+        leading decode-only prefix; the prologue does the rebase
+        internally under `@tensor_cache`, avoiding a per-call D2H sync.
+        """
+        # from aiter.ops.flydsl.linear_attention_prefill_kernels import flydsl_gdr_prefill
+        from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
+            chunk_gated_delta_rule_opt_vk,
+        )
+
+        initial_state = ssm_state[non_spec_state_indices].contiguous()
+        initial_state[~has_initial_state, ...] = 0
+        core_attn_out, last_recurrent_state = chunk_gated_delta_rule_opt_vk(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            o=o,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+        )
+        ssm_state[non_spec_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+        return core_attn_out
+
+    def gdr_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_state: torch.Tensor,
+        non_spec_state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        o: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Single-token decode path (one token per request, no spec).
+        Uses the fused sigmoid-gating + delta-rule kernel which reads/
+        writes ssm_state inplace via the slot table.
+
+        When `ATOM_USE_FLYDSL_GDR` is set and aiter is importable, takes
+        the flydsl decode fast-path instead. `o` is required when the
+        flydsl path is selected (it has no `output_final_state` return).
+        """
+        if USE_FLYDSL_GDR:
+            assert o is not None, "flydsl_gdr_decode requires a pre-allocated o"
+            core_attn_out = o
+            # flydsl expects (seq, batch, num_v_heads, head_v_dim).
+            q_perm = q.permute(1, 0, 2, 3)
+            # NOTE: a and b use the (batch, seq, num_v_heads) layout.
+            flydsl_gdr_decode(
+                query=q_perm,
+                key=k,
+                value=v,
+                a=a.unsqueeze(1),
+                b=b.unsqueeze(1),
+                dt_bias=self.dt_bias,
+                A_log=self.A_log,
+                indices=non_spec_state_indices,
+                state=ssm_state,
+                out=core_attn_out,
+                use_qk_l2norm=True,
+                need_shuffle_state=False,
+                stream=torch.cuda.current_stream(),
+            )
+            return core_attn_out
+
+        core_attn_out, _ = fused_sigmoid_gating_delta_rule_update(
+            A_log=self.A_log,
+            a=a,
+            b=b,
+            dt_bias=self.dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            initial_state=ssm_state,
+            inplace_final_state=True,
+            cu_seqlens=query_start_loc,
+            ssm_state_indices=non_spec_state_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return core_attn_out
+
+    def gdr_spec(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_state: torch.Tensor,
+        spec_state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Multi-query speculative-decode path. Walks only the accepted
+        prefix of each candidate (via `num_accepted_tokens`) and updates
+        ssm_state inplace at the slot pointed to by column 0 of
+        `spec_state_indices`.
+        """
+        core_attn_out, _ = fused_sigmoid_gating_delta_rule_update(
+            A_log=self.A_log,
+            a=a,
+            b=b,
+            dt_bias=self.dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            initial_state=ssm_state,
+            inplace_final_state=True,
+            cu_seqlens=query_start_loc,
+            ssm_state_indices=spec_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return core_attn_out
+
     def forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -367,6 +543,9 @@ class GatedDeltaNet(nn.Module):
                 1, num_tokens_nonspec, -1, self.head_v_dim
             )
 
+        # Gating: pre-computed only for the prefill path (chunk kernel does
+        # not fuse gating). The decode/spec kernels fuse gating internally
+        # from `a`/`b`/`A_log`/`dt_bias`, so they don't need `g`/`beta`.
         if attn_metadata.num_prefills > 0:
             g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
             if spec_sequence_masks is not None:
@@ -379,118 +558,179 @@ class GatedDeltaNet(nn.Module):
             g_non_spec = None
             beta_non_spec = None
 
-        # 2. Recurrent attention
+        # For the decode helper, `a`/`b` need to be in non-spec token order
+        # (the kernel walks them via `cu_seqlens=non_spec_query_start_loc`).
+        # When spec is active, gather the non-spec rows out of the full
+        # mixed `a`/`b`; otherwise the whole tensor is already non-spec.
+        if (
+            attn_metadata.num_decodes > 0
+            and spec_sequence_masks is not None
+            and non_spec_token_indx is not None
+        ):
+            a_non_spec = a.index_select(0, non_spec_token_indx)
+            b_non_spec = b.index_select(0, non_spec_token_indx)
+        else:
+            a_non_spec = a
+            b_non_spec = b
 
-        # 2.1: Process the multi-query part
+        num_decodes = attn_metadata.num_decodes
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_prefills = attn_metadata.num_prefills
+
+        # 2. Recurrent attention — dispatch to per-request-type helpers.
+        # The three sub-paths (spec multi-query, single-token decode,
+        # chunked prefill) are independent and may all fire in the same
+        # call when the batch is mixed. All run on the default stream;
+        # an earlier multi-stream design was tried but the event/stream
+        # bookkeeping overhead outweighed the overlap gain.
+
+        core_attn_out_decode = None
+        core_attn_out_prefill = None
+
+        # 2.1: Chunked-prefill path.
+        #
+        # Disjoint-region invariants when decode also runs:
+        #   * `ssm_state` rows: decode uses
+        #     `non_spec_state_indices_tensor[:num_decodes]`, prefill
+        #     uses `non_spec_state_indices_tensor[num_decodes:]`.
+        #   * `core_attn_out` slices: decode writes `[:num_decode_tokens]`,
+        #     prefill writes `[num_decode_tokens:num_actual_tokens]`.
+        if num_prefills > 0:
+            # Prefill `o` target. When spec is absent the prefill output
+            # goes straight into `core_attn_out` (either the full
+            # `[:num_actual_tokens]` slice when there are no decode
+            # tokens, or the tail past the decode tokens otherwise).
+            # With spec active the merge below needs a separately-
+            # allocated buffer.
+            if spec_sequence_masks is None:
+                prefill_o = core_attn_out[
+                    num_decode_tokens:num_actual_tokens
+                ].unsqueeze(0)
+            else:
+                prefill_o = None
+
+            # Pass the ORIGINAL `non_spec_query_start_loc` (the
+            # metadata's tensor, cache-stable across forward calls)
+            # plus `num_decodes` / `num_decode_tokens`. The chunk-vk
+            # prologue rebases it under `@tensor_cache`, avoiding a
+            # per-call `[num_decodes:] - num_decode_tokens` subtraction
+            # kernel and the `.tolist()` D2H syncs that the old ad-hoc
+            # rebase would otherwise trigger inside
+            # `prepare_chunk_indices` / `prepare_chunk_offsets`.
+            core_attn_out_prefill = self.gdr_prefill(
+                q=query_non_spec[:, num_decode_tokens:],
+                k=key_non_spec[:, num_decode_tokens:],
+                v=value_non_spec[:, num_decode_tokens:],
+                g=(
+                    g_non_spec[:, num_decode_tokens:]
+                    if g_non_spec is not None
+                    else None
+                ),
+                beta=(
+                    beta_non_spec[:, num_decode_tokens:]
+                    if beta_non_spec is not None
+                    else None
+                ),
+                ssm_state=ssm_state,
+                has_initial_state=(
+                    has_initial_state[num_decodes:]
+                    if has_initial_state is not None
+                    else None
+                ),
+                non_spec_state_indices=non_spec_state_indices_tensor[num_decodes:],
+                query_start_loc=non_spec_query_start_loc,
+                o=prefill_o,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+
+        # 2.2: Spec multi-query path.
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
-                    a=a,
-                    b=b,
-                    dt_bias=self.dt_bias,
-                    q=query_spec,
-                    k=key_spec,
-                    v=value_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=spec_query_start_loc[
-                        : attn_metadata.num_spec_decodes + 1
-                    ],
-                    ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=num_accepted_tokens,
-                    use_qk_l2norm_in_kernel=True,
-                )
+            core_attn_out_spec = self.gdr_spec(
+                q=query_spec,
+                k=key_spec,
+                v=value_spec,
+                a=a,
+                b=b,
+                ssm_state=ssm_state,
+                spec_state_indices=spec_state_indices_tensor,
+                query_start_loc=spec_query_start_loc[
+                    : attn_metadata.num_spec_decodes + 1
+                ],
+                num_accepted_tokens=num_accepted_tokens,
             )
         else:
-            core_attn_out_spec, last_recurrent_state = None, None
+            core_attn_out_spec = None
 
-        # 2.2: Process the remaining part
-        if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-            initial_state[~has_initial_state, ...] = 0
-            # When spec_sequence_masks is None, T_nonspec == num_actual_tokens
-            # and core_attn_out[:num_actual_tokens] is contiguous, so the
-            # prefill kernel can write its output directly into that slice —
-            # saves a `core_attn_out_non_spec.squeeze(0)` copy per layer per
-            # prefill step. With spec decode active, mixed_qkv was index_select'd
-            # by non_spec_token_indx so T_nonspec < num_actual_tokens and the
-            # merge below (index_copy_) needs a separately-allocated buffer to
-            # scatter back to the correct slot positions — fall back to o=None.
+        # 2.3: Single-token decode path. vLLM convention: decode tokens
+        # come first in the non-spec slice (one per request), followed
+        # by variable-length prefill tokens.
+        if num_decodes > 0:
+            # Decode `o` slice. The decode kernel writes `[num_decode_tokens,
+            # H, V]` token-major into `core_attn_out` when spec is absent —
+            # the slice `[:num_decode_tokens]` is the right region whether
+            # or not prefill also fires, because the prefill helper above
+            # writes into `[num_decode_tokens:num_actual_tokens]`. With spec
+            # active the merge below needs to scatter via `index_copy_` to
+            # spec-interleaved positions, so allocate a separate buffer.
             if spec_sequence_masks is None:
-                o_buf = core_attn_out[:num_actual_tokens].unsqueeze(0)
+                decode_o = core_attn_out[:num_decode_tokens]
             else:
-                o_buf = None
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                o=o_buf,
-            )
-            # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
-            )
-            # When spec_sequence_masks is None the kernel already wrote into
-            # core_attn_out via o_buf — no copy needed here. With spec decode,
-            # core_attn_out_non_spec is a separate alloc and the merge below
-            # scatters it via index_copy_.
-        elif attn_metadata.num_decodes > 0:
-            o = core_attn_out[: attn_metadata.num_decode_tokens]
-            if USE_FLYDSL_GDR:
-                core_attn_out_non_spec = query_non_spec.new_empty(*value_non_spec.shape)
-                query_non_spec = query_non_spec.permute(1, 0, 2, 3)
-                # NOTE: a and b should use the (batch, seq, num_v_heads) layout
-                flydsl_gdr_decode(
-                    query=query_non_spec,
-                    key=key_non_spec,
-                    value=value_non_spec,
-                    a=a.unsqueeze(1),
-                    b=b.unsqueeze(1),
-                    dt_bias=self.dt_bias,
-                    A_log=self.A_log,
-                    indices=non_spec_state_indices_tensor,
-                    state=ssm_state,
-                    out=o,
-                    use_qk_l2norm=True,
-                    need_shuffle_state=False,
-                    stream=torch.cuda.current_stream(),
-                )
-
-                last_recurrent_state = None
-            else:
-                core_attn_out_non_spec, last_recurrent_state = (
-                    fused_sigmoid_gating_delta_rule_update(
-                        A_log=self.A_log,
-                        a=a,
-                        b=b,
-                        dt_bias=self.dt_bias,
-                        q=query_non_spec,
-                        k=key_non_spec,
-                        v=value_non_spec,
-                        o=o,
-                        initial_state=ssm_state,
-                        inplace_final_state=True,
-                        cu_seqlens=non_spec_query_start_loc[
-                            : attn_metadata.num_decodes + 1
-                        ],
-                        ssm_state_indices=non_spec_state_indices_tensor,
-                        use_qk_l2norm_in_kernel=True,
+                decode_o = query_non_spec.new_empty(
+                    (
+                        num_decode_tokens,
+                        value_non_spec.shape[2],
+                        value_non_spec.shape[3],
                     )
                 )
-        else:
-            core_attn_out_non_spec, last_recurrent_state = None, None
+            core_attn_out_decode = self.gdr_decode(
+                q=query_non_spec[:, :num_decode_tokens],
+                k=key_non_spec[:, :num_decode_tokens],
+                v=value_non_spec[:, :num_decode_tokens],
+                a=a_non_spec[:num_decode_tokens],
+                b=b_non_spec[:num_decode_tokens],
+                ssm_state=ssm_state,
+                non_spec_state_indices=non_spec_state_indices_tensor[:num_decodes],
+                query_start_loc=non_spec_query_start_loc[: num_decodes + 1],
+                o=decode_o,
+            )
 
-        # 3. Merge core attention output
+        # Stitch the decode and prefill outputs back into a single
+        # non-spec tensor in the same token order they came in. When spec
+        # is absent, both helpers already wrote inplace into adjacent
+        # slices of `core_attn_out` (decode → `[:num_decode_tokens]`,
+        # prefill → `[num_decode_tokens:num_actual_tokens]`), so no cat is
+        # needed — `core_attn_out[:num_actual_tokens]` already holds the
+        # stitched non-spec result. With spec active both helpers wrote
+        # into separate fresh buffers (or a `None` o for prefill) and we
+        # need to cat them for the `index_copy_` in the merge step below.
+        if (
+            spec_sequence_masks is not None
+            and core_attn_out_decode is not None
+            and core_attn_out_prefill is not None
+        ):
+            # decode helper returned `[num_decode_tokens, H, V]` (flat
+            # alloc, spec-active path); promote to `[1, ..., H, V]` for cat.
+            if core_attn_out_decode.dim() == 3:
+                core_attn_out_decode_4d = core_attn_out_decode.unsqueeze(0)
+            else:
+                core_attn_out_decode_4d = core_attn_out_decode
+            core_attn_out_non_spec = torch.cat(
+                (core_attn_out_decode_4d, core_attn_out_prefill), dim=1
+            )
+        elif core_attn_out_decode is not None:
+            core_attn_out_non_spec = core_attn_out_decode
+        elif core_attn_out_prefill is not None:
+            core_attn_out_non_spec = core_attn_out_prefill
+        else:
+            core_attn_out_non_spec = None
+
+        # 3. Merge core attention output. Three cases:
+        #   (a) spec + non-spec coexist → scatter via index_copy_ into a
+        #       fresh `[num_actual_tokens]` buffer.
+        #   (b) spec only → copy spec output into core_attn_out.
+        #   (c) non-spec only → the helpers already wrote into core_attn_out
+        #       via their inplace `o` slices (no copy needed).
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             merged_out = torch.empty(
                 (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
@@ -498,7 +738,14 @@ class GatedDeltaNet(nn.Module):
                 device=core_attn_out_non_spec.device,
             )
             merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
-            merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            # core_attn_out_non_spec may be 3-D (flat decode-only) or 4-D
+            # (prefill or cat). Promote to 4-D for index_copy_ on dim 1.
+            non_spec_4d = (
+                core_attn_out_non_spec.unsqueeze(0)
+                if core_attn_out_non_spec.dim() == 3
+                else core_attn_out_non_spec
+            )
+            merged_out.index_copy_(1, non_spec_token_indx, non_spec_4d)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)

@@ -345,6 +345,9 @@ def test_register_custom_attention_uses_aiter_name():
     fake_modules["atom.models.deepseek_v2"].DeepseekV3ForCausalLM = type(
         "DeepseekV3ForCausalLM", (), {}
     )
+    fake_modules["atom.models.deepseek_v2"].GlmMoeDsaForCausalLM = type(
+        "GlmMoeDsaForCausalLM", (), {}
+    )
     fake_modules["atom.models.minimax_m2"].MiniMaxM2ForCausalLM = type(
         "MiniMaxM2ForCausalLM", (), {}
     )

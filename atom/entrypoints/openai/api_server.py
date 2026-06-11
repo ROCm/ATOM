@@ -839,6 +839,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     sampling_params,
                     request_id,
                     multimodal_data=stream_multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
                 )
                 gen = stream_chat_response_fanout(
                     request_id,
@@ -855,6 +856,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     sampling_params,
                     request_id,
                     multimodal_data=stream_multimodal_data,
+                    kv_transfer_params=request.kv_transfer_params,
                 )
                 gen = stream_chat_response(
                     request_id,
@@ -877,6 +879,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 sampling_params,
                 request_id,
                 multimodal_data=multimodal_data,
+                kv_transfer_params=request.kv_transfer_params,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
@@ -896,13 +899,23 @@ async def chat_completions(request: ChatCompletionRequest):
                 request_id, model_name, final_output["text"], final_output
             )
         elif effective_n > 1:
-            outputs = await generate_async_fanout(prompt, sampling_params, request_id)
+            outputs = await generate_async_fanout(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=request.kv_transfer_params,
+            )
             if not outputs:
                 raise RuntimeError("No output generated")
             resp = build_chat_response_multi(request_id, model_name, outputs)
         else:
             final_output = None
-            async for output in generate_async(prompt, sampling_params, request_id):
+            async for output in generate_async(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=request.kv_transfer_params,
+            ):
                 final_output = output
             if final_output is None:
                 raise RuntimeError("No output generated")
@@ -1031,6 +1044,34 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/debug/mtp_stats")
+async def get_mtp_stats():
+    """Return current speculative decoding acceptance statistics."""
+    global engine
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        return engine.get_mtp_statistics()
+    except Exception as e:
+        logger.error(f"Failed to get MTP statistics: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get MTP statistics: {str(e)}"
+        )
+
+
+@app.get("/kv_transfer_info")
+async def kv_transfer_info():
+    global engine
+    cfg = engine.config
+    kv_cfg = cfg.kv_transfer_config or {}
+    return {
+        "tp_size": cfg.tensor_parallel_size,
+        "dp_size": cfg.parallel_config.data_parallel_size,
+        "kv_role": kv_cfg.get("kv_role"),
+        "handshake_port": kv_cfg.get("handshake_port", 6301),
+    }
+
+
 @app.post("/start_profile")
 async def start_profile():
     """Start profiling the engine."""
@@ -1050,10 +1091,11 @@ async def stop_profile():
     """Stop profiling the engine."""
     global engine
     try:
-        engine.stop_profile()
+        traces = engine.stop_profile()
         return {
             "status": "success",
             "message": "Profiling stopped. Trace files generated.",
+            "traces": traces,
         }
     except Exception as e:
         logger.error(f"Failed to stop profiling: {e}", exc_info=True)

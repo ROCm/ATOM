@@ -124,6 +124,58 @@ def test_prepare_model_sglang_happy_path():
     assert result is fake_model
 
 
+def test_prepare_model_remaps_quant_config_for_generic_wrapper():
+    fake_quant_config = MagicMock()
+    fake_atom_config = _Obj(
+        hf_config=_Obj(model_type="glm_moe_dsa"),
+        plugin_config=_Obj(is_plugin_mode=True),
+        quant_config=fake_quant_config,
+    )
+    fake_model = MagicMock(name="FakeGlmModel")
+    fake_model_cls = MagicMock(return_value=fake_model)
+    fake_model_cls.packed_modules_mapping = {"gate_proj": ("gate_up_proj", 0)}
+    fake_model_cls.hf_to_atom_mapper = object()
+    fake_model_cls.quant_exclude_name_mapping = {
+        "indexers_proj": "indexer.weights_proj",
+    }
+    fake_model_cls.quant_default_exclude_layers = ["*.indexer.weights_proj"]
+
+    fake_register = _make_fake_register_module(
+        model_dict={"GlmMoeDsaForCausalLM": fake_model_cls}
+    )
+    fake_runtime = _make_fake_runtime_module()
+    fake_config_mod = MagicMock()
+    fake_config_mod.generate_atom_config_for_plugin_mode = MagicMock(
+        return_value=fake_atom_config
+    )
+
+    with patch.dict(
+        sys.modules,
+        {
+            "atom.plugin.register": fake_register,
+            "atom.plugin.config": fake_config_mod,
+            "atom.plugin.sglang.runtime": fake_runtime,
+            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+                apply_graph_capture_patch=MagicMock()
+            ),
+        },
+    ):
+        config = _Obj(architectures=["GlmMoeDsaForCausalLM"])
+        result = sglang_prepare.prepare_model(config=config)
+
+    fake_quant_config.remap_layer_name.assert_called_once_with(
+        fake_atom_config.hf_config,
+        packed_modules_mapping=fake_model_cls.packed_modules_mapping,
+        weights_mapper=fake_model_cls.hf_to_atom_mapper,
+        quant_exclude_name_mapping=fake_model_cls.quant_exclude_name_mapping,
+    )
+    fake_quant_config.apply_default_exclude_layers.assert_called_once_with(
+        fake_model_cls.quant_default_exclude_layers
+    )
+    fake_model_cls.assert_called_once_with(atom_config=fake_atom_config)
+    assert result is fake_model
+
+
 def test_prepare_model_selects_sglang_dict_for_deepseek_v2():
     """Verify that sglang engine uses _ATOM_SUPPORTED_MODELS (has DeepSeekV2)."""
     fake_atom_config = _Obj(plugin_config=_Obj(is_plugin_mode=True))

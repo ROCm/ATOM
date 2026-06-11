@@ -49,15 +49,13 @@ python -m atom.entrypoints.openai_server \
 
 Override knobs (escape hatches, normally not needed):
 
-- **`ATOM_V4_ROUTED_QUANT={fp4,fp8_block}`** — forces the routed-expert path. Useful for debugging or when the auto-detection picks the wrong scheme. `fp8` and `fp8_per_block` are valid aliases for `fp8_block`.
-- **`ATOM_V4_DISABLE_FUSED_SHARED=1`** — disables the aiter fused shared+routed expert kernel. On V4-Flash-Base both routed and shared experts are FP8 (matching dtype), so the framework auto-enables fusion. If you hit numerical instabilities or kernel issues on a specific GPU, set this to 1 to keep them as 2 separate kernels.
 - **`ATOM_USE_TRITON_MOE=1`** — `gfx942` defaults to Triton MoE automatically (no need to set), but it doesn't hurt to set explicitly. Required on `gfx950` for V4-Pro (see V4-Pro section above).
 
 #### Auto-detection logic
 
 The routed-expert quant spec is resolved in this priority order (see [`_detect_v4_routed_quant_spec`](../atom/models/deepseek_v4.py)):
 
-1. **`ATOM_V4_ROUTED_QUANT` env override** — explicit forcing.
+1. **HF config `expert_dtype`** — if `config.json` declares `expert_dtype` (e.g. `"fp8"` / `"fp4"`), use it directly.
 2. **Parser-derived layer spec** — if the ckpt's `quantization_config.layer_quant_config` (Quark) or global config (compressed-tensors / generic) directly produces a per-layer spec for `ffn.experts.*.w*`, that wins.
 3. **Heuristic from `quant_method` / `fmt`** — strings containing `fp8` → FP8 block; `fp4` / `mxfp4` → FP4.
 4. **V4-Pro fallback** — historical default.

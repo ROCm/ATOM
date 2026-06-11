@@ -67,6 +67,7 @@ def _reset_framework_state():
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
         "DeepseekV3ForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "Qwen3MoeForCausalLM",
     ),
 )

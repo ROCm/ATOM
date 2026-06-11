@@ -48,6 +48,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -87,6 +88,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -126,6 +128,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -165,6 +168,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -204,6 +208,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -243,6 +248,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -282,6 +288,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -321,6 +328,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -915,6 +923,7 @@ jobs:
               "DeepSeek-V3.2 FP8 TP4 (AW)",
               "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
               "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
+              "DeepSeek-V4-Pro TP8 (OOB)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
               "GLM-4.7-FP8 TP4 (AW)",
@@ -1187,16 +1196,28 @@ jobs:
                       key=lambda p: (
                           int(p["input_length"]),
                           int(p["output_length"]),
+                          str(p["random_range_ratio"]),
                           int(p["concurrency"]),
                       )
                   )
-                  if filtered_params:
+                  cases_by_pair = {}
+                  for param in filtered_params:
+                      pair_key = (
+                          int(param["input_length"]),
+                          int(param["output_length"]),
+                          str(param["random_range_ratio"]),
+                      )
+                      cases_by_pair.setdefault(pair_key, []).append(param)
+
+                  for pair_key in sorted(cases_by_pair):
+                      pair_cases = cases_by_pair[pair_key]
                       include.append(
                           {
                               "model": model,
-                              # Keep params for job naming and older consumers; AW runs all cases below.
-                              "params": filtered_params[0],
-                              "cases": filtered_params,
+                              # One AW matrix cell launches one server for one ISL/OSL pair,
+                              # then runs all concurrency cases for that pair.
+                              "params": pair_cases[0],
+                              "cases": pair_cases,
                           }
                       )
               else:
@@ -1340,7 +1361,7 @@ jobs:
           docker rmi atom_oot_base:ci || true
 
   benchmark:
-    name: ${{ contains(matrix.model.display, '(AW)') && format('OOT {0} all AW cases', matrix.model.display) || format('OOT {0} {1}/{2} c={3}', matrix.model.display, matrix.params.input_length, matrix.params.output_length, matrix.params.concurrency) }}
+    name: ${{ contains(matrix.model.display, '(AW)') && format('OOT {0} {1}/{2} all concurrency', matrix.model.display, matrix.params.input_length, matrix.params.output_length) || format('OOT {0} {1}/{2} c={3}', matrix.model.display, matrix.params.input_length, matrix.params.output_length, matrix.params.concurrency) }}
     needs: [resolve-atom-source, build-benchmark-matrix, build-oot-image]
     if: >-
       always()
@@ -1638,6 +1659,11 @@ jobs:
             fi
           fi
 
+          TEMPERATURE_ARG=""
+          if [[ "${MODEL_NAME}" == *"MTP"* ]]; then
+            TEMPERATURE_ARG="--temperature 0"
+          fi
+
           python3 - <<'PY' > /tmp/benchmark_cases.tsv
           import json
           import os
@@ -1760,6 +1786,7 @@ jobs:
                       --percentile-metrics ttft,tpot,itl,e2el \
                       --result-dir \"${CONTAINER_RESULT_DIR}\" \
                       --result-filename \"${RESULT_FILENAME}.json\" \
+                      ${TEMPERATURE_ARG} \
                       ${BENCH_EXTRA_ARGS:-}
                   "
               fi
@@ -2512,7 +2539,7 @@ jobs:
           alert-threshold: "80%"
           comment-on-alert: true
           fail-on-alert: false
-          max-items-in-chart: 90
+          max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push dashboard data to gh-pages

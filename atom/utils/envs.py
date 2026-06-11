@@ -117,6 +117,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is aiter's OPUS kernel (gfx950 fast path). Set to 1 to fall back to Triton
     # (e.g. for debugging or on non-gfx950 builds).
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # Use gluon pa decode for some models
+    "ATOM_USE_GLUON_PA_DECODE": lambda: (
+        os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
+    ),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
@@ -136,6 +140,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
+    ),
+    # --- Atomesh ---
+    # Build atomesh when installing ATOM from source.
+    "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",
+    # Route the OpenAI-compatible server entrypoint through Atomesh.
+    "USE_ATOMESH_ENTRYPOINTS": lambda: (
+        os.getenv("USE_ATOMESH_ENTRYPOINTS", "0") == "1"
     ),
     # --- Gradient Control ---
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
@@ -222,6 +233,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
+    ),
+    # --- TBO prefill ubatch splitting ---
+    # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
+    # cutting through a request if needed for perfectly balanced 50/50 ubatches.
+    # Default on; set "0" to fall back to the request-boundary balanced split.
+    "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
+        os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
     ),
 }
 

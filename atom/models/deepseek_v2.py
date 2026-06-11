@@ -169,6 +169,31 @@ def _can_fuse_indexer_wk_weights_proj(
     return True
 
 
+def _extract_layer_index_from_prefix(prefix: str) -> int:
+    for part in reversed(prefix.split(".")):
+        if part.isdigit():
+            return int(part)
+    return 0
+
+
+def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
+    if not getattr(config, "use_index_cache", False):
+        return False
+
+    layer_id = _extract_layer_index_from_prefix(prefix)
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is not None:
+        return (
+            0 <= layer_id < len(index_topk_pattern)
+            and index_topk_pattern[layer_id] == "S"
+        )
+
+    index_topk_freq = int(getattr(config, "index_topk_freq", 1))
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    return max(layer_id - 1, 0) % index_topk_freq != 0
+
+
 def _fuse_rmsnorm_fp4_quant_fake(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -870,9 +895,15 @@ class DeepseekV2MoE(nn.Module):
         self._use_dual_stream = False
         self.alt_stream = alt_stream
         self.prefix = prefix
+        self.is_rocm_aiter_fusion_shared_expert_enabled = (
+            is_rocm_aiter_fusion_shared_expert_enabled(
+                shared_expert_prefix=f"{prefix}.shared_experts",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
+        )
 
         if config.n_shared_experts is not None:
-            if not is_rocm_aiter_fusion_shared_expert_enabled():
+            if not self.is_rocm_aiter_fusion_shared_expert_enabled:
                 tbo_active = get_current_atom_config().enable_tbo
                 if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                     self._use_dual_stream = True
@@ -945,7 +976,7 @@ class DeepseekV2MoE(nn.Module):
         shared_output = None
         if (
             self.n_shared_experts is not None
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             shared_output = self.shared_experts(hidden_states)
 
@@ -1723,8 +1754,10 @@ class DeepseekV2MLAAttention(nn.Module):
             self.scaling = self.scaling * mscale * mscale
 
         self.is_v32 = hasattr(config, "index_topk")
+        self.skip_topk = False
 
         if self.is_v32:
+            self.skip_topk = _should_skip_index_topk(config, prefix)
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
@@ -1877,7 +1910,7 @@ class DeepseekV2MLAAttention(nn.Module):
         if not self.fuse_qknorm_quant and not self.fuse_qknorm:
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
-        if self.is_v32 and self.indexer is not None:
+        if self.is_v32 and self.indexer is not None and not self.skip_topk:
             self.indexer(
                 hidden_states,
                 hidden_states_or_q_c,
@@ -2207,11 +2240,7 @@ class DeepseekV2Model(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
-                else 0
-            ),
+            + (self.config.n_shared_experts or 0),
         )
 
 

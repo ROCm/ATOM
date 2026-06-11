@@ -45,6 +45,7 @@ from atom.utils.tbo import (
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
+    ForwardMode,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
@@ -971,9 +972,13 @@ class ModelRunner:
         return True
 
     def stop_profiler(self):
-        """Stop profiling for this rank."""
+        """Stop profiling for this rank.
+
+        Returns a dict with ``trace_dir`` and ``elapsed`` so the caller
+        can report where the trace was written.
+        """
         if self.profiler is None:
-            return True
+            return {"trace_dir": self.profiler_dir, "elapsed": 0.0}
         t0 = time.monotonic()
         logger.info("Rank %d: stopping profiler...", self.rank)
         try:
@@ -982,12 +987,13 @@ class ModelRunner:
             logger.exception("Rank %d: profiler stop failed", self.rank)
         finally:
             self.profiler = None
+        elapsed = round(time.monotonic() - t0, 1)
         logger.info(
             "Rank %d: profiler stop completed in %.1fs",
             self.rank,
-            time.monotonic() - t0,
+            elapsed,
         )
-        return True
+        return {"trace_dir": self.profiler_dir, "elapsed": elapsed}
 
     def debug(self, *args: Any):
         if self.rank == 0:
@@ -1279,11 +1285,14 @@ class ModelRunner:
         # Subtract our own PyTorch usage + CUDA graph estimate + safety.
         # This is independent of other processes on the GPU.
         budget = int(total * config.gpu_memory_utilization)
-        available_for_kv = budget - peak_torch - cudagraph_overhead - safety_margin
+        # Fixed (utilization-independent) overhead of this process: model
+        # weights + peak activations + CUDA graph capture + safety margin.
+        non_kv_overhead = peak_torch + cudagraph_overhead + safety_margin
+        available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
         # This prevents OOM when other processes share the GPU.
-        available_for_kv = min(available_for_kv, free)
+        available_for_kv = min(available_for_kv_budget, free)
 
         torch.set_default_device("cpu")
 
@@ -1301,13 +1310,42 @@ class ModelRunner:
         per_req_cache_tensor_bytes = max_per_req_cache_slots * per_req_cache_bytes
         available_for_pool = available_for_kv - per_req_cache_tensor_bytes
         if available_for_pool <= 0:
-            raise RuntimeError(
+            # Minimum gpu_memory_utilization that makes the budget just cover the
+            # per-request cache tensor (available_for_kv_budget ==
+            # per_req_cache_tensor_bytes). Rounded UP to the next 0.01 so the
+            # printed value is actually sufficient, not the exact threshold.
+            min_util = (non_kv_overhead + per_req_cache_tensor_bytes) / total
+            min_util_hint = math.ceil(min_util * 100) / 100
+            base_msg = (
                 f"Per-request cache tensor "
                 f"({per_req_cache_tensor_bytes / (1 << 30):.2f}GB for "
                 f"{max_per_req_cache_slots} slots) exceeds available KV budget "
-                f"({available_for_kv / (1 << 30):.2f}GB). "
-                f"Reduce --max-num-seqs or increase gpu_memory_utilization."
+                f"({available_for_kv / (1 << 30):.2f}GB) at "
+                f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
+            if available_for_kv_budget > free:
+                # The physical free-memory clamp is the binding limit, not the
+                # utilization budget — raising --gpu-memory-utilization won't help.
+                fix_msg = (
+                    f" Only {free / (1 << 30):.2f}GB is physically free on the GPU "
+                    f"(other processes may be holding memory); raising "
+                    f"--gpu-memory-utilization will NOT help. Free GPU memory or "
+                    f"reduce --max-num-seqs (currently {config.max_num_seqs})."
+                )
+            elif min_util_hint <= 1.0:
+                fix_msg = (
+                    f" Set --gpu-memory-utilization >= {min_util_hint:.2f} "
+                    f"(this only zeroes out the deficit; use a higher value for "
+                    f"actual KV capacity) or reduce --max-num-seqs "
+                    f"(currently {config.max_num_seqs})."
+                )
+            else:
+                fix_msg = (
+                    f" Even --gpu-memory-utilization 1.0 is insufficient "
+                    f"(would need {min_util:.2f}); reduce --max-num-seqs "
+                    f"(currently {config.max_num_seqs}) or free GPU memory."
+                )
+            raise RuntimeError(base_msg + fix_msg)
         per_req_cache_equiv_blocks = (
             math.ceil(per_req_cache_bytes / block_bytes)
             if per_req_cache_bytes > 0
@@ -1498,11 +1536,18 @@ class ModelRunner:
         layer_id = 0
         # Promote to self so the attention builder's build_kv_cache_tensor()
         # can access it without recomputing from drafter state. Heterogeneous
-        # drafts (Eagle3) own their own layer space via their builder, so
-        # leave mtp_start_layer_idx at hf_config.num_hidden_layers in that mode.
+        # drafts (Eagle3 MHA) own their own layer space via their builder.
+        # Eagle3 MLA drafts (K2.6) share the target's MLA pool but still
+        # appear as one extra layer at index num_hidden_layers. In both Eagle3
+        # variants the eagle3 draft model has no `.model.mtp_start_layer_idx`,
+        # so only MTP-style drafts take the first branch.
+        is_eagle3 = (
+            self.config.speculative_config is not None
+            and self.config.speculative_config.method == "eagle3"
+        )
         self.mtp_start_layer_idx = (
             self.drafter.model.model.mtp_start_layer_idx
-            if hasattr(self, "drafter") and not hasattr(self, "eagle3_draft_builder")
+            if hasattr(self, "drafter") and not is_eagle3
             else hf_config.num_hidden_layers
         )
         for model_name, model in models_to_bind:
@@ -1595,9 +1640,9 @@ class ModelRunner:
         num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
             num_tokens, dp_size, dp_rank
         )
-        max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp).item()
+        max_tokens_across_dp = int(torch.max(num_tokens_across_dp))
 
-        return max_tokens_across_dp_cpu - num_tokens, num_tokens_across_dp
+        return max_tokens_across_dp - num_tokens, num_tokens_across_dp
 
     def _maybe_create_tbo_slices(
         self,
@@ -1675,6 +1720,11 @@ class ModelRunner:
                 None,
             )
 
+        # Mixed prefill+decode DP steps only deadlock under prefill
+        # token-split + TBO-decode
+        require_uniform_mode = (
+            self.config.enable_tbo_decode and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+        )
         sync = sync_dp_for_tbo(
             dp_group=get_dp_group().cpu_group,
             dp_size=dp_size,
@@ -1683,9 +1733,10 @@ class ModelRunner:
             tbo_on=tbo_on,
             local_tbo_eligible=local_eligible,
             local_ub_tokens=(local_ub0, local_ub1),
+            require_uniform_mode=require_uniform_mode,
         )
 
-        max_tokens = int(sync.num_tokens_across_dp.max().item())
+        max_tokens = int(sync.num_tokens_across_dp.max())
         dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention
         )
@@ -1717,34 +1768,42 @@ class ModelRunner:
             ub_max_tokens_across_dp,
         ) = self._preprocess(batch, num_scheduled_tokens=num_scheduled_tokens)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
+
+        forward_mode = ForwardMode.decide(
+            is_prefill=is_prefill,
+            total_seqs_num=batch.total_seqs_num,
+            scheduled_bs_decode=batch.total_seqs_num_decode,
+            num_input_tokens=num_input_tokens,
+            dp_uniform_decode=dp_uniform_decode,
+            enforce_eager=self.enforce_eager,
+            graph_bs=self.graph_bs,
+            mtp_step=(self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1,
+        )
+
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
-            # num_pad, num_tokens_across_dp = self.get_dp_padding(scheduled_bs)
-            # padded_scheduled_bs = scheduled_bs + num_pad
-            # TODO rename num_input_tokens to actual bs in currrent rank?
-            padded_scheduled_bs = num_input_tokens
-            # for MTP, we need to divide by (mtp_k + 1) to get the actual batch size
-            if hasattr(self, "drafter"):
-                mtp_step = self.drafter.mtp_k + 1
-                padded_scheduled_bs = (padded_scheduled_bs + mtp_step - 1) // mtp_step
-            bs = (
-                padded_scheduled_bs
-                if self.enforce_eager
-                else next(
-                    (x for x in self.graph_bs if x >= padded_scheduled_bs),
-                    padded_scheduled_bs,
+            bs = forward_mode.effective_bs  # single source of truth
+            assert bs >= scheduled_bs, (
+                f"effective_bs={bs} < scheduled_bs={scheduled_bs}; "
+                f"ForwardMode.decide invariant violated"
+            )
+            # Only pad cu_seqlens_q out to the cudagraph capture size if we
+            # actually grew bs. Eager (bs == scheduled_bs) leaves the slice
+            # empty so no overwrite happens.
+            if bs > scheduled_bs:
+                self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
+                    self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
                 )
-            )
-            assert (
-                bs >= padded_scheduled_bs
-            ), f"current decode {padded_scheduled_bs=} > max graph_bs{bs}"
-            self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
-                self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
-            )
         attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
 
-        graph_bs = num_input_tokens if is_prefill else bs
+        # MoE's pad_for_all_gather reads context.graph_bs to pad hidden_states
+        # before a cross-DP all_gather, so it must be unified across DP ranks
+        # under uniform decode (where pad path is taken). Use forward_mode's
+        # moe_pad_bs, which equals effective_bs except in the uniform-eager
+        # corner (enforce_eager / bs>graph_bs[-1]) where attention needs local
+        # but MoE pad needs the DP-unified padded_scheduled_bs.
+        graph_bs = num_input_tokens if is_prefill else forward_mode.moe_pad_bs
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
@@ -1752,6 +1811,7 @@ class ModelRunner:
             batch_size=context_bs,
             graph_bs=graph_bs,
             dp_uniform_decode=dp_uniform_decode,
+            forward_mode=forward_mode,
         )
 
         actual_num_tokens = batch.total_tokens_num
@@ -1863,12 +1923,21 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
 
-        if (
-            is_prefill
-            or self.enforce_eager
-            or not context.dp_uniform_decode
-            or bs > self.graph_bs[-1]
-        ):
+        # Dispatch is owned by ForwardMode.decide() (called in prepare_inputs).
+        # Every run_model caller MUST go through prepare_inputs first, so
+        # forward_mode is always set here.
+        forward_mode = context.forward_mode
+        assert forward_mode is not None, (
+            "context.forward_mode is None; run_model invoked without going "
+            "through prepare_inputs. Add ForwardMode.decide() at the new "
+            "entry point instead of re-deriving the 4-OR dispatch here."
+        )
+
+        # Single canonical shape check; contract owned by ForwardMode, which
+        # internally short-circuits for prefill / cudagraph.
+        forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
+
+        if not forward_mode.use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             if is_prefill:
@@ -2019,11 +2088,7 @@ class ModelRunner:
         sampled_logprobs = None
         if need_logprobs:
             logits_fp32 = logits.float()
-            safe_temps = torch.where(
-                temperatures <= 0, torch.ones_like(temperatures), temperatures
-            )
-            scaled_logits = logits_fp32 / safe_temps.view(-1, 1)
-            log_probs = torch.log_softmax(scaled_logits, dim=-1)
+            log_probs = torch.log_softmax(logits_fp32, dim=-1)
             sampled_logprobs = log_probs.gather(
                 -1, sampled_tokens.to(torch.long).unsqueeze(-1)
             ).squeeze(-1)

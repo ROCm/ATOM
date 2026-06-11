@@ -159,6 +159,15 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         )
         self.decode_using_pa_ps = self.page_size == 1024
 
+    def _cuda_graph_mla_max_seqlen_qo(self) -> int:
+        """Largest q length used by MLA CUDA graph speculative paths."""
+        max_seqlen_qo = 1
+        if self.num_draft_tokens is not None:
+            max_seqlen_qo = max(max_seqlen_qo, self.num_draft_tokens)
+        if self.speculative_num_steps is not None:
+            max_seqlen_qo = max(max_seqlen_qo, self.speculative_num_steps + 1)
+        return max_seqlen_qo
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -744,7 +753,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         )
 
         if self.use_mla and _sglang_aiter._use_mla_ps_kernel:
-            max_seqlen_qo = 1
+            max_seqlen_qo = self._cuda_graph_mla_max_seqlen_qo()
             (
                 self.work_metadata,
                 self.work_indptr,
@@ -1617,7 +1626,40 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             block_size,
         )
 
-    def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
+    def _forward_sparse_mla(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        topk_indices: torch.Tensor,
+        save_kv_cache: bool = True,
+    ) -> torch.Tensor:
+        from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
+            forward_sparse_mla_for_sglang,
+        )
+
+        return forward_sparse_mla_for_sglang(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            topk_indices,
+            save_kv_cache=save_kv_cache,
+            input_dtype=self.input_dtype,
+        )
+
+    def forward_extend(
+        self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
+    ):
+        topk_indices = kwargs.get("topk_indices")
+        if self.use_mla and topk_indices is not None:
+            return self._forward_sparse_mla(
+                q, k, v, layer, forward_batch, topk_indices, save_kv_cache
+            )
+
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -2139,7 +2181,14 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        **kwargs,
     ):
+        topk_indices = kwargs.get("topk_indices")
+        if self.use_mla and topk_indices is not None:
+            return self._forward_sparse_mla(
+                q, k, v, layer, forward_batch, topk_indices, save_kv_cache
+            )
+
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         batch_size = q.shape[0]
         head_dim_out = (
