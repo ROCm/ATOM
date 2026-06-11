@@ -350,6 +350,9 @@ jobs:
 
       - name: Build OOT image locally
         run: |
+          echo "DOCKER_CONFIG=${DOCKER_CONFIG:-<unset>}"
+          echo "Effective: ${DOCKER_CONFIG:-$HOME/.docker}"
+      
           set -euo pipefail
           docker rmi "atom_oot_base:ci" || true
           docker rmi "atom_oot:ci" || true
