@@ -667,6 +667,16 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Contiguity guard (merge-regression fix): the aiter HIP fused-kernel path
+        # below uses x.view(), which requires a contiguous input. QK-norm feeds a
+        # non-contiguous GQA slice here (step3p5 torch.split -> reshape keeps the
+        # qkv row stride, e.g. (1280,128,1) for an 8x128 q), so x.view(-1, head_dim)
+        # raises "Cannot view a tensor ...". Fall back to the pre-merge native math
+        # for non-contiguous inputs; contiguous callers keep main's fast HIP kernel.
+        # Under Dynamo, FakeTensor.is_contiguous() resolves to a concrete bool from
+        # static strides, so this short-circuits at trace time before the .view().
+        if not x.is_contiguous():
+            return self.forward_native(x, residual)
         # Use the aiter HIP fused_qk_rmsnorm_group_quant kernel in no-quant mode
         # (q_out_scale=None) to perform Gemma RMSNorm + optional residual add.
         # Same math as the Triton kernel: out = rmsnorm(x [+ residual]) * (1 + w),
