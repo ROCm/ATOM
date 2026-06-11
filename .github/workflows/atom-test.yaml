@@ -451,6 +451,13 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
+      - name: GPU preflight check
+        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        timeout-minutes: 5
+        env:
+          GPU_PREFLIGHT_ALLOCATION_MB: "8"
+        run: bash .github/scripts/gpu_preflight_check.sh "$CONTAINER_NAME" docker
+
       - name: Collect GPU info (inside container)
         id: gpu-info
         env:
@@ -751,4 +758,3 @@ jobs:
           auto-push: true
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
-
