@@ -23,9 +23,6 @@ from math import prod
 from aiter import ActivationType
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from atom.model_ops.moe_utils import (
-    check_and_swizzle_scales,
-)
 from atom.utils import envs
 
 if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
@@ -41,6 +38,18 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
         mxfp4_quant,
     )
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
+    from aiter.ops.triton.moe.moe_op_gemm_a4w4 import swizzle_scales  # same for a4 and a16
+
+
+def check_and_swizzle_scales(scale, N, K):
+    # ensure swizzle is imported
+    assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE 
+
+    if N % 32 == 0 and K % (32 * 8) == 0:
+        scale = swizzle_scales(scale)
+        return scale, "CDNA4_SCALE"
+    else:
+        return scale, None
 
 
 def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1):
