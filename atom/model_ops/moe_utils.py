@@ -14,26 +14,3 @@ def check_and_swizzle_scales(scale, N, K):
         return scale, "CDNA4_SCALE"
     else:
         return scale, None
-
-
-def quantize(x, dtype):
-    if dtype == "bf16":
-        x = x.to(torch.bfloat16).transpose(-1, -2).contiguous().transpose(-1, -2)
-        return x, None
-    elif dtype == "fp8":
-        scale = x.abs().max().item() / 448.0
-        fp8e4_dtype = (
-            torch.float8_e4m3fn if get_arch() != "gfx942" else torch.float8_e4m3fnuz
-        )
-        x = x.to(fp8e4_dtype)
-        return x, scale
-    elif dtype == "mx8":
-        fp8e4_dtype = (
-            torch.float8_e4m3fn if get_arch() != "gfx942" else torch.float8_e4m3fnuz
-        )
-        x, scale = downcast_to_mxfp(x, fp8e4_dtype, axis=1)
-        return x, scale
-    else:
-        assert dtype == "mx4", f"{dtype=}"
-        x, scale = downcast_to_mxfp(x.to(torch.bfloat16), torch.uint8, axis=1)
-        return x, scale
