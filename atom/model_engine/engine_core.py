@@ -92,9 +92,13 @@ class EngineCore:
         # Initialize model runner processes
         try:
             good = False
+            # Number of worker processes = full model-parallel world size.
+            # PCP is an independent dimension (world = tp x pcp), so spawn
+            # tp x pcp workers; otherwise init_dist_env (which expects a world
+            # of tp x pcp) would hang waiting for the PCP ranks.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tensor_parallel_size,
+                config.tensor_parallel_size * config.prefill_context_parallel_size,
                 config.runner_qualname,
                 config,
             )
