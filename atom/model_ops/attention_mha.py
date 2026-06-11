@@ -224,7 +224,7 @@ class PagedAttentionImpl(nn.Module):
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
                 v = v.view(-1, self.num_kv_heads, self.head_dim)
             self._cache_format = "SHUFFLE"
-        elif use_triton_attn and self.rotary_emb is not None:
+        elif (use_triton_attn or self.use_flash_layout) and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
@@ -272,17 +272,38 @@ class PagedAttentionImpl(nn.Module):
                     asm_layout=asm_layout,
                 )
             else:
-                aiter.reshape_and_cache(
-                    k,
-                    v,
-                    k_cache,
-                    v_cache,
-                    attn_metadata.slot_mapping,
-                    kv_cache_dtype="auto",
-                    k_scale=None,
-                    v_scale=None,
-                    asm_layout=asm_layout,
-                )
+                if self.use_flash_layout:
+                    # Flash layout: cache is NHD [num_blocks, block_size,
+                    # num_kv_heads, head_dim]. The aiter HIP reshape_and_cache
+                    # expects an HND-with-asm-packing layout when asm_layout
+                    # is True, which doesn't fit flash NHD. Call the aiter
+                    # triton path directly so the cache write matches the
+                    # cache layout TritonMHAMetadataBuilder.build_kv_cache_tensor
+                    # allocated.
+                    from aiter.ops.triton.kv_cache import (
+                        reshape_and_cache as _reshape_and_cache_triton,
+                    )
+
+                    _reshape_and_cache_triton(
+                        k,
+                        v,
+                        k_cache,
+                        v_cache,
+                        attn_metadata.slot_mapping,
+                        kv_cache_layout="NHD",
+                    )
+                else:
+                    aiter.reshape_and_cache(
+                        k,
+                        v,
+                        k_cache,
+                        v_cache,
+                        attn_metadata.slot_mapping,
+                        kv_cache_dtype="auto",
+                        k_scale=None,
+                        v_scale=None,
+                        asm_layout=asm_layout,
+                    )
             self._cache_format = "SHUFFLE" if asm_layout else "NHD"
 
         # Prefix cache hit: gather cached KV from paged cache and concat with new tokens

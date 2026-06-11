@@ -63,6 +63,11 @@ def get_attn_backend_cls(
                 "atom.plugin.sglang.attention_backend.attention_gdn.GDNAttentionBackend"
             )
         return "atom.model_ops.attentions.gdn_attn.GDNAttentionBackend"
+    # Set ATOM_USE_UNIFIED_ATTN=1 to route through TritonMHABackend (aiter
+    # triton unified_attention for both prefill and decode via a flash-layout
+    # NHD KV cache). Required on arches without a prebuilt HIP attention
+    # code object (e.g. gfx1201 RDNA4 in rocm/atom-dev:latest); see
+    # recipes/{Ministral-3-8B,Qwen3-8B-FP8}.md.
     if envs.ATOM_USE_UNIFIED_ATTN:
         return "atom.model_ops.attentions.triton_mha.TritonMHABackend"
     return "atom.model_ops.attentions.aiter_attention.AiterBackend"  # noqa: E501

@@ -73,6 +73,8 @@ support_model_arch_dict = {
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2_flash.MiMoV2FlashForCausalLM",
+    "Mistral3ForConditionalGeneration": "atom.models.mistral3.Mistral3TextOnly",
+    "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
