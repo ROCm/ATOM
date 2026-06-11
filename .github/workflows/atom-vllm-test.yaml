@@ -285,18 +285,11 @@ jobs:
       - name: Configure Docker client config path
         run: |
           if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
-            echo "DOCKER_CONFIG=/it-share/action_runner/docker" >> "$GITHUB_ENV"
-            echo "Set DOCKER_CONFIG for atom-mi355-8gpu.predownload (shared /it-share)."
+            echo "DOCKER_CONFIG=${GITHUB_WORKSPACE}/.atom-docker-client" >> "$GITHUB_ENV"
+            echo "Set DOCKER_CONFIG to workspace .atom-docker-client (runner-owned, avoids /it-share chmod)."
           else
             echo "Runner ${{ matrix.runner }}: leave DOCKER_CONFIG unset (default ~/.docker)."
           fi
-
-      - name: Ensure Docker client config directory
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
-        run: |
-          set -euo pipefail
-          mkdir -p "$DOCKER_CONFIG"
-          chmod 700 "$DOCKER_CONFIG"
 
       - name: Clean up containers and workspace
         if: matrix.runner == 'atom-mi355-8gpu.predownload'
@@ -311,6 +304,13 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
+
+      - name: Ensure Docker client config directory
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        run: |
+          set -euo pipefail
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
 
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
