@@ -17,10 +17,11 @@ def apply_attention_mha_rtpllm_patch() -> None:
     import atom.model_ops as ops
     from .rtp_full_attention import RTPFullAttention
 
-    if is_rtpllm():
-        ops.Attention = RTPFullAttention
-        logger.info(
-            "Applied RTP-LLM attention patch: atom.model_ops.Attention -> RTPFullAttention."
-        )
+    if not is_rtpllm():
+        return
 
+    ops.Attention = RTPFullAttention
+    logger.info(
+        "Applied RTP-LLM attention patch: atom.model_ops.Attention -> RTPFullAttention."
+    )
     _PATCHED = True

@@ -636,7 +636,7 @@ class ATOMQwen35Moe(BaseModel):
             )
 
         from atom.model_loader.loader import load_model_in_plugin_mode
-        from atom.plugin.prepare import prepare_model
+        from atom.plugin.prepare import _set_framework_backbone, prepare_model
 
         target_device = torch.device(
             self.device if getattr(self, "device", None) else "cuda"
@@ -754,6 +754,7 @@ class ATOMQwen35Moe(BaseModel):
 
         try:
             # Keep RTP-specific behavior in plugin path only.
+            _set_framework_backbone("rtpllm")
             apply_attention_gdn_rtpllm_patch()
             apply_attention_mha_rtpllm_patch()
             apply_qwen3_next_rtpllm_patch()
