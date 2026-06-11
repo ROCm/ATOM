@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inference-only MiMo-V2-Flash MTP (Multi-Token Prediction) model."""
+"""Inference-only MiMo-V2 MTP (Multi-Token Prediction) model."""
 
 import re
 
@@ -14,10 +14,10 @@ from atom.model_ops.linear import ReplicatedLinear
 from atom.models.utils import IntermediateTensors, ckpt_has_tensor_suffix, maybe_prefix
 from atom.utils.decorators import support_torch_compile
 
-from .mimo_v2_flash import MiMoV2Attention, MiMoV2MLP
+from .mimo_v2 import MiMoV2Attention, MiMoV2MLP, mark_prefused_qkv
 
 
-class MiMoV2FlashMTPLayer(nn.Module):
+class MiMoV2MTPLayer(nn.Module):
     """Single transformer decoder block for MTP, using SWA attention + dense MLP."""
 
     def __init__(
@@ -35,7 +35,9 @@ class MiMoV2FlashMTPLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         rope_theta = getattr(config, "rope_theta", 1000000)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        max_position_embeddings = getattr(config, "context_len", None) or getattr(
+            config, "max_position_embeddings", 32768
+        )
         v_scale = getattr(config, "attention_value_scale", None)
 
         # MTP block always uses SWA (sliding window attention)
@@ -103,7 +105,7 @@ class MiMoV2FlashMTPLayer(nn.Module):
         return hidden_states, residual
 
 
-class MiMoV2FlashMTPPredictorLayer(nn.Module):
+class MiMoV2MTPPredictorLayer(nn.Module):
     """One MTP prediction layer: enorm + hnorm + eh_proj + mtp_block + final_layernorm."""
 
     def __init__(self, atom_config: Config, prefix: str, layer_idx: int) -> None:
@@ -122,7 +124,7 @@ class MiMoV2FlashMTPPredictorLayer(nn.Module):
             prefix=maybe_prefix(prefix, "eh_proj"),
         )
 
-        self.mtp_block = MiMoV2FlashMTPLayer(
+        self.mtp_block = MiMoV2MTPLayer(
             atom_config=atom_config,
             layer_num=layer_idx,
             prefix=f"{prefix}.mtp_block",
@@ -162,7 +164,7 @@ class MiMoV2FlashMTPPredictorLayer(nn.Module):
         return hidden_states
 
 
-class MiMoV2FlashMultiTokenPredictor(nn.Module):
+class MiMoV2MultiTokenPredictor(nn.Module):
     def __init__(self, *, atom_config: Config, prefix: str = ""):
         super().__init__()
         config = atom_config.hf_config
@@ -171,7 +173,7 @@ class MiMoV2FlashMultiTokenPredictor(nn.Module):
 
         self.layers = torch.nn.ModuleDict(
             {
-                str(idx): MiMoV2FlashMTPPredictorLayer(
+                str(idx): MiMoV2MTPPredictorLayer(
                     atom_config, f"{prefix}.layers.{idx}", layer_idx=idx
                 )
                 for idx in range(
@@ -206,12 +208,12 @@ class MiMoV2FlashMultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class MiMoV2FlashMTP(nn.Module):
+class MiMoV2MTP(nn.Module):
 
     packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
+        "self_attn.q_proj": ("self_attn.qkv_proj", "q"),
+        "self_attn.k_proj": ("self_attn.qkv_proj", "k"),
+        "self_attn.v_proj": ("self_attn.qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
@@ -255,9 +257,10 @@ class MiMoV2FlashMTP(nn.Module):
                 ["*.self_attn.o_proj"]
             )
 
-        self.model = MiMoV2FlashMultiTokenPredictor(
+        self.model = MiMoV2MultiTokenPredictor(
             atom_config=atom_config, prefix=maybe_prefix(prefix, "model")
         )
+        mark_prefused_qkv(self.model, self.config)
 
         self.lm_head = ParallelLMHead(
             num_embeddings=self.config.vocab_size,

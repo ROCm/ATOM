@@ -48,6 +48,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -87,6 +88,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -126,6 +128,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -165,6 +168,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -204,6 +208,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -243,6 +248,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -282,6 +288,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -321,6 +328,7 @@ on:
           - DeepSeek-V3.2 FP8 TP8 (AW)
           - DeepSeek-V3.2 FP8 MTP TP4 (AW)
           - DeepSeek-V3.2 FP8 PTPC TP4 (AW)
+          - DeepSeek-V4-Pro TP8 (OOB)
           - GLM-4.7-FP8 TP4 (AW)
           - GLM-4.7-FP8 TP8 (AW)
           - GLM-4.7-FP8 MTP TP4 (AW)
@@ -915,6 +923,7 @@ jobs:
               "DeepSeek-V3.2 FP8 TP4 (AW)",
               "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
               "DeepSeek-V3.2 FP8 PTPC TP4 (AW)",
+              "DeepSeek-V4-Pro TP8 (OOB)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
               "GLM-4.7-FP8 TP4 (AW)",
@@ -1650,6 +1659,11 @@ jobs:
             fi
           fi
 
+          TEMPERATURE_ARG=""
+          if [[ "${MODEL_NAME}" == *"MTP"* ]]; then
+            TEMPERATURE_ARG="--temperature 0"
+          fi
+
           python3 - <<'PY' > /tmp/benchmark_cases.tsv
           import json
           import os
@@ -1772,6 +1786,7 @@ jobs:
                       --percentile-metrics ttft,tpot,itl,e2el \
                       --result-dir \"${CONTAINER_RESULT_DIR}\" \
                       --result-filename \"${RESULT_FILENAME}.json\" \
+                      ${TEMPERATURE_ARG} \
                       ${BENCH_EXTRA_ARGS:-}
                   "
               fi

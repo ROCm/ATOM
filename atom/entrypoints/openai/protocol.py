@@ -89,6 +89,8 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
     n: Optional[int] = 1
+    # Optional KV-transfer metadata for P/D disaggregation.
+    kv_transfer_params: Optional[Dict[str, Any]] = None
 
     def get_messages(self) -> List[ChatMessage]:
         """Get messages from either 'messages' or 'prompt' field."""
@@ -133,6 +135,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[Dict[str, Any]]
     usage: Dict[str, Any]
+    kv_transfer_params: Optional[Dict[str, Any]] = None
 
     model_config = ConfigDict(extra="allow")
 

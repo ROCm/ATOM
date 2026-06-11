@@ -223,6 +223,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
     ),
+    # --- TBO prefill ubatch splitting ---
+    # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
+    # cutting through a request if needed for perfectly balanced 50/50 ubatches.
+    # Default on; set "0" to fall back to the request-boundary balanced split.
+    "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
+        os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
+    ),
 }
 
 

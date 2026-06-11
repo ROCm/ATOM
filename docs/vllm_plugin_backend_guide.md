@@ -293,3 +293,16 @@ export ATOM_DISABLE_VLLM_PLUGIN=1
 |---|---|---|---|
 | `ATOM_DISABLE_VLLM_PLUGIN` | bool | `0` (false) | Set to `1` to disable the entire ATOM vLLM plugin (platform + model registration). vLLM runs in pure ROCm mode. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `0` (false) | Enable QK-norm + RoPE + cache + quant fusion in attention. Recommended for Qwen3-MoE models. |
+
+### Online quantization
+
+Online (load-time) quantization is supported in plugin mode. Since `vllm serve`
+cannot take ATOM's `--online_quant_config` CLI flag, pass the same JSON through
+vLLM's `--additional-config` under the `online_quant_config` key:
+
+```bash
+vllm serve <model> ... \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config": {"*expert*": "mxfp4"}, "exclude_layer": ["lm_head", "*.gate.*"]}}'
+```
+
+See the [online quantization guide](online_quantization_guide.md#35-plugin-mode-vllm-serve) for the full schema.
