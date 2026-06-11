@@ -9,12 +9,3 @@ which is licensed under the Apache License, Version 2.0.
   Licensed under the Apache License, Version 2.0
   https://www.apache.org/licenses/LICENSE-2.0
 
-The following components are used under their respective licenses:
-
-  - smg-grpc-client (crate): gRPC protocol definitions derived from sgl-model-gateway
-  - reasoning-parser (crate): Reasoning output parser from sgl-model-gateway
-  - openai-protocol (crate): OpenAI-compatible protocol types from sgl-model-gateway
-  - tool-parser (crate): Tool call parser from sgl-model-gateway
-  - llm-tokenizer (crate): Tokenizer wrapper from sgl-model-gateway
-
-All of the above are licensed under the Apache License, Version 2.0.
