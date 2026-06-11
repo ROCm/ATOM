@@ -137,31 +137,30 @@ _FP8_DTYPES = tuple(
 )
 
 
-def _allow_ds_v2_non_triton_fp4_input_norm_quant(
+def _enable_non_triton_global_mxfp4_input_norm_quant(
     config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
+    quant_dtype: Optional[torch.dtype],
+    is_mtp_block: bool,
 ) -> bool:
-    model_type = str(getattr(config, "model_type", "") or "").lower()
-    architectures = getattr(config, "architectures", None) or []
-    architecture_names = {str(arch) for arch in architectures if arch}
-    architecture_text = " ".join(architecture_names).lower()
-
-    # This is only for the PR-added non-Triton FP4 input RMSNorm quant path.
-    # Wrappers that reuse DeepSeek-V2/MLA should keep the original path unless
-    # Triton GEMM is explicitly enabled, which was the pre-existing gate.
-    if model_type in {"glm_moe_dsa", "kimi_k2", "kimi_k25"}:
+    if (
+        is_mtp_block
+        or quant_dtype != dtypes.fp4x2
+        or quant_config is None
+        or quant_config.quant_method != "quark"
+        or quant_config.quant_dtype != dtypes.fp4x2
+        or quant_config.layer_pattern_specs
+    ):
         return False
-    if any(name in architecture_text for name in ("glm", "kimi", "qwen", "gpt")):
-        return False
-
-    if architecture_names:
-        return bool(
-            architecture_names
-            & {
-                "DeepseekV2ForCausalLM",
-                "DeepseekV3ForCausalLM",
-            }
-        )
-    return model_type in {"deepseek_v2", "deepseek_v3", "deepseek_v32", "deepseek_v4"}
+    architectures = set(getattr(config, "architectures", None) or [])
+    return bool(
+        architectures & {"DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"}
+    ) or str(getattr(config, "model_type", "")).lower() in {
+        "deepseek_v2",
+        "deepseek_v3",
+        "deepseek_v32",
+        "deepseek_v4",
+    }
 
 
 def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
@@ -275,17 +274,6 @@ def _mxfp4_activation_quant_layout(num_tokens: int) -> Tuple[bool, bool]:
         should_shuffle = num_tokens >= MXFP4_QUANT_BLOCK_SIZE
         return should_shuffle, should_shuffle
     return True, True
-
-
-def _is_global_mxfp4_without_layer_overrides(
-    quant_config: Optional[QuantizationConfig],
-) -> bool:
-    return (
-        quant_config is not None
-        and quant_config.quant_method == "quark"
-        and quant_config.quant_dtype == dtypes.fp4x2
-        and not quant_config.layer_pattern_specs
-    )
 
 
 def _fused_rms_fp8_quant_fake(
@@ -1929,56 +1917,33 @@ class DeepseekV2MLAAttention(nn.Module):
                 )
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
                 if self.fuse_qknorm_quant or self.fuse_qknorm:
-                    use_asm_fp4_q_b_proj = (
-                        self.quant_dtype == dtypes.fp4x2 and not use_triton_gemm()
-                    )
-                    if use_asm_fp4_q_b_proj:
+                    q_shuffle = False
+                    q_scale_shuffle_padding = False
+                    if self.quant_dtype == dtypes.fp4x2 and not use_triton_gemm():
                         q_shuffle, q_scale_shuffle_padding = (
                             _mxfp4_activation_quant_layout(q_c.shape[0])
                         )
-                        (
-                            (hidden_states_or_q_c, hidden_states_or_q_c_scale),
-                            _,
-                            kv_c_normed,
-                            _,
-                        ) = _fuse_rmsnorm_quant(
-                            q_c,
-                            self.q_a_layernorm.weight,
-                            self.q_a_layernorm.eps,
-                            kv_c,
-                            self.kv_a_layernorm.weight,
-                            self.kv_a_layernorm.eps,
-                            None,
-                            dtype_quant=self.quant_dtype,
-                            shuffle=q_shuffle,
-                            scale_shuffle_padding=q_scale_shuffle_padding,
-                            group_size=128,
-                            quant_type=self.qknorm_quant_type,
-                            output_unquantized_inp1=False,
-                            transpose_scale=True,
-                        )
-                    else:
-                        (
-                            (hidden_states_or_q_c, hidden_states_or_q_c_scale),
-                            _,
-                            kv_c_normed,
-                            _,
-                        ) = _fuse_rmsnorm_quant(
-                            q_c,
-                            self.q_a_layernorm.weight,
-                            self.q_a_layernorm.eps,
-                            kv_c,
-                            self.kv_a_layernorm.weight,
-                            self.kv_a_layernorm.eps,
-                            None,
-                            dtype_quant=self.quant_dtype,
-                            shuffle=False,
-                            scale_shuffle_padding=False,
-                            group_size=128,
-                            quant_type=self.qknorm_quant_type,
-                            output_unquantized_inp1=False,
-                            transpose_scale=True,
-                        )
+                    (
+                        (hidden_states_or_q_c, hidden_states_or_q_c_scale),
+                        _,
+                        kv_c_normed,
+                        _,
+                    ) = _fuse_rmsnorm_quant(
+                        q_c,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.eps,
+                        kv_c,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.eps,
+                        None,
+                        dtype_quant=self.quant_dtype,
+                        shuffle=q_shuffle,
+                        scale_shuffle_padding=q_scale_shuffle_padding,
+                        group_size=128,
+                        quant_type=self.qknorm_quant_type,
+                        output_unquantized_inp1=False,
+                        transpose_scale=True,
+                    )
                 else:
                     hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
@@ -2071,10 +2036,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
             enable_fp4_input_norm_quant = self.quant_dtype == dtypes.fp4x2 and (
                 use_triton_gemm()
-                or (
-                    not is_mtp_block
-                    and _allow_ds_v2_non_triton_fp4_input_norm_quant(config)
-                    and _is_global_mxfp4_without_layer_overrides(quant_config)
+                or _enable_non_triton_global_mxfp4_input_norm_quant(
+                    config,
+                    quant_config,
+                    self.quant_dtype,
+                    is_mtp_block,
                 )
             )
             if enable_fp8_input_norm_quant or enable_fp4_input_norm_quant:
