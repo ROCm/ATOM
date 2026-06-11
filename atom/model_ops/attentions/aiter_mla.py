@@ -7,6 +7,7 @@ from typing import List, Optional, Type
 
 import numpy as np
 import torch
+from atom.utils import envs
 from aiter import (
     decode_update_mla_metadata_v1,
     dtypes,
@@ -77,6 +78,12 @@ class AiterMLABackend(AttentionBackend):
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def __init__(self, model_runner):
         self.block_size = 1
+        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+            assert model_runner.block_size == 64, (
+                f"ATOM_USE_TRITON_MLA=1 and ATOM_USE_TRITON_MLA_SHUFFLE_KV=1 expects --block-size 64 "
+                f"for {model_runner.kv_cache_dtype} KV cache, "
+                f"got --block-size {model_runner.block_size}"
+            )
         CommonAttentionBuilder.__init__(self, model_runner)
         config = model_runner.config
         hf_config = config.hf_config
