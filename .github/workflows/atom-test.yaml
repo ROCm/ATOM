@@ -72,8 +72,6 @@ jobs:
           echo "=== Trying latest main aiter wheel manifest from S3 first ==="
 
           S3_MAIN_MANIFEST_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json"
-          PINNED_AITER_WHEEL_NAME="amd_aiter-0.1.1.dev1+gff903093a-cp312-cp312-linux_x86_64.whl"
-          PINNED_AITER_WHEEL_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/amd_aiter-0.1.1.dev1%2Bgff903093a-cp312-cp312-linux_x86_64.whl"
           API_URL="https://api.github.com"
           AUTH_HEADER="Authorization: token ${{ secrets.GITHUB_TOKEN }}"
           AITER_TEST_WORKFLOW_ID=179476100
@@ -130,11 +128,6 @@ jobs:
 
             mkdir -p aiter-whl
             rm -f aiter-whl/amd_aiter*.whl
-
-            echo "Using pinned aiter wheel for linux-atom-do-mi350x-8 A/B test: ${PINNED_AITER_WHEEL_NAME}"
-            curl -fsSL "$PINNED_AITER_WHEEL_URL" -o "aiter-whl/$PINNED_AITER_WHEEL_NAME"
-            echo "Downloaded pinned wheel: aiter-whl/$PINNED_AITER_WHEEL_NAME"
-            return 0
 
             manifest_file=$(mktemp)
             trap 'rm -f "$manifest_file"' RETURN
@@ -462,44 +455,6 @@ jobs:
         id: gpu-info
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
-      - name: Install newer RCCL
-        if: matrix.runner == 'linux-atom-do-mi350x-8'
-        timeout-minutes: 90
-        env:
-          RCCL_REPO: https://github.com/ROCm/rccl.git
-          RCCL_REF: 96a25b5fd6f73fba58c7d83eb57cf19a50230aa4
-        run: |
-          docker exec \
-            -e RCCL_REPO="${RCCL_REPO}" \
-            -e RCCL_REF="${RCCL_REF}" \
-            "$CONTAINER_NAME" bash -lc '
-              set -euo pipefail
-              echo "========== RCCL before =========="
-              ldconfig -p | grep -E "librccl|libnccl" || true
-
-              apt-get update
-              apt --fix-broken install -y
-              apt-get install -y --no-install-recommends \
-                git cmake build-essential pkg-config libpci-dev
-              python -m pip install --upgrade cmake
-
-              rm -rf /tmp/rccl-src /tmp/rccl-debs
-              git clone "${RCCL_REPO}" /tmp/rccl-src
-              cd /tmp/rccl-src
-              git checkout "${RCCL_REF}"
-              git rev-parse HEAD
-              ./install.sh -p --amdgpu_targets=gfx950
-
-              mkdir -p /tmp/rccl-debs
-              cp build/release/*.deb /tmp/rccl-debs/
-              DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl-debs/*.deb
-              rm -rf /tmp/rccl-src /tmp/rccl-debs
-              ldconfig
-
-              echo "========== RCCL after =========="
-              ldconfig -p | grep -E "librccl|libnccl" || true
-            '
-
       - name: Install aiter from wheel
         run: |
           AITER_WHL=$(ls -t /tmp/aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
@@ -523,15 +478,6 @@ jobs:
 
             echo '=== Installed amd-aiter version ==='
             pip show amd-aiter
-          "
-
-      - name: Pin Triton to 3.6.0
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc "
-            set -euo pipefail
-            echo '=== Pinning Triton to 3.6.0 ==='
-            pip install --timeout 60 --retries 10 --force-reinstall --no-deps 'triton==3.6.0'
-            pip show triton | grep -E '^(Name|Version):'
           "
 
       - name: Install ATOM and dependencies

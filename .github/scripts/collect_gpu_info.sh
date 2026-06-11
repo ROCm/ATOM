@@ -31,11 +31,24 @@ RUNNER_HINT="${3:-${RUNNER_HINT:-}}"
 
 if [ -n "$CONTAINER" ]; then
     exec_in() { "$ENGINE" exec "$CONTAINER" bash -lc "$1" 2>/dev/null; }
+    exec_in_verbose() { "$ENGINE" exec "$CONTAINER" bash -lc "$1"; }
 else
     exec_in() { bash -lc "$1" 2>/dev/null; }
+    exec_in_verbose() { bash -lc "$1"; }
 fi
 
 trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+print_probe() {
+    local title="$1"
+    local command="$2"
+
+    echo ""
+    echo "========== ${title} =========="
+    if ! exec_in_verbose "$command"; then
+        echo "WARNING: ${title} failed"
+    fi
+}
 
 # --- GPU name ---------------------------------------------------------------
 # 1) amd-smi (preferred; covers MI300X / MI325X / MI355X+).
@@ -105,6 +118,44 @@ GPU_VRAM_GB="${GPU_VRAM_GB:-0}"
 # --- ROCm version -----------------------------------------------------------
 ROCM_VERSION=$(exec_in 'cat /opt/rocm/.info/version' | trim)
 ROCM_VERSION="${ROCM_VERSION:-unknown}"
+
+print_probe "ROCm version files" '
+    set +e
+    cat /opt/rocm/.info/version 2>/dev/null || true
+    cat /opt/rocm/.info/version-dev 2>/dev/null || true
+    cat /opt/rocm/.info/version-utils 2>/dev/null || true
+'
+
+print_probe "rocminfo" '
+    command -v rocminfo >/dev/null 2>&1 || { echo "rocminfo not found"; exit 127; }
+    rocminfo
+'
+
+print_probe "rocm-smi" '
+    command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
+    rocm-smi
+'
+
+print_probe "rocm-smi product and driver details" '
+    command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
+    rocm-smi --showproductname --showdriverversion --showvbios
+'
+
+print_probe "rocm-smi topology" '
+    command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
+    rocm-smi --showtopo
+'
+
+print_probe "rocm-smi memory and processes" '
+    command -v rocm-smi >/dev/null 2>&1 || { echo "rocm-smi not found"; exit 127; }
+    rocm-smi --showmemuse
+    rocm-smi --showpids
+    rocm-smi --showpidgpus
+'
+
+print_probe "ROCm device nodes" '
+    ls -l /dev/kfd /dev/dri 2>/dev/null || true
+'
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
     {
