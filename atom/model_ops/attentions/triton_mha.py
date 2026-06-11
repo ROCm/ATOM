@@ -9,6 +9,7 @@ import torch
 from atom.config import KVCacheTensor
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl
+from atom.utils import envs
 
 from .aiter_attention import AiterAttentionMetadataBuilder
 from .backends import AttentionBackend
@@ -93,18 +94,40 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         else:
             attn_idx = layer_id
 
-        k_cache = runner.kv_cache[0, attn_idx].view(
-            runner.num_physical_kvcache_blocks,
-            runner.physical_block_size,
-            runner.num_kv_heads,
-            hf_config.head_dim,
+        use_shuffled_kv_cache = (
+            envs.ATOM_GPTOSS_USE_PA_DECODE_BF16_ASM
+            and config.kv_cache_dtype == "fp8"
+            and runner.physical_block_size == 256
         )
-        v_cache = runner.kv_cache[1, attn_idx].view(
-            runner.num_physical_kvcache_blocks,
-            runner.physical_block_size,
-            runner.num_kv_heads,
-            hf_config.head_dim,
-        )
+        if use_shuffled_kv_cache:
+            x = 16 // runner.kv_cache.element_size()
+            k_cache = runner.kv_cache[0, attn_idx].view(
+                runner.num_physical_kvcache_blocks,
+                runner.num_kv_heads,
+                hf_config.head_dim // x,
+                runner.physical_block_size,
+                x,
+            )
+            v_cache = runner.kv_cache[1, attn_idx].view(
+                runner.num_physical_kvcache_blocks,
+                runner.num_kv_heads,
+                runner.physical_block_size // x,
+                hf_config.head_dim,
+                x,
+            )
+        else:
+            k_cache = runner.kv_cache[0, attn_idx].view(
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                runner.num_kv_heads,
+                hf_config.head_dim,
+            )
+            v_cache = runner.kv_cache[1, attn_idx].view(
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                runner.num_kv_heads,
+                hf_config.head_dim,
+            )
         if config.kv_cache_dtype == "fp8":
             module.k_scale = runner.kv_scale[0, attn_idx]
             module.v_scale = runner.kv_scale[1, attn_idx]
@@ -113,7 +136,8 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         module.k_cache = k_cache
         module.v_cache = v_cache
         if impl is not None:
-            impl.use_flash_layout = True
+            impl.use_flash_layout = not use_shuffled_kv_cache
+            impl.use_triton_shuffled_kv_cache = use_shuffled_kv_cache
 
         return KVCacheTensor(
             layer_num=layer_id,

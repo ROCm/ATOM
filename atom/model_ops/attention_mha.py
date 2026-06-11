@@ -634,14 +634,20 @@ class PagedAttentionImpl(nn.Module):
         o = torch.empty_like(q)
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        if self.use_flash_layout:
+        use_triton_shuffled_kv_cache = getattr(
+            self, "use_triton_shuffled_kv_cache", False
+        )
+
+        if self.use_flash_layout or use_triton_shuffled_kv_cache:
             sliding_window = (
                 (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
             )
 
-            # KV cache is already in flash layout (4D), allocated by
-            # TritonMHAMetadataBuilder.build_kv_cache_tensor.
-            nkv = k_cache.shape[2]
+            nkv = (
+                k_cache.shape[1]
+                if use_triton_shuffled_kv_cache
+                else k_cache.shape[2]
+            )
             descale_shape = (num_seqs, nkv)
 
             unified_attention(
@@ -663,6 +669,7 @@ class PagedAttentionImpl(nn.Module):
                 k_descale=self.kv_scale.expand(descale_shape),
                 v_descale=self.kv_scale.expand(descale_shape),
                 sinks=self.sinks,
+                shuffled_kv_cache=use_triton_shuffled_kv_cache,
             )
         else:
             _, num_q_heads_total, head_size = q.shape
@@ -915,6 +922,10 @@ class PagedAttentionImpl(nn.Module):
         o = torch.empty_like(q)
         num_seqs = attn_metadata.cu_seqlens_q.shape[0] - 1
         descale_shape = (num_seqs, k.shape[1])
+        use_cached_shuffled_kv_cache = (
+            getattr(self, "use_triton_shuffled_kv_cache", False)
+            and attn_metadata.has_cached
+        )
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
@@ -952,6 +963,7 @@ class PagedAttentionImpl(nn.Module):
             k_descale=self.kv_scale.expand(descale_shape),
             v_descale=self.kv_scale.expand(descale_shape),
             sinks=self.sinks,
+            shuffled_kv_cache=use_cached_shuffled_kv_cache,
         )
 
         return o
@@ -961,11 +973,17 @@ class PagedAttentionImpl(nn.Module):
         ctx = fwd_ctx.context
 
         if ctx.is_prefill:
-            if self.use_flash_layout:
+            if self.use_flash_layout or getattr(
+                self, "use_triton_shuffled_kv_cache", False
+            ):
                 return self.prefill_attention_triton
             return self.prefill_attention
         else:
-            if self.use_triton_attn or self.use_flash_layout:
+            if (
+                self.use_triton_attn
+                or self.use_flash_layout
+                or getattr(self, "use_triton_shuffled_kv_cache", False)
+            ):
                 return self.paged_attention_triton
             else:
                 # Only use pa persistent when block_size == 1024
