@@ -231,4 +231,4 @@ Clients send `Authorization: Bearer <key>`. Workers declared on the CLI inherit 
 
 ## Acknowledgments
 
-This project was derived from [sgl-model-gateway](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway).
+Atomesh was derived from [sgl-model-gateway](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway) and has since been substantially reworked into an independent serving layer for the **ATOM** stack and **AMD** hardware. Its routing, scheduling, runtime integration, and performance-sensitive paths are designed around AMD accelerator deployments and ATOM-specific serving requirements.
