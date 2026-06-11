@@ -285,6 +285,16 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 f"The model {model_arch} is not supported by model impl backend atom"
             )
 
+        from atom.utils.debug_helper import install_block_forward_hooks
+
+        n_fwd_hooks = install_block_forward_hooks(self.model)
+        if n_fwd_hooks:
+            logger.info(
+                "[ATOM_FWD_DUMP] %d forward hooks installed on %s",
+                n_fwd_hooks,
+                model_arch,
+            )
+
         # here init aiter dist for using aiter custom collective ops
         self.pp_group = get_pp_group()
         self.tp_group = get_tp_group()
@@ -531,6 +541,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         logits = self.model.compute_logits(hidden_states)
+        from atom.utils.debug_helper import maybe_log_topk
+
+        maybe_log_topk(logits, prefix="logits ")
         return logits
 
 

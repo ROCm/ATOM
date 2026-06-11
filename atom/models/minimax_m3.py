@@ -40,6 +40,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils.debug_helper import maybe_dump_head_stage
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers import PretrainedConfig
@@ -461,7 +462,11 @@ class MiniMaxM3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
+        maybe_dump_head_stage("pre_final_norm_hidden", hidden_states)
+        if residual is not None:
+            maybe_dump_head_stage("pre_final_norm_residual", residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        maybe_dump_head_stage("after_final_norm", hidden_states)
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

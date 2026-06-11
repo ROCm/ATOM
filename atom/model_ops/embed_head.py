@@ -13,6 +13,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
+from atom.utils.debug_helper import maybe_dump_head_stage
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from aiter.tuned_gemm import tgemm
 
@@ -178,7 +179,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             if context.is_prefill and not context.is_draft:
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
+        maybe_dump_head_stage("lm_head_in", x)
         logits = tgemm.mm(x, self.weight, self.bias)
+        maybe_dump_head_stage("lm_head_shard_logits", logits)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
             logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)
@@ -189,4 +192,5 @@ class ParallelLMHead(VocabParallelEmbedding):
             # )
             # dist.gather(logits, all_logits, 0)
             # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+        maybe_dump_head_stage("lm_head_logits", logits)
         return logits

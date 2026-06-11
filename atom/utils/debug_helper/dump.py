@@ -201,6 +201,43 @@ def maybe_dump_weights_and_exit(model: torch.nn.Module) -> None:
         sys.exit(0)
 
 
+# === LM head / final norm dump =======================================
+
+
+_head_stage_dump_calls: int = 0
+
+
+def maybe_dump_head_stage(stage: str, tensor: torch.Tensor) -> None:
+    """Dump final-norm / lm_head tensors for concurrent batch bisect.
+
+    Enabled by ATOM_MINIMAX_M3_HEAD_STAGE_DUMP. Files:
+      head_{stage}_n{n}_rank{R}_call{idx}.pt
+    """
+    dump_dir = os.getenv("ATOM_MINIMAX_M3_HEAD_STAGE_DUMP", "")
+    if not dump_dir or tensor is None:
+        return
+    global _head_stage_dump_calls  # noqa: PLW0603
+    os.makedirs(dump_dir, exist_ok=True)
+    _head_stage_dump_calls += 1
+    call_idx = _head_stage_dump_calls
+    rank = _get_rank()
+    n_tokens = int(tensor.shape[0]) if tensor.ndim >= 1 else 1
+    path = os.path.join(
+        dump_dir,
+        f"head_{stage}_n{n_tokens}_rank{rank}_call{call_idx:04d}.pt",
+    )
+    torch.save(
+        {
+            "stage": stage,
+            "tensor": tensor.detach().cpu(),
+            "n_tokens": n_tokens,
+            "call_idx": call_idx,
+            "rank": rank,
+        },
+        path,
+    )
+
+
 # === Sampler top-K dump ==============================================
 
 
