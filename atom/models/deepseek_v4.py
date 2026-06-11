@@ -44,6 +44,12 @@ from aiter.dist.communication_op import (
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+    pcp_split_stripe,
+)
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -1010,6 +1016,18 @@ class Compressor(nn.Module):
         # stride must be 1).
         coff_d = (1 + overlap) * d
         combined = self.wkv_gate(x)
+        # ===== PCP (full-KV) =====
+        # `x` here is this rank's 1/W stripe shard (model.forward entry split).
+        # The wkv_gate projection above is per-token (parallelizable), but the
+        # downstream fused_compress_attn compresses `ratio` CONSECUTIVE tokens
+        # into one entry — which stripe split breaks. So all-gather the
+        # projected `combined` back to full sequence order before compression,
+        # mirroring SGLang's compute_kv_score (all-gather kv_score after the
+        # projection, before the cross-token compress). The plan /
+        # state_slot_mapping passed to fused_compress_attn are full-sequence
+        # (never split in the builder), so they match the gathered `combined`.
+        if _pcp_active():
+            combined = pcp_allgather_rerange(combined, get_pcp_world_size())
         kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
@@ -1865,6 +1883,37 @@ class DeepseekV4Attention(nn.Module):
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
             # buffer with SWA history + compress section), extend from per-fwd
             # `kv` tensor (in-chunk SWA tail; extend buffer is layer-invariant).
+            #
+            # ===== PCP (full-KV) =====
+            # Under PCP the model.forward entry stripe-split x/positions to 1/W,
+            # so `q_sa` and `kv` here are this rank's 1/W shard. The per-query
+            # metadata (kv_indptr/indices_*, indexer_meta) was already reduced
+            # to this rank's owned queries in the builder (_apply_pcp_reindex),
+            # so `q_sa` + those indices are aligned and used as-is. The only
+            # runtime fixups here are on the actual K/V data:
+            #   - swa_write must write the FULL sequence SWA ring (every PCP
+            #     rank keeps full KV), and
+            #   - sparse_attn's extend source must be the FULL `kv` so each 1/W
+            #     query can attend the whole in-chunk SWA window.
+            # So all-gather `kv` back to full order; positions/cu_seqlens_q/
+            # state_slot_mapping for the SWA write stay full (cu_seqlens_q /
+            # state_slot_mapping are per-seq, never split; positions_full comes
+            # from the forward context which holds the pre-split copy).
+            pcp_on = _pcp_active()
+            if pcp_on:
+                pcp_ws = get_pcp_world_size()
+                kv_full = pcp_allgather_rerange(kv, pcp_ws)
+                # positions must match kv_full's full-sequence coords for the
+                # swa_write ring addressing (`positions[src] % cache_size`).
+                # `positions` here is this rank's 1/W shard (split in
+                # ForCausalLM.forward); all-gather it back to full order with
+                # the same rerange used for kv (NOT fc.context.positions, which
+                # the builder reindexed to 1/W).
+                positions_full = pcp_allgather_rerange(positions, pcp_ws)
+            else:
+                kv_full = kv
+                positions_full = positions
+
             if ratio == 0:
                 kv_indices_prefix = attn_md.kv_indices_prefix_swa
                 kv_indptr_prefix = attn_md.kv_indptr_prefix_swa
@@ -1881,7 +1930,7 @@ class DeepseekV4Attention(nn.Module):
                 self.unified_kv,
                 kv_indices_prefix,
                 kv_indptr_prefix,
-                kv,
+                kv_full,
                 attn_md.kv_indices_extend,
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
@@ -1890,9 +1939,11 @@ class DeepseekV4Attention(nn.Module):
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see
             # prior-chunk's ring contents (current swa_write would overwrite
             # ring slots `pos % cache_size` for positions in this chunk's tail).
+            # PCP: write the FULL sequence SWA ring from the gathered kv_full +
+            # full positions/cu_seqlens_q (full-KV scheme — every rank holds it).
             swa_write(
-                kv,
-                positions,
+                kv_full,
+                positions_full,
                 attn_md.cu_seqlens_q,
                 state_slot_mapping,
                 self.swa_kv,
@@ -2652,6 +2703,19 @@ class ParallelHead(ParallelLMHead):
         return self.get_logits(norm(x))  # [bs, vocab]
 
 
+def _pcp_active() -> bool:
+    """Whether to apply PCP stripe-split in this forward.
+
+    True only when pcp_size > 1 AND this is a real prefill forward (not decode,
+    not dummy/warmup run). Decode runs PCP-redundant (full KV, no split); the
+    warmup dummy run has no valid KV cache so it must skip the split path.
+    """
+    if get_pcp_world_size() <= 1:
+        return False
+    fc = get_forward_context()
+    return fc.context.is_prefill and not fc.context.is_dummy_run
+
+
 @support_torch_compile
 class DeepseekV4Model(nn.Module):
     """Full model: embed -> expand to hc_mult copies -> N blocks -> hc_head -> logits.
@@ -2728,6 +2792,12 @@ class DeepseekV4Model(nn.Module):
         MTP draft consume it without re-expanding from a dim-reduced state.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
+        # PCP note: under PCP, `input_ids`/`positions` arrive already stripe-
+        # split to this rank's 1/W shard (done in DeepseekV4ForCausalLM.forward,
+        # OUTSIDE the torch.compile boundary — keeping comms / dynamic padding
+        # out of the compiled graph). So everything here runs on the 1/W shard;
+        # the K/V all-gather inside attention reconstructs full KV per layer,
+        # and the final all-gather + un-pad happens back in the caller.
         h = self.embed(input_ids)  # [num_tokens, dim]
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
@@ -2853,6 +2923,30 @@ class DeepseekV4ForCausalLM(nn.Module):
         # `model.forward` — production runner, warmup, benchmarks — gets
         # correct hash routing without a separate setup step.
         ctx = get_forward_context()
+
+        # ===== PCP: stripe-split the prefill sequence OUTSIDE torch.compile =====
+        # PCP splits the prefill query sequence across the PCP group (full-KV
+        # scheme). This must happen here in ForCausalLM.forward (NOT in the
+        # @support_torch_compile-wrapped DeepseekV4Model.forward) so the
+        # cross-rank all-gather + data-dependent padding stay out of the
+        # compiled graph (Dynamo mishandles comms / dynamic shapes -> shape
+        # desync). Mirrors SGLang, which does cp_round_robin on input_ids in
+        # the un-compiled ForCausalLM.forward. We pad tokens to a multiple of
+        # pcp_size (dummy tokens, zero-length KV in the builder metadata), then
+        # stripe-split input_ids/positions to this rank's 1/W shard. The model
+        # runs entirely on 1/W; the final hidden is all-gathered + un-padded
+        # after self.model(...) returns.
+        use_pcp = _pcp_active()
+        if use_pcp:
+            pcp_size = get_pcp_world_size()
+            n_global = input_ids.shape[0]
+            pad = pcp_pad_len(n_global, pcp_size) - n_global
+            if pad > 0:
+                input_ids = torch.cat([input_ids, input_ids.new_zeros(pad)], dim=0)
+                positions = torch.cat([positions, positions.new_zeros(pad)], dim=0)
+            input_ids = pcp_split_stripe(input_ids, pcp_size)
+            positions = pcp_split_stripe(positions, pcp_size)
+
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
             # gate sees DP-gathered gating_output, so gather ids to match. This
@@ -2865,7 +2959,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         else:
             ctx.context.input_ids = input_ids
-        return self.model(input_ids, positions)
+        h = self.model(input_ids, positions)
+
+        # ----- PCP: all-gather shards, restore original order, drop pad -----
+        if use_pcp:
+            h = pcp_allgather_rerange(h, pcp_size)
+            if pad > 0:
+                h = h[:n_global]
+        return h
 
     def compute_logits(
         self,
