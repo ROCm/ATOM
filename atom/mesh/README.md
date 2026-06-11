@@ -231,8 +231,4 @@ Clients send `Authorization: Bearer <key>`. Workers declared on the CLI inherit 
 
 ## Acknowledgments
 
-Atomesh is derived from [**sgl-model-gateway**](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway) (Copyright 2023-2024 SGLang Team, Apache License 2.0). The original project provided the foundational architecture for disaggregated model routing and high-throughput serving.
-
-Atomesh has since been substantially modified and extended as an independent serving layer for the **ATOM** inference engine and **AMD** accelerator deployments. Key differences include ATOM-specific runtime integration, AMD hardware-oriented scheduling and routing policies, PyO3 bridge for ATOM standalone mode, and performance paths designed around ROCm.
-
-See the [NOTICE](NOTICE) file for full attribution details.
+This project was derived from [sgl-model-gateway](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway).
