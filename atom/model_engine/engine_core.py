@@ -778,22 +778,6 @@ class PrefillEngineCore(EngineCore):
 
         # Run on the dedicated prefill stream; returns sampled token IDs (one per seq).
         t0 = time.perf_counter()
-        # for sid, sq in seqs.items():
-        #     if not sq.block_table:
-        #         logger.error("prefill scheduling seq %d with EMPTY block_table — about to fault", sid)
-        #         raise RuntimeError(f"empty block_table for seq {sid}")
-        # total_t = int(scheduled_batch.total_tokens_num)
-        # nreqs = int(scheduled_batch.total_seqs_num)
-        # max_blk = max((max(sq.block_table) for sq in seqs.values()), default=-1)
-        # logger.info(
-        #     "prefill dispatch: nreqs=%d total_tokens=%d max_block_id=%d req_ids=%s nst=%s",
-        #     nreqs, total_t, max_blk,
-        #     list(scheduled_batch.req_ids)[:8],
-        #     list(scheduled_batch.num_scheduled_tokens)[:8],
-        # )
-        # if total_t == 0 or nreqs == 0:
-        #     logger.error("prefill scheduling EMPTY batch (nreqs=%d total_tokens=%d) — skipping forward", nreqs, total_t)
-        #     return False
         sampled_token_ids = self.runner_mgr.call_func(
             "prefill_forward", scheduled_batch, wait_out=True
         )
@@ -893,7 +877,7 @@ class DecodeEngineCore(EngineCore):
             raw = sock.recv()
         bundle = pickle.loads(raw)
         num_kvcache_blocks = bundle["num_kvcache_blocks"]
-        logger.warning(
+        logger.info(
             f"DecodeEngineCore: received kvcache bundle ({num_kvcache_blocks} blocks)"
         )
 

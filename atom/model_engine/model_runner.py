@@ -1313,7 +1313,7 @@ class ModelRunner:
         cudagraph_overhead = self._estimate_cudagraph_overhead()
 
         # Safety margin (2% of total)
-        safety_margin = int(total * 0.05)
+        safety_margin = int(total * 0.02)
 
         # Budget: this server may use up to gpu_memory_utilization * total.
         # Subtract our own PyTorch usage + CUDA graph estimate + safety.
@@ -1329,7 +1329,7 @@ class ModelRunner:
         # (e.g. the 512MB NCCL barrier buffer) don't OOM when two processes
         # share the GPU.
         if getattr(config, "enable_disagg", False):
-            available_for_kv_budget -= safety_margin
+            available_for_kv_budget -= 4*safety_margin
         # This prevents OOM when other processes share the GPU.
         available_for_kv = min(available_for_kv_budget, free)
 
