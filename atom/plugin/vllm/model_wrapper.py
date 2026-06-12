@@ -340,8 +340,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if self.is_eagle3_draft_model:
             self._enable_eagle3_draft_interface()
         elif self.is_eagle3 and self._eagle3_uses_aux_hidden_state():
-            # _enable_eagle3_target_interface() raises if the inner model does
-            # not expose the ATOM server-mode aux-hidden-state interface.
             self._enable_eagle3_target_interface()
         if self.is_mtp or self.is_eagle3:
             # Mirror nested attributes required by vLLM speculative decoding.
@@ -550,7 +548,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         """Expose vLLM's SupportsEagle3 target surface by bridging to the inner
         ATOM model's server-mode aux_hidden_state interface.
         ATOM target models follow the server-mode convention, exposing
-        `set_aux_hidden_state_layers(layers)` and `get_eagle3_aux_hidden_state_layers()`.
+        `set_aux_hidden_state_layers` and `get_eagle3_aux_hidden_state_layers`.
         vLLM's SupportsEagle3 instead calls `set_aux_hidden_state_layers` and
         `get_eagle3_default_aux_hidden_state_layers`.
         """
@@ -568,11 +566,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.has_own_lm_head = False
         self.has_own_embed_tokens = False
         self.set_aux_hidden_state_layers = model.set_aux_hidden_state_layers
-        # vLLM falls back to this "default" when its own config lookup finds
-        # nothing. On the V2 engine that lookup reads only the top-level key, so
-        # resolve the draft's configured ids here (already parsed out of the
-        # possibly-nested eagle_config by ATOM's SpeculativeConfig) — mirroring
-        # server mode and making the V2 gap moot without patching vLLM.
         self.get_eagle3_default_aux_hidden_state_layers = (
             self._resolve_eagle3_aux_hidden_state_layers
         )
