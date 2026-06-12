@@ -763,7 +763,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or gfx.startswith("gfx12")
                 or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
-        self.use_a8w4 = envs.ATOM_USE_TRITON_A8W4_MOE
+        from atom.model_ops.fused_moe_triton import MoEActivationQuant
+
+        self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
 
     def create_weights(
         self,
@@ -945,6 +947,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.hidden_size,  # N_2,
                 self.intermediate_size,  # K_2,
                 atom_config.tensor_parallel_size,
+                act_quant=self.act_quant,
             )
             del layer.w13_weight
             del layer.w2_weight
@@ -991,12 +994,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
 
-        # if activation scales are specified, check quant dtype
+        from atom.model_ops.fused_moe_triton import MoEActivationQuant
+
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
 
-        # NOTE: implemented for visibility to fp8 moe
-        if self.moe.a_quant_dtype == "fp8_e4m3":
+        if self.act_quant == MoEActivationQuant.FP8:
             return mxfp4_w4a8_moe_quant_config(
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
@@ -1080,15 +1083,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
 
-                # Shared experts are handled separately (see below), so the
-                # routed GEMM processes only the routed experts.
-
-                x_q_dtype = (
-                    self.moe.a_quant_dtype if self.moe.a_quant_dtype != "bf16" else None
-                )
-                if self.use_a8w4 and activation == ActivationType.Swiglu:
-                    x_q_dtype = "fp8_e4m3"
-
                 output = torch.empty_like(x)
                 _moe_result = triton_kernel_fused_experts(
                     output,
@@ -1112,7 +1106,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
                     expert_map=expert_map,
-                    x_q_dtype=x_q_dtype,
+                    act_quant=self.act_quant,
                 )
 
                 # Always-on shared expert(s) via a standalone dense GEMM,
@@ -1128,12 +1122,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ), "triton kernel does not support fused shared experts func"
 
             # Takes directly from model dtype in config.json
-            x_q_dtype = (
-                self.moe.a_quant_dtype if self.moe.a_quant_dtype != "bf16" else None
-            )
-            if self.use_a8w4 and activation == ActivationType.Swiglu:
-                x_q_dtype = "fp8_e4m3"
-
             return triton_kernel_moe_forward(
                 x,
                 layer.w13_weight,
@@ -1153,7 +1141,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 expert_map=expert_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
-                x_q_dtype=x_q_dtype,
+                act_quant=self.act_quant,
             )
 
         topk_weights, topk_ids = FusedMoE.select_experts(
@@ -1259,17 +1247,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         M = x.shape[0]
         swiglu_limit = getattr(layer, "swiglu_limit", 0.0)
 
-        # Match the routed-expert activation precision: MXFP4 activations
-        # (a4w4) when x_q_dtype is fp4, otherwise bf16 activations (a16w4).
-        # The shared-expert weights share the routed (N, K//2) + (N, K//32)
-        # MXFP4 layout, so the only difference is whether the dense activation
-        # is MXFP4-quantized before the GEMM.
-        a_quant_dtype = self.moe.a_quant_dtype
-        use_a4w4 = (
-            a_quant_dtype is not None
-            and isinstance(a_quant_dtype, str)
-            and a_quant_dtype.split("_")[0] == "fp4"
-        )
+        from atom.model_ops.fused_moe_triton import MoEActivationQuant
+
+        use_a4w4 = self.act_quant == MoEActivationQuant.FP4
         if use_a4w4:
             from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
             from aiter.ops.triton.moe.moe_op_gemm_a4w4 import mxfp4_quant
