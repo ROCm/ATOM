@@ -865,9 +865,9 @@ jobs:
           elif [ -d "/data/models" ]; then
             MODEL_CACHE_MOUNT="-v /data/models:/models"
             MODEL_CACHE_DESC="/data/models (shared host path)"
-          elif [ -d "/shared/data/amd_int/models" ]; then
-            MODEL_CACHE_MOUNT="-v /shared/data/amd_int/models:/models"
-            MODEL_CACHE_DESC="/shared/data/amd_int/models (shared host path)"
+          #elif [ -d "/shared/data/amd_int/models" ]; then
+          #  MODEL_CACHE_MOUNT="-v /shared/data/amd_int/models:/models"
+          #  MODEL_CACHE_DESC="/shared/data/amd_int/models (shared host path)"
           else
             echo "No shared host model cache found; using container-local /models."
           fi
