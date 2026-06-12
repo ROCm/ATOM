@@ -2,9 +2,7 @@ name: Atomesh Mocker Benchmark
 
 on:
   push:
-    branches:
-      - main
-      - zwan/feat-mesh-ci
+    branches: [main]
     paths:
       - 'atom/mesh/**'
       - '.github/scripts/atomesh_mocker_benchmark.sh'
