@@ -16,6 +16,7 @@ class SGLangModelAdapterSpec:
     """
 
     wrapper_binds_gdn_context: bool = False
+    uses_context_only_forward: bool = False
     prepare_config: Optional[Callable[[Any, str], None]] = None
     install_adapters: Optional[Callable[[Any], None]] = None
 
@@ -24,6 +25,27 @@ def _prepare_qwen35_config(atom_config: Any, model_arch: str) -> None:
     from atom.plugin.sglang.models.qwen3_5 import apply_prepare_model_adaptations
 
     apply_prepare_model_adaptations(atom_config, model_arch)
+
+
+def _prepare_minimax_m2_config(atom_config: Any, model_arch: str) -> None:
+    quant_config = getattr(atom_config, "quant_config", None)
+    if quant_config is None:
+        return
+
+    from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
+
+    quant_config.remap_layer_name(
+        atom_config.hf_config,
+        packed_modules_mapping=MiniMaxM2ForCausalLM.packed_modules_mapping,
+    )
+
+
+def _prepare_kimi_k25_config(atom_config: Any, model_arch: str) -> None:
+    from atom.plugin.sglang.models.kimi_k25 import (
+        remap_kimi_k25_quant_config_for_sglang_plugin,
+    )
+
+    remap_kimi_k25_quant_config_for_sglang_plugin(atom_config, model_arch)
 
 
 def _install_deepseek_mla_adapters(model: Any) -> None:
@@ -35,8 +57,14 @@ def _install_deepseek_mla_adapters(model: Any) -> None:
 MODEL_ADAPTER_SPECS = {
     "DeepseekV3ForCausalLM": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_mla_adapters,
+        uses_context_only_forward=True,
     ),
     "GlmMoeDsaForCausalLM": SGLangModelAdapterSpec(
+        install_adapters=_install_deepseek_mla_adapters,
+        uses_context_only_forward=True,
+    ),
+    "KimiK25ForConditionalGeneration": SGLangModelAdapterSpec(
+        prepare_config=_prepare_kimi_k25_config,
         install_adapters=_install_deepseek_mla_adapters,
     ),
     "Qwen3MoeForCausalLM": SGLangModelAdapterSpec(),
@@ -48,6 +76,10 @@ MODEL_ADAPTER_SPECS = {
     ),
     "Qwen3_5MoeForConditionalGeneration": SGLangModelAdapterSpec(
         prepare_config=_prepare_qwen35_config,
+    ),
+    "MiniMaxM2ForCausalLM": SGLangModelAdapterSpec(
+        uses_context_only_forward=True,
+        prepare_config=_prepare_minimax_m2_config,
     ),
 }
 
@@ -61,6 +93,7 @@ MODEL_ARCH_SPECS = {
         "GlmMoeDsaForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
+        "MiniMaxM2ForCausalLM",
     )
 }
 

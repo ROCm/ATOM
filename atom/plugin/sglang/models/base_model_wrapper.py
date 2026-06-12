@@ -168,10 +168,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                     ),
                     inputs_embeds=runtime.input_embeds,
                 )
-                uses_context_only_forward = (
-                    self.model_arch_spec.install_adapters is not None
-                    or self.model_arch_spec.wrapper_binds_gdn_context
-                )
+
                 with SGLangForwardBatchMetadata.bind(metadata):
                     if self.model_arch_spec.wrapper_binds_gdn_context:
                         from atom.plugin.sglang.attention_backend.attention_gdn import (
@@ -180,7 +177,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
                         with SGLangGDNForwardContext.bind(metadata):
                             hidden_states = self.model(**model_inputs)
-                    elif uses_context_only_forward:
+                    elif self.model_arch_spec.uses_context_only_forward:
                         hidden_states = self.model(**model_inputs)
                     else:
                         hidden_states = self.model(

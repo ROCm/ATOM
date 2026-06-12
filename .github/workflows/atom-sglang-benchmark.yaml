@@ -767,26 +767,26 @@ jobs:
     steps:
       - name: Detect container engine
         run: |
-          if docker info > /dev/null 2>&1; then
-            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
-            echo "Container engine: docker"
-          elif command -v podman > /dev/null 2>&1; then
+          if command -v podman > /dev/null 2>&1; then
             echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
             echo "Container engine: podman"
+          elif docker info > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
+            echo "Container engine: docker"
           else
             echo "ERROR: Neither docker nor podman is available on this runner."
             exit 1
           fi
 
-      - name: Clean up containers and workspace
-        run: |
-          echo "=== Cleaning up containers on $(hostname) ==="
-          containers=$($CONTAINER_ENGINE ps -q)
-          if [ -n "$containers" ]; then
-            $CONTAINER_ENGINE kill $containers || true
-          fi
-          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
-          $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged docker.io/rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
+      #- name: Clean up containers and workspace
+      #  run: |
+      #    echo "=== Cleaning up containers on $(hostname) ==="
+      #    containers=$($CONTAINER_ENGINE ps -q)
+      #    if [ -n "$containers" ]; then
+      #      $CONTAINER_ENGINE kill $containers || true
+      #    fi
+      #    $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
+      #    $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged docker.io/rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
 
       - name: Checkout benchmark ATOM source
         uses: actions/checkout@v6
@@ -910,7 +910,7 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
+            --ipc=host --group-add keep-groups \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
