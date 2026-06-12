@@ -201,6 +201,7 @@ def load_model_in_plugin_mode(
     load_fused_expert_weights_fn=None,
     spec_decode: bool = False,
     hf_config_override: AutoConfig | None = None,
+    model_name_or_path_override: str | None = None,
 ) -> set[str]:
 
     # during loading model, the outplace operation may consume more
@@ -215,7 +216,9 @@ def load_model_in_plugin_mode(
     assert (
         config.plugin_config is not None and config.plugin_config.is_plugin_mode
     ), "ATOM is not running in plugin mode"
-    if config.plugin_config.is_vllm:
+    if model_name_or_path_override is not None:
+        model_name_or_path = model_name_or_path_override
+    elif config.plugin_config.is_vllm:
         model_name_or_path = config.plugin_config.model_config.model
     elif config.plugin_config.is_sglang:
         model_name_or_path = config.plugin_config.model_config.model_path

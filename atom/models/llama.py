@@ -514,3 +514,14 @@ class LlamaForCausalLM(nn.Module):
     ) -> Optional[torch.Tensor]:
         logits = self.lm_head(hidden_states)
         return logits
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Default Eagle3 aux hidden-state layer ids: early / middle / late of
+        the target model. Aligned with vLLM's default (see
+        vllm/model_executor/models/llama.py).
+        """
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
