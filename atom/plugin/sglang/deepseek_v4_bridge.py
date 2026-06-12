@@ -113,6 +113,11 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
 
         total_bytes = self._compute_raw_bytes()
         self.raw_arena = torch.empty(total_bytes, dtype=torch.uint8, device=device)
+        # SGLang's /get_internal_state path reports
+        # token_to_kv_pool_allocator.get_kvcache().mem_usage.  The ATOM proxy
+        # owns one raw arena instead of regular SGLang KV buffers, so report
+        # the arena footprint in GiB to keep that API compatible.
+        self.mem_usage = total_bytes / (1 << 30)
         self.views = self._slice_views()
         self.is_atom_v4_proxy_pool = True
 
