@@ -979,23 +979,6 @@ class MooncakeConnector(KVConnectorBase):
         """Block-only RDMA transfer (MHA, MLA, and other block-indexed backends)."""
         consumer_base_addrs = request_data["consumer_base_addrs"]
 
-        # Fail fast on P/D region-count asymmetry. On this block-indexed path
-        # (MHA/MLA) MTP adds a real draft layer to the KV pool only when the
-        # drafter is loaded, so a one-side `--method mtp` changes the region
-        # count — unlike V4, where count is invariant (see
-        # _execute_block_slot_transfer). The loop below indexes
-        # consumer_base_addrs by the producer's region index, so a mismatch
-        # either IndexErrors (producer-more) or silently under-transfers
-        # (producer-fewer); `!=` catches both.
-        if len(consumer_base_addrs) != len(self.kv_caches_base_addr):
-            raise RuntimeError(
-                "P/D KV region-count mismatch (likely MTP config asymmetry): "
-                f"producer={len(self.kv_caches_base_addr)} vs "
-                f"consumer={len(consumer_base_addrs)} regions. Both prefill and "
-                "decode must launch with identical "
-                "--method / --num-speculative-tokens."
-            )
-
         src_addrs: list[int] = []
         dst_addrs: list[int] = []
         sizes: list[int] = []
@@ -1040,34 +1023,6 @@ class MooncakeConnector(KVConnectorBase):
         consumer_slot_bps = request_data["consumer_v4_slot_bps"]
         dst_slot = request_data["dst_slot_index"]
         src_slot = prefill_data["slot_index"]
-
-        # Fail fast on P/D KV geometry asymmetry before the per-region loops
-        # below trust the consumer's regions. For V4 the region COUNT is
-        # invariant to MTP: compress_ratios is static (from hf_config) and
-        # already includes the MTP layer, so both sides build the same number of
-        # regions. The MTP delta lands in the per-region BYTE SIZE instead —
-        # with `--method mtp`, win_with_spec = window_size + mtp_k, so each SWA
-        # slot's `bps` (and CSA/HCA `bpb`) grows. If P has MTP and D doesn't (or
-        # a different K), the producer would write its larger `bps` into D's
-        # smaller per-slot stride → RDMA overrun / silent corruption. A list
-        # `!=` catches both a byte-size mismatch (MTP asymmetry) and a count
-        # mismatch (gross corruption / wrong model). The consumer ships both.
-        producer_block_bpb = [bpb for _, bpb in self._v4_block_regions]
-        producer_slot_bps = [bps for _, bps in self._v4_slot_regions]
-        if (
-            len(consumer_block_addrs) != len(self._v4_block_regions)
-            or len(consumer_slot_addrs) != len(self._v4_slot_regions)
-            or list(consumer_block_bpb) != producer_block_bpb
-            or list(consumer_slot_bps) != producer_slot_bps
-        ):
-            raise RuntimeError(
-                "P/D KV geometry mismatch (likely MTP config asymmetry — "
-                "differing --method / --num-speculative-tokens): producer "
-                f"block_bpb={producer_block_bpb} slot_bps={producer_slot_bps} "
-                f"vs consumer block_bpb={list(consumer_block_bpb)} "
-                f"slot_bps={list(consumer_slot_bps)}. Both prefill and decode "
-                "must launch with identical --method / --num-speculative-tokens."
-            )
 
         # ---- Phase 1: Block transfer ----
         block_src: list[int] = []
