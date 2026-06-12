@@ -787,16 +787,6 @@ class Scheduler:
                         drafts = list(
                             (seq.kv_transfer_params or {}).get("draft_token_ids") or []
                         )[: self.mtp_k]
-                        if len(drafts) < self.mtp_k:
-                            logger.warning(
-                                "[PD-TRANSITION] seq %s: producer sent %d/%d MTP "
-                                "drafts; padding with EOS. First-decode acceptance "
-                                "will read 0 (producer likely unprimed).",
-                                seq.id,
-                                len(drafts),
-                                self.mtp_k,
-                            )
-                            drafts += [self.eos_token_id] * (self.mtp_k - len(drafts))
                         for d in drafts:
                             seq.append_token(int(d))
                         seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
