@@ -118,13 +118,6 @@ RUN echo "========== [OOT] Restore base image triton ==========" && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
     "${VENV_PYTHON}" -m pip show triton || true
 
-# Qwen3-next encounter accuracy issue with the triton from base image
-# we install verified good version triton==3.6.0 here as a temporary fix
-# this should be removed after the triton issue is resolved  
-RUN echo "========== [OOT] Reinstall known good triton ==========" && \
-    pip uninstall -y triton amd-triton && \
-    pip install triton==3.6.0
-RUN pip show triton || true
 
 RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
     "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \

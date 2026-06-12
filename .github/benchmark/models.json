@@ -62,6 +62,13 @@
           "conc_max": 1024
         },
         {
+          "label": "DPA TBO",
+          "suffix": "-dpa-tbo",
+          "extra_args": "--enable-dp-attention --enable-tbo",
+          "conc_min": 256,
+          "conc_max": 1024
+        },
+        {
           "label": "DPA MTP3",
           "suffix": "-dpa-mtp3",
           "extra_args": "--method mtp --num-speculative-tokens 3 --enable-dp-attention",

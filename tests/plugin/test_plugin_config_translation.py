@@ -65,6 +65,49 @@ def test_generate_from_vllm_translates_core_fields(monkeypatch):
     assert cfg.plugin_config.is_sglang is False
 
 
+def _vllm_cfg(additional_config=None):
+    return _Obj(
+        model_config=_Obj(model="m1", max_model_len=4096),
+        scheduler_config=_Obj(max_num_batched_tokens=2048, max_num_seqs=8),
+        cache_config=_Obj(
+            gpu_memory_utilization=0.5,
+            block_size=16,
+            num_gpu_blocks=1024,
+            cache_dtype="auto",
+            enable_prefix_caching=True,
+        ),
+        parallel_config=_Obj(
+            rank=1, tensor_parallel_size=2, enable_expert_parallel=False
+        ),
+        compilation_config=_Obj(mode=3),
+        quant_config=_Obj(name="q"),
+        additional_config=additional_config if additional_config is not None else {},
+    )
+
+
+def test_online_quant_config_unset_is_none(monkeypatch):
+    _patch_atom_config_module(monkeypatch)
+
+    cfg = plugin_config._generate_atom_config_from_vllm_config(_vllm_cfg())
+
+    assert cfg.online_quant_config is None
+
+
+def test_online_quant_config_from_additional_config(monkeypatch):
+    _patch_atom_config_module(monkeypatch)
+
+    oqc = {
+        "global_quant_config": "ptpc_fp8",
+        "layer_quant_config": {"*expert*": "mxfp4"},
+        "exclude_layer": ["lm_head", "*.gate.*"],
+    }
+    cfg = plugin_config._generate_atom_config_from_vllm_config(
+        _vllm_cfg({"online_quant_config": oqc})
+    )
+
+    assert cfg.online_quant_config == oqc
+
+
 def test_generate_atom_config_requires_plugin_mode(monkeypatch):
     import atom.plugin.config as config_module
     import atom.plugin as plugin_module

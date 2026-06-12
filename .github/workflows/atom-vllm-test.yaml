@@ -7,6 +7,9 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+      - 'atom/plugin/sglang/**'
+      - '.github/workflows/atom-sglang-*.yaml'
+      - '.github/benchmark/sglang_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
 
@@ -77,20 +80,23 @@ jobs:
           }
 
           find_latest_artifact() {
-            local runs_json artifact_json run_id
+            local runs_json artifact_json run_id python_artifact_suffix
 
             if [ -n "$ARTIFACT_ID" ] && [ "$ARTIFACT_ID" != "null" ]; then
               return 0
             fi
 
-            echo "=== Finding latest aiter-whl-* artifact from ROCm/aiter ==="
+            python_artifact_suffix="py${ATOM_PYTHON_TAG#cp}"
+            python_artifact_suffix="${python_artifact_suffix:0:3}.${python_artifact_suffix:3}"
+
+            echo "=== Finding latest aiter-whl-* artifact for ${python_artifact_suffix} from ROCm/aiter ==="
             runs_json=$(curl -fsSL -H "$AUTH_HEADER" \
               "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
 
             for run_id in $(echo "$runs_json" | jq -r '.workflow_runs[].id'); do
               artifact_json=$(curl -fsSL -H "$AUTH_HEADER" \
                 "$API_URL/repos/ROCm/aiter/actions/runs/$run_id/artifacts" \
-                | jq '[.artifacts[] | select(.name | startswith("aiter-whl-")) | select(.expired == false)] | sort_by(.created_at) | last')
+                | jq --arg artifact_suffix "-${python_artifact_suffix}" '[.artifacts[] | select(.name | startswith("aiter-whl-") and endswith($artifact_suffix)) | select(.expired == false)] | sort_by(.created_at) | last')
 
               if [ "$artifact_json" != "null" ] && [ -n "$artifact_json" ]; then
                 ARTIFACT_ID=$(echo "$artifact_json" | jq -r '.id')
@@ -168,9 +174,11 @@ jobs:
           }
 
           download_from_artifact() {
-            echo "=== Falling back to latest aiter-whl-* artifact from ROCm/aiter ==="
+            local fallback_wheel fallback_wheel_name
+
+            echo "=== Falling back to latest ${ATOM_PYTHON_TAG} aiter-whl-* artifact from ROCm/aiter ==="
             find_latest_artifact || {
-              echo "ERROR: No aiter-whl-* artifact found in recent Aiter Test runs"
+              echo "ERROR: No ${ATOM_PYTHON_TAG} aiter-whl-* artifact found in recent Aiter Test runs"
               return 1
             }
 
@@ -181,6 +189,15 @@ jobs:
               -o aiter-whl.zip
             unzip -o aiter-whl.zip -d aiter-whl
             rm -f aiter-whl.zip
+
+            fallback_wheel=$(ls -t aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
+            fallback_wheel_name=$(basename "${fallback_wheel:-}")
+            if [ -z "$fallback_wheel" ] || [[ "$fallback_wheel_name" != *${ATOM_PYTHON_TAG}* ]]; then
+              echo "ERROR: artifact fallback did not produce a ${ATOM_PYTHON_TAG} wheel"
+              ls -la aiter-whl/ || true
+              return 1
+            fi
+            echo "Downloaded artifact-selected wheel: $fallback_wheel"
           }
 
           if download_from_s3_manifest; then
@@ -194,6 +211,10 @@ jobs:
           if [ -z "$AITER_WHL" ]; then
             echo "ERROR: No amd_aiter wheel available after S3/artifact attempts"
             ls -la aiter-whl/ || true
+            exit 1
+          fi
+          if [[ "$(basename "$AITER_WHL")" != *${ATOM_PYTHON_TAG}* ]]; then
+            echo "ERROR: selected wheel $AITER_WHL does not match target Python ${ATOM_PYTHON_TAG}"
             exit 1
           fi
 
@@ -216,19 +237,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - display_name: "DeepSeek-R1-FP8 TP8"
-            model_name: "DeepSeek-R1-FP8"
-            model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extra_args: "--tensor-parallel-size 8"
-            env_vars: ""
-            accuracy_test_threshold: 0.93
+          - display_name: "DeepSeek-V4-Pro TP8"
+            model_name: "DeepSeek-V4-Pro"
+            model_path: "deepseek-ai/DeepSeek-V4-Pro"
+            extra_args: "--tensor-parallel-size 8 --gpu-memory-utilization 0.9 --max-num-seqs 512 --tokenizer-mode deepseek_v4"
+            env_vars: |
+              AITER_BF16_FP8_MOE_BOUND=0
+              ATOM_MOE_GU_ITLV=1
+            lm_eval_num_fewshot: 20
+            accuracy_test_threshold: 0.94
             runner: atom-mi355-8gpu.predownload
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extra_args: "--tensor-parallel-size 1 --gpu-memory-utilization 0.5"
             client_command: "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}"
-            env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+            env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_USE_V2_MODEL_RUNNER=1"
             accuracy_test_threshold: 0.88
             runner: linux-atom-mi35x-1
           - display_name: "Kimi-K2.5-MXFP4 TP4"
@@ -258,6 +282,15 @@ jobs:
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
+      - name: Configure Docker client config path
+        run: |
+          if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+            echo "DOCKER_CONFIG=${GITHUB_WORKSPACE}/.atom-docker-client" >> "$GITHUB_ENV"
+            echo "Set DOCKER_CONFIG to workspace .atom-docker-client (runner-owned, avoids /it-share chmod)."
+          else
+            echo "Runner ${{ matrix.runner }}: leave DOCKER_CONFIG unset (default ~/.docker)."
+          fi
+
       - name: Clean up containers and workspace
         if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: |
@@ -271,6 +304,13 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
+
+      - name: Ensure Docker client config directory
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        run: |
+          set -euo pipefail
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
 
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
@@ -323,7 +363,7 @@ jobs:
               echo "=== ATOM version AFTER installation ===" && pip show atom || true
           RUN pip show amd-aiter atom vllm torch triton mori || true
           EOF
-
+      
       - name: Build OOT image locally
         run: |
           set -euo pipefail
