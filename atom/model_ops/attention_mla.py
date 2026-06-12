@@ -679,16 +679,18 @@ class MLAAttention(nn.Module):
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
+            page_size = get_current_atom_config().kv_cache_block_size
             if self.kv_cache_dtype.startswith("fp8"):
                 mla_decode_fwd(
                     q,
-                    kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+                    kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
                     o,
                     paged_cu_seqlens_q,
                     paged_kv_indptr,
                     paged_kv_indices,
                     kv_last_page_lens,
                     max_q_len,
+                    page_size=page_size,
                     sm_scale=self.scale,
                     q_scale=self._q_scale,
                     kv_scale=self._k_scale,
@@ -696,7 +698,7 @@ class MLAAttention(nn.Module):
             else:
                 mla_prefill_fwd(
                     q,
-                    kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+                    kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
                     o,
                     paged_cu_seqlens_q,
                     paged_kv_indptr,
@@ -739,7 +741,13 @@ class MLAAttention(nn.Module):
 
             k_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
             v_buffer = k_buffer[..., : self.kv_lora_rank]
-            page_size = k_buffer.shape[1]
+            # The KV cache is bound flattened to a per-token layout
+            # ([num_blocks*block_size, 1, 1, 576]), so k_buffer.shape[1] is 1,
+            # not the real paged block size. The dense block_table stores page
+            # ids at block granularity, so PAGE_SIZE must be the real KV cache
+            # block size for the kernel's page// and intra-page% addressing.
+            page_size = get_current_atom_config().kv_cache_block_size
+            logger.info("triton_mla decode: page_size=%d", page_size)
 
             q_for_triton = (
                 q.to(torch.bfloat16)
@@ -784,7 +792,7 @@ class MLAAttention(nn.Module):
                     paged_kv_indices = self.sparse_kv_indices_buffer
 
             dp_size = get_dp_group().world_size
-            use_persistent_mode = not (dp_size > 1)
+            use_persistent_mode = False
 
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
@@ -813,15 +821,17 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
+            page_size = get_current_atom_config().kv_cache_block_size
             mla_decode_fwd(
                 q,
-                kv_buffer.view(-1, 1, 1, q.shape[-1]),
+                kv_buffer.view(-1, page_size, 1, q.shape[-1]),
                 o,
                 paged_cu_seqlens_q,
                 paged_kv_indptr,
                 paged_kv_indices,
                 paged_kv_last_page_lens,
                 max_q_len,
+                page_size=page_size,
                 num_kv_splits=16,
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,

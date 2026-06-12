@@ -76,7 +76,7 @@ class AiterMLABackend(AttentionBackend):
 
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def __init__(self, model_runner):
-        self.block_size = 1
+        self.block_size = 64
         CommonAttentionBuilder.__init__(self, model_runner)
         config = model_runner.config
         hf_config = config.hf_config
