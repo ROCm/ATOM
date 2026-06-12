@@ -218,11 +218,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def request_finished(self, seq: Sequence) -> None:
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
-        # Transfer the producer's MTP drafts (proposed for the token after T0)
-        # so the consumer's first decode is primed exactly like an aggregated
-        # post-prefill seq ([T0, drafts]); without them the consumer's deferred
-        # pipeline is unprimed and its second forward writes out of range.
-        # Empty when MTP is off.
         drafts = getattr(seq, "spec_token_ids", None)
         draft_token_ids = (
             [int(x) for x in drafts] if drafts is not None and len(drafts) else []

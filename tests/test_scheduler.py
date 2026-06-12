@@ -386,12 +386,6 @@ class TestGetNextBatchInfo:
 
 
 class TestScheduledBatchPDFirstDecodeMTP:
-    """方法2: the PD consumer's transition primes token_ids = [prompt, T0,
-    drafts] (T0 + the mtp_k drafts transferred from the producer). The first
-    decode then slices [T0, drafts] as input — matching the aggregated MTP
-    decode — with a non-negative offset, so it neither crashes nor reaches back
-    into prompt tokens. Even a 1-token prompt works.
-    """
 
     def test_first_decode_slices_t0_then_drafts(self):
         mtp_k = 3
@@ -414,8 +408,6 @@ class TestScheduledBatchPDFirstDecodeMTP:
             num_spec_step=mtp_k,
         )
 
-        # offset = num_tokens - 0 - (mtp_k+1) = num_prompt = 1 (>= 0, no crash);
-        # window is [T0, d1, d2, d3] — T0 first (verified), drafts after.
         assert list(batch.scheduled_tokens) == [t0, *drafts]
 
     def test_normal_decode_window_unchanged(self):

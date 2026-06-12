@@ -784,14 +784,6 @@ class Scheduler:
                     seq.append_token(first_token_id)
                     seq._injected_t0 = first_token_id
                     if self.mtp_k > 0:
-                        # Prime the first decode like an aggregated post-prefill
-                        # seq: token_ids becomes [prompt, T0, drafts] and
-                        # spec_token_ids holds the producer's mtp_k drafts. The
-                        # first decode then slices [T0, drafts] (offset >= 0) and
-                        # speculates from step 1; without this the deferred
-                        # pipeline is unprimed and the second forward writes out
-                        # of range. Pad with EOS (rejected) if the producer sent
-                        # fewer drafts (e.g. legacy producer with no draft KV).
                         drafts = list(
                             (seq.kv_transfer_params or {}).get("draft_token_ids") or []
                         )[: self.mtp_k]

@@ -1045,8 +1045,6 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         """
         # Attach output metadata for the proxy to relay
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
-        # MTP drafts for the consumer's first-decode priming (empty when off);
-        # see mooncake_connector.request_finished for the rationale.
         drafts = getattr(seq, "spec_token_ids", None)
         draft_token_ids = (
             [int(x) for x in drafts] if drafts is not None and len(drafts) else []
