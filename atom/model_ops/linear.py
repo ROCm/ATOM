@@ -148,6 +148,8 @@ def triton_bf16_mm(
         y = _mm(x.reshape(-1, x.shape[-1]))
         return y.reshape(*x.shape[:-1], y.shape[-1])
     return _mm(x)
+
+
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 

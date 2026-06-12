@@ -76,7 +76,16 @@ def _swizzle_scales_for_kernel(scale, act_quant: MoEActivationQuant):
 
 
 def _swizzle_mxfp4(
-    w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1,
+    w1,
+    w1_scale,
+    w2,
+    w2_scale,
+    w_dtype,
+    N_1,
+    K_1,
+    N_2,
+    K_2,
+    TP=1,
     act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
 ):
     """Weight swizzle for mxfp4 moe, used for aiter triton mxfp4 moe kernels."""
