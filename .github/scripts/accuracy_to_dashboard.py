@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert OOT accuracy result JSON files to github-action-benchmark input."""
+"""Convert accuracy result JSON files to github-action-benchmark input."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 def _load_model_configs(models_path: Path) -> dict[str, dict]:
-    """Load the OOT accuracy model catalog and index by model_name."""
+    """Load the accuracy model catalog and index by model_name."""
     models = json.loads(models_path.read_text(encoding="utf-8"))
     return {m["model_name"]: m for m in models}
 
