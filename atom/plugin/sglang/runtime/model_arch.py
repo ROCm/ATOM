@@ -40,6 +40,14 @@ def _prepare_minimax_m2_config(atom_config: Any, model_arch: str) -> None:
     )
 
 
+def _prepare_kimi_k25_config(atom_config: Any, model_arch: str) -> None:
+    from atom.plugin.sglang.models.kimi_k25 import (
+        remap_kimi_k25_quant_config_for_sglang_plugin,
+    )
+
+    remap_kimi_k25_quant_config_for_sglang_plugin(atom_config, model_arch)
+
+
 def _install_deepseek_mla_adapters(model: Any) -> None:
     from atom.plugin.sglang.models.deepseek_mla import setup_deepseek_for_sglang
 
@@ -56,6 +64,7 @@ MODEL_ADAPTER_SPECS = {
         uses_context_only_forward=True,
     ),
     "KimiK25ForConditionalGeneration": SGLangModelAdapterSpec(
+        prepare_config=_prepare_kimi_k25_config,
         install_adapters=_install_deepseek_mla_adapters,
     ),
     "Qwen3MoeForCausalLM": SGLangModelAdapterSpec(),
@@ -82,7 +91,6 @@ MODEL_ARCH_SPECS = {
     for key in (
         "DeepseekV3ForCausalLM",
         "GlmMoeDsaForCausalLM",
-        "KimiK25ForConditionalGeneration",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
         "MiniMaxM2ForCausalLM",

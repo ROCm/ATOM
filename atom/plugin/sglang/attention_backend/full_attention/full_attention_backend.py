@@ -2212,6 +2212,38 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
     def _call_mla_decode_fwd(self, q, k_buffer, o, layer):
         """Common mla_decode_fwd invocation shared across decode/extend paths."""
         md = self.forward_metadata
+        head_repeat_factor = getattr(self, "head_repeat_factor", 1)
+        if head_repeat_factor > 1:
+            q_in = q.repeat_interleave(head_repeat_factor, dim=1)
+            o_padded = q.new_empty(
+                (q.shape[0], self.num_head_padded, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            mla_decode_fwd(
+                q_in,
+                k_buffer.view(-1, 1, 1, layer.qk_head_dim),
+                o_padded,
+                md.qo_indptr,
+                md.kv_indptr,
+                md.kv_indices,
+                md.kv_last_page_len,
+                md.max_q_len,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                work_meta_data=md.work_metadata,
+                work_indptr=md.work_indptr,
+                work_info_set=md.work_info_set,
+                reduce_indptr=md.reduce_indptr,
+                reduce_final_map=md.reduce_final_map,
+                reduce_partial_map=md.reduce_partial_map,
+                q_scale=layer.k_scale,
+                kv_scale=layer.k_scale,
+                intra_batch_mode=_sglang_aiter.intra_batch_mode,
+                num_kv_splits=md.num_kv_splits,
+            )
+            o.copy_(o_padded[:, ::head_repeat_factor, :])
+            return
+
         mla_decode_fwd(
             q,
             k_buffer.view(-1, 1, 1, layer.qk_head_dim),
