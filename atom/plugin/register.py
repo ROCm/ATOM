@@ -25,12 +25,20 @@ if is_sglang():
         Qwen3_5ForCausalLM,
         Qwen3_5MoeForCausalLM,
     )
+    from atom.models.kimi_k25 import KimiK25ForCausalLM
 
     _ATOM_SUPPORTED_MODELS.update(
         {
             "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
             "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
             "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
+            # ROCm/ATOM#1078: route Kimi-K2.x through ATOM's quant-aware model
+            # path (KimiK25ForCausalLM -> DeepseekV2ForCausalLM). The standalone
+            # engine already registers this in atom/model_engine/model_runner.py;
+            # the SGLang plugin path was missing it, so launches fell back to
+            # sglang's native model and failed weight loading on the excluded
+            # (BF16) attention projections.
+            "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
         }
     )
 

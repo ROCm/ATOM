@@ -39,6 +39,9 @@ MODEL_ADAPTER_SPECS = {
     "GlmMoeDsaForCausalLM": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_mla_adapters,
     ),
+    "KimiK25ForConditionalGeneration": SGLangModelAdapterSpec(
+        install_adapters=_install_deepseek_mla_adapters,
+    ),
     "Qwen3MoeForCausalLM": SGLangModelAdapterSpec(),
     "Qwen3NextForCausalLM": SGLangModelAdapterSpec(
         wrapper_binds_gdn_context=True,
@@ -59,6 +62,7 @@ MODEL_ARCH_SPECS = {
     for key in (
         "DeepseekV3ForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "KimiK25ForConditionalGeneration",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
     )
