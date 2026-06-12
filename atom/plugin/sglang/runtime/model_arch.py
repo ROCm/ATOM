@@ -57,6 +57,7 @@ MODEL_ADAPTER_SPECS = {
     ),
     "KimiK25ForConditionalGeneration": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_mla_adapters,
+        uses_context_only_forward=True,
     ),
     "Qwen3MoeForCausalLM": SGLangModelAdapterSpec(),
     "Qwen3NextForCausalLM": SGLangModelAdapterSpec(
