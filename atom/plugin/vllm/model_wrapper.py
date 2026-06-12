@@ -226,17 +226,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         model_arch = _normalize_atom_model_arch(selected_model_arch)
         draft_model_config = getattr(speculative_config, "draft_model_config", None)
         draft_hf_config = getattr(draft_model_config, "hf_config", None)
-        self.is_mtp_draft_model = (
-            self.is_mtp and selected_model_arch != main_model_arch
-        )
+        self.is_mtp_draft_model = self.is_mtp and selected_model_arch != main_model_arch
         self.is_eagle3_draft_model = (
             self.is_eagle3
             and selected_model_arch != main_model_arch
             and _is_eagle3_draft_arch(selected_model_arch)
         )
-        self.is_spec_draft_model = (
-            self.is_mtp_draft_model or self.is_eagle3_draft_model
-        )
+        self.is_spec_draft_model = self.is_mtp_draft_model or self.is_eagle3_draft_model
 
         if self.is_eagle3_draft_model and draft_hf_config is None:
             raise ValueError("EAGLE3 draft model config is missing hf_config")
@@ -538,7 +534,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             )
 
         return masked_forward
-    
+
     def _eagle3_uses_aux_hidden_state(self) -> bool:
         vllm_spec_config = getattr(self.vllm_config, "speculative_config", None)
         if getattr(vllm_spec_config, "method", None) != "eagle3":
@@ -554,7 +550,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         """Expose vLLM's SupportsEagle3 target surface by bridging to the inner
         ATOM model's server-mode aux_hidden_state interface.
         ATOM target models follow the server-mode convention, exposing
-        `set_aux_hidden_state_layers(layers)` and `get_eagle3_aux_hidden_state_layers()`. 
+        `set_aux_hidden_state_layers(layers)` and `get_eagle3_aux_hidden_state_layers()`.
         vLLM's SupportsEagle3 instead calls `set_aux_hidden_state_layers` and
         `get_eagle3_default_aux_hidden_state_layers`.
         """
