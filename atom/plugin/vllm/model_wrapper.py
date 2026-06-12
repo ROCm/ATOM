@@ -49,7 +49,7 @@ _EAGLE3_DRAFT_ARCH_TO_ATOM_ARCH: dict[str, str] = {
     "Eagle3DeepseekV2ForCausalLM": "Eagle3DeepseekMLAModel",
     "Eagle3DeepseekV3ForCausalLM": "Eagle3DeepseekMLAModel",
 }
-_EAGLE3_ATOM_DRAFT_ARCHS: str[str] = {
+_EAGLE3_ATOM_DRAFT_ARCHS: set[str] = {
     "Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel",
 }
