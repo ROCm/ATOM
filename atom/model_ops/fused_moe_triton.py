@@ -29,6 +29,7 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
+        swizzle_scales_gfx1250,
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
@@ -48,8 +49,13 @@ def check_and_swizzle_scales(scale, N, K):
     assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
 
     if N % 32 == 0 and K % (32 * 8) == 0:
-        scale = swizzle_scales(scale)
-        return scale, "CDNA4_SCALE"
+        # The mxfp4 weight-scale swizzle layout is arch-specific, and the
+        # moe_gemm_*w4 kernels arch-dispatch internally (gfx1250 gluon vs
+        # CDNA4 triton). Match the scale layout and SWIZZLE_MX_SCALE mode to
+        # the kernel the wrapper will pick (use_gluon = arch == "gfx1250").
+        if get_arch() == "gfx1250":
+            return swizzle_scales_gfx1250(scale), "GFX1250_SCALE"
+        return swizzle_scales(scale), "CDNA4_SCALE"
     else:
         return scale, None
 
