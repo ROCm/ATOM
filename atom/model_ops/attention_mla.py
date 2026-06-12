@@ -498,9 +498,6 @@ class MLAAttention(nn.Module):
             )
             if chunked_out is None:
                 chunked_out = suf_out
-                # A seq absent from this chunk has lse=-inf; both-(-inf) merges
-                # are handled inside merge_attn_states (see its both_empty
-                # guard), so the seed needs no sanitizing here.
                 chunked_lse = suf_lse
             else:
                 tmp_out = torch.empty_like(new_out)
