@@ -51,7 +51,7 @@ logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
 
-if use_triton_gemm():
+if False:
     try:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
             fused_gemm_a8w8_blockscale_preshuffle_split_cat,
@@ -63,6 +63,8 @@ if use_triton_gemm():
         logger.warning(f"Triton fused GEMM split_cat not available: {e}")
         fused_gemm_afp4wfp4_preshuffle_split_cat = None
         fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
+fused_gemm_afp4wfp4_preshuffle_split_cat = None
+fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 
 
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
