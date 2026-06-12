@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ATOMesh Mocker Dashboard</title>
   <style>
-    :root{--bg:#f6f8fa;--card:#fff;--text:#24292f;--muted:#57606a;--border:#d8dee4;--accent:#0969da;--accent-soft:#dbeafe;--pink:#d946ef;--good:#1a7f37;--bad:#cf222e}
+    :root{--bg:#f6f8fa;--card:#fff;--text:#24292f;--muted:#57606a;--border:#d8dee4;--accent:#0969da;--accent-soft:#dbeafe;--pink:#d946ef;--good:#1a7f37;--bad:#cf222e;--link:#94a3b8}
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
     header,footer{background:var(--card);border-bottom:1px solid var(--border);padding:22px 32px}footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--border);border-bottom:0;color:var(--muted)}
     h1{margin:0 0 6px;font-size:24px}h2{margin:0 0 14px;font-size:18px}.muted{color:var(--muted)}
@@ -15,11 +15,12 @@
     main{padding:24px 32px}.panel{display:none}.panel.active{display:block}
     .card{background:var(--card);border:1px solid #cbd5e1;border-radius:12px;padding:22px 24px;margin-bottom:18px}.toolbar{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-bottom:18px}
     select{border:1px solid var(--border);border-radius:6px;padding:7px 10px;background:var(--card);color:var(--text)}.chart-wrap{height:520px}
-    table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid var(--border);padding:9px 10px;text-align:left}th{background:var(--bg);color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.04em}.num{text-align:right;font-variant-numeric:tabular-nums}.commit-link{text-decoration:none}.commit-link:hover{text-decoration:none}
+    a,a:visited,a:hover{color:var(--link);text-decoration:none}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid var(--border);padding:9px 10px;text-align:left}th{background:var(--bg);color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.04em}.num{text-align:right;font-variant-numeric:tabular-nums}.commit-link{text-decoration:none}.commit-link:hover{text-decoration:none}
     .chart-title{color:#2b5c9a;font-size:20px;font-weight:700;margin-bottom:14px}.section-label{color:#6b7280;font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
     .latency-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.latency-card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:16px}.latency-card .chart-wrap{height:330px}
+    .chart-row{display:flex;align-items:stretch}.chart-row .chart-wrap{flex:1;min-width:0}.chart-legend{display:flex;gap:18px;align-items:center;justify-content:center;margin:0 0 8px;color:#52525b;font-size:13px}.chart-legend.vertical{flex-direction:column;align-items:flex-start;justify-content:center;margin:0 0 0 12px;gap:8px;min-width:64px}.legend-item{display:inline-flex;align-items:center;gap:7px;padding:0;border:0;background:transparent;color:#52525b;cursor:pointer;font:inherit}.legend-item.hidden{opacity:.38}.legend-symbol-svg{width:12px;height:12px;flex:0 0 12px;display:block}
     .trend-layout{display:grid;grid-template-columns:130px 1fr;gap:16px}.trend-selector{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}.trend-btn{border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#475569;padding:7px 12px;cursor:pointer;font-size:12px}.trend-btn.active{background:#38b2ac;color:#fff;border-color:#38b2ac}.trend-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.trend-card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:16px}.trend-card .chart-wrap{height:330px}
-    .download-btn{border:1px solid var(--border);border-radius:6px;background:#fff;color:var(--muted);padding:7px 12px;cursor:pointer}footer a{text-decoration:none}footer a:hover{text-decoration:none}.ok{color:var(--good);font-weight:700}.bad{color:var(--bad);font-weight:700}
+    .download-btn{border:1px solid var(--border);border-radius:6px;background:#fff;color:var(--muted);padding:7px 12px;cursor:pointer}.ok{color:var(--good);font-weight:700}.bad{color:var(--bad);font-weight:700}
   </style>
 </head>
 <body>
@@ -38,7 +39,7 @@
       <div class="card"><div class="trend-layout"><span class="section-label">Historical Trends</span><div><div class="trend-selector" id="trend-selector"></div><div class="trend-grid" id="trend-grid"></div></div></div></div>
     </section>
     <section id="accuracy" class="panel">
-      <div class="card"><h2>Atomesh Standalone Accuracy (GSM8K)</h2><p class="muted">Read from ../benchmark-dashboard/data.js and filtered to models used by atomesh-accuracy-validation.</p><div id="accuracy-table"></div></div>
+      <div class="card"><h2>Atomesh Standalone Accuracy (GSM8K)</h2><div id="accuracy-table"></div></div>
     </section>
   </main>
   <footer><button class="download-btn" id="download-json">Download JSON</button><span>Powered by <a href="https://github.com/benchmark-action/github-action-benchmark">github-action-benchmark</a> · ATOMesh Distributed Inference Framework</span></footer>
@@ -54,6 +55,7 @@
   const labels={'request throughput':'Request Throughput','avg latency':'Avg Latency','p99 latency':'P99 Latency','p999 latency':'P999 Latency','failed requests':'Failed Requests'};
   const units={'request throughput':'req/s','avg latency':'ms','p99 latency':'ms','p999 latency':'ms','failed requests':'count'};
   const latencyMetrics=['avg latency','p99 latency','p999 latency'];
+  const pointStyles=['circle','triangle','rectRot','star','crossRot','rectRounded','cross'];
   const enabledTopologies=new Set(['1P1D','2P1D','3P1D']);
   const atomeshModels=new Set(['Meta-Llama-3-8B-Instruct','DeepSeek-R1-0528','DeepSeek-V4-Pro MTP','gpt-oss-120b']);
   const valueLabelPlugin={
@@ -157,17 +159,31 @@
     document.getElementById('latest').innerHTML=`<table><thead><tr><th>Backend</th><th>Scenario</th><th>Configuration</th><th>Request Number</th><th>Conc</th><th>Req/s</th><th>Avg Latency (ms)</th><th>P99 (ms)</th><th>P999 (ms)</th><th>Failed</th><th>Commit</th><th>Run</th></tr></thead><tbody>${body||'<tr><td colspan="12">No data</td></tr>'}</tbody></table>`;
   }
   function fmt(value,digits=2){return Number.isFinite(value)?value.toFixed(digits):'--'}
+  function legendSvg(style,color){
+    const c=esc(color);
+    const shapes={circle:`<circle cx="6" cy="6" r="4.5" fill="${c}"/>`,triangle:`<path d="M6 1.5 10.5 10.5 1.5 10.5Z" fill="${c}"/>`,rectRot:`<path d="M6 1.5 10.5 6 6 10.5 1.5 6Z" fill="${c}"/>`,star:`<path d="M6 1.1 7.3 4.4 10.8 4.6 8.1 6.8 9 10.2 6 8.3 3 10.2 3.9 6.8 1.2 4.6 4.7 4.4Z" fill="${c}"/>`,crossRot:`<path d="M3.1 1.8 6 4.7 8.9 1.8 10.2 3.1 7.3 6 10.2 8.9 8.9 10.2 6 7.3 3.1 10.2 1.8 8.9 4.7 6 1.8 3.1Z" fill="${c}"/>`,rectRounded:`<rect x="1.8" y="1.8" width="8.4" height="8.4" rx="2" fill="${c}"/>`,cross:`<path d="M5 1.5h2v3.5h3.5v2H7v3.5H5V7H1.5V5H5Z" fill="${c}"/>`};
+    return `<svg class="legend-symbol-svg" viewBox="0 0 12 12" aria-hidden="true">${shapes[style]||shapes.circle}</svg>`;
+  }
+  function renderHtmlLegend(chart,legendId,vertical=false){
+    const el=document.getElementById(legendId);
+    if(!el)return;
+    el.className=`chart-legend${vertical?' vertical':''}`;
+    el.innerHTML=chart.data.datasets.map((ds,i)=>`<button class="legend-item${chart.isDatasetVisible(i)?'':' hidden'}" type="button" data-dataset="${i}">${legendSvg(ds.pointStyle,ds.borderColor||ds.backgroundColor)}<span>${esc(ds.label)}</span></button>`).join('');
+    el.querySelectorAll('button').forEach(btn=>btn.addEventListener('click',()=>{const i=Number(btn.dataset.dataset);chart.setDatasetVisibility(i,!chart.isDatasetVisible(i));chart.update();renderHtmlLegend(chart,legendId,vertical)}));
+  }
   function renderPerf(){
     performanceCharts.forEach(chart=>chart.destroy());
     performanceCharts=[];
     const grid=document.getElementById('performance-grid');
-    grid.innerHTML=['request throughput','latency'].map((metric,i)=>`<div class="latency-card"><div class="chart-title">Atomesh Mocker · ${metric==='latency'?'Latency':labels[metric]}</div><div class="chart-wrap"><canvas id="performance-chart-${i}"></canvas></div></div>`).join('');
+    grid.innerHTML=['request throughput','latency'].map((metric,i)=>`<div class="latency-card"><div class="chart-title">Atomesh Mocker · ${metric==='latency'?'Latency':labels[metric]}</div>${metric==='latency'?'<div id="performance-legend-1" class="chart-legend"></div>':''}<div class="chart-wrap"><canvas id="performance-chart-${i}"></canvas></div></div>`).join('');
     const throughputRows=latest('request throughput');
     performanceCharts.push(new Chart(document.getElementById('performance-chart-0'),{type:'bar',data:{labels:throughputRows.map(barLabel),datasets:[{label:`${labels['request throughput']} (${units['request throughput']})`,data:throughputRows.map(p=>p.value),backgroundColor:'rgba(96,165,250,.55)',borderColor:'#2b6cb0',borderWidth:2,borderRadius:6}]},options:{responsive:true,maintainAspectRatio:false,layout:{padding:{top:24}},plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${labels['request throughput']}: ${ctx.parsed.y} ${units['request throughput']}`}}},scales:{x:{title:{display:true,text:'Configuration / Concurrency'},ticks:{minRotation:45,maxRotation:45,color:'#64748b'}},y:{beginAtZero:true,title:{display:true,text:units['request throughput']},ticks:{color:'#64748b'},grid:{color:'rgba(148,163,184,.28)'}}}}}));
     const baseRows=latest('avg latency');
     const cs=colors(latencyMetrics.length);
-    const latencyDatasets=latencyMetrics.map((metric,i)=>{const byCell=new Map(latest(metric).map(p=>[p.cell,p.value]));return{label:labels[metric],data:baseRows.map(p=>byCell.get(p.cell)??null),borderColor:cs[i],backgroundColor:cs[i],tension:.25,pointRadius:4,pointHoverRadius:6}});
-    performanceCharts.push(new Chart(document.getElementById('performance-chart-1'),{type:'line',data:{labels:baseRows.map(barLabel),datasets:latencyDatasets},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${ctx.parsed.y} ms`}}},scales:{x:{title:{display:true,text:'Configuration / Concurrency'},ticks:{minRotation:45,maxRotation:45,color:'#64748b'}},y:{beginAtZero:true,title:{display:true,text:'ms'},ticks:{color:'#64748b'},grid:{color:'rgba(148,163,184,.28)'}}}}}));
+    const latencyDatasets=latencyMetrics.map((metric,i)=>{const byCell=new Map(latest(metric).map(p=>[p.cell,p.value]));return{label:labels[metric],data:baseRows.map(p=>byCell.get(p.cell)??null),borderColor:cs[i],backgroundColor:cs[i],tension:.25,pointStyle:pointStyles[i%pointStyles.length],pointRadius:5,pointHoverRadius:7}});
+    const latencyChart=new Chart(document.getElementById('performance-chart-1'),{type:'line',data:{labels:baseRows.map(barLabel),datasets:latencyDatasets},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${ctx.parsed.y} ms`}}},scales:{x:{title:{display:true,text:'Configuration / Concurrency'},ticks:{minRotation:45,maxRotation:45,color:'#64748b'}},y:{beginAtZero:true,title:{display:true,text:'ms'},ticks:{color:'#64748b'},grid:{color:'rgba(148,163,184,.28)'}}}}});
+    performanceCharts.push(latencyChart);
+    renderHtmlLegend(latencyChart,'performance-legend-1');
     renderDetailTable();
   }
   function trendConfigurations(){
@@ -185,7 +201,7 @@
     document.getElementById('trend-selector').innerHTML=configs.map(cfg=>`<button class="trend-btn${cfg===trendConfig?' active':''}" data-config="${cfg}">Atomesh Mocker · ${cfg}</button>`).join('');
     const trendMetrics=['request throughput','avg latency','p99 latency','p999 latency'];
     const grid=document.getElementById('trend-grid');
-    grid.innerHTML=trendMetrics.map((metric,i)=>`<div class="trend-card"><div class="chart-title">Atomesh Mocker · ${trendConfig} · ${labels[metric]}</div><div class="muted" style="font-size:12px;margin-bottom:8px">Hover to inspect values, use filters to narrow down</div><div class="chart-wrap"><canvas id="trend-chart-${i}"></canvas></div></div>`).join('');
+    grid.innerHTML=trendMetrics.map((metric,i)=>`<div class="trend-card"><div class="chart-title">Atomesh Mocker · ${trendConfig} · ${labels[metric]}</div><div class="muted" style="font-size:12px;margin-bottom:8px">Hover to inspect values, use filters to narrow down</div><div class="chart-row"><div class="chart-wrap"><canvas id="trend-chart-${i}"></canvas></div><div id="trend-legend-${i}" class="chart-legend vertical"></div></div></div>`).join('');
     trendMetrics.forEach((metric,i)=>{
       const rows=allPoints.filter(p=>p.metric===metric&&p.topology===trendConfig);
       const orderedRuns=[...new Map(rows.sort((a,b)=>a.date-b.date).map(p=>[`${dateYMD(p.date)}|${(p.commit?.id||'').slice(0,7)}`,p])).values()];
@@ -195,9 +211,11 @@
       const cs=colors(byConc.size);
       const datasets=[...byConc.entries()].sort((a,b)=>a[0]-b[0]).map(([conc,ps],idx)=>{
         const byLabel=new Map(ps.map(p=>[trendLabel(p),p.value]));
-        return {label:`c${conc}`,data:axisLabels.map(label=>byLabel.get(label)??null),borderColor:cs[idx],backgroundColor:cs[idx],tension:.2,pointRadius:4,pointHoverRadius:6};
+        return {label:`c${conc}`,data:axisLabels.map(label=>byLabel.get(label)??null),borderColor:cs[idx],backgroundColor:cs[idx],tension:.2,pointStyle:pointStyles[idx%pointStyles.length],pointRadius:5,pointHoverRadius:7};
       });
-      trendCharts.push(new Chart(document.getElementById(`trend-chart-${i}`),{type:'line',data:{labels:axisLabels,datasets},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'}},scales:{x:{title:{display:true,text:'Commit'},ticks:{minRotation:45,maxRotation:45,color:'#64748b'}},y:{beginAtZero:true,title:{display:true,text:units[metric]},grid:{color:'rgba(148,163,184,.28)'}}}}}));
+      const chart=new Chart(document.getElementById(`trend-chart-${i}`),{type:'line',data:{labels:axisLabels,datasets},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${ctx.parsed.y} ${units[metric]}`}}},scales:{x:{title:{display:true,text:'Commit'},ticks:{minRotation:45,maxRotation:45,color:'#64748b'}},y:{beginAtZero:true,title:{display:true,text:units[metric]},grid:{color:'rgba(148,163,184,.28)'}}}}});
+      trendCharts.push(chart);
+      renderHtmlLegend(chart,`trend-legend-${i}`,true);
     });
   }
   function accuracyRows(){
