@@ -577,13 +577,13 @@ jobs:
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
-      #- name: Clean up old containers
-      #  run: |
-      #    containers=$(docker ps -q)
-      #    if [ -n "$containers" ]; then
-      #      docker kill $containers || true
-      #    fi
-      #    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+      - name: Clean up old containers
+        run: |
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
       - name: Start validation container
         run: |
