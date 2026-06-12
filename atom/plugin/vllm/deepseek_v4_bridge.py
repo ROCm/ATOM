@@ -1284,24 +1284,34 @@ def get_deepseek_v4_proxy_metadata_from_vllm_context():
     return None
 
 
-def _is_vllm_decode_graph_warmup(attn_metadata) -> bool:
-    """True for vLLM's eager warmup immediately before FULL decode capture.
+def _is_vllm_decode_graph_phase(attn_metadata) -> bool:
+    """True when vLLM is inside its CUDA-graph capture window for V4 decode.
 
-    Native ATOM sets ``in_hipgraph=True`` for both the eager warmup on the graph
-    stream and the following ``torch.cuda.graph`` capture. vLLM labels the
-    warmup forward as ``CUDAGraphMode.NONE`` even though it runs on the same
-    graph stream and is preparing a concrete capture bucket. ATOM patches vLLM's
-    ``_warmup_and_capture`` at runtime to expose that phase without modifying
-    vLLM sources.
+    vLLM sets ``cudagraph_capturing_enabled=True`` around both the eager warmup
+    and the actual capture. The flag is global and defaults to True, so narrow
+    it to real V4 decode-shaped forwards before mapping it to ATOM's
+    ``in_hipgraph``.
     """
     if getattr(getattr(attn_metadata, "state", None), "value", None) != "decode":
         return False
     try:
-        from atom.plugin.vllm.cudagraph_phase_patch import (
-            is_vllm_graph_capture_phase,
+        import vllm.compilation.monitor as vllm_monitor
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
         )
 
-        return is_vllm_graph_capture_phase()
+        if not is_forward_context_available():
+            return False
+        vllm_ctx = get_forward_context()
+        batch_descriptor = getattr(vllm_ctx, "batch_descriptor", None)
+        is_uniform_decode_bucket = bool(
+            batch_descriptor is not None and getattr(batch_descriptor, "uniform", False)
+        )
+        is_single_query_decode = int(getattr(attn_metadata, "max_seqlen_q", 0)) == 1
+        if not (is_uniform_decode_bucket or is_single_query_decode):
+            return False
+        return bool(getattr(vllm_monitor, "cudagraph_capturing_enabled", False))
     except Exception:
         return False
 
@@ -1349,7 +1359,7 @@ def atom_deepseek_v4_forward_context(
             if reset_slots:
                 reset_deepseek_v4_state_slots(state_model, reset_slots)
     in_hipgraph = bool(getattr(attn_metadata, "in_hipgraph", False)) or (
-        _is_vllm_decode_graph_warmup(attn_metadata)
+        _is_vllm_decode_graph_phase(attn_metadata)
     )
     is_prefill = attn_metadata.state.value.startswith("prefill")
     batch_size = int(
