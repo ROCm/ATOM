@@ -46,12 +46,12 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" crossorigin="anonymous"></script>
   <script src="data.js"></script>
   <script>window.MOCKER_BENCHMARK_DATA=window.BENCHMARK_DATA||{entries:{}};window.BENCHMARK_DATA=null;</script>
-  <script src="../benchmark-dashboard/data.js"></script>
-  <script>window.ATOM_BENCHMARK_DATA=window.BENCHMARK_DATA||{entries:{}};window.BENCHMARK_DATA=window.MOCKER_BENCHMARK_DATA;</script>
+  <script src="../atomesh-accuracy-dashboard/data.js"></script>
+  <script>window.ATOMESH_ACCURACY_DATA=window.BENCHMARK_DATA||{entries:{}};window.BENCHMARK_DATA=window.MOCKER_BENCHMARK_DATA;</script>
   <script>
   'use strict';
   const mockerRaw=window.MOCKER_BENCHMARK_DATA||{entries:{}};
-  const atomRaw=window.ATOM_BENCHMARK_DATA||{entries:{}};
+  const atomeshAccuracyRaw=window.ATOMESH_ACCURACY_DATA||{entries:{}};
   const labels={'request throughput':'Request Throughput','avg latency':'Avg Latency','p99 latency':'P99 Latency','p999 latency':'P999 Latency','failed requests':'Failed Requests'};
   const units={'request throughput':'req/s','avg latency':'ms','p99 latency':'ms','p999 latency':'ms','failed requests':'count'};
   const latencyMetrics=['avg latency','p99 latency','p999 latency'];
@@ -220,10 +220,10 @@
   }
   function accuracyRows(){
     const byModel=new Map();
-    for(const run of runs(atomRaw))for(const bench of run.benches||[]){
-      const m=String(bench.name||'').match(/^ATOM::(.+?) accuracy \(GSM8K\)$/);if(!m||!atomeshModels.has(m[1]))continue;
+    for(const run of runs(atomeshAccuracyRaw))for(const bench of run.benches||[]){
+      const m=String(bench.name||'').match(/^ATOMesh::(.+?) accuracy \(GSM8K\)$/);if(!m||!atomeshModels.has(m[1]))continue;
       const extra=parseExtra(bench.extra);
-      const row={backend:'ATOM',model:m[1],score:Number(bench.value),strict:extra.strict?Number(extra.strict):undefined,threshold:extra.threshold?Number(extra.threshold):undefined,baseline:extra.baseline?Number(extra.baseline):undefined,fewshot:extra.fewshot||'--',date:Number(run.date),dateText:dateText(run.date),commit:run.commit||{},runUrl:extra.runUrl||''};
+      const row={backend:'ATOMesh',model:m[1],score:Number(bench.value),strict:extra.strict?Number(extra.strict):undefined,threshold:extra.threshold?Number(extra.threshold):undefined,baseline:extra.baseline?Number(extra.baseline):undefined,fewshot:extra.fewshot||'--',date:Number(run.date),dateText:dateText(run.date),commit:run.commit||{},runUrl:extra.runUrl||''};
       if(!byModel.has(row.model))byModel.set(row.model,[]);
       byModel.get(row.model).push(row);
     }
@@ -245,7 +245,7 @@
       const trend=Number.isFinite(r.trend)?`${r.trend>=0?'+':''}${r.trend.toFixed(4)}`:'--';
       return `<tr><td>${esc(r.backend)}</td><td>${esc(r.model)}</td><td class="num"><strong>${fmt(r.score,4)}</strong></td><td class="num">${fmt(r.strict,4)}</td><td class="num">${fmt(r.baseline,4)}</td><td class="num">${Number.isFinite(recovery)?recovery.toFixed(1)+'%':'--'}</td><td class="num">${fmt(r.threshold,4)}</td><td class="num">${Number.isFinite(margin)?(margin>=0?'+':'')+margin.toFixed(4):'--'}</td><td class="num">${trend}</td><td class="num">${esc(r.fewshot)}</td><td>${esc(dateYMD(r.date))}</td><td>${r.runUrl?`<a href="${esc(r.runUrl)}" target="_blank" rel="noopener noreferrer">view</a>`:'--'}</td></tr>`;
     }).join('');
-    document.getElementById('accuracy-table').innerHTML=`<table><thead><tr><th>Backend</th><th>Model</th><th>Flexible-Extract</th><th>Strict-Match</th><th>Baseline</th><th>Recovery</th><th>Threshold</th><th>Margin</th><th>Trend</th><th>Fewshot</th><th>Last Tested</th><th>Run</th></tr></thead><tbody>${body||'<tr><td colspan="12">No accuracy data found in ../benchmark-dashboard/data.js</td></tr>'}</tbody></table>`;
+    document.getElementById('accuracy-table').innerHTML=`<table><thead><tr><th>Backend</th><th>Model</th><th>Flexible-Extract</th><th>Strict-Match</th><th>Baseline</th><th>Recovery</th><th>Threshold</th><th>Margin</th><th>Trend</th><th>Fewshot</th><th>Last Tested</th><th>Run</th></tr></thead><tbody>${body||'<tr><td colspan="12">No Atomesh accuracy data found in ../atomesh-accuracy-dashboard/data.js</td></tr>'}</tbody></table>`;
   }
   function switchTab(tab){
     document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active',e.dataset.tab===tab));

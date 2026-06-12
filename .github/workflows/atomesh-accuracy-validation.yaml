@@ -778,6 +778,7 @@ jobs:
             /tmp/accuracy-results \
             --output accuracy-benchmark-input.json \
             --models .github/benchmark/models_accuracy.json \
+            --backend ATOMesh \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "=== Generated entries ==="
           cat accuracy-benchmark-input.json
@@ -789,7 +790,7 @@ jobs:
           tool: customBiggerIsBetter
           output-file-path: accuracy-benchmark-input.json
           gh-pages-branch: gh-pages
-          benchmark-data-dir-path: benchmark-dashboard
+          benchmark-data-dir-path: atomesh-accuracy-dashboard
           auto-push: true
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
