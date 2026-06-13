@@ -452,8 +452,6 @@ class MLAAttention(nn.Module):
             attn_metadata.cu_seqlens_k,
             k_full,
             v_full,
-            weight_preshuffle=getattr(self.kv_b_proj.weight, "is_shuffled", False),
-            seg_layout=True,
         )
         output = flash_attn_varlen_func(
             q=prefill_q,
@@ -584,8 +582,6 @@ class MLAAttention(nn.Module):
                 chunk_meta.cu_seqlens_k[c],
                 k_chunk,
                 v_chunk,
-                weight_preshuffle=weight_preshuffle,
-                seg_layout=True,
             )
             suf_out, suf_lse = flash_attn_varlen_func(
                 q=prefill_q,
