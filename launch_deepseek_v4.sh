@@ -36,7 +36,9 @@ elif [ $NUM_GPU -eq 4 ]; then
 fi
 
 export ATOM_SGLANG_V4_DEBUG=${ATOM_SGLANG_V4_DEBUG:-0}
-export PYTHONPATH=/home/qichu_qle/zhiwei/dsv4/sglang/python:/home/qichu_qle/zhiwei/dsv4/atom-main
+# Use the environment-provided SGLang.  Only prepend atom-main so the external
+# model package resolves to the local ATOM plugin code.
+export PYTHONPATH=/home/qichu_qle/zhiwei/dsv4/atom-main:${PYTHONPATH:-}
 export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
 
 TORCHINDUCTOR_COMPILE_THREADS=128 \
@@ -48,15 +50,14 @@ python3 -m sglang.launch_server \
     --tensor-parallel-size $TP_SIZE \
     --kv-cache-dtype fp8_e4m3 \
     --mem-fraction-static 0.9 \
-    --chunked-prefill-size 8192 \
     --swa-full-tokens-ratio 0.1 \
     --max-running-requests 256 \
     --page-size 256 \
-    --attention-backend dsv4 \
     --disable-radix-cache \
-    --disable-shared-experts-fusion \
     --tool-call-parser deepseekv4 \
+    --disable-shared-experts-fusion \
     --reasoning-parser deepseek-v4 \
     2>&1 | tee log.deepseek_v4.serve.log
-    
+    # --attention-backend dsv4 \
+    # --chunked-prefill-size 8192 \
     # >log.deepseek_v4.serve.log 2>&1

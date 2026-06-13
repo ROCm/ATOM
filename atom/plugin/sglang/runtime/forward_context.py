@@ -149,6 +149,10 @@ def _set_atom_forward_context(
         except Exception:
             attn_metadata = None
 
+        if attn_metadata is None:
+            backend = getattr(forward_batch, "attn_backend", None)
+            attn_metadata = getattr(backend, "atom_v4_graph_metadata", None)
+
         proxy_pool, req_to_token_pool = maybe_get_proxy_pool_from_sglang_backend()
         if attn_metadata is None and getattr(proxy_pool, "is_atom_v4_proxy_pool", False):
             attn_metadata = build_atom_v4_attention_metadata_from_sglang(

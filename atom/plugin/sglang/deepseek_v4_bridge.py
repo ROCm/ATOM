@@ -244,6 +244,12 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
             raise RuntimeError("ATOM V4 proxy pool has no full->SWA mapping")
         return self.full_to_swa_index_mapping[kv_indices]
 
+    def set_swa_loc(self, loc: torch.Tensor) -> None:
+        # SGLang 0.5.12 requires BaseSWAKVPool subclasses to expose this hook.
+        # DSV4 pools do not use the generic precomputed SWA location path, and
+        # ATOM writes the proxy arena through its own bridge metadata.
+        pass
+
     def get_state_buf_infos(self):
         return ([], [], [])
 
@@ -1006,13 +1012,29 @@ def _populate_indexer(md, batch_np, positions, device) -> None:
 
 
 def maybe_get_proxy_pool_from_sglang_backend():
+    backend = None
     try:
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         backend = get_attn_backend()
     except Exception:
-        return None, None
-    return getattr(backend, "token_to_kv_pool", None), getattr(backend, "req_to_token_pool", None)
+        backend = None
+
+    proxy_pool = getattr(backend, "token_to_kv_pool", None)
+    req_to_token_pool = getattr(backend, "req_to_token_pool", None)
+    if getattr(proxy_pool, "is_atom_v4_proxy_pool", False):
+        return proxy_pool, req_to_token_pool
+
+    try:
+        from atom.plugin.sglang.runtime import get_current_forward_batch
+
+        forward_batch = get_current_forward_batch()
+    except Exception:
+        forward_batch = None
+
+    proxy_pool = getattr(forward_batch, "token_to_kv_pool", None)
+    req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+    return proxy_pool, req_to_token_pool
 
 
 def reset_deepseek_v4_state_slots(model, slots) -> None:

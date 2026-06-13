@@ -91,6 +91,12 @@ class _AtomCausalLMBaseForSglang(nn.Module):
             if self.atom_config is None:
                 self.atom_config = get_current_atom_config()
                 self.model.atom_config = self.atom_config
+        # SGLang's loader invokes some quantization post-load hooks after
+        # returning from this constructor/load_weights scope. Keep the
+        # process-local ATOM config available, matching native model_runner.
+        from atom.config import set_current_atom_config
+
+        set_current_atom_config(self.atom_config)
         if self.model is None:
             raise ValueError(
                 f"ATOM failed to create model for architecture {self.model_arch}"
