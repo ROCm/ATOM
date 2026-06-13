@@ -51,6 +51,13 @@ logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
 
+try:
+    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+
+    _IS_GFX1250 = _get_gfx() == "gfx1250"
+except Exception:
+    _IS_GFX1250 = False
+
 if use_triton_gemm():
     try:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
@@ -614,6 +621,7 @@ class MLAAttention(nn.Module):
             elif (
                 fused_gemm_a8w8_blockscale_preshuffle_split_cat is not None
                 and weight.dtype == dtypes.fp8
+                and not _IS_GFX1250
             ):  # FP8 GEMM + split + cat
                 weight_shuffled = weight.reshape(
                     weight.shape[0] // 16, weight.shape[1] * 16
