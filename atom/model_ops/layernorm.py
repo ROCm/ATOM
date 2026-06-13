@@ -17,12 +17,6 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
-
-# ATOM_GFX1250_WORKAROUND (ATOM_USE_TRITON_RMSNORM): aiter HIP rmsnorm2d_fwd
-# faults on gfx1250; route to the AITER Triton/Gluon fused_rmsnorm_add, which
-# arch-dispatches internally (gfx1250 Gluon vs portable Triton) and registers
-# its own torch.compile fake.
-from aiter.ops.triton.normalization.fused_rmsnorm_add import fused_rmsnorm_add
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
@@ -63,14 +57,7 @@ def rmsnorm2d_fwd_(
 ) -> torch.Tensor:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    if not envs.ATOM_USE_TRITON_RMSNORM:
-        # Default path: original AITER HIP kernel (faults on gfx1250).
-        return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
-    # ATOM_GFX1250_WORKAROUND (ATOM_USE_TRITON_RMSNORM): HIP rmsnorm2d_fwd faults
-    # on gfx1250. fused_rmsnorm_add arch-dispatches internally (gfx1250 Gluon vs
-    # portable Triton) and registers its own compile fake.
-    out = fused_rmsnorm_add(x, weight, eps)
-    return out.view(ori_shape)
+    return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
 
 
 @torch_compile_guard()
@@ -79,18 +66,9 @@ def rmsnorm2d_fwd_with_add_(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    if not envs.ATOM_USE_TRITON_RMSNORM:
-        # Default path: original AITER HIP kernel (faults on gfx1250).
-        out = torch.empty_like(x)
-        residual_out = torch.empty_like(x)
-        rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
-        return out.view(ori_shape), residual_out.view(ori_shape)
-    # ATOM_GFX1250_WORKAROUND (ATOM_USE_TRITON_RMSNORM): HIP rmsnorm2d_fwd_with_add
-    # faults on gfx1250. fused_rmsnorm_add fuses the residual add + RMSNorm and
-    # arch-dispatches internally (contiguity handled inside the launcher).
-    out, residual_out = fused_rmsnorm_add(
-        x, weight, eps, res1=residual.reshape(-1, dim)
-    )
+    out = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
+    rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
     return out.view(ori_shape), residual_out.view(ori_shape)
 
 

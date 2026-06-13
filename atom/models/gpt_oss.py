@@ -302,12 +302,6 @@ class TransformerBlock(torch.nn.Module):
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.tp_size > 1,
             x_pad_to_multiple=0 if self.tp_size > 1 else 256,
         )
-        # gfx1250 bf16 TDM BLOCK_K=256 route: pad qkv_proj + router input K to a
-        # 256-multiple at load. Their feeding RMSNorms pad to 256 at tp==1, so the
-        # padded activation is consumed directly (qkv) or padded defensively (router).
-        if self.tp_size == 1:
-            self.self_attn.qkv_proj.pad_input_to_multiple = 256
-            self.mlp.router.pad_input_to_multiple = 256
 
     def forward(
         self,

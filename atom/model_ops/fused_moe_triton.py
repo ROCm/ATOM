@@ -19,7 +19,6 @@
 # limitations under the License.
 
 import torch
-from enum import Enum
 from math import prod
 from aiter import ActivationType
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
@@ -42,24 +41,7 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     )
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 
-
-class MoEActivationQuant(Enum):
-    BF16 = "bf16"
-    FP8 = "fp8"
-    FP4 = "fp4"
-
-    @staticmethod
-    def from_model_config(a_quant_dtype: str | None) -> "MoEActivationQuant":
-        if a_quant_dtype is None or a_quant_dtype == "":
-            return MoEActivationQuant.BF16
-        prefix = a_quant_dtype.split("_")[0]
-        if prefix == "fp8":
-            return MoEActivationQuant.FP8
-        # fp4 activations may be reported as "fp4", "fp4_e2m1", or "uint8"
-        # (packed two e2m1 values per byte)
-        if prefix in ("fp4", "uint8"):
-            return MoEActivationQuant.FP4
-        return MoEActivationQuant.BF16
+from atom.model_ops.moe import MoEActivationQuant
 
 
 def _swizzle_scales_for_kernel(scale, act_quant: MoEActivationQuant):
@@ -70,6 +52,7 @@ def _swizzle_scales_for_kernel(scale, act_quant: MoEActivationQuant):
     """
     if act_quant == MoEActivationQuant.FP8:
         return swizzle_scales_a8w4(scale)
+    # TODO: move arch dispatch into aiter's a4w4/a16w4 swizzle_scales (like a8w4)
     if get_arch() in ("gfx942", "gfx950"):
         return swizzle_scales_cdna4(scale), "CDNA4_SCALE"
     return scale, None

@@ -64,6 +64,23 @@ import logging
 logger = logging.getLogger("atom")
 
 
+class MoEActivationQuant(Enum):
+    BF16 = "bf16"
+    FP8 = "fp8"
+    FP4 = "fp4"
+
+    @staticmethod
+    def from_model_config(a_quant_dtype: str | None) -> "MoEActivationQuant":
+        if a_quant_dtype is None or a_quant_dtype == "":
+            return MoEActivationQuant.BF16
+        prefix = a_quant_dtype.split("_")[0]
+        if prefix == "fp8":
+            return MoEActivationQuant.FP8
+        if prefix in ("fp4", "uint8"):
+            return MoEActivationQuant.FP4
+        return MoEActivationQuant.BF16
+
+
 class FusedMoeWeightScaleSupported(Enum):
     """Supported quantization strategies for MoE weight scales."""
 
@@ -763,8 +780,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or gfx.startswith("gfx12")
                 or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
-        from atom.model_ops.fused_moe_triton import MoEActivationQuant
-
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
 
     def create_weights(
@@ -993,8 +1008,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-
-        from atom.model_ops.fused_moe_triton import MoEActivationQuant
 
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
@@ -1246,8 +1259,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         M = x.shape[0]
         swiglu_limit = getattr(layer, "swiglu_limit", 0.0)
-
-        from atom.model_ops.fused_moe_triton import MoEActivationQuant
 
         use_a4w4 = self.act_quant == MoEActivationQuant.FP4
         if use_a4w4:

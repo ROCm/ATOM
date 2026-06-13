@@ -30,24 +30,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
-    # Route unquantized (bf16/fp16) Linear GEMMs (router, attn qkv/o_proj,
-    # lm_head, etc.) through aiter's Triton/gluon gemm_a16w16 instead of
-    # tuned_gemm (which defaults to torch/native on gfx1250). See
-    # atom/model_ops/linear.py.
-    "ATOM_USE_TRITON_GEMM_BF16": lambda: os.getenv("ATOM_USE_TRITON_GEMM_BF16", "0")
-    == "1",
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
-    # --- gfx1250 kernel reroutes (ATOM_GFX1250_WORKAROUND) ---
-    # HIP rmsnorm2d_fwd / mixed_sample_outer_exponential fault on gfx1250; these
-    # opt into the Triton/gluon RMSNorm and torch greedy-argmax sampler instead.
-    # Default off => original HIP kernels (which fault on gfx1250, so the serve
-    # scripts set these to 1). See atom/model_ops/{layernorm,sampler}.py.
-    "ATOM_USE_TRITON_RMSNORM": lambda: os.getenv("ATOM_USE_TRITON_RMSNORM", "0") == "1",
-    "ATOM_USE_TORCH_SAMPLER": lambda: os.getenv("ATOM_USE_TORCH_SAMPLER", "0") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.

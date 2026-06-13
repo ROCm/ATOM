@@ -9,8 +9,6 @@ from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
 
-from atom.utils import envs
-
 # Try to import aiter top-k/top-p sampling ops
 try:
     import aiter.ops.sampling  # noqa: F401
@@ -117,18 +115,7 @@ class Sampler(nn.Module):
         of collapsing onto the same token when they share logits. Otherwise we
         keep the cached ``(1, vocab_size)`` row broadcasted across the batch,
         which preserves the existing run-to-run determinism optimization.
-
-        ATOM_USE_TORCH_SAMPLER (ATOM_GFX1250_WORKAROUND, ported from
-        ce1809f8473f): aiter HIP mixed_sample_outer_exponential faults on
-        gfx1250 (opus::gmem buffer-resource issue). When the flag is set, fall
-        back to torch-native greedy argmax. Simplification: this path is greedy
-        only (bring-up uses temperature=0) and does NOT reproduce the
-        non-greedy / n>1 noise behaviour. Default off => original Gumbel-max.
         """
-        if envs.ATOM_USE_TORCH_SAMPLER:
-            del needs_independent_noise  # noqa: F841 — unused on the workaround path
-            return logits.argmax(dim=-1).to(torch.int)
-
         num_tokens, vocab_size = logits.shape
         sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
         if needs_independent_noise:
