@@ -42,10 +42,6 @@ def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
 
-def use_triton_gemm_bf16() -> bool:
-    return envs.ATOM_USE_TRITON_GEMM_BF16
-
-
 def use_fp4_non_shuffle_triton_gemm() -> bool:
     return envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM
 
@@ -81,7 +77,6 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
-
 
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
