@@ -343,6 +343,31 @@ class MLAAttention(nn.Module):
                 f"seg decode kv_indices max block {max_blk} >= num_blocks "
                 f"{num_blocks}"
             )
+        # One-shot per-layer diagnostic of the actual runtime config so we can
+        # compare against the asm-supported variants (nhead/decode_qlen) and the
+        # scale story (triton casts fp8 q to bf16 without applying q_scale, while
+        # mla_decode_fwd applies q_scale/kv_scale here).
+        if not getattr(self, "_seg_decode_logged", False):
+            self._seg_decode_logged = True
+            logger.info(
+                "SEG-DECODE layer=%d nhead=%d padded_nh=%d hrf=%d B=%d "
+                "q.shape=%s q.stride=%s q.dtype=%s kv.shape=%s kv.dtype=%s "
+                "kv_indptr[:4]=%s kv_indices[:4]=%s q_scale=%s kv_scale=%s",
+                self.layer_num,
+                self.num_heads,
+                self.padded_num_heads,
+                self.head_repeat_factor,
+                q.shape[0],
+                tuple(q.shape),
+                tuple(q.stride()),
+                str(q.dtype),
+                tuple(kv_buffer_4d.shape),
+                str(kv_buffer_4d.dtype),
+                kv_indptr[:4].tolist(),
+                kv_indices[: min(4, kv_indices.shape[0])].tolist(),
+                None if self._q_scale is None else self._q_scale.flatten()[:1].tolist(),
+                None if self._k_scale is None else self._k_scale.flatten()[:1].tolist(),
+            )
 
     @staticmethod
     def _assert_seg_decode_output(o: torch.Tensor) -> None:
@@ -355,6 +380,20 @@ class MLAAttention(nn.Module):
             "seg decode output `o` contains NaN/inf (asm likely did not write "
             "the whole buffer for this nhead/decode_qlen variant)"
         )
+        # Flag fully-zero head rows: with zero-init `o`, an all-zero row means
+        # the asm did not write that (head, token) -> partial write / variant
+        # mismatch. Logged once.
+        if not getattr(MLAAttention, "_seg_zero_row_logged", False):
+            zero_rows = int((o.reshape(o.shape[0], o.shape[1], -1).abs().sum(-1) == 0).sum().item())
+            if zero_rows > 0:
+                MLAAttention._seg_zero_row_logged = True
+                logger.warning(
+                    "SEG-DECODE output has %d all-zero (head,token) rows out of "
+                    "%d -> asm did not write them (partial write / variant "
+                    "mismatch)",
+                    zero_rows,
+                    o.shape[0] * o.shape[1],
+                )
 
     def process_weights_after_loading(self):
         if is_rocm_aiter_fp4bmm_enabled():
