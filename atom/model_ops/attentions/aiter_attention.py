@@ -55,6 +55,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # conversion. Pass --block-size equal to the performant physical
             # page: fp8 packs x=16 - 128; bf16 packs x=8 - 64 (both keep a
             # 128-byte physical page, i.e. block_size // x == 8).
+            expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
+            assert model_runner.block_size == expected, (
+                f"ATOM_USE_UNIFIED_ATTN=1 expects --block-size {expected} "
+                f"for {model_runner.kv_cache_dtype} KV cache (so block_ratio == 1), "
+                f"got --block-size {model_runner.block_size}"
+            )
             self.block_size = model_runner.block_size
         assert (
             model_runner.block_size % self.block_size == 0
