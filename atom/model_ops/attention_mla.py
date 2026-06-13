@@ -252,23 +252,46 @@ class MLAAttention(nn.Module):
         )
         self._seg_layout_validated = True
 
-    def _assert_seg_write(self, kv_cache: torch.Tensor, slot_mapping: torch.Tensor) -> None:
-        """Per-step runtime asserts for the seg KV-cache write path. Gated by
+    def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
+        """Reshape the KV cache buffer into the page-level flat seg layout
+        ``[num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)]`` that the
+        seg write kernels expect (they derive page_size from ``stride(0)``).
+
+        The cache is allocated token-major as ``[num_blocks*page_size, ..., entry]``
+        (so ``kv_cache.shape[0]`` is the total slot count, not the block count).
+        A plain view groups every ``page_size`` consecutive token slots into one
+        block, i.e. slot = block*page_size + offset, which matches slot_mapping
+        and the page-level view used on the decode side
+        (``kv_buffer.view(-1, page_size, 1, entry)``). Using
+        ``kv_cache.view(kv_cache.shape[0], -1)`` here is WRONG: it keeps the
+        token-level stride (entry), so the kernel derives page_size=1 and writes
+        an interleaved layout that the page_size=64 decode then misreads."""
+        page_size = get_current_atom_config().kv_cache_block_size
+        entry = self.kv_lora_rank + self.qk_rope_head_dim
+        return kv_cache.view(-1, page_size * entry)
+
+    def _assert_seg_write(
+        self, kv_cache_seg: torch.Tensor, slot_mapping: torch.Tensor
+    ) -> None:
+        """Per-step runtime asserts for the seg KV-cache write path (operates on
+        the page-level seg view from _seg_kv_cache_view). Gated by
         ATOM_DEBUG_MLA_SEG. Catches layout/stride/slot_mapping mistakes that
         would otherwise silently scatter the cache to wrong offsets."""
         if not envs.ATOM_DEBUG_MLA_SEG:
             return
         entry = self.kv_lora_rank + self.qk_rope_head_dim
-        num_blocks = kv_cache.shape[0]
-        kvf = kv_cache.view(num_blocks, -1)
-        assert kvf.is_contiguous(), "seg kv_cache flat view must be contiguous"
-        assert kvf.stride(0) == entry * _MLA_SEG_PAGE_SIZE, (
-            f"seg kv_cache block stride {kvf.stride(0)} != "
-            f"page_size*entry {entry * _MLA_SEG_PAGE_SIZE}"
+        num_blocks = kv_cache_seg.shape[0]
+        assert kv_cache_seg.is_contiguous(), "seg kv_cache view must be contiguous"
+        assert (
+            kv_cache_seg.dim() == 2
+            and kv_cache_seg.shape[1] == entry * _MLA_SEG_PAGE_SIZE
+        ), (
+            f"seg kv_cache view shape {tuple(kv_cache_seg.shape)} != "
+            f"[num_blocks, {entry * _MLA_SEG_PAGE_SIZE}]"
         )
-        assert kvf.shape[1] % entry == 0 and kvf.shape[1] // entry == _MLA_SEG_PAGE_SIZE, (
-            f"seg kv_cache derived page_size {kvf.shape[1] // entry} != "
-            f"{_MLA_SEG_PAGE_SIZE}"
+        assert kv_cache_seg.stride(0) == entry * _MLA_SEG_PAGE_SIZE, (
+            f"seg kv_cache block stride {kv_cache_seg.stride(0)} != "
+            f"page_size*entry {entry * _MLA_SEG_PAGE_SIZE}"
         )
         slot = slot_mapping.flatten()
         valid = slot[slot >= 0]
@@ -1171,11 +1194,12 @@ class MLAAttention(nn.Module):
                     # kv_cache is flattened to
                     # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so
                     # the kernel derives page_size from stride(0).
-                    self._assert_seg_write(kv_cache, attn_metadata.slot_mapping)
+                    kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+                    self._assert_seg_write(kv_cache_seg, attn_metadata.slot_mapping)
                     concat_and_cache_mla_seg(
                         k_nope,
                         k_rope.squeeze(1),
-                        kv_cache.view(kv_cache.shape[0], -1),
+                        kv_cache_seg,
                         attn_metadata.slot_mapping.flatten(),
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=self._k_scale,
@@ -1251,14 +1275,15 @@ class MLAAttention(nn.Module):
                     )
                 else:
                     self._validate_seg_layout(attn_metadata, positions)
-                    self._assert_seg_write(kv_cache, attn_metadata.slot_mapping)
+                    kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+                    self._assert_seg_write(kv_cache_seg, attn_metadata.slot_mapping)
                     fused_qk_rope_concat_and_cache_mla_seg(
                         q_nope,
                         q_rope,
                         k_nope,
                         k_rope,
                         # Flat seg layout: [num_blocks, page_size*(kv_lora + pe)].
-                        kv_cache.view(kv_cache.shape[0], -1),
+                        kv_cache_seg,
                         q_out,
                         attn_metadata.slot_mapping,
                         self._k_scale,
