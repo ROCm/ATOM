@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import Optional
@@ -145,6 +146,9 @@ def dynamic_per_batched_tensor_quant(
 
 
 class MLAAttention(nn.Module):
+    # Per-layer counter of finite seg decode steps dumped (debug only).
+    _seg_step_counts: dict = {}
+
     def __init__(
         self,
         num_heads: int,
@@ -408,16 +412,17 @@ class MLAAttention(nn.Module):
         max_q_len,
         page_size,
         finite=True,
+        step=0,
     ) -> None:
         """Save the exact kernel inputs (compacted to the referenced pages) so
         they can be replayed offline through `mla_decode_fwd` and an fp32
-        reference. One-shot for the first finite step and one-shot for the first
-        non-finite step."""
-        tag = "OK" if finite else "FAIL"
-        flag = "_seg_okfile_dumped" if finite else "_seg_failfile_dumped"
-        if getattr(MLAAttention, flag, False):
-            return
-        setattr(MLAAttention, flag, True)
+        reference. Captures consecutive finite steps for the target layer plus
+        the first non-finite step."""
+        tag = f"OK_step{step:03d}" if finite else "FAIL"
+        if not finite:
+            if getattr(MLAAttention, "_seg_failfile_dumped", False):
+                return
+            MLAAttention._seg_failfile_dumped = True
         import os
 
         out_dir = os.path.expanduser(
@@ -454,9 +459,12 @@ class MLAAttention(nn.Module):
             "q_dtype": str(q.dtype),
             "kv_dtype": str(seg_kv_buffer_4d.dtype),
         }
-        path = os.path.join(
-            out_dir, f"seg_decode_{tag}_layer{int(self.layer_num):03d}.pt"
+        fname = (
+            f"seg_decode_FAIL_layer{int(self.layer_num):03d}.pt"
+            if not finite
+            else f"seg_decode_OK_layer{int(self.layer_num):03d}_step{step:03d}.pt"
         )
+        path = os.path.join(out_dir, fname)
         torch.save(bundle, path)
         logger.error(
             "SEG-DECODE [%s] output at layer=%d -> saved inputs to %s "
@@ -1222,28 +1230,33 @@ class MLAAttention(nn.Module):
                 kv_scale=self._k_scale,
             )
 
-            if envs.ATOM_DEBUG_MLA_SEG and (
-                not torch.isfinite(o).all()
-                or not getattr(MLAAttention, "_seg_ok_dumped", False)
-            ):
-                # Dump the first (clean, finite) seg decode step AND any
-                # non-finite one, so we can replay vs an fp32 reference and
-                # measure cosine even when there is no NaN.
+            if envs.ATOM_DEBUG_MLA_SEG:
+                # Dump several consecutive finite decode steps for one target
+                # layer (default 0) so we can replay an *early* step (correct)
+                # and a *later* step (after the output degrades) and see whether
+                # the incremental decode-write corrupts the KV cache over time.
+                dbg_layer = int(os.environ.get("ATOM_SEG_DUMP_LAYER", "0"))
+                budget = int(os.environ.get("ATOM_SEG_DUMP_STEPS", "40"))
                 finite = bool(torch.isfinite(o).all())
-                if finite:
-                    MLAAttention._seg_ok_dumped = True
-                self._dump_seg_decode_failure(
-                    q=q,
-                    seg_kv_buffer_4d=seg_kv_buffer_4d,
-                    o=o,
-                    paged_cu_seqlens_q=paged_cu_seqlens_q,
-                    paged_kv_indptr=paged_kv_indptr,
-                    paged_kv_indices=paged_kv_indices,
-                    paged_kv_last_page_lens=paged_kv_last_page_lens,
-                    max_q_len=max_q_len,
-                    page_size=page_size,
-                    finite=finite,
-                )
+                cnt = MLAAttention._seg_step_counts.get(self.layer_num, 0)
+                if (not finite) or (
+                    self.layer_num == dbg_layer and cnt < budget
+                ):
+                    if self.layer_num == dbg_layer:
+                        MLAAttention._seg_step_counts[self.layer_num] = cnt + 1
+                    self._dump_seg_decode_failure(
+                        q=q,
+                        seg_kv_buffer_4d=seg_kv_buffer_4d,
+                        o=o,
+                        paged_cu_seqlens_q=paged_cu_seqlens_q,
+                        paged_kv_indptr=paged_kv_indptr,
+                        paged_kv_indices=paged_kv_indices,
+                        paged_kv_last_page_lens=paged_kv_last_page_lens,
+                        max_q_len=max_q_len,
+                        page_size=page_size,
+                        finite=finite,
+                        step=cnt,
+                    )
             self._assert_seg_decode_output(o)
 
             if envs.ATOM_DUMP_MLA_DECODE and not self.is_sparse_mla:
