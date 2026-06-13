@@ -1239,7 +1239,18 @@ class MLAAttention(nn.Module):
                 budget = int(os.environ.get("ATOM_SEG_DUMP_STEPS", "40"))
                 finite = bool(torch.isfinite(o).all())
                 cnt = MLAAttention._seg_step_counts.get(self.layer_num, 0)
-                if (not finite) or (
+                # Also force-capture the first MULTI-PAGE (>=2 pages) finite step
+                # for the target layer, since cross-page gather is a distinct
+                # code path from the (verified-correct) single-page case.
+                n_pages_0 = int(paged_kv_indptr[1].item() - paged_kv_indptr[0].item())
+                want_multipage = (
+                    self.layer_num == dbg_layer
+                    and n_pages_0 >= 2
+                    and not getattr(MLAAttention, "_seg_multipage_dumped", False)
+                )
+                if want_multipage:
+                    MLAAttention._seg_multipage_dumped = True
+                if (not finite) or want_multipage or (
                     self.layer_num == dbg_layer and cnt < budget
                 ):
                     if self.layer_num == dbg_layer:
