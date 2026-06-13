@@ -395,6 +395,75 @@ class MLAAttention(nn.Module):
                     o.shape[0] * o.shape[1],
                 )
 
+    def _dump_seg_decode_failure(
+        self,
+        *,
+        q,
+        seg_kv_buffer_4d,
+        o,
+        paged_cu_seqlens_q,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_lens,
+        max_q_len,
+        page_size,
+    ) -> None:
+        """On the first non-finite seg decode output, save the exact kernel
+        inputs (compacted to the referenced pages) so they can be replayed
+        offline through `mla_decode_fwd` and an fp32 reference. One-shot."""
+        if getattr(MLAAttention, "_seg_failure_dumped", False):
+            return
+        MLAAttention._seg_failure_dumped = True
+        import os
+
+        out_dir = os.path.expanduser(
+            os.environ.get("MLA_DUMP_DIR", "~/mla_decode_dump")
+        )
+        os.makedirs(out_dir, exist_ok=True)
+
+        bs = int(paged_kv_indptr.numel() - 1)
+        total_pages = int(paged_kv_indptr[bs].item())
+        used = paged_kv_indices.to(torch.int64).cpu()[:total_pages]
+        uniq, inverse = torch.unique(used, sorted=True, return_inverse=True)
+        kv_compact = seg_kv_buffer_4d[uniq.to(seg_kv_buffer_4d.device)].detach().cpu()
+
+        bundle = {
+            "layer_num": int(self.layer_num),
+            "q": q.detach().cpu(),
+            "q_stride": tuple(q.stride()),
+            "seg_kv_compact": kv_compact,
+            "kv_indices_remapped": inverse.to(torch.int32),
+            "o": o.detach().cpu(),
+            "qo_indptr": paged_cu_seqlens_q.detach().cpu(),
+            "kv_indptr": paged_kv_indptr.detach().cpu(),
+            "kv_last_page_lens": paged_kv_last_page_lens.detach().cpu(),
+            "max_q_len": int(max_q_len),
+            "page_size": int(page_size),
+            "sm_scale": float(self.scale),
+            "num_heads": int(self.num_heads),
+            "padded_num_heads": int(self.padded_num_heads),
+            "kv_lora_rank": int(self.kv_lora_rank),
+            "qk_rope_head_dim": int(self.qk_rope_head_dim),
+            "v_head_dim": int(self.v_head_dim),
+            "q_scale": None if self._q_scale is None else self._q_scale.detach().cpu(),
+            "kv_scale": None if self._k_scale is None else self._k_scale.detach().cpu(),
+            "q_dtype": str(q.dtype),
+            "kv_dtype": str(seg_kv_buffer_4d.dtype),
+        }
+        path = os.path.join(out_dir, f"seg_decode_FAIL_layer{int(self.layer_num):03d}.pt")
+        torch.save(bundle, path)
+        logger.error(
+            "SEG-DECODE non-finite output at layer=%d -> saved failing inputs to %s "
+            "(bs=%d total_pages=%d uniq_pages=%d kv_indptr[:4]=%s last_page_lens[:4]=%s)",
+            self.layer_num,
+            path,
+            bs,
+            total_pages,
+            int(uniq.numel()),
+            paged_kv_indptr[:4].tolist(),
+            paged_kv_last_page_lens[:4].tolist(),
+        )
+
     def process_weights_after_loading(self):
         if is_rocm_aiter_fp4bmm_enabled():
             kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj)
@@ -1146,6 +1215,18 @@ class MLAAttention(nn.Module):
                 kv_scale=self._k_scale,
             )
 
+            if envs.ATOM_DEBUG_MLA_SEG and not torch.isfinite(o).all():
+                self._dump_seg_decode_failure(
+                    q=q,
+                    seg_kv_buffer_4d=seg_kv_buffer_4d,
+                    o=o,
+                    paged_cu_seqlens_q=paged_cu_seqlens_q,
+                    paged_kv_indptr=paged_kv_indptr,
+                    paged_kv_indices=paged_kv_indices,
+                    paged_kv_last_page_lens=paged_kv_last_page_lens,
+                    max_q_len=max_q_len,
+                    page_size=page_size,
+                )
             self._assert_seg_decode_output(o)
 
             if envs.ATOM_DUMP_MLA_DECODE and not self.is_sparse_mla:
