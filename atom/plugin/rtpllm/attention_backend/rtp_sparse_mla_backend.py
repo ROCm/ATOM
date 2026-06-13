@@ -927,6 +927,7 @@ class _RealSparseMlaImpl:
         head_repeat_factor = padded_num_heads // num_heads
         q_dtype = self._aiter_dtype_for_tensor(q_latent)
         kv_dtype = self._aiter_dtype_for_tensor(kv_cache_base)
+        reuse_eager_metadata = False
         if in_capture:
             work_meta_data = sparse_bufs["work_meta_data"]
             work_indptr = sparse_bufs["work_indptr"]
@@ -956,6 +957,9 @@ class _RealSparseMlaImpl:
                 reduce_indptr = cached_eager_meta["reduce_indptr"]
                 reduce_final_map = cached_eager_meta["reduce_final_map"]
                 reduce_partial_map = cached_eager_meta["reduce_partial_map"]
+                reuse_eager_metadata = bool(
+                    cached_eager_meta.get("metadata_ready", False)
+                )
             else:
                 metadata_budget_tokens = self._metadata_token_budget(
                     num_tokens=num_tokens, topk=topk
@@ -1005,6 +1009,7 @@ class _RealSparseMlaImpl:
                         "reduce_indptr": reduce_indptr,
                         "reduce_final_map": reduce_final_map,
                         "reduce_partial_map": reduce_partial_map,
+                        "metadata_ready": False,
                     }
                 except Exception:
                     pass
@@ -1050,7 +1055,7 @@ class _RealSparseMlaImpl:
                 max_slots=max_page_slots,
             )
 
-        if not reuse_capture_metadata:
+        if not reuse_capture_metadata and not reuse_eager_metadata:
             get_mla_metadata_v1(
                 qo_indptr,
                 paged_kv_indptr,
@@ -1072,6 +1077,12 @@ class _RealSparseMlaImpl:
                 dtype_q=q_dtype,
                 dtype_kv=kv_dtype,
             )
+            if not in_capture:
+                cached_eager_meta = getattr(
+                    plugin_metadata, "_rtp_sparse_eager_meta_workspace", None
+                )
+                if isinstance(cached_eager_meta, dict):
+                    cached_eager_meta["metadata_ready"] = True
             if in_capture:
                 plugin_metadata._rtp_sparse_capture_meta_workspace = {
                     "signature": capture_meta_sig,

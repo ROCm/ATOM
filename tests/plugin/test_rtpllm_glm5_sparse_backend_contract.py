@@ -609,6 +609,97 @@ def test_real_sparse_decode_uses_atom_aiter_metadata(monkeypatch):
     assert decode_call["kwargs"]["reduce_final_map"] is not None
 
 
+def test_real_sparse_eager_metadata_workspace_skips_refill(monkeypatch):
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    metadata_calls = []
+
+    fake_aiter = type(sys)("aiter")
+    fake_aiter.dtypes = SimpleNamespace(d_dtypes={"bf16": "bf16", "fp16": "fp16"})
+
+    def fake_metadata_info(*args, **kwargs):
+        return (
+            (4, torch.int32),
+            (4, torch.int32),
+            (4, torch.int32),
+            (4, torch.int32),
+            (4, torch.int32),
+            (4, torch.int32),
+        )
+
+    def fake_metadata_v1(*args, **kwargs):
+        metadata_calls.append((args, kwargs))
+
+    fake_aiter.get_mla_metadata_info_v1 = fake_metadata_info
+    fake_aiter.get_mla_metadata_v1 = fake_metadata_v1
+    monkeypatch.setitem(sys.modules, "aiter", fake_aiter)
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: False, raising=False
+    )
+
+    fake_sparse_helpers = type(sys)("atom.plugin.attention_mla_sparse")
+
+    def fake_convert(
+        req_id,
+        block_table,
+        token_indices,
+        cu_seqlens,
+        out,
+        BLOCK_SIZE=1,
+        NUM_TOPK_TOKENS=0,
+        BLOCK_N=128,
+    ):
+        del req_id, block_table, token_indices, BLOCK_SIZE, NUM_TOPK_TOKENS, BLOCK_N
+        out[: int(cu_seqlens[-1].item())].zero_()
+
+    fake_sparse_helpers.triton_convert_req_index_to_global_index = fake_convert
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.plugin.attention_mla_sparse",
+        fake_sparse_helpers,
+    )
+
+    impl = module._RealSparseMlaImpl(
+        mla_modules=SimpleNamespace(
+            kv_lora_rank=4,
+            qk_nope_head_dim=2,
+            qk_rope_head_dim=1,
+            num_heads=2,
+            rotary_emb=None,
+            kv_b_proj=SimpleNamespace(weight=torch.empty(0)),
+        ),
+        v_head_dim=3,
+    )
+    q_latent = torch.randn(2, 2, 5)
+    kv_cache = torch.randn(8, 1, 5)
+    topk = torch.tensor([[0, 1, 2], [0, 1, -1]], dtype=torch.int32)
+    plugin_metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([3, 2], dtype=torch.int32),
+        req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+    )
+    attn_metadata = SimpleNamespace(plugin_metadata=plugin_metadata)
+
+    first = impl._build_atom_sparse_metadata(
+        q_latent=q_latent,
+        kv_cache_base=kv_cache,
+        topk_indices=topk,
+        attn_metadata=attn_metadata,
+        block_size=4,
+    )
+    second = impl._build_atom_sparse_metadata(
+        q_latent=q_latent,
+        kv_cache_base=kv_cache,
+        topk_indices=topk,
+        attn_metadata=attn_metadata,
+        block_size=4,
+    )
+
+    assert len(metadata_calls) == 1
+    assert second.work_meta_data is first.work_meta_data
+    assert plugin_metadata._rtp_sparse_eager_meta_workspace["metadata_ready"] is True
+
+
 def test_real_sparse_decode_rejects_oob_paged_kv_indices(monkeypatch):
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
     decode_called = {"value": False}
