@@ -132,14 +132,24 @@ ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGLANG_REF="v0.5.12"
-ARG SGLANG_TRITON_VERSION="3.6.0"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
 
-RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL versions before SGLang build ==========" && \
-    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl || true
+RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
+    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
+    echo "========== [SGLANG-ATOM 0/6] Back up base image Triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
+    mkdir -p /tmp/triton-base-backup && \
+    cp -a "${SITE_PACKAGES}/triton" /tmp/triton-base-backup/ && \
+    for f in "${SITE_PACKAGES}"/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
+      cp -a "$f" /tmp/triton-base-backup/; \
+    done && \
+    echo "Base image Triton backed up: import_version=${BASE_TRITON_VERSION}" && \
+    ls /tmp/triton-base-backup/
 
 RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     rm -rf /app/sglang && \
@@ -202,28 +212,35 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     rm -f /tmp/sglang-runtime-common.txt && \
     "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
 
-RUN echo "========== [SGLANG-ATOM 4/6] Validate vision/audio wheels ==========" && \
+# Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
+# runtime installs can perturb Triton; restore the base package before final
+# validation so ATOM, AITER, triton_kernels, and SGLang run with one coherent
+# runtime stack, matching the vLLM/OOT image policy above.
+RUN echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && \
+    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
+    rm -rf "${SITE_PACKAGES}/triton" \
+           "${SITE_PACKAGES}"/triton-*.dist-info && \
+    cp -a /tmp/triton-base-backup/triton "${SITE_PACKAGES}/" && \
+    for f in /tmp/triton-base-backup/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
+      cp -a "$f" "${SITE_PACKAGES}/"; \
+    done && \
+    rm -rf /tmp/triton-base-backup && \
+    "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
+    "${VENV_PYTHON}" -m pip show triton
+
+RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" && \
     "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null && \
     "${VENV_PYTHON}" -c "import os, torch, torchvision, torchaudio, sglang, triton, transformers; from torchvision.io import decode_jpeg; assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'; print(f'torch: {torch.__version__}'); print(f'triton: {triton.__version__}'); print(f'transformers: {transformers.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'decode_jpeg: {decode_jpeg.__name__}'); print(f'sglang imported from: {sglang.__file__}'); print(f'PYTHONPATH={os.environ.get(\"PYTHONPATH\", \"\")}')" && \
     echo "Validated sglang launch_server entrypoint"
-
-# Only the derived SGLang image needs the newer Triton compiler. SGLang serving
-# for DeepSeek-R1 hit `ConvertTritonAMDGPUToLLVM` failures with the Triton that
-# ships in the shared ATOM base image, while Triton 3.6.0 fixes that compiler
-# path for this flow. Install Triton after the torchvision/torchaudio wheel pin
-# so pip does not downgrade it back to the torch-pinned 3.5.1 dependency. Keep
-# this override local to `atom_sglang` so the OOT/atom_release flow preserves
-# its prior Triton behavior.
-RUN echo "========== [SGLANG-ATOM 5/6] Install validated Triton ==========" && \
-    "${VENV_PYTHON}" -m pip install --no-cache-dir "triton==${SGLANG_TRITON_VERSION}" && \
-    "${VENV_PYTHON}" -m pip show triton
 
 RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir "smg-grpc-servicer==0.5.2" && \
     "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer
 
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
-    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl || true
+    "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl sglang triton triton-kernels || true
 
 CMD ["/bin/bash"]
 
