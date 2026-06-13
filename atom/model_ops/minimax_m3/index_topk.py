@@ -338,7 +338,9 @@ def _decode_index_score_kernel(
         q_ptr + pid_b * stride_q_n + pid_h * stride_q_h + off_d * stride_q_d,
         mask=d_mask,
         other=0.0,
-    ).to(tl.float32)  # [D]
+    ).to(
+        tl.float32
+    )  # [D]
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
@@ -350,7 +352,9 @@ def _decode_index_score_kernel(
             + off_d[:, None] * stride_ik_d,
             mask=d_mask[:, None] & pos_mask[None, :],
             other=0.0,
-        ).to(tl.float32)  # [D, N]
+        ).to(
+            tl.float32
+        )  # [D, N]
         qk = tl.sum(q[:, None] * k, axis=0) * sm_scale_log2e  # [N]
         qk = tl.where(pos_mask, qk, float("-inf"))
         score = tl.max(qk, axis=0)  # one score for this 128-block
@@ -614,9 +618,9 @@ def minimax_m3_index_topk(
     per-index-head top-k maps 1:1 to kv heads (no index-head reduction needed).
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
-    assert num_idx_heads == num_kv_heads, (
-        "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    )
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
 
@@ -700,9 +704,9 @@ def minimax_m3_index_topk_decode(
     Returns topk_idx [num_kv_heads, batch, topk] (0-indexed block ids, -1 pad).
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
-    assert num_idx_heads == num_kv_heads, (
-        "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    )
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     batch = total_q
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     score = torch.empty(

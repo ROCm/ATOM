@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 """Attention backend for MiniMax M3 sparse ("lightning indexer") attention.
 
 MiniMax M3 sparse layers run GQA attention restricted to a small set of KV
@@ -30,6 +30,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
 )
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -53,12 +54,28 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+def _maybe_view_fp8_kv_cache(
+    kv_cache: torch.Tensor,
+    kv_cache_dtype: str,
+) -> torch.Tensor:
+    if (
+        isinstance(kv_cache_dtype, str)
+        and kv_cache_dtype.startswith("fp8")
+        and kv_cache.dtype == torch.uint8
+    ):
+        return kv_cache.view(current_platform.fp8_dtype())
+    return kv_cache
+
+
 class MiniMaxM3SparseBackend(AttentionBackend):
     """Block-sparse GQA backend for MiniMax M3 sparse attention layers."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
-    # Sparse kernels operate on a bf16 KV cache only.
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
 
     @staticmethod
     def get_name() -> str:
@@ -376,7 +393,6 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
         self.score_type = score_type
         self.num_index_heads = num_index_heads
         self.index_head_dim = index_head_dim
-        self._prefill_gqa_sparse = self._prefill_gqa_sparse_triton
 
     def _run_prefill(
         self,
@@ -412,7 +428,7 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
             self.scale,
         )
         # 2. GQA block-sparse attention over the selected blocks (main cache).
-        self._prefill_gqa_sparse(
+        self._prefill_gqa_sparse_triton(
             q,
             out,
             kv_cache,
@@ -444,7 +460,7 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
     ) -> None:
         minimax_m3_sparse_attn(
             q,
-            kv_cache,
+            _maybe_view_fp8_kv_cache(kv_cache, self.kv_cache_dtype),
             topk_idx,
             main_block_table,
             cu_seqlens_q,
@@ -485,7 +501,7 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
         # 2. GQA block-sparse attention (split-K over the selected blocks).
         minimax_m3_sparse_attn_decode(
             q,
-            kv_cache,
+            _maybe_view_fp8_kv_cache(kv_cache, self.kv_cache_dtype),
             topk_idx,
             main_block_table,
             seq_lens,

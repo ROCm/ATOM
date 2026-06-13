@@ -329,7 +329,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
         layer_num: int = 0,
     ) -> None:
         super().__init__()
-        self.layer_id = layer_num
         attn_cls = (
             MiniMaxM3SparseAttention
             if layer_num in _sparse_attention_layer_ids(config)
@@ -604,4 +603,6 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 # Native full VL support will be wired after the MiniMax-M3 vision tower is
 # ported to ATOM.  Keep the architecture name available as a text-only fallback
 # so checkpoints with the VL arch can start loading during language bring-up.
-MiniMaxM3SparseForConditionalGeneration = MiniMaxM3SparseForConditionalGenerationTextOnly
+MiniMaxM3SparseForConditionalGeneration = (
+    MiniMaxM3SparseForConditionalGenerationTextOnly
+)

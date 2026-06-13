@@ -8,23 +8,56 @@ specific processor, vision, and sparse-attention helpers are implemented in
 ATOM-owned modules.
 """
 
-import os
 from collections.abc import Iterable
 
 import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
-from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
 from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config
+from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    BlockQuantScaleParameter,
+)
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.utils.torch_utils import is_quantized_kv_cache, kv_cache_dtype_str_to_dtype
+from vllm.v1.kv_cache_interface import FullAttentionSpec, get_kv_quant_mode
+
+from atom.config import Config
+from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
+from atom.model_ops.layernorm import fused_allreduce_gemma_rms_norm
+from atom.model_ops.linear import ReplicatedLinear
+from atom.model_ops.minimax_m3.gemma_rmsnorm import (
+    gemma_fused_add_rmsnorm,
+    gemma_rmsnorm,
+)
+from atom.model_ops.minimax_m3.moe import MiniMaxM3Bf16Experts
+from atom.model_ops.swiglu_oai import swiglu_oai_split
+from atom.model_ops.utils import atom_parameter
+from atom.models import minimax_m3 as minimax_m3_base
+from atom.models.minimax_m3 import (
+    MiniMaxM3SparseForCausalLM as NativeMiniMaxM3ForCausalLM,
+)
+from atom.models.utils import IntermediateTensors, maybe_prefix
+from atom.plugin.vllm.attention.ops import minimax_m3_sparse_attention  # noqa: F401
+from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
 from atom.plugin.vllm.models.minimax_m3_mm_preprocess import (
     MiniMaxM3VLDummyInputsBuilder,
     MiniMaxM3VLMultiModalProcessor,
@@ -36,27 +69,368 @@ from atom.plugin.vllm.models.minimax_m3_sparse_attention import (
     MiniMaxM3SparseMetadata,
 )
 from atom.plugin.vllm.models.minimax_m3_vision_tower import MiniMaxVLVisionModel
-from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-from vllm.v1.kv_cache_interface import FullAttentionSpec, get_kv_quant_mode
 
-from atom.config import Config
-from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
-from atom.model_ops.layernorm import GemmaRMSNorm
-from atom.model_ops.linear import (
-    MinimaxM3QKVParallelLinearWithIndexer,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
-from atom.model_ops.minimax_m3.moe import MiniMaxM3Bf16Experts
-from atom.model_ops.utils import atom_parameter
-from atom.models import minimax_m3 as minimax_m3_base
-from atom.models.minimax_m3 import (
-    MiniMaxM3SparseForCausalLM as NativeMiniMaxM3ForCausalLM,
-)
-from atom.models.utils import IntermediateTensors, maybe_prefix
-from atom.plugin.vllm.attention.ops import minimax_m3_sparse_attention  # noqa: F401
-from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
+
+class MiniMAXGemmaRMSNorm(nn.Module):
+    """Gemma-style RMSNorm from ame MiniMax-M3 AMD implementation."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return gemma_rmsnorm(x, self.weight, self.variance_epsilon)
+        return gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
+
+
+class MiniMaxM3MLP(nn.Module):
+    """Shared-expert MLP using vLLM linear layers (matches code/ame minimax_m3)."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        intermediate_size: int,
+        quant_config: QuantizationConfig | None = None,
+        reduce_results: bool = True,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        del quant_config
+        self.gate_up_proj = MergedColumnParallelLinear(
+            config.hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=None,
+            reduce_results=reduce_results,
+            prefix=f"{prefix}.down_proj",
+        )
+        if config.hidden_act != "swigluoai":
+            raise ValueError(
+                f"Unsupported activation: {config.hidden_act}. "
+                "Only swigluoai is supported."
+            )
+        self.swiglu_alpha = config.swiglu_alpha
+        self.swiglu_beta = config.swiglu_beta
+        self.swiglu_limit = config.swiglu_limit
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(x)
+        if isinstance(gate_up, tuple):
+            gate_up = gate_up[0]
+        x = swiglu_oai_split(
+            gate_up,
+            alpha=self.swiglu_alpha,
+            beta=self.swiglu_beta,
+            limit=self.swiglu_limit,
+        )
+        x = self.down_proj(x)
+        if isinstance(x, tuple):
+            x = x[0]
+        return x
+
+
+def adjust_block_scale_shard(
+    weight_block_size: tuple[int, ...] | None,
+    shard_size: int,
+    shard_offset: int,
+) -> tuple[int, int]:
+    assert weight_block_size is not None
+    block_n = weight_block_size[0]
+    shard_offset = (shard_offset + block_n - 1) // block_n
+    shard_size = (shard_size + block_n - 1) // block_n
+    return shard_size, shard_offset
+
+
+class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
+    """QKV projection fused with a lightning-indexer's index_q/index_k.
+
+    NOTE: MiniMax-M3-specific. This is tailored to the M3 sparse-attention
+    layers (it assumes the indexer's head count equals the KV head count and
+    shares the main head_dim); it is not a general-purpose linear layer. It
+    lives here only to sit alongside QKVParallelLinear, whose sharding /
+    weight-loading machinery it reuses.
+
+    A single column-parallel GEMM emits, per rank::
+
+        [q | k | v | index_q | index_k]
+
+    ``index_q`` must have the same head count as the KV heads
+    (``total_num_index_heads == total_num_kv_heads``) and ``index_head_size ==
+    head_size``, so it shards exactly like K/V -- including the KV-head
+    *replication* path when ``tp_size > total_num_kv_heads`` (this is what makes
+    a TP size greater than the KV-head count work). ``index_k`` is a single
+    shared head, replicated to every rank.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        total_num_index_heads: int,
+        index_head_size: int,
+        bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        # index_q rides the KV-head sharding/replication path, so its head count
+        # must match the KV heads.
+        assert total_num_index_heads == total_num_kv_heads, (
+            "MinimaxM3QKVParallelLinearWithIndexer requires "
+            "total_num_index_heads == total_num_kv_heads"
+        )
+        self.hidden_size = hidden_size
+        self.head_size = head_size
+        self.v_head_size = head_size
+        self.total_num_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
+        self.total_num_index_heads = total_num_index_heads
+        self.index_head_size = index_head_size
+
+        tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads = divide(self.total_num_heads, tp_size)
+        if tp_size >= self.total_num_kv_heads:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+        else:
+            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_head_replicas = 1
+        # index_q shards identically to the KV heads.
+        self.num_index_heads = self.num_kv_heads
+
+        # Global per-group sizes (replicated groups counted x tp_size, matching
+        # the QKVParallelLinear convention). index_k is a single replicated head.
+        q = self.num_heads * self.head_size
+        kv = self.num_kv_heads * self.head_size
+        iq = self.num_index_heads * self.index_head_size
+        ik = self.index_head_size
+        self.output_sizes = [
+            q * tp_size,  # q
+            kv * tp_size,  # k
+            kv * tp_size,  # v
+            iq * tp_size,  # index_q
+            ik * tp_size,  # index_k (replicated)
+        ]
+
+        # Skip QKVParallelLinear.__init__ (3-group layout); build the 5-group
+        # column-parallel weight directly.
+        ColumnParallelLinear.__init__(
+            self,
+            input_size=self.hidden_size,
+            output_size=sum(self.output_sizes),
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def validate_shard_id(self, loaded_shard_id: str | None) -> None:
+        if loaded_shard_id is None:
+            return
+        if loaded_shard_id not in ("q", "k", "v", "index_q", "index_k"):
+            raise ValueError(
+                "Shard id for MinimaxM3QKVParallelLinearWithIndexer must be one of "
+                "'q', 'k', 'v', 'index_q', 'index_k'; got "
+                f"{loaded_shard_id}."
+            )
+
+    def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
+        h = self.head_size
+        nq, nkv, nidx = self.num_heads, self.num_kv_heads, self.num_index_heads
+        return {
+            "q": 0,
+            "k": nq * h,
+            "v": (nq + nkv) * h,
+            "index_q": (nq + 2 * nkv) * h,
+            "index_k": (nq + 2 * nkv + nidx) * h,
+        }.get(loaded_shard_id)
+
+    def _get_shard_size_mapping(self, loaded_shard_id: str) -> int | None:
+        h = self.head_size
+        return {
+            "q": self.num_heads * h,
+            "k": self.num_kv_heads * h,
+            "v": self.num_kv_heads * h,
+            "index_q": self.num_index_heads * h,
+            "index_k": self.index_head_size,
+        }.get(loaded_shard_id)
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+        # Index checkpoints are never pre-fused on disk; a shard id is always given.
+        assert loaded_shard_id in ("q", "k", "v", "index_q", "index_k")
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        # index_k is fully replicated: num_heads == tp_size makes
+        # load_qkv_weight pick shard_id_int == 0 on every rank. q/k/v/index_q ride
+        # the KV-head replication factor.
+        num_heads = (
+            self.tp_size if loaded_shard_id == "index_k" else self.num_kv_head_replicas
+        )
+        param.load_qkv_weight(
+            loaded_weight=loaded_weight,
+            num_heads=num_heads,
+            shard_id=loaded_shard_id,
+            shard_offset=shard_offset,
+            shard_size=shard_size,
+            tp_rank=self.tp_rank,
+        )
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        # Unquantized (bf16) path. MXFP8 checkpoints use weight_loader_v2; this
+        # keeps an unquantized load correct too.
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("q", "k", "v", "index_q", "index_k")
+        output_dim = getattr(param, "output_dim", None)
+        assert output_dim is not None
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        param_data = param.data.narrow(output_dim, shard_offset, shard_size)
+        if loaded_shard_id == "q":
+            shard_rank = self.tp_rank
+        elif loaded_shard_id == "index_k":
+            shard_rank = 0  # replicated to every rank
+        else:
+            shard_rank = self.tp_rank // self.num_kv_head_replicas
+        loaded_weight = loaded_weight.narrow(
+            output_dim, shard_rank * shard_size, shard_size
+        )
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+
+
+class MiniMaxM3Attention(nn.Module):
+    """Dense attention with vLLM linear/RoPE/RMSNorm, matching ame AMD path."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        cache_config=None,
+    ) -> None:
+        super().__init__()
+        del layer_id, quant_config, cache_config
+        vllm_cache_config = get_current_vllm_config().cache_config
+
+        self.hidden_size = config.hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+
+        self.total_num_heads = config.num_attention_heads
+        if self.total_num_heads % tp_size != 0:
+            raise ValueError("num_attention_heads must be divisible by TP size.")
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = config.num_key_value_heads
+        if self.total_num_kv_heads >= tp_size:
+            if self.total_num_kv_heads % tp_size != 0:
+                raise ValueError("num_key_value_heads must divide TP size.")
+        elif tp_size % self.total_num_kv_heads != 0:
+            raise ValueError("TP size must divide num_key_value_heads replication.")
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = config.head_dim
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.qkv_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            reduce_results=False,
+            quant_config=None,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        self.q_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=config.max_position_embeddings,
+            rope_parameters={
+                "rope_theta": config.rope_theta,
+                "partial_rotary_factor": config.partial_rotary_factor,
+            },
+        )
+
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=vllm_cache_config,
+            quant_config=None,
+            prefix=f"{prefix}.attn",
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q_by_head = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
+        q = self.q_norm(q_by_head).view(q.shape)
+        k_by_head = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
+        k = self.k_norm(k_by_head).view(k.shape)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class MiniMaxM3SparseAttention(nn.Module):
@@ -71,7 +445,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         cache_config: str = "bf16",
     ) -> None:
         super().__init__()
-        del layer_id
+        del layer_id, quant_config
         AttentionLayerBase.register(self.__class__)
         self.hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -105,7 +479,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.total_idx_heads,
             self.idx_head_dim,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -113,29 +487,42 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.hidden_size,
             bias=False,
             reduce_results=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.o_proj",
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        rotary_dim = int(self.head_dim * getattr(config, "partial_rotary_factor", 1.0))
+        self.q_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=rotary_dim,
             max_position=config.max_position_embeddings,
-            base=minimax_m3_base._rope_theta(config),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_parameters={
+                "rope_theta": config.rope_theta,
+                "partial_rotary_factor": config.partial_rotary_factor,
+            },
         )
-        self.index_q_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
-        self.index_k_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
+        self.index_q_norm = MiniMAXGemmaRMSNorm(
+            self.idx_head_dim, eps=config.rms_norm_eps
+        )
+        self.index_k_norm = MiniMAXGemmaRMSNorm(
+            self.idx_head_dim, eps=config.rms_norm_eps
+        )
         self.index_rotary_emb = self.rotary_emb
 
         vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
-        self.kv_cache_dtype = cache_config
+        self.kv_cache_dtype = (
+            cache_config.cache_dtype
+            if hasattr(cache_config, "cache_dtype")
+            else cache_config
+        )
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
+        )
+        self.index_cache_torch_dtype = (
+            vllm_config.model_config.dtype
+            if is_quantized_kv_cache(self.kv_cache_dtype)
+            else self.kv_cache_torch_dtype
         )
         self.attn_backend = MiniMaxM3SparseBackend
         self.impl = self.attn_backend.get_impl_cls()(
@@ -160,13 +547,10 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.kv_cache = torch.tensor([])
         self.index_cache = MiniMaxM3IndexerCache(
             head_dim=self.idx_head_dim,
-            dtype=self.kv_cache_torch_dtype,
+            dtype=self.index_cache_torch_dtype,
             prefix=f"{self.layer_name}.index_cache",
             cache_config=vllm_config.cache_config,
         )
-        self._debug_zero_cache_tail = os.getenv(
-            "ATOM_MINIMAX_M3_ZERO_CACHE_TAIL", "0"
-        ) == "1"
 
     def get_attn_backend(self):
         return self.attn_backend
@@ -180,38 +564,6 @@ class MiniMaxM3SparseAttention(nn.Module):
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
-
-    def _debug_zero_partial_cache_tails(
-        self,
-        kv_cache: torch.Tensor,
-        index_kv_cache: torch.Tensor,
-        main_meta: MiniMaxM3SparseMetadata,
-        index_meta: MiniMaxM3SparseMetadata,
-    ) -> None:
-        """Diagnostic only: clear unwritten tails in reused KV/index pages."""
-        block_size = kv_cache.shape[2]
-
-        def zero_phase(main_phase, index_phase) -> None:
-            if main_phase is None or index_phase is None:
-                return
-            seq_lens = main_phase.seq_lens.detach().cpu().tolist()
-            main_block_table = main_phase.block_table.detach().cpu()
-            index_block_table = index_phase.block_table.detach().cpu()
-            for row, seq_len in enumerate(seq_lens):
-                seq_len = int(seq_len)
-                if seq_len <= 0:
-                    continue
-                tail = seq_len % block_size
-                if tail == 0:
-                    continue
-                block_idx = (seq_len - 1) // block_size
-                main_page = int(main_block_table[row, block_idx])
-                index_page = int(index_block_table[row, block_idx])
-                kv_cache[main_page, :, tail:, :, :].zero_()
-                index_kv_cache[index_page, tail:, :].zero_()
-
-        zero_phase(main_meta.decode, index_meta.decode)
-        zero_phase(main_meta.prefill, index_meta.prefill)
 
     def _insert_kv(
         self,
@@ -257,10 +609,6 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
         idx_cache = index_kv_cache.view(-1, self.idx_head_dim)
         idx_cache[index_slot_mapping] = index_key.to(idx_cache.dtype)
-        if self._debug_zero_cache_tail:
-            self._debug_zero_partial_cache_tails(
-                kv_cache, index_kv_cache, main_meta, index_meta
-            )
 
     def minimax_m3_sparse_attention_forward(
         self,
@@ -304,6 +652,9 @@ class MiniMaxM3SparseAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
+        if isinstance(qkv, tuple):
+            qkv = qkv[0]
+
         q, k, v, index_q, index_k = qkv.split(
             [
                 self.q_size,
@@ -338,26 +689,20 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.index_cache.kv_cache,
             self.layer_name,
         )
-        return self.o_proj(attn_output)
-
-
-class MiniMaxM3PluginExperts(MiniMaxM3Bf16Experts):
-    """Plugin-owned MiniMax-M3 experts with vLLM-compatible routing semantics."""
+        out = self.o_proj(attn_output)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out
 
 
 class MiniMaxM3MoE(nn.Module):
-    """MiniMax-M3 MoE aligned with vLLM FusedMoE behavior.
-
-    The docker vLLM version used by ATOM lacks the MiniMax-M3-specific
-    ``swigluoai_uninterleave``/alpha/beta plumbing, so the plugin keeps an
-    ATOM-owned experts module while matching vLLM's routing and expert layout.
-    """
+    """Sigmoid-routed MoE using ATOM's MiniMax-M3 expert kernels."""
 
     def __init__(
         self,
         config: PretrainedConfig,
         layer_id: int,
-        quant_config=None,
+        quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
         prefix: str = "",
     ) -> None:
@@ -370,16 +715,9 @@ class MiniMaxM3MoE(nn.Module):
                 f"the number of experts {config.num_local_experts}."
             )
 
-        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
-        self.n_shared_experts = getattr(config, "n_shared_experts", None)
-
-        self.use_routing_bias = getattr(config, "use_routing_bias", False)
-        if self.use_routing_bias:
+        if getattr(config, "use_routing_bias", False):
             self.e_score_correction_bias = atom_parameter(
                 torch.empty(config.num_local_experts, dtype=torch.float32)
-            )
-            self.e_score_correction_bias.weight_loader = (
-                MiniMaxM3MoE.ebias_weight_loader
             )
         else:
             self.register_parameter("e_score_correction_bias", None)
@@ -395,17 +733,17 @@ class MiniMaxM3MoE(nn.Module):
         self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
         self.gate.weight.weight_loader_process = old_wlp
 
-        self.shared_experts: minimax_m3_base.MiniMaxM3MLP | None = None
-        if self.n_shared_experts:
-            self.shared_experts = minimax_m3_base.MiniMaxM3MLP(
+        self.shared_experts: MiniMaxM3MLP | None = None
+        if getattr(config, "n_shared_experts", 0):
+            self.shared_experts = MiniMaxM3MLP(
                 config=config,
-                intermediate_size=config.intermediate_size * self.n_shared_experts,
-                quant_config=quant_config,
+                intermediate_size=config.intermediate_size * config.n_shared_experts,
+                quant_config=None,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
 
-        self.experts = MiniMaxM3PluginExperts(
+        self.experts = MiniMaxM3Bf16Experts(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -415,15 +753,10 @@ class MiniMaxM3MoE(nn.Module):
             swiglu_alpha=getattr(config, "swiglu_alpha", 1.702),
             swiglu_beta=getattr(config, "swiglu_beta", 1.0),
             swiglu_limit=getattr(config, "swiglu_limit", 7.0),
-            quant_config=quant_config,
+            quant_config=None,
             params_dtype=params_dtype,
             prefix=f"{prefix}.experts",
         )
-
-    @staticmethod
-    def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        assert param.size() == loaded_weight.size()
-        param.data.copy_(loaded_weight.to(torch.float32))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -456,11 +789,10 @@ class MiniMaxM3DecoderLayer(minimax_m3_base.MiniMaxM3DecoderLayer):
         layer_num: int = 0,
     ) -> None:
         nn.Module.__init__(self)
-        self.layer_id = layer_num
         attn_cls = (
             MiniMaxM3SparseAttention
             if layer_num in minimax_m3_base._sparse_attention_layer_ids(config)
-            else minimax_m3_base.MiniMaxM3Attention
+            else MiniMaxM3Attention
         )
         self.self_attn = attn_cls(
             config=config,
@@ -479,16 +811,40 @@ class MiniMaxM3DecoderLayer(minimax_m3_base.MiniMaxM3DecoderLayer):
                 prefix=f"{prefix}.block_sparse_moe",
             )
         else:
-            self.mlp = minimax_m3_base.MiniMaxM3MLP(
+            self.mlp = MiniMaxM3MLP(
                 config=config,
                 intermediate_size=config.dense_intermediate_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        self.input_layernorm = MiniMAXGemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.post_attention_layernorm = MiniMAXGemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+
+        hidden_states, residual = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, self.post_attention_layernorm
+        )
+
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        hidden_states = ffn(hidden_states)
+        return hidden_states, residual
 
 
 class MiniMaxM3SparseForCausalLM(NativeMiniMaxM3ForCausalLM):
@@ -659,9 +1015,13 @@ class MiniMaxM3SparseForConditionalGeneration_(nn.Module, SupportsMultiModal):
         multimodal_embeddings: list[torch.Tensor] = []
         for modality, multimodal_input in mm_input_by_modality.items():
             if modality == "image":
-                multimodal_embeddings.extend(self._process_image_input(multimodal_input))
+                multimodal_embeddings.extend(
+                    self._process_image_input(multimodal_input)
+                )
             if modality == "video":
-                multimodal_embeddings.extend(self._process_video_input(multimodal_input))
+                multimodal_embeddings.extend(
+                    self._process_video_input(multimodal_input)
+                )
         return tuple(multimodal_embeddings)
 
     def forward(

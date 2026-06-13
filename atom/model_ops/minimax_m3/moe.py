@@ -6,13 +6,15 @@
 This module intentionally does not depend on ATOM's generic ``FusedMoE``.  It
 keeps the same checkpoint-facing parameter layout (``w13_weight`` and
 ``w2_weight``) so ATOM's existing expert weight mapping can load MiniMax-M3
-checkpoints, while the forward path uses the same vLLM bf16 MoE Triton helper
-kernels as the pure vLLM MiniMax-M3 implementation.
+checkpoints, while the forward path uses vLLM's bf16 MoE Triton helper kernels
+when they are available and falls back to a local routed GEMV implementation
+otherwise.
 """
 
 from __future__ import annotations
 
-import os
+from functools import lru_cache
+from importlib import import_module
 from typing import Optional
 
 import torch
@@ -20,12 +22,6 @@ import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
-from vllm import _custom_ops as ops
-from vllm.model_executor.layers.fused_moe.fused_moe import (
-    _prepare_expert_assignment,
-    invoke_fused_moe_triton_kernel,
-    try_get_optimal_moe_config,
-)
 
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.model_loader.weight_utils import set_weight_attrs
@@ -33,6 +29,25 @@ from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: 
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import QuantType
+
+
+@lru_cache(maxsize=1)
+def _get_vllm_moe_helpers():
+    try:
+        ops = import_module("vllm._custom_ops")
+        fused_moe = import_module("vllm.model_executor.layers.fused_moe.fused_moe")
+    except ModuleNotFoundError as exc:
+        if exc.name is not None and exc.name.startswith("vllm"):
+            return None
+        raise
+
+    return (
+        ops,
+        fused_moe._prepare_expert_assignment,
+        fused_moe.invoke_fused_moe_triton_kernel,
+        fused_moe.try_get_optimal_moe_config,
+    )
+
 
 @triton.jit
 def _routed_w13_kernel(
@@ -79,8 +94,7 @@ def _routed_w13_kernel(
             + expert_id * stride_w13_e
             + offs_n[:, None] * stride_w13_n
             + k[None, :] * stride_w13_k,
-            mask=(offs_n[:, None] < two_intermediate_size)
-            & (k[None, :] < hidden_size),
+            mask=(offs_n[:, None] < two_intermediate_size) & (k[None, :] < hidden_size),
             other=0.0,
         ).to(tl.float32)
         acc += tl.sum(weight * hidden[None, :], axis=1)
@@ -125,9 +139,7 @@ def _routed_w2_reduce_kernel(
     for topk_id in range(0, top_k):
         routed_id = token_id * top_k + topk_id
         expert_id = tl.load(
-            topk_ids_ptr
-            + token_id * stride_topk_ids_m
-            + topk_id * stride_topk_ids_k
+            topk_ids_ptr + token_id * stride_topk_ids_m + topk_id * stride_topk_ids_k
         ).to(tl.int64)
         route_weight = tl.load(
             topk_weights_ptr
@@ -147,8 +159,7 @@ def _routed_w2_reduce_kernel(
                 + expert_id * stride_w2_e
                 + offs_h[:, None] * stride_w2_h
                 + i[None, :] * stride_w2_i,
-                mask=(offs_h[:, None] < hidden_size)
-                & (i[None, :] < intermediate_size),
+                mask=(offs_h[:, None] < hidden_size) & (i[None, :] < intermediate_size),
                 other=0.0,
             ).to(tl.float32)
             acc += tl.sum(weight * act[None, :], axis=1) * route_weight
@@ -227,10 +238,9 @@ class MiniMaxM3Bf16Experts(nn.Module):
 
         self.num_experts = num_experts
         self.top_k = top_k
-        self.hidden_size = hidden_size
-        self.tp_group = get_tp_group()
-        self.tp_size = self.tp_group.world_size
-        self.tp_rank = self.tp_group.rank_in_group
+        tp_group = get_tp_group()
+        self.tp_size = tp_group.world_size
+        self.tp_rank = tp_group.rank_in_group
         if intermediate_size % self.tp_size != 0:
             raise ValueError(
                 "MiniMax-M3 intermediate_size must be divisible by tensor "
@@ -349,8 +359,7 @@ class MiniMaxM3Bf16Experts(nn.Module):
         del weight_name
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(
-                "MiniMax-M3 expert shard_id must be w1/w2/w3, "
-                f"got {shard_id!r}."
+                "MiniMax-M3 expert shard_id must be w1/w2/w3, " f"got {shard_id!r}."
             )
 
         if loaded_weight.dim() == param.data.dim():
@@ -387,12 +396,108 @@ class MiniMaxM3Bf16Experts(nn.Module):
         self.w13_weight.data = self.w13_weight.data.contiguous()
         self.w2_weight.data = self.w2_weight.data.contiguous()
 
+    def _forward_routed_gemv(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        n_tokens = hidden_states.shape[0]
+        if not hidden_states.is_contiguous():
+            hidden_states = hidden_states.contiguous()
+        if topk_ids.dtype != torch.int32:
+            topk_ids = topk_ids.to(torch.int32)
+        topk_ids = topk_ids.contiguous()
+        topk_weights = topk_weights.contiguous()
+
+        top_k = topk_ids.shape[1]
+        hidden_size = self.w2_weight.shape[1]
+        two_intermediate_size = self.w13_weight.shape[1]
+        intermediate_size = self.intermediate_size_per_partition
+
+        gate_up = torch.empty(
+            n_tokens * top_k,
+            two_intermediate_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        block_n = 64
+        block_k = 64
+        _routed_w13_kernel[
+            (n_tokens * top_k, triton.cdiv(two_intermediate_size, block_n))
+        ](
+            hidden_states,
+            self.w13_weight,
+            topk_ids,
+            gate_up,
+            hidden_size,
+            two_intermediate_size,
+            top_k,
+            hidden_states.stride(0),
+            hidden_states.stride(1),
+            self.w13_weight.stride(0),
+            self.w13_weight.stride(1),
+            self.w13_weight.stride(2),
+            topk_ids.stride(0),
+            topk_ids.stride(1),
+            gate_up.stride(0),
+            gate_up.stride(1),
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+        )
+
+        activated = swiglu_oai_split(
+            gate_up,
+            alpha=self.swiglu_alpha,
+            beta=self.swiglu_beta,
+            limit=self.swiglu_limit,
+            out_dtype=hidden_states.dtype,
+        )
+        output = torch.empty_like(hidden_states)
+        block_h = 64
+        block_i = 64
+        _routed_w2_reduce_kernel[(n_tokens, triton.cdiv(hidden_size, block_h))](
+            activated,
+            self.w2_weight,
+            topk_ids,
+            topk_weights,
+            output,
+            hidden_size,
+            intermediate_size,
+            top_k,
+            activated.stride(0),
+            activated.stride(1),
+            self.w2_weight.stride(0),
+            self.w2_weight.stride(1),
+            self.w2_weight.stride(2),
+            topk_ids.stride(0),
+            topk_ids.stride(1),
+            topk_weights.stride(0),
+            topk_weights.stride(1),
+            output.stride(0),
+            output.stride(1),
+            BLOCK_H=block_h,
+            BLOCK_I=block_i,
+        )
+        return output
+
     def _forward_graph_safe(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        # Prefer vLLM's graph-safe fused MoE path when available; it is faster
+        # than the local routed GEMV fallback.
+        vllm_moe_helpers = _get_vllm_moe_helpers()
+        if vllm_moe_helpers is None:
+            return self._forward_routed_gemv(hidden_states, topk_weights, topk_ids)
+        (
+            ops,
+            _prepare_expert_assignment,
+            invoke_fused_moe_triton_kernel,
+            try_get_optimal_moe_config,
+        ) = vllm_moe_helpers
         n_tokens = hidden_states.shape[0]
         if not hidden_states.is_contiguous():
             hidden_states = hidden_states.contiguous()
@@ -511,124 +616,6 @@ class MiniMaxM3Bf16Experts(nn.Module):
         ops.moe_sum(w2_accum.view(*w2_accum.size()), output)
         return output
 
-    def _forward_torch_slow(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Reference expert path for debugging fused-kernel corruption."""
-        output = torch.zeros_like(hidden_states)
-        for expert_id in range(self.num_experts):
-            w13 = self.w13_weight[expert_id]
-            w2 = self.w2_weight[expert_id]
-            for route_idx in range(topk_ids.shape[1]):
-                token_idx = torch.where(topk_ids[:, route_idx] == expert_id)[0]
-                if token_idx.numel() == 0:
-                    continue
-                expert_in = hidden_states.index_select(0, token_idx)
-                gate_up = torch.nn.functional.linear(expert_in, w13)
-                activated = swiglu_oai_split(
-                    gate_up,
-                    alpha=self.swiglu_alpha,
-                    beta=self.swiglu_beta,
-                    limit=self.swiglu_limit,
-                    out_dtype=hidden_states.dtype,
-                )
-                expert_out = torch.nn.functional.linear(activated, w2)
-                expert_out = expert_out * topk_weights.index_select(
-                    0, token_idx
-                )[:, route_idx].unsqueeze(-1).to(expert_out.dtype)
-                output.index_add_(0, token_idx, expert_out.to(output.dtype))
-        return output
-
-    def _forward_routed_gemv(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        n_tokens = hidden_states.shape[0]
-        if not hidden_states.is_contiguous():
-            hidden_states = hidden_states.contiguous()
-        if topk_ids.dtype != torch.int32:
-            topk_ids = topk_ids.to(torch.int32)
-        topk_ids = topk_ids.contiguous()
-        topk_weights = topk_weights.contiguous()
-
-        top_k = topk_ids.shape[1]
-        hidden_size = self.hidden_size
-        two_intermediate_size = self.w13_weight.shape[1]
-        intermediate_size = self.intermediate_size_per_partition
-
-        gate_up = torch.empty(
-            n_tokens * top_k,
-            two_intermediate_size,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        block_n = 64
-        block_k = 64
-        _routed_w13_kernel[
-            (n_tokens * top_k, triton.cdiv(two_intermediate_size, block_n))
-        ](
-            hidden_states,
-            self.w13_weight,
-            topk_ids,
-            gate_up,
-            hidden_size,
-            two_intermediate_size,
-            top_k,
-            hidden_states.stride(0),
-            hidden_states.stride(1),
-            self.w13_weight.stride(0),
-            self.w13_weight.stride(1),
-            self.w13_weight.stride(2),
-            topk_ids.stride(0),
-            topk_ids.stride(1),
-            gate_up.stride(0),
-            gate_up.stride(1),
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
-        )
-
-        activated = swiglu_oai_split(
-            gate_up,
-            alpha=self.swiglu_alpha,
-            beta=self.swiglu_beta,
-            limit=self.swiglu_limit,
-            out_dtype=hidden_states.dtype,
-        )
-        output = torch.empty_like(hidden_states)
-        block_h = 64
-        block_i = 64
-        _routed_w2_reduce_kernel[
-            (n_tokens, triton.cdiv(hidden_size, block_h))
-        ](
-            activated,
-            self.w2_weight,
-            topk_ids,
-            topk_weights,
-            output,
-            hidden_size,
-            intermediate_size,
-            top_k,
-            activated.stride(0),
-            activated.stride(1),
-            self.w2_weight.stride(0),
-            self.w2_weight.stride(1),
-            self.w2_weight.stride(2),
-            topk_ids.stride(0),
-            topk_ids.stride(1),
-            topk_weights.stride(0),
-            topk_weights.stride(1),
-            output.stride(0),
-            output.stride(1),
-            BLOCK_H=block_h,
-            BLOCK_I=block_i,
-        )
-        return output
-
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -649,25 +636,7 @@ class MiniMaxM3Bf16Experts(nn.Module):
             router_logits,
             e_score_correction_bias,
         )
-        if os.getenv("ATOM_MINIMAX_M3_TORCH_MOE", "0") == "1":
-            output = self._forward_torch_slow(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-            )
-        elif os.getenv("ATOM_MINIMAX_M3_ROUTED_GEMV_MOE", "0") == "1":
-            output = self._forward_routed_gemv(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-            )
-        else:
-            output = self._forward_graph_safe(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-            )
-
+        output = self._forward_graph_safe(hidden_states, topk_weights, topk_ids)
         if self.routed_scaling_factor != 1.0:
             output = output * self.routed_scaling_factor
         return output
