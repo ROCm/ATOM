@@ -407,13 +407,17 @@ class MLAAttention(nn.Module):
         paged_kv_last_page_lens,
         max_q_len,
         page_size,
+        finite=True,
     ) -> None:
-        """On the first non-finite seg decode output, save the exact kernel
-        inputs (compacted to the referenced pages) so they can be replayed
-        offline through `mla_decode_fwd` and an fp32 reference. One-shot."""
-        if getattr(MLAAttention, "_seg_failure_dumped", False):
+        """Save the exact kernel inputs (compacted to the referenced pages) so
+        they can be replayed offline through `mla_decode_fwd` and an fp32
+        reference. One-shot for the first finite step and one-shot for the first
+        non-finite step."""
+        tag = "OK" if finite else "FAIL"
+        flag = "_seg_okfile_dumped" if finite else "_seg_failfile_dumped"
+        if getattr(MLAAttention, flag, False):
             return
-        MLAAttention._seg_failure_dumped = True
+        setattr(MLAAttention, flag, True)
         import os
 
         out_dir = os.path.expanduser(
@@ -450,11 +454,14 @@ class MLAAttention(nn.Module):
             "q_dtype": str(q.dtype),
             "kv_dtype": str(seg_kv_buffer_4d.dtype),
         }
-        path = os.path.join(out_dir, f"seg_decode_FAIL_layer{int(self.layer_num):03d}.pt")
+        path = os.path.join(
+            out_dir, f"seg_decode_{tag}_layer{int(self.layer_num):03d}.pt"
+        )
         torch.save(bundle, path)
         logger.error(
-            "SEG-DECODE non-finite output at layer=%d -> saved failing inputs to %s "
+            "SEG-DECODE [%s] output at layer=%d -> saved inputs to %s "
             "(bs=%d total_pages=%d uniq_pages=%d kv_indptr[:4]=%s last_page_lens[:4]=%s)",
+            tag,
             self.layer_num,
             path,
             bs,
@@ -1215,7 +1222,16 @@ class MLAAttention(nn.Module):
                 kv_scale=self._k_scale,
             )
 
-            if envs.ATOM_DEBUG_MLA_SEG and not torch.isfinite(o).all():
+            if envs.ATOM_DEBUG_MLA_SEG and (
+                not torch.isfinite(o).all()
+                or not getattr(MLAAttention, "_seg_ok_dumped", False)
+            ):
+                # Dump the first (clean, finite) seg decode step AND any
+                # non-finite one, so we can replay vs an fp32 reference and
+                # measure cosine even when there is no NaN.
+                finite = bool(torch.isfinite(o).all())
+                if finite:
+                    MLAAttention._seg_ok_dumped = True
                 self._dump_seg_decode_failure(
                     q=q,
                     seg_kv_buffer_4d=seg_kv_buffer_4d,
@@ -1226,6 +1242,7 @@ class MLAAttention(nn.Module):
                     paged_kv_last_page_lens=paged_kv_last_page_lens,
                     max_q_len=max_q_len,
                     page_size=page_size,
+                    finite=finite,
                 )
             self._assert_seg_decode_output(o)
 
