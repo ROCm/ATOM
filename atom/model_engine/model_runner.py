@@ -72,7 +72,8 @@ support_model_arch_dict = {
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
-    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2_flash.MiMoV2FlashForCausalLM",
+    "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
+    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -89,9 +90,6 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        # Deferred output is disabled when running in P/D disaggregation mode
-        # (kv_transfer_config is set), enabled otherwise.
-        # TODO: In P/D disaggregation mode, if have issue, we can disable it
         self.is_deferred_out = True
 
         self.runner = runner
@@ -560,6 +558,7 @@ class ModelRunner:
         set_current_atom_config(config)
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size
+        self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
@@ -792,7 +791,10 @@ class ModelRunner:
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("mimo_v2_flash"):
+        elif self.hf_text_config.model_type in (
+            "mimo_v2",
+            "mimo_v2_flash",
+        ):
             return True
         return False
 

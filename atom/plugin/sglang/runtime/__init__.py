@@ -1,5 +1,6 @@
 """Runtime utilities for ATOM's SGLang plugin integration."""
 
+from atom.plugin.sglang.runtime.load_config_patch import apply_load_config_patch
 from atom.plugin.sglang.runtime.context import (
     SGLangForwardBatchMetadata,
     bind_current_forward_batch,
@@ -14,7 +15,10 @@ from atom.plugin.sglang.runtime.model_arch import (
     get_model_arch_spec,
 )
 
+apply_load_config_patch()
+
 __all__ = [
+    "apply_load_config_patch",
     "MODEL_ADAPTER_SPECS",
     "MODEL_ARCH_SPECS",
     "SGLangForwardBatchMetadata",

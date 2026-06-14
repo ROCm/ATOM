@@ -29,7 +29,8 @@ vllm serve "${MODEL}" \
     --tensor-parallel-size "${TP}" \
     --distributed-executor-backend mp \
     --trust-remote-code \
-    --gpu-memory-utilization 0.8 \
+    --gpu-memory-utilization 0.9 \
+    --max-num-seqs 512 \
     --tokenizer-mode deepseek_v4 \
     --async-scheduling \
     --no-enable-prefix-caching \
@@ -39,6 +40,7 @@ vllm serve "${MODEL}" \
 Notes:
 - `ATOM_USE_TRITON_MOE=1` enables the Triton MoE path used by this configuration.
 - `--tokenizer-mode deepseek_v4` selects the DeepSeek-V4 tokenizer mode required by the vLLM-ATOM adapter.
+- Keep `--max-num-seqs` at or below `512` for this configuration; larger values may OOM.
 - The command above serves on port `8001`; update the accuracy command below if you change the port.
 - The profiler writes torch traces to `./vllm_profile`. Remove `--profiler-config` if profiling is not needed.
 
