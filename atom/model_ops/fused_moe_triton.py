@@ -22,7 +22,11 @@ import torch
 from math import prod
 from aiter import ActivationType
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+from aiter.ops.triton.fusions.fused_routing_from_topk import (
+    fused_routing_from_topk as _aiter_fused_routing_from_topk,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from atom.model_ops.utils import has_triton_kernels
 from atom.utils import envs
 
 if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
@@ -42,6 +46,119 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 
 from atom.model_ops.moe import MoEActivationQuant
+
+
+def fused_routing_from_topk_triton(
+    topk_weights, topk_ids, n_expts_tot, expert_map: torch.Tensor | None = None
+):
+    """Build matmul_ogs routing data via the AITER fused-routing kernel.
+
+    Thin bridge over ``aiter.ops.triton.fused_routing_from_topk``: invokes
+    the single-CTA counting-sort kernel for small NK and packages the
+    resulting indices into the ``RoutingData`` / ``GatherIndx`` /
+    ``ScatterIndx`` structures consumed by
+    ``triton_kernels.matmul_ogs``. For ``NK = n_tokens * n_expts_act``
+    above the kernel's single-CTA budget (prefill-shaped inputs), falls
+    back to the multi-kernel ``routing_from_topk`` reference defined
+    below — that path does the per-row sort + global stable argsort in
+    plain torch and is correctness-stable at any NK.
+
+    Equivalence vs reference: the fused kernel skips the per-row sort,
+    so ``topk_indx`` / ``gate_indx`` differ at intra-expert ordering.
+    ``hist`` and the per-(token, expert, weight) bucket assignments
+    match exactly; ``matmul_ogs`` is commutative over per-expert slices
+    so the MoE output is unchanged (up to FP non-associativity).
+    """
+    if not has_triton_kernels():
+        return routing_from_topk(
+            topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+        )
+
+    n_tokens, n_expts_act = topk_weights.shape
+    n_gates_pad = n_tokens * n_expts_act
+
+    if n_gates_pad > 4096:
+        # Single-CTA design exceeded; fall back rather than degrading
+        # silently. Typically only hit during prefill.
+        return routing_from_topk(
+            topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+        )
+    hist, topk_indx, gate_indx, gate_scal = _aiter_fused_routing_from_topk(
+        topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+    )
+
+    # Package as the matmul_ogs routing data structures.
+    from triton_kernels.routing import (
+        RoutingData,
+        GatherIndx,
+        ScatterIndx,
+        compute_expt_data,
+    )
+
+    gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
+    scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
+    expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad)
+
+    routing_data = RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
+    return routing_data, gather_indx, scatter_indx
+
+
+def routing_from_topk(
+    topk_weights, topk_ids, n_expts_tot, expert_map: torch.Tensor | None = None
+):
+    """Convert FusedMoE.select_experts output to triton routing data structures.
+
+    This bridges the gap between ATOM's grouped topk / sigmoid routing
+    (which triton_kernels routing() does not support) and the triton
+    matmul_ogs compute kernels.
+
+    Args:
+        topk_weights: (n_tokens, n_expts_act) routing weights from select_experts
+        topk_ids: (n_tokens, n_expts_act) expert indices from select_experts
+        n_expts_tot: total number of experts (global, before EP)
+
+    Returns:
+        (RoutingData, GatherIndx, ScatterIndx) compatible with triton_kernel_fused_experts
+    """
+    from triton_kernels.routing import (
+        RoutingData,
+        GatherIndx,
+        ScatterIndx,
+        compute_expt_data,
+    )
+
+    n_tokens, n_expts_act = topk_weights.shape
+    n_gates_pad = n_tokens * n_expts_act
+
+    if expert_map is not None:
+        local_ids = expert_map[topk_ids.long()]
+        invalid = local_ids < 0
+        topk_weights = topk_weights.masked_fill(invalid, 0.0)
+        topk_ids = local_ids.masked_fill(invalid, 0).to(torch.int32)
+
+    # Sort each token's selected experts by expert_id (required by triton kernels)
+    expt_indx_sorted, sort_indices = torch.sort(topk_ids.int(), dim=1)
+    expt_scal_sorted = torch.gather(topk_weights, 1, sort_indices.long())
+
+    # Flatten to 1D
+    expt_scal = expt_scal_sorted.reshape(-1).to(topk_weights.dtype)
+    expt_indx = expt_indx_sorted.reshape(-1).to(torch.int32)
+
+    # Sort by expert_id globally so experts are contiguous for the matmul
+    topk_indx = torch.argsort(expt_indx, stable=True).int()
+    gate_indx = torch.argsort(topk_indx, stable=True).int()
+    gate_scal = expt_scal[topk_indx.long()]
+
+    # Histogram of tokens over experts
+    hist = torch.histc(expt_indx.float(), bins=n_expts_tot, max=n_expts_tot - 1).int()
+
+    # Build routing data structures using triton-accelerated compute_expt_data
+    gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
+    scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
+    expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad)
+
+    routing_data = RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
+    return routing_data, gather_indx, scatter_indx
 
 
 def _swizzle_scales_for_kernel(scale, act_quant: MoEActivationQuant):

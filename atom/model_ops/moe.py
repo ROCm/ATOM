@@ -43,6 +43,7 @@ from atom.model_ops.topK import (
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
+from atom.plugin.prepare import is_vllm
 from atom.model_ops.utils import (
     _has_module,
     atom_parameter,
@@ -127,12 +128,18 @@ class FusedMoEParallelConfig:
         # Otherwise, use pure DP for MoE.
         enable_dp_attention = parallel_config.enable_dp_attention
 
+        # for vllm mode, when ep is enabled, the ep rank needs to
+        # be calculated in DP * TP flatten group space
+        flatten_tp_across_dp_for_moe = enable_dp_attention or (
+            is_vllm() and parallel_config.enable_expert_parallel
+        )
+
         use_ep = dp_size_ * tp_size_ > 1 and parallel_config.enable_expert_parallel
 
         dp_size = dp_size_
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
 
-        if enable_dp_attention:
+        if flatten_tp_across_dp_for_moe:
             tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
         else:
             tp_size = tp_size_
@@ -410,6 +417,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # )
             # mori_dtype = torch.bfloat16
 
+            if is_vllm():
+                max_num_tokens_per_dp_rank = moe.max_num_tokens
+            else:
+                max_num_tokens_per_dp_rank = 16384
+
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
@@ -420,7 +432,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=16384,
+                max_num_tokens_per_dp_rank=max_num_tokens_per_dp_rank,
                 # input_dtype=moe.in_dtype,
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
@@ -1052,6 +1064,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_moe_forward,
                 triton_kernel_fused_experts,
+                fused_routing_from_topk_triton,
             )
 
             # Check if the model needs custom routing that triton routing()
@@ -1064,37 +1077,47 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             if needs_custom_routing:
-                # custom routing -- set for deepseek routing n expts act, for grouped topk
-                n_expts_act = top_k
-
-                # custom routing
-                from aiter.ops.triton.moe.moe_routing.routing import (
-                    routing,
-                )  # grouped topk included
-
-                routing_data, gather_idx, scatter_idx = routing(
-                    router_logits,
-                    n_expts_act,
-                    score_mode=scoring_func,
-                    bias=(
-                        e_score_correction_bias.to(torch.float32)
-                        if e_score_correction_bias is not None
-                        else None
-                    ),
-                    renorm=renormalize,
-                    routed_scaling_factor=layer.routed_scaling_factor,
+                # Use ATOM's full-featured select_experts for routing (grouped
+                # topk / sigmoid scoring / bias correction, and the EP local
+                # remap), then triton matmul_ogs for the actual MoE computation.
+                # Routing is routed-only (num_fused_shared_experts not passed):
+                # the always-on shared expert(s) are applied separately by
+                # _apply_shared_experts_dense below, matching the dense-shared
+                # design rather than fusing them into the routed gate.
+                topk_weights, topk_ids = FusedMoE.select_experts(
+                    hidden_states=x,
+                    router_logits=router_logits,
                     use_grouped_topk=use_grouped_topk,
-                    num_expert_group=num_expert_group,
+                    top_k=top_k,
+                    renormalize=renormalize,
                     topk_group=topk_group,
+                    num_expert_group=num_expert_group,
+                    custom_routing_function=custom_routing_function,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=layer.routed_scaling_factor,
                 )
-                # Routed-only gate count (no shared-expert widening).
-                n_expts_act = routing_data.n_expts_act
+                n_expts_act = topk_weights.shape[1]
 
-                # Convert to triton routing data structures
-                num_tokens, n_expts_tot = router_logits.shape
+                # Convert to triton routing data structures.
+                # The expert_map arg carries the 0/1 expert_mask, but triton routing
+                # remap needs the global-to-local int index map (-1 for non-local)
+                ep_expert_map = layer.expert_map
+                if ep_expert_map is not None:
+                    # local_num_experts already includes the shared-expert slots
+                    # (added in FusedMoE.__init__, "local_num_experts +=
+                    # num_fused_shared_experts"). Routing stays routed-only, so
+                    # those trailing slots simply receive no tokens here.
+                    n_expts_tot = layer.local_num_experts
+                else:
+                    n_expts_tot = router_logits.shape[-1]
+                    if global_num_experts > 0:
+                        n_expts_tot = global_num_experts
+                    n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
-                if global_num_experts > 0:
-                    n_expts_tot = global_num_experts
+                routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
+                    topk_weights, topk_ids, n_expts_tot, expert_map=ep_expert_map
+                )
 
                 output = torch.empty_like(x)
                 _moe_result = triton_kernel_fused_experts(
@@ -1118,7 +1141,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
-                    expert_map=expert_map,
+                    expert_map=ep_expert_map,
                     act_quant=self.act_quant,
                 )
 
@@ -1151,7 +1174,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 a2_scale=layer.w2_input_scale,
                 w1_bias=layer.w13_bias,
                 w2_bias=layer.w2_bias,
-                expert_map=expert_map,
+                expert_map=layer.expert_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 act_quant=self.act_quant,
@@ -3261,7 +3284,10 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            expert_map=self.expert_map,
+            # Non-triton routing consume 0/1 expert_masks indexed by global
+            # expert id. For triton routing that needs index map, read the
+            # layer.expert_map directly in Mxfp4MoEMethod.apply.
+            expert_map=self.expert_mask,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
@@ -3319,7 +3345,10 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            expert_map=self.expert_map,
+            # Non-triton routing consume 0/1 expert_masks indexed by global
+            # expert id. For triton routing that needs index map, read the
+            # layer.expert_map directly in Mxfp4MoEMethod.apply.
+            expert_map=self.expert_mask,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
