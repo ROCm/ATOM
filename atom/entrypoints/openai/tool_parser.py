@@ -17,7 +17,6 @@ OpenAI format:
 """
 
 import re
-import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
@@ -81,11 +80,12 @@ def _parse_tool_call_entries(section_text: str) -> List[ToolCall]:
     )
     for match in pattern.finditer(section_text):
         name = match.group(1)
-        _index = match.group(2)  # noqa: F841 (captured but not used in ID generation)
+        index = match.group(2)
         arguments = match.group(3).strip()
+        tool_id = f"functions.{name}:{index}"
         tool_calls.append(
             ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
+                id=tool_id,
                 type="function",
                 function={"name": name, "arguments": arguments},
             )
@@ -171,13 +171,13 @@ class ToolCallStreamParser:
             index = int(match.group(2))
             arguments = match.group(3).strip()
 
-            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            tool_id = f"functions.{name}:{index}"
             results.append(
                 (
                     "tool_call_start",
                     {
                         "index": index,
-                        "id": call_id,
+                        "id": tool_id,
                         "type": "function",
                         "function": {"name": name, "arguments": ""},
                     },

@@ -49,6 +49,18 @@ from .serving_chat import (
     stream_chat_response,
     stream_chat_response_fanout,
 )
+from .serving_anthropic import (
+    AnthropicMessagesRequest,
+    anthropic_to_openai_messages,
+    build_anthropic_response,
+    stream_content_block_delta,
+    stream_content_block_start,
+    stream_content_block_stop,
+    stream_message_delta,
+    stream_message_start,
+    stream_message_stop,
+    stream_signature_delta,
+)
 from .serving_completion import (
     build_completion_response,
     build_completion_response_multi,
@@ -1029,6 +1041,252 @@ async def completions(request: CompletionRequest):
     except Exception as e:
         logger.error(f"Error in completions: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Request):
+    """Handle Anthropic Messages API requests.
+
+    Translates Anthropic format to OpenAI format internally, runs inference,
+    and returns Anthropic-formatted responses. Enables Claude Code and other
+    Anthropic-compatible tools to use ATOM as a backend.
+    """
+    global engine, tokenizer, model_name
+
+    try:
+        # Convert Anthropic messages to OpenAI format
+        openai_messages = anthropic_to_openai_messages(request.messages, request.system)
+
+        # Apply chat template
+        from .protocol import ChatMessage
+
+        messages = [ChatMessage(**m) for m in openai_messages]
+
+        merged_kwargs = dict(default_chat_template_kwargs)
+        prompt = apply_chat_template(
+            tokenizer,
+            custom_message_encoder,
+            [msg.to_template_dict() for msg in messages],
+            tools=None,
+            **merged_kwargs,
+        )
+
+        sampling_params = _build_sampling_params(
+            temperature=request.temperature or 1.0,
+            max_tokens=request.max_tokens,
+            stop_strings=request.stop_sequences,
+            ignore_eos=False,
+            top_k=request.top_k if request.top_k is not None else -1,
+            top_p=request.top_p if request.top_p is not None else 1.0,
+        )
+
+        request_id = uuid.uuid4().hex[:24]
+        input_tokens = len(tokenizer.encode(prompt))
+
+        max_ctx = getattr(engine, "max_model_len", None)
+        if max_ctx is None:
+            try:
+                max_ctx = engine.config.max_model_len
+            except AttributeError:
+                max_ctx = 16384
+        headroom = min(request.max_tokens, max_ctx // 4)
+        max_input = max_ctx - headroom
+        if input_tokens > max_input:
+            logger.warning(
+                f"Prompt too long ({input_tokens} > {max_input}), truncating"
+            )
+            token_ids = tokenizer.encode(prompt)[:max_input]
+            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
+            input_tokens = max_input
+
+        if request.stream:
+            # Streaming response
+            seq_id, stream_queue = await setup_streaming_request(
+                prompt, sampling_params, request_id
+            )
+
+            async def generate_anthropic_stream():
+                from .reasoning import ReasoningFilter
+                from .tool_parser import ToolCallStreamParser
+
+                reasoning_filter = ReasoningFilter()
+                if prompt.rstrip().endswith("<think>"):
+                    reasoning_filter.state = 1
+                tool_parser = ToolCallStreamParser()
+                block_index = 0
+                started_text = False
+                started_thinking = False
+                has_tool_calls = False
+                output_tokens = 0
+                stop_reason = "end_turn"
+
+                yield stream_message_start(request_id, model_name, input_tokens)
+
+                try:
+                    while True:
+                        chunk_data = await stream_queue.get()
+                        new_text = chunk_data["text"]
+                        output_tokens += len(chunk_data.get("token_ids", []))
+                        finished = chunk_data.get("finished", False)
+
+                        # Phase 1: Reasoning filter
+                        segments = reasoning_filter.process(new_text)
+                        if finished:
+                            segments.extend(reasoning_filter.flush())
+
+                        for field, text in segments:
+                            if not text:
+                                continue
+
+                            if field == "reasoning_content":
+                                pass
+                            else:
+                                # Phase 2: Tool call detection on content
+                                events = tool_parser.process(text)
+                                for etype, edata in events:
+                                    if etype == "content":
+                                        if started_thinking and not started_text:
+                                            yield stream_signature_delta(block_index)
+                                            yield stream_content_block_stop(block_index)
+                                            block_index += 1
+                                        if not started_text:
+                                            yield stream_content_block_start(
+                                                block_index, "text"
+                                            )
+                                            started_text = True
+                                        yield stream_content_block_delta(
+                                            block_index, edata, "text"
+                                        )
+                                    elif etype == "tool_call_start":
+                                        has_tool_calls = True
+                                        stop_reason = "tool_use"
+                                        if started_text:
+                                            yield stream_content_block_stop(block_index)
+                                            block_index += 1
+                                            started_text = False
+                                        elif started_thinking:
+                                            yield stream_signature_delta(block_index)
+                                            yield stream_content_block_stop(block_index)
+                                            block_index += 1
+                                            started_thinking = False
+                                        fn = edata.get("function", {})
+                                        yield stream_content_block_start(
+                                            block_index,
+                                            "tool_use",
+                                            tool_use_id=edata.get("id", ""),
+                                            tool_name=fn.get("name", ""),
+                                        )
+                                    elif etype == "tool_call_args":
+                                        fn = edata.get("function", {})
+                                        yield stream_content_block_delta(
+                                            block_index,
+                                            fn.get("arguments", ""),
+                                            "tool_use",
+                                        )
+                                    elif etype == "tool_call_end":
+                                        yield stream_content_block_stop(block_index)
+                                        block_index += 1
+
+                        if finished:
+                            # Flush remaining tool call events
+                            for etype, edata in tool_parser.flush():
+                                if etype == "content":
+                                    if not started_text:
+                                        if started_thinking:
+                                            yield stream_signature_delta(block_index)
+                                            yield stream_content_block_stop(block_index)
+                                            block_index += 1
+                                            started_thinking = False
+                                        yield stream_content_block_start(
+                                            block_index, "text"
+                                        )
+                                        started_text = True
+                                    yield stream_content_block_delta(
+                                        block_index, edata, "text"
+                                    )
+                                elif etype == "tool_call_start":
+                                    has_tool_calls = True
+                                    stop_reason = "tool_use"
+                                    if started_text:
+                                        yield stream_content_block_stop(block_index)
+                                        block_index += 1
+                                        started_text = False
+                                    fn = edata.get("function", {})
+                                    yield stream_content_block_start(
+                                        block_index,
+                                        "tool_use",
+                                        tool_use_id=edata.get("id", ""),
+                                        tool_name=fn.get("name", ""),
+                                    )
+                                elif etype == "tool_call_args":
+                                    fn = edata.get("function", {})
+                                    yield stream_content_block_delta(
+                                        block_index,
+                                        fn.get("arguments", ""),
+                                        "tool_use",
+                                    )
+                                elif etype == "tool_call_end":
+                                    yield stream_content_block_stop(block_index)
+                                    block_index += 1
+
+                            if not started_text and not has_tool_calls:
+                                if started_thinking:
+                                    yield stream_signature_delta(block_index)
+                                    yield stream_content_block_stop(block_index)
+                                    block_index += 1
+                                yield stream_content_block_start(block_index, "text")
+                                started_text = True
+                            if started_text:
+                                yield stream_content_block_stop(block_index)
+                            yield stream_message_delta(stop_reason, output_tokens)
+                            yield stream_message_stop()
+                            break
+                finally:
+                    cleanup_streaming_request(request_id, seq_id)
+
+            return StreamingResponse(
+                generate_anthropic_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "anthropic-version": "2023-06-01",
+                    "x-request-id": request_id,
+                },
+            )
+
+        # Non-streaming response
+        from .reasoning import separate_reasoning
+        from .tool_parser import parse_tool_calls
+
+        final_output = None
+        async for output in generate_async(prompt, sampling_params, request_id):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError("No output generated")
+
+        raw_text = final_output["text"]
+        reasoning_content, content_with_tools = separate_reasoning(raw_text)
+        content_text, tool_calls = parse_tool_calls(content_with_tools)
+        output_tokens = len(tokenizer.encode(raw_text))
+
+        return build_anthropic_response(
+            request_id=request_id,
+            model=model_name,
+            content_text=content_text,
+            reasoning_content=reasoning_content,
+            tool_calls=tool_calls if tool_calls else None,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    except Exception as e:
+        logger.error(f"Error in anthropic_messages: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "type": "error",
+                "error": {"type": "api_error", "message": str(e)},
+            },
+        )
 
 
 @app.get("/v1/models")
