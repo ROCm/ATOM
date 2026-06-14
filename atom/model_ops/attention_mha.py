@@ -535,6 +535,15 @@ class PagedAttentionImpl(nn.Module):
         q_fp8 = (q / q_scale).clamp(min=-fp8_max, max=fp8_max).to(fp8_dtype)
         return q_fp8.contiguous(), q_scale
 
+    @staticmethod
+    def _as_pa_int32(t: torch.Tensor) -> torch.Tensor:
+        """Canonical index dtype/layout for the PA kernel + get_ps_metadata_v1:
+        int32, contiguous. No-op (returns the same object, preserving data_ptr so
+        the metadata cache stays valid) when the tensor already matches."""
+        if t.dtype == torch.int32 and t.is_contiguous():
+            return t
+        return t.to(torch.int32).contiguous()
+
     def _get_pa_decode_bf16_asm_scale_tensors(
         self, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -542,7 +551,7 @@ class PagedAttentionImpl(nn.Module):
         if cached is not None and cached[0].device == device:
             return cached
         key_scale = torch.full(
-            (1,), self.kv_scale_float * self.scale, dtype=torch.float32, device=device
+            (1,), self.kv_scale_float, dtype=torch.float32, device=device
         )
         value_scale = torch.full(
             (1,), self.kv_scale_float, dtype=torch.float32, device=device
@@ -554,6 +563,9 @@ class PagedAttentionImpl(nn.Module):
     def _get_pa_decode_bf16_asm_metadata(
         self,
         attn_metadata,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        context_lens: torch.Tensor,
         batch_size: int,
         max_seqlen_q: int,
         page_size: int,
@@ -565,15 +577,15 @@ class PagedAttentionImpl(nn.Module):
             self.num_kv_heads,
             gqa,
             page_size,
-            attn_metadata.cu_seqlens_q.data_ptr(),
-            attn_metadata.kv_indptr.data_ptr(),
-            attn_metadata.context_lens.data_ptr(),
+            qo_indptr.data_ptr(),
+            kv_indptr.data_ptr(),
+            context_lens.data_ptr(),
         )
         cached = getattr(attn_metadata, "_pa_decode_bf16_asm_metadata", None)
         if cached is not None and cached[0] == cache_key:
             return cached[1]
 
-        device = attn_metadata.context_lens.device
+        device = context_lens.device
 
         def _empty(spec):
             shape, dtype = spec
@@ -601,9 +613,9 @@ class PagedAttentionImpl(nn.Module):
         reduce_partial_map = _empty(reduce_partial_map_spec)
 
         aiter.get_ps_metadata_v1(
-            attn_metadata.cu_seqlens_q,
-            attn_metadata.kv_indptr,
-            attn_metadata.context_lens,
+            qo_indptr,
+            kv_indptr,
+            context_lens,
             gqa,
             self.num_kv_heads,
             work_meta_data,
@@ -616,7 +628,11 @@ class PagedAttentionImpl(nn.Module):
             qlen_granularity=max_seqlen_q,
             kvlen_granularity=page_size,
             block_size=page_size,
-            is_causal=False,
+            # Kernel is compile-time CAUSAL=1 (per-row border = seq_len-mtp+r/gqa)
+            # and the working Triton path uses causal=True. For qlen=1 this is a
+            # no-op; for MTP/spec-decode (max_seqlen_q>1) is_causal=False produces
+            # work/reduce maps inconsistent with the kernel's causal masking.
+            is_causal=True,
         )
 
         metadata = {
@@ -758,19 +774,37 @@ class PagedAttentionImpl(nn.Module):
         page_size = int(k_cache.shape[3])
         gqa = self.num_heads // self.num_kv_heads
 
+        # ---- Q: FP8, logical [batch, qlen, kv_head, gqa, head_dim], contiguous ----
         q_5d = q.view(batch_size, max_seqlen_q, self.num_kv_heads, gqa, self.head_dim)
         q_fp8, query_scale = self._quantize_pa_decode_bf16_asm_query(q_5d)
+        # ---- K/V dequant scales: per-tensor [1] fp32, GPU-cached. Value ==
+        # self.kv_scale (kv_scale_float), exactly what the working Triton path
+        # passes as k_descale/v_descale. softmax_scale is passed BY VALUE below,
+        # so it is NOT folded into key_scale. ----
         key_scale, value_scale = self._get_pa_decode_bf16_asm_scale_tensors(q.device)
+        # ---- V cache: FP8 5D [np, kv_head, page//x, head_dim, x] ----
         v_cache_5d = self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
+
+        # ---- Index tensors: int32 + contiguous (kernel + get_ps_metadata ABI) ----
+        kv_indices = self._as_pa_int32(attn_metadata.kv_indices)
+        kv_indptr = self._as_pa_int32(attn_metadata.kv_indptr)
+        qo_indptr = self._as_pa_int32(attn_metadata.cu_seqlens_q)
+        context_lens = self._as_pa_int32(attn_metadata.context_lens)
 
         ps_metadata = self._get_pa_decode_bf16_asm_metadata(
             attn_metadata,
+            qo_indptr,
+            kv_indptr,
+            context_lens,
             batch_size,
             max_seqlen_q,
             page_size,
         )
 
-        output = torch.empty_like(q_5d)
+        # ---- Output: bf16, Q's logical shape ----
+        output = torch.empty(
+            q_5d.shape, dtype=torch.bfloat16, device=q.device
+        )
         split_rows = max(
             1,
             int(ps_metadata["reduce_partial_map"].numel()) * max_seqlen_q,
@@ -792,16 +826,16 @@ class PagedAttentionImpl(nn.Module):
             Q=q_fp8,
             K=k_cache,
             V=v_cache_5d,
-            kv_indices=attn_metadata.kv_indices,
-            context_lens=attn_metadata.context_lens,
-            softmax_scale=1.0,
-            kv_indptr=attn_metadata.kv_indptr,
+            kv_indices=kv_indices,
+            context_lens=context_lens,
+            softmax_scale=float(self.scale),
+            kv_indptr=kv_indptr,
             gqa=gqa,
             mtp=max_seqlen_q - 1,
             query_scale=query_scale,
             key_scale=key_scale,
             value_scale=value_scale,
-            qo_indptr=attn_metadata.cu_seqlens_q,
+            qo_indptr=qo_indptr,
             work_indptr=ps_metadata["work_indptr"],
             work_info=ps_metadata["work_info"],
             split_o=split_o,
