@@ -1,9 +1,11 @@
 from typing import Optional, Union
 
 import torch
+from aiter import QuantType, dtypes
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
-    tensor_model_parallel_fused_qknorm_allreduce,
+    tensor_model_parallel_fused_qknorm_allreduce_rope,
+    tensor_model_parallel_fused_qknorm_allreduce_rope_cache_quant,
 )
 from aiter.dist.parallel_state import (
     get_pp_group,
@@ -25,8 +27,10 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -82,26 +86,41 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        # Match vLLM: gate weights in fp32 for routing precision
-        old_wlp = self.gate.weight.weight_loader_process
-        self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
-        self.gate.weight.weight_loader_process = old_wlp
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def process_weights_after_loading(self):
+        # Keep the router gate weight in fp32 for routing precision (matches
+        # vLLM). Converting here -- after the checkpoint has been loaded --
+        # means forward() can use self.gate.weight directly with no per-call
+        # .float() cast on the weight. The loader invokes this hook once after
+        # weight loading completes.
+        if self.gate.weight.dtype != torch.float32:
+            self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp32: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         assert (
             hidden_states.dim() <= 2
         ), "MiniMaxM2SparseMoeBlock only supports 1D or 2D inputs"
         is_input_1d = hidden_states.dim() == 1
 
-        num_tokens, hidden_dim = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # Use fp32 for gate computation to match reference precision.
         # With 256 experts + sigmoid scoring + bias correction, bf16
         # gate precision causes enough routing errors to degrade accuracy.
-        router_logits = torch.nn.functional.linear(
-            hidden_states.float(), self.gate.weight.float()
-        )
+        # gate.weight is converted to fp32 in process_weights_after_loading.
+        # When the upstream RMSNorm already produced an fp32 mirror of the
+        # normed activation (hidden_states_fp32), use it directly to also skip
+        # the per-token hidden_states.float() cast; otherwise fall back to it.
+        if hidden_states_fp32 is not None:
+            gate_input = hidden_states_fp32.view(-1, hidden_dim)
+        else:
+            gate_input = hidden_states.float()
+        router_logits = torch.nn.functional.linear(gate_input, self.gate.weight)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -179,6 +198,15 @@ class MiniMaxM2Attention(nn.Module):
             rope_scaling=rope_scaling,
             dtype=getattr(quant_config, "torch_dtype", None),
         )
+        self.rotary_dim = rotary_dim
+        self.kv_cache_dtype = kv_cache_dtype
+        cos = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+        sin = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+        self.register_buffer(
+            "qknorm_rope_cos_sin_cache",
+            torch.cat([cos, sin], dim=-1).contiguous(),
+            persistent=False,
+        )
 
         self.use_qk_norm = use_qk_norm
         if self.use_qk_norm:
@@ -197,6 +225,13 @@ class MiniMaxM2Attention(nn.Module):
                     self.total_num_kv_heads * self.head_dim
                 )
 
+        self.delegate_qknorm_rope_to_vllm = (
+            is_vllm()
+            and self.use_qk_norm
+            and self.tp_size > 1
+            and self.kv_cache_dtype == "fp8"
+        )
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -205,7 +240,9 @@ class MiniMaxM2Attention(nn.Module):
             kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
             use_mla=False,
-            rotary_emb=self.rotary_emb,
+            rotary_emb=self.rotary_emb if self.delegate_qknorm_rope_to_vllm else None,
+            q_norm=self.q_norm if self.delegate_qknorm_rope_to_vllm else None,
+            k_norm=self.k_norm if self.delegate_qknorm_rope_to_vllm else None,
             prefix=f"{prefix}.attn",
         )
 
@@ -226,17 +263,87 @@ class MiniMaxM2Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        hidden_states_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        # hidden_states_scale is non-None when input_layernorm already emitted a
+        # per-group-quantized (fp8, scale) activation; qkv_proj then skips its
+        # internal quant and feeds the GEMM directly.
+        qkv = self.qkv_proj(hidden_states, hidden_states_scale)
 
-        if self.use_qk_norm:
+        if self.delegate_qknorm_rope_to_vllm:
+            q, k, v = torch.split(
+                qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+        elif self.use_qk_norm:
             # TP-aware RMSNorm: all-reduce variance across TP ranks so
             # normalization uses the global variance (over 6144/1024 dims)
             # rather than per-rank variance (768/128 dims).
             if self.tp_size > 1:
-                q, k, v = tensor_model_parallel_fused_qknorm_allreduce(
-                    qkv, self.q_norm.weight, self.k_norm.weight, self.rms_norm_eps
+                cos_sin_cache = self.qknorm_rope_cos_sin_cache
+                if cos_sin_cache.dtype != qkv.dtype or cos_sin_cache.device != qkv.device:
+                    cos_sin_cache = cos_sin_cache.to(device=qkv.device, dtype=qkv.dtype)
+                fwd_ctx = get_forward_context()
+                fwd_context = getattr(fwd_ctx, "context", None)
+                kv_cache_data = getattr(fwd_ctx, "kv_cache_data", None)
+                use_fused_cache_quant = (
+                    self.kv_cache_dtype == "fp8"
+                    and hasattr(self.attn, "impl")
+                    and fwd_context is not None
+                    and not fwd_context.is_dummy_run
+                    and kv_cache_data is not None
+                    and f"layer_{self.layer_num}" in kv_cache_data
                 )
+                if use_fused_cache_quant:
+                    kv_cache = kv_cache_data[f"layer_{self.layer_num}"]
+                    k_cache = kv_cache.k_cache
+                    v_cache = kv_cache.v_cache
+                    k_scale = kv_cache.k_scale
+                    v_scale = kv_cache.v_scale
+                    if k_scale is not None and v_scale is not None:
+                        x = 16 // k_cache.element_size()
+                        if k_cache.dim() == 5 and v_cache.dim() == 4:
+                            n, nh, hd, bs = v_cache.shape
+                            v_cache = v_cache.view(n, nh, bs // x, hd, x)
+                        q, k, v = (
+                            tensor_model_parallel_fused_qknorm_allreduce_rope_cache_quant(
+                                qkv,
+                                self.q_norm.weight,
+                                self.k_norm.weight,
+                                cos_sin_cache,
+                                positions,
+                                k_cache,
+                                v_cache,
+                                k_scale,
+                                v_scale,
+                                fwd_ctx.attn_metadata.slot_mapping,
+                                self.head_dim,
+                                self.rotary_dim,
+                                self.rms_norm_eps,
+                            )
+                        )
+                        self.attn.impl._skip_next_kv_cache_write = True
+                    else:
+                        q, k, v = tensor_model_parallel_fused_qknorm_allreduce_rope(
+                            qkv,
+                            self.q_norm.weight,
+                            self.k_norm.weight,
+                            cos_sin_cache,
+                            positions,
+                            self.head_dim,
+                            self.rotary_dim,
+                            self.rms_norm_eps,
+                        )
+                else:
+                    q, k, v = tensor_model_parallel_fused_qknorm_allreduce_rope(
+                        qkv,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        cos_sin_cache,
+                        positions,
+                        self.head_dim,
+                        self.rotary_dim,
+                        self.rms_norm_eps,
+                    )
             else:
                 q, k, v = torch.split(
                     qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
@@ -256,10 +363,12 @@ class MiniMaxM2Attention(nn.Module):
                 k = (
                     k * torch.rsqrt(k_var + self.rms_norm_eps) * self.k_norm.weight
                 ).to(orig_dtype)
+                q, k = self.rotary_emb(positions, q, k)
         else:
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
+            q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(
             query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
@@ -315,15 +424,36 @@ class MiniMaxM2DecoderLayer(nn.Module):
             prefix=f"{prefix}.block_sparse_moe",
         )
 
+        # When the downstream qkv_proj consumes per-group FP8 (per_1x128) input,
+        # fuse the activation quant into input_layernorm's AllReduce+RMSNorm so
+        # qkv_proj receives (fp8, scale) directly and skips a separate quant
+        # kernel. Only meaningful on the fused-allreduce path (tp>1, layer>0).
+        # NOTE: quant_config + the qkv_proj prefix MUST be passed so RMSNorm
+        # resolves quant_type=per_1x128 (matching the Linear); without them it
+        # defaults to quant_type=No and the fused-quant branch is never taken.
+        qkv = self.self_attn.qkv_proj
+        qkv_group_quant = (
+            qkv.quant_type.value == QuantType.per_1x128.value
+            and qkv.params_dtype == dtypes.fp8
+        )
+        fuse_input_allreduce = ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0,
+            fused_allreduce=fuse_input_allreduce,
+            fused_quant=fuse_input_allreduce and qkv_group_quant,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn.qkv_proj",
         )
+        # Request an fp32 mirror of the normed output on the fused-allreduce
+        # path so the MoE router gate can consume fp32 hidden_states directly
+        # (skips a per-token hidden_states.float() cast). Only meaningful when
+        # the fused AR+RMSNorm path is actually taken (tp>1 checked at runtime).
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            emit_fp32=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
     def forward(
@@ -332,17 +462,34 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states_scale = None
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            # The fused AllReduce+RMSNorm+per_group_quant path returns the
+            # normed activation as a (fp8, scale) tuple for qkv_proj to consume
+            # directly; the plain path returns a bf16 tensor.
+            if isinstance(hidden_states, tuple):
+                hidden_states, hidden_states_scale = hidden_states
 
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+        )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
-        hidden_states = self.block_sparse_moe(hidden_states)
+        # On the fused AR+RMSNorm path with emit_fp32, post_attention_layernorm
+        # returns the normed output as a (bf16, fp32) tuple. The MoE experts
+        # consume the bf16 view; the router gate consumes the fp32 view.
+        hidden_states_fp32 = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_fp32 = hidden_states
+
+        hidden_states = self.block_sparse_moe(hidden_states, hidden_states_fp32)
 
         return hidden_states, residual
 

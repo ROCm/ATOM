@@ -196,6 +196,18 @@ class PagedAttentionImpl(nn.Module):
         )
         self.use_triton_attn = use_triton_attn
 
+        if getattr(self, "_skip_next_kv_cache_write", False):
+            self._skip_next_kv_cache_write = False
+            self.per_token_quant = True
+            self._cache_format = "SHUFFLE"
+            if attn_metadata.has_cached:
+                q, k, v, k_cache, v_cache, k_scale, v_scale = (
+                    self._gather_prefix_and_concat_kv(
+                        q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
+                    )
+                )
+            return q, k, v, k_cache, v_cache, k_scale, v_scale
+
         if (
             self.rotary_emb is not None
             and self.q_norm is not None
