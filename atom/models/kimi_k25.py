@@ -70,6 +70,16 @@ class KimiK25ForCausalLM(nn.Module):
     def packed_modules_mapping(self):
         return self.language_model.packed_modules_mapping
 
+    @property
+    def model(self):
+        # Expose the inner DeepseekV2Model so the SGLang plugin wrapper can
+        # reach ``embed_tokens`` for embed/lm_head tying (ROCm/ATOM#1078).
+        return self.language_model.model
+
+    @property
+    def lm_head(self):
+        return self.language_model.lm_head
+
     # ---- forward / inference API ----
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
