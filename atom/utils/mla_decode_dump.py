@@ -38,6 +38,16 @@ def _max_steps() -> int:
     return int(os.environ.get("ATOM_MLA_DUMP_MAX_STEPS", "1") or "1")
 
 
+def _min_pages() -> int:
+    """Only dump steps whose longest per-batch KV span is >= this many pages.
+
+    The fp8 get_meta_param clamp keeps num_kv_splits>1 only when
+    (pages-1)//min_block_n + 1 >= 2, i.e. pages >= 33 for nhead=128 (min_block_n=32).
+    Set ATOM_MLA_DUMP_MIN_PAGES=33 to capture only steps where the >1-split path
+    is actually exercised end-to-end."""
+    return int(os.environ.get("ATOM_MLA_DUMP_MIN_PAGES", "0") or "0")
+
+
 def _cpu(t):
     return t.detach().to("cpu") if torch.is_tensor(t) else t
 
@@ -91,6 +101,14 @@ def dump_decode_mla(
         return
     if _DUMP_COUNTS[int(layer_num)] >= _max_steps():
         return
+    min_pages = _min_pages()
+    if min_pages > 0:
+        # Longest per-batch KV span in pages; skip short-context steps where the
+        # fp8 clamp collapses num_kv_splits back to 1.
+        kv_indptr_cpu = kv_indptr.to(torch.int64).cpu()
+        max_pages = int((kv_indptr_cpu[1:] - kv_indptr_cpu[:-1]).max().item())
+        if max_pages < min_pages:
+            return
     step = _DUMP_COUNTS[int(layer_num)]
     _DUMP_COUNTS[int(layer_num)] += 1
 
