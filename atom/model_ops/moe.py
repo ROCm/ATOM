@@ -82,7 +82,6 @@ class MoEActivationQuant(Enum):
         return MoEActivationQuant.BF16
 
 
-
 class FusedMoeWeightScaleSupported(Enum):
     """Supported quantization strategies for MoE weight scales."""
 
@@ -795,6 +794,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             assert has_triton_kernels(), "triton_kernels is not installed"
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
 
+        # gfx1250: aiter's grouped MoE branch hard-overrides the activation dtype
+        # to MXFP4 (a4w4) unless AITER_FORCE_A8W4=1, ignoring the dtype ATOM
+        # passes. For an a8w4 model (FP8 activations) we must opt in explicitly,
+        # otherwise it would silently run a4w4. Set it from the model's own quant
+        # config so no external env wrangling is needed.
+        if self.is_gfx1250 and self.act_quant == MoEActivationQuant.FP8:
+            os.environ["AITER_FORCE_A8W4"] = "1"
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1005,36 +1012,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # shuffle scale
         if self.is_gfx1250:
-            # gfx1250 grouped a8w4 MoE kernel reads the e8m0 scale preshuffled by
-            # _grouped_a8w4_prepare_scale_batch (warp_tile = tile_n // n_warp =
-            # 64 // 2 = 32, tile_k = 128). w13 is the (gate|up) operand
-            # (rows = 2*inter, k_dim = model_dim); w2 (down) has
-            # rows = model_dim, k_dim = inter.
+            # gfx1250 grouped a8w4 MoE kernel reads the weight (B) e8m0 scale in
+            # the "N4K8" layout produced by _grouped_b_scale_prepare_batch: a
+            # 64-row x 256-K super-block is folded into one row so each lane
+            # reads its full WMMA scaleB operand with one contiguous load. The
+            # layout is fixed by the WMMA scale contract (no warp_tile/tile_k
+            # knobs). w13 is the (gate|up) operand (rows = 2*inter,
+            # k_dim = model_dim); w2 (down) has rows = model_dim, k_dim = inter.
+            # The 256 pad_align on hidden_size/intermediate_size guarantees
+            # rows % 64 == 0 and k_dim % 256 == 0, as the layout requires.
             from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-                _grouped_a8w4_prepare_scale_batch,
+                _grouped_b_scale_prepare_batch,
             )
 
-            _GROUPED_WARP_TILE_N = 64
-            _GROUPED_TILE_K = 256
             layer.w13_weight_scale = atom_parameter(
-                _grouped_a8w4_prepare_scale_batch(
+                _grouped_b_scale_prepare_batch(
                     layer.w13_weight_scale.data,
                     experts=self.num_experts,
                     rows=2 * self.intermediate_size,
                     k_dim=self.hidden_size,
-                    warp_tile=_GROUPED_WARP_TILE_N,
-                    tile_k=_GROUPED_TILE_K,
                     device=layer.w13_weight_scale.device,
                 )
             )
             layer.w2_weight_scale = atom_parameter(
-                _grouped_a8w4_prepare_scale_batch(
+                _grouped_b_scale_prepare_batch(
                     layer.w2_weight_scale.data,
                     experts=self.num_experts,
                     rows=self.hidden_size,
                     k_dim=self.intermediate_size,
-                    warp_tile=_GROUPED_WARP_TILE_N,
-                    tile_k=_GROUPED_TILE_K,
                     device=layer.w2_weight_scale.device,
                 )
             )
