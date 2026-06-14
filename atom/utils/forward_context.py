@@ -384,6 +384,7 @@ class AttentionMetaData:
     reduce_indptr: Optional[torch.Tensor] = None
     reduce_final_map: Optional[torch.Tensor] = None
     reduce_partial_map: Optional[torch.Tensor] = None
+    pa_decode_bf16_asm_metadata: bool = False
 
     # for prefix cache
     has_cached: bool = False
@@ -415,6 +416,7 @@ class AttentionMetaData:
         reduce_indptr: Optional[torch.Tensor] = None,
         reduce_final_map: Optional[torch.Tensor] = None,
         reduce_partial_map: Optional[torch.Tensor] = None,
+        pa_decode_bf16_asm_metadata: bool = False,
         sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
         token_to_seq_idxs: Optional[torch.Tensor] = None,
         has_cached: bool = False,
@@ -448,6 +450,7 @@ class AttentionMetaData:
         self.reduce_indptr = reduce_indptr
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
+        self.pa_decode_bf16_asm_metadata = pa_decode_bf16_asm_metadata
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs
 

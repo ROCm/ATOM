@@ -558,6 +558,23 @@ class PagedAttentionImpl(nn.Module):
         max_seqlen_q: int,
         page_size: int,
     ) -> dict[str, torch.Tensor]:
+        if (
+            getattr(attn_metadata, "pa_decode_bf16_asm_metadata", False)
+            and attn_metadata.work_indptr is not None
+            and attn_metadata.work_info_set is not None
+            and attn_metadata.reduce_indptr is not None
+            and attn_metadata.reduce_final_map is not None
+            and attn_metadata.reduce_partial_map is not None
+        ):
+            return {
+                "work_meta_data": attn_metadata.work_meta_data,
+                "work_indptr": attn_metadata.work_indptr,
+                "work_info": attn_metadata.work_info_set,
+                "reduce_indptr": attn_metadata.reduce_indptr,
+                "reduce_final_map": attn_metadata.reduce_final_map,
+                "reduce_partial_map": attn_metadata.reduce_partial_map,
+            }
+
         gqa = self.num_heads // self.num_kv_heads
         cache_key = (
             batch_size,

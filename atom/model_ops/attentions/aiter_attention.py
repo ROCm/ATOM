@@ -106,6 +106,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        self._pa_decode_bf16_asm_num_head_k = num_head_k
+        self._pa_decode_bf16_asm_enabled = (
+            use_pa_decode_bf16_asm() and model_runner.block_size == 256
+        )
 
         pa_persistent_metadata = {
             "max_qlen": max_qlen,
@@ -135,6 +139,54 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 **i32_kwargs,
             ),
         }
+        if self._pa_decode_bf16_asm_enabled:
+            (
+                (pa_asm_work_meta_data_size, pa_asm_work_meta_data_type),
+                (pa_asm_work_indptr_size, pa_asm_work_indptr_type),
+                (pa_asm_work_info_size, pa_asm_work_info_type),
+                (pa_asm_reduce_indptr_size, pa_asm_reduce_indptr_type),
+                (pa_asm_reduce_final_map_size, pa_asm_reduce_final_map_type),
+                (pa_asm_reduce_partial_map_size, pa_asm_reduce_partial_map_type),
+            ) = aiter.get_ps_metadata_info_v1(
+                self.max_bs,
+                num_head_k,
+                max_qlen,
+                qlen_granularity=max_qlen,
+            )
+            pa_persistent_metadata.update(
+                {
+                    "pa_decode_bf16_asm_work_meta_data": torch.empty(
+                        pa_asm_work_meta_data_size,
+                        dtype=pa_asm_work_meta_data_type,
+                        device=self.device,
+                    ),
+                    "pa_decode_bf16_asm_work_indptr": torch.empty(
+                        pa_asm_work_indptr_size,
+                        dtype=pa_asm_work_indptr_type,
+                        device=self.device,
+                    ),
+                    "pa_decode_bf16_asm_work_info": torch.empty(
+                        pa_asm_work_info_size,
+                        dtype=pa_asm_work_info_type,
+                        device=self.device,
+                    ),
+                    "pa_decode_bf16_asm_reduce_indptr": torch.empty(
+                        pa_asm_reduce_indptr_size,
+                        dtype=pa_asm_reduce_indptr_type,
+                        device=self.device,
+                    ),
+                    "pa_decode_bf16_asm_reduce_final_map": torch.empty(
+                        pa_asm_reduce_final_map_size,
+                        dtype=pa_asm_reduce_final_map_type,
+                        device=self.device,
+                    ),
+                    "pa_decode_bf16_asm_reduce_partial_map": torch.empty(
+                        pa_asm_reduce_partial_map_size,
+                        dtype=pa_asm_reduce_partial_map_type,
+                        device=self.device,
+                    ),
+                }
+            )
         self.model_runner.forward_vars.update(pa_persistent_metadata)
         # Per-ubatch buffers for CUDAGraph TBO
         if model_runner.config.enable_tbo:
@@ -290,6 +342,68 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "reduce_final_map": reduce_final_map,
             "reduce_partial_map": reduce_partial_map,
         }
+
+    def _pa_decode_bf16_asm_metadata_views(self, bs: int, max_q_len: int):
+        def first_dim(shape):
+            return shape[0] if isinstance(shape, tuple) else shape
+
+        (
+            _,
+            (_, _),
+            (work_info_size, _),
+            (reduce_indptr_size, _),
+            (reduce_final_map_size, _),
+            (reduce_partial_map_size, _),
+        ) = aiter.get_ps_metadata_info_v1(
+            bs,
+            self._pa_decode_bf16_asm_num_head_k,
+            max_q_len,
+            qlen_granularity=max_q_len,
+        )
+        var = self.model_runner.forward_vars
+        return {
+            "pa_decode_bf16_asm_metadata": True,
+            "work_meta_data": var["pa_decode_bf16_asm_work_meta_data"],
+            "work_indptr": var["pa_decode_bf16_asm_work_indptr"],
+            "work_info_set": var["pa_decode_bf16_asm_work_info"][
+                : first_dim(work_info_size), :
+            ],
+            "reduce_indptr": var["pa_decode_bf16_asm_reduce_indptr"][
+                : first_dim(reduce_indptr_size)
+            ],
+            "reduce_final_map": var["pa_decode_bf16_asm_reduce_final_map"][
+                : first_dim(reduce_final_map_size), :
+            ],
+            "reduce_partial_map": var["pa_decode_bf16_asm_reduce_partial_map"][
+                : first_dim(reduce_partial_map_size)
+            ],
+        }
+
+    def set_pa_decode_bf16_asm_metadata(self, bs: int, max_q_len: int):
+        """Refresh graph-stable PS metadata buffers for PA BF16 ASM decode."""
+        ctx = self._pa_decode_bf16_asm_metadata_views(bs, max_q_len)
+        var = self.model_runner.forward_vars
+        num_kv_heads = self._pa_decode_bf16_asm_num_head_k
+        num_query_heads = self.num_attention_heads
+        aiter.get_ps_metadata_v1(
+            var["cu_seqlens_q"].gpu[: bs + 1],
+            var["kv_indptr"].gpu[: bs + 1],
+            var["context_lens"].gpu[:bs],
+            num_query_heads // num_kv_heads,
+            num_kv_heads,
+            ctx["work_meta_data"],
+            ctx["work_indptr"],
+            ctx["work_info_set"],
+            ctx["reduce_indptr"],
+            ctx["reduce_final_map"],
+            ctx["reduce_partial_map"],
+            qhead_granularity=num_query_heads // num_kv_heads,
+            qlen_granularity=max_q_len,
+            kvlen_granularity=self.block_size,
+            block_size=self.block_size,
+            is_causal=False,
+        )
+        return ctx
 
     def compute_block_bytes(self) -> int:
         """Standard split-K/V MHA per-block bytes.
@@ -772,6 +886,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self.block_ratio,
             max_seqlen_k,
         )
+        if self._pa_decode_bf16_asm_enabled:
+            ctx.update(self.set_pa_decode_bf16_asm_metadata(bs, max_seqlen_q))
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
@@ -989,14 +1105,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
         max_seqlen_k = self.model_runner.config.max_model_len
-        if use_pa_decode_bf16_asm() and self.block_size == 256:
-            max_seqlen_k = self._prepare_pa_decode_bf16_asm_capture_metadata(bs)
+        max_q_len = int(var["max_qlen"])
+        if self._pa_decode_bf16_asm_enabled:
+            self._prepare_pa_decode_bf16_asm_capture_metadata(bs)
+            ctx_pa_decode_bf16_asm = self.set_pa_decode_bf16_asm_metadata(
+                bs, max_q_len
+            )
+        else:
+            ctx_pa_decode_bf16_asm = {}
 
         if self.block_size == 1024:
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
-        max_q_len = int(var["max_qlen"])
         attn_metadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[: bs * max_q_len],
             context_lens=var["context_lens"].gpu[:bs],
@@ -1007,6 +1128,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             kv_indices=var["kv_indices"].gpu,
             max_seqlen_k=max_seqlen_k,
             **ctx_pa_ps,
+            **ctx_pa_decode_bf16_asm,
         )
 
         positions = var["positions"].copy_to_gpu(bs * max_q_len)
