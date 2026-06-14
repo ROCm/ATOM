@@ -171,7 +171,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.num_experts
-        self.n_shared_experts = config.n_shared_experts
 
         # self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
