@@ -39,10 +39,21 @@ Workers bind to `base-port + worker_index`. For example, `--base-port 30010 --wo
 Start Atomesh and point it at the virtual worker URL:
 
 ```bash
-cd ATOM/atom/mesh && ./target/debug/atomesh \
+cd ATOM/atom/mesh && cargo run -- launch \
   --host 127.0.0.1 \
   --port 30000 \
-  --worker http://127.0.0.1:30010
+  --worker-urls http://127.0.0.1:30010
+```
+
+To enable TLS on Atomesh, add the certificate and private key paths:
+
+```bash
+cd ATOM/atom/mesh && cargo run -- launch \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --tls-cert-path ./fullchain.pem \
+  --tls-key-path ./privkey.pem \
+  --worker-urls http://127.0.0.1:30010
 ```
 
 Adjust the Atomesh launch arguments to match the router mode you want to test. For PD mode, start multiple virtual workers and pass the corresponding prefill/decode worker URLs to Atomesh.
@@ -56,6 +67,25 @@ cd ATOM/atom/mesh/mocker && ./target/debug/atomesh-mocker benchmark-request \
   --base-url http://127.0.0.1:30000 \
   --producer-threads 1 \
   --consumer-threads 4 \
+  fixtures/http_regular_chat.json
+```
+
+For TLS, use an `https://` base URL and either trust the server certificate or
+skip validation for local debugging:
+
+```bash
+cd ATOM/atom/mesh/mocker && ./target/debug/atomesh-mocker benchmark-request \
+  --base-url https://127.0.0.1:30000 \
+  --producer-threads 1 \
+  --consumer-threads 4 \
+  --tls-ca-cert-path ../fullchain.pem \
+  fixtures/http_regular_chat.json
+
+cd ATOM/atom/mesh/mocker && ./target/debug/atomesh-mocker benchmark-request \
+  --base-url https://127.0.0.1:30000 \
+  --producer-threads 1 \
+  --consumer-threads 4 \
+  --tls-accept-invalid-certs \
   fixtures/http_regular_chat.json
 ```
 

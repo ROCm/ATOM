@@ -43,11 +43,7 @@ pub(crate) struct ChatStreamConfig {
     pub backend_label: &'static str,
 }
 
-pub fn process(
-    stream: TokenHandle,
-    ctx: ResponseContext,
-    backend_label: &'static str,
-) -> Response {
+pub fn process(stream: TokenHandle, ctx: ResponseContext, backend_label: &'static str) -> Response {
     let chat_request = match &ctx.original {
         ProtocolRequest::Chat(r) => Arc::clone(r),
         ProtocolRequest::Generate(_) => {
