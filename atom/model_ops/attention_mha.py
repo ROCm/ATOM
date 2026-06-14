@@ -816,6 +816,23 @@ class PagedAttentionImpl(nn.Module):
         qo_indptr = self._as_pa_int32(attn_metadata.cu_seqlens_q)
         context_lens = self._as_pa_int32(attn_metadata.context_lens)
 
+        # --- DIAGNOSTIC: the GPU kv_indices the kernel actually reads must be
+        # duplicate-free (prefix caching OFF => each physical block belongs to one
+        # seq). A dup HERE (while prepare_decode's CPU block_tables were clean)
+        # means the GPU buffer was raced/overwritten between prepare and kernel.
+        # Remove once root cause is fixed. ---
+        try:
+            _tot = int(kv_indptr[-1].item())
+            _v = kv_indices[:_tot].tolist()
+            if len(_v) != len(set(_v)):
+                logger.error(
+                    "PA-DIAG GPU-KVI DUP bs=%d tot=%d dup=%d",
+                    batch_size, _tot, len(_v) - len(set(_v)),
+                )
+        except Exception as _e:  # never let the probe break the run
+            logger.error("PA-DIAG GPU-KVI probe error: %s", _e)
+        # --- END DIAGNOSTIC ---
+
         ps_metadata = self._get_pa_decode_bf16_asm_metadata(
             attn_metadata,
             qo_indptr,
