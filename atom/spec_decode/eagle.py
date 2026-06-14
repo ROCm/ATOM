@@ -344,15 +344,22 @@ class EagleProposer:
         # Eaale3 only support mha currently
         draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
 
-        # Eagle3 MLA: re-slice slot_mapping to len(input_ids).
-        # Target's MLA prepare_decode sized it
-        # to bs*max_q_len; after rejection len(input_ids) may be smaller,
-        # and the MHA cache-write kernel asserts slot_mapping <= q.
-        # Other fields (block_tables, context_lens, slot_mapping values
-        # themselves) are already in a draft-compatible format because
-        # MLA's prepare_decode uses the same runner.block_size as the draft.
+        # Eagle3 draft attention runs outside the target CUDA graph, so its Q is
+        # active-sized. Target decode metadata may still be padded to graph_bs;
+        # keep the first draft attention call aligned with context.batch_size.
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
+            attn_metadata.block_tables = var["block_tables"].gpu[:bs]
+            attn_metadata.context_lens = var["context_lens"].gpu[:bs]
+            attn_metadata.cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
+            attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+            attn_metadata.kv_indices = var["kv_indices"].gpu
+            if target_uses_mla:
+                attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
+            if "sparse_kv_indptr" in var:
+                attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
+                    : bs + 1
+                ]
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
