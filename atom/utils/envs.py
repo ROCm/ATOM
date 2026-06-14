@@ -74,6 +74,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
     ),
+    "ATOM_ENABLE_HIP_MLA_REDUCE": lambda: (
+        os.getenv("ATOM_ENABLE_HIP_MLA_REDUCE", "1") == "1"
+    ),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",

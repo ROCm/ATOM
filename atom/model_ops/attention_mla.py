@@ -36,6 +36,8 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
 
+from aiter.mla_v_up_proj import mla_reduce_decode
+
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
 )
@@ -841,26 +843,51 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
-            mla_decode_fwd(
-                q,
-                kv_buffer.view(-1, 1, 1, q.shape[-1]),
-                o,
-                paged_cu_seqlens_q,
-                paged_kv_indptr,
-                paged_kv_indices,
-                paged_kv_last_page_lens,
-                max_q_len,
-                num_kv_splits=16,
-                sm_scale=self.scale,
-                work_meta_data=work_meta_data,
-                work_indptr=work_indptr,
-                work_info_set=work_info_set,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                q_scale=self._q_scale,
-                kv_scale=self._k_scale,
-            )
+            reduced = None
+            if (
+                envs.ATOM_ENABLE_HIP_MLA_REDUCE
+                and is_rocm_aiter_fp4bmm_enabled()
+                and self.padded_num_heads == 16
+            ):
+                reduced = mla_reduce_decode(
+                    q,
+                    kv_buffer,
+                    o,
+                    cu_seqlens_q=paged_cu_seqlens_q,
+                    kv_indptr=paged_kv_indptr,
+                    kv_indices=paged_kv_indices,
+                    kv_last_page_lens=paged_kv_last_page_lens,
+                    max_seqlen_q=max_q_len,
+                    scale=self.scale,
+                    q_scale=self._q_scale,
+                    k_scale=self._k_scale,
+                    kv_lora_rank=self.kv_lora_rank,
+                    v_head_dim=self.v_head_dim,
+                )
+
+            if reduced is not None:
+                o = reduced
+            else:
+                mla_decode_fwd(
+                    q,
+                    kv_buffer.view(-1, 1, 1, q.shape[-1]),
+                    o,
+                    paged_cu_seqlens_q,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_lens,
+                    max_q_len,
+                    num_kv_splits=16,
+                    sm_scale=self.scale,
+                    work_meta_data=work_meta_data,
+                    work_indptr=work_indptr,
+                    work_info_set=work_info_set,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    q_scale=self._q_scale,
+                    kv_scale=self._k_scale,
+                )
 
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :].contiguous()
