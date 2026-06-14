@@ -7,6 +7,7 @@ from typing import List, Optional, Type
 
 import numpy as np
 import torch
+from atom.utils import envs
 from aiter import (
     decode_update_mla_metadata_v1,
     dtypes,
@@ -54,6 +55,10 @@ class MLAChunkContextMetadata:
     num_chunks: int
     k_workspace: torch.Tensor
     v_workspace: torch.Tensor
+    # Block-granular CSR per chunk for the shuffled-KV gather (block_size=64
+    # blocks instead of token slots). None for the plain token-slot layout.
+    shuffle_kv_block_indptr: Optional[List[torch.Tensor]] = None
+    shuffle_kv_block_indices: Optional[List[torch.Tensor]] = None
 
 
 def cdiv(a, b):
@@ -77,6 +82,12 @@ class AiterMLABackend(AttentionBackend):
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def __init__(self, model_runner):
         self.block_size = 1
+        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+            assert model_runner.block_size == 64, (
+                f"ATOM_USE_TRITON_MLA=1 and ATOM_USE_TRITON_MLA_SHUFFLE_KV=1 expects --block-size 64 "
+                f"for {model_runner.kv_cache_dtype} KV cache, "
+                f"got --block-size {model_runner.block_size}"
+            )
         CommonAttentionBuilder.__init__(self, model_runner)
         config = model_runner.config
         hf_config = config.hf_config
