@@ -384,21 +384,20 @@ class EagleProposer:
         # Eaale3 only support mha currently
         draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
 
-        # Eagle3 MHA reuses target metadata, but the target may be MLA.  Keep
-        # write slots sized to this draft pass, and when prefix cache is active
-        # restore logical block ids: MLA prefill expands block_tables by
-        # block_ratio for its physical block_size=1 pool, while the draft MHA
-        # cache is indexed by runner.block_size blocks.
-        if draft_uses_mha:
-            attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
-            attn_metadata.block_tables = var["block_tables"].gpu[:bs]
-
         # Backends that expose flat per-seq kv_indices/kv_indptr (MLA, MHA)
         # wire them through eagle's mid-step block; V4 has block_tables +
         # context_lens instead (its v4_kv_indices_{swa,csa,hca} are per-token
         # non-equivalent). Hoisted out of the loop so the value is bound for
         # every iteration (used at i>=1 too, even though i==0 sets it).
         has_flat_kv = "kv_indices" in var
+
+        # Target cudagraph replay may pass graph-sized Q into the Eagle3 draft.
+        # Match slot/block metadata to the graph-padded draft shape.
+        if draft_uses_mha:
+            attn_metadata.slot_mapping = var["slot_mapping"].gpu[
+                : context.graph_bs * attn_metadata.max_seqlen_q
+            ]
+            attn_metadata.block_tables = var["block_tables"].gpu[: context.graph_bs]
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):

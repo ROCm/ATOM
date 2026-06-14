@@ -334,6 +334,21 @@ class Eagle3LlamaModel(nn.Module):
         compute_logits() is norm-aware, so EagleProposer only sees one tensor.
         """
         embeds = self.embed_tokens(input_ids)
+        if hidden_states.shape[0] > embeds.shape[0]:
+            pad_tokens = hidden_states.shape[0] - embeds.shape[0]
+            embeds = torch.cat(
+                [embeds, embeds.new_zeros((pad_tokens, embeds.shape[1]))], dim=0
+            )
+            if positions.ndim == 1:
+                positions = torch.cat(
+                    [positions, positions.new_zeros((pad_tokens,))], dim=0
+                )
+            else:
+                pad_shape = list(positions.shape)
+                pad_shape[-1] = pad_tokens
+                positions = torch.cat(
+                    [positions, positions.new_zeros(pad_shape)], dim=-1
+                )
         hidden_states = self.midlayer(positions, embeds, hidden_states)
         return self.norm(hidden_states) if self.norm_output else hidden_states
 
