@@ -354,12 +354,6 @@ class EagleProposer:
             attn_metadata.cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
             attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
             attn_metadata.kv_indices = var["kv_indices"].gpu
-            if target_uses_mla:
-                attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
-            if "sparse_kv_indptr" in var:
-                attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
-                    : bs + 1
-                ]
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
