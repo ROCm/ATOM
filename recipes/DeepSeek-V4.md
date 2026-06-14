@@ -15,14 +15,14 @@ All the operations below will be executed inside the container.
 ### FP8 on 8xMI355X GPUs (TP8 + FP8 KV Cache)
 
 ```bash
-ATOM_USE_TRITON_MOE=1 \
+AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 AITER_LOG_LEVEL=WARNING \
 python -m atom.entrypoints.openai_server \
   --model deepseek-ai/DeepSeek-V4-Pro \
   --kv_cache_dtype fp8 -tp 8
 ```
 
 Tips on server configuration:
-- **`ATOM_USE_TRITON_MOE=1` is required.** V4-Pro routes 6 experts out of 384 with hash-based selection; the triton MoE backend is the only path that handles the FP8 E4M3 + UE8M0 block-scaled weights correctly. Launching without this env silently falls back to a numerically incorrect path and GSM8K accuracy drops from ~0.95 to ~0.6.
+- **MoE backend**: V4-Pro routes 6 experts out of 384 with hash-based selection. The default fused MoE path with `AITER_BF16_FP8_MOE_BOUND=0` + `ATOM_MOE_GU_ITLV=1` handles the FP4 e2m1 microscaling weights correctly — measured GSM8K (1319 samples, 3-shot flexible-extract) = 0.9522 on MI355X/gfx950.
 - Use `--kv_cache_dtype fp8` for memory efficiency. The CSA indexer's compressed K cache is stored separately in FP8 regardless.
 - Set `AITER_LOG_LEVEL=WARNING` before starting to suppress aiter kernel log noise.
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
@@ -49,7 +49,7 @@ python -m atom.entrypoints.openai_server \
 
 Override knobs (escape hatches, normally not needed):
 
-- **`ATOM_USE_TRITON_MOE=1`** — `gfx942` defaults to Triton MoE automatically (no need to set), but it doesn't hurt to set explicitly. Required on `gfx950` for V4-Pro (see V4-Pro section above).
+- **`ATOM_USE_TRITON_MOE=1`** — `gfx942` defaults to Triton MoE automatically (no need to set), but it doesn't hurt to set explicitly. On `gfx950`, V4-Pro uses the fused MoE path by default (see V4-Pro section above); Triton MoE remains available as an alternative backend.
 
 #### Auto-detection logic
 

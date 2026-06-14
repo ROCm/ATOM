@@ -44,7 +44,6 @@ from aiter.dist.communication_op import (
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -2279,10 +2278,9 @@ class MoE(nn.Module):
             sizes = ctx.dp_metadata.get_sizes_across_dp()
             ids_2d = all_gatherv(ids_2d, sizes, get_dp_group())
         else:
-            from atom.model_ops.moe import pad_for_all_gather
+            from atom.model_ops.moe import all_gather_with_padding
 
-            ids_2d, _ = pad_for_all_gather(ids_2d)
-            ids_2d = get_dp_group().all_gather(ids_2d, use_custom=False, dim=0)
+            ids_2d, _ = all_gather_with_padding(ids_2d, use_cag=False)
         return ids_2d.flatten()
 
     def combine_outputs(
@@ -2855,14 +2853,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         ctx = get_forward_context()
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
-            # gate sees DP-gathered gating_output, so gather ids to match. This
-            # runs for every forward, including each TBO ubatch, which invokes
-            # this same forward with its own local slice + ubatch context.
-            # Route through the routing-side stream so the all-gather does not
-            # serialize behind the main compute stream during TBO ping-pong.
-            ctx.context.input_ids = _run_on_tbo_comm_stream(
-                MoE._gather_ids_for_dp, input_ids.flatten(), ctx
-            )
+            # gate sees DP-gathered gating_output, so gather ids to match. Run
+            # the gather INLINE on the compute stream. The original side-stream
+            # hop (_run_on_tbo_comm_stream) coordinated this ids all-gather with
+            # a DIFFERENT stream/sync than the MoE hidden/router DP gather under
+            # TBO → mismatched DP layouts → wrong V4 hash routing (GSM8K
+            # 0.95→0.87). NOTE: do NOT wrap this in the TBO ping-pong
+            # (tbo_yield_and_switch_*) — injecting an extra yield at forward top
+            # desyncs the ping-pong ring and collapses accuracy to ~0.54
+            # (measured). The ids tensor is [N,1] int (tiny vs hidden [N,7168]),
+            # so inline costs ~nothing in overlap.
+            ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
         else:
             ctx.context.input_ids = input_ids
         return self.model(input_ids, positions)
