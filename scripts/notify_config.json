@@ -1,0 +1,20 @@
+{
+  "enabled_channels": ["file", "ntfy"],
+  "slack_webhook_url": "",
+  "discord_webhook_url": "",
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "ntfy_topic": "atom-experiment",
+  "ntfy_server": "https://ntfy.sh",
+  "pushover_token": "",
+  "pushover_user": "",
+  "generic_webhook_url": "",
+  "email_smtp_host": "",
+  "email_smtp_port": 587,
+  "email_from": "",
+  "email_to": "",
+  "email_password": "",
+  "file_log_path": "notifications.log",
+  "min_interval_seconds": 30,
+  "quiet_hours": ""
+}
