@@ -1,6 +1,6 @@
 {
   "name": "http_regular_chat_streaming",
-  "model": "test-model",
+  "model": "hf-internal-testing/llama-tokenizer",
   "endpoint": "/v1/chat/completions",
   "route": {
     "worker_kind": "regular",

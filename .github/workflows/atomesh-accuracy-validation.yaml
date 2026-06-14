@@ -1,25 +1,21 @@
-name: ATOM Test
+name: Atomesh Accuracy Validation
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'atom/mesh/**'
+      - '.github/workflows/atomesh-accuracy-validation.yaml'
+      - '.github/scripts/accuracy_to_dashboard.py'
+      - '.github/benchmark/models_accuracy.json'
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'atom/plugin/**'
+    paths:
       - 'atom/mesh/**'
-      - '.github/workflows/atomesh-*.yaml'
-      - '.github/scripts/atomesh_*.sh'
-      - '.github/dashboard/atomesh_*.html'
-      - '.github/workflows/atom-vllm-*.yaml'
-      - '.github/workflows/atom-sglang-*.yaml'
-      - '.github/benchmark/oot_models_accuracy.json'
-      - '.github/benchmark/sglang_models_accuracy.json'
-      - 'LICENSE'
-      - '.gitignore'
+      - '.github/workflows/atomesh-accuracy-validation.yaml'
+      - '.github/scripts/accuracy_to_dashboard.py'
+      - '.github/benchmark/models_accuracy.json'
   schedule:
     # Nightly at 00:00 Beijing time (16:00 UTC)
     - cron: '0 16 * * *'
@@ -261,23 +257,34 @@ jobs:
           python3 << 'PY'
           import json, os
           event = os.environ["EVENT_NAME"]
-          # pr → pr models only; push to main → pr+main; schedule/dispatch → all
+          # Atomesh standalone validates a small representative subset only.
+          # Keep this whitelist local; full ATOM accuracy owns test_level.
           level_map = {"schedule": "nightly", "workflow_dispatch": "nightly", "push": "main"}
           current = level_map.get(event, "pr")
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
-          filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
+          atomesh_levels = {
+              "Meta-Llama-3-8B-Instruct": "pr",
+              "DeepSeek-R1-0528": "main",
+              "DeepSeek-V4-Pro MTP": "nightly",
+              "gpt-oss-120b": "nightly",
+          }
+          filtered = [m for m in models if atomesh_levels.get(m["model_name"], "skip") in allowed]
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
-          print(f"{'Model':<45} {'Level':<10} {'Runner'}")
+          print(f"{'Model':<45} {'Atomesh':<10} {'ATOM':<10} {'Runner'}")
           print("-" * 80)
           for m in models:
               enabled = "✓" if m in filtered else "·"
-              print(f"  {enabled} {m['model_name']:<43} {m.get('test_level','?'):<10} {m['runner']}")
+              print(
+                  f"  {enabled} {m['model_name']:<43} "
+                  f"{atomesh_levels.get(m['model_name'],'skip'):<10} "
+                  f"{m.get('test_level','?'):<10} {m['runner']}"
+              )
           PY
 
-  atom-test:
+  atomesh-test:
     needs: [download_aiter_wheel, load-test-models]
     name: Accuracy
     strategy:
@@ -288,7 +295,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     env:
-      CONTAINER_NAME: atom_test_${{ strategy.job-index }}
+      CONTAINER_NAME: atomesh_test_${{ strategy.job-index }}
+      USE_ATOMESH_ENTRYPOINTS: 1
+      ATOM_SERVER_PORT: 8000
 
     steps:
       - name: Kill all Docker containers and clean up workspace
@@ -380,10 +389,23 @@ jobs:
           RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
           RUN pip uninstall -y atom
           RUN rm -rf /app/ATOM
+          ARG RUST_VERSION="1.94.0"
+          RUN if ! command -v cargo >/dev/null 2>&1; then \\
+                echo "=== Installing Rust toolchain for atomesh build ===" && \\
+                apt-get update && \\
+                apt --fix-broken install -y && \\
+                apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev protobuf-compiler libprotobuf-dev && \\
+                rm -rf /var/lib/apt/lists/* && \\
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\
+                  | sh -s -- -y --default-toolchain "\${RUST_VERSION}" --profile minimal && \\
+                . "\$HOME/.cargo/env" && \\
+                rustc --version && cargo --version; \\
+              fi
+          ENV PATH="/root/.cargo/bin:\$PATH"
           RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
               cd /app/ATOM && \\
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
-              pip install -e .
+              ATOM_MESH_BUILD=1 python -m pip install -e .
 
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
           EOF
@@ -442,6 +464,8 @@ jobs:
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
           -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \
+          -e USE_ATOMESH_ENTRYPOINTS="${USE_ATOMESH_ENTRYPOINTS}" \
+          -e ATOM_SERVER_PORT="${ATOM_SERVER_PORT}" \
           --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
@@ -460,17 +484,8 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
-      - name: GPU preflight check
-        if: matrix.runner == 'linux-atom-do-mi350x-8'
-        timeout-minutes: 5
-        env:
-          GPU_PREFLIGHT_ALLOCATION_MB: "8"
-        run: bash .github/scripts/gpu_preflight_check.sh "$CONTAINER_NAME" docker
-
       - name: Collect GPU info (inside container)
         id: gpu-info
-        env:
-          COLLECT_VERBOSE_GPU_INFO: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
@@ -505,11 +520,25 @@ jobs:
             pip install --timeout 60 --retries 10 -U 'lm-eval[api]'
             pip install --timeout 60 --retries 10 hf_transfer
             pip install --timeout 60 --retries 10 --upgrade 'pybind11>=3.0.1'
+            if ! command -v cargo >/dev/null 2>&1; then
+              echo '=== Installing Rust toolchain for atomesh build ==='
+              RUST_VERSION='1.94.0'
+              apt-get update
+              apt --fix-broken install -y
+              apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev protobuf-compiler libprotobuf-dev
+              rm -rf /var/lib/apt/lists/*
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain \"\$RUST_VERSION\" --profile minimal
+              . \"\$HOME/.cargo/env\"
+            fi
+            export PATH=\"\$HOME/.cargo/bin:\$PATH\"
+            rustc --version
+            cargo --version
 
             echo '=== Installing ATOM ==='
             cd /workspace
             git config --global --add safe.directory /workspace
-            pip install -e .
+            ATOM_MESH_BUILD=1 python -m pip install -e .
 
             echo '=== Installed package versions ==='
             pip show amd-aiter | grep -E '^(Name|Version):'
@@ -604,7 +633,6 @@ jobs:
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
-          ATOM_DEBUG_DEVICE_MAPPING: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
         run: |
           set -euo pipefail
           echo ""
@@ -617,9 +645,7 @@ jobs:
           # Pipe via stdin so container bash parses shell quoting in extraArgs
           # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
           echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
-            docker exec \
-              -e ATOM_DEBUG_DEVICE_MAPPING="${ATOM_DEBUG_DEVICE_MAPPING}" \
-              -i "$CONTAINER_NAME" bash -l
+            docker exec -i "$CONTAINER_NAME" bash -l
           echo ""
           echo "========== Running accuracy test =========="
           docker exec \
@@ -725,7 +751,7 @@ jobs:
   # ---------- Push accuracy data to benchmark dashboard ----------
   accuracy-dashboard:
     name: Update accuracy dashboard
-    needs: [atom-test]
+    needs: [atomesh-test]
     if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule')
     runs-on: ubuntu-latest
     steps:
@@ -752,6 +778,7 @@ jobs:
             /tmp/accuracy-results \
             --output accuracy-benchmark-input.json \
             --models .github/benchmark/models_accuracy.json \
+            --backend ATOMesh \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "=== Generated entries ==="
           cat accuracy-benchmark-input.json
@@ -763,7 +790,8 @@ jobs:
           tool: customBiggerIsBetter
           output-file-path: accuracy-benchmark-input.json
           gh-pages-branch: gh-pages
-          benchmark-data-dir-path: benchmark-dashboard
+          benchmark-data-dir-path: atomesh-accuracy-dashboard
           auto-push: true
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
