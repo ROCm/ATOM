@@ -989,6 +989,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.w13_weight.is_shuffled = True
         layer.w2_weight.is_shuffled = True
+        layer.w13_weight.is_guinterleave = self.is_guinterleave
+        layer.w2_weight.is_guinterleave = self.is_guinterleave
 
         # shuffle scale
         w13_scale_2d = layer.w13_weight_scale.reshape(
