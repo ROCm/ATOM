@@ -18,6 +18,7 @@ This module provides:
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import deque
 from typing import Optional
@@ -29,6 +30,8 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+import struct
+import atomics
 
 logger = logging.getLogger("atom")
 
@@ -194,6 +197,30 @@ class CacheStats:
         )
 
 
+def _optimal_cu_fraction(
+    decode_batch: int, prefill_waiting_tokens: int
+) -> Optional[float]:
+    """Return the prefill CU fraction for the current workload, or None for no mask.
+
+    Called by the DecodeScheduler, which has visibility into both the decode
+    batch size and the total tokens queued in prefill_waiting.  The chosen
+    fraction is written to shared memory so the PrefillScheduler can read it.
+
+    Lookup table derived from empirical benchmarking across CU splits
+    (30/50/60/70/80% prefill) on DeepSeek-R1 tp=8.  Prefill latency
+    dominates in nearly all cases; decode tolerates CU reduction well
+    at typical batch sizes.
+
+    Returns None when CU masking provides no benefit (no pending prefill,
+    tiny prefill).
+    """
+    assert prefill_waiting_tokens>=0
+    if prefill_waiting_tokens==0 or decode_batch<64:
+        return None
+    else:
+        return 0.5
+
+
 class ScheduledBatch:
     """Immutable snapshot of sequences selected for a single forward pass.
 
@@ -224,6 +251,7 @@ class ScheduledBatch:
         is_dummy_run: bool = False,
         num_spec_step: int = 0,
         scheduled_spec_decode_tokens: dict[int, np.ndarray] | None = None,
+        cu_stream_fraction: Optional[float] = None,
         remote_kv_block_ids: list[int] | None = None,
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
@@ -338,6 +366,9 @@ class ScheduledBatch:
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
 
+        # Key into ModelRunner's stream pool for CU-masked disagg streams.
+        # None means full-CU fallback (no mask).
+        self.cu_stream_fraction = cu_stream_fraction
         # Collect multimodal data from prefill sequences
         self.multimodal_data = {}
         for seq in seqs.values():
@@ -1423,3 +1454,315 @@ class Scheduler:
         else:
             passed_delay = True
         return passed_delay
+
+
+class PrefillScheduler:
+    """Scheduler for the disaggregated prefill process.
+
+    Key differences from the base Scheduler:
+    - No BlockManager: KV blocks are pre-assigned by DecodeEngineCore and
+      written into seq.block_table before schedule() is called.
+    - schedule() only runs sequences that already have a non-empty block_table.
+      Sequences still waiting for a BlockAssignment message stay in waiting.
+    - postprocess() is a no-op: prefill produces no sampled tokens.
+    - Decode scheduling is never performed.
+    """
+
+    def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
+        self.max_num_seqs = config.max_num_seqs
+        self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.block_manager = None  # blocks managed by decode process
+        self.waiting: deque[Sequence] = deque()
+        self.running: deque[Sequence] = deque()
+        # spec decode not used on prefill side
+        self.use_spec = False
+        self.mtp_k = 0
+        self.spec_stats = None
+        self.cache_stats = None
+
+        # Shared memory for dynamic CU partitioning.
+        # Layout: [0:4] = decode_tokens (uint32)
+        self._cu_shm = None
+        if disagg_cu_shm_name:
+            import multiprocessing.shared_memory
+
+            self._cu_shm = multiprocessing.shared_memory.SharedMemory(
+                name=disagg_cu_shm_name, create=False
+            )
+            logger.info("initialized shared memory")
+        self.num_seq_done=0
+        self._pending_lock=threading.Lock()
+
+    def is_finished(self) -> bool:
+        return not self.waiting and not self.running
+
+    def has_requests(self) -> bool:
+        return bool(self.waiting) or bool(self.running)
+
+    def publish_kv_events(self) -> None:
+        # No-op: disagg prefill has no BlockManager — the decode process owns the
+        # KV blocks and emits KV events. Defined so EngineCore.busy_loop teardown
+        # (which calls this on every scheduler) works for PrefillScheduler.
+        pass
+
+    def shutdown_kv_events(self) -> None:
+        # No-op: see publish_kv_events.
+        pass
+
+    def add(self, seq: Sequence):
+        self.waiting.append(seq)
+
+    def extend(self, seqs: list):
+        self.waiting.extend(seqs)
+
+    def schedule(self):
+        """Schedule only sequences whose block_table has been populated.
+
+        Sequences that do not yet have a block assignment (block_table is
+        empty) remain in the waiting queue and will be reconsidered on the
+        next call.
+
+        Returns (ScheduledBatch, dict[seq_id, Sequence]) or (None, {}) when
+        no sequence is ready.
+        """
+        scheduled_seqs = {}
+        num_scheduled_tokens = []
+        num_batched_tokens = 0
+        num_seqs = 0
+
+        with self._pending_lock:
+            # Collect ready sequences (have received BlockAssignment from decode)
+            ready = [s for s in self.waiting if s.block_table]
+
+            for seq in ready:
+                if num_seqs >= self.max_num_seqs:
+                    break
+                num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+                if num_batched_tokens + num_new_tokens > self.max_num_batched_tokens:
+                    break
+                self.waiting.remove(seq)
+                seq.status = SequenceStatus.RUNNING
+                seq.type = SequenceType.PREFILL
+                self.running.append(seq)
+                scheduled_seqs[seq.id] = seq
+                num_scheduled_tokens.append(num_new_tokens)
+                num_batched_tokens += num_new_tokens
+                num_seqs += 1
+
+        if not scheduled_seqs:
+            return None, {}
+
+        # Read the decode tokens from decode process via shared memory.
+
+        cu_fraction = None
+
+        if self._cu_shm is not None:
+            decode_tokens = struct.unpack_from("I", self._cu_shm.buf, 0)[0]
+            cu_fraction = _optimal_cu_fraction(decode_tokens,num_batched_tokens)
+
+        return (
+            ScheduledBatch(
+                seqs=scheduled_seqs,
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_tokens_num=num_batched_tokens,
+                total_tokens_num_prefill=num_batched_tokens,
+                total_seqs_num=num_seqs,
+                total_seqs_num_prefill=num_seqs,
+                cu_stream_fraction=cu_fraction,
+            ),
+            scheduled_seqs,
+        )
+
+    def postprocess(self, seqs, fwd_output, stream_output_queue=None) -> list:
+        """No-op: prefill produces no sampled tokens."""
+        return []
+
+    def get_next_batch_info(self) -> tuple:
+        if self.waiting:
+            seq = self.waiting[0]
+            return (True, seq.num_tokens - seq.num_cached_tokens)
+        return (False, 0)
+
+    def get_num_unfinished_requests(self) -> int:
+        return len(self.waiting) + len(self.running)
+
+
+class DecodeScheduler(Scheduler):
+    """Scheduler for the disaggregated decode process.
+
+    Manages 3 queues:
+    - waiting:         new requests pending block allocation
+    - prefill_waiting: blocks allocated, BlockAssignment sent, awaiting PrefillDone
+    - running:         ongoing decode sequences
+
+    Block allocation is separated from scheduling: allocate_waiting() is called
+    by DecodeEngineCore after draining the input queue, and returns newly
+    allocated sequences so the engine can send BlockAssignment to prefill.
+
+    on_prefill_done() promotes sequences directly from prefill_waiting to
+    running.  schedule() only schedules the running queue as decode batches.
+    """
+
+    def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
+        super().__init__(config)
+        # seq_id → Sequence; blocks allocated, BlockAssignment sent, awaiting PrefillDone.
+        self.prefill_waiting: dict[int, Sequence] = {}
+        self.prefill_done: deque[Sequence] = deque()
+        # Shared memory for dynamic CU partitioning.
+        self._cu_shm = None
+        if disagg_cu_shm_name:
+            import multiprocessing.shared_memory
+
+            self._cu_shm = multiprocessing.shared_memory.SharedMemory(
+                name=disagg_cu_shm_name, create=False
+            )
+            struct.pack_into("I", self._cu_shm.buf, 0, 0)
+
+        # Protects prefill_waiting and running: on_prefill_done is called
+        # from the _recv_prefill_done background thread.
+        self._prefill_lock = threading.Lock()
+        self.cu_fraction: Optional[float] = None
+        self.prefill_waiting_tokens=atomics.atomic(width=4, atype=atomics.INT)
+        self.prefill_waiting_tokens.store(0)
+
+    def is_finished(self) -> bool:
+        return not self.waiting and not self.prefill_waiting and not self.running and not self.prefill_done
+
+    def has_requests(self) -> bool:
+        return bool(self.waiting or self.prefill_waiting or self.running or self.prefill_done)
+
+    def get_num_unfinished_requests(self) -> int:
+        return len(self.waiting) + len(self.prefill_waiting) + len(self.running) + len(self.prefill_done)
+
+    def allocate_waiting(self) -> list[Sequence]:
+        """Allocate KV blocks for sequences in waiting; move them to prefill_waiting.
+
+        Returns newly allocated sequences so DecodeEngineCore can send a
+        BlockAssignment message to the prefill process for each one.
+        Called from the main busy_loop thread only.
+        """
+        newly_allocated = []
+        while self.waiting:
+            seq = self.waiting[0]
+            with self._prefill_lock:
+                if self.block_manager.can_allocate(seq) < 0:
+                    logger.warning("Cannot allocate prefill")
+                    break
+                self.block_manager.allocate(seq)
+            self.waiting.popleft()
+        
+            self.prefill_waiting[seq.id] = seq
+            self.prefill_waiting_tokens.add(seq.num_tokens)
+            newly_allocated.append(seq)
+        return newly_allocated
+
+    def on_prefill_done(
+        self, seq_id: int, num_tokens_computed: int, sampled_token_id: int
+    ) -> None:
+        """Promote a sequence from prefill_waiting directly to running.
+
+        Called from the _recv_prefill_done background thread.
+        sampled_token_id is the first generated token sampled by the prefill
+        process; it is appended here so that context_lens and slot_mapping
+        match the non-disagg postprocess state before the first decode step.
+        """
+        
+        seq = self.prefill_waiting.pop(seq_id, None)
+        self.prefill_waiting_tokens.add(-seq.num_tokens)
+        if seq is not None:
+            seq.num_cached_tokens = num_tokens_computed
+            seq.append_token(sampled_token_id)
+            seq.first_token_time = time.time()
+            self.prefill_done.append(seq)
+
+    def schedule(self):
+        """Schedule decode-only batches.
+
+        Sequences are promoted directly from prefill_waiting to running by
+        on_prefill_done(); this method only schedules the running queue.
+        """
+        
+        prefill_finished=False
+        while self.prefill_done:
+            seq = self.prefill_done.popleft()
+            seq.status = SequenceStatus.RUNNING
+            seq.type = SequenceType.DECODE
+            # Append the first generated token sampled by the prefill process.
+            # In non-disagg mode, Scheduler.postprocess() does this after the
+            # prefill forward (is_deferred_out=True always appends one placeholder
+            # that is later overwritten with the real token from the async queue).
+            # In disagg mode the prefill process ran sampling and sent us the real
+            # token; appending it here puts num_tokens, context_lens, and
+            # slot_mapping in the same state as non-disagg before the first decode
+            # step.
+            self.running.append(seq)
+            prefill_finished=True
+
+        if not self.running:
+            self.cu_fraction=None
+            if self._cu_shm is not None:
+                struct.pack_into("I", self._cu_shm.buf, 0, 0)    
+            return None
+
+        scheduled_seqs: dict[int, Sequence] = {}
+        num_scheduled_tokens: list[int] = []
+        scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
+       
+        with self._prefill_lock:
+            while self.running and len(scheduled_seqs) < self.max_num_seqs:
+                seq = self.running.popleft()
+                # logger.warning("decode state: waiting=%d prefill_waiting=%d prefill_done=%d running=%d free_blocks=%d",
+                #     len(self.waiting), len(self.prefill_waiting), len(self.prefill_done),
+                #     len(self.running), len(self.block_manager.free_block_ids_set))
+                while not self.block_manager.can_append(seq, self.mtp_k + 1):
+                    logger.warning("Cannot allocate")
+                    if self.running:
+                        self.preempt(self.running.pop())
+                    else:
+                        self.preempt(seq)
+                        break
+                else:
+                    if seq.spec_token_ids.size > 0:
+                        scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
+                    num_new_tokens = self.mtp_k + 1
+                    self.block_manager.may_append(seq, num_new_tokens)
+                    scheduled_seqs[seq.id] = seq
+                    seq.type = SequenceType.DECODE
+                    num_scheduled_tokens.append(num_new_tokens)
+
+
+        if not scheduled_seqs:
+            self.cu_fraction=None
+            if self._cu_shm is not None:
+                struct.pack_into("I", self._cu_shm.buf, 0, 0)
+            return None
+
+        self.running.extendleft(reversed(scheduled_seqs.values()))
+
+        total_tokens_num_decode = sum(num_scheduled_tokens)
+
+        # Dynamic CU partitioning: decode decides the fraction based on its
+        # batch size and the total tokens queued for prefill, then writes the
+        # decode tokens to shared memory for PrefillScheduler to read.
+
+        if self._cu_shm is not None:
+            struct.pack_into("I", self._cu_shm.buf, 0, total_tokens_num_decode)
+            if prefill_finished:
+                pwait=int(self.prefill_waiting_tokens.load())
+                self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
+
+        
+        return (
+            ScheduledBatch(
+                seqs=scheduled_seqs,
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_tokens_num=total_tokens_num_decode,
+                total_tokens_num_decode=total_tokens_num_decode,
+                total_seqs_num=len(scheduled_seqs),
+                total_seqs_num_decode=len(scheduled_seqs),
+                num_spec_step=self.mtp_k,
+                scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+                cu_stream_fraction=self.cu_fraction,
+            ),
+            scheduled_seqs,
+        )

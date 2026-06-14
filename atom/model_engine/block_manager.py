@@ -16,6 +16,9 @@ from atom.distributed.kv_events import (
 )
 from atom.model_engine.sequence import Sequence
 
+import logging
+logger = logging.getLogger("atom")
+
 
 class Block:
     def __init__(self, block_id):

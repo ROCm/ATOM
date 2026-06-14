@@ -1028,6 +1028,31 @@ class Config:
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict[str, Any]] = None
 
+    # Intra-GPU prefill/decode disaggregation
+    enable_disagg: bool = False
+    # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages)
+    disagg_d2p_addr: str = ""
+    # ZMQ IPC address: prefill PUSH → decode PULL (PrefillDone messages)
+    disagg_p2d_addr: str = ""
+    # Bootstrap round 1: prefill PUSH → decode PULL (weight IPC handles)
+    disagg_weight_ipc_addr: str = ""
+    # Bootstrap round 1 ACK: decode PUSH → prefill PULL (signals weights freed)
+    disagg_weight_ack_addr: str = ""
+    # Bootstrap round 2: prefill PUSH → decode PULL (kvcache_args + num_blocks)
+    disagg_kvcache_ipc_addr: str = ""
+    # True for the decode process in disagg mode: skip GPU weight/kvcache allocation.
+    disagg_is_decode: bool = False
+    # Name of the shared-memory region used for dynamic CU partitioning.
+    # Both prefill and decode processes open this to exchange batch sizes.
+    disagg_cu_shm_name: str = ""
+    # Override max_num_seqs for the prefill process in disagg mode.
+    # When None, prefill inherits the base max_num_seqs.
+    disagg_prefill_max_num_seqs: Optional[int] = None
+    # When True (and enable_disagg=True), use CU-masked streams + shm
+    # coordination between prefill and decode. When False (default),
+    # use plain separate streams with no CU masking.
+    disagg_constrained: bool = False
+
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.compilation_config.cudagraph_capture_sizes
