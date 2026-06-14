@@ -788,6 +788,11 @@ class PagedAttentionImpl(nn.Module):
         )
 
         output = torch.empty_like(q_5d)
+        # CUDAGraph decode pads scheduled_bs up to graph_bs. PA ASM has no work
+        # for padded rows (context_len == 0), so keep those rows deterministic;
+        # otherwise later PA ASM query quantization can include garbage padded
+        # values in the full-batch q.abs().max() scale.
+        output.zero_()
         split_rows = max(
             1,
             int(ps_metadata["reduce_partial_map"].numel()) * max_seqlen_q,
