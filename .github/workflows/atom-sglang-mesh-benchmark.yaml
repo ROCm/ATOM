@@ -1,0 +1,328 @@
+name: ATOM SGLang Mesh Benchmark
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      deepseek-r1-fp8-1p1d:
+        description: "DeepSeek-R1 FP8 1P1D (TP4+TP8)"
+        type: boolean
+        default: false
+      sglang_image:
+        description: "Optional image override. Leave empty to use sglang-latest."
+        type: string
+        default: ""
+      publish_to_dashboard:
+        description: "Upload benchmark results to the dashboard"
+        type: boolean
+        default: true
+      param_lists:
+        description: |
+          "Benchmark parameter lists (ISL,OSL,concurrency,random_range_ratio; semicolon between sets)."
+        type: string
+        default: "1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
+
+env:
+  DOCKER_IMAGE: ${{ inputs.sglang_image || 'rocm/atom-dev:sglang-latest' }}
+  MODEL_PATH: /mnt/models/deepseek-ai/DeepSeek-R1
+  CONTAINER: atom_sglang_mesh
+  PREFILL_TP: "4"
+  DECODE_TP: "8"
+  PREFILL_PORT: "8010"
+  DECODE_PORT: "8020"
+  ROUTER_PORT: "8000"
+  BOOTSTRAP_PORT: "8998"
+
+jobs:
+  # ---------- 1. Parse benchmark params ----------
+  parse-param-lists:
+    name: Parse parameter lists
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.parse.outputs.matrix_json }}
+    steps:
+      - name: Parse parameter lists
+        id: parse
+        run: |
+          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8' }}"
+          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
+          MATRIX_JSON="["
+          SEP=""
+          for SET in "${SETS[@]}"; do
+            IFS=',' read -ra P <<< "$SET"
+            MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${P[0]},\"output_length\":${P[1]},\"concurrency\":${P[2]},\"random_range_ratio\":${P[3]}}"
+            SEP=","
+          done
+          MATRIX_JSON="${MATRIX_JSON}]"
+          echo "matrix_json=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+
+  # ---------- 2. Start prefill server ----------
+  start-prefill:
+    name: Start Prefill Server
+    runs-on: atom-mi355-8gpu-mesh-pd-prefill-1-benchmark
+    outputs:
+      prefill_ip: ${{ steps.ip.outputs.ip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cleanup
+        run: docker rm -f "${{ env.CONTAINER }}" 2>/dev/null || true
+
+      - name: Start container
+        run: |
+          docker run -d --name "${{ env.CONTAINER }}" \
+            --network host --ipc host --privileged \
+            --device /dev/kfd --device /dev/dri \
+            --group-add video --group-add render \
+            --cap-add IPC_LOCK --cap-add NET_ADMIN \
+            -v /mnt:/mnt -v /it-share:/it-share \
+            "${{ env.DOCKER_IMAGE }}" sleep infinity
+
+      - name: Get IP
+        id: ip
+        run: echo "ip=$(hostname -I | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Launch prefill
+        run: bash .github/scripts/atom_sglang_mesh/atom_sglang_mesh_prefill.sh
+        env:
+          CONTAINER: ${{ env.CONTAINER }}
+          PREFILL_IP: ${{ steps.ip.outputs.ip }}
+          MODEL_PATH: ${{ env.MODEL_PATH }}
+          PREFILL_TP: ${{ env.PREFILL_TP }}
+          PREFILL_PORT: ${{ env.PREFILL_PORT }}
+          BOOTSTRAP_PORT: ${{ env.BOOTSTRAP_PORT }}
+
+  # ---------- 3. Start decode server ----------
+  start-decode:
+    name: Start Decode Server
+    runs-on: atom-mi355-8gpu-mesh-pd-decode-1-benchmark
+    needs: [start-prefill]
+    outputs:
+      decode_ip: ${{ steps.ip.outputs.ip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cleanup
+        run: docker rm -f "${{ env.CONTAINER }}" 2>/dev/null || true
+
+      - name: Start container
+        run: |
+          docker run -d --name "${{ env.CONTAINER }}" \
+            --network host --ipc host --privileged \
+            --device /dev/kfd --device /dev/dri \
+            --group-add video --group-add render \
+            --cap-add IPC_LOCK --cap-add NET_ADMIN \
+            -v /mnt:/mnt -v /it-share:/it-share \
+            "${{ env.DOCKER_IMAGE }}" sleep infinity
+
+      - name: Get IP
+        id: ip
+        run: echo "ip=$(hostname -I | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Launch decode
+        run: bash .github/scripts/atom_sglang_mesh/atom_sglang_mesh_decode.sh
+        env:
+          CONTAINER: ${{ env.CONTAINER }}
+          DECODE_IP: ${{ steps.ip.outputs.ip }}
+          MODEL_PATH: ${{ env.MODEL_PATH }}
+          DECODE_TP: ${{ env.DECODE_TP }}
+          DECODE_PORT: ${{ env.DECODE_PORT }}
+          BOOTSTRAP_PORT: ${{ env.BOOTSTRAP_PORT }}
+
+  # ---------- 4. Router + Benchmark ----------
+  benchmark:
+    name: PD ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
+    runs-on: atom-mi355-8gpu-mesh-pd-prefill-1-benchmark
+    needs: [start-prefill, start-decode, parse-param-lists]
+    strategy:
+      fail-fast: false
+      matrix:
+        params: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
+    env:
+      PREFILL_IP: ${{ needs.start-prefill.outputs.prefill_ip }}
+      DECODE_IP: ${{ needs.start-decode.outputs.decode_ip }}
+      ISL: ${{ matrix.params.input_length }}
+      OSL: ${{ matrix.params.output_length }}
+      CONC: ${{ matrix.params.concurrency }}
+      RANDOM_RANGE_RATIO: ${{ matrix.params.random_range_ratio }}
+      RESULT_FILENAME: pd-dsr1-fp8-1p1d-${{ matrix.params.input_length }}-${{ matrix.params.output_length }}-${{ matrix.params.concurrency }}-${{ matrix.params.random_range_ratio }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Start router
+        run: bash .github/scripts/atom_sglang_mesh/atom_sglang_mesh_router.sh
+        env:
+          CONTAINER: ${{ env.CONTAINER }}
+          PREFILL_IP: ${{ env.PREFILL_IP }}
+          DECODE_IP: ${{ env.DECODE_IP }}
+          PREFILL_PORT: ${{ env.PREFILL_PORT }}
+          DECODE_PORT: ${{ env.DECODE_PORT }}
+          ROUTER_PORT: ${{ env.ROUTER_PORT }}
+          BOOTSTRAP_PORT: ${{ env.BOOTSTRAP_PORT }}
+
+      - name: Prepare bench_serving
+        run: |
+          docker exec "${{ env.CONTAINER }}" bash -lc "
+            set -euo pipefail
+            rm -rf /tmp/sglang-benchmark
+            mkdir -p /tmp/sglang-benchmark
+            git clone --depth 1 https://github.com/kimbochen/bench_serving.git /tmp/sglang-benchmark/bench_serving
+          "
+
+      - name: Run benchmark
+        timeout-minutes: 60
+        run: |
+          docker exec \
+            -e ISL="${ISL}" \
+            -e OSL="${OSL}" \
+            -e CONC="${CONC}" \
+            -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+            -e RESULT_FILENAME="${RESULT_FILENAME}" \
+            "${{ env.CONTAINER }}" bash -lc "
+              set -euo pipefail
+              rm -rf /tmp/sglang-benchmark-results
+              mkdir -p /tmp/sglang-benchmark-results
+              PYTHONDONTWRITEBYTECODE=1 python /tmp/sglang-benchmark/bench_serving/benchmark_serving.py \
+                --model='${{ env.MODEL_PATH }}' \
+                --backend=sglang \
+                --base-url=http://127.0.0.1:${{ env.ROUTER_PORT }} \
+                --dataset-name=random \
+                --random-input-len=\"\${ISL}\" \
+                --random-output-len=\"\${OSL}\" \
+                --random-range-ratio \"\${RANDOM_RANGE_RATIO}\" \
+                --num-prompts=\"\$(( CONC * 10 ))\" \
+                --max-concurrency=\"\${CONC}\" \
+                --trust-remote-code \
+                --num-warmups=\"\$(( 2 * CONC ))\" \
+                --request-rate=inf \
+                --ignore-eos \
+                --save-result \
+                --percentile-metrics=\"ttft,tpot,itl,e2el\" \
+                --result-dir=/tmp/sglang-benchmark-results \
+                --result-filename=\"\${RESULT_FILENAME}.json\"
+            "
+          docker cp "${{ env.CONTAINER }}:/tmp/sglang-benchmark-results/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json"
+
+      - name: Enrich result metadata
+        run: |
+          python3 -c "
+          import json, os
+          p = '${RESULT_FILENAME}.json'
+          with open(p) as f:
+              d = json.load(f)
+          d['random_input_len'] = int(os.environ['ISL'])
+          d['random_output_len'] = int(os.environ['OSL'])
+          d['benchmark_backend'] = 'ATOM-PD-Disagg'
+          d['pd_topology'] = '1P1D'
+          d['prefill_tp'] = ${{ env.PREFILL_TP }}
+          d['decode_tp'] = ${{ env.DECODE_TP }}
+          with open(p, 'w') as f:
+              json.dump(d, f, indent=2)
+          "
+
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v7
+        with:
+          name: pd-benchmark-${{ env.RESULT_FILENAME }}
+          path: ${{ env.RESULT_FILENAME }}.json
+
+  # ---------- 5. Summarize + Dashboard ----------
+  summarize:
+    if: always()
+    name: Summarize PD benchmark
+    needs: [benchmark, parse-param-lists]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: 'pd-benchmark-*'
+          merge-multiple: true
+          path: .
+        continue-on-error: true
+
+      - name: Generate summary
+        run: |
+          shopt -s nullglob
+          json_files=(*.json)
+          echo "### PD Disagg Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "Downloaded ${#json_files[@]} result files" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Config | TTFT (ms) | ITL (ms) | Throughput (tok/s) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-----------|----------|--------------------|" >> "$GITHUB_STEP_SUMMARY"
+          for f in "${json_files[@]}"; do
+            python3 -c "
+          import json
+          d = json.load(open('$f'))
+          isl = d.get('random_input_len', '?')
+          osl = d.get('random_output_len', '?')
+          conc = d.get('max_concurrency', '?')
+          ttft = d.get('mean_ttft_ms', 'N/A')
+          itl = d.get('mean_itl_ms', 'N/A')
+          tp = d.get('output_throughput', 'N/A')
+          ttft_s = f'{ttft:.1f}' if isinstance(ttft, (int, float)) else ttft
+          itl_s = f'{itl:.2f}' if isinstance(itl, (int, float)) else itl
+          tp_s = f'{tp:.1f}' if isinstance(tp, (int, float)) else tp
+          print(f'| {isl}/{osl} c={conc} | {ttft_s} | {itl_s} | {tp_s} |')
+          " >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Transform and upload to dashboard
+        if: inputs.publish_to_dashboard == true
+        run: |
+          python3 .github/scripts/plugin_benchmark_to_dashboard.py \
+            . \
+            --output benchmark-action-input.json \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --default-backend "ATOM-PD-Disagg"
+
+      - name: Store to dashboard
+        if: inputs.publish_to_dashboard == true
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: customBiggerIsBetter
+          output-file-path: benchmark-action-input.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmark-dashboard
+          auto-push: false
+          alert-threshold: "80%"
+          comment-on-alert: true
+          fail-on-alert: false
+          max-items-in-chart: 90
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push dashboard data
+        if: inputs.publish_to_dashboard == true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+          cp benchmark-dashboard/data.js /tmp/pd-benchmark-data.js
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/pd-benchmark-data.js benchmark-dashboard/data.js
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update PD benchmark dashboard data"
+          git push origin HEAD:gh-pages
+
+  # ---------- 6. Cleanup both nodes ----------
+  cleanup:
+    if: always()
+    name: Cleanup ${{ matrix.runner }}
+    needs: [benchmark]
+    strategy:
+      matrix:
+        runner: [atom-mi355-8gpu-mesh-pd-prefill-1-benchmark, atom-mi355-8gpu-mesh-pd-decode-1-benchmark]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Remove container
+        run: docker rm -f atom_sglang_mesh 2>/dev/null || true
