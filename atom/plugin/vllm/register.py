@@ -138,3 +138,12 @@ def register_model() -> None:
     from atom.plugin.vllm.graph_capture_patch import apply_graph_capture_patch
 
     apply_graph_capture_patch()
+
+    # Expose batch-ordered req_ids to ATOM metadata builders so the DeepSeek-V4
+    # proxy can key state-slot allocation on the request id (host-resident)
+    # instead of a D2H copy of the first block id.
+    from atom.plugin.vllm.req_id_passthrough_patch import (
+        apply_vllm_req_id_passthrough_patch,
+    )
+
+    apply_vllm_req_id_passthrough_patch()
