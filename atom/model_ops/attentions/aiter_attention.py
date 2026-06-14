@@ -722,6 +722,37 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     block_tables, batch.last_block_num_tokens
                 )
             ]
+        # --- DIAGNOSTIC (batch-64 corruption hunt): log-only, does not crash ---
+        # (1) block overlap: with prefix caching OFF, no two live seqs may share a
+        #     physical block. A dup => allocator/scheduler handed one block to two
+        #     seqs => mutual KV corruption.
+        # (2) slot collision: each decode token must write a unique physical KV
+        #     slot this step. A dup => one token clobbers another's KV.
+        # Remove this block once the root cause is fixed.
+        _blk = [
+            int(b)
+            for bt in block_tables
+            for b in (bt.tolist() if hasattr(bt, "tolist") else list(bt))
+            if int(b) >= 0
+        ]
+        if len(_blk) != len(set(_blk)):
+            logger.error(
+                "PA-DIAG BLOCK OVERLAP scheduled_bs=%d total=%d unique=%d dup=%d",
+                scheduled_bs,
+                len(_blk),
+                len(set(_blk)),
+                len(_blk) - len(set(_blk)),
+            )
+        _sm = [int(s) for s in slot_mapping if int(s) >= 0]
+        if len(_sm) != len(set(_sm)):
+            logger.error(
+                "PA-DIAG SLOT COLLISION scheduled_bs=%d total=%d unique=%d dup=%d",
+                scheduled_bs,
+                len(_sm),
+                len(set(_sm)),
+                len(_sm) - len(set(_sm)),
+            )
+        # --- END DIAGNOSTIC ---
         positions = np.tile(
             np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
         ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
