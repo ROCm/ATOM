@@ -1283,7 +1283,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # model.forward entry stripe-splits hidden/positions to 1/W, so the
         # per-query (per-token) metadata must be reduced to the SAME owned-query
         # set. Per-seq / KV-write fields stay full (every rank keeps full KV).
-        if pcp_is_enabled():
+        if pcp_is_enabled() and not batch.is_dummy_run:
+            # Gate on `not is_dummy_run`: ForCausalLM.forward's stripe-split is
+            # skipped on dummy/warmup runs (_pcp_active() returns False there),
+            # so reindexing metadata to 1/W here would pair full-size
+            # input_ids/positions with 1/W metadata (length mismatch). Keeping
+            # both full on dummy runs stays self-consistent.
             # Reindex metadata to 1/W in-place. We intentionally DISCARD the
             # returned 1/W positions: `positions` must stay FULL here so it
             # lands on context.positions full, and ForCausalLM.forward does the

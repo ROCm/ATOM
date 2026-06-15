@@ -74,11 +74,8 @@ def pcp_split_stripe(
         return input_
     if pcp_rank is None:
         pcp_rank = get_pcp_rank()
-    n = input_.shape[0]
-    assert n % pcp_size == 0, (
-        f"pcp_split_stripe: dim0={n} not divisible by pcp_size={pcp_size}; "
-        "pad to a multiple of pcp_size before splitting (see pcp_pad_len)."
-    )
+    # Divisibility by pcp_size is guaranteed upstream by pcp_pad_len (callers
+    # pad before splitting); the view below would error if violated.
     rest = tuple(input_.shape[1:])
     return input_.view(-1, pcp_size, *rest)[:, pcp_rank].contiguous()
 
@@ -131,17 +128,36 @@ def pcp_stripe_query_indices(
     return torch.arange(pcp_rank, n_global_q, pcp_size, dtype=torch.long)
 
 
-def pcp_pad_indptr(kv_indptr: torch.Tensor, n_pad_q: int) -> torch.Tensor:
-    """Pad a ragged prefix-sum indptr `[T+1]` to `[T_pad+1]`.
+# pcp_pad_indptr / pcp_pad_dense share the (tensor, n_pad) signature but pad two
+# DIFFERENT metadata shapes, so they are kept separate on purpose:
+#
+#   dense (per-query: one value per token), e.g. skip_prefix_len_csa:
+#       [5, 3, 8]  --pcp_pad_dense(.,1)-->  [5, 3, 8, 0]
+#                                                     ^ dummy query q3 = 0 row
+#
+#   ragged (per-query variable-length segments, sliced by an indptr prefix-sum),
+#   e.g. kv_indices grouped by kv_indptr:
+#       kv_indptr  = [0, 2, 5, 6]   kv_indices = [a,b | c,d,e | f]
+#       --pcp_pad_indptr(kv_indptr, 1)-->  [0, 2, 5, 6, 6]
+#                                                       ^ dummy q3 segment =
+#                                                         indices[6:6] = EMPTY
+#       (kv_indices itself is NOT touched — the dummy query references no KV)
+#
+# So dense APPENDS ZERO ROWS; indptr APPENDS REPEATS OF THE LAST PREFIX-SUM
+# VALUE (giving the dummy query a zero-length segment). Both make padded dummy
+# queries contribute nothing to attention; they are sliced to 1/W by owned_q
+# and dropped after the final all-gather.
+def pcp_pad_indptr(kv_indptr: torch.Tensor, n_pad: int) -> torch.Tensor:
+    """Pad a ragged prefix-sum indptr `[T+1]` to `[T+n_pad+1]`.
 
-    Appends `n_pad_q` entries each repeating the last value, i.e. the padded
+    Appends `n_pad` entries each repeating the last value, i.e. the padded
     (dummy) queries get zero-length KV segments. Used so per-query metadata
     matches the token sequence padded to a multiple of pcp_size; the dummy
     tokens then contribute nothing to attention.
     """
-    if n_pad_q <= 0:
+    if n_pad <= 0:
         return kv_indptr
-    tail = kv_indptr[-1:].expand(n_pad_q)
+    tail = kv_indptr[-1:].expand(n_pad)
     return torch.cat([kv_indptr, tail], dim=0)
 
 
