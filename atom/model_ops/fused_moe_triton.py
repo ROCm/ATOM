@@ -29,6 +29,7 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
+        swizzle_scales as swizzle_scales_a8w4,
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
@@ -36,42 +37,62 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
         moe_gemm_a4w4,
         mxfp4_quant,
+        swizzle_scales as swizzle_scales_cdna4,
     )
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
-    from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-        swizzle_scales,
-    )  # same for a4 and a16
+
+from atom.model_ops.moe import MoEActivationQuant
 
 
-def check_and_swizzle_scales(scale, N, K):
-    # ensure swizzle is imported
+def _swizzle_scales_for_kernel(scale, act_quant: MoEActivationQuant):
+    """Swizzle MoE weight scales for the kernel that act_quant selects.
+
+    FP8 (a8w4): arch-agnostic swizzle (CDNA4 on gfx950, GFX1250 on gfx1250).
+    BF16/FP4 (a16w4/a4w4): CDNA4 swizzle on gfx942/gfx950, no swizzle elsewhere.
+    """
+    if act_quant == MoEActivationQuant.FP8:
+        return swizzle_scales_a8w4(scale)
+    # TODO: move arch dispatch into aiter's a4w4/a16w4 swizzle_scales (like a8w4)
+    if get_arch() in ("gfx942", "gfx950"):
+        return swizzle_scales_cdna4(scale), "CDNA4_SCALE"
+    return scale, None
+
+
+def _swizzle_mxfp4(
+    w1,
+    w1_scale,
+    w2,
+    w2_scale,
+    w_dtype,
+    N_1,
+    K_1,
+    N_2,
+    K_2,
+    TP=1,
+    act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
+):
+    """Weight swizzle for mxfp4 moe, used for aiter triton mxfp4 moe kernels."""
     assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
 
-    if N % 32 == 0 and K % (32 * 8) == 0:
-        scale = swizzle_scales(scale)
-        return scale, "CDNA4_SCALE"
-    else:
-        return scale, None
-
-
-def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1):
-    """weight swizzle for mxfp4 moe, used for aiter triton weight mxfp4 moe method/kernels"""
-
-    # assert environment variable is active for use with triton gemm
-    assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
-
-    # transposing for expected layout of aiter triton kernels
+    # Transposing for expected layout of aiter triton kernels
     w1_triton_layout = w1.transpose(-2, -1)
     w1_scale_triton_layout = w1_scale.transpose(-2, -1)
     w2_triton_layout = w2.transpose(-2, -1)
     w2_scale_triton_layout = w2_scale.transpose(-2, -1)
 
-    w1_scale_triton_layout, w1_swizzle_layout = check_and_swizzle_scales(
-        w1_scale_triton_layout, N_1, K_1
-    )
-    w2_scale_triton_layout, w2_swizzle_layout = check_and_swizzle_scales(
-        w2_scale_triton_layout, N_2, K_2
-    )
+    if N_1 % 32 == 0 and K_1 % (32 * 8) == 0:
+        w1_scale_triton_layout, w1_swizzle_layout = _swizzle_scales_for_kernel(
+            w1_scale_triton_layout, act_quant
+        )
+    else:
+        w1_swizzle_layout = None
+
+    if N_2 % 32 == 0 and K_2 % (32 * 8) == 0:
+        w2_scale_triton_layout, w2_swizzle_layout = _swizzle_scales_for_kernel(
+            w2_scale_triton_layout, act_quant
+        )
+    else:
+        w2_swizzle_layout = None
 
     return (
         w1_triton_layout,
@@ -113,8 +134,7 @@ def triton_kernel_moe_forward(
     apply_router_weight_on_input: bool = False,
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
-    x_q_dtype: str | None = None,
-    static_scale: torch.Tensor | None = None,
+    act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
 ) -> torch.Tensor:
     routing_data, gather_idx, scatter_idx = routing(
         gating_output, topk, sm_first=not renormalize
@@ -143,8 +163,7 @@ def triton_kernel_moe_forward(
         apply_router_weight_on_input=apply_router_weight_on_input,
         global_num_experts=global_num_experts,
         expert_map=expert_map,
-        x_q_dtype=x_q_dtype,
-        static_scale=static_scale,
+        act_quant=act_quant,
     )
 
 
@@ -173,9 +192,7 @@ def triton_kernel_fused_experts(
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
     intermediate_cache: torch.Tensor | None = None,
-    a1q_scale: torch.Tensor | None = None,
-    x_q_dtype: str | None = None,
-    static_scale: torch.Tensor | None = None,
+    act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
@@ -211,9 +228,7 @@ def triton_kernel_fused_experts(
 
     if activation == ActivationType.Swiglu:
         # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
-        x_q_dtype_base = x_q_dtype.split("_")[0] if x_q_dtype else None
-        if x_q_dtype_base == "fp8":
-            # If input type is fp8, input scales must be available
+        if act_quant == MoEActivationQuant.FP8:
             assert a13_scale is not None
             assert a2_scale is not None
 
@@ -240,9 +255,9 @@ def triton_kernel_fused_experts(
                 swizzle_mx_scale=w13_swizzle_layout,
                 out_dtype=quant_dtype,
                 apply_swiglu=True,
-                alpha=1.702,  # gpt-oss
-                limit=7.0,  # gpt-oss
-                swiglu_add_residual=True,  # gpt-oss `(up + 1)`
+                alpha=swiglu_alpha,
+                limit=swiglu_limit,
+                swiglu_add_residual=True,
             )
             output_tensor = moe_gemm_a8w4(
                 interm_cache,
@@ -271,8 +286,8 @@ def triton_kernel_fused_experts(
                 gammas=gammas if apply_router_weight_on_input else None,
                 swizzle_mx_scale=w13_swizzle_layout,
                 apply_swiglu=True,
-                alpha=1.702,  # gpt-oss
-                limit=7.0,  # gpt-oss
+                alpha=swiglu_alpha,
+                limit=swiglu_limit,
                 swiglu_add_residual=True,  # gpt-oss `(up + 1)`
             )
             output_tensor = moe_gemm_a16w4(
@@ -291,11 +306,8 @@ def triton_kernel_fused_experts(
     else:
         # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation.
         # The activation precision selects the routed GEMM: MXFP4 activations
-        # (a4w4) when x_q_dtype is fp4, otherwise bf16 activations (a16w4).
-        x_q_dtype_base = x_q_dtype.split("_")[0] if x_q_dtype else None
-
-        if x_q_dtype_base == "fp4":
-            # quant to a4 then matmul
+        # (a4w4) when act_quant is FP4, otherwise bf16 activations (a16w4).
+        if act_quant == MoEActivationQuant.FP4:
             hidden_states_fp4, hidden_states_mx_scale = mxfp4_quant(hidden_states)
             raw_intermediate = moe_gemm_a4w4(
                 hidden_states_fp4,
@@ -337,8 +349,7 @@ def triton_kernel_fused_experts(
             dtype_quant=None,
         )
 
-        if x_q_dtype_base == "fp4":
-            # quant to a4 then matmul
+        if act_quant == MoEActivationQuant.FP4:
             intermediate_fp4, intermediate_mx_scale = mxfp4_quant(intermediate_cache)
             output_tensor = moe_gemm_a4w4(
                 intermediate_fp4,
