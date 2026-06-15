@@ -748,12 +748,15 @@ jobs:
           # Remove the pre-built image to free disk space on the runner
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
 
-  # ---------- Push accuracy data to benchmark dashboard ----------
-  accuracy-dashboard:
-    name: Update accuracy dashboard
+  # ---------- Publish Atomesh accuracy data for the mocker benchmark dashboard ----------
+  publish-atomesh-accuracy-data:
+    name: Publish Atomesh accuracy data
     needs: [atomesh-test]
     if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule')
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
     steps:
       - uses: actions/checkout@v6
 
@@ -772,7 +775,7 @@ jobs:
           echo "=== Downloaded accuracy artifacts ==="
           find /tmp/accuracy-results -type f -name '*.json' | head -20 || echo "No JSON files found"
 
-      - name: Transform accuracy results for dashboard
+      - name: Transform accuracy results for mocker dashboard data
         run: |
           python3 .github/scripts/accuracy_to_dashboard.py \
             /tmp/accuracy-results \
@@ -783,7 +786,7 @@ jobs:
           echo "=== Generated entries ==="
           cat accuracy-benchmark-input.json
 
-      - name: Store accuracy result to dashboard
+      - name: Store Atomesh accuracy data
         if: hashFiles('accuracy-benchmark-input.json') != ''
         uses: benchmark-action/github-action-benchmark@v1
         with:

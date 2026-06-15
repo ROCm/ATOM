@@ -8,6 +8,7 @@ on:
       - '.github/scripts/atomesh_mocker_benchmark.sh'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
       - '.github/dashboard/atomesh_mocker_index.html'
+      - 'docs/assets/atomesh_logo.png'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -16,6 +17,7 @@ on:
       - '.github/scripts/atomesh_mocker_benchmark.sh'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
       - '.github/dashboard/atomesh_mocker_index.html'
+      - 'docs/assets/atomesh_logo.png'
   schedule:
     # Nightly at 02:00 Beijing time (18:00 UTC)
     - cron: '0 18 * * *'
