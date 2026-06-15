@@ -4,9 +4,7 @@ from types import SimpleNamespace
 import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
-
 logger = logging.getLogger("atom.plugin.sglang.attention_backend.deepseek_v4")
-
 
 
 class ATOMDeepseekV4BackendForSgl(AttentionBackend):
@@ -16,6 +14,7 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
     context publication.  The actual DeepSeek-V4 cache layout, metadata, and
     kernels are owned by ATOM through ``deepseek_v4_bridge``.
     """
+
     needs_cpu_seq_lens = True
 
     def __init__(self, model_runner, *args, **kwargs):

@@ -129,7 +129,11 @@ def _set_atom_forward_context(
 ) -> None:
     """Bridge SGLang batch metadata into ATOM's global forward context."""
 
-    from atom.utils.forward_context import AttentionMetaData, Context, set_forward_context
+    from atom.utils.forward_context import (
+        AttentionMetaData,
+        Context,
+        set_forward_context,
+    )
 
     forward_mode = forward_batch.forward_mode
     # This value is only used by ATOM-side MoE padding in the SGLang wrapper.
@@ -154,7 +158,9 @@ def _set_atom_forward_context(
             attn_metadata = getattr(backend, "atom_v4_graph_metadata", None)
 
         proxy_pool, req_to_token_pool = maybe_get_proxy_pool_from_sglang_backend()
-        if attn_metadata is None and getattr(proxy_pool, "is_atom_v4_proxy_pool", False):
+        if attn_metadata is None and getattr(
+            proxy_pool, "is_atom_v4_proxy_pool", False
+        ):
             attn_metadata = build_atom_v4_attention_metadata_from_sglang(
                 forward_batch,
                 positions,
@@ -162,7 +168,9 @@ def _set_atom_forward_context(
                 req_to_token_pool=req_to_token_pool,
             )
     except Exception as exc:
-        raise RuntimeError("Failed to build ATOM DeepSeek-V4 metadata for SGLang") from exc
+        raise RuntimeError(
+            "Failed to build ATOM DeepSeek-V4 metadata for SGLang"
+        ) from exc
 
     if attn_metadata is None:
         attn_metadata = AttentionMetaData(max_seqlen_q=max_seqlen_q)

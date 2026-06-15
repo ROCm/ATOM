@@ -51,9 +51,7 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
                         num_real,
                         x.shape[0],
                     )
-                out = self._sglang_v4_forward_impl(
-                    x[:num_real], positions[:num_real]
-                )
+                out = self._sglang_v4_forward_impl(x[:num_real], positions[:num_real])
                 return torch.nn.functional.pad(out, (0, 0, 0, x.shape[0] - num_real))
         return self._sglang_v4_forward_impl(x, positions)
 

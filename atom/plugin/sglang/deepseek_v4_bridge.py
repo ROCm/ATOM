@@ -193,7 +193,10 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 unified.append(
                     self.raw_arena[layer_start:offset]
                     .view(torch.bfloat16)
-                    .view(self.num_slots * self.window_size + self.num_blocks * k, self.head_dim)
+                    .view(
+                        self.num_slots * self.window_size + self.num_blocks * k,
+                        self.head_dim,
+                    )
                 )
                 idx_bytes = self.num_blocks * k * self.index_dim
                 idx = (
@@ -222,11 +225,16 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 unified.append(
                     self.raw_arena[layer_start:offset]
                     .view(torch.bfloat16)
-                    .view(self.num_slots * self.window_size + self.num_blocks * k, self.head_dim)
+                    .view(
+                        self.num_slots * self.window_size + self.num_blocks * k,
+                        self.head_dim,
+                    )
                 )
                 hca_main.append(main)
             else:
-                unified.append(swa_view.view(self.num_slots * self.window_size, self.head_dim))
+                unified.append(
+                    swa_view.view(self.num_slots * self.window_size, self.head_dim)
+                )
 
         return {
             "unified": unified,
@@ -317,7 +325,11 @@ def _bind_compressor_state(
         compressor.cache_scale = (
             kv_cache.view(torch.float32)
             .view(-1)
-            .as_strided(size=(nb, k1), stride=(block_fp32_stride, 1), storage_offset=scale_fp32_offset)
+            .as_strided(
+                size=(nb, k1),
+                stride=(block_fp32_stride, 1),
+                storage_offset=scale_fp32_offset,
+            )
         )
     else:
         compressor.cache_scale = None
@@ -344,7 +356,9 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
                 proxy_pool.num_slots,
             )
             attn.indexer.kv_cache = proxy_pool.views["csa_indexer"][csa_i]
-            attn.indexer._max_model_len_idx = max(1, proxy_pool.num_blocks * ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4)
+            attn.indexer._max_model_len_idx = max(
+                1, proxy_pool.num_blocks * ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
+            )
             _bind_compressor_state(
                 attn.indexer.compressor,
                 proxy_pool.views["csa_indexer"][csa_i],
@@ -383,8 +397,14 @@ class _V4StateSlotAllocator:
 
     def assign(self, first_block_ids, fresh_mask) -> tuple[np.ndarray, set[int]]:
         self._step += 1
-        fb = first_block_ids.tolist() if hasattr(first_block_ids, "tolist") else list(first_block_ids)
-        fresh = fresh_mask.tolist() if hasattr(fresh_mask, "tolist") else list(fresh_mask)
+        fb = (
+            first_block_ids.tolist()
+            if hasattr(first_block_ids, "tolist")
+            else list(first_block_ids)
+        )
+        fresh = (
+            fresh_mask.tolist() if hasattr(fresh_mask, "tolist") else list(fresh_mask)
+        )
         active = set(int(x) for x in fb)
         slots = []
         reset: set[int] = set()
@@ -434,7 +454,9 @@ def _make_compress_plans(extend_lens_cpu, context_lens_cpu, device):
     plan_buffers = {
         ratio: {
             "compress": CpuGpuBuffer(total, 4, dtype=torch.int32, device=device),
-            "write": CpuGpuBuffer(total * max(1, ratio), 4, dtype=torch.int32, device=device),
+            "write": CpuGpuBuffer(
+                total * max(1, ratio), 4, dtype=torch.int32, device=device
+            ),
         }
         for ratio in (4, 128)
     }
@@ -516,7 +538,9 @@ class _V4SGLangDecodeGraphBuffers:
 
     def stage(self, buf, arr_np, n: Optional[int] = None):
         n = int(arr_np.shape[0]) if n is None else int(n)
-        assert n <= buf.np.shape[0], f"V4 graph buffer too small: need {n}, have {buf.np.shape[0]}"
+        assert (
+            n <= buf.np.shape[0]
+        ), f"V4 graph buffer too small: need {n}, have {buf.np.shape[0]}"
         if n:
             buf.np[:n] = arr_np[:n]
         return buf.copy_to_gpu(n)
@@ -551,10 +575,15 @@ def _get_seq_lens_cpu(forward_batch) -> np.ndarray:
     return seq_lens_cpu.numpy().astype(np.int32)
 
 
-def _build_block_tables(req_to_token_pool, req_pool_indices, max_seq_len: int, block_size: int) -> torch.Tensor:
+def _build_block_tables(
+    req_to_token_pool, req_pool_indices, max_seq_len: int, block_size: int
+) -> torch.Tensor:
     req_to_token = req_to_token_pool.req_to_token
     max_blocks = max(1, (int(max_seq_len) + block_size - 1) // block_size)
-    return (req_to_token[req_pool_indices, : max_blocks * block_size : block_size] // block_size).to(torch.int32)
+    return (
+        req_to_token[req_pool_indices, : max_blocks * block_size : block_size]
+        // block_size
+    ).to(torch.int32)
 
 
 def build_atom_v4_decode_graph_metadata_from_sglang(
@@ -575,10 +604,20 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     if seq_np.size == 0:
         seq_np = np.ones(0, dtype=np.int32)
 
-    actual_mode = getattr(forward_batch, "actual_forward_mode", forward_batch.forward_mode)
+    actual_mode = getattr(
+        forward_batch, "actual_forward_mode", forward_batch.forward_mode
+    )
     is_idle = bool(getattr(actual_mode, "is_idle", lambda: False)())
     out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
-    scheduled_bs = 0 if is_idle else (min(bs, int(out_cache_loc.numel())) if torch.is_tensor(out_cache_loc) else bs)
+    scheduled_bs = (
+        0
+        if is_idle
+        else (
+            min(bs, int(out_cache_loc.numel()))
+            if torch.is_tensor(out_cache_loc)
+            else bs
+        )
+    )
     total = scheduled_bs
     t_pad = bs
 
@@ -639,7 +678,9 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
 
     allocator = getattr(proxy_pool, "_atom_v4_slot_allocator", None)
     if allocator is None:
-        allocator = proxy_pool._atom_v4_slot_allocator = _V4StateSlotAllocator(proxy_pool.num_slots)
+        allocator = proxy_pool._atom_v4_slot_allocator = _V4StateSlotAllocator(
+            proxy_pool.num_slots
+        )
 
     slot_arr = np.zeros(bs, dtype=np.int32)
     reset_slots: set[int] = set()
@@ -675,7 +716,9 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     index_topk = int(md.index_topk)
     if total:
         actual_swa = np.minimum(pos_np + 1, win).astype(np.int32)
-        csa_valid = np.minimum(np.minimum((pos_np + 1) // 4, n_csa[:total]), index_topk).astype(np.int32)
+        csa_valid = np.minimum(
+            np.minimum((pos_np + 1) // 4, n_csa[:total]), index_topk
+        ).astype(np.int32)
         hca_valid = n_hca[:total].astype(np.int32)
     else:
         actual_swa = csa_valid = hca_valid = np.zeros(0, dtype=np.int32)
@@ -761,7 +804,9 @@ def build_atom_v4_attention_metadata_from_sglang(
                 extend_lens = extend_lens_t.detach().cpu().numpy().astype(np.int32)
             else:
                 extend_lens = np.diff(
-                    torch.nn.functional.pad(forward_batch.extend_start_loc, (0, 1), value=positions.numel())
+                    torch.nn.functional.pad(
+                        forward_batch.extend_start_loc, (0, 1), value=positions.numel()
+                    )
                     .detach()
                     .cpu()
                     .numpy()
@@ -803,13 +848,21 @@ def build_atom_v4_attention_metadata_from_sglang(
 
     allocator = getattr(proxy_pool, "_atom_v4_slot_allocator", None)
     if allocator is None:
-        allocator = proxy_pool._atom_v4_slot_allocator = _V4StateSlotAllocator(proxy_pool.num_slots)
+        allocator = proxy_pool._atom_v4_slot_allocator = _V4StateSlotAllocator(
+            proxy_pool.num_slots
+        )
     first_block_ids = block_tables[:num_reqs, 0].detach().cpu().numpy()
-    fresh_mask = pos_np[q_np[:-1]] == 0 if total and len(q_np) > 1 else np.zeros(num_reqs, dtype=bool)
+    fresh_mask = (
+        pos_np[q_np[:-1]] == 0
+        if total and len(q_np) > 1
+        else np.zeros(num_reqs, dtype=bool)
+    )
     slot_arr, reset_slots = allocator.assign(first_block_ids, fresh_mask)
     md.reset_slots = reset_slots
     md.state_slot_mapping_cpu = slot_arr
-    md.state_slot_mapping = torch.from_numpy(slot_arr).to(device=device, dtype=torch.int32)
+    md.state_slot_mapping = torch.from_numpy(slot_arr).to(
+        device=device, dtype=torch.int32
+    )
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device=device)
     md.n_committed_csa_per_seq_cpu = (seq_np // 4).astype(np.int32)
@@ -817,8 +870,12 @@ def build_atom_v4_attention_metadata_from_sglang(
     if os.environ.get("ATOM_SGLANG_V4_DISABLE_COMPRESS_READ") == "1":
         md.n_committed_csa_per_seq_cpu = np.zeros_like(md.n_committed_csa_per_seq_cpu)
         md.n_committed_hca_per_seq_cpu = np.zeros_like(md.n_committed_hca_per_seq_cpu)
-    md.n_committed_csa_per_seq = torch.from_numpy(md.n_committed_csa_per_seq_cpu).to(device=device)
-    md.n_committed_hca_per_seq = torch.from_numpy(md.n_committed_hca_per_seq_cpu).to(device=device)
+    md.n_committed_csa_per_seq = torch.from_numpy(md.n_committed_csa_per_seq_cpu).to(
+        device=device
+    )
+    md.n_committed_hca_per_seq = torch.from_numpy(md.n_committed_hca_per_seq_cpu).to(
+        device=device
+    )
     md.compress_plans = _make_compress_plans(lens, seq_np, device)
 
     if is_decode:
@@ -868,9 +925,15 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
     swa_indptr = torch.from_numpy(swa_indptr_np).to(device=device)
     csa_indptr = torch.from_numpy(csa_indptr_np).to(device=device)
     hca_indptr = torch.from_numpy(hca_indptr_np).to(device=device)
-    swa_indices = torch.empty(max(1, int(swa_indptr_np[-1])), dtype=torch.int32, device=device)
-    csa_indices = torch.empty(max(1, int(csa_indptr_np[-1])), dtype=torch.int32, device=device)
-    hca_indices = torch.empty(max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device)
+    swa_indices = torch.empty(
+        max(1, int(swa_indptr_np[-1])), dtype=torch.int32, device=device
+    )
+    csa_indices = torch.empty(
+        max(1, int(csa_indptr_np[-1])), dtype=torch.int32, device=device
+    )
+    hca_indices = torch.empty(
+        max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device
+    )
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_mapping,
         batch_id_per_token=md.batch_id_per_token,
@@ -894,10 +957,9 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         n_hca = int(hca_counts[t])
         base = int(hca_indptr_np[t])
         if n_hca:
-            hca_cpu[base : base + n_hca] = (
-                int(md.swa_pages)
-                + block_tables[int(bid), :n_hca].detach().cpu().numpy().astype(np.int32)
-            )
+            hca_cpu[base : base + n_hca] = int(md.swa_pages) + block_tables[
+                int(bid), :n_hca
+            ].detach().cpu().numpy().astype(np.int32)
     hca_indices.copy_(torch.from_numpy(hca_cpu).to(device=device))
     md.kv_indices_swa = swa_indices[: int(swa_indptr_np[-1])]
     md.kv_indices_csa = csa_indices[: int(csa_indptr_np[-1])]
@@ -939,12 +1001,22 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
     hca_indptr_np = _counts_to_indptr(prefix_swa_count + hca_count)
 
     def t(arr):
-        return torch.from_numpy(np.ascontiguousarray(arr)).to(device=device, dtype=torch.int32)
+        return torch.from_numpy(np.ascontiguousarray(arr)).to(
+            device=device, dtype=torch.int32
+        )
 
-    ext_indices = torch.empty(max(1, int(ext_indptr_np[-1])), dtype=torch.int32, device=device)
-    swa_indices = torch.empty(max(1, int(swa_indptr_np[-1])), dtype=torch.int32, device=device)
-    csa_indices = torch.empty(max(1, int(csa_indptr_np[-1])), dtype=torch.int32, device=device)
-    hca_indices = torch.empty(max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device)
+    ext_indices = torch.empty(
+        max(1, int(ext_indptr_np[-1])), dtype=torch.int32, device=device
+    )
+    swa_indices = torch.empty(
+        max(1, int(swa_indptr_np[-1])), dtype=torch.int32, device=device
+    )
+    csa_indices = torch.empty(
+        max(1, int(csa_indptr_np[-1])), dtype=torch.int32, device=device
+    )
+    hca_indices = torch.empty(
+        max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device
+    )
     write_v4_paged_prefill_indices(
         positions=t(pos_np),
         bid_per_token=md.batch_id_per_token.to(torch.int64),
@@ -1046,7 +1118,9 @@ def reset_deepseek_v4_state_slots(model, slots) -> None:
         swa = getattr(attn, "swa_kv", None)
         if isinstance(swa, torch.Tensor):
             if idx is None:
-                idx = torch.as_tensor(sorted(slots), dtype=torch.long, device=swa.device)
+                idx = torch.as_tensor(
+                    sorted(slots), dtype=torch.long, device=swa.device
+                )
             swa[idx] = 0
         for compressor in (
             getattr(attn, "compressor", None),

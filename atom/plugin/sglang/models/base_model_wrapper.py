@@ -136,7 +136,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         except (TypeError, ValueError):
             return kwargs
 
-        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        if any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+        ):
             return kwargs
 
         return {key: value for key, value in kwargs.items() if key in params}
@@ -267,9 +269,8 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 hidden_states = runtime.trim_output(hidden_states)
 
                 if self.pp_group.is_last_rank:
-                    if (
-                        self.model_arch == "DeepseekV4ForCausalLM"
-                        and not getattr(forward_batch, "return_logprob", False)
+                    if self.model_arch == "DeepseekV4ForCausalLM" and not getattr(
+                        forward_batch, "return_logprob", False
                     ):
                         if forward_batch.forward_mode.is_decode_or_idle():
                             pruned_states = hidden_states
