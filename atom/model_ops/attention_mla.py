@@ -1108,7 +1108,105 @@ class MLAAttention(nn.Module):
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
-        if context.is_prefill and not use_prefill_mla:
+        if context.is_mixed:
+            # Mixed prefill+decode split dispatch: the first `num_prefill_tokens`
+            # rows are prefill chunks (MHA path), the rest are decode tokens (MLA
+            # latent path). Each half runs its own Q/KV/O projections against its
+            # own nested metadata, then outputs are concatenated (same hidden dim).
+            assert not self.is_sparse_mla, (
+                "Mixed prefill+decode batches do not yet support sparse MLA "
+                "(V3.2/V4 indexer). Disable --enable-mixed-prefill-decode."
+            )
+            assert not use_prefill_mla, (
+                "Mixed prefill+decode batches do not support the prefill-MLA "
+                "(sparse) path. Disable --enable-mixed-prefill-decode."
+            )
+            n_prefill = context.num_prefill_tokens
+            prefill_meta = attn_metadata.prefill_attn_metadata
+            decode_meta = attn_metadata.decode_attn_metadata
+
+            # ---- Prefill half: MHA path ----
+            q_p = q[:n_prefill]
+            k_nope_p = k_nope[:n_prefill]
+            k_rope_p = k_rope[:n_prefill]
+            positions_p = positions[:n_prefill]
+
+            prefill_q = self.q_proj(q_p, x_scale=q_scale).view(
+                -1, self.num_heads, self.qk_head_dim
+            )
+            prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+            self.rotary_emb(positions_p, prefill_q_pe, k_rope_p)
+
+            if kv_cache.numel() > 0:
+                concat_and_cache_mla(
+                    k_nope_p,
+                    k_rope_p.squeeze(1),
+                    kv_cache,
+                    prefill_meta.slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
+
+            if prefill_meta.has_cached:
+                chunk_meta = getattr(prefill_meta, "mla_chunk_meta", None)
+                if chunk_meta is not None:
+                    out_prefill = self._forward_prefill_cached_chunked(
+                        prefill_q,
+                        k_nope_p,
+                        k_rope_p,
+                        kv_cache,
+                        prefill_meta,
+                        chunk_meta,
+                    )
+                else:
+                    out_prefill = self._forward_prefill_cached_single_pass(
+                        prefill_q, kv_cache, prefill_meta
+                    )
+            else:
+                out_prefill = self._forward_prefill_mha(
+                    prefill_q, k_nope_p, k_rope_p, kv_cache, prefill_meta
+                )
+
+            # ---- Decode half: MLA latent path ----
+            q_d = q[n_prefill:]
+            k_nope_d = k_nope[n_prefill:]
+            k_rope_d = k_rope[n_prefill:]
+            positions_d = positions[n_prefill:]
+
+            q_nope_d, q_rope_d = self._q_proj_and_k_up_proj(q_d, x_scale=q_scale)
+            q_out_d = torch.empty(
+                (
+                    q_nope_d.shape[0],
+                    self.num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=decode_meta.dtype_q,
+                device=q_nope_d.device,
+            )
+            if kv_cache.numel() > 0:
+                fused_qk_rope_concat_and_cache_mla(
+                    q_nope_d,
+                    q_rope_d,
+                    k_nope_d,
+                    k_rope_d,
+                    kv_cache.view(
+                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                    ),
+                    q_out_d,
+                    decode_meta.slot_mapping,
+                    self._k_scale,
+                    self._q_scale,
+                    positions_d,
+                    self.rotary_emb.cos_cache,
+                    self.rotary_emb.sin_cache,
+                    is_neox=self.rotary_emb.is_neox_style,
+                    is_nope_first=True,
+                )
+
+            out_decode = self._forward_decode(q_out_d, kv_cache, decode_meta)
+
+            output = torch.cat([out_prefill, out_decode], dim=0)
+        elif context.is_prefill and not use_prefill_mla:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )

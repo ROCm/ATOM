@@ -95,7 +95,15 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        self.is_deferred_out = True
+        # Deferred output is disabled when running in P/D disaggregation mode
+        # (kv_transfer_config is set), enabled otherwise.
+        # TODO: In P/D disaggregation mode, if have issue, we can disable it
+        # Mixed prefill+decode batches do not yet support deferred output
+        # (the [prefill | decode] input-id layout isn't wired into the deferred
+        # path — see prepare_input_ids), so auto-disable it when the flag is on.
+        self.is_deferred_out = not getattr(
+            runner.config, "enable_mixed_prefill_decode", False
+        )
 
         self.runner = runner
         device = runner.device

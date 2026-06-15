@@ -445,11 +445,20 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
 
     def build(self, batch: ScheduledBatch, bs: int):
+        if getattr(batch, "is_mixed", False):
+            return self.prepare_mixed(batch, bs)
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch)
         else:
             return self.prepare_decode(batch, bs)
+
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support mixed prefill+decode "
+            "batches yet. Only the dense-MLA backend (AiterMLAMetadataBuilder) "
+            "implements split dispatch. Disable --enable-mixed-prefill-decode."
+        )
 
 
 class AttentionImpl(nn.Module):

@@ -174,6 +174,12 @@ class PagedAttentionImpl(nn.Module):
 
         fwd_ctx: ForwardContext = get_forward_context()
 
+        assert not getattr(fwd_ctx.context, "is_mixed", False), (
+            "MHA models do not support mixed prefill+decode batches yet "
+            "(split dispatch is implemented only for dense MLA). "
+            "Disable --enable-mixed-prefill-decode."
+        )
+
         # dummy run will skip attention in cuda graph capture phase
         if fwd_ctx.context.is_dummy_run:
             o = torch.empty_like(q)

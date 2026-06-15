@@ -1078,6 +1078,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         #   - v4 indexer meta (Indexer — only present when ratio == 4)
         return {}
 
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        raise NotImplementedError(
+            "DeepSeek-V4 does not support mixed prefill+decode batches yet "
+            "(sparse indexer + ring-buffer state need split-dispatch metadata; "
+            "tracked as a follow-up to the dense-MLA split dispatch). "
+            "Disable --enable-mixed-prefill-decode for V4."
+        )
+
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         """V4-style decode prep: populates positions, cu_seqlens_q,
         block_tables, and state_slot_mapping.

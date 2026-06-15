@@ -403,6 +403,15 @@ class AttentionMetaData:
     num_cached_tokens: Optional[torch.Tensor] = None
     seq_starts: Optional[torch.Tensor] = None
 
+    # Mixed prefill+decode (Phase 2) split-dispatch sub-metadata. For a mixed
+    # batch the builder returns ONE AttentionMetaData whose `slot_mapping` covers
+    # all tokens (merged prefill-then-decode), and whose attention dispatch is
+    # driven by these two nested objects: `prefill_attn_metadata` for the first
+    # `context.num_prefill_tokens` rows and `decode_attn_metadata` for the rest.
+    # None for non-mixed batches.
+    prefill_attn_metadata: Optional["AttentionMetaData"] = None
+    decode_attn_metadata: Optional["AttentionMetaData"] = None
+
     def __init__(
         self,
         cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -433,7 +442,11 @@ class AttentionMetaData:
         total_kv: Optional[int] = None,
         num_cached_tokens: Optional[torch.Tensor] = None,
         seq_starts: Optional[torch.Tensor] = None,
+        prefill_attn_metadata: Optional["AttentionMetaData"] = None,
+        decode_attn_metadata: Optional["AttentionMetaData"] = None,
     ):
+        self.prefill_attn_metadata = prefill_attn_metadata
+        self.decode_attn_metadata = decode_attn_metadata
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.num_cached_tokens = num_cached_tokens
