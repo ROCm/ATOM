@@ -542,7 +542,7 @@ class PagedAttentionImpl(nn.Module):
         if cached is not None and cached[0].device == device:
             return cached
         key_scale = torch.full(
-            (1,), self.kv_scale_float * self.scale, dtype=torch.float32, device=device
+            (1,), self.kv_scale_float, dtype=torch.float32, device=device
         )
         value_scale = torch.full(
             (1,), self.kv_scale_float, dtype=torch.float32, device=device
@@ -816,7 +816,7 @@ class PagedAttentionImpl(nn.Module):
             V=v_cache_5d,
             kv_indices=attn_metadata.kv_indices,
             context_lens=attn_metadata.context_lens,
-            softmax_scale=1.0,
+            softmax_scale=self.scale,
             kv_indptr=attn_metadata.kv_indptr,
             gqa=gqa,
             mtp=max_seqlen_q - 1,
