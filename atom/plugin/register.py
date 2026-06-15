@@ -15,6 +15,7 @@ _ATOM_SUPPORTED_MODELS = {
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
+    "DeepseekV32ForCausalLM": DeepseekV3ForCausalLM,
     "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
     "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
 }
