@@ -234,6 +234,48 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_indptr_extend: Optional[torch.Tensor] = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `extend_count`."""
 
+    # ----- Mixed prefill+decode split dispatch (set by `prepare_mixed`) -----
+    # When `is_mixed`, `prefill_attn_metadata` / `decode_attn_metadata` (on the
+    # base class) carry the two per-segment metadata sets; the forward splits
+    # the flat q/kv tensor at `num_prefill_tokens` and runs each segment through
+    # its own path. None/False for non-mixed batches.
+    is_mixed: bool = False
+    num_prefill_tokens: int = 0
+    num_prefill_seqs: int = 0
+    num_decode_tokens: int = 0
+    num_decode_seqs: int = 0
+
+
+class _MixedDecodeView:
+    """Thin read-only view exposing the DECODE rows ``[n_prefill:]`` of a mixed
+    batch as if they were a standalone decode batch, so the unmodified
+    `prepare_decode` builds decode metadata for them.
+
+    Only the fields `prepare_decode` (and `prepare_block_tables`) actually read
+    are sliced; everything else delegates to the wrapped batch. Per-row arrays
+    (`context_lens`, `block_tables`, `per_req_cache_groups`) are sliced to drop
+    the leading prefill rows; counts report the decode totals.
+    """
+
+    def __init__(self, batch: ScheduledBatch, n_prefill_seqs: int):
+        self._batch = batch
+        self._np = n_prefill_seqs
+        self.context_lens = batch.context_lens[n_prefill_seqs:]
+        self.block_tables = batch.block_tables[n_prefill_seqs:]
+        # per_req_cache_groups holds only seqs with a per-req cache, in batch
+        # order; for V4 every seq has one, so the decode rows are the tail.
+        self.per_req_cache_groups = batch.per_req_cache_groups[n_prefill_seqs:]
+        self.total_seqs_num_decode = batch.total_seqs_num_decode
+        self.total_tokens_num_decode = batch.total_tokens_num_decode
+        self.total_seqs_num_prefill = 0
+        self.total_tokens_num_prefill = 0
+        self.is_dummy_run = batch.is_dummy_run
+        self.num_spec_step = batch.num_spec_step
+
+    def __getattr__(self, name):
+        # Anything not explicitly sliced above falls through to the real batch.
+        return getattr(self._batch, name)
+
 
 class DeepseekV4Backend(AttentionBackend):
     """Backend selector entry for V4 hybrid attention.
@@ -1079,12 +1121,105 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return {}
 
     def prepare_mixed(self, batch: ScheduledBatch, bs: int):
-        raise NotImplementedError(
-            "DeepSeek-V4 does not support mixed prefill+decode batches yet "
-            "(sparse indexer + ring-buffer state need split-dispatch metadata; "
-            "tracked as a follow-up to the dense-MLA split dispatch). "
-            "Disable --enable-mixed-prefill-decode for V4."
+        """Build split-dispatch metadata for a V4 mixed prefill+decode batch.
+
+        Mirrors the dense-MLA `prepare_mixed` (aiter_mla.py) pattern but for
+        V4's much larger metadata surface. The batch layout is
+        ``[prefill rows | decode rows]`` (prefill first, M1 scheduler order).
+
+        Strategy: reuse the existing, validated `prepare_prefill` and
+        `prepare_decode` unmodified.
+          1. `prepare_prefill(batch)` reads only rows ``[0:n_p_seqs]`` (prefill
+             rows are first), so it is correct as-is. Its per-fwd metadata
+             aliases shared `forward_vars`/`_stage` buffers, so we CLONE those
+             aliasing tensors before the decode half overwrites them.
+          2. `prepare_decode(decode_view)` runs against a thin sub-batch view
+             that exposes only the decode rows ``[n_p_seqs:]``.
+          3. The returned merged metadata carries both as nested
+             `v4_prefill_meta` / `v4_decode_meta`, plus merged full-tensor
+             fields (positions, cu_seqlens_q, batch_id_per_token,
+             state_slot_mapping, block_tables) for the shared ops in
+             `forward_impl` that run on the whole flat tensor.
+
+        forward_impl raises until P2-P4 land the per-segment split; this
+        builder is exercised first (P1) so the metadata is validated before
+        the forward consumes it.
+        """
+        assert not self.is_sparse or True  # placeholder; V4 is always sparse
+        var = self.model_runner.forward_vars
+        n_p_seqs = batch.total_seqs_num_prefill
+        n_p_tokens = batch.total_tokens_num_prefill
+        n_d_seqs = batch.total_seqs_num_decode
+        n_d_tokens = batch.total_tokens_num_decode
+        total_tokens = n_p_tokens + n_d_tokens
+
+        # ---- Prefill half: rows [0:n_p_seqs] are first, prepare_prefill is
+        # correct as-is. Capture positions before the decode half overwrites
+        # the shared positions buffer. ----
+        prefill_meta, prefill_positions = self.prepare_prefill(batch)
+        prefill_positions_np = var["positions"].np[:n_p_tokens].copy()
+
+        # Detach prefill metadata from shared forward_vars / _stage buffers that
+        # the decode half will rewrite. Self-owned tensors built by
+        # `_build_paged_prefill_meta` (kv_indices_prefix_*, kv_indptr_prefix_*,
+        # kv_indices_extend, skip_prefix_len_csa) are fresh torch.empty/from_numpy
+        # and need no clone; only the shared per-fwd buffers do.
+        for fname in (
+            "batch_id_per_token",
+            "n_committed_csa_per_seq",
+            "state_slot_mapping",
+            "block_tables",
+            "cu_seqlens_q",
+            "cu_seqlens_k",
+            "context_lens",
+        ):
+            t = getattr(prefill_meta, fname, None)
+            if isinstance(t, torch.Tensor):
+                setattr(prefill_meta, fname, t.clone())
+        # indexer_meta GPU tensors also alias _stage buffers.
+        if prefill_meta.indexer_meta is not None:
+            prefill_meta.indexer_meta = {
+                k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                for k, v in prefill_meta.indexer_meta.items()
+            }
+
+        # ---- Decode half: present rows [n_p_seqs:] as a standalone batch so
+        # the unmodified prepare_decode builds decode metadata into shared
+        # buffer rows [0:n_d_seqs]. Mixed runs eager, so bs == n_d_seqs (no CG
+        # padding). ----
+        decode_view = _MixedDecodeView(batch, n_p_seqs)
+        decode_meta, decode_positions = self.prepare_decode(decode_view, n_d_seqs)
+
+        # ---- Merge full-tensor fields for the shared forward_impl ops. ----
+        # positions: [prefill | decode]
+        var["positions"].np[:n_p_tokens] = prefill_positions_np
+        var["positions"].np[n_p_tokens:total_tokens] = (
+            decode_positions.cpu().numpy()
+            if isinstance(decode_positions, torch.Tensor)
+            else decode_positions
         )
+        positions = var["positions"].copy_to_gpu(total_tokens)
+
+        merged = AttentionMetaData_DSV4(
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=max(prefill_meta.max_seqlen_q, decode_meta.max_seqlen_q),
+            max_seqlen_k=max(prefill_meta.max_seqlen_k, decode_meta.max_seqlen_k),
+            min_seqlen_q=0,
+            dropout_p=0.0,
+            has_cached=prefill_meta.has_cached,
+            total_kv=(prefill_meta.total_kv or 0) + (decode_meta.total_kv or 0),
+            state=AttnState.PREFILL_PREFIX,  # mixed always carries a prefill row
+        )
+        merged.prefill_attn_metadata = prefill_meta
+        merged.decode_attn_metadata = decode_meta
+        # Marker the forward reads to take the mixed branch.
+        merged.is_mixed = True
+        merged.num_prefill_tokens = n_p_tokens
+        merged.num_prefill_seqs = n_p_seqs
+        merged.num_decode_tokens = n_d_tokens
+        merged.num_decode_seqs = n_d_seqs
+        return merged, positions
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         """V4-style decode prep: populates positions, cu_seqlens_q,
