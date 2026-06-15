@@ -10,6 +10,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from aiter.ops.fused_qk_norm_rope_cache_quant import minimax_qk_norm_rope_tp1
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.base_attention import Attention
@@ -178,6 +179,15 @@ class MiniMaxM2Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        self.rotary_dim = rotary_dim
+        self.kv_cache_dtype = kv_cache_dtype
+        cos = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+        sin = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+        self.register_buffer(
+            "qknorm_rope_cos_sin_cache",
+            torch.cat([cos, sin], dim=-1).contiguous(),
+            persistent=False,
+        )
 
         self.use_qk_norm = use_qk_norm
         if self.use_qk_norm:
@@ -204,7 +214,7 @@ class MiniMaxM2Attention(nn.Module):
             kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
             use_mla=False,
-            rotary_emb=self.rotary_emb,
+            rotary_emb=None,
             prefix=f"{prefix}.attn",
         )
 
@@ -233,32 +243,37 @@ class MiniMaxM2Attention(nn.Module):
             # normalization uses the global variance (over 6144/1024 dims)
             # rather than per-rank variance (768/128 dims).
             if self.tp_size > 1:
-                q, k, v = tensor_model_parallel_fused_qknorm_allreduce(
-                    qkv, self.q_norm.weight, self.k_norm.weight, self.rms_norm_eps
+                q, k, v = tensor_model_parallel_fused_qknorm_allreduce_rope(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.qknorm_rope_cos_sin_cache,
+                    positions,
+                    self.head_dim,
+                    self.rotary_dim,
+                    self.rms_norm_eps,
                 )
             else:
-                q, k, v = torch.split(
-                    qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
+                q_weight = self.q_norm.weight
+                k_weight = self.k_norm.weight
+                q, k, v = minimax_qk_norm_rope_tp1(
+                    qkv,
+                    q_weight,
+                    k_weight,
+                    self.qknorm_rope_cos_sin_cache,
+                    positions,
+                    num_heads_q=self.num_heads,
+                    num_heads_k=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    rotary_dim=self.rotary_dim,
+                    eps=self.rms_norm_eps,
+                    is_neox_style=self.rotary_emb.is_neox_style,
                 )
-                orig_dtype = q.dtype
-                q = q.to(torch.float32)
-                k = k.to(torch.float32)
-                q_var = q.pow(2).mean(dim=-1, keepdim=True)
-                k_var = k.pow(2).mean(dim=-1, keepdim=True)
-                if self.tp_size > 1:
-                    qk_var = torch.cat([q_var, k_var], dim=-1)
-                    qk_var = tensor_model_parallel_all_reduce(qk_var) / self.tp_size
-                    q_var, k_var = qk_var.chunk(2, dim=-1)
-                q = (
-                    q * torch.rsqrt(q_var + self.rms_norm_eps) * self.q_norm.weight
-                ).to(orig_dtype)
-                k = (
-                    k * torch.rsqrt(k_var + self.rms_norm_eps) * self.k_norm.weight
-                ).to(orig_dtype)
         else:
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
+            q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(
             query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
