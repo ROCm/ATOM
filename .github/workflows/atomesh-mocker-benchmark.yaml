@@ -271,12 +271,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           DASHBOARD_TEMPLATE=$(mktemp)
+          LOGO_ASSET=$(mktemp)
           cp .github/dashboard/atomesh_mocker_index.html "$DASHBOARD_TEMPLATE"
+          cp docs/assets/atomesh_logo.png "$LOGO_ASSET"
           CURRENT_SHA=$(git rev-parse HEAD)
           git fetch origin gh-pages
           git checkout gh-pages
           mkdir -p atomesh-mocker-dashboard
           cp "$DASHBOARD_TEMPLATE" atomesh-mocker-dashboard/index.html
+          cp "$LOGO_ASSET" atomesh-mocker-dashboard/atomesh_logo.png
           git add atomesh-mocker-dashboard/
           git diff --cached --quiet || git commit -m "Update Atomesh mocker benchmark dashboard"
           git push origin gh-pages
