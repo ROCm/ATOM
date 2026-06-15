@@ -11,6 +11,7 @@ from __future__ import annotations
 # be handled by ATOM's native backend, making sglang-specific overrides
 # unnecessary.
 
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -84,13 +85,6 @@ try:
     )
 except ImportError:
     pass
-
-
-def _max_reduce_group_size(reduce_indptr: torch.Tensor) -> int:
-    """Maximum number of partial tiles reduced into a single output tile."""
-    if reduce_indptr.numel() <= 1:
-        return 1
-    return max(int((reduce_indptr[1:] - reduce_indptr[:-1]).max().item()), 1)
 
 
 class ATOMAttnBackendForSgl(AiterAttnBackend):
@@ -174,6 +168,15 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             num_kv_heads, max_total_tokens, dtype=torch.float32, device=self.device
         )
         self.decode_using_pa_ps = self.page_size == 1024
+        if self.use_mla:
+            cu_num = torch.cuda.get_device_properties(
+                self.device
+            ).multi_processor_count
+            self.prefill_ps_num_kv_splits = cu_num // math.gcd(
+                self.num_kv_head, cu_num
+            )
+        else:
+            self.prefill_ps_num_kv_splits = None
 
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:
         """Largest q length used by MLA CUDA graph speculative paths."""
@@ -629,6 +632,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         reduce_final_map = None
         reduce_partial_map = None
         fp8_prefill_kv_indices = None
+        num_kv_splits = None
 
         from sglang.srt.utils import is_gfx95_supported
 
@@ -665,6 +669,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             fp8_prefill_kv_indices = torch.arange(
                 total_s, device=self.device, dtype=torch.int32
             )
+            num_kv_splits = self.prefill_ps_num_kv_splits
 
         self.forward_metadata = ForwardMetadata(
             kv_indptr,
@@ -682,6 +687,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             fp8_prefill_kv_indices=fp8_prefill_kv_indices,
+            num_kv_splits=num_kv_splits,
         )
 
     def _init_extend_mha(self, bs, forward_batch):
@@ -2084,7 +2090,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             one_scale,
             one_scale,
         )
-        num_kv_splits = _max_reduce_group_size(md.reduce_indptr)
         mla_reduce_v1(
             logits,
             attn_lse,
@@ -2092,7 +2097,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             md.reduce_final_map,
             md.reduce_partial_map,
             tile_q,
-            num_kv_splits,
+            md.num_kv_splits,
             output,
             final_lse,
         )
