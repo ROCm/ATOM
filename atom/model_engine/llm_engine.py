@@ -54,14 +54,6 @@ class LLMEngine:
         if data_parallel_master_port is not None:
             config.parallel_config.data_parallel_master_port = data_parallel_master_port
         self.data_parallel_size = data_parallel_size
-        # PCP MoE comm mode (mode B). Only meaningful when PCP is enabled.
-        if moe_pcp_merge and config.prefill_context_parallel_size <= 1:
-            raise ValueError(
-                "moe_pcp_merge=True (PCP MoE mode B) requires "
-                "prefill_context_parallel_size > 1 (-pcp). With PCP disabled "
-                "there is no token sharding to all-gather for MoE."
-            )
-        config.parallel_config.moe_pcp_merge = moe_pcp_merge
         # PCP and DP-attention are not yet compatible: PCP stripe-splits
         # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
         # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
