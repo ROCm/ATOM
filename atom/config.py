@@ -850,7 +850,8 @@ class SpeculativeConfig:
         "qwen3_5_moe": "qwen3_5_mtp",
         "qwen3_5_text": "qwen3_5_mtp",
         "qwen3_5_moe_text": "qwen3_5_mtp",
-        "mimo_v2_flash": "mimo_v2_flash_mtp",
+        "mimo_v2": "mimo_v2_mtp",
+        "mimo_v2_flash": "mimo_v2_mtp",
     }
 
     # mtp_model_type → (n_predict_attr, architecture)
@@ -927,7 +928,7 @@ class SpeculativeConfig:
 
         # MiMo-V2 has not MTP related information in HF config.json,
         # override n_predict with the actual layer count (default 3).
-        if hf_config.model_type == "mimo_v2_flash_mtp":
+        if hf_config.model_type == "mimo_v2_mtp":
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 3)
             hf_config.update(
                 {

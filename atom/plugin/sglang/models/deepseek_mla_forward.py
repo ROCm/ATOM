@@ -15,13 +15,15 @@ import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from aiter import dtypes
-from aiter.utility import fp4_utils
+from aiter import QuantType, dtypes, get_hip_quant
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mla import (
     dynamic_per_batched_tensor_quant,
 )
-from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
+from atom.models.deepseek_v2 import (
+    _fuse_rmsnorm_quant,
+    _mxfp4_activation_quant_layout,
+)
 from atom.models.utils import maybe_prefix
 
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -47,6 +49,13 @@ try:
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 except ImportError:
     gemm_afp4wfp4 = None
+
+try:
+    from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import (
+        fused_gemm_afp4wfp4_preshuffle_split_cat,
+    )
+except ImportError:
+    fused_gemm_afp4wfp4_preshuffle_split_cat = None
 
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
@@ -102,6 +111,62 @@ def _unwrap_linear_output(output: Any) -> torch.Tensor:
     return output
 
 
+def use_sglang_fp8_prefill_attn() -> bool:
+    return (
+        get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
+    )
+
+
+def try_fused_mxfp4_kv_b_proj_fp8(
+    kv_b_proj: Any,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    *,
+    num_heads: int,
+    qk_nope_head_dim: int,
+    v_head_dim: int,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Return FP8 k/v from MXFP4 kv_b_proj when the fused split-cat path fits."""
+    if fused_gemm_afp4wfp4_preshuffle_split_cat is None:
+        return None
+    weight = getattr(kv_b_proj, "weight", None)
+    weight_scale = getattr(kv_b_proj, "weight_scale", None)
+    if weight is None or weight_scale is None:
+        return None
+    if weight.dtype not in (torch.uint8, getattr(dtypes, "fp4x2", None)):
+        return None
+    if weight.dim() != 2 or weight.shape[0] % 16 != 0:
+        return None
+    if weight_scale.shape[0] % 32 != 0:
+        return None
+
+    kvc_for_gemm = kv_c_normed.reshape(-1, kv_c_normed.shape[-1]).contiguous()
+    if k_pe.dim() == 2:
+        k_pe = k_pe.unsqueeze(1)
+
+    m = kvc_for_gemm.shape[0]
+    q_input, x_scale = get_hip_quant(QuantType.per_1x32)(
+        kvc_for_gemm,
+        quant_dtype=dtypes.fp4x2,
+        shuffle=(m >= 32),
+    )
+    if m >= 32:
+        x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+    else:
+        x_scale = x_scale[:m, ...].view(torch.uint8)
+
+    return fused_gemm_afp4wfp4_preshuffle_split_cat(
+        q_input.view(torch.uint8),
+        weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+        k_pe.expand((-1, num_heads, -1)),
+        x_scale,
+        weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1),
+        qk_nope_head_dim,
+        v_head_dim,
+        dtypes.fp8,
+    )
+
+
 def _linear_quant_type_value(linear: Any) -> Optional[int]:
     quant_type = getattr(linear, "quant_type", None)
     return None if quant_type is None else getattr(quant_type, "value", quant_type)
@@ -116,6 +181,12 @@ def _fuse_qk_rmsnorm_and_q_quant(
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """Fuse q/k RMSNorm and q quant using ATOM's DeepSeek-V2 path."""
 
+    if getattr(attn, "quant_dtype", None) == dtypes.fp4x2:
+        q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(q.shape[0])
+    else:
+        q_shuffle = False
+        q_scale_shuffle_padding = False
+
     (q_quantized, q_scale), q_normed, k_nope_normed, _ = _fuse_rmsnorm_quant(
         q,
         attn.q_a_layernorm.weight,
@@ -125,51 +196,14 @@ def _fuse_qk_rmsnorm_and_q_quant(
         attn.kv_a_layernorm.eps,
         None,
         dtype_quant=attn.quant_dtype,
-        shuffle=False,
-        scale_shuffle_padding=False,
+        shuffle=q_shuffle,
+        scale_shuffle_padding=q_scale_shuffle_padding,
         group_size=128,
         quant_type=_linear_quant_type_value(attn.q_b_proj),
         output_unquantized_inp1=output_unquantized_q,
         transpose_scale=True,
     )
     return q_quantized, q_scale, q_normed, k_nope_normed
-
-
-def _q_b_proj_mxfp4_raw_scale(
-    attn: DeepseekV2MLAAttention,
-    q: torch.Tensor,
-    q_scale: torch.Tensor,
-) -> torch.Tensor:
-    """Run q_b_proj with native SGLang-style raw MXFP4 activation scales."""
-
-    raw_weight = getattr(attn.q_b_proj, "_mxfp4_unshuffled_weight", None)
-    raw_weight_scale = getattr(attn.q_b_proj, "_mxfp4_unshuffled_weight_scale", None)
-    bias = getattr(attn.q_b_proj, "bias", None)
-    if (
-        gemm_afp4wfp4 is not None
-        and raw_weight is not None
-        and raw_weight_scale is not None
-        and bias is None
-    ):
-        q_2d = q.view(-1, q.size(-1))
-        y = torch.empty(
-            q_2d.shape[0],
-            raw_weight.shape[0],
-            device=q.device,
-            dtype=torch.bfloat16,
-        )
-        gemm_afp4wfp4(
-            q_2d.view(torch.uint8),
-            raw_weight.view(torch.uint8),
-            q_scale.view(torch.uint8),
-            raw_weight_scale.view(torch.uint8),
-            torch.bfloat16,
-            y,
-        )
-        return y
-
-    q_scale = fp4_utils.e8m0_shuffle(q_scale.view(torch.float8_e8m0fnu))
-    return _unwrap_linear_output(attn.q_b_proj(q, q_scale))
 
 
 def _q_b_proj_with_optional_scale(
@@ -180,7 +214,7 @@ def _q_b_proj_with_optional_scale(
     if q_scale is None:
         return _unwrap_linear_output(attn.q_b_proj(q))
     if getattr(attn, "quant_dtype", None) == dtypes.fp4x2:
-        return _q_b_proj_mxfp4_raw_scale(attn, q, q_scale)
+        return _unwrap_linear_output(attn.q_b_proj(q, q_scale))
     return _unwrap_linear_output(attn.q_b_proj(q, q_scale))
 
 
