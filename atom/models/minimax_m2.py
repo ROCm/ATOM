@@ -3,7 +3,7 @@ from typing import Optional, Union
 import torch
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
-    tensor_model_parallel_fused_qknorm_allreduce,
+    tensor_model_parallel_fused_qknorm_allreduce_rope,
 )
 from aiter.dist.parallel_state import (
     get_pp_group,
