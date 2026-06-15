@@ -783,6 +783,13 @@ class Scheduler:
                 if first_token_id is not None:
                     seq.append_token(first_token_id)
                     seq._injected_t0 = first_token_id
+                    if self.mtp_k > 0:
+                        drafts = list(
+                            (seq.kv_transfer_params or {}).get("draft_token_ids") or []
+                        )[: self.mtp_k]
+                        for d in drafts:
+                            seq.append_token(int(d))
+                        seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
                 logger.info(
                     "[PD-TRANSITION] seq %s: num_tokens=%d, "
                     "num_prompt=%d, blocks=%d, first_token=%s, "

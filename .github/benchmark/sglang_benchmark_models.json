@@ -93,13 +93,13 @@
       "env_vars": "deepseek_dp_common"
     },
     {
-      "display": "DeepSeek-R1-0528-MXFP4 FP4 TP4 DP8 EP8",
-      "dashboard_model": "DeepSeek-R1-0528-MXFP4-tp4-dp8-ep8",
+      "display": "DeepSeek-R1-0528-MXFP4 FP4 TP8 DP8 EP8",
+      "dashboard_model": "DeepSeek-R1-0528-MXFP4-tp8-dp8-ep8",
       "workload_label": "SGLang-OOB",
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
-      "prefix": "deepseek-r1-fp4-tp4-dp8-ep8",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 4 --expert-parallel-size 8 --data-parallel-size 8 --enable-dp-attention", "aiter_runtime"],
+      "prefix": "deepseek-r1-fp4-tp8-dp8-ep8",
+      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8 --expert-parallel-size 8 --data-parallel-size 8 --enable-dp-attention", "aiter_runtime"],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",

@@ -128,6 +128,27 @@ def set_kv_buffer_with_layout_shuffle(
     kv_cache_dtype = "auto"
     if k_buffer.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
         kv_cache_dtype = "fp8"
+    if kv_cache_dtype.startswith("fp8"):
+        import aiter
+
+        x = 16 // k_buffer.element_size()
+        key_cache = k_buffer.view(
+            num_blocks, num_kv_heads, head_dim // x, block_size, x
+        )
+        value_cache = v_buffer.view(
+            num_blocks, num_kv_heads, block_size // x, head_dim, x
+        ).view(num_blocks, num_kv_heads, head_dim, block_size)
+        aiter.reshape_and_cache_with_pertoken_quant(
+            k,
+            v,
+            key_cache,
+            value_cache,
+            k_scale,
+            v_scale,
+            cache_loc,
+            asm_layout=True,
+        )
+        return
     reshape_and_cache_shuffle_triton(
         k,
         v,

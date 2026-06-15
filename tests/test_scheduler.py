@@ -2,8 +2,13 @@
 # Tests for atom/model_engine/scheduler.py — public API only
 
 
-from atom.model_engine.scheduler import Scheduler, ScheduledBatchOutput, SpecStats
-from atom.model_engine.sequence import SequenceStatus, SequenceType
+from atom.model_engine.scheduler import (
+    ScheduledBatch,
+    Scheduler,
+    ScheduledBatchOutput,
+    SpecStats,
+)
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 from conftest import MockConfig
 
@@ -375,3 +380,53 @@ class TestGetNextBatchInfo:
         assert is_prefill is False
         assert n == 1
         assert num_reqs == 1
+
+
+# ── ScheduledBatch: PD consumer first decode primed with T0 + drafts (MTP) ──
+
+
+class TestScheduledBatchPDFirstDecodeMTP:
+
+    def test_first_decode_slices_t0_then_drafts(self):
+        mtp_k = 3
+        prompt_tok, t0 = 6366, 14
+        drafts = [101, 102, 103]  # mtp_k transferred drafts
+        seq = Sequence([prompt_tok], block_size=16)  # 1-token prompt
+        seq.append_token(t0)  # injected T0
+        for d in drafts:  # primed drafts
+            seq.append_token(d)
+        seq.type = SequenceType.DECODE
+        assert seq.num_tokens == 1 + 1 + mtp_k  # prompt + T0 + drafts
+
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[mtp_k + 1],
+            total_tokens_num=mtp_k + 1,
+            total_tokens_num_decode=mtp_k + 1,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            num_spec_step=mtp_k,
+        )
+
+        assert list(batch.scheduled_tokens) == [t0, *drafts]
+
+    def test_normal_decode_window_unchanged(self):
+        """offset >= 0 path is byte-for-byte the trailing mtp_k+1 slice."""
+        mtp_k = 3
+        toks = list(range(100, 110))  # 10 tokens, ample context
+        seq = Sequence(toks[:6], block_size=16)
+        for t in toks[6:]:
+            seq.append_token(t)
+        seq.type = SequenceType.DECODE
+
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[mtp_k + 1],
+            total_tokens_num=mtp_k + 1,
+            total_tokens_num_decode=mtp_k + 1,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            num_spec_step=mtp_k,
+        )
+
+        assert list(batch.scheduled_tokens) == toks[-(mtp_k + 1) :]

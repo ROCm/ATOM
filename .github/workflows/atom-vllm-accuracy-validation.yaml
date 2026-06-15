@@ -616,7 +616,7 @@ jobs:
                   "toggle_env": "RUN_DSV4_PRO_TP8",
                   "model_name": "DeepSeek-V4-Pro TP8",
                   "model_path": "deepseek-ai/DeepSeek-V4-Pro",
-                  "extra_args": "--tensor-parallel-size 8 --gpu-memory-utilization 0.8 --tokenizer-mode deepseek_v4",
+                  "extra_args": "--tensor-parallel-size 8 --gpu-memory-utilization 0.9 --max-num-seqs 512 --tokenizer-mode deepseek_v4",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.94,
                   "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
