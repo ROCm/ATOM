@@ -86,6 +86,13 @@ except ImportError:
     pass
 
 
+def _max_reduce_group_size(reduce_indptr: torch.Tensor) -> int:
+    """Maximum number of partial tiles reduced into a single output tile."""
+    if reduce_indptr.numel() <= 1:
+        return 1
+    return max(int((reduce_indptr[1:] - reduce_indptr[:-1]).max().item()), 1)
+
+
 class ATOMAttnBackendForSgl(AiterAttnBackend):
     """ATOM's custom attention backend for sglang plugin mode.
 
@@ -2077,6 +2084,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             one_scale,
             one_scale,
         )
+        num_kv_splits = _max_reduce_group_size(md.reduce_indptr)
         mla_reduce_v1(
             logits,
             attn_lse,
@@ -2084,6 +2092,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             md.reduce_final_map,
             md.reduce_partial_map,
             tile_q,
+            num_kv_splits,
             output,
             final_lse,
         )
