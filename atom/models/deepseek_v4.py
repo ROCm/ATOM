@@ -1747,6 +1747,7 @@ class DeepseekV4Attention(nn.Module):
         qr, qr_scale = self.q_norm(q_lora)
         q = self.wq_b(qr, x_scale=qr_scale)
         is_decode = attn_md.state is AttnState.DECODE
+        is_mixed = getattr(attn_md, "is_mixed", False)
         # Single kernel fuses per-head Q RMSNorm (weightless) + KV RMSNorm
         # (weighted) + GPT-J interleaved RoPE on the tail rd dims. Dispatches
         # to flydsl when the shape matches (V4-Pro is always V4-Pro shape →
@@ -1768,9 +1769,11 @@ class DeepseekV4Attention(nn.Module):
             quant_q=False,
             quant_k=False,
         )
-        if is_decode:
+        if is_decode and not is_mixed:
             # SWA write per-token in decode (prefill writes after sparse_attn
             # below so the in-chunk SWA tail is captured post-attention).
+            # Mixed batches do their own per-segment swa_write in the dispatch
+            # section below (decode-slice before its kernel, prefill-slice after).
             swa_write(
                 kv,
                 positions,
@@ -1813,7 +1816,70 @@ class DeepseekV4Attention(nn.Module):
         # always sees the current token's K in the ring. Prefill does NOT
         # call swa_write from this layer (prior-chunk K is read from
         # ``unified_kv`` ring via the kv_indices_prefix_swa region).
-        if is_decode:
+        if is_mixed:
+            # ===== Mixed prefill+decode split dispatch =====
+            # Layout [prefill rows | decode rows]; split q_sa/kv at n_p_tokens.
+            # P2 supports Dense (ratio==0) layers only — these have no
+            # Compressor/Indexer/CSA, so only swa_write ordering + the two
+            # sparse kernels differ between segments.
+            assert ratio == 0, (
+                f"Mixed prefill+decode for V4 currently supports only Dense "
+                f"(ratio==0) layers; got ratio={ratio}. CSA/HCA land in P3/P4. "
+                "Disable --enable-mixed-prefill-decode."
+            )
+            p_md = attn_md.prefill_attn_metadata
+            d_md = attn_md.decode_attn_metadata
+            n_p = attn_md.num_prefill_tokens
+
+            q_p = q_sa[:n_p]
+            q_d = q_sa[n_p:]
+            kv_p = kv[:n_p]
+            kv_d = kv[n_p:]
+            pos_p = positions[:n_p]
+            pos_d = positions[n_p:]
+
+            # Decode slice: swa_write BEFORE its kernel (so paged_decode sees
+            # the current token's K in the ring).
+            swa_write(
+                kv_d,
+                pos_d,
+                d_md.cu_seqlens_q,
+                d_md.state_slot_mapping,
+                self.swa_kv,
+                cache_size,
+                min(d_md.max_seqlen_q, cache_size),
+            )
+            o_d = sparse_attn_v4_paged_decode(
+                q_d,
+                self.unified_kv,
+                d_md.kv_indices_swa,
+                d_md.kv_indptr_swa,
+                self.attn_sink,
+                self.softmax_scale,
+            )
+            # Prefill slice: two-source paged prefill, then swa_write AFTER.
+            o_p = sparse_attn_v4_paged_prefill(
+                q_p,
+                self.unified_kv,
+                p_md.kv_indices_prefix_swa,
+                p_md.kv_indptr_prefix_swa,
+                kv_p,
+                p_md.kv_indices_extend,
+                p_md.kv_indptr_extend,
+                self.attn_sink,
+                self.softmax_scale,
+            )
+            swa_write(
+                kv_p,
+                pos_p,
+                p_md.cu_seqlens_q,
+                p_md.state_slot_mapping,
+                self.swa_kv,
+                cache_size,
+                min(p_md.max_seqlen_q, cache_size),
+            )
+            o = torch.cat([o_p, o_d], dim=0)
+        elif is_decode:
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
                 kv_indptr = attn_md.kv_indptr_swa
