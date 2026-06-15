@@ -36,44 +36,25 @@ def pcp_is_enabled() -> bool:
     return get_pcp_world_size() > 1
 
 
-# Per-rank M alignment for the opus a16w16 bf16-workspace split-k GEMM. Its
-# "exact-N row-block" reduce fast path asserts `M % ROWS == 0`, where ROWS is 8
-# for the smallest N (=64) tile (see aiter
-# csrc/opus_gemm/codegen/gen_instances_gfx942.py EXACT_N_ROWBLOCK_REDUCE_CONFIGS
-# and the AITER_CHECK at ~line 271). Padding the global token count to a
-# multiple of pcp_size * 8 makes every rank's shard (M) a multiple of 8, which
-# satisfies the strictest tile. Without this, e.g. 1013 tokens -> pad 1014 ->
-# M=507 (odd) on pcp_size=2 aborts the worker with SIGABRT. Mirrors SGLang's
-# get_cp_padding_align_size (align, not just divide). See plan §N.
-PCP_GEMM_M_ALIGN = 1 # 8
-
-
 def pcp_pad_len(
     total_tokens: int,
     pcp_size: Optional[int] = None,
-    align: int = PCP_GEMM_M_ALIGN,
 ) -> int:
-    """Padded token count so that each rank's shard is GEMM-friendly.
+    """Padded token count so the global sequence is divisible by pcp_size.
 
     Stripe split requires the global token count to be divisible by pcp_size
-    (see SGLang `can_dsa_cp_split` assert / HIP `apply_cp_reindex`). On top of
-    that, each rank's shard (M = total / pcp_size) must be a multiple of
-    `align` so the opus bf16-workspace split-k GEMM's exact-N row-block reduce
-    constraint (`M % ROWS == 0`) holds; align=8 covers the strictest N=64 tile
-    (see PCP_GEMM_M_ALIGN). The global count is therefore padded to a multiple
-    of `pcp_size * align`. Returns the padded length (>= total_tokens); callers
-    pad per-token tensors to this length with dummy tokens (KV length 0) before
-    splitting. All call sites must pass the same `align`.
+    (see SGLang `can_dsa_cp_split` assert / HIP `apply_cp_reindex`). Returns the
+    padded length (>= total_tokens); callers pad per-token tensors to this
+    length with dummy tokens (KV length 0) before splitting.
     """
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return total_tokens
-    step = pcp_size * max(1, align)
-    rem = total_tokens % step
+    rem = total_tokens % pcp_size
     if rem == 0:
         return total_tokens
-    return total_tokens + (step - rem)
+    return total_tokens + (pcp_size - rem)
 
 
 def pcp_split_stripe(
