@@ -83,10 +83,15 @@ async def stream_chat_response(
     # Send initial role chunk
     yield create_chat_chunk(request_id, model, delta={"role": "assistant"})
 
+    kv_transfer_params_value = None
+
     while True:
         chunk_data = await stream_queue.get()
         new_text = chunk_data["text"]
         num_tokens_output += len(chunk_data.get("token_ids", []))
+
+        if "kv_transfer_params" in chunk_data:
+            kv_transfer_params_value = chunk_data["kv_transfer_params"]
 
         # Phase 1: Process through reasoning filter
         segments = reasoning_filter.process(new_text)
@@ -155,6 +160,8 @@ async def stream_chat_response(
         "model": model,
         "usage": usage,
     }
+    if kv_transfer_params_value is not None:
+        usage_chunk["kv_transfer_params"] = kv_transfer_params_value
     yield f"data: {json.dumps(usage_chunk)}\n\n"
     yield STREAM_DONE_MESSAGE
 
@@ -194,7 +201,7 @@ def build_chat_response(
     final_output: Dict[str, Any],
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
-    return ChatCompletionResponse(
+    response = ChatCompletionResponse(
         id=request_id,
         created=int(time.time()),
         model=model,
@@ -209,6 +216,13 @@ def build_chat_response(
             "latency_s": round(final_output.get("latency", 0.0), 4),
         },
     )
+    if "kv_transfer_output_meta_info" in final_output:
+        response = response.model_copy(
+            update={
+                "kv_transfer_params": final_output["kv_transfer_output_meta_info"],
+            }
+        )
+    return response
 
 
 def build_chat_response_multi(
@@ -277,6 +291,7 @@ async def stream_chat_response_fanout(
     tool_parsers = [ToolCallStreamParser() for _ in range(n)]
     has_tool_calls = [False] * n
     finished = [False] * n
+    kv_transfer_params_value = None
 
     for i in range(n):
         yield create_chat_chunk(request_id, model, delta={"role": "assistant"}, index=i)
@@ -288,6 +303,9 @@ async def stream_chat_response_fanout(
             continue
         new_text = chunk_data["text"]
         num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
+
+        if "kv_transfer_params" in chunk_data:
+            kv_transfer_params_value = chunk_data["kv_transfer_params"]
 
         segments = reasoning_filters[idx].process(new_text)
         if chunk_data.get("finished", False):
@@ -368,5 +386,7 @@ async def stream_chat_response_fanout(
         "model": model,
         "usage": usage,
     }
+    if kv_transfer_params_value is not None:
+        usage_chunk["kv_transfer_params"] = kv_transfer_params_value
     yield f"data: {json.dumps(usage_chunk)}\n\n"
     yield STREAM_DONE_MESSAGE

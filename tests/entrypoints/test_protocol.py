@@ -185,6 +185,22 @@ class TestChatCompletionRequest:
         )
         assert req.n == 4
 
+    def test_kv_transfer_params_parsed(self):
+        kv = {"transfer_id": "abc", "block_table": [1, 2, 3]}
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "kv_transfer_params": kv,
+            }
+        )
+        assert req.kv_transfer_params == kv
+
+    def test_kv_transfer_params_default_none(self):
+        req = ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="Hi")],
+        )
+        assert req.kv_transfer_params is None
+
     def test_multimodal_messages(self):
         """Request with multimodal content should parse correctly."""
         req = ChatCompletionRequest.model_validate(
@@ -250,6 +266,35 @@ class TestResponseModels:
         )
         assert resp.id == "chatcmpl-123"
         assert resp.choices[0]["message"]["content"] == "Hello!"
+
+    def test_chat_response_kv_transfer_params(self):
+        kv = {"transfer_id": "xfer-123", "block_table": [0, 1]}
+        resp = ChatCompletionResponse(
+            id="chatcmpl-456",
+            created=int(time.time()),
+            model="test-model",
+            choices=[
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hi"},
+                    "finish_reason": "stop",
+                }
+            ],
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            kv_transfer_params=kv,
+        )
+        dumped = resp.model_dump()
+        assert dumped["kv_transfer_params"] == kv
+
+    def test_chat_response_kv_transfer_params_absent(self):
+        resp = ChatCompletionResponse(
+            id="chatcmpl-789",
+            created=int(time.time()),
+            model="test-model",
+            choices=[],
+            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        )
+        assert resp.kv_transfer_params is None
 
     def test_completion_response(self):
         resp = CompletionResponse(

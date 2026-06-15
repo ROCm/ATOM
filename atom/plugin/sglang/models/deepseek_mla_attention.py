@@ -269,6 +269,8 @@ class SGLangDeepseekMLAAttention(nn.Module):
             _concat_mha_k_for_non_absorbed,
             _set_mla_kv_buffer_for_non_absorbed,
             _unwrap_linear_output,
+            try_fused_mxfp4_kv_b_proj_fp8,
+            use_sglang_fp8_prefill_attn,
         )
 
         q = self._project_q(q_input, q_scale)
@@ -282,12 +284,34 @@ class SGLangDeepseekMLAAttention(nn.Module):
 
         _set_mla_kv_buffer_for_non_absorbed(attn, kv_a, k_pe, forward_batch)
 
-        kv = _unwrap_linear_output(attn.kv_b_proj(kv_a)).view(
-            -1, attn.num_local_heads, attn.qk_nope_head_dim + attn.v_head_dim
+        extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        extend_no_prefix = (
+            False if extend_prefix_lens_cpu is None else not any(extend_prefix_lens_cpu)
         )
-        k_nope = kv[..., : attn.qk_nope_head_dim]
-        v = kv[..., attn.qk_nope_head_dim :]
-        k = _concat_mha_k_for_non_absorbed(attn, k_nope, k_pe)
+        fused_kv = None
+        if (
+            use_sglang_fp8_prefill_attn()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and extend_no_prefix
+        ):
+            fused_kv = try_fused_mxfp4_kv_b_proj_fp8(
+                attn.kv_b_proj,
+                kv_a,
+                k_pe,
+                num_heads=attn.num_local_heads,
+                qk_nope_head_dim=attn.qk_nope_head_dim,
+                v_head_dim=attn.v_head_dim,
+            )
+
+        if fused_kv is not None:
+            k, v = fused_kv
+        else:
+            kv = _unwrap_linear_output(attn.kv_b_proj(kv_a)).view(
+                -1, attn.num_local_heads, attn.qk_nope_head_dim + attn.v_head_dim
+            )
+            k_nope = kv[..., : attn.qk_nope_head_dim]
+            v = kv[..., attn.qk_nope_head_dim :]
+            k = _concat_mha_k_for_non_absorbed(attn, k_nope, k_pe)
 
         attn_output = attn.attn_non_absorbed(
             q,

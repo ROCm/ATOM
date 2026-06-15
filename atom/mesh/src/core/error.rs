@@ -1,4 +1,4 @@
-//! Error types for the SGLang router core
+//! Error types for the Atomesh router core.
 //!
 //! This module defines error types used throughout the router for worker operations.
 

@@ -8,10 +8,10 @@
       "mtp3_common": "--speculative-draft-model-path SGLang/DeepSeek-R1-NextN --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 160 192 224 256"
     },
     "env_vars": {
-      "deepseek_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
-      "deepseek_dp_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nMORI_SHMEM_MODE=ISOLATION\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
-      "deepseek_mtp_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_ENABLE_SPEC_V2=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
-      "deepseek_mtp_dp_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_ENABLE_SPEC_V2=1\nMORI_SHMEM_MODE=ISOLATION\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
+      "deepseek_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
+      "deepseek_dp_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nMORI_SHMEM_MODE=ISOLATION\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
+      "deepseek_mtp_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_ENABLE_SPEC_V2=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
+      "deepseek_mtp_dp_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_ENABLE_SPEC_V2=1\nMORI_SHMEM_MODE=ISOLATION\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
       "qwen_common": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0"
     }
   },
@@ -27,7 +27,7 @@
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": "deepseek_common"
+      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
     },
     {
       "display": "DeepSeek-R1-0528 FP8 TP8",
@@ -39,7 +39,7 @@
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": "deepseek_common"
+      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP4",
@@ -52,7 +52,7 @@
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": "deepseek_common"
+      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP8",
@@ -64,7 +64,7 @@
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": "deepseek_common"
+      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP4 DP4 EP4",
@@ -77,7 +77,7 @@
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": "deepseek_dp_common"
+      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP8 EP8",
@@ -103,7 +103,7 @@
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": "deepseek_dp_common"
+      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP8 MTP1",
@@ -116,7 +116,7 @@
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
-      "env_vars": "deepseek_mtp_common"
+      "env_vars": ["deepseek_mtp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP8 MTP3",
@@ -129,7 +129,7 @@
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
-      "env_vars": "deepseek_mtp_common"
+      "env_vars": ["deepseek_mtp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 MTP3 TP4 DP4 EP4",
@@ -142,7 +142,7 @@
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
-      "env_vars": "deepseek_mtp_dp_common"
+      "env_vars": ["deepseek_mtp_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 MTP3 TP8 DP8 EP8",
@@ -155,7 +155,7 @@
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
-      "env_vars": "deepseek_mtp_dp_common"
+      "env_vars": ["deepseek_mtp_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
     },
     {
       "display": "Qwen3.5-397B-A17B-FP8 TP4",
@@ -203,7 +203,7 @@
       "supported_concurrency_values_by_pair": {
         "8192x1": [256, 512, 1024]
       },
-      "env_vars": "deepseek_dp_common",
+      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -229,7 +229,7 @@
         "8192x1": [512, 1024, 2048],
         "1x1024": [1024, 2048, 4096]
       },
-      "env_vars": "deepseek_dp_common",
+      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -255,7 +255,7 @@
         "8192x1": [64, 128, 256],
         "1x1024": [64, 128, 256]
       },
-      "env_vars": "deepseek_common",
+      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
       "case_env_vars_by_pair": {
         "1x1024": "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1"
       }
@@ -281,7 +281,7 @@
         "8192x1": [2, 4, 8, 16, 32, 64, 128, 256],
         "1x1024": [2, 4, 8, 16, 32, 64, 128, 256]
       },
-      "env_vars": "deepseek_common",
+      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
       "case_env_vars_by_pair": {
         "1x1024": "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1"
       }
@@ -306,7 +306,7 @@
       "supported_concurrency_values_by_pair": {
         "8192x1": [256, 512, 1024]
       },
-      "env_vars": "deepseek_dp_common",
+      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -332,7 +332,7 @@
         "8192x1": [512, 1024, 2048],
         "1x1024": [1024, 2048, 4096]
       },
-      "env_vars": "deepseek_dp_common",
+      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -358,7 +358,7 @@
         "8192x1": [64, 128, 256],
         "1x1024": [64, 128, 256]
       },
-      "env_vars": "deepseek_mtp_common",
+      "env_vars": ["deepseek_mtp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
       "case_env_vars_by_pair": {
         "1x1024": "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1"
       }
@@ -384,7 +384,7 @@
         "8192x1": [2, 4, 8, 16, 32, 64, 128, 256],
         "1x1024": [2, 4, 8, 16, 32, 64, 128, 256]
       },
-      "env_vars": "deepseek_mtp_common",
+      "env_vars": ["deepseek_mtp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
       "case_env_vars_by_pair": {
         "1x1024": "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1"
       }
@@ -409,7 +409,7 @@
       "supported_concurrency_values_by_pair": {
         "8192x1": [256, 512, 1024]
       },
-      "env_vars": "deepseek_mtp_dp_common",
+      "env_vars": ["deepseek_mtp_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -435,7 +435,7 @@
         "8192x1": [512, 1024, 2048],
         "1x1024": [1024, 2048, 4096]
       },
-      "env_vars": "deepseek_mtp_dp_common",
+      "env_vars": ["deepseek_mtp_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
