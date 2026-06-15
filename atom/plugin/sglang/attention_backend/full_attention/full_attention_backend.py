@@ -169,12 +169,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         )
         self.decode_using_pa_ps = self.page_size == 1024
         if self.use_mla:
-            cu_num = torch.cuda.get_device_properties(
-                self.device
-            ).multi_processor_count
-            self.prefill_ps_num_kv_splits = cu_num // math.gcd(
-                self.num_kv_head, cu_num
-            )
+            cu_num = torch.cuda.get_device_properties(self.device).multi_processor_count
+            self.prefill_ps_num_kv_splits = cu_num // math.gcd(self.num_kv_head, cu_num)
         else:
             self.prefill_ps_num_kv_splits = None
 
