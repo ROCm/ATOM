@@ -90,9 +90,6 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        # Deferred output is disabled when running in P/D disaggregation mode
-        # (kv_transfer_config is set), enabled otherwise.
-        # TODO: In P/D disaggregation mode, if have issue, we can disable it
         self.is_deferred_out = True
 
         self.runner = runner
@@ -561,6 +558,7 @@ class ModelRunner:
         set_current_atom_config(config)
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size
+        self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank

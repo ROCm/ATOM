@@ -151,7 +151,7 @@
   {
     "model_name": "DeepSeek-V4-Pro TP8",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
-    "extraArgs": "--tensor-parallel-size 8 --gpu-memory-utilization 0.8 --tokenizer-mode deepseek_v4",
+    "extraArgs": "--tensor-parallel-size 8 --gpu-memory-utilization 0.9 --max-num-seqs 512 --tokenizer-mode deepseek_v4",
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",

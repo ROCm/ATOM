@@ -1045,6 +1045,10 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         """
         # Attach output metadata for the proxy to relay
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
+        drafts = getattr(seq, "spec_token_ids", None)
+        draft_token_ids = (
+            [int(x) for x in drafts] if drafts is not None and len(drafts) else []
+        )
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
@@ -1057,6 +1061,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "dp_rank": self.dp_rank,
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
+            "draft_token_ids": draft_token_ids,
         }
 
         # Clean up transfer ID mapping on the consumer side

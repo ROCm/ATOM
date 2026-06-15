@@ -178,6 +178,7 @@ class MiniMaxM2Attention(nn.Module):
             max_position=max_position,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            dtype=getattr(quant_config, "torch_dtype", None),
         )
         self.rotary_dim = rotary_dim
         self.kv_cache_dtype = kv_cache_dtype
