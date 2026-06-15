@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ATOMesh Mocker Benchmark Dashboard</title>
+  <style>
+    :root{--bg:#f6f8fa;--card:#fff;--text:#24292f;--muted:#57606a;--border:#d8dee4;--card-border:#cbd5e1;--accent:#0969da;--accent-soft:#dbeafe;--pink:#d946ef;--good:#1a7f37;--bad:#cf222e;--link:#94a3b8;--table-head:#f6f8fa;--table-head-text:#64748b;--axis:#64748b;--grid:rgba(148,163,184,.28);--chart-title:#2b5c9a;--legend:#52525b;--button-bg:#fff;--button-text:#475569;--bar-bg:rgba(96,165,250,.55);--bar-border:#2b6cb0}
+    body[data-theme="dark"]{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--muted:#94a3b8;--border:#1f2937;--card-border:#334155;--accent:#60a5fa;--accent-soft:#172554;--pink:#f0abfc;--good:#4ade80;--bad:#f87171;--link:#cbd5e1;--table-head:#1e293b;--table-head-text:#cbd5e1;--axis:#cbd5e1;--grid:rgba(148,163,184,.22);--chart-title:#93c5fd;--legend:#cbd5e1;--button-bg:#1e293b;--button-text:#e5e7eb;--bar-bg:rgba(96,165,250,.38);--bar-border:#93c5fd}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    header{display:flex;align-items:center;justify-content:space-between;gap:16px;background:var(--card);border-bottom:1px solid var(--border);padding:18px 32px}footer{display:flex;align-items:center;justify-content:space-between;background:var(--card);padding:22px 32px;border-top:1px solid var(--border);border-bottom:0;color:var(--muted)}
+    h1{margin:0 0 6px;font-size:24px}h2{margin:0 0 14px;font-size:18px}.muted{color:var(--muted)}
+    .brand{display:flex;align-items:center;gap:18px}.brand-link{display:block;line-height:0}.brand-logo{display:block;width:260px;max-width:42vw;height:auto}.brand-title h1{font-size:20px;margin-bottom:4px}
+    .theme-toggle{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:999px;background:var(--button-bg);color:var(--button-text);padding:7px 12px;cursor:pointer;font-weight:600}.theme-toggle:hover{border-color:var(--accent)}.theme-dot{width:16px;height:16px;border-radius:50%;background:linear-gradient(90deg,#111827 0 50%,#f8fafc 50%);border:1px solid var(--border)}
+    .tabs{display:flex;gap:26px;padding:0 32px;background:var(--card);border-bottom:1px solid var(--border);box-shadow:inset 0 -2px 0 rgba(217,70,239,.55)}
+    .tab{position:relative;padding:14px 0 13px;color:var(--muted);cursor:pointer;font-weight:600;border-bottom:2px solid transparent}
+    .tab.active{color:var(--text);border-bottom-color:#ef4444}.badge{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;margin-left:6px;padding:0 5px;border-radius:999px;background:#fee2e2;color:#dc2626;font-size:11px}
+    main{padding:24px 32px}.panel{display:none}.panel.active{display:block}
+    .card{background:var(--card);border:1px solid var(--card-border);border-radius:12px;padding:22px 24px;margin-bottom:18px}.toolbar{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-bottom:18px}
+    select{border:1px solid var(--border);border-radius:6px;padding:7px 10px;background:var(--card);color:var(--text)}.chart-wrap{height:520px}
+    a,a:visited,a:hover{color:var(--link);text-decoration:none}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid var(--border);padding:9px 10px;text-align:left}th{background:var(--table-head);color:var(--table-head-text);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.num{text-align:right;font-variant-numeric:tabular-nums}.commit-link{text-decoration:none}.commit-link:hover{text-decoration:none}
+    .chart-title{color:var(--chart-title);font-size:20px;font-weight:700;margin-bottom:14px}.section-label{color:var(--muted);font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+    .latency-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.latency-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}.latency-card .chart-wrap{height:330px}
+    .chart-row{display:flex;align-items:stretch}.chart-row .chart-wrap{flex:1;min-width:0}.chart-legend{display:flex;gap:18px;align-items:center;justify-content:center;margin:0 0 8px;color:var(--legend);font-size:13px}.chart-legend.vertical{flex-direction:column;align-items:flex-start;justify-content:center;margin:0 0 0 12px;gap:8px;min-width:64px}.legend-item{display:inline-flex;align-items:center;gap:7px;padding:0;border:0;background:transparent;color:var(--legend);cursor:pointer;font:inherit}.legend-item.hidden{opacity:.38}.legend-symbol-svg{width:12px;height:12px;flex:0 0 12px;display:block}
+    .trend-layout{display:grid;grid-template-columns:130px 1fr;gap:16px}.trend-selector{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}.trend-btn{border:1px solid var(--card-border);border-radius:6px;background:var(--button-bg);color:var(--button-text);padding:7px 12px;cursor:pointer;font-size:12px}.trend-btn.active{background:#38b2ac;color:#fff;border-color:#38b2ac}.trend-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.trend-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}.trend-card .chart-wrap{height:330px}
+    .download-btn{border:1px solid var(--border);border-radius:6px;background:var(--button-bg);color:var(--muted);padding:7px 12px;cursor:pointer}.ok{color:var(--good);font-weight:700}.bad{color:var(--bad);font-weight:700}
+  </style>
+</head>
+<body>
+  <header><div class="brand"><a class="brand-link" href="https://github.com/ROCm/ATOM/tree/main/atom/mesh" target="_blank" rel="noopener noreferrer"><img class="brand-logo" src="atomesh_logo.png" alt="ATOMesh"></a><div class="brand-title"><h1>Mocker Benchmark</h1><div class="muted" id="meta">Loading...</div></div></div><button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle dark theme"><span class="theme-dot"></span><span id="theme-label">Light</span></button></header>
+  <nav class="tabs">
+    <div class="tab active" data-tab="performance">Performance<span class="badge" id="perf-badge">0</span></div>
+    <div class="tab" data-tab="accuracy">Accuracy<span class="badge" id="acc-badge">0</span></div>
+    <div class="tab" data-tab="trends">Trends</div>
+  </nav>
+  <main>
+    <section id="performance" class="panel active">
+      <div class="card"><div class="toolbar"><span class="section-label">Request Performance Overview</span></div><div class="latency-grid" id="performance-grid"></div></div>
+      <div class="card"><h2>Detailed Performance Data</h2><div id="latest"></div></div>
+    </section>
+    <section id="trends" class="panel">
+      <div class="card"><div class="trend-layout"><span class="section-label">Historical Trends</span><div><div class="trend-selector" id="trend-selector"></div><div class="trend-grid" id="trend-grid"></div></div></div></div>
+    </section>
+    <section id="accuracy" class="panel">
+      <div class="card"><h2>Atomesh Standalone Accuracy (GSM8K)</h2><div id="accuracy-table"></div></div>
+    </section>
+  </main>
+  <footer><button class="download-btn" id="download-json">Download JSON</button><span>Powered by <a href="https://github.com/benchmark-action/github-action-benchmark">github-action-benchmark</a> · ATOMesh Distributed Inference Framework</span></footer>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" crossorigin="anonymous"></script>
+  <script src="data.js"></script>
+  <script>window.MOCKER_BENCHMARK_DATA=window.BENCHMARK_DATA||{entries:{}};window.BENCHMARK_DATA=null;</script>
+  <script src="../atomesh-accuracy-dashboard/data.js"></script>
+  <script>window.ATOMESH_ACCURACY_DATA=window.BENCHMARK_DATA||{entries:{}};window.BENCHMARK_DATA=window.MOCKER_BENCHMARK_DATA;</script>
+  <script>
+  'use strict';
+  const mockerRaw=window.MOCKER_BENCHMARK_DATA||{entries:{}};
+  const atomeshAccuracyRaw=window.ATOMESH_ACCURACY_DATA||{entries:{}};
+  const labels={'request throughput':'Request Throughput','avg latency':'Avg Latency','p99 latency':'P99 Latency','p999 latency':'P999 Latency','failed requests':'Failed Requests'};
+  const units={'request throughput':'req/s','avg latency':'ms','p99 latency':'ms','p999 latency':'ms','failed requests':'count'};
+  const latencyMetrics=['avg latency','p99 latency','p999 latency'];
+  const pointStyles=['circle','triangle','rectRot','star','crossRot','rectRounded','cross'];
+  const enabledTopologies=new Set(['1P1D','2P1D','3P1D']);
+  const atomeshModels=new Set(['Meta-Llama-3-8B-Instruct','DeepSeek-R1-0528','DeepSeek-V4-Pro MTP','gpt-oss-120b']);
+  const valueLabelPlugin={
+    id:'valueLabelPlugin',
+    afterDatasetsDraw(chart){
+      if(chart.config.type!=='bar')return;
+      const{ctx}=chart;
+      ctx.save();
+      ctx.font='12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+      ctx.fillStyle=cssVar('--axis');
+      ctx.textAlign='center';
+      ctx.textBaseline='bottom';
+      chart.getDatasetMeta(0).data.forEach((bar,i)=>{
+        const raw=chart.data.datasets[0].data[i];
+        if(!Number.isFinite(raw))return;
+        const label=raw>=1000?`${(raw/1000).toFixed(raw>=10000?1:2)}K`:String(Number(raw.toFixed(3)));
+        ctx.fillText(label,bar.x,bar.y-6);
+      });
+      ctx.restore();
+    }
+  };
+  Chart.register(valueLabelPlugin);
+  let performanceCharts=[],trendCharts=[],trendConfig='';
+  const meshUrl='https://github.com/ROCm/ATOM/tree/main/atom/mesh';
+  function cssVar(name){return getComputedStyle(document.body).getPropertyValue(name).trim()}
+  function horizontalGrid(){return{color:cssVar('--grid'),borderDash:[4,4],drawTicks:false}}
+  function preferredTheme(){
+    try{const saved=localStorage.getItem('atomesh-dashboard-theme');if(saved==='dark'||saved==='light')return saved}catch(e){}
+    return window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+  }
+  function setTheme(theme,persist=true){
+    document.body.dataset.theme=theme;
+    const label=document.getElementById('theme-label');
+    if(label)label.textContent=theme==='dark'?'Dark':'Light';
+    if(persist)try{localStorage.setItem('atomesh-dashboard-theme',theme)}catch(e){}
+  }
+  function runs(raw){return Object.values(raw.entries||{}).flat().sort((a,b)=>Number(b.date)-Number(a.date))}
+  function dateText(ms){const v=Number(ms);return Number.isFinite(v)?new Date(v).toLocaleString():'unknown'}
+  function dateYMD(ms){const v=Number(ms);if(!Number.isFinite(v))return 'unknown';const d=new Date(v);return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`}
+  function relTime(ms){const v=Number(ms);if(!Number.isFinite(v))return 'unknown';const diff=Math.max(0,Date.now()-v);const units=[['d',86400000],['h',3600000],['m',60000]];for(const[u,size]of units){const n=Math.floor(diff/size);if(n>=1)return `${n}${u} ago`}return 'just now'}
+  function esc(s){const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
+  function parseExtra(extra){
+    const out={};
+    if(!extra)return out;
+    const text=String(extra);
+    for(const part of text.split(/\s+\|\s+|\s+/)){
+      const i=part.indexOf('=');
+      if(i>0)out[part.slice(0,i)]=part.slice(i+1);
+    }
+    const run=text.match(/Run:\s*(https?:\/\/\S+)/);
+    if(run)out.runUrl=run[1];
+    for(const [key,re] of Object.entries({threshold:/Threshold:\s*([0-9.]+)/,baseline:/Baseline:\s*([0-9.]+)/,strict:/strict-match:\s*([0-9.]+)/,fewshot:/fewshot:\s*([0-9]+)/})){
+      const m=text.match(re);
+      if(m)out[key]=m[1];
+    }
+    return out;
+  }
+  function parseMocker(name){
+    const prefix='Atomesh-Mocker::';
+    if(!name||!name.startsWith(prefix))return null;
+    const rest=name.slice(prefix.length);
+    const metric=Object.keys(labels).sort((a,b)=>b.length-a.length).find(m=>rest.endsWith(' '+m));
+    if(!metric)return null;
+    const cell=rest.slice(0,-metric.length-1);
+    const m=cell.match(/^pd-chat-(\d+)p(\d+)d-conc(\d+)$/);
+    if(!m)return null;
+    const topology=`${m[1]}P${m[2]}D`;
+    return enabledTopologies.has(topology)?{cell,topology,concurrency:Number(m[3]),metric}:null;
+  }
+  function points(){
+    const out=[];
+    for(const run of runs(mockerRaw))for(const bench of run.benches||[]){
+      const p=parseMocker(bench.name);if(!p)continue;
+      const meta=parseExtra(bench.extra);
+      out.push({...p,meta,date:Number(run.date),dateText:dateText(run.date),commit:run.commit||{},value:Number(bench.value),unit:bench.unit||units[p.metric],runUrl:meta.runUrl||''});
+    }
+    return out;
+  }
+  const allPoints=points();
+  function latest(metric){
+    const byKey=new Map();
+    for(const p of allPoints.filter(x=>x.metric===metric)){if(!byKey.has(p.cell)||p.date>byKey.get(p.cell).date)byKey.set(p.cell,p)}
+    return [...byKey.values()].sort((a,b)=>a.topology.localeCompare(b.topology)||a.concurrency-b.concurrency);
+  }
+  function colors(n){return Array.from({length:n},(_,i)=>`hsl(${(210+i*37)%360},62%,52%)`)}
+  function barLabel(p){return `${p.topology.toLowerCase()} c=${p.concurrency}`}
+  function commitLink(commit){
+    const id=commit?.id||'';
+    if(!id)return '--';
+    const short=id.slice(0,7);
+    const url=commit.url||`${mockerRaw.repoUrl||'https://github.com/ROCm/ATOM'}/commit/${id}`;
+    return `<a class="commit-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(short)}</a>`;
+  }
+  function runCell(row){
+    const time=esc(dateYMD(row.date));
+    return row.runUrl?`${time} | <a href="${esc(row.runUrl)}" target="_blank" rel="noopener noreferrer">view</a>`:`${time} | --`;
+  }
+  function detailedRows(){
+    const byCell=new Map();
+    for(const p of allPoints){
+      if(!byCell.has(p.cell))byCell.set(p.cell,{cell:p.cell,topology:p.topology,concurrency:p.concurrency,dateText:p.dateText,commit:p.commit,runUrl:p.runUrl,meta:p.meta});
+      const row=byCell.get(p.cell);
+      if(!row[p.metric]||p.date>=row[p.metric].date)row[p.metric]={value:p.value,unit:p.unit,date:p.date};
+      if(p.date>=Number(row.date||0)){row.date=p.date;row.dateText=p.dateText;row.commit=p.commit;row.runUrl=p.runUrl||row.runUrl;row.meta={...row.meta,...p.meta}}
+    }
+    return [...byCell.values()].sort((a,b)=>a.topology.localeCompare(b.topology)||a.concurrency-b.concurrency);
+  }
+  function renderDetailTable(){
+    const body=detailedRows().map(r=>{
+      const duration=Number(r.meta?.duration_seconds)||180;
+      const requestNumber=Number(r.meta?.request_number)||Math.round((r['request throughput']?.value||0)*duration);
+      return `<tr><td>Atomesh</td><td>PD Chat</td><td>${esc(r.topology)}</td><td class="num">${requestNumber.toLocaleString()}</td><td class="num">${r.concurrency}</td><td class="num">${fmt(r['request throughput']?.value)}</td><td class="num">${fmt(r['avg latency']?.value,3)}</td><td class="num">${fmt(r['p99 latency']?.value,3)}</td><td class="num">${fmt(r['p999 latency']?.value,3)}</td><td class="num">${fmt(r['failed requests']?.value,0)}</td><td>${commitLink(r.commit)}</td><td>${runCell(r)}</td></tr>`;
+    }).join('');
+    document.getElementById('latest').innerHTML=`<table><thead><tr><th>Backend</th><th>Scenario</th><th>Configuration</th><th>Request Number</th><th>Conc</th><th>Req/s</th><th>Avg Latency (ms)</th><th>P99 (ms)</th><th>P999 (ms)</th><th>Failed</th><th>Commit</th><th>Run</th></tr></thead><tbody>${body||'<tr><td colspan="12">No data</td></tr>'}</tbody></table>`;
+  }
+  function fmt(value,digits=2){return Number.isFinite(value)?value.toFixed(digits):'--'}
+  function legendSvg(style,color){
+    const c=esc(color);
+    const shapes={circle:`<circle cx="6" cy="6" r="4.5" fill="${c}"/>`,triangle:`<path d="M6 1.5 10.5 10.5 1.5 10.5Z" fill="${c}"/>`,rectRot:`<path d="M6 1.5 10.5 6 6 10.5 1.5 6Z" fill="${c}"/>`,star:`<path d="M6 1.1 7.3 4.4 10.8 4.6 8.1 6.8 9 10.2 6 8.3 3 10.2 3.9 6.8 1.2 4.6 4.7 4.4Z" fill="${c}"/>`,crossRot:`<path d="M3.1 1.8 6 4.7 8.9 1.8 10.2 3.1 7.3 6 10.2 8.9 8.9 10.2 6 7.3 3.1 10.2 1.8 8.9 4.7 6 1.8 3.1Z" fill="${c}"/>`,rectRounded:`<rect x="1.8" y="1.8" width="8.4" height="8.4" rx="2" fill="${c}"/>`,cross:`<path d="M5 1.5h2v3.5h3.5v2H7v3.5H5V7H1.5V5H5Z" fill="${c}"/>`};
+    return `<svg class="legend-symbol-svg" viewBox="0 0 12 12" aria-hidden="true">${shapes[style]||shapes.circle}</svg>`;
+  }
+  function renderHtmlLegend(chart,legendId,vertical=false){
+    const el=document.getElementById(legendId);
+    if(!el)return;
+    el.className=`chart-legend${vertical?' vertical':''}`;
+    el.innerHTML=chart.data.datasets.map((ds,i)=>`<button class="legend-item${chart.isDatasetVisible(i)?'':' hidden'}" type="button" data-dataset="${i}">${legendSvg(ds.pointStyle,ds.borderColor||ds.backgroundColor)}<span>${esc(ds.label)}</span></button>`).join('');
+    el.querySelectorAll('button').forEach(btn=>btn.addEventListener('click',()=>{const i=Number(btn.dataset.dataset);chart.setDatasetVisibility(i,!chart.isDatasetVisible(i));chart.update();renderHtmlLegend(chart,legendId,vertical)}));
+  }
+  function renderPerf(){
+    performanceCharts.forEach(chart=>chart.destroy());
+    performanceCharts=[];
+    const grid=document.getElementById('performance-grid');
+    grid.innerHTML=['request throughput','latency'].map((metric,i)=>`<div class="latency-card"><div class="chart-title">Atomesh Mocker · ${metric==='latency'?'Latency':labels[metric]}</div>${metric==='latency'?'<div id="performance-legend-1" class="chart-legend"></div>':''}<div class="chart-wrap"><canvas id="performance-chart-${i}"></canvas></div></div>`).join('');
+    const throughputRows=latest('request throughput');
+    performanceCharts.push(new Chart(document.getElementById('performance-chart-0'),{type:'bar',data:{labels:throughputRows.map(barLabel),datasets:[{label:`${labels['request throughput']} (${units['request throughput']})`,data:throughputRows.map(p=>p.value),backgroundColor:cssVar('--bar-bg'),borderColor:cssVar('--bar-border'),borderWidth:2,borderRadius:6}]},options:{responsive:true,maintainAspectRatio:false,layout:{padding:{top:24}},plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${labels['request throughput']}: ${ctx.parsed.y} ${units['request throughput']}`}}},scales:{x:{title:{display:true,text:'Configuration / Concurrency'},ticks:{minRotation:45,maxRotation:45,color:cssVar('--axis')},grid:{display:false}},y:{beginAtZero:true,title:{display:true,text:units['request throughput']},ticks:{color:cssVar('--axis')},grid:horizontalGrid()}}}}));
+    const baseRows=latest('avg latency');
+    const cs=colors(latencyMetrics.length);
+    const latencyDatasets=latencyMetrics.map((metric,i)=>{const byCell=new Map(latest(metric).map(p=>[p.cell,p.value]));return{label:labels[metric],data:baseRows.map(p=>byCell.get(p.cell)??null),borderColor:cs[i],backgroundColor:cs[i],tension:.25,pointStyle:pointStyles[i%pointStyles.length],pointRadius:5,pointHoverRadius:7}});
+    const latencyChart=new Chart(document.getElementById('performance-chart-1'),{type:'line',data:{labels:baseRows.map(barLabel),datasets:latencyDatasets},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${ctx.parsed.y} ms`}}},scales:{x:{title:{display:true,text:'Configuration / Concurrency'},ticks:{minRotation:45,maxRotation:45,color:cssVar('--axis')},grid:{display:false}},y:{beginAtZero:true,title:{display:true,text:'ms'},ticks:{color:cssVar('--axis')},grid:horizontalGrid()}}}});
+    performanceCharts.push(latencyChart);
+    renderHtmlLegend(latencyChart,'performance-legend-1');
+    renderDetailTable();
+  }
+  function trendConfigurations(){
+    return [...new Set(allPoints.map(p=>p.topology))].sort((a,b)=>a.localeCompare(b));
+  }
+  function trendLabel(point){
+    const d=new Date(point.date);
+    return `${d.getMonth()+1}/${d.getDate()} ${(point.commit?.id||'local').slice(0,7)}`;
+  }
+  function renderTrends(){
+    trendCharts.forEach(chart=>chart.destroy());
+    trendCharts=[];
+    const configs=trendConfigurations();
+    if(!trendConfig||!configs.includes(trendConfig))trendConfig=configs[0]||'';
+    document.getElementById('trend-selector').innerHTML=configs.map(cfg=>`<button class="trend-btn${cfg===trendConfig?' active':''}" data-config="${cfg}">Atomesh Mocker · ${cfg}</button>`).join('');
+    const trendMetrics=['request throughput','avg latency','p99 latency','p999 latency'];
+    const grid=document.getElementById('trend-grid');
+    grid.innerHTML=trendMetrics.map((metric,i)=>`<div class="trend-card"><div class="chart-title">Atomesh Mocker · ${trendConfig} · ${labels[metric]}</div><div class="muted" style="font-size:12px;margin-bottom:8px">Hover to inspect values, use filters to narrow down</div><div class="chart-row"><div class="chart-wrap"><canvas id="trend-chart-${i}"></canvas></div><div id="trend-legend-${i}" class="chart-legend vertical"></div></div></div>`).join('');
+    trendMetrics.forEach((metric,i)=>{
+      const rows=allPoints.filter(p=>p.metric===metric&&p.topology===trendConfig);
+      const orderedRuns=[...new Map(rows.sort((a,b)=>a.date-b.date).map(p=>[`${dateYMD(p.date)}|${(p.commit?.id||'').slice(0,7)}`,p])).values()];
+      const axisLabels=orderedRuns.map(trendLabel);
+      const byConc=new Map();
+      for(const p of rows){if(!byConc.has(p.concurrency))byConc.set(p.concurrency,[]);byConc.get(p.concurrency).push(p)}
+      const cs=colors(byConc.size);
+      const datasets=[...byConc.entries()].sort((a,b)=>a[0]-b[0]).map(([conc,ps],idx)=>{
+        const byLabel=new Map(ps.map(p=>[trendLabel(p),p.value]));
+        return {label:`c${conc}`,data:axisLabels.map(label=>byLabel.get(label)??null),borderColor:cs[idx],backgroundColor:cs[idx],tension:.2,pointStyle:pointStyles[idx%pointStyles.length],pointRadius:5,pointHoverRadius:7};
+      });
+      const chart=new Chart(document.getElementById(`trend-chart-${i}`),{type:'line',data:{labels:axisLabels,datasets},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${ctx.dataset.label}: ${ctx.parsed.y} ${units[metric]}`}}},scales:{x:{title:{display:true,text:'Commit'},ticks:{minRotation:45,maxRotation:45,color:cssVar('--axis')}},y:{beginAtZero:true,title:{display:true,text:units[metric]},ticks:{color:cssVar('--axis')},grid:{color:cssVar('--grid')}}}}});
+      trendCharts.push(chart);
+      renderHtmlLegend(chart,`trend-legend-${i}`,true);
+    });
+  }
+  function accuracyRows(){
+    const byModel=new Map();
+    for(const run of runs(atomeshAccuracyRaw))for(const bench of run.benches||[]){
+      const m=String(bench.name||'').match(/^ATOMesh::(.+?) accuracy \(GSM8K\)$/);if(!m||!atomeshModels.has(m[1]))continue;
+      const extra=parseExtra(bench.extra);
+      const row={backend:'ATOMesh',model:m[1],score:Number(bench.value),strict:extra.strict?Number(extra.strict):undefined,threshold:extra.threshold?Number(extra.threshold):undefined,baseline:extra.baseline?Number(extra.baseline):undefined,fewshot:extra.fewshot||'--',date:Number(run.date),dateText:dateText(run.date),commit:run.commit||{},runUrl:extra.runUrl||''};
+      if(!byModel.has(row.model))byModel.set(row.model,[]);
+      byModel.get(row.model).push(row);
+    }
+    const rows=[];
+    for(const [model,history] of byModel.entries()){
+      history.sort((a,b)=>b.date-a.date);
+      const latest=history[0],prev=history[1];
+      latest.trend=prev&&Number.isFinite(prev.score)?latest.score-prev.score:undefined;
+      rows.push(latest);
+    }
+    return rows.sort((a,b)=>a.model.localeCompare(b.model));
+  }
+  function renderAccuracy(){
+    const rows=accuracyRows();
+    document.getElementById('acc-badge').textContent=String(rows.length);
+    const body=rows.map(r=>{
+      const recovery=Number.isFinite(r.baseline)&&r.baseline>0?(r.score/r.baseline*100):undefined;
+      const margin=Number.isFinite(r.threshold)?r.score-r.threshold:undefined;
+      const trend=Number.isFinite(r.trend)?`${r.trend>=0?'+':''}${r.trend.toFixed(4)}`:'--';
+      return `<tr><td>${esc(r.backend)}</td><td>${esc(r.model)}</td><td class="num"><strong>${fmt(r.score,4)}</strong></td><td class="num">${fmt(r.strict,4)}</td><td class="num">${fmt(r.baseline,4)}</td><td class="num">${Number.isFinite(recovery)?recovery.toFixed(1)+'%':'--'}</td><td class="num">${fmt(r.threshold,4)}</td><td class="num">${Number.isFinite(margin)?(margin>=0?'+':'')+margin.toFixed(4):'--'}</td><td class="num">${trend}</td><td class="num">${esc(r.fewshot)}</td><td>${esc(dateYMD(r.date))}</td><td>${r.runUrl?`<a href="${esc(r.runUrl)}" target="_blank" rel="noopener noreferrer">view</a>`:'--'}</td></tr>`;
+    }).join('');
+    document.getElementById('accuracy-table').innerHTML=`<table><thead><tr><th>Backend</th><th>Model</th><th>Flexible-Extract</th><th>Strict-Match</th><th>Baseline</th><th>Recovery</th><th>Threshold</th><th>Margin</th><th>Trend</th><th>Fewshot</th><th>Last Tested</th><th>Run</th></tr></thead><tbody>${body||'<tr><td colspan="12">No Atomesh accuracy data found in ../atomesh-accuracy-dashboard/data.js</td></tr>'}</tbody></table>`;
+  }
+  function switchTab(tab){
+    document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active',e.dataset.tab===tab));
+    document.querySelectorAll('.panel').forEach(e=>e.classList.toggle('active',e.id===tab));
+    if(tab==='performance')renderPerf();if(tab==='trends')renderTrends();if(tab==='accuracy')renderAccuracy();
+  }
+  setTheme(preferredTheme(),false);
+  document.querySelectorAll('.tab').forEach(e=>e.addEventListener('click',()=>switchTab(e.dataset.tab)));
+  document.getElementById('theme-toggle').addEventListener('click',()=>{
+    const active=document.querySelector('.tab.active')?.dataset.tab||'performance';
+    setTheme(document.body.dataset.theme==='dark'?'light':'dark');
+    switchTab(active);
+  });
+  document.getElementById('trend-selector').addEventListener('click',e=>{if(e.target.matches('.trend-btn')){trendConfig=e.target.dataset.config;renderTrends()}});
+  document.getElementById('download-json').addEventListener('click',()=>{const a=document.createElement('a');a.href='data:application/json,'+encodeURIComponent(JSON.stringify(mockerRaw,null,2));a.download='atomesh-mocker-benchmark-data.json';a.click()});
+  document.getElementById('meta').innerHTML=`Updated ${esc(relTime(mockerRaw.lastUpdate))} · <a href="${meshUrl}" target="_blank" rel="noopener noreferrer">ATOMesh</a>`;
+  document.getElementById('perf-badge').textContent=String(new Set(allPoints.map(p=>p.cell)).size);
+  renderPerf();renderAccuracy();
+  </script>
+</body>
+</html>

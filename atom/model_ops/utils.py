@@ -42,11 +42,6 @@ def _has_module(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
 
 
-def has_triton_kernels() -> bool:
-    """Whether the optional `triton_kernels` package is available."""
-    return _has_module("triton_kernels")
-
-
 MXFP4_QUANT_BLOCK_SIZE = 32
 
 

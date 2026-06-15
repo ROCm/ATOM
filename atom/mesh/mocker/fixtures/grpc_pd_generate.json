@@ -1,6 +1,6 @@
 {
   "name": "grpc_pd_generate",
-  "model": "test-model",
+  "model": "hf-internal-testing/llama-tokenizer",
   "endpoint": "/generate",
   "route": {
     "worker_kind": "prefill_decode",
@@ -8,7 +8,7 @@
     "backend": "sglang"
   },
   "request": {
-    "model": "test-model",
+    "model": "hf-internal-testing/llama-tokenizer",
     "text": "Hello world",
     "stream": false
   },

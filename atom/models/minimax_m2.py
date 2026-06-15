@@ -177,6 +177,7 @@ class MiniMaxM2Attention(nn.Module):
             max_position=max_position,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            dtype=getattr(quant_config, "torch_dtype", None),
         )
 
         self.use_qk_norm = use_qk_norm

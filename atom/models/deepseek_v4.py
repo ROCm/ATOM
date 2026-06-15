@@ -44,7 +44,6 @@ from aiter.dist.communication_op import (
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -166,34 +165,6 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
-
-
-def _hc_head_reduce_fake(
-    x: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_eps: float,
-    hc_eps: float,
-) -> torch.Tensor:
-    return torch.empty(x.shape[0], x.shape[-1], dtype=x.dtype, device=x.device)
-
-
-@torch_compile_guard(gen_fake=_hc_head_reduce_fake, mutates_args=[])
-def _hc_head_reduce(
-    x: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_eps: float,
-    hc_eps: float,
-) -> torch.Tensor:
-    x_flat = x.flatten(-2)
-    x_normed = _rmsnorm_nw(x_flat, norm_eps, x_flat.shape[-1])
-    mixes = F.linear(x_normed.float(), hc_fn)
-    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
-    y = torch.sum(pre.unsqueeze(-1) * x, dim=-2)
-    return y.to(x.dtype)
 
 
 def _v4_attention_fake(
@@ -2307,10 +2278,9 @@ class MoE(nn.Module):
             sizes = ctx.dp_metadata.get_sizes_across_dp()
             ids_2d = all_gatherv(ids_2d, sizes, get_dp_group())
         else:
-            from atom.model_ops.moe import pad_for_all_gather
+            from atom.model_ops.moe import all_gather_with_padding
 
-            ids_2d, _ = pad_for_all_gather(ids_2d)
-            ids_2d = get_dp_group().all_gather(ids_2d, use_custom=False, dim=0)
+            ids_2d, _ = all_gather_with_padding(ids_2d, use_cag=False)
         return ids_2d.flatten()
 
     def combine_outputs(
@@ -2347,7 +2317,7 @@ class MoE(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         routed = self.routed_expert_forward(x)
         with torch.cuda.stream(self.alt_stream):
-            shared = self.shared_experts(x)
+            shared = self.shared_experts.forward(x)
         current_stream.wait_stream(self.alt_stream)
         return self.combine_outputs(routed, shared)
 
@@ -2368,6 +2338,14 @@ class MoE(nn.Module):
             # inside `dual_stream_moe_forward` is opaque to torch.compile.
             return torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
         return self.single_stream_moe_forward(x)
+
+
+@dataclass
+class HCState:
+    residual: torch.Tensor
+    post_mix: Optional[torch.Tensor] = None
+    comb_mix: Optional[torch.Tensor] = None
+    x_prev: Optional[torch.Tensor] = None
 
 
 class Block(nn.Module):
@@ -2431,6 +2409,12 @@ class Block(nn.Module):
         _dim_ok = args.dim % 512 == 0 or args.dim % 256 == 0
         self._mhc_pre = getattr(aiter, "mhc_pre", None) if _dim_ok else None
         self._mhc_post = getattr(aiter, "mhc_post", None) if _dim_ok else None
+        self._mhc_fused_post_pre = (
+            getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
+        )
+        self.enable_fused_hc = (
+            hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
+        )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
@@ -2527,44 +2511,77 @@ class Block(nn.Module):
         )
         return y.type_as(x)
 
+    def fuse_hc(
+        self,
+        hc_state: HCState,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
+    ) -> HCState:
+        residual = hc_state.residual
+        post = hc_state.post_mix
+        comb = hc_state.comb_mix
+        x = hc_state.x_prev
+        if self.enable_fused_hc and x is not None:
+            post, comb, x, res = self._mhc_fused_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                float(self.norm_eps),
+                float(self.hc_eps),
+                float(self.hc_eps),
+                self.HC_POST_MULT,
+                int(self.hc_sinkhorn_iters),
+                norm_weight,
+                norm_eps,
+            )
+        else:
+            if x is not None:
+                res = self.hc_post(x, residual, post, comb)
+            else:
+                res = residual
+            x, post, comb = self.hc_pre(
+                res, hc_fn, hc_scale, hc_base, norm_weight, norm_eps
+            )
+        return HCState(residual=res, post_mix=post, comb_mix=comb, x_prev=x)
+
     def forward(
         self,
-        x: torch.Tensor,  # [num_tokens, hc, dim]  mHC residual stream
+        hc_state: HCState,
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
-    ) -> torch.Tensor:  # [num_tokens, hc, dim]  updated residual stream
+    ) -> HCState:  # [num_tokens, hc, dim]  updated residual stream
         # ----- Attention sub-layer with mHC mixing -----
-        residual = x  # [num_tokens, hc, dim]
-        (
-            x,
-            post,
-            comb,
-        ) = self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
-            x,
+        hc_state = self.fuse_hc(
+            hc_state,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
             self.attn_norm.weight,
             self.norm_eps,
         )
-        # x = self.attn_norm(x)  # [num_tokens, dim]
+        x = hc_state.x_prev
         x = self.attn(x, positions)  # [num_tokens, dim]
-        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-        # ----- FFN sub-layer with mHC mixing -----
-        residual = x  # [num_tokens, hc, dim]
-        x, post, comb = self.hc_pre(
-            x,
+        hc_state.x_prev = x
+        hc_state = self.fuse_hc(
+            hc_state,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
             self.ffn_norm.weight,
             self.norm_eps,
         )
-        # x = self.ffn_norm(x)  # [num_tokens, dim]
+        x = hc_state.x_prev
         x = self.ffn(
             x
         )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)
-        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-        return x
+        hc_state.x_prev = x
+        return hc_state
 
 
 class ParallelHead(ParallelLMHead):
@@ -2615,14 +2632,10 @@ class ParallelHead(ParallelLMHead):
         """Reduce mHC residual `[num_tokens, hc, dim]` → `[num_tokens, dim]`
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
-        return _hc_head_reduce(
-            x,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            self.norm_eps,
-            self.hc_eps,
+        _, _, y = aiter.mhc_pre(
+            x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0
         )
+        return y
 
     def forward(
         self,
@@ -2716,10 +2729,13 @@ class DeepseekV4Model(nn.Module):
         h = self.embed(input_ids)  # [num_tokens, dim]
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None)
 
         for layer in self.layers:
-            h = layer(h, positions)  # [num_tokens, hc, dim]
-
+            hc_state = layer(hc_state, positions)  # [num_tokens, hc, dim]
+        h = self.layers[-1].hc_post(
+            hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
+        )
         return h
 
 
@@ -2837,14 +2853,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         ctx = get_forward_context()
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
-            # gate sees DP-gathered gating_output, so gather ids to match. This
-            # runs for every forward, including each TBO ubatch, which invokes
-            # this same forward with its own local slice + ubatch context.
-            # Route through the routing-side stream so the all-gather does not
-            # serialize behind the main compute stream during TBO ping-pong.
-            ctx.context.input_ids = _run_on_tbo_comm_stream(
-                MoE._gather_ids_for_dp, input_ids.flatten(), ctx
-            )
+            # gate sees DP-gathered gating_output, so gather ids to match. Run
+            # the gather INLINE on the compute stream. The original side-stream
+            # hop (_run_on_tbo_comm_stream) coordinated this ids all-gather with
+            # a DIFFERENT stream/sync than the MoE hidden/router DP gather under
+            # TBO → mismatched DP layouts → wrong V4 hash routing (GSM8K
+            # 0.95→0.87). NOTE: do NOT wrap this in the TBO ping-pong
+            # (tbo_yield_and_switch_*) — injecting an extra yield at forward top
+            # desyncs the ping-pong ring and collapses accuracy to ~0.54
+            # (measured). The ids tensor is [N,1] int (tiny vs hidden [N,7168]),
+            # so inline costs ~nothing in overlap.
+            ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
         else:
             ctx.context.input_ids = input_ids
         return self.model(input_ids, positions)
