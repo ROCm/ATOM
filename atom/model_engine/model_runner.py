@@ -1127,6 +1127,10 @@ class ModelRunner:
         else:
             warmup_max_tokens = max_num_batched_tokens // dp_size
 
+        pcp_size = self.config.prefill_context_parallel_size
+        if pcp_size > 1:
+            warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
+
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
         if num_seqs == 0:

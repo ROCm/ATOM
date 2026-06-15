@@ -54,6 +54,29 @@ class LLMEngine:
         if data_parallel_master_port is not None:
             config.parallel_config.data_parallel_master_port = data_parallel_master_port
         self.data_parallel_size = data_parallel_size
+        # PCP MoE comm mode (mode B). Only meaningful when PCP is enabled.
+        if moe_pcp_merge and config.prefill_context_parallel_size <= 1:
+            raise ValueError(
+                "moe_pcp_merge=True (PCP MoE mode B) requires "
+                "prefill_context_parallel_size > 1 (-pcp). With PCP disabled "
+                "there is no token sharding to all-gather for MoE."
+            )
+        config.parallel_config.moe_pcp_merge = moe_pcp_merge
+        # PCP and DP-attention are not yet compatible: PCP stripe-splits
+        # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
+        # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
+        # the FULL (un-split) token count, so all_gatherv asserts
+        # `1/pcp_size != full`.
+        if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
+            raise ValueError(
+                "prefill_context_parallel_size > 1 (-pcp) combined with "
+                "--enable-dp-attention is not supported yet (may be supported "
+                "in a future release): PCP splits tokens to 1/pcp_size while "
+                "DP-attention's id-gather expects the full token count, "
+                "causing an all_gatherv size mismatch. For now, disable one of "
+                "them (use -tp N -pcp M without DP-attention, or -dp N "
+                "--enable-dp-attention without -pcp)."
+            )
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
