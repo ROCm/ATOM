@@ -21,6 +21,7 @@ _ATOM_SUPPORTED_MODELS = {
 }
 
 if is_sglang():
+    from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
     from atom.models.qwen3_next import Qwen3NextForCausalLM
     from atom.models.qwen3_5 import (
         Qwen3_5ForCausalLM,
@@ -30,6 +31,7 @@ if is_sglang():
 
     _ATOM_SUPPORTED_MODELS.update(
         {
+            "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
             "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
             "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
             "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
@@ -58,6 +60,9 @@ def _register_custom_attention_to_sglang() -> None:
     from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
         ATOMAttnBackendForSgl,
     )
+    from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
+        ATOMDeepseekV4BackendForSgl,
+    )
 
     # here register the custom attention backend with the name "aiter"
     # as sglang defines the fixed attention backend choices, which must be
@@ -72,7 +77,20 @@ def _register_custom_attention_to_sglang() -> None:
 
     @register_attention_backend("aiter")
     def create_atom_backend(runner):
+        arches = getattr(runner.model_config.hf_config, "architectures", None) or []
+        if any("DeepseekV4" in str(arch) for arch in arches):
+            logger.info(
+                "Use ATOMDeepseekV4BackendForSgl for DeepSeek-V4 through SGLang aiter backend choice"
+            )
+            return ATOMDeepseekV4BackendForSgl(runner)
         return ATOMAttnBackendForSgl(runner)
+
+    @register_attention_backend("dsv4")
+    def create_dsv4_backend(runner):
+        logger.info(
+            "Create ATOMDeepseekV4BackendForSgl through SGLang dsv4 backend choice"
+        )
+        return ATOMDeepseekV4BackendForSgl(runner)
 
 
 def register_ops_to_sglang(atom_config: Config) -> None:
