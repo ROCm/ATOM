@@ -937,10 +937,7 @@ class Scheduler:
         remote_kv_seq_blocks: dict[int, list[int]] = {}
         decode_carryover: list[Sequence] = []
         decode_scheduled: list[Sequence] = []
-        while (
-            self.running
-            and num_seqs_prefill + num_seqs_decode < self.max_num_seqs
-        ):
+        while self.running and num_seqs_prefill + num_seqs_decode < self.max_num_seqs:
             seq = self.running.popleft()
             if seq.id in scheduled_seqs:
                 # Already scheduled as a prefill chunk this step — keep its slot.
