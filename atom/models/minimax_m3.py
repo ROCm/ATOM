@@ -213,6 +213,16 @@ class MiniMaxM3MoE(nn.Module):
         # so force the Triton MXFP4 MoE path before FusedMoE chooses its
         # quant_method implementation.
         os.environ["ATOM_USE_TRITON_MOE"] = "1"
+        # aiter's flat Triton MoE top-k only supports softmax/sqrtsoftplus, not
+        # the sigmoid scoring MiniMax-M3 uses; its grouped top-k does support
+        # sigmoid (+ routing bias). M3 has no real expert groups, so we route
+        # through grouped top-k with topk_group == num_expert_group: every group
+        # is kept, which degenerates to exact flat top-k while unlocking the
+        # sigmoid path. num_expert_group is the largest divisor of the expert
+        # count in (1, 16] (aiter caps num_expert_group at 16).
+        num_expert_group = next(
+            (g for g in (16, 8, 4, 2) if config.num_local_experts % g == 0), 1
+        )
         self.experts = FusedMoE(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
@@ -223,6 +233,9 @@ class MiniMaxM3MoE(nn.Module):
             quant_config=quant_config,
             scoring_func=getattr(config, "scoring_func", "sigmoid"),
             e_score_correction_bias=self.e_score_correction_bias,
+            use_grouped_topk=True,
+            num_expert_group=num_expert_group,
+            topk_group=num_expert_group,
             activation=ActivationType.Swiglu,
             has_bias=False,
             config=moe_config,
