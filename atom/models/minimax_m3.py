@@ -30,6 +30,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import MoEActivationQuant
 from atom.model_ops.minimax_m3.index_topk import (
     minimax_m3_index_topk,
     minimax_m3_index_topk_decode,
@@ -239,6 +240,11 @@ class MiniMaxM3MoE(nn.Module):
             config=config,
             shared_expert_prefix=f"{prefix}.shared_experts",
         )
+        self.experts.moe_config.a_quant_dtype = "fp4"
+        if hasattr(self.experts.quant_method, "act_quant"):
+            self.experts.quant_method.act_quant = MoEActivationQuant.FP4
+        self.experts.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
+        self.experts.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
@@ -757,7 +763,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.self_attn = attn_cls(
             config=config,
             layer_id=layer_num,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.self_attn",
             cache_config=cache_config,
         )
@@ -775,7 +781,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             self.mlp = MiniMaxM3MLP(
                 config=config,
                 intermediate_size=config.dense_intermediate_size,
-                quant_config=quant_config,
+                quant_config=None,
                 reduce_results=False,
                 prefix=f"{prefix}.mlp",
             )

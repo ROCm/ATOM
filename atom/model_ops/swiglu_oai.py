@@ -102,3 +102,34 @@ def swiglu_oai_split(
         num_warps=4,
     )
     return out.reshape(*orig_shape[:-1], n_inter)
+
+
+def swiglu_oai_interleaved(
+    gate_up: torch.Tensor,
+    alpha: float,
+    beta: float,
+    limit: float | None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Apply MiniMax-M3 SwiGLU-OAI to interleaved ``[gate0, up0, ...]``."""
+    if gate_up.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"SwiGLU-OAI expects an even last dimension, got {gate_up.shape[-1]}."
+        )
+    orig_shape = gate_up.shape
+    two_i = orig_shape[-1]
+    n_inter = two_i // 2
+    split_gate_up = (
+        gate_up.reshape(-1, n_inter, 2)
+        .transpose(1, 2)
+        .contiguous()
+        .reshape(-1, two_i)
+    )
+    out = swiglu_oai_split(
+        split_gate_up,
+        alpha=alpha,
+        beta=beta,
+        limit=limit,
+        out_dtype=out_dtype,
+    )
+    return out.reshape(*orig_shape[:-1], n_inter)

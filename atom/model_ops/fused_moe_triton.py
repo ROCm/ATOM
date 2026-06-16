@@ -272,6 +272,45 @@ def triton_kernel_fused_experts(
                 gammas=None if apply_router_weight_on_input else gammas,
                 swizzle_mx_scale=w2_swizzle_layout,
             )
+        elif act_quant == MoEActivationQuant.FP4:
+            from atom.model_ops.swiglu_oai import swiglu_oai_split
+
+            hidden_states_fp4, hidden_states_mx_scale = mxfp4_quant(hidden_states)
+            raw_intermediate = moe_gemm_a4w4(
+                hidden_states_fp4,
+                w1,
+                hidden_states_mx_scale,
+                w13_scale,
+                None,
+                None,
+                w1_bias,
+                routing_data,
+                gather_indx=gather_indx,
+                gammas=gammas if apply_router_weight_on_input else None,
+                swizzle_mx_scale=w13_swizzle_layout,
+                apply_swiglu=False,
+            )
+            interm_cache = swiglu_oai_split(
+                raw_intermediate,
+                alpha=swiglu_alpha,
+                beta=1.0,
+                limit=swiglu_limit,
+                out_dtype=hidden_states.dtype,
+            )
+            intermediate_fp4, intermediate_mx_scale = mxfp4_quant(interm_cache)
+            output_tensor = moe_gemm_a4w4(
+                intermediate_fp4,
+                w2,
+                intermediate_mx_scale,
+                w2_scale,
+                None,
+                None,
+                w2_bias,
+                routing_data,
+                scatter_indx=scatter_indx,
+                gammas=None if apply_router_weight_on_input else gammas,
+                swizzle_mx_scale=w2_swizzle_layout,
+            )
         else:
             interm_cache = moe_gemm_a16w4(
                 hidden_states,

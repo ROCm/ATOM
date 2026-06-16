@@ -50,7 +50,7 @@ from atom.model_ops.minimax_m3.gemma_rmsnorm import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, MoEActivationQuant
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models import minimax_m3 as minimax_m3_base
@@ -863,6 +863,11 @@ class MiniMaxM3MoE(nn.Module):
             config=config,
             shared_expert_prefix=f"{prefix}.shared_experts",
         )
+        self.experts.moe_config.a_quant_dtype = "fp4"
+        if hasattr(self.experts.quant_method, "act_quant"):
+            self.experts.quant_method.act_quant = MoEActivationQuant.FP4
+        self.experts.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
+        self.experts.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0

@@ -1045,6 +1045,86 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
+    def _route_sigmoid_for_triton(
+        self,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        e_score_correction_bias: Optional[torch.Tensor],
+        routed_scaling_factor: float,
+    ):
+        """Build AITER routing data for MiniMax-style sigmoid routing."""
+        import triton
+        from aiter.ops.triton.moe.moe_routing.routing import (
+            ExptData,
+            RoutingData,
+            sort_tokens,
+            sort_tokens_fused,
+        )
+        from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+
+        num_tokens, n_expts_tot = router_logits.shape
+        num_expert_group = min(16, n_expts_tot)
+        while num_expert_group > 1 and n_expts_tot % num_expert_group != 0:
+            num_expert_group -= 1
+        if num_expert_group <= 1:
+            raise RuntimeError(
+                "Sigmoid Triton routing requires more than one expert group "
+                f"for n_expts_tot={n_expts_tot}."
+            )
+
+        m = num_tokens * top_k
+        tokens_per_expt = max(1, m // n_expts_tot)
+        block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+        hist_block_m = 32
+        expt_scal, expt_indx, bitmatrix = grouped_topk(
+            router_logits,
+            top_k,
+            num_expert_group=num_expert_group,
+            topk_group=num_expert_group,
+            apply_softmax=False,
+            score_mode="sigmoid",
+            bias=(
+                e_score_correction_bias.to(torch.float32)
+                if e_score_correction_bias is not None
+                else None
+            ),
+            renorm=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            HIST_BLOCK_M=hist_block_m,
+        )
+        if num_tokens <= 16:
+            hist_block_m = triton.next_power_of_2(max(num_tokens, 1))
+            sort_fn = sort_tokens_fused
+        else:
+            sort_fn = sort_tokens
+        (
+            hist,
+            topk_indx,
+            gate_indx,
+            gate_scal,
+            token_offs_raw,
+            token_offs_pad,
+            block_pid_map,
+        ) = sort_fn(
+            expt_scal,
+            expt_indx,
+            n_expts_tot,
+            bitmatrix,
+            block_m,
+            hist_block_m,
+        )
+        expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+        routing_data = RoutingData(
+            block_m=block_m,
+            gate_scal=gate_scal,
+            expt_hist=hist,
+            n_expts_tot=n_expts_tot,
+            n_expts_act=top_k,
+            expt_data=expt_data,
+        )
+        return routing_data, topk_indx, gate_indx
+
     @mark_trace(prefix="mxfp4_moe", torch_compile=False)
     def apply(
         self,
@@ -1083,27 +1163,47 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if needs_custom_routing:
                 # custom routing -- set for deepseek routing n expts act, for grouped topk
                 n_expts_act = top_k
+                routing_scaling_factor = (
+                    layer.routed_scaling_factor
+                    if layer.num_fused_shared_experts > 0
+                    else 1.0
+                )
 
                 # custom routing
                 from aiter.ops.triton.moe.moe_routing.routing import (  # grouped topk included
                     routing,
                 )
 
-                routing_data, gather_idx, scatter_idx = routing(
-                    router_logits,
-                    n_expts_act,
-                    score_mode=scoring_func,
-                    bias=(
-                        e_score_correction_bias.to(torch.float32)
-                        if e_score_correction_bias is not None
-                        else None
-                    ),
-                    renorm=renormalize,
-                    routed_scaling_factor=layer.routed_scaling_factor,
-                    use_grouped_topk=use_grouped_topk,
-                    num_expert_group=num_expert_group,
-                    topk_group=topk_group,
-                )
+                if (
+                    scoring_func == "sigmoid"
+                    and not use_grouped_topk
+                    and custom_routing_function is None
+                ):
+                    routing_data, gather_idx, scatter_idx = (
+                        self._route_sigmoid_for_triton(
+                            router_logits,
+                            n_expts_act,
+                            renormalize,
+                            e_score_correction_bias,
+                            routing_scaling_factor,
+                        )
+                    )
+                else:
+                    routing_data, gather_idx, scatter_idx = routing(
+                        router_logits,
+                        n_expts_act,
+                        score_mode=scoring_func,
+                        bias=(
+                            e_score_correction_bias.to(torch.float32)
+                            if e_score_correction_bias is not None
+                            else None
+                        ),
+                        renorm=renormalize,
+                        routed_scaling_factor=routing_scaling_factor,
+                        use_grouped_topk=use_grouped_topk,
+                        num_expert_group=num_expert_group,
+                        topk_group=topk_group,
+                    )
                 # Routed-only gate count (no shared-expert widening).
                 n_expts_act = routing_data.n_expts_act
 
@@ -1132,6 +1232,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     a2_scale=layer.w2_input_scale,
                     w1_bias=layer.w13_bias,
                     w2_bias=layer.w2_bias,
+                    swiglu_alpha=getattr(layer, "swiglu_alpha", 1.702),
                     swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
@@ -1264,17 +1365,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         TP-partitioned exactly like the routed experts, so both partial outputs
         reduce together.
         """
-        from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
         from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
 
-        # The dense shared-expert GEMM only implements the SiLU activation
-        # path; SwiGLU models have no fused shared experts, so this assert
-        # documents the supported scope.
-        assert (
-            activation != ActivationType.Swiglu
-        ), "dense shared-expert GEMM only supports the SiLU activation path"
+        if activation == ActivationType.Swiglu:
+            from atom.model_ops.swiglu_oai import swiglu_oai_split
+        else:
+            from aiter.ops.triton.fusions.fused_clamp_act_mul import (
+                fused_clamp_act_mul,
+            )
 
         M = x.shape[0]
+        swiglu_alpha = getattr(layer, "swiglu_alpha", 1.702)
+        swiglu_beta = getattr(layer, "swiglu_beta", 1.0)
         swiglu_limit = getattr(layer, "swiglu_limit", 0.0)
 
         use_a4w4 = self.act_quant == MoEActivationQuant.FP4
@@ -1295,15 +1397,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.shared_w13_weight[e],
                 layer.shared_w13_weight_scale[e],
             )
-            half_n = gate_up.shape[-1] // 2
-            intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
-            fused_clamp_act_mul(
-                gate_up,
-                out=intermediate,
-                swiglu_limit=swiglu_limit,
-                activation="silu",
-                dtype_quant=None,
-            )
+            if activation == ActivationType.Swiglu:
+                intermediate = swiglu_oai_split(
+                    gate_up,
+                    alpha=swiglu_alpha,
+                    beta=swiglu_beta,
+                    limit=swiglu_limit if swiglu_limit > 0 else None,
+                    out_dtype=x.dtype,
+                )
+            else:
+                half_n = gate_up.shape[-1] // 2
+                intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
+                fused_clamp_act_mul(
+                    gate_up,
+                    out=intermediate,
+                    swiglu_limit=swiglu_limit,
+                    activation="silu",
+                    dtype_quant=None,
+                )
             out_e = _shared_expert_gemm(
                 intermediate,
                 layer.shared_w2_weight[e],
@@ -2190,6 +2301,7 @@ class FusedMoE(torch.nn.Module):
         shared_expert_scoring_func: Optional[str] = None,
         config: Optional[PretrainedConfig] = None,
         shared_expert_prefix: Optional[str] = None,
+        fuse_shared_experts: bool = True,
     ):
         super().__init__()
         self.prefix = prefix
@@ -2234,7 +2346,7 @@ class FusedMoE(torch.nn.Module):
         if shared_expert_prefix is None and prefix.endswith(".experts"):
             shared_expert_prefix = prefix[: -len(".experts")] + ".shared_experts"
 
-        fuse_shared_experts = (
+        fuse_shared_experts = fuse_shared_experts and (
             is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
                 quant_config,
                 shared_expert_prefix=shared_expert_prefix,
