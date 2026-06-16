@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Tuple, cast
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
 
-import threading
 
 import aiter
 import torch
@@ -102,34 +101,6 @@ from atom.utils.forward_context import AttnState, get_forward_context
 from torch import nn
 
 logger = logging.getLogger(__name__)
-
-# Per-device auxiliary stream for TBO-adjacent collectives (DP input_ids
-# all-gather hoisted into DeepseekV4ForCausalLM.forward, MoE combine_outputs
-# TP all-reduce). Submitting these on a dedicated stream keeps the main
-# compute lane free of nccl interleaving so it can hardware-overlap with
-# TBO's own comm_stream.
-_TBO_COMM_STREAM: dict = {}
-_TBO_COMM_STREAM_LOCK = threading.Lock()
-
-
-def _run_on_tbo_comm_stream(fn, *args, **kwargs):
-    # Without TBO there is no second compute/comm stream to overlap with,
-    # so the side-stream hop only adds event/sync overhead. Run inline.
-    if not get_current_atom_config().enable_tbo:
-        return fn(*args, **kwargs)
-    device = torch.cuda.current_device()
-    with _TBO_COMM_STREAM_LOCK:
-        side = _TBO_COMM_STREAM.get(device)
-        if side is None:
-            side = torch.cuda.Stream(device=device)
-            _TBO_COMM_STREAM[device] = side
-    main = torch.cuda.current_stream()
-    side.wait_stream(main)
-    with torch.cuda.stream(side):
-        result = fn(*args, **kwargs)
-    main.wait_stream(side)
-    return result
-
 
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
@@ -1436,7 +1407,7 @@ class DeepseekV4Attention(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        compress_stream: Optional[torch.cuda.Stream] = None,
+        indexer_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -1591,7 +1562,7 @@ class DeepseekV4Attention(nn.Module):
             self.indexer.compressor.rotary_emb = self.rotary_emb
 
         self.alt_stream = alt_stream
-        self.compress_stream = compress_stream
+        self.indexer_stream = indexer_stream
         self._use_async_compress = (
             self.alt_stream is not None and self.compressor is not None
         )
@@ -1657,7 +1628,7 @@ class DeepseekV4Attention(nn.Module):
         """Fire Compressor(s) on side streams, return immediately.
 
         Main Compressor → alt_stream (CSA + HCA).
-        Indexer Compressor → compress_stream (CSA only).
+        Indexer Compressor → indexer_stream (CSA only).
         Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us."""
         fc = get_forward_context()
         current_stream = fc.main_stream
@@ -1668,7 +1639,7 @@ class DeepseekV4Attention(nn.Module):
             if has_compressor:
                 self.alt_stream.wait_stream(current_stream)
             if has_indexer:
-                self.compress_stream.wait_stream(current_stream)
+                self.indexer_stream.wait_stream(current_stream)
 
             if has_compressor:
                 with torch.cuda.stream(self.alt_stream):
@@ -1679,7 +1650,7 @@ class DeepseekV4Attention(nn.Module):
                         block_tables=block_tables,
                     )
             if has_indexer:
-                with torch.cuda.stream(self.compress_stream):
+                with torch.cuda.stream(self.indexer_stream):
                     self.indexer.compressor(
                         x,
                         plan=plan,
@@ -1818,7 +1789,7 @@ class DeepseekV4Attention(nn.Module):
             if self.compressor is not None:
                 current_stream.wait_stream(self.alt_stream)
             if self.indexer is not None:
-                current_stream.wait_stream(self.compress_stream)
+                current_stream.wait_stream(self.indexer_stream)
         # ===== Compressor + Indexer =====
         if self.indexer is not None and not self.skip_topk:
             indexer_topk_batched = self.indexer.forward_batched(
@@ -2213,7 +2184,9 @@ class MoE(nn.Module):
         ), "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
         ids = fwd_input_ids.flatten()
         num_tokens = gating_output.shape[0]
-        ids = ids[:num_tokens].clamp(0, self.gate.tid2eid.shape[0] - 1)
+        assert (
+            ids.shape[0] == num_tokens
+        ), f"input_ids length {ids.shape[0]} does not match gating_output num_tokens {num_tokens}"
         topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
         scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
         topk_weights = scores.gather(dim=-1, index=topk_ids.long())
@@ -2294,7 +2267,7 @@ class MoE(nn.Module):
         if shared is not None:
             routed = routed + shared
         if self.tp_size > 1:
-            routed = _run_on_tbo_comm_stream(tensor_model_parallel_all_reduce, routed)
+            routed = tensor_model_parallel_all_reduce(routed)
         return routed
 
     def single_stream_moe_forward(
@@ -2369,7 +2342,7 @@ class Block(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        compress_stream: Optional[torch.cuda.Stream] = None,
+        indexer_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -2379,7 +2352,7 @@ class Block(nn.Module):
             args,
             prefix=f"{prefix}.attn",
             alt_stream=alt_stream,
-            compress_stream=compress_stream,
+            indexer_stream=indexer_stream,
         )
         self.ffn = MoE(layer_id, args, prefix=f"{prefix}.ffn", alt_stream=alt_stream)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -2679,13 +2652,13 @@ class DeepseekV4Model(nn.Module):
         # directly. At TP>1 each rank holds vocab_size/tp rows.
         self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
         # alt_stream: dual-stream MoE (shared_experts // routed_experts) AND
-        # Main Compressor overlap. compress_stream: Indexer Compressor overlap.
+        # Main Compressor overlap. indexer_stream: Indexer Compressor overlap.
         # Both allocated once, shared across all blocks. Attention runs before
         # MoE in each block, so attn and MoE never contend for alt_stream.
         self.alt_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
-        self.compress_stream: Optional[torch.cuda.Stream] = (
+        self.indexer_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
         self.layers = nn.ModuleList(
@@ -2695,7 +2668,7 @@ class DeepseekV4Model(nn.Module):
                     args,
                     prefix=f"layers.{layer_id}",
                     alt_stream=self.alt_stream,
-                    compress_stream=self.compress_stream,
+                    indexer_stream=self.indexer_stream,
                 )
                 for layer_id in range(args.n_layers)
             ]
@@ -2854,11 +2827,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
             # gate sees DP-gathered gating_output, so gather ids to match. Run
-            # the gather INLINE on the compute stream. The original side-stream
-            # hop (_run_on_tbo_comm_stream) coordinated this ids all-gather with
-            # a DIFFERENT stream/sync than the MoE hidden/router DP gather under
-            # TBO → mismatched DP layouts → wrong V4 hash routing (GSM8K
-            # 0.95→0.87). NOTE: do NOT wrap this in the TBO ping-pong
+            # the gather INLINE on the compute stream. Running this all-gather on
+            # a side stream coordinated it with a DIFFERENT stream/sync than the
+            # MoE hidden/router DP gather under TBO → mismatched DP layouts →
+            # wrong V4 hash routing (GSM8K 0.95→0.87). NOTE: do NOT wrap this in
+            # the TBO ping-pong
             # (tbo_yield_and_switch_*) — injecting an extra yield at forward top
             # desyncs the ping-pong ring and collapses accuracy to ~0.54
             # (measured). The ids tensor is [N,1] int (tiny vs hidden [N,7168]),
