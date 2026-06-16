@@ -372,6 +372,149 @@ def _decode_index_score_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Fused decode score + partial top-k (split-K). Combines the score kernel and
+# partial top-k into a single launch: each workgroup computes block scores for
+# its chunk AND selects local top-K, eliminating the intermediate score tensor.
+# Grid: (batch * NUM_TOPK_CHUNKS, num_idx_heads).
+# ---------------------------------------------------------------------------
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+        "TOPK_BSK": lambda args: 128,
+    }
+)
+@triton.jit
+def _fused_score_partial_topk_kernel(
+    q_ptr,            # idx_q: [batch, num_idx_heads, head_dim]
+    ik_cache_ptr,     # index-K cache: [num_pages, 128, head_dim]
+    ts_partial_ptr,   # partial scores: [NUM_TOPK_CHUNKS, num_idx_heads, batch, T]
+    ti_partial_ptr,   # partial indices: [NUM_TOPK_CHUNKS, num_idx_heads, batch, T]
+    block_table_ptr,  # [batch, max_blocks]
+    seq_lens,         # [batch] int32
+    num_idx_heads,
+    batch_size,
+    head_dim,
+    init_blocks,
+    local_blocks,
+    sm_scale,
+    topk: tl.constexpr,
+    stride_q_n, stride_q_h, stride_q_d,
+    stride_ik_blk, stride_ik_pos, stride_ik_d,
+    stride_ts_c, stride_ts_h, stride_ts_b, stride_ts_t,
+    stride_ti_c, stride_ti_h, stride_ti_b, stride_ti_t,
+    stride_bt_b,
+    BLOCK_SIZE_K: tl.constexpr,   # 128 (sparse block size)
+    BLOCK_SIZE_D: tl.constexpr,   # next_pow2(head_dim)
+    NUM_TOPK_CHUNKS: tl.constexpr,
+    TOPK_BSK: tl.constexpr,       # bitonic sort tile size (pow2, >= topk)
+    BLOCK_SIZE_T: tl.constexpr,   # next_pow2(topk)
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_bc = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_b = pid_bc % batch_size
+    pid_chunk = pid_bc // batch_size
+
+    seq_len = tl.load(seq_lens + pid_b)
+    num_blocks = (seq_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
+    chunk_blocks = (num_blocks + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
+    chunk_start = pid_chunk * chunk_blocks
+    chunk_end = tl.minimum(chunk_start + chunk_blocks, num_blocks)
+    chunk_actual = tl.maximum(chunk_end - chunk_start, 0)
+
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    d_mask = off_d < head_dim
+    q = tl.load(
+        q_ptr + pid_b * stride_q_n + pid_h * stride_q_h + off_d * stride_q_d,
+        mask=d_mask, other=0.0,
+    ).to(tl.float32)
+
+    off_k = tl.arange(0, BLOCK_SIZE_K)
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    local_start = tl.maximum(0, num_blocks - local_blocks)
+
+    # Streaming top-K over score tiles (same bitonic pattern as partial kernel)
+    off_sort = tl.arange(0, TOPK_BSK)
+    topk_score = tl.full((TOPK_BSK,), -1e30, dtype=tl.float32)
+    topk_idx = tl.full((TOPK_BSK,), 0, dtype=tl.int32)
+    left_half_mask = off_sort < TOPK_BSK // 2
+
+    for tile_start in tl.range(0, chunk_actual, TOPK_BSK):
+        tile_scores = tl.full((TOPK_BSK,), -1e30, dtype=tl.float32)
+        tile_indices = tl.full((TOPK_BSK,), 0, dtype=tl.int32)
+
+        for j in tl.range(0, TOPK_BSK):
+            blk_in_chunk = tile_start + j
+            blk = chunk_start + blk_in_chunk
+            if blk_in_chunk < chunk_actual and blk < num_blocks:
+                page = tl.load(bt_row + blk).to(tl.int64)
+                pos = blk * BLOCK_SIZE_K + off_k
+                pos_mask = pos < seq_len
+                k = tl.load(
+                    ik_cache_ptr
+                    + page * stride_ik_blk
+                    + off_k[None, :] * stride_ik_pos
+                    + off_d[:, None] * stride_ik_d,
+                    mask=d_mask[:, None] & pos_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                qk = tl.sum(q[:, None] * k, axis=0) * sm_scale_log2e
+                qk = tl.where(pos_mask, qk, float("-inf"))
+                score = tl.max(qk, axis=0)
+                is_init = blk < init_blocks
+                is_local = (blk >= local_start) & (blk < num_blocks)
+                score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
+                tile_scores = tl.where(off_sort == j, score, tile_scores)
+                tile_indices = tl.where(off_sort == j, (blk + 1).to(tl.int32), tile_indices)
+
+        n_dims: tl.constexpr = tl.standard._log2(TOPK_BSK)
+        topk_score, last_topk_score = tile_scores, topk_score
+        topk_idx, last_topk_idx = tile_indices, topk_idx
+        for jj in tl.static_range(1, n_dims):
+            topk_score, topk_idx = _bitonic_merge(
+                topk_score, topk_idx.to(tl.int32), jj, 2, n_dims
+            )
+        if tile_start != 0:
+            topk_score, topk_idx = _bitonic_merge(
+                topk_score, topk_idx.to(tl.int32), n_dims, False, n_dims
+            )
+            topk_score_new = last_topk_score * left_half_mask + topk_score * (1 - left_half_mask)
+            topk_idx_new = last_topk_idx * left_half_mask + topk_idx * (1 - left_half_mask)
+            topk_score, topk_idx = _bitonic_merge(
+                topk_score_new, topk_idx_new.to(tl.int32), n_dims, True, n_dims
+            )
+        else:
+            topk_score, topk_idx = _bitonic_merge(
+                topk_score, topk_idx.to(tl.int32), n_dims, True, n_dims
+            )
+
+    extract_mask = tl.arange(0, TOPK_BSK // BLOCK_SIZE_T) == 0
+    final_score = tl.sum(
+        extract_mask[:, None]
+        * tl.reshape(topk_score, [TOPK_BSK // BLOCK_SIZE_T, BLOCK_SIZE_T]),
+        axis=0,
+    )
+    final_idx = tl.sum(
+        extract_mask[:, None]
+        * tl.reshape(topk_idx, [TOPK_BSK // BLOCK_SIZE_T, BLOCK_SIZE_T]),
+        axis=0,
+    )
+
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    ts_ptrs = (
+        ts_partial_ptr + pid_chunk * stride_ts_c + pid_b * stride_ts_b
+        + pid_h * stride_ts_h + off_t * stride_ts_t
+    )
+    ti_ptrs = (
+        ti_partial_ptr + pid_chunk * stride_ti_c + pid_b * stride_ti_b
+        + pid_h * stride_ti_h + off_t * stride_ti_t
+    )
+    tl.store(ts_ptrs, final_score)
+    tl.store(ti_ptrs, final_idx)
+
+
+# ---------------------------------------------------------------------------
 # Decode top-k (split-K): per-chunk partial top-k + merge. Forced init/local
 # blocks are already encoded in the scores. Ported from the sglang reference.
 # ---------------------------------------------------------------------------
@@ -712,62 +855,18 @@ def minimax_m3_index_topk_decode(
         num_idx_heads == num_kv_heads
     ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     batch = total_q
-    max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
-    score = torch.empty(
-        (num_idx_heads, total_q, max_block),
-        dtype=torch.float32,
-        device=idx_q.device,
-    )
-    # split-K over seq blocks; chunk count depends only on shape constants so
-    # the grid is fixed within a cuda graph.
-    TARGET_GRID = 4096
-    MAX_NUM_KV_CHUNKS = 256
-    target = max(
-        1, min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch * num_idx_heads))
-    )
-    num_kv_chunks = 1 << (target.bit_length() - 1)
-    grid_score = (batch * num_kv_chunks, num_idx_heads)
-    _decode_index_score_kernel[grid_score](
-        idx_q,
-        index_kv_cache,
-        score,
-        block_table,
-        seq_lens,
-        num_idx_heads,
-        batch,
-        head_dim,
-        init_blocks,
-        local_blocks,
-        sm_scale,
-        idx_q.stride(0),
-        idx_q.stride(1),
-        idx_q.stride(2),
-        index_kv_cache.stride(0),
-        index_kv_cache.stride(1),
-        index_kv_cache.stride(2),
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        block_table.stride(0),
-        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        NUM_KV_CHUNKS=num_kv_chunks,
-    )
-
-    topk_idx = torch.empty(
-        (num_idx_heads, total_q, topk),
-        dtype=torch.int32,
-        device=idx_q.device,
-    )
     # Chunk count is shape-constant (cudagraph-safe), capped so the merge sorts
-    # pow2(num_topk_chunks * pow2(topk)) candidates.
-    TOPK_TARGET_GRID = 64
+    # pow2(num_topk_chunks * pow2(topk)) candidates.  The fused kernel does
+    # score+topk per workgroup, so it needs a larger grid than the old partial
+    # kernel (which only did topk on pre-computed scores).
+    TOPK_TARGET_GRID = 512
     MAX_NUM_TOPK_CHUNKS = 16
     topk_target = max(
         1, min(MAX_NUM_TOPK_CHUNKS, TOPK_TARGET_GRID // max(1, batch * num_idx_heads))
     )
     num_topk_chunks = 1 << (topk_target.bit_length() - 1)
     block_size_t = triton.next_power_of_2(topk)
-    chunk_blocks = (max_block + num_topk_chunks - 1) // num_topk_chunks
+
     topk_score_partial = torch.empty(
         num_topk_chunks,
         num_idx_heads,
@@ -784,17 +883,28 @@ def minimax_m3_index_topk_decode(
         dtype=torch.int32,
         device=idx_q.device,
     )
-    _topk_index_partial_kernel[(batch, num_idx_heads, num_topk_chunks)](
-        score,
+
+    grid_fused = (batch * num_topk_chunks, num_idx_heads)
+    _fused_score_partial_topk_kernel[grid_fused](
+        idx_q,
+        index_kv_cache,
         topk_score_partial,
         topk_idx_partial,
+        block_table,
         seq_lens,
-        SPARSE_BLOCK_SIZE,
+        num_idx_heads,
+        batch,
+        head_dim,
+        init_blocks,
+        local_blocks,
+        sm_scale,
         topk,
-        chunk_blocks,
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
+        idx_q.stride(0),
+        idx_q.stride(1),
+        idx_q.stride(2),
+        index_kv_cache.stride(0),
+        index_kv_cache.stride(1),
+        index_kv_cache.stride(2),
         topk_score_partial.stride(0),
         topk_score_partial.stride(1),
         topk_score_partial.stride(2),
@@ -803,6 +913,16 @@ def minimax_m3_index_topk_decode(
         topk_idx_partial.stride(1),
         topk_idx_partial.stride(2),
         topk_idx_partial.stride(3),
+        block_table.stride(0),
+        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        NUM_TOPK_CHUNKS=num_topk_chunks,
+        BLOCK_SIZE_T=block_size_t,
+    )
+
+    topk_idx = torch.empty(
+        (num_idx_heads, total_q, topk),
+        dtype=torch.int32,
+        device=idx_q.device,
     )
     _topk_index_merge_kernel[(batch, num_idx_heads)](
         topk_score_partial,
