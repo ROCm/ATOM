@@ -672,7 +672,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         num_layers = runner.kv_cache.shape[0]
         for layer_id in range(num_layers):
             t = runner.kv_cache[layer_id]
-            bpb = t.stride(0) * t.element_size()
+            bpb = t.stride(0) * t.element_size() * self.block_ratio
             block_regions.append(
                 KVTransferRegion(
                     base_addr=t.data_ptr(),
@@ -684,7 +684,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if hasattr(runner, "index_cache"):
             for layer_id in range(runner.index_cache.shape[0]):
                 t = runner.index_cache[layer_id]
-                bpb = t.stride(0) * t.element_size()
+                bpb = t.stride(0) * t.element_size() * self.block_ratio
                 block_regions.append(
                     KVTransferRegion(
                         base_addr=t.data_ptr(),
@@ -696,7 +696,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
-            num_blocks=runner.num_physical_kvcache_blocks,
+            num_blocks=runner.config.num_kvcache_blocks,
         )
 
     def prepare_prefill(self, batch: ScheduledBatch):
@@ -1389,4 +1389,79 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.sparse_kv_indptr[ts.start : ts.stop + 1] - base
             )
 
+        # ── Token-midpoint split straddle handling ──────────────────────
+        self._attach_tbo_token_split_straddle_prefix(attn_metadata, ub_attn, ub_slice)
+
         return ub_attn
+
+    # ================================================================
+    # TBO PREFILL TOKEN-SPLIT (ATOM_TBO_PREFILL_TOKEN_SPLIT) — MLA path
+    # ================================================================
+
+    def _attach_tbo_token_split_straddle_prefix(self, attn_metadata, ub_attn, ub_slice):
+        """If this ubatch's first request is cut from a previous ubatch, attach
+        the prior portion's KV-cache slots as chunked cached prefixes so dense
+        MLA attention can see it (token-midpoint split correctness). No-op when
+        not straddling."""
+        from atom.utils.tbo import compute_straddle_split_info
+
+        if self.k_chunk_workspace is None:
+            return  # chunked workspace disabled → cannot serve a prefix
+
+        cu_np = self.model_runner.forward_vars["cu_seqlens_q"].np
+        info = compute_straddle_split_info(cu_np, ub_slice)
+        if not info.is_straddling:
+            return  # not straddling — first request starts at the slice edge
+
+        ts = ub_slice.token_slice
+        req_global_start = info.req_global_start
+        prefix_len = info.prefix_len
+        ub_num_reqs = info.ub_num_reqs
+
+        slot_mapping = attn_metadata.slot_mapping
+        if slot_mapping is None:
+            return
+        # Physical KV-cache slots of the straddled request's first half
+        # (written by the previous ubatch). MLA block_size==1, so slot ids are
+        # the gather kv_indices directly.
+        prefix_slots = slot_mapping[req_global_start : ts.start].to(torch.int32)
+
+        device = prefix_slots.device
+        # Only the first (straddled) request has a cached prefix; all other
+        # requests in this ubatch contribute 0 cached tokens. Chunk the prefix
+        # along the token axis so each chunk fits the k/v workspace
+        # (attn_prefill_chunk_size), mirroring _build_mla_chunk_meta.
+        chunk_size = self.attn_prefill_chunk_size
+        num_chunks = max(1, cdiv(prefix_len, chunk_size))
+        kv_indptr_list = []
+        kv_indices_list = []
+        total_tokens_list = []
+        max_seqlen_k_list = []
+        for c in range(num_chunks):
+            c_lo = c * chunk_size
+            c_hi = min(c_lo + chunk_size, prefix_len)
+            c_len = c_hi - c_lo
+            cu = np.full(ub_num_reqs + 1, c_len, dtype=np.int32)
+            cu[0] = 0
+            kv_indptr_list.append(
+                torch.from_numpy(cu).pin_memory().to(device, non_blocking=True)
+            )
+            kv_indices_list.append(prefix_slots[c_lo:c_hi])
+            total_tokens_list.append(c_len)
+            max_seqlen_k_list.append(c_len)
+
+        ub_attn.has_cached = True
+        # total_kv = this ubatch's new tokens + the straddle prefix it now reads
+        # from cache. Only referenced by the chunked-prefill debug log, but keep
+        # it consistent to avoid a None in "%d" formatting.
+        ub_attn.total_kv = int(info.ub_num_tokens + prefix_len)
+        ub_attn.mla_chunk_meta = MLAChunkContextMetadata(
+            kv_indptr=kv_indptr_list,
+            kv_indices=kv_indices_list,
+            cu_seqlens_k=kv_indptr_list,
+            total_tokens=total_tokens_list,
+            max_seqlen_k=max_seqlen_k_list,
+            num_chunks=num_chunks,
+            k_workspace=self.k_chunk_workspace,
+            v_workspace=self.v_chunk_workspace,
+        )

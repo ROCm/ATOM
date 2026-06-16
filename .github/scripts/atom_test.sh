@@ -5,7 +5,44 @@ TYPE=${1:-launch}
 MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
 ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
+ATOM_SERVER_PORT=${ATOM_SERVER_PORT:-8000}
 
+print_device_mapping_debug() {
+  [ "${ATOM_DEBUG_DEVICE_MAPPING:-0}" = "1" ] || return 0
+
+  echo ""
+  echo "========== PyTorch HIP device mapping before ATOM launch =========="
+  python3 - <<'PY'
+import os
+
+keys = [
+    "HIP_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "LOCAL_RANK",
+    "RANK",
+    "WORLD_SIZE",
+]
+for key in keys:
+    print(f"{key}={os.environ.get(key)}")
+
+try:
+    import torch
+except Exception as exc:
+    print(f"torch import failed: {type(exc).__name__}: {exc}")
+    raise SystemExit(0)
+
+print(f"torch.version.hip={getattr(torch.version, 'hip', None)}")
+print(f"torch.cuda.is_available={torch.cuda.is_available()}")
+try:
+    count = torch.cuda.device_count()
+    print(f"torch.cuda.device_count={count}")
+    for index in range(count):
+        print(f"device[{index}]={torch.cuda.get_device_name(index)}")
+except Exception as exc:
+    print(f"torch cuda probe failed: {type(exc).__name__}: {exc}")
+PY
+}
 
 if [ "$TYPE" == "launch" ]; then
   echo ""
@@ -33,7 +70,9 @@ if [ "$TYPE" == "launch" ]; then
   fi
 
   ATOM_SERVER_LOG="/tmp/atom_server.log"
-  PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
+  SERVER_PORT_ARGS=("--server-port" "$ATOM_SERVER_PORT")
+  print_device_mapping_debug
+  PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${SERVER_PORT_ARGS[@]}" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
   tail -f "$ATOM_SERVER_LOG" &
   _tail_launch_pid=$!
@@ -52,7 +91,7 @@ if [ "$TYPE" == "launch" ]; then
           tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
           exit 1
       fi
-      if curl -sf http://localhost:8000/health -o /dev/null; then
+      if curl -sf "http://localhost:${ATOM_SERVER_PORT}/health" -o /dev/null; then
           echo "ATOM server HTTP endpoint is up."
           server_up=true
           break
@@ -79,7 +118,7 @@ if [ "$TYPE" == "launch" ]; then
           tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
           exit 1
       fi
-      if curl -sf http://localhost:8000/v1/completions \
+      if curl -sf "http://localhost:${ATOM_SERVER_PORT}/v1/completions" \
           -H "Content-Type: application/json" \
           -d '{"model":"'"$MODEL_PATH"'","prompt":"hi","max_tokens":1}' \
           -o /dev/null --max-time 120; then
@@ -181,7 +220,7 @@ PY
     set -m
     (
       lm_eval --model local-completions \
-              --model_args "model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+              --model_args "model=${MODEL_PATH},base_url=http://localhost:${ATOM_SERVER_PORT}/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
               --tasks gsm8k \
               --num_fewshot 3 \
               --output_path "${OUTPUT_PATH}" \
@@ -392,7 +431,7 @@ if [ "$TYPE" == "benchmark" ]; then
   set -m
   (
     python -m atom.benchmarks.benchmark_serving \
-      --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
+      --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:${ATOM_SERVER_PORT}" \
       --dataset-name=random \
       --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
       --max-concurrency=$CONC \
@@ -414,7 +453,7 @@ if [ "$TYPE" == "benchmark" ]; then
   # c=1024 with num_prompts=conc*10) take ~48 min wall (warmup + 10240 reqs);
   # 30 min cut them off mid-run (drain exit 4). Real hangs/faults still
   # surface fast via STUCK_POLLS / fault detection, not MAX_MIN.
-  bash scripts/wait_infer_drain.sh 8000 60 10 "$ATOM_CLIENT_LOG" 18
+  bash scripts/wait_infer_drain.sh ${ATOM_SERVER_PORT} 60 10 "$ATOM_CLIENT_LOG" 18
   DRAIN_RC=$?
   if [ "$DRAIN_RC" -ne 0 ]; then
     echo "wait_infer_drain.sh exit=$DRAIN_RC — killing benchmark pgid $CLIENT_PID"

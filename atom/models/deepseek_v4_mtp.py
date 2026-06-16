@@ -43,6 +43,7 @@ from atom.utils.forward_context import get_forward_context
 from .deepseek_v4 import (
     Block,
     DeepseekV4Args,
+    HCState,
     ParallelHead,
     make_v4_quant_config,
 )
@@ -127,7 +128,14 @@ class MTPBlock(Block):
         n_tok, hc, d = x.shape
         h_proj_out = self.h_proj(x.reshape(n_tok * hc, d)).reshape(n_tok, hc, d)
         x = self.e_proj(e).unsqueeze(-2) + h_proj_out  # [num_tokens, hc, dim]
-        return super().forward(x, positions)  # [num_tokens, hc, dim]
+        hc_state = HCState(residual=x, post_mix=None, comb_mix=None, x_prev=None)
+        hc_state = super().forward(hc_state, positions)
+        return self.hc_post(
+            hc_state.x_prev,
+            hc_state.residual,
+            hc_state.post_mix,
+            hc_state.comb_mix,
+        )
 
 
 class DeepseekV4MTPModel(nn.Module):
@@ -213,7 +221,11 @@ class DeepseekV4MTP(nn.Module):
         self.atom_config = config
         self.hf_config = config.hf_config
         self.args = DeepseekV4Args.from_hf_config(self.hf_config)
-        self.args.quant_config = make_v4_quant_config(self.hf_config)
+        self.args.quant_config = make_v4_quant_config(
+            self.hf_config,
+            online_quant_config=getattr(config, "online_quant_config", None),
+        )
+        self.atom_config.quant_config = self.args.quant_config
         self.model = DeepseekV4MTPModel(atom_config=config, args=self.args)
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
@@ -227,15 +239,28 @@ class DeepseekV4MTP(nn.Module):
         """
         return name if "mtp." in name else None
 
+    @property
+    def disable_fused_shared_loading(self) -> bool:
+        """True when MTP shared experts are standalone, not fused into FusedMoE."""
+        for m in self.model.modules():
+            if m.__class__.__name__ == "MoE":
+                return not getattr(m, "_fuse_shared_into_routed", True)
+        return False
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """FusedMoE expert param mapping for MTPBlock's MoE layer. Same
         ckpt convention as the target (`ffn.experts.{e}.w{1,2,3}`).
         """
+        num_fused_shared = 0
+        for m in self.model.modules():
+            if m.__class__.__name__ == "FusedMoE":
+                num_fused_shared = getattr(m, "num_fused_shared_experts", 0)
+                break
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.args.n_routed_experts,
+            num_experts=self.args.n_routed_experts + num_fused_shared,
         )
 
     def forward(

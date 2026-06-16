@@ -68,6 +68,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    use_fp4_non_shuffle_triton_gemm,
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
@@ -136,6 +137,32 @@ _FP8_DTYPES = tuple(
 )
 
 
+def _enable_non_triton_global_mxfp4_input_norm_quant(
+    config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
+    quant_dtype: Optional[torch.dtype],
+    is_mtp_block: bool,
+) -> bool:
+    if (
+        is_mtp_block
+        or quant_dtype != dtypes.fp4x2
+        or quant_config is None
+        or quant_config.quant_method != "quark"
+        or quant_config.quant_dtype != dtypes.fp4x2
+        or quant_config.layer_pattern_specs
+    ):
+        return False
+    architectures = set(getattr(config, "architectures", None) or [])
+    return bool(
+        architectures & {"DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"}
+    ) or str(getattr(config, "model_type", "")).lower() in {
+        "deepseek_v2",
+        "deepseek_v3",
+        "deepseek_v32",
+        "deepseek_v4",
+    }
+
+
 def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
     if not hasattr(config, "index_topk"):
         return False
@@ -169,6 +196,31 @@ def _can_fuse_indexer_wk_weights_proj(
     return True
 
 
+def _extract_layer_index_from_prefix(prefix: str) -> int:
+    for part in reversed(prefix.split(".")):
+        if part.isdigit():
+            return int(part)
+    return 0
+
+
+def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
+    if not getattr(config, "use_index_cache", False):
+        return False
+
+    layer_id = _extract_layer_index_from_prefix(prefix)
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is not None:
+        return (
+            0 <= layer_id < len(index_topk_pattern)
+            and index_topk_pattern[layer_id] == "S"
+        )
+
+    index_topk_freq = int(getattr(config, "index_topk_freq", 1))
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    return max(layer_id - 1, 0) % index_topk_freq != 0
+
+
 def _fuse_rmsnorm_fp4_quant_fake(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -194,8 +246,12 @@ def _fuse_rmsnorm_fp4_quant_fake(
 
     scale_n_valid = (n1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
 
-    scale_m = ((m + 255) // 256) * 256
-    scale_n = ((scale_n_valid + 7) // 8) * 8
+    if scale_shuffle_padding:
+        scale_m = ((m + 255) // 256) * 256
+        scale_n = ((scale_n_valid + 7) // 8) * 8
+    else:
+        scale_m = m
+        scale_n = scale_n_valid
 
     out1_bs = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=x1.device)
 
@@ -209,6 +265,15 @@ def _fuse_rmsnorm_fp4_quant_fake(
 
     out1_unquantized = None
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+
+
+def _mxfp4_activation_quant_layout(num_tokens: int) -> Tuple[bool, bool]:
+    if use_fp4_non_shuffle_triton_gemm():
+        return False, False
+    if use_triton_gemm():
+        should_shuffle = num_tokens >= MXFP4_QUANT_BLOCK_SIZE
+        return should_shuffle, should_shuffle
+    return True, True
 
 
 def _fused_rms_fp8_quant_fake(
@@ -274,10 +339,6 @@ def _fuse_rmsnorm_fp4_quant(
     torch.Tensor,
     torch.Tensor,
 ]:
-    m = x1.shape[0]
-
-    shuffle_bool = shuffle and (m >= MXFP4_QUANT_BLOCK_SIZE)
-
     (out1_quantized, out1_bs), _out1_unquantized, out2, out_res1 = (
         fused_rms_mxfp4_quant(
             x1=x1,
@@ -287,7 +348,7 @@ def _fuse_rmsnorm_fp4_quant(
             x2_weight=x2_weight,
             x2_epsilon=0.0 if x2_epsilon is None else x2_epsilon,
             res1=res1,
-            shuffle=shuffle_bool,
+            shuffle=shuffle,
             scale_shuffle_padding=scale_shuffle_padding,
             output_unquantized_inp1=output_unquantized_inp1,
         )
@@ -436,8 +497,12 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
     device = hidden_states_quant.device
     q_c = torch.empty((M, q_lora_rank // 2), dtype=torch.uint8, device=device)
     scale_n_valid = (q_lora_rank + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-    scale_m = ((M + 255) // 256) * 256
-    scale_n = ((scale_n_valid + 7) // 8) * 8
+    if scale_shuffle_padding:
+        scale_m = ((M + 255) // 256) * 256
+        scale_n = ((scale_n_valid + 7) // 8) * 8
+    else:
+        scale_m = M
+        scale_n = scale_n_valid
     q_c_scale = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=device)
     kv_c_normed = torch.empty((M, kv_lora_rank), dtype=torch.bfloat16, device=device)
     k_pe = torch.empty(
@@ -870,9 +935,15 @@ class DeepseekV2MoE(nn.Module):
         self._use_dual_stream = False
         self.alt_stream = alt_stream
         self.prefix = prefix
+        self.is_rocm_aiter_fusion_shared_expert_enabled = (
+            is_rocm_aiter_fusion_shared_expert_enabled(
+                shared_expert_prefix=f"{prefix}.shared_experts",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
+        )
 
         if config.n_shared_experts is not None:
-            if not is_rocm_aiter_fusion_shared_expert_enabled():
+            if not self.is_rocm_aiter_fusion_shared_expert_enabled:
                 tbo_active = get_current_atom_config().enable_tbo
                 if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                     self._use_dual_stream = True
@@ -945,7 +1016,7 @@ class DeepseekV2MoE(nn.Module):
         shared_output = None
         if (
             self.n_shared_experts is not None
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             shared_output = self.shared_experts(hidden_states)
 
@@ -1723,8 +1794,10 @@ class DeepseekV2MLAAttention(nn.Module):
             self.scaling = self.scaling * mscale * mscale
 
         self.is_v32 = hasattr(config, "index_topk")
+        self.skip_topk = False
 
         if self.is_v32:
+            self.skip_topk = _should_skip_index_topk(config, prefix)
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
@@ -1844,6 +1917,12 @@ class DeepseekV2MLAAttention(nn.Module):
                 )
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
                 if self.fuse_qknorm_quant or self.fuse_qknorm:
+                    q_shuffle = False
+                    q_scale_shuffle_padding = False
+                    if self.quant_dtype == dtypes.fp4x2 and not use_triton_gemm():
+                        q_shuffle, q_scale_shuffle_padding = (
+                            _mxfp4_activation_quant_layout(q_c.shape[0])
+                        )
                     (
                         (hidden_states_or_q_c, hidden_states_or_q_c_scale),
                         _,
@@ -1858,8 +1937,8 @@ class DeepseekV2MLAAttention(nn.Module):
                         self.kv_a_layernorm.eps,
                         None,
                         dtype_quant=self.quant_dtype,
-                        shuffle=False,
-                        scale_shuffle_padding=False,
+                        shuffle=q_shuffle,
+                        scale_shuffle_padding=q_scale_shuffle_padding,
                         group_size=128,
                         quant_type=self.qknorm_quant_type,
                         output_unquantized_inp1=False,
@@ -1877,7 +1956,7 @@ class DeepseekV2MLAAttention(nn.Module):
         if not self.fuse_qknorm_quant and not self.fuse_qknorm:
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
-        if self.is_v32 and self.indexer is not None:
+        if self.is_v32 and self.indexer is not None and not self.skip_topk:
             self.indexer(
                 hidden_states,
                 hidden_states_or_q_c,
@@ -1932,7 +2011,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
 
-        # When ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on self.fuse_input_norm_quant is turned on only if use_triton_gemm and (FP8 or FP4),
+        # Keep input RMSNorm quant fusion narrow: the legacy FP8/FP4 path uses
+        # Triton GEMM, while the non-Triton FP4 path is only enabled for the
+        # pure global MXFP4 DeepSeek v2 checkpoint layout.
         # Because AR_RMS and RMS_Quant cannot co-exist for input_layernorm, this block of codes ensures 3 things when ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on:
         #   1. RMS_Quant fusion is only used for input_layernorm
         #   2. The reduce_results variable is re-enabled for feed forward layers (MOE and MLP), because AR_RMS is now disabled in the beginning of the next layer
@@ -1950,9 +2031,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
-            if (
-                self.quant_dtype == dtypes.fp8 or self.quant_dtype == dtypes.fp4x2
-            ) and use_triton_gemm():
+            enable_fp8_input_norm_quant = (
+                self.quant_dtype == dtypes.fp8 and use_triton_gemm()
+            )
+            enable_fp4_input_norm_quant = self.quant_dtype == dtypes.fp4x2 and (
+                use_triton_gemm()
+                or _enable_non_triton_global_mxfp4_input_norm_quant(
+                    config,
+                    quant_config,
+                    self.quant_dtype,
+                    is_mtp_block,
+                )
+            )
+            if enable_fp8_input_norm_quant or enable_fp4_input_norm_quant:
                 self.fuse_input_norm_quant = True
                 if self.fuse_ar_input_norm:
                     self.fuse_ar_input_norm = False
@@ -1960,11 +2051,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                         logger.info(
                             "Warning: Because ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on, AR + RMS fusion is turned off for input_layernorm and reduce_results is re-enabled for first k dense layer down_proj"
                         )
-            else:
-                if layer_idx == 0:
-                    logger.info(
-                        "Info: Because ATOM_USE_TRITON_GEMM is not turned on in DeepSeek-R1, ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned off automatically"
-                    )
 
         if (
             config.n_routed_experts is not None
@@ -2015,6 +2101,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
+            if self.quant_dtype == dtypes.fp4x2:
+                shuffle_input_norm_quant, scale_shuffle_padding = (
+                    _mxfp4_activation_quant_layout(hidden_states.shape[0])
+                )
+            else:
+                shuffle_input_norm_quant = True
+                scale_shuffle_padding = True
             if residual is None:
                 residual = hidden_states
                 (hidden_states_quant, hidden_states_quant_scale), _, _, _ = (
@@ -2027,8 +2120,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                         None,
                         None,
                         dtype_quant=self.quant_dtype,
-                        shuffle=True,
-                        scale_shuffle_padding=True,
+                        shuffle=shuffle_input_norm_quant,
+                        scale_shuffle_padding=scale_shuffle_padding,
                         group_size=128,
                         quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
@@ -2046,8 +2139,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                         None,
                         residual,
                         dtype_quant=self.quant_dtype,
-                        shuffle=True,
-                        scale_shuffle_padding=True,
+                        shuffle=shuffle_input_norm_quant,
+                        scale_shuffle_padding=scale_shuffle_padding,
                         group_size=128,
                         quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
@@ -2207,11 +2300,7 @@ class DeepseekV2Model(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
-                else 0
-            ),
+            + (self.config.n_shared_experts or 0),
         )
 
 

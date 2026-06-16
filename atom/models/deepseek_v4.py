@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Tuple, cast
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
 
+import threading
+
 import aiter
 import torch
 import torch.nn.functional as F
@@ -42,7 +44,6 @@ from aiter.dist.communication_op import (
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -78,7 +79,9 @@ from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
-from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.topK import (
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
+)
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (
@@ -99,6 +102,34 @@ from atom.utils.forward_context import AttnState, get_forward_context
 from torch import nn
 
 logger = logging.getLogger(__name__)
+
+# Per-device auxiliary stream for TBO-adjacent collectives (DP input_ids
+# all-gather hoisted into DeepseekV4ForCausalLM.forward, MoE combine_outputs
+# TP all-reduce). Submitting these on a dedicated stream keeps the main
+# compute lane free of nccl interleaving so it can hardware-overlap with
+# TBO's own comm_stream.
+_TBO_COMM_STREAM: dict = {}
+_TBO_COMM_STREAM_LOCK = threading.Lock()
+
+
+def _run_on_tbo_comm_stream(fn, *args, **kwargs):
+    # Without TBO there is no second compute/comm stream to overlap with,
+    # so the side-stream hop only adds event/sync overhead. Run inline.
+    if not get_current_atom_config().enable_tbo:
+        return fn(*args, **kwargs)
+    device = torch.cuda.current_device()
+    with _TBO_COMM_STREAM_LOCK:
+        side = _TBO_COMM_STREAM.get(device)
+        if side is None:
+            side = torch.cuda.Stream(device=device)
+            _TBO_COMM_STREAM[device] = side
+    main = torch.cuda.current_stream()
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        result = fn(*args, **kwargs)
+    main.wait_stream(side)
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
@@ -134,34 +165,6 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
-
-
-def _hc_head_reduce_fake(
-    x: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_eps: float,
-    hc_eps: float,
-) -> torch.Tensor:
-    return torch.empty(x.shape[0], x.shape[-1], dtype=x.dtype, device=x.device)
-
-
-@torch_compile_guard(gen_fake=_hc_head_reduce_fake, mutates_args=[])
-def _hc_head_reduce(
-    x: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_eps: float,
-    hc_eps: float,
-) -> torch.Tensor:
-    x_flat = x.flatten(-2)
-    x_normed = _rmsnorm_nw(x_flat, norm_eps, x_flat.shape[-1])
-    mixes = F.linear(x_normed.float(), hc_fn)
-    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
-    y = torch.sum(pre.unsqueeze(-1) * x, dim=-2)
-    return y.to(x.dtype)
 
 
 def _v4_attention_fake(
@@ -222,6 +225,9 @@ class DeepseekV4Args:
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 1024
+    use_index_cache: bool = False
+    index_topk_freq: int = 1
+    index_topk_pattern: Optional[Any] = None
 
     # MoE
     moe_inter_dim: int = 3072  # moe_intermediate_size
@@ -284,6 +290,9 @@ class DeepseekV4Args:
             index_n_heads=g("index_n_heads", 64),
             index_head_dim=g("index_head_dim", 128),
             index_topk=g("index_topk", 1024),
+            use_index_cache=bool(g("use_index_cache", False)),
+            index_topk_freq=int(g("index_topk_freq", 1)),
+            index_topk_pattern=g("index_topk_pattern", None),
             moe_inter_dim=g("moe_intermediate_size", 2048),
             n_routed_experts=g("n_routed_experts", 256),
             n_shared_experts=g("n_shared_experts", 1),
@@ -304,6 +313,43 @@ class DeepseekV4Args:
             # HF config.json does not carry this field, only inference/config.json does.
             scale_fmt=g("scale_fmt", "ue8m0"),
         )
+
+
+def _v4_index_topk_refreshes(args: DeepseekV4Args, layer_id: int) -> bool:
+    index_topk_pattern = args.index_topk_pattern
+    if index_topk_pattern is not None:
+        return not (
+            0 <= layer_id < len(index_topk_pattern)
+            and index_topk_pattern[layer_id] == "S"
+        )
+
+    index_topk_freq = int(args.index_topk_freq)
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    csa_ordinal = (
+        sum(1 for ratio in args.compress_ratios[: layer_id + 1] if ratio == 4) - 1
+    )
+    if csa_ordinal < 0:
+        return False
+    return csa_ordinal % index_topk_freq == 0
+
+
+def _should_skip_v4_index_topk(args: DeepseekV4Args, layer_id: int) -> bool:
+    if not args.use_index_cache:
+        return False
+    if args.compress_ratios[layer_id] != 4:
+        return False
+    if _v4_index_topk_refreshes(args, layer_id):
+        return False
+
+    # V4 writes CSA indices into a shared per-forward buffer and immediately
+    # consumes it. A skip layer is safe only after an earlier CSA refresh layer
+    # has populated that buffer in the same forward pass.
+    return any(
+        args.compress_ratios[prev_layer] == 4
+        and _v4_index_topk_refreshes(args, prev_layer)
+        for prev_layer in range(layer_id - 1, -1, -1)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +399,10 @@ def _wo_a_is_bf16_on_disk(model_path):
 
         with safe_open(os.path.join(model_path, wmap[probe]), framework="pt") as h:
             w = h.get_slice(probe)
-            if w.dtype == torch.bfloat16:
+            w_dtype = (
+                w.get_dtype() if hasattr(w, "get_dtype") else getattr(w, "dtype", None)
+            )
+            if w_dtype in (torch.bfloat16, "BF16"):
                 return True  # BF16 weight; no scale needed regardless of index
             if not scale_present_in_idx:
                 return False
@@ -367,7 +416,7 @@ def _wo_a_is_bf16_on_disk(model_path):
     return False
 
 
-def make_v4_quant_config(hf_config, model_path=None):
+def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
     """Build a QuantizationConfig that knows V4's per-layer quant scheme.
 
     Two V4 SKUs supported:
@@ -391,9 +440,17 @@ def make_v4_quant_config(hf_config, model_path=None):
       - `Compressor.wkv` / `Compressor.wgate` / `indexer.weights_proj`: BF16
         (or fp32 internally; reference declares dtype= explicitly). Loaded raw.
       - All RMSNorm weights, attn_sink, hc_*: BF16/fp32 raw, no quant.
+
+    The optional ``online_quant_config`` is forwarded to the base
+    QuantizationConfig so V4 models can also be re-quantized at load time
+    (e.g. ``ptpc_fp8`` / ``mxfp4``). V4's hardcoded per-layer overrides
+    (FP4 routed experts, BF16 compressor / indexer.weights_proj) are
+    preserved on BOTH the source lookup AND the online lookup — returning
+    the same spec on the online path triggers the FusedMoE/Linear
+    ``source == online_target`` early-return so those layers stay untouched.
     """
 
-    base = QuantizationConfig(hf_config)
+    base = QuantizationConfig(hf_config, online_quant_config=online_quant_config)
 
     fp4_spec = LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2)
     # FP8 per-block 128x128 — V4-Flash-Base routed path.
@@ -427,12 +484,18 @@ def make_v4_quant_config(hf_config, model_path=None):
 
     orig_lookup = base.get_layer_quant_config
 
-    def overridden(layer_name, *, check_children=False):
+    def overridden(layer_name, use_online_quant=False, *, check_children=False):
         # Routed experts → SKU-detected (FP4 for V4-Pro, FP8-block for V4-Flash).
         # Match both per-expert prefix `layers.N.ffn.experts.M.w{1,2,3}` (used
         # by individual Linear lookups, with trailing `.M.w1`) AND the bare
         # `layers.N.ffn.experts` prefix (used by FusedMoE.__init__ when
         # constructing fused expert params — has NO trailing dot).
+        #
+        # V4 hardcoded specs apply on BOTH source AND online lookups. When
+        # online_quant is enabled, returning the source spec here means
+        # FusedMoE/Linear see `source == online_target` and skip the
+        # dequant→requant round-trip for these layers (which would either
+        # crash on the moe assert or further damage already-quantized weights).
         if ".ffn.experts" in layer_name:
             return routed_spec
         # BF16 / fp32 raw paths
@@ -445,9 +508,15 @@ def make_v4_quant_config(hf_config, model_path=None):
         # V4-Flash-FP8 layout: wo_a is BF16 on disk — allocate as BF16 directly
         # so the loader receives matching dtype. Other SKUs let wo_a allocate
         # as FP8 + scale and DeepseekV4Attention dequants at load time.
-        if wo_a_is_bf16 and ".wo_a" in layer_name:
+        # When online_quant is enabled, also keep wo_a BF16 so
+        # the dequant→requant round-trip is skipped for this layer.
+        if ".wo_a" in layer_name and (wo_a_is_bf16 or use_online_quant):
             return no_spec
-        return orig_lookup(layer_name, check_children=check_children)
+        return orig_lookup(
+            layer_name,
+            use_online_quant=use_online_quant,
+            check_children=check_children,
+        )
 
     base.get_layer_quant_config = overridden
     return base
@@ -1395,6 +1464,7 @@ class DeepseekV4Attention(nn.Module):
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
         self.scale_fmt = args.scale_fmt
+        self.skip_topk = False
 
         qc = args.quant_config
         p = prefix  # e.g. "layers.7.attn"
@@ -1459,6 +1529,7 @@ class DeepseekV4Attention(nn.Module):
             )
             if self.compress_ratio == 4:
                 self.indexer = Indexer(args, self.compress_ratio, prefix=f"{p}.indexer")
+                self.skip_topk = _should_skip_v4_index_topk(args, layer_id)
             else:
                 self.indexer = None
         else:
@@ -1592,7 +1663,7 @@ class DeepseekV4Attention(nn.Module):
         current_stream = fc.main_stream
         use_async_compress = self._use_async_compress and fc.in_hipgraph
         has_compressor = self.compressor is not None
-        has_indexer = self.indexer is not None
+        has_indexer = self.indexer is not None and not self.skip_topk
         if use_async_compress:
             if has_compressor:
                 self.alt_stream.wait_stream(current_stream)
@@ -1679,7 +1750,6 @@ class DeepseekV4Attention(nn.Module):
         # compress_plans, ...) is well-typed for pyright.
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         compress_plans = attn_md.compress_plans
-        v4_batch_id_per_token = attn_md.batch_id_per_token
         block_tables_gpu = attn_md.block_tables
         state_slot_mapping = attn_md.state_slot_mapping
         plan_for_layer = compress_plans[ratio] if ratio else None
@@ -1750,7 +1820,7 @@ class DeepseekV4Attention(nn.Module):
             if self.indexer is not None:
                 current_stream.wait_stream(self.compress_stream)
         # ===== Compressor + Indexer =====
-        if self.indexer is not None:
+        if self.indexer is not None and not self.skip_topk:
             indexer_topk_batched = self.indexer.forward_batched(
                 x_full=x,
                 qr_full=qr,
@@ -2059,40 +2129,12 @@ class MoE(nn.Module):
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
         assert args.n_shared_experts == 1
-        # aiter can fuse shared expert into the routed FusedMoE kernel ONLY
-        # when shared and routed have the same quant dtype.
-        # `is_rocm_aiter_fusion_shared_expert_enabled` compares shared vs
-        # GLOBAL (=base dtype), but V4-Pro has routed=FP4 (per-layer override
-        # for `.ffn.experts`) and shared=FP8 (=global). The function returns
-        # True for V4 because shared matches global, missing the routed-shared
-        # mismatch. Direct comparison: get routed and shared specs and compare.
-        routed_spec = qc.get_layer_quant_config(f"{prefix}.experts")
-        shared_spec = qc.get_layer_quant_config(f"{prefix}.shared_experts")
-        routed_dtype = routed_spec.quant_dtype
-        shared_dtype = shared_spec.quant_dtype
-        # aiter's fused shared+routed kernel is broken on gfx942 with FP8
-        # per-block routed experts (V4-Flash-Base on MI308 produces garbage
-        # output unless we run shared and routed as 2 separate kernels). Auto-
-        # disable in that combination; explicit env override always wins.
-        env_override = os.environ.get("ATOM_V4_DISABLE_FUSED_SHARED")
-        if env_override is not None:
-            disable_fused = env_override == "1"
-        else:
-            try:
-                from aiter.jit.utils.chip_info import get_gfx
-
-                gfx = get_gfx() or ""
-            except Exception:
-                gfx = ""
-            disable_fused = (
-                gfx.startswith("gfx94")
-                and routed_spec.quant_type == QuantType.per_1x128
-                and routed_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-            )
         self._fuse_shared_into_routed = (
-            routed_dtype == shared_dtype
-            and is_rocm_aiter_fusion_shared_expert_enabled()
-            and not disable_fused
+            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                qc,
+                shared_expert_prefix=f"{prefix}.shared_experts",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
         )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
@@ -2113,6 +2155,7 @@ class MoE(nn.Module):
             scoring_func=args.score_func,  # "sqrtsoftplus"
             e_score_correction_bias=getattr(self.gate, "e_score_correction_bias", None),
             config=moe_cfg,
+            shared_expert_prefix=f"{prefix}.shared_experts",
         )
         self.experts.swiglu_limit = args.swiglu_limit
 
@@ -2164,47 +2207,13 @@ class MoE(nn.Module):
         topk_weights = sqrtsoftplus(router_logits) gathered at topk_ids
         Then renormalize so weights sum to 1 per token.
         """
-        # input_ids comes from forward_context.context (stashed by
-        # `DeepseekV4ForCausalLM.forward`). This callback runs inside the
-        # FusedMoE expert call, which is wrapped in `maybe_dual_stream_forward`
-        # — a custom op opaque to Dynamo, so context access is safe here.
         fwd_input_ids = get_forward_context().context.input_ids
         assert (
             fwd_input_ids is not None
         ), "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
         ids = fwd_input_ids.flatten()
-        # Under DP-attention gather/scatter, forward_impl_graph gathers
-        # hidden_states and gating_output across DP ranks before calling
-        # select_experts → _hash_topk.  input_ids is still local (not
-        # gathered), so topk_ids would be [local_bs, topk] while the
-        # gathered gating_output is [local_bs*dp, n_experts].  Gather
-        # input_ids to match.
         num_tokens = gating_output.shape[0]
-        if ids.shape[0] < num_tokens:
-            from aiter.dist.parallel_state import get_dp_group as _get_dp_group
-
-            ctx = get_forward_context()
-            dp_eager_mode = (
-                not ctx.context.dp_uniform_decode
-            ) and ctx.dp_metadata is not None
-            if dp_eager_mode:
-                from atom.model_ops.moe import all_gatherv
-
-                sizes = ctx.dp_metadata.get_sizes_across_dp()
-                ids_2d = ids.unsqueeze(-1)
-                ids_2d = all_gatherv(ids_2d, sizes, _get_dp_group())
-                ids = ids_2d.flatten()
-            else:
-                from atom.model_ops.moe import pad_for_all_gather
-
-                ids_2d = ids.unsqueeze(-1)
-                ids_2d, _ = pad_for_all_gather(ids_2d)
-                # use_custom=True: avoid NCCL all_gather recording an event
-                # inside CUDAGraph capture (watchdog would later query it and
-                # trigger hipErrorCapturedEvent).
-                ids_2d = _get_dp_group().all_gather(ids_2d, use_custom=True, dim=0)
-                ids = ids_2d[:num_tokens].flatten()
-            ids = ids.clamp(0, self.gate.tid2eid.shape[0] - 1)
+        ids = ids[:num_tokens].clamp(0, self.gate.tid2eid.shape[0] - 1)
         topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
         scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
         topk_weights = scores.gather(dim=-1, index=topk_ids.long())
@@ -2213,6 +2222,32 @@ class MoE(nn.Module):
                 dim=-1, keepdim=True
             ).clamp_min(1e-20)
         topk_weights = topk_weights * self.routed_scaling_factor
+
+        # Fused shared expert: the custom_routing_function path in
+        # `select_experts` (moe.py:3055) returns early and bypasses the
+        # sqrtsoftplus fused-shared branch (moe.py:3108). Without this block the
+        # returned topk_ids are [N, top_k] with ids in 0..n_routed-1 only — the
+        # shared expert (slot n_routed_experts) never appears, so moe_sorting
+        # assigns it no tokens and its contribution (≈40% of the layer output)
+        # is silently dropped. Replicate the shared-col append: write the routed
+        # weights/ids into the first `top_k` columns of the global topK buffer
+        # and return the full [N, top_k + n_shared] view (last cols pre-filled
+        # with shared id = n_routed_experts and weight = shared_experts_score).
+        num_fused_shared = getattr(self.experts, "num_fused_shared_experts", 0)
+        if num_fused_shared > 0:
+            import atom.model_ops.topK as _topK_mod
+
+            assert _topK_mod.aiter_topK_meta_data is not None, (
+                "AITER topK meta data is not initialized. "
+                "init_aiter_topK_meta_data must run before hash-layer routing."
+            )
+            total_topk_weights, total_topk_ids = _topK_mod.aiter_topK_meta_data
+            n_tokens = topk_ids.shape[0]
+            assert total_topk_weights.shape[0] >= n_tokens
+            total_topk_ids[:n_tokens, :topk] = topk_ids
+            total_topk_weights[:n_tokens, :topk] = topk_weights
+            return total_topk_weights[:n_tokens], total_topk_ids[:n_tokens]
+
         return topk_weights, topk_ids
 
     def routed_expert_forward(
@@ -2228,6 +2263,26 @@ class MoE(nn.Module):
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
         return self.experts(hidden_states=x, router_logits=router_logits)
 
+    @staticmethod
+    def _gather_ids_for_dp(ids: torch.Tensor, ctx) -> torch.Tensor:
+        """All-gather input_ids across DP ranks to match gathered hidden_states."""
+        from aiter.dist.parallel_state import get_dp_group
+
+        ids_2d = ids.unsqueeze(-1)
+        dp_eager_mode = (
+            not ctx.context.dp_uniform_decode
+        ) and ctx.dp_metadata is not None
+        if dp_eager_mode:
+            from atom.model_ops.moe import all_gatherv
+
+            sizes = ctx.dp_metadata.get_sizes_across_dp()
+            ids_2d = all_gatherv(ids_2d, sizes, get_dp_group())
+        else:
+            from atom.model_ops.moe import all_gather_with_padding
+
+            ids_2d, _ = all_gather_with_padding(ids_2d, use_cag=False)
+        return ids_2d.flatten()
+
     def combine_outputs(
         self,
         routed: torch.Tensor,  # [num_tokens, dim]
@@ -2239,7 +2294,7 @@ class MoE(nn.Module):
         if shared is not None:
             routed = routed + shared
         if self.tp_size > 1:
-            routed = tensor_model_parallel_all_reduce(routed)
+            routed = _run_on_tbo_comm_stream(tensor_model_parallel_all_reduce, routed)
         return routed
 
     def single_stream_moe_forward(
@@ -2262,7 +2317,7 @@ class MoE(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         routed = self.routed_expert_forward(x)
         with torch.cuda.stream(self.alt_stream):
-            shared = self.shared_experts(x)
+            shared = self.shared_experts.forward(x)
         current_stream.wait_stream(self.alt_stream)
         return self.combine_outputs(routed, shared)
 
@@ -2283,6 +2338,14 @@ class MoE(nn.Module):
             # inside `dual_stream_moe_forward` is opaque to torch.compile.
             return torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
         return self.single_stream_moe_forward(x)
+
+
+@dataclass
+class HCState:
+    residual: torch.Tensor
+    post_mix: Optional[torch.Tensor] = None
+    comb_mix: Optional[torch.Tensor] = None
+    x_prev: Optional[torch.Tensor] = None
 
 
 class Block(nn.Module):
@@ -2346,6 +2409,12 @@ class Block(nn.Module):
         _dim_ok = args.dim % 512 == 0 or args.dim % 256 == 0
         self._mhc_pre = getattr(aiter, "mhc_pre", None) if _dim_ok else None
         self._mhc_post = getattr(aiter, "mhc_post", None) if _dim_ok else None
+        self._mhc_fused_post_pre = (
+            getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
+        )
+        self.enable_fused_hc = (
+            hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
+        )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
@@ -2403,6 +2472,10 @@ class Block(nn.Module):
             self.hc_eps,
         )
         y = torch.sum(pre.unsqueeze(-1) * residual, dim=-2)  # [num_tokens, dim]
+        if norm_weight is not None:
+            y = F.rms_norm(y.float(), (y.shape[-1],), norm_weight.float(), norm_eps).to(
+                dtype
+            )
         return y.to(dtype), post, comb
 
     def hc_post(
@@ -2438,44 +2511,77 @@ class Block(nn.Module):
         )
         return y.type_as(x)
 
+    def fuse_hc(
+        self,
+        hc_state: HCState,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
+    ) -> HCState:
+        residual = hc_state.residual
+        post = hc_state.post_mix
+        comb = hc_state.comb_mix
+        x = hc_state.x_prev
+        if self.enable_fused_hc and x is not None:
+            post, comb, x, res = self._mhc_fused_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                float(self.norm_eps),
+                float(self.hc_eps),
+                float(self.hc_eps),
+                self.HC_POST_MULT,
+                int(self.hc_sinkhorn_iters),
+                norm_weight,
+                norm_eps,
+            )
+        else:
+            if x is not None:
+                res = self.hc_post(x, residual, post, comb)
+            else:
+                res = residual
+            x, post, comb = self.hc_pre(
+                res, hc_fn, hc_scale, hc_base, norm_weight, norm_eps
+            )
+        return HCState(residual=res, post_mix=post, comb_mix=comb, x_prev=x)
+
     def forward(
         self,
-        x: torch.Tensor,  # [num_tokens, hc, dim]  mHC residual stream
+        hc_state: HCState,
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
-    ) -> torch.Tensor:  # [num_tokens, hc, dim]  updated residual stream
+    ) -> HCState:  # [num_tokens, hc, dim]  updated residual stream
         # ----- Attention sub-layer with mHC mixing -----
-        residual = x  # [num_tokens, hc, dim]
-        (
-            x,
-            post,
-            comb,
-        ) = self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
-            x,
+        hc_state = self.fuse_hc(
+            hc_state,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
             self.attn_norm.weight,
             self.norm_eps,
         )
-        # x = self.attn_norm(x)  # [num_tokens, dim]
+        x = hc_state.x_prev
         x = self.attn(x, positions)  # [num_tokens, dim]
-        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-        # ----- FFN sub-layer with mHC mixing -----
-        residual = x  # [num_tokens, hc, dim]
-        x, post, comb = self.hc_pre(
-            x,
+        hc_state.x_prev = x
+        hc_state = self.fuse_hc(
+            hc_state,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
             self.ffn_norm.weight,
             self.norm_eps,
         )
-        # x = self.ffn_norm(x)  # [num_tokens, dim]
+        x = hc_state.x_prev
         x = self.ffn(
             x
         )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)
-        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-        return x
+        hc_state.x_prev = x
+        return hc_state
 
 
 class ParallelHead(ParallelLMHead):
@@ -2526,14 +2632,10 @@ class ParallelHead(ParallelLMHead):
         """Reduce mHC residual `[num_tokens, hc, dim]` → `[num_tokens, dim]`
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
-        return _hc_head_reduce(
-            x,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            self.norm_eps,
-            self.hc_eps,
+        _, _, y = aiter.mhc_pre(
+            x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0
         )
+        return y
 
     def forward(
         self,
@@ -2627,10 +2729,13 @@ class DeepseekV4Model(nn.Module):
         h = self.embed(input_ids)  # [num_tokens, dim]
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None)
 
         for layer in self.layers:
-            h = layer(h, positions)  # [num_tokens, hc, dim]
-
+            hc_state = layer(hc_state, positions)  # [num_tokens, hc, dim]
+        h = self.layers[-1].hc_post(
+            hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
+        )
         return h
 
 
@@ -2699,15 +2804,39 @@ class DeepseekV4ForCausalLM(nn.Module):
         # weight + scale params for real-checkpoint loading. When the HF
         # config lacks `quantization_config` (e.g. dummy / toy validation),
         # this still works — base spec is QuantType.No.
+        #
+        # Forward the engine-level `online_quant_config` (set via
+        # `--online_quant_config` CLI) so V4 weights can be re-quantized at
+        # load time. Without this, the engine flag is silently dropped on V4.
         self.args.quant_config = make_v4_quant_config(
-            self.hf_config, model_path=getattr(config, "model", None)
+            self.hf_config,
+            model_path=getattr(config, "model", None),
+            online_quant_config=getattr(config, "online_quant_config", None),
         )
+        self.atom_config.quant_config = self.args.quant_config
         self.model = DeepseekV4Model(atom_config=config, args=self.args)
         # Tell ModelRunner to size the CG outputs buffer as
         # [max_num_batched_tokens, hc_mult, hidden_size] instead of the
         # default [max_num_batched_tokens, hidden_size]. forward returns
         # the un-reduced mHC residual stack [N, hc, dim].
         self.extra_output_dims: tuple[int, ...] = (self.args.hc_mult,)
+        self._need_ids_gather = (
+            config.enable_dp_attention
+            and not config.enable_expert_parallel
+            and self.args.n_hash_layers > 0
+        )
+
+    @property
+    def disable_fused_shared_loading(self) -> bool:
+        """True when shared experts are NOT fused into the routed MoE kernel, so
+        the weight loader must keep `ffn.shared_experts.*` on the standalone
+        Expert module instead of rewriting them into the fused slot. Read from
+        the actual built MoE layers so it always agrees with model structure.
+        """
+        for m in self.model.modules():
+            if m.__class__.__name__ == "MoE":
+                return not getattr(m, "_fuse_shared_into_routed", True)
+        return False
 
     def forward(
         self,
@@ -2722,7 +2851,21 @@ class DeepseekV4ForCausalLM(nn.Module):
         # `model.forward` — production runner, warmup, benchmarks — gets
         # correct hash routing without a separate setup step.
         ctx = get_forward_context()
-        ctx.context.input_ids = input_ids
+        if self._need_ids_gather:
+            # DP-attention (no EP) hash routing: input_ids is local but the MoE
+            # gate sees DP-gathered gating_output, so gather ids to match. Run
+            # the gather INLINE on the compute stream. The original side-stream
+            # hop (_run_on_tbo_comm_stream) coordinated this ids all-gather with
+            # a DIFFERENT stream/sync than the MoE hidden/router DP gather under
+            # TBO → mismatched DP layouts → wrong V4 hash routing (GSM8K
+            # 0.95→0.87). NOTE: do NOT wrap this in the TBO ping-pong
+            # (tbo_yield_and_switch_*) — injecting an extra yield at forward top
+            # desyncs the ping-pong ring and collapses accuracy to ~0.54
+            # (measured). The ids tensor is [N,1] int (tiny vs hidden [N,7168]),
+            # so inline costs ~nothing in overlap.
+            ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
+        else:
+            ctx.context.input_ids = input_ids
         return self.model(input_ids, positions)
 
     def compute_logits(
@@ -2748,12 +2891,31 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         V4 expert weights on disk are named `ffn.experts.{e}.w{1,2,3}`. Pass
         these as the gate/down/up names to FusedMoE.make_expert_params_mapping.
+
+        When fused shared expert is enabled, FusedMoE allocates one extra expert
+        slot (id = n_routed_experts) for the shared expert. Include it in the
+        mapping so the loader can dispatch `ffn.shared_experts.w*` (rewritten to
+        `ffn.experts.{n_routed_experts}.w*` by the loader) into that slot.
+        Otherwise the shared expert weights are dropped and slot N stays
+        uninitialized -> garbage MoE output.
         """
+        # Whether the shared expert is fused into the routed buffer is decided
+        # per-MoE-layer (`_fuse_shared_into_routed`). Read the ACTUAL allocated
+        # buffer state from a real MoE layer instead of the global
+        # `is_rocm_aiter_fusion_shared_expert_enabled()` — otherwise when fusion
+        # is disabled (buffer=256) the mapping would emit 257 entries and
+        # mis-load expert weights -> garbage.
+        num_fused_shared = 0
+        for _m in self.model.modules():
+            if _m.__class__.__name__ == "FusedMoE":
+                num_fused_shared = getattr(_m, "num_fused_shared_experts", 0)
+                break
+        num_experts = self.args.n_routed_experts + num_fused_shared
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.args.n_routed_experts,
+            num_experts=num_experts,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

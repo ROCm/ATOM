@@ -953,6 +953,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.handshake_port = get_open_port()
+        self.base_handshake_port = kv_transfer_config.get(
+            "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
+        )
         self.engine_id = "None"
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.parallel_config.data_parallel_size
@@ -1042,6 +1045,10 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         """
         # Attach output metadata for the proxy to relay
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
+        drafts = getattr(seq, "spec_token_ids", None)
+        draft_token_ids = (
+            [int(x) for x in drafts] if drafts is not None and len(drafts) else []
+        )
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
@@ -1049,10 +1056,12 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "remote_engine_id": self.engine_id,
             "remote_host": self.host_ip,
             "remote_port": self.handshake_port,
+            "remote_handshake_port": self.base_handshake_port,
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
+            "draft_token_ids": draft_token_ids,
         }
 
         # Clean up transfer ID mapping on the consumer side

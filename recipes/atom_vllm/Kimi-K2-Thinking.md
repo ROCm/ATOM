@@ -19,35 +19,47 @@ We adopt [amd/Kimi-K2-Thinking-MXFP4-AttnFP8](https://huggingface.co/amd/Kimi-K2
 ```bash
 # use quick allreduce to reduce TTFT
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+TP=4
 
 vllm serve amd/Kimi-K2-Thinking-MXFP4-AttnFP8 \
     --host localhost \
     --port 8000 \
-    --trust-remote-code \
-    --tensor-parallel-size 8 \
-    --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size "${TP}" \
     --max-num-batched-tokens 16384 \
     --max-model-len 16384 \
+    --gpu-memory-utilization 0.9 \
     --no-enable-prefix-caching
 ```
 
 ## Step 3: Performance Benchmark
 Users can use the default vllm bench command for performance benchmarking.
 ```bash
+ISL=1000
+OSL=100
+CONC=4
+
 vllm bench serve \
-    --host localhost \
-    --port 8000 \
+    --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --endpoint /v1/completions \
     --model amd/Kimi-K2-Thinking-MXFP4-AttnFP8 \
     --dataset-name random \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.8 \
-    --max-concurrency 64 \
-    --num-prompts 640 \
+    --random-input-len "${ISL}" \
+    --random-output-len "${OSL}" \
+    --random-range-ratio 0.0 \
+    --max-concurrency "${CONC}" \
+    --num-prompts "$(( CONC * 8 ))" \
     --trust_remote_code \
+    --num-warmups "${CONC}" \
+    --request-rate inf \
+    --ignore-eos \
+    --disable-tqdm \
+    --save-result \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 

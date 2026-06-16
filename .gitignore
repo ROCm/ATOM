@@ -54,3 +54,6 @@ aiter_logs
 *.log
 online_quant_info_*.json
 .claude/plan/
+
+# CI: Docker client config (DOCKER_CONFIG) under workspace for atom-vllm-oot
+.atom-docker-client/

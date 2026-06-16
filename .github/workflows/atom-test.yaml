@@ -9,6 +9,15 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+      - 'atom/plugin/**'
+      - 'atom/mesh/**'
+      - '.github/workflows/atomesh-*.yaml'
+      - '.github/scripts/atomesh_*.sh'
+      - '.github/dashboard/atomesh_*.html'
+      - '.github/workflows/atom-vllm-*.yaml'
+      - '.github/workflows/atom-sglang-*.yaml'
+      - '.github/benchmark/oot_models_accuracy.json'
+      - '.github/benchmark/sglang_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
   schedule:
@@ -34,6 +43,7 @@ concurrency:
 
 env:
   ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
+  ATOM_PYTHON_TAG: "cp312"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)
@@ -90,20 +100,23 @@ jobs:
           }
 
           find_latest_artifact() {
-            local runs_json artifact_json run_id
+            local runs_json artifact_json run_id python_artifact_suffix
 
             if [ -n "$ARTIFACT_ID" ] && [ "$ARTIFACT_ID" != "null" ]; then
               return 0
             fi
 
-            echo "=== Finding latest aiter-whl-* artifact from ROCm/aiter ==="
+            python_artifact_suffix="py${ATOM_PYTHON_TAG#cp}"
+            python_artifact_suffix="${python_artifact_suffix:0:3}.${python_artifact_suffix:3}"
+
+            echo "=== Finding latest aiter-whl-* artifact for ${python_artifact_suffix} from ROCm/aiter ==="
             runs_json=$(curl -fsSL -H "$AUTH_HEADER" \
               "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
 
             for run_id in $(echo "$runs_json" | jq -r '.workflow_runs[].id'); do
               artifact_json=$(curl -fsSL -H "$AUTH_HEADER" \
                 "$API_URL/repos/ROCm/aiter/actions/runs/$run_id/artifacts" \
-                | jq '[.artifacts[] | select(.name | startswith("aiter-whl-")) | select(.expired == false)] | sort_by(.created_at) | last')
+                | jq --arg artifact_suffix "-${python_artifact_suffix}" '[.artifacts[] | select(.name | startswith("aiter-whl-") and endswith($artifact_suffix)) | select(.expired == false)] | sort_by(.created_at) | last')
 
               if [ "$artifact_json" != "null" ] && [ -n "$artifact_json" ]; then
                 ARTIFACT_ID=$(echo "$artifact_json" | jq -r '.id')
@@ -133,11 +146,24 @@ jobs:
             manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
             manifest_timestamp=$(jq -r '.timestamp // empty' "$manifest_file")
             manifest_commit=$(jq -r '.commit // empty' "$manifest_file")
-            wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
-            wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+
+            wheel_name=$(jq -r ".wheels.${ATOM_PYTHON_TAG}.wheel_name // empty" "$manifest_file")
+            wheel_url=$(jq -r ".wheels.${ATOM_PYTHON_TAG}.wheel_url // empty" "$manifest_file")
+            if [ -n "$wheel_name" ] && [ -n "$wheel_url" ]; then
+              echo "Selected ${ATOM_PYTHON_TAG} wheel from versioned manifest"
+            else
+              wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
+              wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+              echo "Versioned manifest not available, using top-level wheel fields"
+            fi
 
             if [ "$manifest_branch" != "main" ] || [ -z "$manifest_timestamp" ] || [ -z "$manifest_commit" ] || [ -z "$wheel_name" ] || [ -z "$wheel_url" ]; then
               echo "Invalid latest main wheel manifest"
+              return 1
+            fi
+
+            if [[ "$wheel_name" == *cp* ]] && [[ "$wheel_name" != *${ATOM_PYTHON_TAG}* ]]; then
+              echo "WARNING: wheel $wheel_name does not match target Python ${ATOM_PYTHON_TAG}"
               return 1
             fi
 
@@ -168,9 +194,11 @@ jobs:
           }
 
           download_from_artifact() {
-            echo "=== Falling back to latest aiter-whl-* artifact from ROCm/aiter ==="
+            local fallback_wheel fallback_wheel_name
+
+            echo "=== Falling back to latest ${ATOM_PYTHON_TAG} aiter-whl-* artifact from ROCm/aiter ==="
             find_latest_artifact || {
-              echo "ERROR: No aiter-whl-* artifact found in recent Aiter Test runs"
+              echo "ERROR: No ${ATOM_PYTHON_TAG} aiter-whl-* artifact found in recent Aiter Test runs"
               return 1
             }
 
@@ -181,6 +209,15 @@ jobs:
               -o aiter-whl.zip
             unzip -o aiter-whl.zip -d aiter-whl
             rm -f aiter-whl.zip
+
+            fallback_wheel=$(ls -t aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
+            fallback_wheel_name=$(basename "${fallback_wheel:-}")
+            if [ -z "$fallback_wheel" ] || [[ "$fallback_wheel_name" != *${ATOM_PYTHON_TAG}* ]]; then
+              echo "ERROR: artifact fallback did not produce a ${ATOM_PYTHON_TAG} wheel"
+              ls -la aiter-whl/ || true
+              return 1
+            fi
+            echo "Downloaded artifact-selected wheel: $fallback_wheel"
           }
 
           if download_from_s3_manifest; then
@@ -194,6 +231,10 @@ jobs:
           if [ -z "$AITER_WHL" ]; then
             echo "ERROR: No amd_aiter wheel available after S3/artifact attempts"
             ls -la aiter-whl/ || true
+            exit 1
+          fi
+          if [[ "$(basename "$AITER_WHL")" != *${ATOM_PYTHON_TAG}* ]]; then
+            echo "ERROR: selected wheel $AITER_WHL does not match target Python ${ATOM_PYTHON_TAG}"
             exit 1
           fi
 
@@ -251,7 +292,7 @@ jobs:
 
     steps:
       - name: Kill all Docker containers and clean up workspace
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
@@ -261,15 +302,15 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true 
 
       - name: Show Docker containers
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: docker ps -a
 
       - name: Show ROCm memory usage
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: rocm-smi --showmemuse
 
       - name: Show ROCm GPU processes
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: rocm-smi --showpidgpus
 
       - name: Checkout ATOM repo
@@ -354,7 +395,7 @@ jobs:
           path: /tmp/aiter-whl
 
       - name: Set HF token for predownload runner
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Start CI container
@@ -387,7 +428,7 @@ jobs:
           PULL_FLAG=""
           if [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
             PULL_FLAG=""
-          elif [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+          elif [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ] || [ "${{ matrix.runner }}" = "linux-atom-do-mi350x-8" ]; then
             PULL_FLAG="--pull always"
           fi
 
@@ -419,8 +460,17 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
+      - name: GPU preflight check
+        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        timeout-minutes: 5
+        env:
+          GPU_PREFLIGHT_ALLOCATION_MB: "8"
+        run: bash .github/scripts/gpu_preflight_check.sh "$CONTAINER_NAME" docker
+
       - name: Collect GPU info (inside container)
         id: gpu-info
+        env:
+          COLLECT_VERBOSE_GPU_INFO: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
@@ -554,6 +604,7 @@ jobs:
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
+          ATOM_DEBUG_DEVICE_MAPPING: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
         run: |
           set -euo pipefail
           echo ""
@@ -566,7 +617,9 @@ jobs:
           # Pipe via stdin so container bash parses shell quoting in extraArgs
           # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
           echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
-            docker exec -i "$CONTAINER_NAME" bash -l
+            docker exec \
+              -e ATOM_DEBUG_DEVICE_MAPPING="${ATOM_DEBUG_DEVICE_MAPPING}" \
+              -i "$CONTAINER_NAME" bash -l
           echo ""
           echo "========== Running accuracy test =========="
           docker exec \
@@ -712,6 +765,5 @@ jobs:
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
           auto-push: true
-          max-items-in-chart: 90
+          max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
-

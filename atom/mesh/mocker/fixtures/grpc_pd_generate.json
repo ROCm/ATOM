@@ -1,0 +1,27 @@
+{
+  "name": "grpc_pd_generate",
+  "model": "hf-internal-testing/llama-tokenizer",
+  "endpoint": "/generate",
+  "route": {
+    "worker_kind": "prefill_decode",
+    "connection_mode": "grpc",
+    "backend": "sglang"
+  },
+  "request": {
+    "model": "hf-internal-testing/llama-tokenizer",
+    "text": "Hello world",
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "body": [
+      {
+        "text": "Hello world"
+      }
+    ]
+  },
+  "simulation": {
+    "ttft_ms": 0,
+    "chunk_interval_ms": 0
+  }
+}

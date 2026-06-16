@@ -7,6 +7,13 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+      - 'atom/plugin/vllm/**'
+      - 'atom/mesh/**'
+      - '.github/workflows/atomesh-*.yaml'
+      - '.github/scripts/atomesh_*.sh'
+      - '.github/dashboard/atomesh_*.html'
+      - '.github/workflows/atom-vllm-*.yaml'
+      - '.github/benchmark/oot_models_accuracy.json'
       - 'LICENSE'
       - '.gitignore'
 
@@ -16,11 +23,11 @@ concurrency:
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+  ATOM_PYTHON_TAG: "cp312"
   SGLANG_IMAGE_CACHE_KEEP: "3"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   NIGHTLY_SGLANG_IMAGE_TAG: rocm/atom-dev:sglang-latest
-  SGLANG_REF: "v0.5.10"
 
 jobs:
   # ---------- SGLANG CI path (pull_request only) ----------
@@ -76,20 +83,23 @@ jobs:
           }
 
           find_latest_artifact() {
-            local runs_json artifact_json run_id
+            local runs_json artifact_json run_id python_artifact_suffix
 
             if [ -n "$ARTIFACT_ID" ] && [ "$ARTIFACT_ID" != "null" ]; then
               return 0
             fi
 
-            echo "=== Finding latest aiter-whl-* artifact from ROCm/aiter ==="
+            python_artifact_suffix="py${ATOM_PYTHON_TAG#cp}"
+            python_artifact_suffix="${python_artifact_suffix:0:3}.${python_artifact_suffix:3}"
+
+            echo "=== Finding latest aiter-whl-* artifact for ${python_artifact_suffix} from ROCm/aiter ==="
             runs_json=$(curl -fsSL -H "$AUTH_HEADER" \
               "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
 
             for run_id in $(echo "$runs_json" | jq -r '.workflow_runs[].id'); do
               artifact_json=$(curl -fsSL -H "$AUTH_HEADER" \
                 "$API_URL/repos/ROCm/aiter/actions/runs/$run_id/artifacts" \
-                | jq '[.artifacts[] | select(.name | startswith("aiter-whl-")) | select(.expired == false)] | sort_by(.created_at) | last')
+                | jq --arg artifact_suffix "-${python_artifact_suffix}" '[.artifacts[] | select(.name | startswith("aiter-whl-") and endswith($artifact_suffix)) | select(.expired == false)] | sort_by(.created_at) | last')
 
               if [ "$artifact_json" != "null" ] && [ -n "$artifact_json" ]; then
                 ARTIFACT_ID=$(echo "$artifact_json" | jq -r '.id')
@@ -119,11 +129,24 @@ jobs:
             manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
             manifest_timestamp=$(jq -r '.timestamp // empty' "$manifest_file")
             manifest_commit=$(jq -r '.commit // empty' "$manifest_file")
-            wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
-            wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+
+            wheel_name=$(jq -r ".wheels.${ATOM_PYTHON_TAG}.wheel_name // empty" "$manifest_file")
+            wheel_url=$(jq -r ".wheels.${ATOM_PYTHON_TAG}.wheel_url // empty" "$manifest_file")
+            if [ -n "$wheel_name" ] && [ -n "$wheel_url" ]; then
+              echo "Selected ${ATOM_PYTHON_TAG} wheel from versioned manifest"
+            else
+              wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
+              wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+              echo "Versioned manifest not available, using top-level wheel fields"
+            fi
 
             if [ "$manifest_branch" != "main" ] || [ -z "$manifest_timestamp" ] || [ -z "$manifest_commit" ] || [ -z "$wheel_name" ] || [ -z "$wheel_url" ]; then
               echo "Invalid latest main wheel manifest"
+              return 1
+            fi
+
+            if [[ "$wheel_name" == *cp* ]] && [[ "$wheel_name" != *${ATOM_PYTHON_TAG}* ]]; then
+              echo "WARNING: wheel $wheel_name does not match target Python ${ATOM_PYTHON_TAG}"
               return 1
             fi
 
@@ -154,9 +177,11 @@ jobs:
           }
 
           download_from_artifact() {
-            echo "=== Falling back to latest aiter-whl-* artifact from ROCm/aiter ==="
+            local fallback_wheel fallback_wheel_name
+
+            echo "=== Falling back to latest ${ATOM_PYTHON_TAG} aiter-whl-* artifact from ROCm/aiter ==="
             find_latest_artifact || {
-              echo "ERROR: No aiter-whl-* artifact found in recent Aiter Test runs"
+              echo "ERROR: No ${ATOM_PYTHON_TAG} aiter-whl-* artifact found in recent Aiter Test runs"
               return 1
             }
 
@@ -167,6 +192,15 @@ jobs:
               -o aiter-whl.zip
             unzip -o aiter-whl.zip -d aiter-whl
             rm -f aiter-whl.zip
+
+            fallback_wheel=$(ls -t aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
+            fallback_wheel_name=$(basename "${fallback_wheel:-}")
+            if [ -z "$fallback_wheel" ] || [[ "$fallback_wheel_name" != *${ATOM_PYTHON_TAG}* ]]; then
+              echo "ERROR: artifact fallback did not produce a ${ATOM_PYTHON_TAG} wheel"
+              ls -la aiter-whl/ || true
+              return 1
+            fi
+            echo "Downloaded artifact-selected wheel: $fallback_wheel"
           }
 
           if download_from_s3_manifest; then
@@ -180,6 +214,10 @@ jobs:
           if [ -z "$AITER_WHL" ]; then
             echo "ERROR: No amd_aiter wheel available after S3/artifact attempts"
             ls -la aiter-whl/ || true
+            exit 1
+          fi
+          if [[ "$(basename "$AITER_WHL")" != *${ATOM_PYTHON_TAG}* ]]; then
+            echo "ERROR: selected wheel $AITER_WHL does not match target Python ${ATOM_PYTHON_TAG}"
             exit 1
           fi
 
@@ -204,20 +242,28 @@ jobs:
         include:
           - model_name: "DeepSeek-R1-FP8 TP4"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extra_args: "--tensor-parallel-size 4"
+            extra_args: "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache"
             env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
               SGLANG_AITER_FP8_PREFILL_ATTN=0
               SGLANG_USE_AITER=1
               ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              SGLANG_ENABLE_TORCH_COMPILE=1
+              TORCHINDUCTOR_COMPILE_THREADS=128
             accuracy_test_threshold: 0.91
             runner: linux-atom-mi35x-4
           - model_name: "DeepSeek-R1-FP4 TP4"
-            model_path: "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-            extra_args: "--tensor-parallel-size 4"
+            model_path: "amd/DeepSeek-R1-0528-MXFP4-v2"
+            extra_args: "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache"
             env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
               SGLANG_AITER_FP8_PREFILL_ATTN=0
               SGLANG_USE_AITER=1
               ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              SGLANG_ENABLE_TORCH_COMPILE=1
+              TORCHINDUCTOR_COMPILE_THREADS=128
             accuracy_test_threshold: 0.91
             runner: linux-atom-mi35x-4
           - model_name: "Qwen3.5-35B-A3B-FP8 TP2"
@@ -233,7 +279,6 @@ jobs:
     timeout-minutes: 180
     env:
       CONTAINER_NAME: atom_sglang_${{ strategy.job-index }}
-      SGLANG_REF: v0.5.10
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
@@ -250,6 +295,9 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+
+      - name: Resolve SGLang version metadata
+        run: python3 .github/scripts/resolve_sglang_metadata.py
 
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV

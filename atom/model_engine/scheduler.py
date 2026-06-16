@@ -234,16 +234,13 @@ class ScheduledBatch:
         self.remote_kv_seq_blocks = remote_kv_seq_blocks or {}
 
         self.req_ids = list(seqs.keys())
-        # self.scheduled_tokens = [
-        #     seq.token_ids[-num_tokens:]
-        #     for seq, num_tokens in zip(seqs.values(), num_scheduled_tokens)
-        # ]
-        # logger.info(f"{num_scheduled_tokens=}")
-        # logger.info(f"{self.scheduled_tokens=}")
-        # num_scheduled_tokens for each sequence in the batch
         self.num_scheduled_tokens = np.asarray(num_scheduled_tokens, dtype=np.int32)
         self.temperatures = np.asarray(
             [seq.temperature for seq in seqs.values()], dtype=np.float32
+        )
+        self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
+        self.context_lens = np.asarray(
+            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
         )
         self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
@@ -348,6 +345,7 @@ class ScheduledBatch:
                 self.multimodal_data[seq.id] = seq.multimodal_data
                 # Clear after first use to avoid re-sending on decode steps
                 seq.multimodal_data = None
+        self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
 
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")
@@ -375,6 +373,8 @@ class ScheduledBatchOutput:
         num_bonus: Optional[np.ndarray],
         draft_token_ids: Optional[np.ndarray],
         is_deferred_out: bool = False,
+        is_prev_prefill=False,
+        logprobs=None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -382,6 +382,9 @@ class ScheduledBatchOutput:
         self.num_rejected = num_rejected
         self.num_bonus = num_bonus
         self.is_deferred_out = is_deferred_out
+        self.is_prev_prefill = is_prev_prefill
+        self.logprobs = logprobs  # Optional[dict[int, float]]
+        # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: Optional[dict[int, int]] = None
 
     def get_idx(self, req_id: int) -> Optional[int]:
@@ -780,6 +783,13 @@ class Scheduler:
                 if first_token_id is not None:
                     seq.append_token(first_token_id)
                     seq._injected_t0 = first_token_id
+                    if self.mtp_k > 0:
+                        drafts = list(
+                            (seq.kv_transfer_params or {}).get("draft_token_ids") or []
+                        )[: self.mtp_k]
+                        for d in drafts:
+                            seq.append_token(int(d))
+                        seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
                 logger.info(
                     "[PD-TRANSITION] seq %s: num_tokens=%d, "
                     "num_prompt=%d, blocks=%d, first_token=%s, "
@@ -825,6 +835,15 @@ class Scheduler:
             )
 
             self.block_manager.allocate(seq, num_cached_blocks)
+
+            # Snapshot the genuine prefix-cache hit at admission. After this,
+            # num_cached_tokens is repurposed to track chunked-prefill progress
+            # (it grows to the full prompt length in postprocess), so it can't be
+            # used to report the cache hit. Set once per seq (Phase-2 admission
+            # only); Phase-1 resume doesn't recompute num_cached_blocks.
+            seq.prefix_cache_hit_tokens = (
+                num_cached_blocks * self.block_manager.block_size
+            )
 
             if self.kv_connector is not None:
                 self.kv_connector.update_state_after_alloc(seq)
@@ -1025,6 +1044,7 @@ class Scheduler:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
+        token_logprobs = fwd_output.logprobs  # Optional[dict[int, float]]
         # update token_ids with the actual sampled token ids
 
         finished_seqs = []
@@ -1080,6 +1100,10 @@ class Scheduler:
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
+            token_logprob = None
+            if token_logprobs is not None and seq.return_logprobs:
+                token_logprob = token_logprobs.get(seq.id)
+
             if is_deferred_out or self.use_spec:
                 # int() casts strip the np.int32 wrapper coming out of
                 # fwd_output's np.ndarray indexing. Without these, the values
@@ -1108,11 +1132,18 @@ class Scheduler:
                 # logger.info(
                 #     f"{seq.id=}, {num_new_token=} {num_rejected=} {self.mtp_k} {token_ids=} {seq.token_ids[-8:]=}"
                 # )
+                if seq.return_logprobs and token_logprob is not None:
+                    if seq.logprobs:
+                        seq.logprobs[-1] = token_logprob
+                    else:
+                        seq.logprobs.append(token_logprob)
             else:
                 num_rejected = 0
                 num_bonus = 0
                 for token_id in token_ids:
                     seq.append_token(token_id)
+                if seq.return_logprobs and token_logprob is not None:
+                    seq.logprobs.append(token_logprob)
             new_tokens = token_ids
 
             injected_t0 = getattr(seq, "_injected_t0", None)
@@ -1213,6 +1244,7 @@ class Scheduler:
                     kv_transfer_params_output=getattr(
                         seq, "kv_transfer_params_output", None
                     ),
+                    num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
                 )
 
                 if request_output.kv_transfer_params_output is not None:
@@ -1243,9 +1275,8 @@ class Scheduler:
                     num = num_placeholder - seq.num_rejected
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
-                    # logger.info(
-                    #     f"{seq.id=}, added {num}, total tokens now: {seq.num_tokens}"
-                    # )
+                        if seq.return_logprobs:
+                            seq.logprobs.append(0.0)
         for seq in finished_seqs:
             logger.debug("Freeing blocks for finished seq %s", seq.id)
             if seq.is_partial_prefill:

@@ -116,6 +116,12 @@ class Glm4MoE(nn.Module):
         self.gate.e_score_correction_bias = atom_parameter(
             torch.empty(config.n_routed_experts, dtype=torch.float32)
         )
+        self.is_rocm_aiter_fusion_shared_expert_enabled = (
+            is_rocm_aiter_fusion_shared_expert_enabled(
+                shared_expert_prefix=f"{prefix}.shared_experts",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
+        )
 
         self.n_redundant_experts = 0
         self.n_logical_experts = self.n_routed_experts
@@ -128,7 +134,7 @@ class Glm4MoE(nn.Module):
         )
 
         if config.n_shared_experts is not None:
-            if not is_rocm_aiter_fusion_shared_expert_enabled():
+            if not self.is_rocm_aiter_fusion_shared_expert_enabled:
                 # Only create separate shared_experts module when fusion is disabled
                 intermediate_size = (
                     config.moe_intermediate_size * config.n_shared_experts
@@ -162,6 +168,7 @@ class Glm4MoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias,
             has_bias=getattr(config, "moe_ffn_bias", False),
             config=config,
+            shared_expert_prefix=f"{prefix}.shared_experts",
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -172,7 +179,7 @@ class Glm4MoE(nn.Module):
         router_logits = self.gate(hidden_states.to(dtype=torch.float32))
         if (
             self.n_shared_experts is not None
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             shared_output = self.shared_experts(hidden_states)
         final_hidden_states = self.experts(
@@ -184,7 +191,7 @@ class Glm4MoE(nn.Module):
 
         if (
             self.shared_experts is not None
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             final_hidden_states = final_hidden_states + shared_output
 
@@ -513,19 +520,12 @@ class Glm4MoeModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        # When fusion is enabled, FusedMoE adds shared expert internally
-        # so we need to include it in the mapping as well
-        num_experts = self.config.n_routed_experts
-        if (
-            is_rocm_aiter_fusion_shared_expert_enabled()
-            and self.config.n_shared_experts
-        ):
-            num_experts += self.config.n_shared_experts
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=num_experts,
+            num_experts=self.config.n_routed_experts
+            + (self.config.n_shared_experts or 0),
         )
 
 
