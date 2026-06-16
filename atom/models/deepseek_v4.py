@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Tuple, cast
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
 
-
 import aiter
 import torch
 import torch.nn.functional as F
@@ -2187,6 +2186,7 @@ class MoE(nn.Module):
         assert (
             ids.shape[0] == num_tokens
         ), f"input_ids length {ids.shape[0]} does not match gating_output num_tokens {num_tokens}"
+        ids = ids.clamp(0, self.gate.tid2eid.shape[0] - 1)
         topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
         scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
         topk_weights = scores.gather(dim=-1, index=topk_ids.long())
