@@ -1082,18 +1082,6 @@ class Config:
                     "implemented yet; disabling prefix caching."
                 )
                 self.enable_prefix_caching = False
-            if self.compilation_config.level != CompilationLevel.NO_COMPILATION:
-                logger.warning(
-                    "MiniMax-M3 native path is not torch.compile-ready yet; "
-                    "disabling compilation for this model."
-                )
-                self.compilation_config.level = CompilationLevel.NO_COMPILATION
-            if not self.enforce_eager:
-                logger.warning(
-                    "MiniMax-M3 native sparse/indexer attention is not CUDA graph "
-                    "capture-ready yet; enabling eager execution."
-                )
-                self.enforce_eager = True
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:
