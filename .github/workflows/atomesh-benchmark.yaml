@@ -1,0 +1,257 @@
+name: Atomesh Benchmark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'atom/mesh/**'
+      - '.github/benchmark/models_atomesh.yaml'
+      - '.github/scripts/atomesh/**'
+      - '.github/workflows/atomesh-benchmark.yaml'
+      - '.github/dashboard/atomesh_index.html'
+      - 'docs/assets/atomesh_logo.png'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'atom/mesh/**'
+      - '.github/benchmark/models_atomesh.yaml'
+      - '.github/scripts/atomesh/**'
+      - '.github/workflows/atomesh-benchmark.yaml'
+      - '.github/dashboard/atomesh_index.html'
+      - 'docs/assets/atomesh_logo.png'
+  schedule:
+    # Nightly at 03:00 Beijing time (19:00 UTC)
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Benchmark suite'
+        required: false
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - nightly
+      model:
+        description: 'Model name from models_atomesh.yaml; empty means all models'
+        required: false
+        default: ''
+        type: string
+      atomesh_image:
+        description: 'Override ATOM docker image'
+        required: false
+        default: ''
+        type: string
+      run_real_benchmark:
+        description: 'Run real Slurm benchmark for workflow_dispatch'
+        required: false
+        default: false
+        type: boolean
+      publish_dashboard:
+        description: 'Publish workflow_dispatch results to dashboard'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  load-config:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    name: Load ATOMesh benchmark config
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.matrix.outputs.matrix_json }}
+      has_matrix: ${{ steps.matrix.outputs.has_matrix }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Install YAML parser
+        run: python3 -m pip install pyyaml
+
+      - name: Build benchmark matrix
+        id: matrix
+        env:
+          SUITE: ${{ github.event_name == 'schedule' && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
+          MODEL_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.model || '' }}
+          ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/atomesh/pd_matrix.py \
+            --suite "$SUITE" \
+            ${MODEL_NAME:+--model "$MODEL_NAME"} \
+            ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+            --output atomesh-matrix.json \
+            --github-output
+          cat atomesh-matrix.json
+
+      - name: Upload expanded matrix
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-benchmark-matrix
+          path: atomesh-matrix.json
+
+  validate-dry-run:
+    name: Validate ATOMesh cell (${{ matrix.id }})
+    needs: [load-config]
+    if: ${{ needs.load-config.outputs.has_matrix == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Dry-run submit cell
+        env:
+          CELL_JSON: ${{ toJson(matrix) }}
+          RESULT_DIR: atomesh-dry-run-results
+        run: |
+          set -euo pipefail
+          bash .github/scripts/atomesh/pd_submit.sh \
+            --cell-json "$CELL_JSON" \
+            --result-dir "$RESULT_DIR" \
+            --dry-run
+
+      - name: Upload dry-run result
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-dry-run-${{ matrix.id }}
+          path: atomesh-dry-run-results/
+
+  run-real-benchmark:
+    name: Run ATOMesh real P/D (${{ matrix.id }})
+    needs: [load-config, validate-dry-run]
+    if: >-
+      needs.load-config.outputs.has_matrix == 'true'
+      && (
+        github.event_name == 'schedule'
+        || github.event_name == 'push'
+        || (github.event_name == 'workflow_dispatch' && inputs.run_real_benchmark)
+      )
+    runs-on: ${{ matrix.runner.slurm_submit_runner }}
+    timeout-minutes: 420
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Run Slurm benchmark cell
+        env:
+          CELL_JSON: ${{ toJson(matrix) }}
+          RESULT_DIR: atomesh-results
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
+          bash .github/scripts/atomesh/pd_submit.sh \
+            --cell-json "$CELL_JSON" \
+            --result-dir "$RESULT_DIR"
+
+      - name: Upload real benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-real-benchmark-${{ matrix.id }}
+          path: |
+            atomesh-results/
+          if-no-files-found: ignore
+
+  normalize-results:
+    name: Normalize ATOMesh benchmark results
+    needs: [run-real-benchmark]
+    if: ${{ !cancelled() && needs.run-real-benchmark.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download real benchmark artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: atomesh-real-benchmark-*
+          merge-multiple: true
+          path: atomesh-results
+
+      - name: Build dashboard input
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/atomesh/pd_to_dashboard.py \
+            atomesh-results \
+            --output atomesh-benchmark-dashboard-input.json \
+            --summary atomesh-benchmark-summary.md \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          cat atomesh-benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload dashboard input
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-benchmark-dashboard-input
+          path: |
+            atomesh-benchmark-dashboard-input.json
+            atomesh-benchmark-summary.md
+
+  dashboard:
+    name: Update ATOMesh Benchmark Dashboard
+    needs: [normalize-results]
+    if: >-
+      !cancelled()
+      && needs.normalize-results.result == 'success'
+      && (
+        github.event_name == 'schedule'
+        || github.event_name == 'push'
+        || (github.event_name == 'workflow_dispatch' && inputs.publish_dashboard)
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download dashboard input
+        uses: actions/download-artifact@v8
+        with:
+          name: atomesh-benchmark-dashboard-input
+          path: atomesh-dashboard-input
+
+      - name: Store benchmark result to dashboard
+        if: hashFiles('atomesh-dashboard-input/atomesh-benchmark-dashboard-input.json') != ''
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: customBiggerIsBetter
+          output-file-path: atomesh-dashboard-input/atomesh-benchmark-dashboard-input.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: atomesh-benchmark-dashboard
+          auto-push: false
+          max-items-in-chart: 500
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy ATOMesh benchmark dashboard to gh-pages
+        if: hashFiles('atomesh-dashboard-input/atomesh-benchmark-dashboard-input.json') != ''
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          DASHBOARD_TEMPLATE=$(mktemp)
+          LOGO_ASSET=$(mktemp)
+          cp .github/dashboard/atomesh_index.html "$DASHBOARD_TEMPLATE"
+          cp docs/assets/atomesh_logo.png "$LOGO_ASSET"
+          CURRENT_SHA=$(git rev-parse HEAD)
+          git fetch origin gh-pages
+          git checkout gh-pages
+          mkdir -p atomesh-benchmark-dashboard
+          cp "$DASHBOARD_TEMPLATE" atomesh-benchmark-dashboard/index.html
+          cp "$LOGO_ASSET" atomesh-benchmark-dashboard/atomesh_logo.png
+          git add atomesh-benchmark-dashboard/
+          git diff --cached --quiet || git commit -m "Update ATOMesh benchmark dashboard"
+          git push origin gh-pages
+          git checkout "$CURRENT_SHA"

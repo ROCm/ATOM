@@ -1,0 +1,106 @@
+defaults:
+  runner:
+    slurm_account: amd-frameworks
+    slurm_partition: amd-frameworks
+    slurm_submit_runner: atom-mi355-8gpu-oot-benchmark
+    gpus_per_node: 8
+    cpus_per_task: 114
+    time_limit: "06:00:00"
+    log_root: /it-share/ATOMESH_LOG/
+  benchmark:
+    random_range_ratio: 0.8
+    request_rate: inf
+    num_prompts_multiplier: 10
+    wait_server_timeout: 2500
+    wait_router_timeout: 300
+  env:
+    common:
+      PYTHONUNBUFFERED: "1"
+
+backends:
+  atom:
+    image: rocm/atom-dev:latest
+    server_script: .github/scripts/atomesh/pd_server_atom.sh
+    env:
+      common:
+        AITER_LOG_LEVEL: WARNING
+      prefill:
+        ATOM_HOST_IP: "${ROLE_IP}"
+      decode:
+        ATOM_HOST_IP: "${ROLE_IP}"
+    service:
+      prefill:
+        port: 8010
+        tp: 8
+      decode:
+        port: 8020
+        tp: 8
+        cudagraph: >-
+          [1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220,224,228,232,236,240,244,248,252,256,512,768,1024,2048]
+      router:
+        port: 8000
+        policy: random
+        prometheus_port: 29100
+
+models:
+  DeepSeek-V4-Pro:
+    backend: atom
+    model_path: /mnt/models/DeepSeek-V4-Pro/
+    precision: FP4
+    env:
+      common:
+        AITER_BF16_FP8_MOE_BOUND: "0"
+        ATOM_MOE_GU_ITLV: "1"
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 16
+        gpu_memory_utilization: 0.85
+        max_num_seqs: 256
+        extra_args: ""
+    suites:
+      smoke:
+        - name: ds-v4-1p1d-tp8-smoke
+          topology: 1p1d_tp
+          display_topology: 1P1D-TP8
+          nodes: [mia1-p02-g42, mia1-p02-g44]
+          isl: [8192]
+          osl: 1024
+          concurrency: [4, 8]
+          run_eval: true
+          eval_limit: 64
+
+      nightly:
+        - name: ds-v4-1p1d-tp8
+          topology: 1p1d_tp
+          display_topology: 1P1D-TP8
+          nodes: [mia1-p02-g42, mia1-p02-g44]
+          isl: [8192]
+          osl: 1024
+          concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
+          run_eval: true
+
+        - name: ds-v4-2p1d-dpa-tp8
+          topology: 2p1d_dpa
+          display_topology: 2P1D-DPA-TP8
+          nodes: [mia1-p02-g42, mia1-p02-g44, mia1-p02-g47]
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024, 2048]
+          prefill:
+            workers: 2
+            tp: 8
+            enable_dp_attention: true
+          decode:
+            workers: 1
+            tp: 8
+            enable_dp_attention: true
+          run_eval: true
+
+    accuracy:
+      task: gsm8k
+      fewshot: 3
+      limit: null

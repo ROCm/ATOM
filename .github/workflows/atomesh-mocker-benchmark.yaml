@@ -7,7 +7,7 @@ on:
       - 'atom/mesh/**'
       - '.github/scripts/atomesh_mocker_benchmark.sh'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
-      - '.github/dashboard/atomesh_mocker_index.html'
+      - '.github/dashboard/atomesh_index.html'
       - 'docs/assets/atomesh_logo.png'
   pull_request:
     branches: [main]
@@ -16,7 +16,7 @@ on:
       - 'atom/mesh/**'
       - '.github/scripts/atomesh_mocker_benchmark.sh'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
-      - '.github/dashboard/atomesh_mocker_index.html'
+      - '.github/dashboard/atomesh_index.html'
       - 'docs/assets/atomesh_logo.png'
   schedule:
     # Nightly at 02:00 Beijing time (18:00 UTC)
@@ -277,7 +277,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           DASHBOARD_TEMPLATE=$(mktemp)
           LOGO_ASSET=$(mktemp)
-          cp .github/dashboard/atomesh_mocker_index.html "$DASHBOARD_TEMPLATE"
+          cp .github/dashboard/atomesh_index.html "$DASHBOARD_TEMPLATE"
           cp docs/assets/atomesh_logo.png "$LOGO_ASSET"
           CURRENT_SHA=$(git rev-parse HEAD)
           git fetch origin gh-pages
