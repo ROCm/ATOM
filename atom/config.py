@@ -1225,7 +1225,6 @@ class Config:
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
 
-
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
