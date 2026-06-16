@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781547253269,
+  "lastUpdate": 1781624201960,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -93,6 +93,42 @@ window.BENCHMARK_DATA = {
             "value": 0.8901,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/27565040307 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202606151651 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3601 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "103567126+valarLip@users.noreply.github.com",
+            "name": "Lingpeng Jin",
+            "username": "valarLip"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1b5bef7bb19bb7136b2b40a6841e56ad386f2d03",
+          "message": "fix(v4): zero-init all-gather padding to stop uninitialized memory corrupting MoE (#1229)\n\n* fix(v4): zero-init all-gather padding to stop uninitialized memory corrupting MoE\n\npad_for_all_gather built the padding rows with torch.empty and never zeroed\nthem (the .zero_() was commented out), contradicting the function's own\ndocstring. Those uninitialized rows are all-gathered across DP ranks and fed\nstraight into the aiter fused-MoE expert GEMM, and the padded input_ids reach\ntid2eid[ids] for V4 hash routing. Garbage there leaks into real tokens'\noutputs.\n\nBecause the corruption is whatever happens to sit in freshly-allocated GPU\nmemory, the result is nondeterministic across machines/runs: locally it landed\nat GSM8K ~0.95, but CI on a different SKU dropped to 0.9007 (TBO+DPA conc1000,\nbelow the 0.93 threshold) and a local rerun crashed with a null-pointer GPU\nmemory access fault (garbage id -> out-of-range expert -> invalid weight ptr).\nRestoring the zero fixes all three: padding hidden is benign and padding ids\nroute to expert 0.\n\nWith the pad guaranteed zero, the _hash_topk clamp band-aid is replaced by an\nassert that input_ids length matches gating_output num_tokens, surfacing any\nreal DP-layout mismatch instead of silently masking it.\n\nAlso remove the _run_on_tbo_comm_stream side-stream helper: its only caller\n(MoE.combine_outputs TP all-reduce) now runs inline, matching the ids-gather\nwhich must stay inline to keep DP collective ordering aligned under TBO.\nRename compress_stream -> indexer_stream for accuracy.\n\nVerified: V4-Pro TBO+DPA conc1000 GSM8K 3-shot = 0.9515 (flexible) / 0.9522\n(strict), no GPU fault, drain clean.\n\n* ci: TEMP run only DeepSeek-V4-Pro TBO+DPA conc1000 (revert before merge)\n\nFlip every accuracy entry except the TBO+DPA conc1000 case to test_level\n\"off\" so any trigger (pr/push/dispatch/schedule) runs only this one job,\nto validate the pad zero-init fix in CI quickly.\n\nDO NOT MERGE this commit — drop it before merging the PR.\n\n* Fix TBO 1024c accurary issue by remove cpu yield in collective op\n\n(cherry picked from commit 9bf2d25c99e0c7ad03c61f9255d1b0d8edeebe45)\n\n* test(v4): disable pad zero-init for CI repro + print server cmd\n\n- moe.py: temporarily comment out pad_for_all_gather zero-init to reproduce\n  the uninitialized-padding behavior in CI (the CI gate already restricts the\n  run to the V4-Pro TBO+DPA conc1000 case).\n- deepseek_v4.py: restore the tid2eid[ids] clamp as a bounds guard for hash\n  routing.\n- atom_test.sh: print the full openai_server command line before launch so the\n  CI log shows the exact server args.\n\nExperiment on top of the pad zero-init fix — not for merge as-is.\n\n* ci: restore full accuracy matrix (undo temp single-case gate)\n\nReverts the test_level \"off\" gate from 3662ac00 — all accuracy cases are\nre-enabled at their original pr/main/nightly levels. The CI experiment that\nneeded only DeepSeek-V4-Pro TBO+DPA conc1000 is done.\n\n* ci: lower gpt-oss-120b accuracy threshold to 0.87\n\nBoth gpt-oss-120b entries (1-GPU and 2-GPU) drop from 0.88 to 0.87 to absorb\nrun-to-run GSM8K variance. Other models unchanged.\n\n* perf(v4): fuse _hash_topk into a single Triton kernel\n\nThe hash-routing custom_routing_function for V4's first layers ran\nsoftplus+sqrt over every routed expert (n_routed_experts ~256-384) but kept\nonly topk (~6) of them, plus separate clamp / tid2eid gather / score gather /\nrenorm / scale ops.\n\ntriton_hash_topk.py fuses all of it into one kernel (one program per token):\nid clamp, tid2eid[id] lookup, gating gather at the selected experts only,\nsqrt(softplus(.)), optional renorm and scaling. When shared experts are fused\nit writes directly into the first topk columns of the global topK buffer,\navoiding an extra copy.\n\nNumerics match the PyTorch path (max|dw| ~1e-7 fp32 / ~5e-7 bf16 across OOB\nids, bf16, renorm on/off, sliced-buffer write). V4-Pro TBO+DPA conc1000 GSM8K\n3-shot = 0.9522.\n\n* ci: print server cmd with [@] expansion to match actual invocation\n\nUse ${ARRAY[@]} instead of ${ARRAY[*]} in the debug echo so the printed\ncommand line reflects the same word-splitting/quoting as the real launch\nthat uses \"${ARRAY[@]}\" (addresses Copilot review).\n\n---------\n\nCo-authored-by: ZhangLirong-amd <Lirong.Zhang@amd.com>",
+          "timestamp": "2026-06-16T23:01:23+08:00",
+          "tree_id": "2726baca4aa6b8b962b93fe26548d65e29a11acd",
+          "url": "https://github.com/ROCm/ATOM/commit/1b5bef7bb19bb7136b2b40a6841e56ad386f2d03"
+        },
+        "date": 1781624193878,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.95,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/27627027719 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202606151651 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7491,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/27627027719 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202606151651 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7483 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
           }
         ]
       }
