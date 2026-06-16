@@ -471,7 +471,12 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Use torch.split, not Tensor.split: the bound method traces as a
+        # call_function on torch._tensor, which AOTAutograd's cache treats as
+        # non-cacheable and bypasses (breaking standalone-compile artifact save).
+        # torch.split (torch.functional) is on the cache allowlist, matching the
+        # rest of the codebase (deepseek_v2, qwen3_next).
+        q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._qk_norm_rope(positions, q, k)
         attn_output = self.attn(q, k, v)
         return self.o_proj(attn_output)
@@ -718,7 +723,10 @@ class MiniMaxM3SparseAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        q, k, v, index_q, index_k = qkv.split(
+        # torch.split, not Tensor.split (see MiniMaxM3Attention.forward): the
+        # bound method bypasses the AOTAutograd cache and breaks artifact save.
+        q, k, v, index_q, index_k = torch.split(
+            qkv,
             [
                 self.q_size,
                 self.kv_size,
