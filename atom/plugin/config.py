@@ -322,6 +322,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # concept for max num batched tokens
     return Config(
         model=server_args.model_path,
+        trust_remote_code=server_args.trust_remote_code,
         max_num_batched_tokens=16384,
         max_num_seqs=server_args.max_running_requests or 512,
         max_model_len=server_args.context_length,

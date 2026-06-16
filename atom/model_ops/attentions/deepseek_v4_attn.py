@@ -720,7 +720,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return None
 
         num_slots = runner.max_per_req_cache_slots
-        swa_pages = num_slots * self.window_size
+        swa_pages = num_slots * self.win_with_spec
         elem_bf16 = 2
         elem_fp32 = 4
 
@@ -754,7 +754,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
 
         # Slot regions: SWA per layer
-        swa_slot_bytes = self.window_size * self.head_dim * elem_bf16
+        swa_slot_bytes = self.win_with_spec * self.head_dim * elem_bf16
         for layer_id in range(self.num_layers):
             uv = runner.v4_unified_kv[layer_id]
             slot_regions.append(

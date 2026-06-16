@@ -11,6 +11,7 @@ from __future__ import annotations
 # be handled by ATOM's native backend, making sglang-specific overrides
 # unnecessary.
 
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -167,6 +168,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             num_kv_heads, max_total_tokens, dtype=torch.float32, device=self.device
         )
         self.decode_using_pa_ps = self.page_size == 1024
+        if self.use_mla:
+            cu_num = torch.cuda.get_device_properties(self.device).multi_processor_count
+            self.prefill_ps_num_kv_splits = cu_num // math.gcd(self.num_kv_head, cu_num)
+        else:
+            self.prefill_ps_num_kv_splits = None
 
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:
         """Largest q length used by MLA CUDA graph speculative paths."""
@@ -279,6 +285,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         )
 
     def _init_decode_mha(self, bs, kv_indptr, kv_indices, forward_batch):
+        seq_lens_i32 = forward_batch.seq_lens[:bs]
+        if seq_lens_i32.dtype != torch.int32:
+            seq_lens_i32 = seq_lens_i32.to(torch.int32)
+
         if self.decode_using_pa_ps:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             if seq_lens_cpu is None:
@@ -287,7 +297,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             page_table, seq_lens = self._update_decode_page_table(
                 bs,
                 forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
+                seq_lens_i32,
                 seq_lens_cpu=seq_lens_cpu,
             )
             self.forward_metadata = ForwardMetadata(
@@ -313,7 +323,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 1,
                 None,
                 page_table,
-                forward_batch.seq_lens,
+                seq_lens_i32,
             )
 
     def _init_forward_metadata_extend(self, forward_batch: ForwardBatch):
@@ -618,6 +628,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         reduce_final_map = None
         reduce_partial_map = None
         fp8_prefill_kv_indices = None
+        num_kv_splits = None
 
         from sglang.srt.utils import is_gfx95_supported
 
@@ -654,6 +665,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             fp8_prefill_kv_indices = torch.arange(
                 total_s, device=self.device, dtype=torch.int32
             )
+            num_kv_splits = self.prefill_ps_num_kv_splits
 
         self.forward_metadata = ForwardMetadata(
             kv_indptr,
@@ -671,6 +683,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             fp8_prefill_kv_indices=fp8_prefill_kv_indices,
+            num_kv_splits=num_kv_splits,
         )
 
     def _init_extend_mha(self, bs, forward_batch):
@@ -1586,6 +1599,35 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
         return k_descale, v_descale
 
+    def _ensure_fp8_kv_scales(self, layer, k_buffer, block_size):
+        if self.kv_cache_dtype != dtypes.fp8:
+            return layer.k_scale, layer.v_scale
+
+        num_slots, num_kv_heads, _ = k_buffer.shape
+        num_blocks = num_slots // block_size
+        expected_shape = (num_blocks, num_kv_heads, block_size)
+
+        def needs_alloc(scale):
+            return (
+                scale is None
+                or scale.numel() <= 1
+                or tuple(scale.shape) != expected_shape
+                or scale.device != k_buffer.device
+            )
+
+        if needs_alloc(layer.k_scale):
+            layer.k_scale = torch.nn.Parameter(
+                torch.ones(expected_shape, dtype=torch.float32, device=k_buffer.device),
+                requires_grad=False,
+            )
+        if needs_alloc(layer.v_scale):
+            layer.v_scale = torch.nn.Parameter(
+                torch.ones(expected_shape, dtype=torch.float32, device=k_buffer.device),
+                requires_grad=False,
+            )
+
+        return layer.k_scale, layer.v_scale
+
     def _get_aiter_paged_ragged_kv_cache_dtype(self) -> str:
         if self.kv_cache_dtype != dtypes.fp8:
             return "auto"
@@ -1690,14 +1732,17 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
+                    k_scale, v_scale = self._ensure_fp8_kv_scales(
+                        layer, k_buffer, self.page_size
+                    )
                     self.set_kv_buffer_with_layout_shuffle(
                         cache_loc,
                         k,
                         v,
                         k_buffer,
                         v_buffer,
-                        layer.k_scale,
-                        layer.v_scale,
+                        k_scale,
+                        v_scale,
                         self.page_size,
                     )
 
@@ -2048,6 +2093,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             md.reduce_final_map,
             md.reduce_partial_map,
             tile_q,
+            md.num_kv_splits,
             output,
             final_lse,
         )
@@ -2176,6 +2222,38 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
     def _call_mla_decode_fwd(self, q, k_buffer, o, layer):
         """Common mla_decode_fwd invocation shared across decode/extend paths."""
         md = self.forward_metadata
+        head_repeat_factor = getattr(self, "head_repeat_factor", 1)
+        if head_repeat_factor > 1:
+            q_in = q.repeat_interleave(head_repeat_factor, dim=1)
+            o_padded = q.new_empty(
+                (q.shape[0], self.num_head_padded, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            mla_decode_fwd(
+                q_in,
+                k_buffer.view(-1, 1, 1, layer.qk_head_dim),
+                o_padded,
+                md.qo_indptr,
+                md.kv_indptr,
+                md.kv_indices,
+                md.kv_last_page_len,
+                md.max_q_len,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                work_meta_data=md.work_metadata,
+                work_indptr=md.work_indptr,
+                work_info_set=md.work_info_set,
+                reduce_indptr=md.reduce_indptr,
+                reduce_final_map=md.reduce_final_map,
+                reduce_partial_map=md.reduce_partial_map,
+                q_scale=layer.k_scale,
+                kv_scale=layer.k_scale,
+                intra_batch_mode=_sglang_aiter.intra_batch_mode,
+                num_kv_splits=md.num_kv_splits,
+            )
+            o.copy_(o_padded[:, ::head_repeat_factor, :])
+            return
+
         mla_decode_fwd(
             q,
             k_buffer.view(-1, 1, 1, layer.qk_head_dim),
@@ -2302,14 +2380,17 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
+            k_scale, v_scale = self._ensure_fp8_kv_scales(
+                layer, k_buffer, self.page_size
+            )
             self.set_kv_buffer_with_layout_shuffle(
                 forward_batch.out_cache_loc,
                 k,
                 v,
                 k_buffer,
                 v_buffer,
-                layer.k_scale,
-                layer.v_scale,
+                k_scale,
+                v_scale,
                 self.page_size,
             )
 
@@ -2358,6 +2439,22 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
         else:
             q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            if self.forward_metadata.page_table.dtype != torch.int32:
+                raise TypeError(
+                    "pa_fwd_asm block_tables must be torch.int32, got "
+                    f"{self.forward_metadata.page_table.dtype}"
+                )
+            if self.forward_metadata.kv_lens.dtype != torch.int32:
+                raise TypeError(
+                    "pa_fwd_asm context_lens must be torch.int32, got "
+                    f"{self.forward_metadata.kv_lens.dtype}"
+                )
+            k_qscale = (
+                layer.k_scale if self.kv_cache_dtype == dtypes.fp8 else self.k_scale
+            )
+            v_qscale = (
+                layer.v_scale if self.kv_cache_dtype == dtypes.fp8 else self.v_scale
+            )
             pa_fwd_asm(
                 Q=q_3d,
                 K=new_key_cache,
@@ -2365,8 +2462,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 block_tables=self.forward_metadata.page_table,
                 context_lens=self.forward_metadata.kv_lens,
                 block_tables_stride0=self.forward_metadata.page_table.stride(0),
-                K_QScale=self.k_scale,
-                V_QScale=self.v_scale,
+                K_QScale=k_qscale,
+                V_QScale=v_qscale,
                 out_=o,
             )
 
