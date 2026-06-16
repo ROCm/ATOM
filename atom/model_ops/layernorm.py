@@ -662,17 +662,20 @@ class GemmaRMSNorm(nn.Module):
         eps: float = 1e-6,
         quant_config: LayerQuantConfig | None = None,
         write_bf16: bool = False,
+        fused_allreduce: bool = False,
     ) -> None:
         super().__init__()
         self.weight = atom_parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
         self.use_fused_quant = False
         self.write_bf16 = write_bf16
+        self.tp_size = get_tensor_model_parallel_world_size()
         if quant_config is not None:
             from aiter import QuantType
 
             if quant_config.quant_type == QuantType.per_1x128:
                 self.use_fused_quant = True
+        self.fused_allreduce = fused_allreduce and not self.use_fused_quant
 
     @staticmethod
     def forward_static(
@@ -713,6 +716,19 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.fused_allreduce and self.tp_size > 1:
+            assert (
+                residual is not None
+            ), "fused_allreduce_rmsnorm requires residual input!"
+            weight = self.weight.data.to(x.dtype) + 1.0
+            x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
+                x.contiguous(),
+                residual,
+                weight,
+                self.variance_epsilon,
+            )
+            return x, residual
+
         # Use the aiter HIP fused_qk_rmsnorm_group_quant kernel in no-quant mode
         # (q_out_scale=None) to perform Gemma RMSNorm + optional residual add.
         # Same math as the Triton kernel: out = rmsnorm(x [+ residual]) * (1 + w),
