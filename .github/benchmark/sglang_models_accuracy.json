@@ -4,7 +4,7 @@
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
     "extraArgs": "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4",
     "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nATOM_USE_TRITON_MOE=1\nAITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nSGLANG_DEFAULT_THINKING=1\nSGLANG_DSV4_REASONING_EFFORT=max\nSGLANG_USE_AITER=1\nSGLANG_DSV4_FP4_EXPERTS=true\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
-    "runner": "atom-mi355-8gpu.predownload",
+    "runner": "atom-mi355-8gpu-conductor-sgl-runner",
     "test_level": "nightly",
     "lm_eval_num_fewshot": 5,
     "lm_eval_num_concurrent": 8,
