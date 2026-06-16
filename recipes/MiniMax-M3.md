@@ -2,7 +2,7 @@
 
 [MiniMax-M3](https://huggingface.co/amd/MiniMax-M3) is a MiniMax-M3 BF16 checkpoint supported by the native ATOM OpenAI-compatible server path.
 
-This recipe tracks the MiniMax-M3 BF16 support added in [ROCm/ATOM PR #1238](https://github.com/ROCm/ATOM/pull/1238). The validated setup also uses the AITER branch `xiaobing/gemma-rmsnorm-bias`.
+This recipe tracks the MiniMax-M3 BF16 support added in [ROCm/ATOM PR #1238](https://github.com/ROCm/ATOM/pull/1238). The validated setup also uses the AITER branch `M3_mi355`.
 
 ## Preparing Environment
 
