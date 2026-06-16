@@ -146,6 +146,70 @@ stop_server() {
   fi
 }
 
+# Scrape MTP/speculative-decode acceptance from the live vLLM /metrics endpoint
+# and store overall + per-position acceptance into the result JSON. Must be
+# called while the server is still running. No-op for non-speculative runs
+# (the spec_decode counters are absent). The workflow's "Check OOT MTP
+# acceptance rate" step reads these values to gate against regressions —
+# gsm8k accuracy alone cannot, since spec decoding is lossless w.r.t. the
+# target model and a broken draft head only craters acceptance/throughput.
+record_mtp_acceptance() {
+  local result_file="$1"
+  local metrics_file="/tmp/oot_spec_metrics.txt"
+
+  if ! curl -fsS "http://127.0.0.1:${VLLM_PORT}/metrics" -o "${metrics_file}" 2>/dev/null; then
+    echo "MTP acceptance: /metrics not reachable (skipping)."
+    return 0
+  fi
+
+  RESULT_FILE="${result_file}" METRICS_FILE="${metrics_file}" python3 - <<'PY'
+import json, os, re
+
+with open(os.environ["METRICS_FILE"], encoding="utf-8", errors="replace") as f:
+    metrics = f.read()
+
+def sum_counter(name):
+    # Sum a Prometheus counter across all label series; tolerate the `_total`
+    # suffix and optional `{labels}`. Anchored so e.g. num_accepted_tokens does
+    # not also match num_accepted_tokens_per_pos.
+    pat = rf'^{re.escape(name)}(?:_total)?(?:\{{[^}}]*\}})?\s+([0-9eE+.\-]+)\s*$'
+    vals = [float(m.group(1)) for m in re.finditer(pat, metrics, re.M)]
+    return sum(vals) if vals else None
+
+accepted = sum_counter("vllm:spec_decode_num_accepted_tokens")
+draft_tokens = sum_counter("vllm:spec_decode_num_draft_tokens")
+num_drafts = sum_counter("vllm:spec_decode_num_drafts")
+
+per_pos_counts = {}
+for m in re.finditer(
+    r'vllm:spec_decode_num_accepted_tokens_per_pos(?:_total)?\{([^}]*)\}\s+([0-9eE+.\-]+)',
+    metrics,
+):
+    pm = re.search(r'position="(\d+)"', m.group(1))
+    if pm:
+        i = int(pm.group(1))
+        per_pos_counts[i] = per_pos_counts.get(i, 0.0) + float(m.group(2))
+
+if not draft_tokens:
+    print("MTP acceptance: no spec-decode metrics found (non-MTP run).")
+else:
+    overall = accepted / draft_tokens
+    per_pos = []
+    if num_drafts and per_pos_counts:
+        per_pos = [per_pos_counts[i] / num_drafts for i in sorted(per_pos_counts)]
+    rf = os.environ["RESULT_FILE"]
+    with open(rf, encoding="utf-8") as f:
+        data = json.load(f)
+    meta = data.setdefault("atom_ci_metadata", {})
+    meta["mtp_acceptance_overall"] = overall
+    meta["mtp_per_pos_acceptance"] = per_pos
+    with open(rf, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print("MTP acceptance overall: %.4f, per-position: %s" % (
+        overall, ", ".join("%.4f" % r for r in per_pos) if per_pos else "n/a"))
+PY
+}
+
 launch_one_model() {
   local model_name="$1"
   local model_path="$2"
@@ -386,6 +450,9 @@ print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
 PY
 )
   fi
+
+  # Capture MTP acceptance from /metrics while the server is still alive.
+  record_mtp_acceptance "${result_file}"
 
   echo "Result file: ${result_file}"
   echo "Flexible extract value: ${value}"
