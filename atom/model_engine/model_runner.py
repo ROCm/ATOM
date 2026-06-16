@@ -93,12 +93,7 @@ class tokenIDProcessor:
         # Deferred output is disabled when running in P/D disaggregation mode
         # (kv_transfer_config is set), enabled otherwise.
         # TODO: In P/D disaggregation mode, if have issue, we can disable it
-        # Mixed prefill+decode batches do not yet support deferred output
-        # (the [prefill | decode] input-id layout isn't wired into the deferred
-        # path — see prepare_input_ids), so auto-disable it when the flag is on.
-        self.is_deferred_out = not getattr(
-            runner.config, "enable_mixed_prefill_decode", False
-        )
+        self.is_deferred_out = True
 
         self.runner = runner
         device = runner.device
@@ -373,26 +368,72 @@ class tokenIDProcessor:
         self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
 
         if is_mixed:
-            # Mixed batch: write decode tokens after the prefill region.
-            # MTP / deferred-output integration with mixed batches is not yet
-            # supported (P2-M4 follow-up) — keep the failure obvious until
-            # those paths are adapted to the layout
-            #   [prefill_tokens | decode_tokens].
-            assert not self.is_deferred_out, (
-                "Mixed prefill+decode batches do not yet support deferred output "
-                "(P2-M4 follow-up). Disable --enable-mixed-prefill-decode for now."
-            )
+            # Mixed batch layout: [prefill_tokens | decode_tokens]. The prefill
+            # region is already written above. Fill the decode region (one token
+            # per decode seq, in batch order — which matches the decode attention
+            # metadata's row order) starting at `decode_offset`.
+            # MTP / speculative decode with mixed batches is a separate follow-up
+            # (the per-seq multi-token layout isn't wired into this branch).
             assert not self.use_spec, (
                 "Mixed prefill+decode batches do not yet support MTP / speculative "
-                "decode (P2-M4 follow-up). Disable --enable-mixed-prefill-decode for now."
+                "decode (follow-up). Disable --enable-mixed-prefill-decode for now."
             )
-            token_ids = scheduled_tokens[
-                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
+            decode_offset = total_tokens_prefill
+            sched_decode = scheduled_tokens[
+                decode_offset : decode_offset + total_tokens_decode
             ]
-            self.input_ids.np[
-                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
-            ] = token_ids
+
+            # Non-deferred OR first step (no prior batch to gather from): decode
+            # inputs come straight from scheduled_tokens. This is the path
+            # already verified at GSM8K parity on R1 / V4-Pro.
+            if not self.is_deferred_out or self.prev_batch is None:
+                self.input_ids.np[
+                    decode_offset : decode_offset + total_tokens_decode
+                ] = sched_decode
+                self.input_ids.copy_to_gpu(total_tokens)
+                return self.input_ids.gpu[:total_tokens]
+
+            # Deferred path: each decode seq's input is the token sampled for it
+            # last step, kept on-GPU in `prev_token_ids` (ordered by
+            # prev_batch.req_ids). Map current decode seqs — batch positions
+            # [n_prefill_seqs:] — to their prev_batch slot. A decode seq is
+            # ALWAYS in prev_batch in steady state (it decoded last step); a
+            # genuinely-new decode row (just finished prefill elsewhere) falls
+            # back to scheduled_tokens. Prefill rows are never gathered.
+            #
+            # Destination index = decode_offset + i, where i is the decode seq's
+            # position within the decode segment — identical to the decode
+            # attention metadata row order, guaranteeing alignment.
+            n_prefill_seqs = batch.total_seqs_num_prefill
+            prev_id_to_idx = {rid: j for j, rid in enumerate(self.prev_batch.req_ids)}
+            deferred_dst: list[int] = []
+            deferred_prev: list[int] = []
+            for i, rid in enumerate(batch.req_ids[n_prefill_seqs:]):
+                prev_idx = prev_id_to_idx.get(rid)
+                if prev_idx is not None:
+                    deferred_dst.append(decode_offset + i)
+                    deferred_prev.append(prev_idx)
+
+            # Baseline the whole decode region from scheduled_tokens (correct for
+            # any new decode seq not in prev_batch). Deferred positions are then
+            # overwritten GPU-side by the gather below.
+            self.input_ids.np[decode_offset : decode_offset + total_tokens_decode] = (
+                sched_decode
+            )
             self.input_ids.copy_to_gpu(total_tokens)
+
+            if deferred_dst:
+                self.input_ids_loc.np[: len(deferred_prev)] = deferred_prev
+                prev_idx_gpu = self.input_ids_loc.copy_to_gpu(len(deferred_prev))
+                gathered = torch.gather(self.prev_token_ids, 0, prev_idx_gpu)
+                dst_gpu = torch.as_tensor(
+                    deferred_dst, dtype=torch.long, device=self.input_ids.gpu.device
+                )
+                self.input_ids.gpu[dst_gpu] = gathered.to(self.input_ids.gpu.dtype)
+
+            # prev_batch / prev_token_ids are advanced by prepare_sampled_ids
+            # (postprocess) after sampling — NOT here, exactly like the non-mixed
+            # deferred path.
             return self.input_ids.gpu[:total_tokens]
 
         # TODO: remove this when we support mixed prefill and decode in one batch
