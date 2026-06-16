@@ -439,7 +439,7 @@ def fused_compress_attn(
     # by the kernel doing both BF16 and FP8 paths through a single
     # launcher (less per-call Python overhead at the boundary).
     # ------------------------------------------------------------------
-    _flydsl_mode = envs.ATOM_FUSED_COMPRESS_USE_FLYDSL
+    _flydsl_mode = None
     _shape_key = (head_dim, rope_head_dim, ratio, overlap)
     _flydsl_shape_ok = _shape_key in _FLYDSL_SUPPORTED
     _flydsl_use = (

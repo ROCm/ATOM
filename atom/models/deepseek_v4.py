@@ -38,6 +38,7 @@ from aiter import (
     rope_rotate_activation,
 )
 from aiter import silu_and_mul as aiter_silu_and_mul
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
 )
@@ -165,6 +166,34 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
+
+
+def _hc_head_reduce_fake(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    return torch.empty(x.shape[0], x.shape[-1], dtype=x.dtype, device=x.device)
+
+
+@torch_compile_guard(gen_fake=_hc_head_reduce_fake, mutates_args=[])
+def _hc_head_reduce(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    x_flat = x.flatten(-2)
+    x_normed = _rmsnorm_nw(x_flat, norm_eps, x_flat.shape[-1])
+    mixes = F.linear(x_normed.float(), hc_fn)
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
+    y = torch.sum(pre.unsqueeze(-1) * x, dim=-2)
+    return y.to(x.dtype)
 
 
 def _v4_attention_fake(
@@ -1030,6 +1059,9 @@ class Compressor(nn.Module):
         else:
             scatter_kv_cache = self.kv_cache
             scatter_block_tables = block_tables
+        _cbisect = int(os.environ.get("ATOM_V4_BISECT_COMPRESS", "0"))
+        if _cbisect == 1:
+            return  # BISECT_COMPRESS1: before fused_compress_attn
         fused_compress_attn(
             kv_in=kv,
             score_in=score,
@@ -1055,6 +1087,8 @@ class Compressor(nn.Module):
             preshuffle=True,
             fp8_max=(torch.finfo(self.kv_cache.dtype).max if is_quant else None),
         )
+        if _cbisect == 2:
+            return  # BISECT_COMPRESS2: after fused_compress_attn, before update_compressor_states
         update_compressor_states(
             kv,
             score,
@@ -1737,52 +1771,46 @@ class DeepseekV4Attention(nn.Module):
             return torch.zeros_like(x)
         if os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return torch.zeros_like(x)
+        _bisect = int(os.environ.get("ATOM_V4_BISECT", "0"))
+        if _bisect == 1:
+            return torch.zeros_like(x)  # BISECT1: top of forward
         num_tokens = x.size(0)
         cache_size = self.swa_kv.shape[1]
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
-        # All per-fwd state read once. Production prepare_decode/prefill
-        # always populates these; warmup goes through the same path
-        # (`_populate_state_slot_mapping` falls back to slot 0).
-        # Cast to V4 typed metadata so V4-specific attribute access (v4_*,
-        # compress_plans, ...) is well-typed for pyright.
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         compress_plans = attn_md.compress_plans
         block_tables_gpu = attn_md.block_tables
         state_slot_mapping = attn_md.state_slot_mapping
         plan_for_layer = compress_plans[ratio] if ratio else None
 
-        # ----- Batched ops on full flat tensors -----
-        # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
-        # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
-        # quantization. EXPERIMENT only.
         if _V4_FORCE_UE8M0_QUANT:
             x = x.clone()
             act_quant_inplace(x, 128, "ue8m0")
 
-        # ===== Triple-stream: Q/KV path + both Compressors in parallel =====
+        if _bisect == 2:
+            return torch.zeros_like(x)  # BISECT2: before compressors_async
         use_async_compress = self.maybe_compressors_async(
             x, plan_for_layer, state_slot_mapping, block_tables_gpu
         )
+        if _bisect == 3:
+            return torch.zeros_like(x)  # BISECT3: after compressors_async
 
-        # ----- Q/KV projections (main stream) -----
         qkv_a = self.wqkv_a(x)
+        if _bisect == 4:
+            return torch.zeros_like(x)  # BISECT4: after wqkv_a
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
         assert (
             not _V4_FORCE_UE8M0_QUANT
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
         qr, qr_scale = self.q_norm(q_lora)
+        if _bisect == 5:
+            return torch.zeros_like(x)  # BISECT5: after q_norm
         q = self.wq_b(qr, x_scale=qr_scale)
+        if _bisect == 6:
+            return torch.zeros_like(x)  # BISECT6: after wq_b
         is_decode = attn_md.state is AttnState.DECODE
-        # Single kernel fuses per-head Q RMSNorm (weightless) + KV RMSNorm
-        # (weighted) + GPT-J interleaved RoPE on the tail rd dims. Dispatches
-        # to flydsl when the shape matches (V4-Pro is always V4-Pro shape →
-        # always flydsl). Microbench shows flydsl wins at every measured T
-        # from 4 (1.12×) to 32k (1.04×); used for both decode and prefill.
-        # Optional FP8 quant outputs left off — downstream sparse_attn /
-        # swa_write are still bf16.
         q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
             q,
             kv_pre,
@@ -1797,9 +1825,9 @@ class DeepseekV4Attention(nn.Module):
             quant_q=False,
             quant_k=False,
         )
+        if _bisect == 7:
+            return torch.zeros_like(x)  # BISECT7: after qk_norm_rope
         if is_decode:
-            # SWA write per-token in decode (prefill writes after sparse_attn
-            # below so the in-chunk SWA tail is captured post-attention).
             swa_write(
                 kv,
                 positions,
@@ -1812,14 +1840,12 @@ class DeepseekV4Attention(nn.Module):
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
-        # HCA
         if use_async_compress:
             current_stream = fc.main_stream
             if self.compressor is not None:
                 current_stream.wait_stream(self.alt_stream)
             if self.indexer is not None:
                 current_stream.wait_stream(self.compress_stream)
-        # ===== Compressor + Indexer =====
         if self.indexer is not None and not self.skip_topk:
             indexer_topk_batched = self.indexer.forward_batched(
                 x_full=x,
@@ -1827,21 +1853,13 @@ class DeepseekV4Attention(nn.Module):
                 qr_full_scale=qr_scale,
                 positions=positions,
             )
-            # Translate seq-local topk → physical paged offsets and write into
-            # the CSA section of either:
-            #   - decode buffer `kv_indices_csa` (state is DECODE)
-            #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
-            # `_fill_csa_paged_compress` dispatches internally on state.
             self._fill_csa_paged_compress(
                 attn_md, indexer_topk_batched, positions, num_tokens
             )
 
-        # ===== Sparse attention dispatch =====
-        # Decode SWA write fires upstream of this dispatch via the
-        # ``swa_write`` call in the decode branch — so ``paged_decode``
-        # always sees the current token's K in the ring. Prefill does NOT
-        # call swa_write from this layer (prior-chunk K is read from
-        # ``unified_kv`` ring via the kv_indices_prefix_swa region).
+        if _bisect == 8:
+            return torch.zeros_like(x)  # BISECT8: before sparse attn
+
         if is_decode:
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
@@ -1849,7 +1867,7 @@ class DeepseekV4Attention(nn.Module):
             elif ratio == 4:
                 kv_indices = attn_md.kv_indices_csa
                 kv_indptr = attn_md.kv_indptr_csa
-            else:  # ratio == 128
+            else:
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
             o = sparse_attn_v4_paged_decode(
@@ -1859,11 +1877,8 @@ class DeepseekV4Attention(nn.Module):
                 kv_indptr,
                 self.attn_sink,
                 self.softmax_scale,
-            )  # [S, H, head_dim]
+            )
         else:
-            # Two-source paged prefill: prefix from `unified_kv` (per-ratio
-            # buffer with SWA history + compress section), extend from per-fwd
-            # `kv` tensor (in-chunk SWA tail; extend buffer is layer-invariant).
             if ratio == 0:
                 kv_indices_prefix = attn_md.kv_indices_prefix_swa
                 kv_indptr_prefix = attn_md.kv_indptr_prefix_swa
@@ -1885,10 +1900,7 @@ class DeepseekV4Attention(nn.Module):
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
                 self.softmax_scale,
-            )  # [S, H, head_dim]
-            # swa_write AFTER attn so chunked-prefill prefix SWA reads see
-            # prior-chunk's ring contents (current swa_write would overwrite
-            # ring slots `pos % cache_size` for positions in this chunk's tail).
+            )
             swa_write(
                 kv,
                 positions,
@@ -1899,10 +1911,10 @@ class DeepseekV4Attention(nn.Module):
                 min(attn_md.max_seqlen_q, cache_size),
             )
 
-        # Inverse RoPE on output's rope dims to remove absolute-position
-        # contribution carried in by the value-side RoPE of the KV entries.
+        if _bisect == 9:
+            return torch.zeros_like(x)  # BISECT9: after sparse attn, before inverse rope
+
         self.rotary_emb.inverse(positions, o[..., -rd:])
-        # ----- Grouped output LoRA (batched on the full flat tensor) -----
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
@@ -2407,13 +2419,16 @@ class Block(nn.Module):
         # `x.is_cuda` is implicit here — model lives on GPU post-`.to()`; a CPU tensor
         # would have crashed earlier in DeepseekV4Attention.
         _dim_ok = args.dim % 512 == 0 or args.dim % 256 == 0
-        self._mhc_pre = getattr(aiter, "mhc_pre", None) if _dim_ok else None
-        self._mhc_post = getattr(aiter, "mhc_post", None) if _dim_ok else None
+        _use_aiter_mhc = _dim_ok and not envs.ATOM_USE_TORCH_MHC
+        self._mhc_pre = getattr(aiter, "mhc_pre", None) if _use_aiter_mhc else None
+        self._mhc_post = getattr(aiter, "mhc_post", None) if _use_aiter_mhc else None
         self._mhc_fused_post_pre = (
-            getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
+            getattr(aiter, "mhc_fused_post_pre", None) if _use_aiter_mhc else None
         )
         self.enable_fused_hc = (
-            hasattr(aiter, "mhc_fused_post_pre") and not self.layer_id == 0
+            hasattr(aiter, "mhc_fused_post_pre")
+            and not self.layer_id == 0
+            and not envs.ATOM_USE_TORCH_MHC
         )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
@@ -2632,6 +2647,10 @@ class ParallelHead(ParallelLMHead):
         """Reduce mHC residual `[num_tokens, hc, dim]` → `[num_tokens, dim]`
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
+        if envs.ATOM_USE_TORCH_MHC:
+            return _hc_head_reduce(
+                x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps,
+            )
         _, _, y = aiter.mhc_pre(
             x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0
         )
