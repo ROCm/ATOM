@@ -327,6 +327,28 @@ jobs:
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
+      - name: Ensure Python 3.10+ (install 3.10.12 if needed)
+        if: matrix.runner == 'atom-mi308-8gpu-plugins-benchmark'
+        id: ensure_python
+        shell: bash
+        run: |
+          if command -v python3 >/dev/null 2>&1 && python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"; then
+            echo "Using $(command -v python3): $(python3 --version)"
+            echo "need_install=false" >> "$GITHUB_OUTPUT"
+          else
+            if command -v python3 >/dev/null 2>&1; then
+              echo "python3 is below 3.10: $(python3 --version 2>&1)"
+            else
+              echo "python3 not found on PATH; will install 3.10.12"
+            fi
+            echo "need_install=true" >> "$GITHUB_OUTPUT"
+          fi
+      
+      - uses: actions/setup-python@v5
+        if: matrix.runner == 'atom-mi308-8gpu-plugins-benchmark' && steps.ensure_python.outputs.need_install == 'true'
+        with:
+          python-version: '3.10.12'
+
       - name: Clean up containers and workspace
         if: contains(fromJSON('["atom-mi355-8gpu.predownload","atom-mi308-8gpu-plugins-benchmark"]'), matrix.runner)
         run: |
