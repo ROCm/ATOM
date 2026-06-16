@@ -10,11 +10,31 @@ from atom.config import KVCacheTensor
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.utils import envs
+from aiter.jit.utils.chip_info import get_gfx
 
 from .aiter_attention import AiterAttentionMetadataBuilder
 from .backends import AttentionBackend
 
 logger = logging.getLogger("atom")
+
+# RDNA4 (gfx1200/gfx1201) reads the flash (4D NHD) KV layout markedly faster in
+# decode than the 5D SHUFFLE layout. The shuffle layout is a CDNA/MFMA pre-shuffle
+# that unified_attention has to un-shuffle (an in-register transpose) on every KV
+# tile; that transpose is LDS-bound on RDNA4's WMMA and costs ~1.7-1.8x decode
+# TPOT. CDNA / gfx1250 keep the shuffle layout (their MFMA path consumes it
+# directly). Override the auto choice with ATOM_KV_CACHE_LAYOUT=flash|shuffle.
+_RDNA4_ARCHS = ("gfx1200", "gfx1201")
+
+
+def use_flash_kv_layout() -> bool:
+    """Whether TritonMHABackend allocates the flash (4D NHD) KV layout instead of
+    the 5D SHUFFLE layout. See the note above for the perf rationale."""
+    override = envs.ATOM_KV_CACHE_LAYOUT
+    if override == "flash":
+        return True
+    if override == "shuffle":
+        return False
+    return get_gfx() in _RDNA4_ARCHS
 
 
 class TritonMHABackend(AttentionBackend):
@@ -115,25 +135,44 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         else:
             attn_idx = layer_id
 
-        # 5D SHUFFLE (pre-shuffled) layout, consumed by
-        # unified_attention(shuffled_kv_cache=True) for prefill+decode:
-        #   K [num_blocks, num_kv_heads, head_dim // x, block_size, x]
-        #   V [num_blocks, num_kv_heads, block_size // x, head_dim, x]
-        x = 16 // runner.kv_cache.element_size()
-        k_cache = runner.kv_cache[0, attn_idx].view(
-            runner.num_physical_kvcache_blocks,
-            runner.num_kv_heads,
-            hf_config.head_dim // x,
-            runner.physical_block_size,
-            x,
-        )
-        v_cache = runner.kv_cache[1, attn_idx].view(
-            runner.num_physical_kvcache_blocks,
-            runner.num_kv_heads,
-            runner.physical_block_size // x,
-            hf_config.head_dim,
-            x,
-        )
+        # KV layout depends on arch (see use_flash_kv_layout): RDNA4 uses the
+        # flash (4D NHD) layout for faster decode; CDNA / gfx1250 use the 5D
+        # SHUFFLE layout consumed by unified_attention(shuffled_kv_cache=True).
+        use_flash = use_flash_kv_layout()
+        if use_flash:
+            # Flash (4D) NHD layout: K/V both
+            #   [num_blocks, block_size, num_kv_heads, head_dim]
+            k_cache = runner.kv_cache[0, attn_idx].view(
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                runner.num_kv_heads,
+                hf_config.head_dim,
+            )
+            v_cache = runner.kv_cache[1, attn_idx].view(
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                runner.num_kv_heads,
+                hf_config.head_dim,
+            )
+        else:
+            # 5D SHUFFLE (pre-shuffled) layout:
+            #   K [num_blocks, num_kv_heads, head_dim // x, block_size, x]
+            #   V [num_blocks, num_kv_heads, block_size // x, head_dim, x]
+            x = 16 // runner.kv_cache.element_size()
+            k_cache = runner.kv_cache[0, attn_idx].view(
+                runner.num_physical_kvcache_blocks,
+                runner.num_kv_heads,
+                hf_config.head_dim // x,
+                runner.physical_block_size,
+                x,
+            )
+            v_cache = runner.kv_cache[1, attn_idx].view(
+                runner.num_physical_kvcache_blocks,
+                runner.num_kv_heads,
+                runner.physical_block_size // x,
+                hf_config.head_dim,
+                x,
+            )
         if config.kv_cache_dtype == "fp8":
             module.k_scale = runner.kv_scale[0, attn_idx]
             module.v_scale = runner.kv_scale[1, attn_idx]
@@ -142,9 +181,9 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         module.k_cache = k_cache
         module.v_cache = v_cache
         if impl is not None:
-            # KV cache is no longer in flash (4D) layout; unified_attention is
-            # selected via ATOM_USE_UNIFIED_ATTN, and reads the SHUFFLE layout.
-            impl.use_flash_layout = False
+            # attention_mha selects the matching reshape_and_cache + read path via
+            # use_flash_layout (shuffled_kv_cache = not use_flash_layout).
+            impl.use_flash_layout = use_flash
 
         return KVCacheTensor(
             layer_num=layer_id,
