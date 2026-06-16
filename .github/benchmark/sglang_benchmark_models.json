@@ -478,6 +478,32 @@
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
+    },
+    {
+      "display": "DeepSeek-V3.2 FP8 TP8",
+      "dashboard_model": "DeepSeek-V3.2-tp8",
+      "workload_label": "SGLang-OOB",
+      "source_path": "deepseek-ai/DeepSeek-V3.2",
+      "path": "deepseek-ai/DeepSeek-V3.2",
+      "prefix": "deepseek-v3-2-fp8-tp8",
+      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8", "aiter_runtime"],
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-aac-runner",
+      "nightly_group": "A",
+      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
+    },
+    {
+      "display": "GLM-5.1 FP8 TP8",
+      "dashboard_model": "GLM-5.1-FP8-tp8",
+      "workload_label": "SGLang-OOB",
+      "source_path": "zai-org/GLM-5.1-FP8",
+      "path": "zai-org/GLM-5.1-FP8",
+      "prefix": "glm-5-1-fp8-tp8",
+      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8", "aiter_runtime"],
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-aac-runner",
+      "nightly_group": "B",
+      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
     }
   ]
 }
