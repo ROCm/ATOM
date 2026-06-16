@@ -6,6 +6,7 @@ replacing sglang's built-in implementations with ATOM-optimized versions.
 To add a new model, append its architecture class name to _MODEL_NAMES.
 """
 
+import inspect
 import logging
 from typing import Any, Iterable, Optional, Tuple, Union
 
@@ -37,6 +38,23 @@ __all__ = [
     "get_current_forward_batch",
     "plugin_runtime_scope",
 ]
+
+
+class _ComputeLogitsHeadAdapter(nn.Module):
+    """Expose ATOM `compute_logits` through SGLang's lm_head call contract."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def set_lora(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def apply_lora(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.model.compute_logits(hidden_states)
 
 
 class _AtomCausalLMBaseForSglang(nn.Module):
@@ -73,15 +91,35 @@ class _AtomCausalLMBaseForSglang(nn.Module):
             if self.atom_config is None:
                 self.atom_config = get_current_atom_config()
                 self.model.atom_config = self.atom_config
+        # SGLang's loader invokes some quantization post-load hooks after
+        # returning from this constructor/load_weights scope. Keep the
+        # process-local ATOM config available, matching native model_runner.
+        from atom.config import set_current_atom_config
+
+        set_current_atom_config(self.atom_config)
         if self.model is None:
             raise ValueError(
                 f"ATOM failed to create model for architecture {self.model_arch}"
             )
 
+        if hasattr(self.model, "lm_head"):
+            self.logits_head = self.model.lm_head
+            logits_head_handles_all_gather = False
+        elif hasattr(self.model, "compute_logits"):
+            self.logits_head = _ComputeLogitsHeadAdapter(self.model)
+            logits_head_handles_all_gather = True
+        else:
+            raise AttributeError(
+                f"ATOM model {type(self.model).__name__} must define lm_head "
+                "or compute_logits for SGLang logits processing"
+            )
+
         # Under SGLang dp-attention, ATOM runtime interprets non-MoE modules
         # like lm_head with tp=1 semantics, so plugin logits must not perform
         # an extra TP all-gather after local lm_head matmul.
-        plugin_skip_all_gather = bool(self.model.atom_config.enable_dp_attention)
+        plugin_skip_all_gather = bool(
+            self.model.atom_config.enable_dp_attention or logits_head_handles_all_gather
+        )
         self.logits_processor = LogitsProcessor(
             config, skip_all_gather=plugin_skip_all_gather
         )
@@ -90,6 +128,20 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         if self.model_arch_spec.install_adapters is not None:
             with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
                 self.model_arch_spec.install_adapters(self.model)
+
+    def _filter_model_forward_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Drop SGLang wrapper kwargs that the ATOM model forward does not accept."""
+        try:
+            params = inspect.signature(self.model.forward).parameters
+        except (TypeError, ValueError):
+            return kwargs
+
+        if any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+        ):
+            return kwargs
+
+        return {key: value for key, value in kwargs.items() if key in params}
 
     def get_embed_and_head(self):
         if hasattr(self.model, "get_embed_and_head"):
@@ -155,6 +207,25 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 input_embeds=input_embeds,
                 set_forward_context=not self.model_arch_spec.wrapper_binds_gdn_context,
             ) as runtime:
+                if self.model_arch == "DeepseekV4ForCausalLM":
+                    from atom.plugin.sglang.deepseek_v4_bridge import (
+                        bind_deepseek_v4_proxy_cache_views,
+                        maybe_get_proxy_pool_from_sglang_backend,
+                        reset_deepseek_v4_state_slots,
+                    )
+
+                    proxy_pool, _ = maybe_get_proxy_pool_from_sglang_backend()
+                    if not bind_deepseek_v4_proxy_cache_views(self.model, proxy_pool):
+                        raise RuntimeError(
+                            "DeepSeek-V4 SGLang proxy KV pool is not initialized"
+                        )
+                    from atom.utils.forward_context import get_forward_context
+
+                    reset_slots = getattr(
+                        get_forward_context().attn_metadata, "reset_slots", None
+                    )
+                    reset_deepseek_v4_state_slots(self.model, reset_slots)
+
                 metadata = SGLangForwardBatchMetadata.build(
                     runtime.forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
@@ -176,25 +247,47 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                         )
 
                         with SGLangGDNForwardContext.bind(metadata):
-                            hidden_states = self.model(**model_inputs)
+                            hidden_states = self.model(
+                                **self._filter_model_forward_kwargs(model_inputs)
+                            )
                     elif self.model_arch_spec.uses_context_only_forward:
-                        hidden_states = self.model(**model_inputs)
-                    else:
                         hidden_states = self.model(
-                            **model_inputs,
+                            **self._filter_model_forward_kwargs(model_inputs)
+                        )
+                    else:
+                        model_call_kwargs = dict(
+                            model_inputs,
                             forward_batch=runtime.forward_batch,
                             get_embedding=get_embedding,
                             pp_proxy_tensors=pp_proxy_tensors,
-                            **model_kwargs,
+                        )
+                        model_call_kwargs.update(model_kwargs)
+                        hidden_states = self.model(
+                            **self._filter_model_forward_kwargs(model_call_kwargs)
                         )
 
                 hidden_states = runtime.trim_output(hidden_states)
 
                 if self.pp_group.is_last_rank:
+                    if self.model_arch == "DeepseekV4ForCausalLM" and not getattr(
+                        forward_batch, "return_logprob", False
+                    ):
+                        if forward_batch.forward_mode.is_decode_or_idle():
+                            pruned_states = hidden_states
+                        elif forward_batch.forward_mode.is_extend():
+                            last_index = (
+                                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                            )
+                            pruned_states = hidden_states[last_index]
+                        else:
+                            pruned_states = hidden_states
+                        return LogitsProcessorOutput(
+                            next_token_logits=self.model.compute_logits(pruned_states)
+                        )
                     return self.logits_processor(
                         input_ids,
                         hidden_states,
-                        self.model.lm_head,
+                        self.logits_head,
                         forward_batch,
                     )
                 return hidden_states
