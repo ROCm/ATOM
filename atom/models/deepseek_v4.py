@@ -80,6 +80,7 @@ from atom.model_ops.sparse_attn_v4 import (
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
+from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (
@@ -2186,26 +2187,14 @@ class MoE(nn.Module):
         assert (
             ids.shape[0] == num_tokens
         ), f"input_ids length {ids.shape[0]} does not match gating_output num_tokens {num_tokens}"
-        ids = ids.clamp(0, self.gate.tid2eid.shape[0] - 1)
-        topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
-        scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
-        topk_weights = scores.gather(dim=-1, index=topk_ids.long())
-        if renormalize:
-            topk_weights = topk_weights / topk_weights.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-20)
-        topk_weights = topk_weights * self.routed_scaling_factor
+        tid2eid = self.gate.tid2eid
 
-        # Fused shared expert: the custom_routing_function path in
-        # `select_experts` (moe.py:3055) returns early and bypasses the
-        # sqrtsoftplus fused-shared branch (moe.py:3108). Without this block the
-        # returned topk_ids are [N, top_k] with ids in 0..n_routed-1 only — the
-        # shared expert (slot n_routed_experts) never appears, so moe_sorting
-        # assigns it no tokens and its contribution (≈40% of the layer output)
-        # is silently dropped. Replicate the shared-col append: write the routed
-        # weights/ids into the first `top_k` columns of the global topK buffer
-        # and return the full [N, top_k + n_shared] view (last cols pre-filled
-        # with shared id = n_routed_experts and weight = shared_experts_score).
+        # Fused-shared expert: the custom_routing_function path bypasses
+        # select_experts' shared-expert append, so the shared expert (slot
+        # n_routed_experts) would never be routed and its ~40% contribution
+        # dropped. When shared is fused, write the routed result into the first
+        # `topk` columns of the global topK buffer (shared cols pre-filled) and
+        # return the full [N, topk + n_shared] view.
         num_fused_shared = getattr(self.experts, "num_fused_shared_experts", 0)
         if num_fused_shared > 0:
             import atom.model_ops.topK as _topK_mod
@@ -2215,12 +2204,33 @@ class MoE(nn.Module):
                 "init_aiter_topK_meta_data must run before hash-layer routing."
             )
             total_topk_weights, total_topk_ids = _topK_mod.aiter_topK_meta_data
-            n_tokens = topk_ids.shape[0]
-            assert total_topk_weights.shape[0] >= n_tokens
-            total_topk_ids[:n_tokens, :topk] = topk_ids
-            total_topk_weights[:n_tokens, :topk] = topk_weights
-            return total_topk_weights[:n_tokens], total_topk_ids[:n_tokens]
+            assert total_topk_weights.shape[0] >= num_tokens
+            hash_topk_triton(
+                ids,
+                gating_output,
+                tid2eid,
+                renormalize,
+                self.routed_scaling_factor,
+                total_topk_ids[:num_tokens, :topk],
+                total_topk_weights[:num_tokens, :topk],
+            )
+            return total_topk_weights[:num_tokens], total_topk_ids[:num_tokens]
 
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+        )
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+        )
+        hash_topk_triton(
+            ids,
+            gating_output,
+            tid2eid,
+            renormalize,
+            self.routed_scaling_factor,
+            topk_ids,
+            topk_weights,
+        )
         return topk_weights, topk_ids
 
     def routed_expert_forward(
