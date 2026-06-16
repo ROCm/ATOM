@@ -373,12 +373,19 @@ def _decode_index_score_kernel(
 # ---------------------------------------------------------------------------
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
 @triton.autotune(
+    # IMPORTANT: keep this to a SINGLE config. This kernel runs in the decode
+    # path, which is captured into a FULL cudagraph. Triton's autotuner only
+    # benchmarks (and calls torch.cuda.synchronize()) when len(configs) > 1; a
+    # sync is illegal while a stream is capturing and aborts capture with
+    # `hipErrorStreamCaptureUnsupported`. The decode path is first reached
+    # during capture (warmup runs prefill metadata), so there's no opportunity
+    # to autotune beforehand. With one config the autotuner skips the benchmark
+    # entirely and is capture-safe. All configs are numerically identical
+    # (BLOCK_SIZE_K only affects the seq-block tiling), so this is correctness-
+    # neutral. The prefill `_topk_index_kernel` keeps its full autotune list
+    # because prefill is never captured.
     configs=[
         triton.Config({"BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_SIZE_K": 64}, num_warps=2, num_stages=2),
     ],
     key=["topk"],
 )

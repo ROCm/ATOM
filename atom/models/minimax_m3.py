@@ -430,6 +430,11 @@ class MiniMaxM3Model(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
+        # EAGLE3 target interface: layer ids whose residual-stream hidden state
+        # is exported as an aux hidden state. Empty unless an EAGLE3 draft is
+        # attached (set via set_aux_hidden_state_layers on the wrapping module).
+        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -452,7 +457,16 @@ class MiniMaxM3Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer : self.end_layer]:
+        aux_hidden_states: list[torch.Tensor] = []
+        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+            if idx in self.aux_hidden_state_layers:
+                # Residual-stream hidden state entering this layer. The decoder
+                # layer's fused add-norm convention means ``hidden_states +
+                # residual`` is the full (already all-reduced) hidden state, the
+                # same quantity EAGLE3 fuses across low/mid/high target layers.
+                aux_hidden_states.append(
+                    hidden_states if residual is None else hidden_states + residual
+                )
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
@@ -461,6 +475,9 @@ class MiniMaxM3Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -546,6 +563,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Default EAGLE3 aux hidden-state layer ids: early / middle / late of
+        the target model, matching vLLM's default (see
+        vllm/model_executor/models/llama.py) and ATOM's llama.py.
+        """
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
 
 class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
     """Native ATOM text-only view of a MiniMax-M3 VL checkpoint."""
@@ -598,6 +626,12 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
 
 
 # Native full VL support will be wired after the MiniMax-M3 vision tower is

@@ -253,8 +253,20 @@ class MiniMaxM3SparseMetadata(AttentionMetadata):
 
 
 class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMetadata]):
-    # Full cudagraphs for uniform single-query decode batches.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # Full cudagraphs ONLY for uniform single-query (q_len==1) decode batches.
+    # Must NOT be UNIFORM_BATCH: that level tells vLLM to also full-capture
+    # spec-decode verify batches (uniform q_len == 1 + num_speculative_tokens).
+    # Those multi-query batches route through the prefill kernels (see
+    # reorder_batch_threshold below), whose per-step metadata is rebuilt with
+    # fresh tensor allocations and runtime-dependent shapes -- not stable across
+    # cudagraph replays. Capturing them yields a graph that reads stale pointers
+    # on replay and emits corrupted tokens (null/token-0 spam). With
+    # UNIFORM_SINGLE_TOKEN_DECODE the verify path runs piecewise (attention
+    # eager via the splitting op), while true q_len==1 decode -- which uses the
+    # stable-buffer decode kernel -- is still full-captured.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
     # The split-K decode kernel doesn't support spec decode yet (it handles one
     # query token per request only). Keep the threshold at 1 so multi-query
     # verify batches route to the prefill kernels instead of the decode kernel.

@@ -243,6 +243,15 @@ class Eagle3LlamaModel(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    # The kimi-k2.5-eagle3 checkpoint stores the single decoder layer directly
+    # under ``midlayer.*``. torchspec / SpecForge EAGLE3 exports (e.g.
+    # Inferact/MiniMax-M3-EAGLE3) instead name it ``layers.0.*``. Remap the
+    # latter onto our module path; this is a no-op for checkpoints that already
+    # use the ``midlayer.`` prefix.
+    weights_mapping = {
+        "layers.0.": "midlayer.",
+    }
+
     def __init__(self, atom_config: Config, prefix: str = "", layer_offset: int = 0):
         super().__init__()
         config = atom_config.hf_config
@@ -291,10 +300,21 @@ class Eagle3LlamaModel(nn.Module):
 
         # Draft attention layer_num must start from the target model's layer
         # count so kv_cache_data["layer_N"] maps to the correct cache entry.
+        #
+        # The forward-context / KV-cache layer name must also encode this
+        # offset as a single integer: ATOM identifies draft attention layers via
+        # extract_layer_index(name) >= num_hidden_layers (see
+        # atom/plugin/vllm/attention/metadata.py). This mirrors vLLM's
+        # Eagle3 LlamaModel, which names its single decoder layer
+        # ``layers.{layer_idx + start_layer_id}`` (start_layer_id == target
+        # layer count) while keeping the loadable params under the ModuleList
+        # index. We keep the loadable module attribute as ``midlayer`` (matched
+        # by ``weights_mapping``) but register the layer under ``layers.{offset}``
+        # so its attention name carries the offset index.
         self.midlayer = Eagle3LlamaDecoderLayer(
             config=config,
             cache_config=cache_config,
-            prefix="midlayer",
+            prefix=f"layers.{layer_offset}",
             layer_num=layer_offset,
         )
 

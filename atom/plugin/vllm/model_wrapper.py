@@ -716,7 +716,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             ]
             buf[: positions.numel()].copy_(positions)
 
-
         if self._is_deepseek_v4:
             # DeepSeek-V4 is a native ATOM model: it reads ATOM's own forward
             # context and takes a native (input_ids, positions) forward — vLLM's

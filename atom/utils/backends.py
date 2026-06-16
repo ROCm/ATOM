@@ -282,6 +282,28 @@ class SplitItem:
     graph: fx.GraphModule
 
 
+def _graph_output_signature(graph: fx.GraphModule) -> int:
+    """Number of leaf values returned by the traced graph.
+
+    Used as a compilation-cache factor so that graphs differing only in their
+    output structure (notably EAGLE3 aux hidden states, which are added by a
+    post-construction set_aux_hidden_state_layers() call rather than by config
+    or source) get distinct cache dirs. Reusing a cache across output
+    signatures yields a split parent graph that indexes more sub-graph outputs
+    than the (cached) sub-graph actually returns -> IndexError at runtime.
+    """
+    count = 0
+    for node in graph.graph.nodes:
+        if node.op != "output":
+            continue
+        out = node.args[0] if node.args else None
+        if isinstance(out, (tuple, list)):
+            count += len(out)
+        elif out is not None:
+            count += 1
+    return count
+
+
 # used to judge whether the node should be split or not
 def _split_judge_func(node: fx.Node) -> bool:
     # ATOM use mark_spliting_op to mark the attn as splitting op
@@ -592,6 +614,19 @@ class VllmBackend:
             compiler_hash = self.compiler_manager.compute_hash(vllm_config)
             factors.append(compiler_hash)
 
+            # 4. traced-graph output signature.
+            #    config_hash + code_hash assume that config + source fully
+            #    determine the traced graph. EAGLE3 breaks that assumption:
+            #    set_aux_hidden_state_layers() mutates the model *after*
+            #    construction so the same source/config traces a graph with
+            #    extra aux-hidden-state outputs (and extra cross-split values).
+            #    Without this factor a spec-off cache dir (e.g. submod_0 -> 7
+            #    outputs) gets reused for a spec-on run whose split parent
+            #    indexes 8 outputs, crashing with "list index out of range".
+            #    Hash the output node's leaf count so each distinct output
+            #    signature gets its own cache dir.
+            factors.append(("graph_output_signature", _graph_output_signature(graph)))
+
             # combine all factors to generate the cache dir
             hash_key = hashlib.md5(
                 str(factors).encode(), usedforsecurity=False
@@ -616,7 +651,7 @@ class VllmBackend:
         os.makedirs(local_cache_dir, exist_ok=True)
         self.compilation_config.local_cache_dir = local_cache_dir
 
-        disable_cache = False
+        disable_cache = os.environ.get("VLLM_DISABLE_COMPILE_CACHE", "0") == "1"
 
         if disable_cache:
             logger.info("vLLM's torch.compile cache is disabled.")
