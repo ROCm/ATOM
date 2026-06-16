@@ -28,14 +28,17 @@ export ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT=0
 export ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0
 ```
 
-`ATOM_LM_HEAD_FP8=1` (default on) lazily quantizes lm_head to FP8;
-set `=0` to keep the BF16 hipBLASLt path.
+**Fused RMSNorm+Quant / SiLU+Quant**: set
+`ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT=1` and
+`ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT=1` to fuse
+normalization/activation with FP8 quantization. Requires HIP
+`rmsnorm_quant` to JIT-compile on gfx1201 — test before enabling.
 
 ## Required CLI flags
 
 - `--level 0` — torch.compile not supported with this backend
 - `--block-size 64` — required with `ATOM_USE_UNIFIED_ATTN=1` + bf16 KV (the engine asserts `block_ratio == 1`; default 16 fails)
-- `--kv_cache_dtype bf16` — FP8 KV is TODO
+- `--kv_cache_dtype bf16` or `--kv_cache_dtype fp8` (FP8 KV halves cache memory)
 - `-tp 1` — TP > 1 not exercised
 
 CUDAGraph capture works at all default decode batch sizes.
