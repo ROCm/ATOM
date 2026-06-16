@@ -48,7 +48,7 @@ from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_pad_len,
-    pcp_split_stripe,
+    pcp_round_robin_split,
 )
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -1016,10 +1016,10 @@ class Compressor(nn.Module):
         coff_d = (1 + overlap) * d
         combined = self.wkv_gate(x)
         # ===== PCP (full-KV) =====
-        # `x` here is this rank's 1/W stripe shard (model.forward entry split).
+        # `x` here is this rank's 1/W round-robin shard (model.forward entry split).
         # The wkv_gate projection above is per-token (parallelizable), but the
         # downstream fused_compress_attn compresses `ratio` CONSECUTIVE tokens
-        # into one entry — which stripe split breaks. So all-gather the
+        # into one entry — which round-robin split breaks. So all-gather the
         # projected `combined` back to full sequence order before compression,
         # mirroring SGLang's compute_kv_score (all-gather kv_score after the
         # projection, before the cross-token compress). The plan /
@@ -1884,7 +1884,7 @@ class DeepseekV4Attention(nn.Module):
             # `kv` tensor (in-chunk SWA tail; extend buffer is layer-invariant).
             #
             # ===== PCP (full-KV) =====
-            # Under PCP the model.forward entry stripe-split x/positions to 1/W,
+            # Under PCP the model.forward entry round-robin-split x/positions to 1/W,
             # so `q_sa` and `kv` here are this rank's 1/W shard. The per-query
             # metadata (kv_indptr/indices_*, indexer_meta) was already reduced
             # to this rank's owned queries in the builder (_apply_pcp_reindex),
@@ -2702,7 +2702,7 @@ class ParallelHead(ParallelLMHead):
 
 
 def _pcp_active() -> bool:
-    """Whether to apply PCP stripe-split in this forward.
+    """Whether to apply PCP round-robin-split in this forward.
 
     True only when pcp_size > 1 AND this is a real prefill forward (not decode,
     not dummy/warmup run). Decode runs PCP-redundant (full KV, no split); the
@@ -2790,7 +2790,7 @@ class DeepseekV4Model(nn.Module):
         MTP draft consume it without re-expanding from a dim-reduced state.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
-        # PCP note: under PCP, `input_ids`/`positions` arrive already stripe-
+        # PCP note: under PCP, `input_ids`/`positions` arrive already round-robin-
         # split to this rank's 1/W shard (done in DeepseekV4ForCausalLM.forward,
         # OUTSIDE the torch.compile boundary — keeping comms / dynamic padding
         # out of the compiled graph). So everything here runs on the 1/W shard;
@@ -2922,7 +2922,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # correct hash routing without a separate setup step.
         ctx = get_forward_context()
 
-        # ===== PCP: stripe-split the prefill sequence OUTSIDE torch.compile =====
+        # ===== PCP: round-robin-split the prefill sequence OUTSIDE torch.compile =====
         # PCP splits the prefill query sequence across the PCP group (full-KV
         # scheme). This must happen here in ForCausalLM.forward (NOT in the
         # @support_torch_compile-wrapped DeepseekV4Model.forward) so the
@@ -2931,7 +2931,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # desync). Mirrors SGLang, which does cp_round_robin on input_ids in
         # the un-compiled ForCausalLM.forward. We pad tokens to a multiple of
         # pcp_size (dummy tokens, zero-length KV in the builder metadata), then
-        # stripe-split input_ids/positions to this rank's 1/W shard. The model
+        # round-robin-split input_ids/positions to this rank's 1/W shard. The model
         # runs entirely on 1/W; the final hidden is all-gathered + un-padded
         # after self.model(...) returns.
         use_pcp = _pcp_active()
@@ -2942,8 +2942,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             if pad > 0:
                 input_ids = torch.cat([input_ids, input_ids.new_zeros(pad)], dim=0)
                 positions = torch.cat([positions, positions.new_zeros(pad)], dim=0)
-            input_ids = pcp_split_stripe(input_ids, pcp_size)
-            positions = pcp_split_stripe(positions, pcp_size)
+            input_ids = pcp_round_robin_split(input_ids, pcp_size)
+            positions = pcp_round_robin_split(positions, pcp_size)
 
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE

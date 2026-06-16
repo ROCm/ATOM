@@ -49,7 +49,7 @@ from atom.distributed.pcp_utils import (
     pcp_pad_indptr,
     pcp_pad_len,
     pcp_reindex_ragged,
-    pcp_stripe_query_indices,
+    pcp_round_robin_query_indices,
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attentions.backends import (
@@ -1280,11 +1280,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # ----- PCP: reindex per-query metadata to this rank's 1/W shard -----
         # Mirrors SGLang's apply_cp_reindex (deepseek_v4_backend_hip_radix.py):
         # all metadata above was built for the FULL sequence; under PCP the
-        # model.forward entry stripe-splits hidden/positions to 1/W, so the
+        # model.forward entry round-robin-splits hidden/positions to 1/W, so the
         # per-query (per-token) metadata must be reduced to the SAME owned-query
         # set. Per-seq / KV-write fields stay full (every rank keeps full KV).
         if pcp_is_enabled() and not batch.is_dummy_run:
-            # Gate on `not is_dummy_run`: ForCausalLM.forward's stripe-split is
+            # Gate on `not is_dummy_run`: ForCausalLM.forward's round-robin-split is
             # skipped on dummy/warmup runs (_pcp_active() returns False there),
             # so reindexing metadata to 1/W here would pair full-size
             # input_ids/positions with 1/W metadata (length mismatch). Keeping
@@ -1292,7 +1292,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # Reindex metadata to 1/W in-place. We intentionally DISCARD the
             # returned 1/W positions: `positions` must stay FULL here so it
             # lands on context.positions full, and ForCausalLM.forward does the
-            # one and only stripe-split of positions (symmetric with input_ids,
+            # one and only round-robin-split of positions (symmetric with input_ids,
             # which never passes through the builder). Splitting here too would
             # double-split positions (full -> 1/W -> 1/2W) while input_ids/kv
             # are only split once, desyncing swa_write (kv full vs positions
@@ -1310,10 +1310,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs: int,
         total_tokens: int,
     ) -> torch.Tensor:
-        """Reduce per-query prefill metadata to this PCP rank's stripe shard.
+        """Reduce per-query prefill metadata to this PCP rank's round-robin shard.
 
         Splits the per-token / per-query fields by `token_idx % pcp == rank`
-        (matching model.forward's stripe split of hidden/positions) while
+        (matching model.forward's round-robin split of hidden/positions) while
         leaving per-seq and KV-write fields full. The indexer metadata is
         REBUILT from the sliced batch_id_per_token + positions (its per-token
         fields all derive from those two), mirroring SGLang's
@@ -1331,7 +1331,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Pad to a multiple of pcp_size; dummy (pad) queries get zero-length KV.
         padded_total = pcp_pad_len(total_tokens, pcp_size)
         n_pad = padded_total - total_tokens
-        owned_q = pcp_stripe_query_indices(padded_total, pcp_size).to(device)
+        owned_q = pcp_round_robin_query_indices(padded_total, pcp_size).to(device)
 
         # --- ragged per-query buffers: pad indptr to padded_total, then 1/W ---
         for ind_attr, idx_attr in (
@@ -1349,7 +1349,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             setattr(attn_metadata, ind_attr, new_indptr)
             setattr(attn_metadata, idx_attr, new_indices)
 
-        # --- dense per-token fields: pad then stripe-slice to 1/W ---
+        # --- dense per-token fields: pad then round-robin-slice to 1/W ---
         if attn_metadata.skip_prefix_len_csa is not None:
             skip = pcp_pad_dense(attn_metadata.skip_prefix_len_csa, n_pad)
             attn_metadata.skip_prefix_len_csa = skip[owned_q].contiguous()

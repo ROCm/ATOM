@@ -5,7 +5,7 @@
 PCP splits the prefill token sequence across the PCP process group (an
 independent parallel dimension, world = tp x pcp). Only the prefill query
 side is sharded; each rank keeps the full KV (full-KV scheme), so decode is
-unchanged. Load balancing uses stripe (round-robin) splitting:
+unchanged. Load balancing uses round-robin splitting:
 `token_idx % pcp_size == pcp_rank`.
 
 Ported from SGLang's DSA round-robin CP path
@@ -42,7 +42,7 @@ def pcp_pad_len(
 ) -> int:
     """Padded token count so the global sequence is divisible by pcp_size.
 
-    Stripe split requires the global token count to be divisible by pcp_size
+    Round-robin split requires the global token count to be divisible by pcp_size
     (see SGLang `can_dsa_cp_split` assert / HIP `apply_cp_reindex`). Returns the
     padded length (>= total_tokens); callers pad per-token tensors to this
     length with dummy tokens (KV length 0) before splitting.
@@ -57,10 +57,10 @@ def pcp_pad_len(
     return total_tokens + (pcp_size - rem)
 
 
-def pcp_split_stripe(
+def pcp_round_robin_split(
     input_: torch.Tensor, pcp_size: Optional[int] = None, pcp_rank: Optional[int] = None
 ) -> torch.Tensor:
-    """Take this rank's stripe (round-robin) shard along dim 0.
+    """Take this rank's round-robin shard along dim 0.
 
     Selects rows `[pcp_rank, pcp_rank + pcp_size, pcp_rank + 2*pcp_size, ...]`.
     Requires `input_.shape[0] % pcp_size == 0` (pad upstream via pcp_pad_len).
@@ -83,10 +83,10 @@ def pcp_split_stripe(
 def pcp_allgather_rerange(
     input_: torch.Tensor, pcp_size: Optional[int] = None
 ) -> torch.Tensor:
-    """All-gather stripe shards along dim 0 and restore original token order.
+    """All-gather round-robin shards along dim 0 and restore original token order.
 
-    Each rank holds `[L, *rest]` (its stripe shard). After all-gather the
-    naive layout is rank-major `[rank0_rows, rank1_rows, ...]`; the stripe
+    Each rank holds `[L, *rest]` (its round-robin shard). After all-gather the
+    naive layout is rank-major `[rank0_rows, rank1_rows, ...]`; the round-robin
     interleave is restored by `view(pcp, L, *rest).transpose(0, 1)` so that
     output[t] == global token t.
 
@@ -111,10 +111,10 @@ def pcp_allgather_rerange(
     return out
 
 
-def pcp_stripe_query_indices(
+def pcp_round_robin_query_indices(
     n_global_q: int, pcp_size: Optional[int] = None, pcp_rank: Optional[int] = None
 ) -> torch.Tensor:
-    """Global query indices owned by this rank under stripe split.
+    """Global query indices owned by this rank under round-robin split.
 
     Returns `[pcp_rank, pcp_rank+pcp_size, ...]` clipped to `< n_global_q`.
     `n_global_q` should already be padded to a multiple of pcp_size for the
@@ -176,7 +176,7 @@ def pcp_reindex_ragged(
     """Reindex a ragged (indptr, indices) pair down to this rank's queries.
 
     Given global per-query ragged metadata and the global query ids this rank
-    owns (stripe shard), produce the compacted local `(indptr_local,
+    owns (round-robin shard), produce the compacted local `(indptr_local,
     indices_local)` so that for the i-th owned query:
         indices_local[indptr_local[i] : indptr_local[i+1]]
           == kv_indices[kv_indptr[g] : kv_indptr[g+1]]   where g = owned_q[i]
