@@ -42,6 +42,13 @@ fi
 
 MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
+# Fatal server-log markers: if any appears while waiting for the server, abort
+# immediately instead of burning the full MAX_WAIT_RETRIES budget (which keeps the
+# GPU runner occupied long after init has already crashed). These are unambiguously
+# terminal — e.g. NCCL "unhandled cuda error" corrupts the CUDA context and never
+# recovers. The recoverable "tp_group_reuse failed ... will fall back" warning is
+# intentionally NOT matched. Override via FATAL_LOG_PATTERNS; set empty to disable.
+FATAL_LOG_PATTERNS=${FATAL_LOG_PATTERNS:-'unhandled cuda error|uncorrectable ECC|EngineCore[_ ][A-Za-z0-9]* died|Engine core proc.* died|EngineCore failed to start|Failed to initialize EngineCore'}
 VLLM_PORT=${VLLM_PORT:-8000}
 VLLM_HOST=${VLLM_HOST:-localhost}
 VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_oot.pid}
@@ -103,6 +110,13 @@ emit_new_vllm_logs() {
   LAST_VLLM_LOG_LINE=${current_line_count}
 }
 
+# Scan the server log for a fatal marker. Prints the first matching line and
+# returns 0 when a fatal error is present, 1 otherwise.
+detect_fatal_log() {
+  [[ -n "${FATAL_LOG_PATTERNS}" && -f "${VLLM_LOG_FILE}" ]] || return 1
+  grep -E -m1 "${FATAL_LOG_PATTERNS}" "${VLLM_LOG_FILE}" 2>/dev/null
+}
+
 wait_server_ready() {
   local model_name="$1"
   echo ""
@@ -115,6 +129,15 @@ wait_server_ready() {
     fi
 
     emit_new_vllm_logs
+
+    local fatal_line
+    if fatal_line=$(detect_fatal_log); then
+      echo "Detected fatal server error for ${model_name}; aborting wait early instead of retrying:"
+      echo "  ${fatal_line}"
+      emit_new_vllm_logs
+      tail -n 200 "${VLLM_LOG_FILE}" || true
+      return 1
+    fi
 
     if [[ -f "${VLLM_PID_FILE}" ]]; then
       local pid
