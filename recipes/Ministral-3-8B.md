@@ -32,6 +32,7 @@ set `=0` to keep the BF16 hipBLASLt path.
 ## Required CLI flags
 
 - `--level 0` — torch.compile not supported with this backend
+- `--block-size 64` — required with `ATOM_USE_UNIFIED_ATTN=1` + bf16 KV (the engine asserts `block_ratio == 1`; default 16 fails)
 - `--kv_cache_dtype bf16` — FP8 KV is TODO
 - `-tp 1` — multi-GPU not exercised (blocked on host `iommu=pt`)
 
@@ -42,7 +43,7 @@ CUDAGraph capture works at all default decode batch sizes.
 ```bash
 python3 -m atom.examples.simple_inference \
   --model /path/to/Ministral-3-8B-Instruct-2512 \
-  --level 0 -tp 1 --kv_cache_dtype bf16 \
+  --level 0 -tp 1 --kv_cache_dtype bf16 --block-size 64 \
   --max-model-len 16384 --max-tokens 32 \
   --gpu-memory-utilization 0.85
 ```
@@ -52,7 +53,7 @@ python3 -m atom.examples.simple_inference \
 ```bash
 python3 -m atom.entrypoints.openai_server \
   --model /path/to/Ministral-3-8B-Instruct-2512 \
-  --level 0 --kv_cache_dtype bf16 \
+  --level 0 --kv_cache_dtype bf16 --block-size 64 \
   --max-model-len 16384 \
   --server-port 30000
 ```
