@@ -475,6 +475,13 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: GPU preflight check
+        if: success()
+        timeout-minutes: 5
+        env:
+          GPU_PREFLIGHT_ALLOCATION_MB: "8"
+        run: bash .github/scripts/gpu_preflight_check.sh "$CONTAINER_NAME" docker
+
       - name: Download or refresh model if needed
         if: success()
         run: |
@@ -522,7 +529,7 @@ jobs:
 
       - name: Run OOT launch and gsm8k accuracy via script (ci mode)
         if: success()
-        timeout-minutes: 120
+        timeout-minutes: 45
         env:
           OOT_MODEL_NAME: ${{ matrix.model_name }}
           OOT_MODEL_PATH: ${{ matrix.model_path }}
@@ -530,7 +537,7 @@ jobs:
           OOT_CLIENT_COMMAND: ${{ matrix.client_command || '' }}
           OOT_ENV_VARS: ${{ matrix.env_vars }}
           LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
-          MAX_WAIT_RETRIES: "120"
+          MAX_WAIT_RETRIES: "40"
           STREAM_VLLM_LOGS: "1"
         run: |
           docker exec \
