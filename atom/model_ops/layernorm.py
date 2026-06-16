@@ -15,6 +15,7 @@ from aiter import (
 from aiter.dist.communication_op import (
     tensor_model_parallel_fused_allreduce_rmsnorm,
     tensor_model_parallel_fused_allreduce_rmsnorm_fp32,
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant,
     tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
@@ -342,7 +343,6 @@ class RMSNorm(nn.Module):
             and self.tp_size > 1
             and self.use_fused_quant
             and residual is not None
-            and self.quant_type.value == _QV_PER_1X128
         ):
             # Combined AllReduce + RMSNorm + per-group FP8 quant: the downstream
             # GEMM (e.g. qkv_proj) consumes the (fp8, scale) output directly,
@@ -350,17 +350,32 @@ class RMSNorm(nn.Module):
             # (resolved at init) selects the scale layout matching that GEMM
             # (column-major for the preshuffle path, row-major otherwise).
             # The fused kernel does not support non-contiguous input.
-            x_fp8, residual, x_scale = (
-                tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-                    x.contiguous(),
-                    residual,
-                    self.weight,
-                    self.eps,
-                    group_size=128,
-                    transpose_scale=self._aiter_transpose_scale,
+            assert self.quant_type.value in (
+                _QV_PER_1X128,
+                _QV_PER_TOKEN,
+            ), "Unsupported quant type for fused allreduce rmsnorm quant"
+            if self.quant_type.value == _QV_PER_1X128:
+                x_fp8, residual, x_scale = (
+                    tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+                        x.contiguous(),
+                        residual,
+                        self.weight,
+                        self.eps,
+                        group_size=128,
+                        transpose_scale=self._aiter_transpose_scale,
+                    )
                 )
-            )
-            return (x_fp8, x_scale), residual
+                return (x_fp8, x_scale), residual
+            elif self.quant_type.value == _QV_PER_TOKEN:
+                x_fp8, residual, x_scale = (
+                    tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                        x.contiguous(),
+                        residual,
+                        self.weight,
+                        self.eps,
+                    )
+                )
+                return (x_fp8, x_scale), residual
         if self.fused_allreduce and self.tp_size > 1:
             assert (
                 residual is not None
