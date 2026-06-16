@@ -1,4 +1,3 @@
-import os
 from typing import TYPE_CHECKING, Optional
 
 import aiter
@@ -27,9 +26,6 @@ if TYPE_CHECKING:
     )
 
 ATOM_USE_GLUON_PA_DECODE = envs.ATOM_USE_GLUON_PA_DECODE
-_MINIMAX_M3_MHA_DECODE_BACKEND = os.getenv(
-    "ATOM_MINIMAX_M3_MHA_DECODE_BACKEND", ""
-).lower()
 
 # the dispatch rule is based on the kernel benchmark result
 #  of gluon/asm pa with model-specific shapes
@@ -39,7 +35,6 @@ _GLUON_PA_DECODE_BS_MAPPING = {
     "minimax_m2": 16,
 }
 _NO_PS_FIXED_SPLITS = 64
-_MINIMAX_M3_MODEL_TYPES = {"minimax_m3", "minimax_m3_text", "minimax_m3_vl"}
 
 
 def _init_vllm_mha_layer_state(
@@ -698,13 +693,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         )
 
     def _dispatch_decode_backend(self, num_decodes):
-        if self.model_type in _MINIMAX_M3_MODEL_TYPES:
-            if _MINIMAX_M3_MHA_DECODE_BACKEND == "asm":
-                return self.paged_attention_asm
-            # The ASM paged-attention decode path can misaddress high physical
-            # KV block ids seen by MiniMax-M3 after sustained serving.
-            return self.paged_attention_triton
-
         # use asm pa for models without setting gluon pa decode bs
         gluon_pa_decode_bs = _GLUON_PA_DECODE_BS_MAPPING.get(self.model_type, -1)
         if self.use_triton_attn:

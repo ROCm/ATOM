@@ -587,7 +587,6 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
 # multimodal models fully supported by plugin mode
 _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "kimi_k25",
-    "minimax_m3_vl",
     "qwen3_5",
     "qwen3_5_moe",
 }
