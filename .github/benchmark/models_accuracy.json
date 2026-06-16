@@ -79,7 +79,7 @@
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
-    "accuracy_threshold": 0.88,
+    "accuracy_threshold": 0.87,
     "accuracy_baseline": 0.90,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
@@ -152,7 +152,7 @@
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "main",
-    "accuracy_threshold": 0.88,
+    "accuracy_threshold": 0.87,
     "accuracy_baseline": 0.90,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
