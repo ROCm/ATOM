@@ -814,6 +814,13 @@ class Scheduler:
                 if first_token_id is not None:
                     seq.append_token(first_token_id)
                     seq._injected_t0 = first_token_id
+                    if self.mtp_k > 0:
+                        drafts = list(
+                            (seq.kv_transfer_params or {}).get("draft_token_ids") or []
+                        )[: self.mtp_k]
+                        for d in drafts:
+                            seq.append_token(int(d))
+                        seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
                 logger.info(
                     "[PD-TRANSITION] seq %s: num_tokens=%d, "
                     "num_prompt=%d, blocks=%d, first_token=%s, "
@@ -859,6 +866,15 @@ class Scheduler:
             )
 
             self.block_manager.allocate(seq, num_cached_blocks)
+
+            # Snapshot the genuine prefix-cache hit at admission. After this,
+            # num_cached_tokens is repurposed to track chunked-prefill progress
+            # (it grows to the full prompt length in postprocess), so it can't be
+            # used to report the cache hit. Set once per seq (Phase-2 admission
+            # only); Phase-1 resume doesn't recompute num_cached_blocks.
+            seq.prefix_cache_hit_tokens = (
+                num_cached_blocks * self.block_manager.block_size
+            )
 
             if self.kv_connector is not None:
                 self.kv_connector.update_state_after_alloc(seq)
@@ -1259,6 +1275,7 @@ class Scheduler:
                     kv_transfer_params_output=getattr(
                         seq, "kv_transfer_params_output", None
                     ),
+                    num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
                 )
 
                 if request_output.kv_transfer_params_output is not None:

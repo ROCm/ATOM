@@ -1,12 +1,11 @@
-//! Part C byte-equality test: every `GenerationPayload` round-trips through
+//! Byte-equality test: every `GenerationPayload` round-trips through
 //! `to_sglang_proto` / `to_vllm_proto` byte-identical to the corresponding
-//! upstream builder in `smg-grpc-client = 1.0.0`.
+//! builder in `smg-grpc-client = 1.0.0`.
 //!
-//! The upstream `SglangSchedulerClient` / `VllmEngineClient` can only be
-//! constructed via async `connect()`, so the oracles below inline the
-//! upstream builder logic verbatim from `sglang_scheduler.rs` (lines 305-680)
-//! and `vllm_engine.rs` (lines 259-457). The crate version is pinned in
-//! Cargo.toml; on a version bump, this file is the canary.
+//! `SglangSchedulerClient` / `VllmEngineClient` can only be constructed via
+//! async `connect()`, so the oracles below replicate the builder logic.
+//! The crate version is pinned in Cargo.toml; on a version bump, this file
+//! is the canary.
 
 use mesh::protocols::chat::ChatCompletionRequest;
 use mesh::protocols::common::StringOrArray;

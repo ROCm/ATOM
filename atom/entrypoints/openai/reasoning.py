@@ -110,11 +110,10 @@ class ReasoningFilter:
                 self.buf = ""
                 if after:
                     results.extend(self._process_content(after))
-            elif len(self.buf) > 7 and "<" not in self.buf:
-                # No <think> tag found — emit as content. For models that
-                # don't emit <think> (MiniMax), streaming reasoning separation
-                # requires buffering the entire response, which is impractical.
-                # Non-streaming path handles this correctly via separate_reasoning().
+            elif len(self.buf) > 100 and "<" not in self.buf:
+                # No think tags found after significant buffering — emit as
+                # content. Uses a large threshold to give models time to emit
+                # </think> when the chat template injected <think>.
                 results.append(("content", self.buf))
                 self.buf = ""
 

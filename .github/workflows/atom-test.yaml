@@ -10,6 +10,10 @@ on:
       - '**/*.md'
       - 'docs/**'
       - 'atom/plugin/**'
+      - 'atom/mesh/**'
+      - '.github/workflows/atomesh-*.yaml'
+      - '.github/scripts/atomesh_*.sh'
+      - '.github/dashboard/atomesh_*.html'
       - '.github/workflows/atom-vllm-*.yaml'
       - '.github/workflows/atom-sglang-*.yaml'
       - '.github/benchmark/oot_models_accuracy.json'
@@ -456,8 +460,17 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
+      - name: GPU preflight check
+        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        timeout-minutes: 5
+        env:
+          GPU_PREFLIGHT_ALLOCATION_MB: "8"
+        run: bash .github/scripts/gpu_preflight_check.sh "$CONTAINER_NAME" docker
+
       - name: Collect GPU info (inside container)
         id: gpu-info
+        env:
+          COLLECT_VERBOSE_GPU_INFO: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
@@ -591,6 +604,7 @@ jobs:
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
+          ATOM_DEBUG_DEVICE_MAPPING: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
         run: |
           set -euo pipefail
           echo ""
@@ -603,7 +617,9 @@ jobs:
           # Pipe via stdin so container bash parses shell quoting in extraArgs
           # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
           echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
-            docker exec -i "$CONTAINER_NAME" bash -l
+            docker exec \
+              -e ATOM_DEBUG_DEVICE_MAPPING="${ATOM_DEBUG_DEVICE_MAPPING}" \
+              -i "$CONTAINER_NAME" bash -l
           echo ""
           echo "========== Running accuracy test =========="
           docker exec \
@@ -751,4 +767,3 @@ jobs:
           auto-push: true
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
-

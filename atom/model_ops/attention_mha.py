@@ -7,6 +7,7 @@ import aiter
 import torch
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
 from atom.config import get_current_atom_config
@@ -86,6 +87,62 @@ class PagedAttentionImpl(nn.Module):
 
         self.supports_quant_query_input = False
 
+    def _can_attempt_prefill_sink_asm(self, fwd_ctx: ForwardContext) -> bool:
+        if not fwd_ctx.context.is_prefill:
+            return False
+        if envs.ATOM_FORCE_ATTN_TRITON:
+            return False
+        if not (self.use_flash_layout or envs.ATOM_USE_UNIFIED_ATTN):
+            return False
+        attn_metadata = fwd_ctx.attn_metadata
+        if attn_metadata is None:
+            return False
+        if get_gfx() != "gfx1250":
+            return False
+        if self.head_dim != 64:
+            return False
+        if self.sinks is None:
+            return False
+        if self.sliding_window != -1 or self.alibi_slopes is not None:
+            return False
+        if getattr(attn_metadata, "dropout_p", 0.0) != 0.0:
+            return False
+        if getattr(attn_metadata, "has_cached", False):
+            return False
+        if attn_metadata.cu_seqlens_q is None or attn_metadata.cu_seqlens_k is None:
+            return False
+        if attn_metadata.max_seqlen_q != attn_metadata.max_seqlen_k:
+            return False
+        return True
+
+    def _can_use_prefill_sink_asm(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        fwd_ctx: ForwardContext,
+    ) -> bool:
+        if not self._can_attempt_prefill_sink_asm(fwd_ctx):
+            return False
+        if (
+            q.dtype != torch.bfloat16
+            or k.dtype != torch.bfloat16
+            or v.dtype != torch.bfloat16
+        ):
+            return False
+        if (
+            self.head_dim != 64
+            or q.shape[-1] != 64
+            or k.shape[-1] != 64
+            or v.shape[-1] != 64
+        ):
+            return False
+        if q.shape[0] != k.shape[0] or k.shape[0] != v.shape[0]:
+            return False
+        if q.shape[1] % k.shape[1] != 0:
+            return False
+        return True
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -113,7 +170,7 @@ class PagedAttentionImpl(nn.Module):
             q, k, v, qkv, position, fwd_ctx
         )
 
-        attn_impl = self.dispatch_backend(fwd_ctx)
+        attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
 
         o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
 
@@ -227,6 +284,14 @@ class PagedAttentionImpl(nn.Module):
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
+            if (
+                envs.ATOM_USE_UNIFIED_ATTN
+                and self.kv_cache_dtype.startswith("fp8")
+                and not self._can_attempt_prefill_sink_asm(fwd_ctx)
+            ):
+                q_out = torch.empty(*q.shape, dtype=k_cache.dtype, device=q.device)
+            else:
+                q_out = q
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                 q,
                 k,
@@ -243,7 +308,7 @@ class PagedAttentionImpl(nn.Module):
                 flash_layout=self.use_flash_layout,
                 apply_scale=self.kv_cache_dtype.startswith("fp8"),
                 offs=None,
-                q_out=q,
+                q_out=q_out,
                 k_out=k,
                 output_zeros=False,
             )
@@ -398,7 +463,11 @@ class PagedAttentionImpl(nn.Module):
 
         attn_metadata = fwd_ctx.attn_metadata
 
-        o = torch.empty_like(q)
+        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+            o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
+        else:
+            o = torch.empty_like(q)
+
         num_seqs = attn_metadata.context_lens.shape[0]
 
         if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
@@ -594,21 +663,31 @@ class PagedAttentionImpl(nn.Module):
 
         attn_metadata = fwd_ctx.attn_metadata
 
-        o = torch.empty_like(q)
+        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+            o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
+        else:
+            o = torch.empty_like(q)
+
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
 
         # `block_tables` is always populated by TritonMHAMetadataBuilder.
-        # For pure prefill (no cached tokens) it is the fake table built in
-        # prepare_prefill that maps seq i to token indices
+        # For pure prefill (no cached tokens) it is, by default, the fake table
+        # built in prepare_prefill that maps seq i to token indices
         # [cu_seqlens_k[i], ..., cu_seqlens_k[i+1]-1], paired with raw K/V
         # treated as kv_cache with block_size=1.
-        if attn_metadata.has_cached:
+        #
+        # Under ATOM_USE_UNIFIED_ATTN, prepare_prefill instead uploads the real
+        # per-seq block_table and reads from KV cache, the new tokens
+        # already written into the paged flash-layout cache during rope_cache
+        # are read straight from `k_cache`/`v_cache`, identical to the
+        # prefix-cache-hit path.
+        if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
             k_for_attn = k_cache
             v_for_attn = v_cache
-            # Cached path reads the paged KV cache, which is 5D SHUFFLE unless
-            # the (legacy) 4D flash layout is in use.
+            # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
+            # 4D flash layout is in use.
             shuffled_kv_cache = not self.use_flash_layout
         else:
             #   k: [total_tokens, num_kv_heads, head_size]
@@ -642,12 +721,20 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
-    def dispatch_backend(self, fwd_ctx: ForwardContext):
+    def dispatch_backend(
+        self,
+        fwd_ctx: ForwardContext,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
 
         ctx = fwd_ctx.context
 
         use_unified_attn = envs.ATOM_USE_UNIFIED_ATTN
         if ctx.is_prefill:
+            if self._can_use_prefill_sink_asm(q, k, v, fwd_ctx):
+                return self.prefill_attention
             if use_unified_attn or self.use_flash_layout:
                 return self.prefill_attention_triton
             return self.prefill_attention

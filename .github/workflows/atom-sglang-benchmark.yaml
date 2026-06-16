@@ -8,7 +8,7 @@ on:
   schedule:
     # Nightly at 22:00 Beijing time (14:00 UTC).
     - cron: '0 14 * * 1,3'  # Mon/Wed: SGLang-OOB non-MTP DeepSeek configs
-    - cron: '0 14 * * 2,4'  # Tue/Thu: SGLang-OOB MTP + Qwen configs
+    - cron: '0 14 * * 2,4'  # Tue/Thu: SGLang-OOB MTP + Qwen + GLM configs
     - cron: '0 14 * * 5'    # Fri: SGLang-Mesh all configs
     - cron: '0 14 * * 6'    # Sat: SGLang-OOB all configs
   workflow_dispatch:
@@ -27,6 +27,9 @@ on:
           - "none (do not run SGLang-OOB models)"
           - "deepseek-r1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-v3-2-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-v3-2-fp8-tp4-dp4-ep4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-v3-2-fp8-tp8-dp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp4-dp4-ep4 (1024x1024/8192x1024: [4,8,16,32,64])"
@@ -38,11 +41,14 @@ on:
           - "deepseek-r1-fp4-mtp3-tp8-dp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
-          - "all-deepseek (11 DeepSeek configs x 10 default params)"
-          - "all-deepseek-non-mtp (7 DeepSeek non-MTP configs x 10 default params)"
+          - "deepseek-v3-2-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "glm-5-1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "all-deepseek (15 DeepSeek configs x 10 default params)"
+          - "all-deepseek-non-mtp (11 DeepSeek non-MTP configs x 10 default params)"
           - "all-deepseek-mtp (4 DeepSeek MTP configs x 10 default params)"
           - "all-qwen (2 Qwen configs x 10 default params)"
-          - "all-oob (13 SGLang-OOB configs x 10 default params)"
+          - "all-glm (1 GLM config x 10 default params)"
+          - "all-oob (18 SGLang-OOB configs x 10 default params)"
         default: "none (do not run SGLang-OOB models)"
       mesh_config_preset:
         description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"
@@ -453,6 +459,8 @@ jobs:
                   return prefix.startswith("deepseek-") and "mtp" in prefix
               if preset == "all-qwen":
                   return prefix.startswith("qwen")
+              if preset == "all-glm":
+                  return prefix.startswith("glm")
               return prefix == preset
 
           def is_oob_mtp(model):
@@ -460,6 +468,9 @@ jobs:
 
           def is_oob_qwen(model):
               return matches_workload(model) and str(model.get("prefix", "")).startswith("qwen")
+
+          def is_oob_glm(model):
+              return matches_workload(model) and str(model.get("prefix", "")).startswith("glm")
 
           def is_oob_non_mtp_deepseek(model):
               prefix = str(model.get("prefix", ""))
@@ -471,8 +482,8 @@ jobs:
                   selected_group = "OOB-NON-MTP-DEEPSEEK"
                   selected = [m for m in models if is_oob_non_mtp_deepseek(m)]
               elif schedule_cron == "0 14 * * 2,4":
-                  selected_group = "OOB-MTP-QWEN"
-                  selected = [m for m in models if is_oob_mtp(m) or is_oob_qwen(m)]
+                  selected_group = "OOB-MTP-QWEN-GLM"
+                  selected = [m for m in models if is_oob_mtp(m) or is_oob_qwen(m) or is_oob_glm(m)]
               elif schedule_cron == "0 14 * * 5":
                   selected_group = "MESH-ALL"
                   selected = [
@@ -767,26 +778,26 @@ jobs:
     steps:
       - name: Detect container engine
         run: |
-          if docker info > /dev/null 2>&1; then
-            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
-            echo "Container engine: docker"
-          elif command -v podman > /dev/null 2>&1; then
+          if command -v podman > /dev/null 2>&1; then
             echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
             echo "Container engine: podman"
+          elif docker info > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
+            echo "Container engine: docker"
           else
             echo "ERROR: Neither docker nor podman is available on this runner."
             exit 1
           fi
 
-      - name: Clean up containers and workspace
-        run: |
-          echo "=== Cleaning up containers on $(hostname) ==="
-          containers=$($CONTAINER_ENGINE ps -q)
-          if [ -n "$containers" ]; then
-            $CONTAINER_ENGINE kill $containers || true
-          fi
-          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
-          $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged docker.io/rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
+      #- name: Clean up containers and workspace
+      #  run: |
+      #    echo "=== Cleaning up containers on $(hostname) ==="
+      #    containers=$($CONTAINER_ENGINE ps -q)
+      #    if [ -n "$containers" ]; then
+      #      $CONTAINER_ENGINE kill $containers || true
+      #    fi
+      #    $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
+      #    $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged docker.io/rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
 
       - name: Checkout benchmark ATOM source
         uses: actions/checkout@v6
@@ -906,11 +917,35 @@ jobs:
             printf '%s\n' "${CASE_ENV_VARS}" >> /tmp/oot_env_file.txt
           fi
 
-          $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
+          # Podman + crun: avoid "create keyring ... Disk quota exceeded" (kernel user-keyring
+          # quota on shared runners). Docker ignores CONTAINERS_CONF_OVERRIDE; Podman reads it.
+          ATOM_SGLANG_PODMAN_CONF=""
+          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+            ATOM_SGLANG_PODMAN_CONF="$(mktemp "${TMPDIR:-/tmp}/atom-sglang-containers-conf.XXXXXX")"
+            printf '%s\n' '[containers]' 'keyring=false' > "${ATOM_SGLANG_PODMAN_CONF}"
+            _atom_sglang_prev_exit_body="$(trap -p EXIT | sed -nE "s/^trap -- '(.*)' EXIT$/\1/p" || true)"
+            cleanup_atom_podman_conf() {
+              rm -f "${ATOM_SGLANG_PODMAN_CONF:-}"
+              if [[ -n "${_atom_sglang_prev_exit_body:-}" ]]; then
+                eval "${_atom_sglang_prev_exit_body}"
+              fi
+            }
+            trap cleanup_atom_podman_conf EXIT
+          fi
+
+          container_engine_run() {
+            if [[ "${CONTAINER_ENGINE}" != "podman" ]]; then
+              "${CONTAINER_ENGINE}" "$@"
+              return
+            fi
+            CONTAINERS_CONF_OVERRIDE="${ATOM_SGLANG_PODMAN_CONF}" "${CONTAINER_ENGINE}" "$@"
+          }
+
+          container_engine_run run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
+            --ipc=host --group-add keep-groups \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
