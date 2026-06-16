@@ -10,31 +10,34 @@ from atom.config import KVCacheTensor
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.utils import envs
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.attention.unified_attention import (
+    unified_attention_prefers_shuffled_kv,
+)
 
 from .aiter_attention import AiterAttentionMetadataBuilder
 from .backends import AttentionBackend
 
 logger = logging.getLogger("atom")
 
-# RDNA4 (gfx1200/gfx1201) reads the flash (4D NHD) KV layout markedly faster in
-# decode than the 5D SHUFFLE layout. The shuffle layout is a CDNA/MFMA pre-shuffle
-# that unified_attention has to un-shuffle (an in-register transpose) on every KV
-# tile; that transpose is LDS-bound on RDNA4's WMMA and costs ~1.7-1.8x decode
-# TPOT. CDNA / gfx1250 keep the shuffle layout (their MFMA path consumes it
-# directly). Override the auto choice with ATOM_KV_CACHE_LAYOUT=flash|shuffle.
-_RDNA4_ARCHS = ("gfx1200", "gfx1201")
-
 
 def use_flash_kv_layout() -> bool:
     """Whether TritonMHABackend allocates the flash (4D NHD) KV layout instead of
-    the 5D SHUFFLE layout. See the note above for the perf rationale."""
+    the 5D SHUFFLE layout.
+
+    The arch decision is delegated to aiter
+    (``unified_attention_prefers_shuffled_kv``): flash is used wherever
+    unified_attention would otherwise have to un-shuffle the pre-shuffled layout
+    with an in-register transpose (the generic triton kernel, e.g. RDNA4 gfx1201
+    — ~1.7-1.8x slower decode); gfx1250's gluon kernels consume the shuffle layout
+    directly and keep it. ATOM holds no arch knowledge of its own. Override with
+    ``ATOM_KV_CACHE_LAYOUT=flash|shuffle``.
+    """
     override = envs.ATOM_KV_CACHE_LAYOUT
     if override == "flash":
         return True
     if override == "shuffle":
         return False
-    return get_gfx() in _RDNA4_ARCHS
+    return not unified_attention_prefers_shuffled_kv()
 
 
 class TritonMHABackend(AttentionBackend):
