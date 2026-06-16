@@ -26,8 +26,6 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Tuple, cast
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
 
-import threading
-
 import aiter
 import torch
 import torch.nn.functional as F
@@ -102,34 +100,6 @@ from atom.utils.forward_context import AttnState, get_forward_context
 from torch import nn
 
 logger = logging.getLogger(__name__)
-
-# Per-device auxiliary stream for TBO-adjacent collectives (DP input_ids
-# all-gather hoisted into DeepseekV4ForCausalLM.forward, MoE combine_outputs
-# TP all-reduce). Submitting these on a dedicated stream keeps the main
-# compute lane free of nccl interleaving so it can hardware-overlap with
-# TBO's own comm_stream.
-_TBO_COMM_STREAM: dict = {}
-_TBO_COMM_STREAM_LOCK = threading.Lock()
-
-
-def _run_on_tbo_comm_stream(fn, *args, **kwargs):
-    # Without TBO there is no second compute/comm stream to overlap with,
-    # so the side-stream hop only adds event/sync overhead. Run inline.
-    if not get_current_atom_config().enable_tbo:
-        return fn(*args, **kwargs)
-    device = torch.cuda.current_device()
-    with _TBO_COMM_STREAM_LOCK:
-        side = _TBO_COMM_STREAM.get(device)
-        if side is None:
-            side = torch.cuda.Stream(device=device)
-            _TBO_COMM_STREAM[device] = side
-    main = torch.cuda.current_stream()
-    side.wait_stream(main)
-    with torch.cuda.stream(side):
-        result = fn(*args, **kwargs)
-    main.wait_stream(side)
-    return result
-
 
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
@@ -2294,7 +2264,7 @@ class MoE(nn.Module):
         if shared is not None:
             routed = routed + shared
         if self.tp_size > 1:
-            routed = _run_on_tbo_comm_stream(tensor_model_parallel_all_reduce, routed)
+            routed = tensor_model_parallel_all_reduce(routed)
         return routed
 
     def single_stream_moe_forward(
@@ -2855,7 +2825,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
             # gate sees DP-gathered gating_output, so gather ids to match. Run
             # the gather INLINE on the compute stream. The original side-stream
-            # hop (_run_on_tbo_comm_stream) coordinated this ids all-gather with
+            # hop coordinated this ids all-gather with
             # a DIFFERENT stream/sync than the MoE hidden/router DP gather under
             # TBO → mismatched DP layouts → wrong V4 hash routing (GSM8K
             # 0.95→0.87). NOTE: do NOT wrap this in the TBO ping-pong

@@ -3296,7 +3296,7 @@ class FusedMoE(torch.nn.Module):
                     final_hidden_states, original_hidden_size
                 )
             if _tbo:
-                tbo_yield_and_switch_from_comm_to_compute()
+                tbo_switch_to_compute_sync()
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
