@@ -245,7 +245,9 @@ class MiniMaxM2Attention(nn.Module):
             # rather than per-rank variance (768/128 dims).
             cos_sin_cache = self.qknorm_rope_cos_sin_cache
             if cos_sin_cache.dtype != qkv.dtype or cos_sin_cache.device != qkv.device:
-                self.qknorm_rope_cos_sin_cache = cos_sin_cache.to(device=qkv.device, dtype=qkv.dtype)
+                self.qknorm_rope_cos_sin_cache = cos_sin_cache.to(
+                    device=qkv.device, dtype=qkv.dtype
+                )
             if self.tp_size > 1:
                 q, k, v = tensor_model_parallel_fused_qknorm_allreduce_rope(
                     qkv,
