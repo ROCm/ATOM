@@ -1181,6 +1181,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 k: (v.clone() if isinstance(v, torch.Tensor) else v)
                 for k, v in prefill_meta.indexer_meta.items()
             }
+        # compress_plans: each CompressPlan's compress_plan_gpu / write_plan_gpu
+        # are VIEWS into the shared var["v4_compress_plan_{ratio}"] /
+        # var["v4_write_plan_{ratio}"] buffers, which prepare_decode's
+        # _build_compress_plans overwrites below. Clone those GPU tensors so the
+        # prefill segment's Compressor reads its own plan, not the decode plan.
+        if prefill_meta.compress_plans:
+            from dataclasses import replace as _dc_replace
+
+            prefill_meta.compress_plans = {
+                ratio: _dc_replace(
+                    plan,
+                    compress_plan_gpu=plan.compress_plan_gpu.clone(),
+                    write_plan_gpu=plan.write_plan_gpu.clone(),
+                )
+                for ratio, plan in prefill_meta.compress_plans.items()
+            }
 
         # ---- Decode half: present rows [n_p_seqs:] as a standalone batch so
         # the unmodified prepare_decode builds decode metadata into shared
