@@ -188,12 +188,8 @@ class PagedAttentionImpl(nn.Module):
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
-        # MTP MHA must go through triton/gluon; aiter ASM non-persistent path may have some unexpected behavior.
-        use_triton_attn = (
-            self.sliding_window != -1
-            or self.head_dim != 128
-            or self.num_heads == self.num_kv_heads
-        )
+        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
+        use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
         self.use_triton_attn = use_triton_attn
 
         if (
