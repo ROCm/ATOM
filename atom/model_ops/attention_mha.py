@@ -18,16 +18,12 @@ from torch import nn
 
 from .attention_mla import MLAModules
 
-import logging
-
 from atom.utils.decorators import mark_trace
 from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
     run_pa_decode_gluon,
     run_pa_fwd_asm,
 )
-
-logger = logging.getLogger("atom")
 
 
 @cache
@@ -43,8 +39,6 @@ class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
     """
-
-    _pa_decode_bf16_asm_log_keys: set[str] = set()
 
     def __init__(
         self,
@@ -417,31 +411,15 @@ class PagedAttentionImpl(nn.Module):
 
         return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale
 
-    def _log_pa_decode_bf16_asm_once(self, key: str, msg: str, *args):
-        if key in PagedAttentionImpl._pa_decode_bf16_asm_log_keys:
-            return
-        PagedAttentionImpl._pa_decode_bf16_asm_log_keys.add(key)
-        logger.info(msg, *args)
-
-    def _skip_pa_decode_bf16_asm(self, reason: str) -> bool:
-        if use_pa_decode_bf16_asm():
-            self._log_pa_decode_bf16_asm_once(
-                f"skip:{reason}",
-                "PA decode BF16 ASM fallback: %s",
-                reason,
-            )
-        return False
-
     def _should_dispatch_pa_decode_bf16_asm(self, fwd_ctx: ForwardContext) -> bool:
         if not use_pa_decode_bf16_asm():
             return False
-
         if fwd_ctx.context.is_prefill:
-            return self._skip_pa_decode_bf16_asm("prefill")
+            return False
         if self.use_flash_layout:
-            return self._skip_pa_decode_bf16_asm("flash-layout cache")
+            return False
         if self.sliding_window != -1:
-            return self._skip_pa_decode_bf16_asm("sliding-window layer")
+            return False
         return True
 
     def _view_v_cache_for_pa_decode_bf16_asm(
