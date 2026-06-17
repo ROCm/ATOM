@@ -37,6 +37,28 @@ def read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def read_env_file(path: Path) -> dict[str, str]:
+    values = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value
+    return values
+
+
+def slurm_job_env(path: Path) -> dict[str, str]:
+    for parent in path.parents:
+        env_path = parent / "docker.env"
+        if env_path.is_file():
+            return read_env_file(env_path)
+    return {}
+
+
 def metric_entry(
     name: str, unit: str, value: float | None, extra: str | None
 ) -> dict[str, Any] | None:
@@ -65,6 +87,18 @@ def int_value(*values: Any) -> int | None:
 def round_or_none(*values: Any, digits: int = 4) -> float | None:
     parsed = number(*values)
     return round(parsed, digits) if parsed is not None else None
+
+
+def interactivity_value(payload: dict[str, Any]) -> float | None:
+    median_tpot = number(payload.get("median_tpot_ms"), payload.get("median_itl_ms"))
+    if median_tpot and median_tpot > 0:
+        return 1000.0 / median_tpot
+
+    tpot = number(payload.get("mean_tpot_ms"), payload.get("mean_itl_ms"))
+    if tpot and tpot > 0:
+        return 1000.0 / tpot
+
+    return None
 
 
 def parse_payload_date(payload: dict[str, Any]) -> tuple[str | None, int | None]:
@@ -198,16 +232,24 @@ def derive_fields(path: Path, payload: dict[str, Any]) -> dict[str, Any] | None:
 def enrich_payload(
     path: Path, payload: dict[str, Any], fields: dict[str, Any]
 ) -> dict[str, Any]:
+    env = slurm_job_env(path)
     enriched = dict(payload)
     enriched.setdefault("benchmark_backend", "Atomesh")
     enriched.setdefault("dashboard_backend", "Atomesh")
     enriched.setdefault("benchmark_model_name", fields["model"])
     enriched.setdefault("topology", fields["topology"])
-    enriched.setdefault("display_topology", fields["topology"])
+    enriched.setdefault(
+        "display_topology", env.get("DISPLAY_TOPOLOGY", fields["topology"])
+    )
     enriched.setdefault("random_input_len", fields["isl"])
     enriched.setdefault("random_output_len", fields["osl"])
     enriched.setdefault("max_concurrency", fields["conc"])
     enriched.setdefault("random_range_ratio", fields["ratio"])
+    enriched.setdefault("precision", env.get("PRECISION", ""))
+    enriched.setdefault("prefill_workers", env.get("PREFILL_WORKERS"))
+    enriched.setdefault("decode_workers", env.get("DECODE_WORKERS"))
+    enriched.setdefault("prefill_tp", env.get("PREFILL_TP"))
+    enriched.setdefault("decode_tp", env.get("DECODE_TP"))
 
     if "total_token_throughput" not in enriched:
         enriched["total_token_throughput"] = number(
@@ -230,6 +272,32 @@ def enrich_payload(
     enriched.setdefault(
         "mean_tpot_ms",
         number(enriched.get("mean_tpot_ms"), enriched.get("mean_itl_ms")),
+    )
+    enriched.setdefault("interactivity", interactivity_value(enriched))
+    resources = topology_resources(enriched, fields)
+    total_gpu = resources["total_gpu"]
+    num_prefill_gpu = resources["num_prefill_gpu"]
+    num_decode_gpu = resources["num_decode_gpu"]
+    input_tput = number(enriched.get("input_throughput"))
+    output_tput = number(enriched.get("output_throughput"))
+    total_tput = number(
+        enriched.get("total_token_throughput"), enriched.get("total_throughput")
+    )
+    enriched.setdefault(
+        "tput_per_gpu", total_tput / total_gpu if total_tput and total_gpu else None
+    )
+    enriched.setdefault(
+        "input_tput_per_gpu",
+        input_tput / num_prefill_gpu if input_tput and num_prefill_gpu else None,
+    )
+    output_tput_denominator = num_decode_gpu or total_gpu
+    enriched.setdefault(
+        "output_tput_per_gpu",
+        (
+            output_tput / output_tput_denominator
+            if output_tput and output_tput_denominator
+            else None
+        ),
     )
     return enriched
 
@@ -263,9 +331,7 @@ def perf_point(
     )
     input_tput = number(payload.get("input_throughput"))
     tpot_ms = number(payload.get("mean_tpot_ms"), payload.get("mean_itl_ms"))
-    interactivity = number(payload.get("interactivity"))
-    if interactivity is None and tpot_ms:
-        interactivity = 1000.0 / tpot_ms
+    interactivity = interactivity_value(payload)
 
     config_label = "_".join(
         part
@@ -338,10 +404,14 @@ def perf_point(
             total_tput / total_gpu if total_tput and total_gpu else None
         ),
         "input_tput_per_gpu": round_or_none(
-            input_tput / total_gpu if input_tput and total_gpu else None
+            input_tput / resources["num_prefill_gpu"]
+            if input_tput and resources["num_prefill_gpu"]
+            else None
         ),
         "output_tput_per_gpu": round_or_none(
-            output_tput / total_gpu if output_tput and total_gpu else None
+            output_tput / (resources["num_decode_gpu"] or total_gpu)
+            if output_tput and (resources["num_decode_gpu"] or total_gpu)
+            else None
         ),
         "run_url": run_url or "",
         "image": string_value(payload.get("docker_image"), payload.get("image")),
@@ -417,20 +487,24 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
     lines = [
         "### ATOMesh Real P/D Benchmark Summary",
         "",
-        "| Model | Topology | ISL/OSL | Concurrency | Total tok/s | Input tok/s | Output tok/s | TTFT ms | TPOT ms | E2E ms |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {model} | {topology} | {isl}/{osl} | {conc} | {total} | {input_} | {output} | {ttft} | {tpot} | {e2e} |".format(
+            "| {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} |".format(
                 model=row.get("benchmark_model_name", "--"),
                 topology=row.get("display_topology") or row.get("topology", "--"),
                 isl=row.get("random_input_len", "--"),
                 osl=row.get("random_output_len", "--"),
                 conc=row.get("max_concurrency", "--"),
+                interactivity=fmt(row.get("interactivity")),
                 total=fmt(row.get("total_token_throughput")),
                 input_=fmt(row.get("input_throughput")),
                 output=fmt(row.get("output_throughput")),
+                total_per_gpu=fmt(row.get("tput_per_gpu")),
+                input_per_gpu=fmt(row.get("input_tput_per_gpu")),
+                output_per_gpu=fmt(row.get("output_tput_per_gpu")),
                 ttft=fmt(row.get("mean_ttft_ms")),
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
