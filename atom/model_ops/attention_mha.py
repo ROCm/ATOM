@@ -242,7 +242,7 @@ class PagedAttentionImpl(nn.Module):
             if (
                 envs.ATOM_USE_UNIFIED_ATTN
                 and self.kv_cache_dtype.startswith("fp8")
-                and not self._should_dispatch_pa_decode_bf16_asm(fwd_ctx)
+                and not (use_pa_decode_bf16_asm() and self.sliding_window == -1)
             ):
                 q_out = torch.empty(*q.shape, dtype=k_cache.dtype, device=q.device)
             else:
@@ -410,17 +410,6 @@ class PagedAttentionImpl(nn.Module):
         )
 
         return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale
-
-    def _should_dispatch_pa_decode_bf16_asm(self, fwd_ctx: ForwardContext) -> bool:
-        if not use_pa_decode_bf16_asm():
-            return False
-        if fwd_ctx.context.is_prefill:
-            return False
-        if self.use_flash_layout:
-            return False
-        if self.sliding_window != -1:
-            return False
-        return True
 
     def _view_v_cache_for_pa_decode_bf16_asm(
         self, v_cache: torch.Tensor, k_cache: torch.Tensor
@@ -782,28 +771,33 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
+    def _dispatch_decode(self):
+        # Sliding-window layers must use triton (ASM paths don't support it)
+        if self.sliding_window != -1:
+            return self.paged_attention_triton
+
+        atom_config = get_current_atom_config()
+
+        if envs.ATOM_USE_UNIFIED_ATTN:
+            if envs.ATOM_FORCE_ATTN_TRITON:
+                return self.paged_attention_triton
+            if atom_config.kv_cache_block_size == 256:
+                return self.paged_attention_persistent_asm
+            return self.paged_attention_triton
+
+        if self.use_triton_attn or self.use_flash_layout:
+            return self.paged_attention_triton
+
+        if atom_config.kv_cache_block_size in (256, 1024):
+            return self.paged_attention_persistent_asm
+        return self.paged_attention_asm
+
     def dispatch_backend(self, fwd_ctx: ForwardContext):
-
-        ctx = fwd_ctx.context
-
-        use_unified_attn = envs.ATOM_USE_UNIFIED_ATTN
-        if ctx.is_prefill:
-            if use_unified_attn or self.use_flash_layout:
+        if fwd_ctx.context.is_prefill:
+            if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
                 return self.prefill_attention_triton
             return self.prefill_attention
-        else:
-            # gfx1250 + unified + sink → persistent_asm (bf16_asm branch inside)
-            if self._should_dispatch_pa_decode_bf16_asm(fwd_ctx):
-                return self.paged_attention_persistent_asm
-            if use_unified_attn or self.use_triton_attn or self.use_flash_layout:
-                return self.paged_attention_triton
-            else:
-                # Use pa persistent for block_size 256 and 1024;
-                # sink-aware layers take the pa_decode_bf16_asm branch inside.
-                atom_config = get_current_atom_config()
-                if atom_config.kv_cache_block_size in (256, 1024):
-                    return self.paged_attention_persistent_asm
-                return self.paged_attention_asm
+        return self._dispatch_decode()
 
     def forward(
         self,

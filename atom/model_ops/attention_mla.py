@@ -18,7 +18,6 @@ from aiter import (
     get_hip_quant,
 )
 from aiter.dist.parallel_state import get_dp_group
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
@@ -615,10 +614,7 @@ class MLAAttention(nn.Module):
             elif (
                 fused_gemm_a8w8_blockscale_preshuffle_split_cat is not None
                 and weight.dtype == dtypes.fp8
-                and get_gfx() != "gfx1250"
             ):  # FP8 GEMM + split + cat
-                # gfx1250: this fused kernel is unadapted (requires
-                # GROUP_K == BLOCK_SIZE_K); fall through to the non-fused path.
                 weight_shuffled = weight.reshape(
                     weight.shape[0] // 16, weight.shape[1] * 16
                 )

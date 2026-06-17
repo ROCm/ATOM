@@ -108,7 +108,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
-        self._pa_decode_bf16_asm_num_head_k = num_head_k
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
