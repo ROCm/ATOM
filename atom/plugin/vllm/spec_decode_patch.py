@@ -14,6 +14,11 @@ def _patch_eagle3_model_type_checks() -> None:
         from atom.plugin.vllm.model_wrapper import ATOMModelBase
         import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer
     except Exception:
+        logger.warning(
+            "vLLM plugin: failed to patch vLLM V1 EAGLE3 proposer type checks. "
+            "This can happen if you are using an in-compatible vLLM version. "
+            "Please make sure that the correct vLLM version is installed."
+        )
         return
 
     if getattr(llm_base_proposer, "_atom_eagle3_model_types_patched", False):
