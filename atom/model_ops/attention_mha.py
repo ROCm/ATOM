@@ -633,7 +633,7 @@ class PagedAttentionImpl(nn.Module):
             qlen_granularity=max_seqlen_q,
             kvlen_granularity=page_size,
             block_size=page_size,
-            is_causal=False,
+            is_causal=True,
         )
 
         metadata = {
