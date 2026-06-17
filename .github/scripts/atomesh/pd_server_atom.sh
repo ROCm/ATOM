@@ -50,6 +50,16 @@ WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 
 mkdir -p "${RUN_DIR}"/{logs,benchmark_results,eval_results}
 
+role_tp="${PREFILL_TP_SIZE}"
+if [[ "${NODE_RANK}" -ge "${xP}" ]]; then
+  role_tp="${DECODE_TP_SIZE}"
+fi
+if [[ -z "${HIP_VISIBLE_DEVICES:-}" ]]; then
+  export HIP_VISIBLE_DEVICES="$(seq -s, 0 "$((role_tp - 1))")"
+fi
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+echo "[runtime] HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES}"
+
 apply_prefixed_env() {
   local prefix="$1"
   local role_ip="$2"
@@ -120,9 +130,19 @@ wait_http() {
   local url="$1"
   local name="$2"
   local timeout="$3"
+  local pid="${4:-}"
   local deadline=$(( $(date +%s) + timeout ))
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
+    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
+      set +e
+      wait "${pid}"
+      local rc=$?
+      set -e
+      [[ "${rc}" -eq 0 ]] && rc=1
+      echo "[wait][FAIL] ${name} process exited before becoming ready rc=${rc}" >&2
+      exit "${rc}"
+    fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       echo "[wait][FAIL] ${name} not ready after ${timeout}s" >&2
       exit 1
@@ -135,6 +155,15 @@ wait_http() {
 wait_router_closed() {
   local deadline=$(( $(date +%s) + WAIT_SERVER_TIMEOUT ))
   while curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; do
+    if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
+      set +e
+      wait "${server_pid}"
+      local rc=$?
+      set -e
+      [[ "${rc}" -eq 0 ]] && rc=1
+      echo "[wait][FAIL] worker process exited while router was still alive rc=${rc}" >&2
+      exit "${rc}"
+    fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       echo "[wait] router still alive after timeout; exiting worker"
       break
@@ -281,7 +310,7 @@ if [[ "${NODE_RANK}" -eq 0 ]]; then
   start_prefill "prefill-rank-0"
   trap 'kill ${router_pid:-0} ${server_pid:-0} 2>/dev/null || true' EXIT
   for ip in "${prefill_ips[@]}"; do
-    wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}"
+    wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   done
   for ip in "${decode_ips[@]}"; do
     wait_http "http://${ip}:${DECODE_PORT}/health" "decode-${ip}" "${WAIT_SERVER_TIMEOUT}"
@@ -294,13 +323,13 @@ if [[ "${NODE_RANK}" -eq 0 ]]; then
 elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
   start_prefill "prefill-rank-${NODE_RANK}"
   trap 'kill ${server_pid:-0} 2>/dev/null || true' EXIT
-  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" || true
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}" || true
   wait_router_closed
   kill "${server_pid}" 2>/dev/null || true
 else
   start_decode
   trap 'kill ${server_pid:-0} 2>/dev/null || true' EXIT
-  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" || true
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}" || true
   wait_router_closed
   kill "${server_pid}" 2>/dev/null || true
 fi

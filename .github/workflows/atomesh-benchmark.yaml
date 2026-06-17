@@ -2,7 +2,7 @@ name: Atomesh Benchmark
 
 on:
   push:
-    branches: [main]
+    branches: [main, zwan/mesh-model-ci]
     paths:
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
@@ -209,7 +209,7 @@ jobs:
       && needs.normalize-results.result == 'success'
       && (
         github.event_name == 'schedule'
-        || github.event_name == 'push'
+        || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         || (github.event_name == 'workflow_dispatch' && inputs.publish_dashboard)
       )
     runs-on: ubuntu-latest
