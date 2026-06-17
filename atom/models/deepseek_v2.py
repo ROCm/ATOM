@@ -204,6 +204,11 @@ def _extract_layer_index_from_prefix(prefix: str) -> int:
 
 
 def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
+    # IndexShare (e.g. GLM-5.2): index_topk_freq > 1 means the indexer is shared
+    # across layers, so the indexer cache must be on even if the config omits the
+    # ATOM `use_index_cache` flag.
+    if int(getattr(config, "index_topk_freq", 1) or 1) > 1:
+        config.use_index_cache = True
     if not getattr(config, "use_index_cache", False):
         return False
 
@@ -249,22 +254,6 @@ def _indexer_weights_shared(config: PretrainedConfig, prefix: str) -> bool:
         return False
     layer_id = _extract_layer_index_from_prefix(prefix)
     return 0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
-
-
-def maybe_enable_glm_dsa_index_cache(config: PretrainedConfig) -> None:
-    """Auto-enable the DSA indexer cache for glm_moe_dsa when the model declares
-    an IndexShare schedule (indexer_types has "shared", or index_topk_freq > 1)
-    but omits the ATOM `use_index_cache` flag. No-op otherwise."""
-    if getattr(config, "model_type", None) != "glm_moe_dsa":
-        return
-    if getattr(config, "use_index_cache", False):
-        return
-    indexer_types = getattr(config, "indexer_types", None)
-    shares_indexer = (indexer_types is not None and "shared" in indexer_types) or int(
-        getattr(config, "index_topk_freq", 1) or 1
-    ) > 1
-    if shares_indexer:
-        config.use_index_cache = True
 
 
 def _fuse_rmsnorm_fp4_quant_fake(
@@ -2364,8 +2353,6 @@ class DeepseekV2ForCausalLM(nn.Module):
     ):
         super().__init__()
         config = atom_config.hf_config
-        # Enable the DSA indexer cache before building layers (GLM-5.2 IndexShare).
-        maybe_enable_glm_dsa_index_cache(config)
         quant_config = atom_config.quant_config
         self.config = config
         self.quant_config = quant_config
