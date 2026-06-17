@@ -94,55 +94,7 @@ local-completions ({'model': 'amd/MiniMax-M3', 'base_url': 'http://localhost:801
 |     |       |strict-match    |     5|exact_match|↑  |0.9181|±  |0.0076|
 ```
 
-### Serving Benchmark
 
-The following script can be used to benchmark online serving throughput and latency:
-
-```bash
-model_path=amd/MiniMax-M3
-ISL=8192
-OSL=1024
-CONC=16
-
-python -m atom.benchmarks.benchmark_serving \
-  --model="$model_path" \
-  --backend=vllm \
-  --base-url=http://localhost:8013 \
-  --dataset-name=random \
-  --random-input-len="${ISL}" \
-  --random-output-len="${OSL}" \
-  --random-range-ratio=0.8 \
-  --num-prompts=$(( CONC * 10 )) \
-  --max-concurrency="${CONC}" \
-  --request-rate=inf \
-  --ignore-eos \
-  --save-result \
-  --percentile-metrics="ttft,tpot,itl,e2el"
-```
-
-Reference result from the validated run on 8xMI355X GPUs:
-
-```text
-Successful requests:                     160
-Benchmark duration (s):                  233.51
-Total input tokens:                      1175032
-Total generated tokens:                  146426
-Request throughput (req/s):              0.69
-Output token throughput (tok/s):         627.05
-Total Token throughput (tok/s):          5658.99
-Mean TTFT (ms):                          556.88
-Median TTFT (ms):                        335.52
-P99 TTFT (ms):                           3610.92
-Mean TPOT (ms):                          24.02
-Median TPOT (ms):                        24.12
-P99 TPOT (ms):                           27.21
-Mean ITL (ms):                           24.01
-Median ITL (ms):                         20.16
-P99 ITL (ms):                            235.31
-Mean E2EL (ms):                          22530.64
-Median E2EL (ms):                        22406.40
-P99 E2EL (ms):                           26977.54
-```
 
 ## FP4 on 4xMI355 GPUs
 
@@ -191,54 +143,4 @@ local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://12
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9386|±  |0.0066|
 |     |       |strict-match    |     5|exact_match|↑  |0.9393|±  |0.0066|
-```
-
-### Serving Benchmark
-
-The following script can be used to benchmark online serving throughput and latency:
-
-```bash
-model_path=amd/MiniMax-M3-MXFP4
-ISL=8192
-OSL=1024
-CONC=16
-
-python -m atom.benchmarks.benchmark_serving \
-  --model="$model_path" \
-  --backend=vllm \
-  --base-url=http://localhost:8000 \
-  --dataset-name=random \
-  --random-input-len="${ISL}" \
-  --random-output-len="${OSL}" \
-  --random-range-ratio=0.8 \
-  --num-prompts=$(( CONC * 10 )) \
-  --max-concurrency="${CONC}" \
-  --request-rate=inf \
-  --ignore-eos \
-  --save-result \
-  --percentile-metrics="ttft,tpot,itl,e2el"
-```
-
-Reference result from the validated run on 4xMI355 GPUs:
-
-```text
-Successful requests:                     160
-Benchmark duration (s):                  194.46
-Total input tokens:                      1175032
-Total generated tokens:                  146426
-Request throughput (req/s):              0.82
-Output token throughput (tok/s):         753.00
-Total Token throughput (tok/s):          6795.63
-Mean TTFT (ms):                          487.13
-Median TTFT (ms):                        280.03
-P99 TTFT (ms):                           3126.69
-Mean TPOT (ms):                          20.03
-Median TPOT (ms):                        20.15
-P99 TPOT (ms):                           22.52
-Mean ITL (ms):                           20.03
-Median ITL (ms):                         16.51
-P99 ITL (ms):                            196.23
-Mean E2EL (ms):                          18815.54
-Median E2EL (ms):                        18857.89
-P99 E2EL (ms):                           22813.32
 ```
