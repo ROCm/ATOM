@@ -1198,6 +1198,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 for ratio, plan in prefill_meta.compress_plans.items()
             }
 
+        # The prefill staging above issued async H2D copies from SHARED pinned
+        # forward_vars buffers (`_stage` → `copy_to_gpu(non_blocking=True)`).
+        # The GPU-side `.clone()`s only protect against GPU buffer REUSE — they
+        # are enqueued on the stream but not yet executed. The decode half below
+        # (and the cu_seqlens_q reset just under it) overwrite those SAME pinned
+        # CPU buffers on the host thread, which does NOT wait for the prefill
+        # DMA to drain. With a long prefill chunk the DMA window is wide enough
+        # that the host overwrite races the in-flight copy → the prefill index
+        # tensors get decode-half values → downstream `tensor[idx]` indexes OOB
+        # (GPU memory-access fault, only at large ISL). Drain the stream so every
+        # prefill H2D has finished reading the pinned buffers before decode
+        # reuses them. Mixed runs eager and is rare, so one sync per mixed batch
+        # is acceptable.
+        torch.cuda.current_stream().synchronize()
+
         # ---- Decode half: present rows [n_p_seqs:] as a standalone batch so
         # the unmodified prepare_decode builds decode metadata into shared
         # buffer rows [0:n_d_seqs]. Mixed runs eager, so bs == n_d_seqs (no CG
