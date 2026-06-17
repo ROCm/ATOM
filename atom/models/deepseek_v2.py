@@ -208,7 +208,7 @@ def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
         # IndexShare (e.g. GLM-5.2): index_topk_freq > 1 shares the indexer across
         # layers, so enable the cache even if the config omits the flag; otherwise
         # there is nothing to skip.
-        if int(getattr(config, "index_topk_freq", 1) or 1) > 1:
+        if int(getattr(config, "index_topk_freq", 1)) > 1:
             config.use_index_cache = True
         else:
             return False
