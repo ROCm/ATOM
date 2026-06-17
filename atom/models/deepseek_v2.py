@@ -226,7 +226,9 @@ def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
     # authoritative source and supersedes the pattern/freq derivation below.
     indexer_types = getattr(config, "indexer_types", None)
     if indexer_types is not None:
-        return 0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
+        return (
+            0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
+        )
 
     index_topk_pattern = getattr(config, "index_topk_pattern", None)
     if index_topk_pattern is not None:
