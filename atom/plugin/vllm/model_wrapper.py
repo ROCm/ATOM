@@ -281,6 +281,11 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # root HF config so --hf-overrides survive without losing multimodal
             # sub-configs such as Kimi-K2.5's vision_config/text_config.
             self.atom_config.hf_config = self.config
+        # vLLM's hf_config replaces ATOM's above, so re-apply the glm_moe_dsa
+        # indexer-cache auto-enable here (no-op for other models / when set).
+        from atom.config import maybe_enable_glm_dsa_index_cache
+
+        maybe_enable_glm_dsa_index_cache(self.atom_config.hf_config)
         self.model_arch = model_arch
         logger.info(
             "ATOM vLLM hf config overrides: use_index_cache=%s, index_topk_freq=%s, "
