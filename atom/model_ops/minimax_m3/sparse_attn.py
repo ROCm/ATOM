@@ -1334,39 +1334,73 @@ def minimax_m3_sparse_attn_decode_asm(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> None:
-    """Block-sparse decode attention via the AITER ASM paged-attention kernel.
+    """Block-sparse decode attention via the AITER Gluon paged-attention kernel.
 
     The lightning-indexer's selected logical 128-blocks are compacted into a
     dense PHYSICAL 16-page block_table (each 128-block -> 8 pages, tail packed
-    last) + exact context_lens, then fed to ``pa_fwd_asm`` over the page-16
-    SHUFFLE KV cache. ASM PA's bf16 gfx950 kernels cover Gqa in {8, 16} (M3 decode
-    is gqa 16 at tp4 / 8 at tp8) and blkSz=16, hence the 16-page expansion.
+    last) + exact context_lens, then fed to the Gluon split-KV paged-attention
+    decode kernel (``pa_decode_gluon``) over the page-16 SHUFFLE KV cache. The
+    split-KV (flash-decoding) implementation is more efficient than the monolithic
+    ASM kernel at low concurrency (few decode sequences), where it parallelizes
+    over KV partitions to keep the GPU busy.
 
     Requires per-rank num_kv_heads == 1 (the indexer top-k is per-kv-head; one
     shared block_table cannot express per-kv-head selection) and head_dim == 128.
     """
-    from atom.model_ops.base_attention import run_pa_fwd_asm
+    from atom.model_ops.base_attention import run_pa_decode_gluon
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
     assert num_kv_heads == 1, (
         "minimax_m3_sparse_attn_decode_asm requires per-rank num_kv_heads == 1;"
         f" got {num_kv_heads}. Use the Triton split-K decode path for GQA."
     )
-    assert q.shape[-1] == 128, "ASM paged-attention requires head_dim == 128."
+    assert q.shape[-1] == 128, "Gluon paged-attention requires head_dim == 128."
 
     sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table(
         topk_idx, block_table, seq_lens
     )
-    run_pa_fwd_asm(
+
+    # Gluon split-KV decode setup (mirrors the standard MHA path in
+    # attention_mha.py::paged_attention_triton). q is [batch, num_heads, 128];
+    # one query token per sequence (max_seqlen_q == 1).
+    num_seqs, num_q_heads_total, head_size = q.shape
+    query_group_size = num_q_heads_total // num_kv_heads
+    max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+    context_partition_size = 256
+    intermediate_shape = (
+        num_seqs,
+        num_kv_heads,
+        max_context_partition_num,
+        query_group_size,
+    )
+    exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+    max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+    temporary_output = torch.empty(
+        *intermediate_shape, head_size, dtype=q.dtype, device=q.device
+    )
+    compute_type = torch.bfloat16  # bf16 KV cache (k/v_scale = None)
+    run_pa_decode_gluon(
+        output=output,
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
-        block_tables=sparse_bt,
         context_lens=sparse_ctx,
+        block_tables=sparse_bt,
+        softmax_scale=sm_scale,
+        max_seqlen_q=1,
+        max_context_partition_num=max_context_partition_num,
+        context_partition_size=context_partition_size,
+        compute_type=compute_type,
+        q_scale=None,
         k_scale=k_scale,
         v_scale=v_scale,
-        out=output,
-        max_qlen=1,
-        high_precision=0,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        alibi_slopes=None,
+        sinks=None,
+        sliding_window=-1,
+        ps=True,
     )
 
 
