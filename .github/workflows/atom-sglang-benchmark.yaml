@@ -51,6 +51,7 @@ on:
           - "all-deepseek (15 DeepSeek configs x 10 default params)"
           - "all-deepseek-non-mtp (11 DeepSeek non-MTP configs x 10 default params)"
           - "all-deepseek-mtp (4 DeepSeek MTP configs x 10 default params)"
+          - "all-deepseek-v3-2 (4 DeepSeek-V3.2 FP8 OOB configs x 10 default params)"
           - "all-qwen (7 Qwen configs x 10 default params)"
           - "all-glm (1 GLM config x 10 default params)"
           - "all-oob (23 SGLang-OOB configs x 10 default params)"
@@ -462,6 +463,8 @@ jobs:
                   return prefix.startswith("deepseek-") and "mtp" not in prefix
               if preset == "all-deepseek-mtp":
                   return prefix.startswith("deepseek-") and "mtp" in prefix
+              if preset == "all-deepseek-v3-2":
+                  return prefix.startswith("deepseek-v3-2-")
               if preset == "all-qwen":
                   return prefix.startswith("qwen")
               if preset == "all-glm":
