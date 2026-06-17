@@ -35,6 +35,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils import envs
+
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
 # is unavailable; the dispatch in ``qk_norm_rope_maybe_quant`` will fall
 # back to the Triton kernel.
@@ -396,7 +398,7 @@ def qk_norm_rope_maybe_quant(
     # halved launch overhead, large for big T due to better occupancy), so
     # "auto" picks flydsl whenever the shape matches.
     # ------------------------------------------------------------------
-    if _FLYDSL_AVAILABLE:
+    if _FLYDSL_AVAILABLE and envs.ATOM_USE_FLYDSL_QK_NORM:
         return flydsl_qk_norm_rope_quant(
             q,
             kv,

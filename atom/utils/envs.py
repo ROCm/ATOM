@@ -52,6 +52,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # flydsl drop-in for QK-norm + RoPE + optional FP8 quant kernel.
+    # 1 (default) = use flydsl when available; 0 = pin Triton.
+    "ATOM_USE_FLYDSL_QK_NORM": lambda: os.getenv("ATOM_USE_FLYDSL_QK_NORM", "1") == "1",
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
