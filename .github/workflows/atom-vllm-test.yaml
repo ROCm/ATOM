@@ -8,6 +8,10 @@ on:
       - '**/*.md'
       - 'docs/**'
       - 'atom/plugin/sglang/**'
+      - 'atom/mesh/**'
+      - '.github/workflows/atomesh-*.yaml'
+      - '.github/scripts/atomesh_*.sh'
+      - '.github/dashboard/atomesh_*.html'
       - '.github/workflows/atom-sglang-*.yaml'
       - '.github/benchmark/sglang_models_accuracy.json'
       - 'LICENSE'
@@ -237,16 +241,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - display_name: "DeepSeek-V4-Pro TP8"
-            model_name: "DeepSeek-V4-Pro"
-            model_path: "deepseek-ai/DeepSeek-V4-Pro"
-            extra_args: "--tensor-parallel-size 8 --gpu-memory-utilization 0.9 --max-num-seqs 512 --tokenizer-mode deepseek_v4"
+          - display_name: "DeepSeek-V4-Flash TP4"
+            model_name: "DeepSeek-V4-Flash"
+            model_path: "deepseek-ai/DeepSeek-V4-Flash"
+            extra_args: "--tensor-parallel-size 4 --gpu-memory-utilization 0.9 --max-num-seqs 512 --tokenizer-mode deepseek_v4"
             env_vars: |
               AITER_BF16_FP8_MOE_BOUND=0
               ATOM_MOE_GU_ITLV=1
             lm_eval_num_fewshot: 20
             accuracy_test_threshold: 0.94
-            runner: atom-mi355-8gpu.predownload
+            runner: linux-atom-mi35x-4
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
@@ -471,6 +475,13 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: GPU preflight check
+        if: success()
+        timeout-minutes: 5
+        env:
+          GPU_PREFLIGHT_ALLOCATION_MB: "8"
+        run: bash .github/scripts/gpu_preflight_check.sh "$CONTAINER_NAME" docker
+
       - name: Download or refresh model if needed
         if: success()
         run: |
@@ -518,7 +529,7 @@ jobs:
 
       - name: Run OOT launch and gsm8k accuracy via script (ci mode)
         if: success()
-        timeout-minutes: 120
+        timeout-minutes: 45
         env:
           OOT_MODEL_NAME: ${{ matrix.model_name }}
           OOT_MODEL_PATH: ${{ matrix.model_path }}
@@ -526,7 +537,7 @@ jobs:
           OOT_CLIENT_COMMAND: ${{ matrix.client_command || '' }}
           OOT_ENV_VARS: ${{ matrix.env_vars }}
           LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
-          MAX_WAIT_RETRIES: "120"
+          MAX_WAIT_RETRIES: "40"
           STREAM_VLLM_LOGS: "1"
         run: |
           docker exec \
