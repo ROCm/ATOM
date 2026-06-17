@@ -107,14 +107,34 @@ def _can_use_fused_minimax_m3_attention_preproc(
 
 def _minimax_m3_cos_sin_cache(
     rotary_emb: nn.Module,
-    dtype: torch.dtype,
+    query: torch.Tensor,
 ) -> torch.Tensor:
+    cache_name = "_minimax_m3_cos_sin_cache"
     cos_cache = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+    cached = getattr(rotary_emb, cache_name, None)
+    expected_shape = (*cos_cache.shape[:-1], cos_cache.shape[-1] * 2)
+    if (
+        cached is not None
+        and cached.dtype == query.dtype
+        and cached.device == query.device
+        and tuple(cached.shape) == expected_shape
+    ):
+        return cached
+
     sin_cache = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
-    if cos_cache.dtype != dtype:
-        cos_cache = cos_cache.to(dtype=dtype)
-        sin_cache = sin_cache.to(dtype=dtype)
-    return torch.cat([cos_cache, sin_cache], dim=-1)
+    if cos_cache.dtype != query.dtype or cos_cache.device != query.device:
+        cos_cache = cos_cache.to(device=query.device, dtype=query.dtype)
+        sin_cache = sin_cache.to(device=query.device, dtype=query.dtype)
+    cos_sin_cache = torch.cat([cos_cache, sin_cache], dim=-1).contiguous()
+
+    if torch.compiler.is_compiling():
+        return cos_sin_cache
+
+    if cache_name in rotary_emb._buffers:
+        rotary_emb._buffers[cache_name] = cos_sin_cache
+    else:
+        rotary_emb.register_buffer(cache_name, cos_sin_cache, persistent=False)
+    return cos_sin_cache
 
 
 def _minimax_m3_gemma_qk_norm(
@@ -375,6 +395,7 @@ class MiniMaxM3Attention(nn.Module):
             base=_rope_theta(config),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
+        _minimax_m3_cos_sin_cache(self.rotary_emb, self.q_norm.weight)
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -415,7 +436,7 @@ class MiniMaxM3Attention(nn.Module):
             q = torch.empty(
                 (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
             )
-            cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv.dtype)
+            cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
             aiter.fused_minimax_m3_qknorm_rope_kv_insert(
                 qkv,
                 self.q_norm.weight,
@@ -532,6 +553,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             base=_rope_theta(config),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
+        _minimax_m3_cos_sin_cache(self.rotary_emb, self.q_norm.weight)
         self.index_q_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
         self.index_k_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
         self.index_rotary_emb = self.rotary_emb
@@ -699,7 +721,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             index_q = torch.empty(
                 (qkv.shape[0], self.index_q_size), dtype=qkv.dtype, device=qkv.device
             )
-            cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv.dtype)
+            cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
             aiter.fused_minimax_m3_qknorm_rope_kv_insert(
                 qkv,
                 self.q_norm.weight,
