@@ -62,8 +62,8 @@ def int_value(*values: Any) -> int | None:
     return int(parsed) if parsed is not None else None
 
 
-def round_or_none(value: Any, digits: int = 4) -> float | None:
-    parsed = number(value)
+def round_or_none(*values: Any, digits: int = 4) -> float | None:
+    parsed = number(*values)
     return round(parsed, digits) if parsed is not None else None
 
 
@@ -215,15 +215,12 @@ def enrich_payload(
             enriched.get("total_throughput"),
         )
     if "input_throughput" not in enriched:
-        input_len = number(enriched.get("random_input_len"))
-        completed = number(
-            enriched.get("completed"), enriched.get("successful_requests")
-        )
+        total_input_tokens = number(enriched.get("total_input_tokens"))
         duration = number(
             enriched.get("benchmark_duration_s"), enriched.get("duration")
         )
-        if input_len and completed and duration:
-            enriched["input_throughput"] = input_len * completed / duration
+        if total_input_tokens and duration:
+            enriched["input_throughput"] = total_input_tokens / duration
     if "mean_e2el_ms" not in enriched:
         enriched["mean_e2el_ms"] = number(
             enriched.get("mean_e2el_ms"),
