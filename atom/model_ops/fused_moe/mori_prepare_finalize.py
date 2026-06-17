@@ -190,8 +190,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if self.use_fp8_dispatch:
             from aiter import get_hip_quant
 
-            quant_func = get_hip_quant(quant_type)
-            a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
+            # [fp8-dispatch exp] MXFP8 per_1x32 + e8m0 byte scale, matching
+            # DSv4 expert GEMM (q_type=per_1x32). dispatch_scale is wired as
+            # the GEMM a1_scale in modular_kernel (a1_scale=dispatch_scale).
+            quant_func = get_hip_quant(QuantType.per_1x32)
+            a1, scale = quant_func(
+                a1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+            )
 
         block_num, warp_per_block = self._get_dispatch_config()
 
