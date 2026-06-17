@@ -1430,6 +1430,127 @@ class QKVParallelLinear(ColumnParallelLinear):
         param.weight_loader_process(param_data, loaded_weight)
 
 
+class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
+    """QKV projection fused with MiniMax-M3 lightning-indexer projections.
+
+    The sparse attention layers emit ``[q | k | v | index_q | index_k]`` from a
+    single column-parallel GEMM. ``index_q`` follows the KV-head sharding and
+    replication rules, while ``index_k`` is a single replicated head.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        total_num_index_heads: int,
+        index_head_size: int,
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
+        **kwargs,
+    ):
+        if total_num_index_heads != total_num_kv_heads:
+            raise ValueError(
+                "MiniMax-M3 index_q must shard like KV heads: "
+                "total_num_index_heads must equal total_num_kv_heads."
+            )
+
+        self.head_size = head_size
+        self.v_head_size = head_size
+        self.index_head_size = index_head_size
+        self.total_num_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
+        self.total_num_index_heads = total_num_index_heads
+
+        tp_size = get_tp_group().world_size
+        self.num_heads = divide(self.total_num_heads, tp_size)
+        if self.total_num_kv_heads >= tp_size:
+            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_head_replicas = 1
+        else:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+        self.num_index_heads = self.num_kv_heads
+
+        output_sizes = [
+            self.num_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.v_head_size * tp_size,
+            self.num_index_heads * self.index_head_size * tp_size,
+            self.index_head_size * tp_size,
+        ]
+
+        ColumnParallelLinear.__init__(
+            self,
+            hidden_size,
+            output_sizes,
+            bias=bias,
+            quant_config=quant_config,
+            source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
+            **kwargs,
+        )
+
+    def _shard_offset_size(self, loaded_shard_id: str) -> tuple[int, int]:
+        h = self.head_size
+        ih = self.index_head_size
+        nq = self.num_heads
+        nkv = self.num_kv_heads
+        nidx = self.num_index_heads
+        mapping = {
+            "q": (0, nq * h),
+            "k": (nq * h, nkv * h),
+            "v": ((nq + nkv) * h, nkv * h),
+            "index_q": ((nq + 2 * nkv) * h, nidx * ih),
+            "index_k": ((nq + 2 * nkv) * h + nidx * ih, ih),
+        }
+        if loaded_shard_id not in mapping:
+            raise ValueError(
+                "MiniMax-M3 QKV/indexer shard id must be one of "
+                "'q', 'k', 'v', 'index_q', 'index_k'; got "
+                f"{loaded_shard_id!r}."
+            )
+        return mapping[loaded_shard_id]
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str,
+    ):
+        shard_offset, shard_size = self._shard_offset_size(loaded_shard_id)
+        if param is getattr(self, "weight_scale", None) or param is getattr(
+            self, "input_scale", None
+        ):
+            if self.quant_type == QuantType.per_1x128:
+                shard_offset = (shard_offset + 127) // 128
+                shard_size = (shard_size + 127) // 128
+            elif self.quant_type == QuantType.per_Tensor:
+                loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
+                shard_offset = ["q", "k", "v", "index_q", "index_k"].index(
+                    loaded_shard_id
+                )
+                shard_size = 1
+
+        if loaded_shard_id == "q":
+            shard_rank = self.tp_rank
+        elif loaded_shard_id == "index_k":
+            shard_rank = 0
+        else:
+            shard_rank = self.tp_rank // self.num_kv_head_replicas
+
+        param_data = param.data.narrow(self.tp_dim, shard_offset, shard_size)
+        loaded_weight = loaded_weight.narrow(
+            self.tp_dim,
+            shard_rank * shard_size,
+            shard_size,
+        )
+        param.weight_loader_process(param_data, loaded_weight)
+
+
 class RowParallelLinear(LinearBase):
     def __init__(
         self,

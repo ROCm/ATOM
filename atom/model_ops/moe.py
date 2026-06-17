@@ -720,6 +720,8 @@ def rocm_aiter_fused_moe_impl(
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    swiglu_limit: float = 0.0,
+    gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
 
@@ -740,6 +742,8 @@ def rocm_aiter_fused_moe_impl(
         w2_scale,
         a1_scale,
         a2_scale,
+        swiglu_limit=swiglu_limit,
+        gate_mode=gate_mode,
     )
 
 
@@ -757,6 +761,8 @@ def rocm_aiter_fused_moe_fake(
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    swiglu_limit: float = 0.0,
+    gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1674,6 +1680,10 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                moe_extra_args={
+                    "gate_mode": GateMode.SEPARATED.value,
+                    "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
+                },
             )
         else:
             return torch.ops.aiter.rocm_aiter_fused_moe(
@@ -1690,6 +1700,8 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
+                gate_mode=GateMode.SEPARATED.value,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
             )
 
 
@@ -2015,6 +2027,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
         # per_Tensor doesn't support num_local_tokens, so fallback to
         # rocm_aiter_fused_moe when using per-tensor or no modular kernel.
+        moe_extra_args = {
+            "gate_mode": GateMode.SEPARATED.value,
+            "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
+        }
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
             return torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
@@ -2030,6 +2046,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 doweight_stage1=apply_router_weight_on_input,
+                **moe_extra_args,
             )
         return self.fused_experts(
             hidden_states=x,
@@ -2048,6 +2065,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            moe_extra_args=moe_extra_args,
         )
 
 
@@ -3152,6 +3170,24 @@ class FusedMoE(torch.nn.Module):
                     topk_weights = topk_weights / topk_weights.sum(
                         dim=-1, keepdim=True
                     ).clamp_min(1e-20)
+
+                if num_fused_shared_experts > 0:
+                    if routed_scaling_factor != 1.0:
+                        topk_weights = topk_weights * routed_scaling_factor
+
+                    import atom.model_ops.topK as _topK_mod
+
+                    assert _topK_mod.aiter_topK_meta_data is not None, (
+                        "AITER topK meta data is not initialized. "
+                        "Please ensure that init_aiter_topK_meta_data is called "
+                        "before this function."
+                    )
+                    total_topk_weights, total_topk_ids = _topK_mod.aiter_topK_meta_data
+                    tokens_num = topk_ids.shape[0]
+                    assert total_topk_weights.shape[0] >= tokens_num
+                    total_topk_ids[:tokens_num, :top_k] = topk_ids.to(torch.int32)
+                    total_topk_weights[:tokens_num, :top_k] = topk_weights
+                    return total_topk_weights[:tokens_num], total_topk_ids[:tokens_num]
 
                 topk_ids = topk_ids.to(torch.int32)
             elif scoring_func == "sqrtsoftplus":

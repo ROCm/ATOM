@@ -12,7 +12,10 @@ from aiter import (
     rmsnorm2d_fwd,
     rmsnorm2d_fwd_with_add,
 )
-from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_fused_allreduce_rmsnorm,
+)
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
@@ -752,6 +755,54 @@ class GemmaRMSNorm(nn.Module):
         if self.use_fused_quant:
             return self._forward_fused_fp8(x, residual)
         return self.forward_cuda(x, residual)
+
+
+def _gemma_rms_norm_with_weight(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+
+    ori_shape = x.shape
+    x_2d = x.reshape(-1, ori_shape[-1])
+    residual_2d = residual.reshape(-1, ori_shape[-1])
+    out = torch.empty_like(x_2d)
+    res_out = torch.empty_like(x_2d)
+    fused_qk_rmsnorm_group_quant(
+        q=x_2d,
+        q_weight=weight,
+        q_epsilon=variance_epsilon,
+        q_out_unquantized=out,
+        q_res_out=res_out,
+        q_residual=residual_2d,
+        gemma_norm=True,
+    )
+    return out.reshape(ori_shape), res_out.reshape(ori_shape)
+
+
+def fused_allreduce_gemma_rms_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MiniMax-M3 post-attention all-reduce + Gemma RMSNorm helper.
+
+    Use aiter's fused tensor-parallel all-reduce + RMSNorm.
+    ``weight_bias=1.0`` preserves Gemma's ``normalize(x) * (1 + weight)`` math.
+    """
+    if get_tensor_model_parallel_world_size() > 1:
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        # todo: add back the fused allreduce rmsnorm
+        # return tensor_model_parallel_fused_allreduce_rmsnorm(
+        #     hidden_states.contiguous(),
+        #     residual,
+        #     norm.weight,
+        #     norm.variance_epsilon,
+        #     weight_bias=1.0,
+        # )
+    return norm(hidden_states, residual)
 
 
 # ---------------------------------------------------------------------------

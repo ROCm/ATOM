@@ -295,6 +295,8 @@ def load_model(
         # MoE buffer's extra slot. Returning the full prefix (incl. mlp./ffn.)
         # lets the rewrite preserve the module-naming style.
         maybe_matching_list = [
+            "block_sparse_moe.shared_experts.",
+            "block_sparse_moe.shared_expert.",
             "mlp.shared_experts.",
             "mlp.shared_expert.",
             "ffn.shared_experts.",
@@ -474,14 +476,27 @@ def load_model(
                 # Preserve the module-naming prefix (mlp. / ffn.) so the rewritten
                 # name matches this model's routed-expert param naming.
                 module_prefix = maybe_matching_name.split("shared_expert", 1)[0]
+                n_routed_experts = (
+                    getattr(hf_config, "n_routed_experts", None)
+                    or getattr(hf_config, "num_local_experts", None)
+                    or getattr(hf_config, "num_experts", None)
+                )
+                if n_routed_experts is None:
+                    raise AttributeError(
+                        "Cannot remap shared expert weights without "
+                        "n_routed_experts, num_local_experts, or num_experts "
+                        "on the model config."
+                    )
                 name = name.replace(
                     maybe_matching_name,
-                    f"{module_prefix}experts.{hf_config.n_routed_experts}.",
+                    f"{module_prefix}experts.{n_routed_experts}.",
                 )
             for k in packed_modules_mapping:
                 # We handle the experts below in expert_params_mapping
                 if (
-                    "mlp.experts." in name or "ffn.experts." in name
+                    "mlp.experts." in name
+                    or "ffn.experts." in name
+                    or "block_sparse_moe.experts." in name
                 ) and name not in params_dict:
                     continue
                 if k in name:
