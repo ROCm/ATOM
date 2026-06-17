@@ -952,6 +952,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         super().__init__()
         config = _get_text_config(atom_config.hf_config)
         self.config = config
+        # bf16 routes routed experts through MiniMaxM3Bf16Experts with standalone
+        # shared experts, so the loader must NOT fuse shared-expert weights into
+        # the routed slot. FP4 keeps FusedMoE's fused-shared loading.
+        self.disable_fused_shared_loading = _minimax_m3_use_dedicated_bf16_experts(
+            atom_config.quant_config
+        )
         self.model = MiniMaxM3Model(
             atom_config=atom_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -1032,6 +1038,10 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = "") -> None:
         super().__init__()
         self.config = atom_config.hf_config
+        # See MiniMaxM3SparseForCausalLM: keep shared experts standalone for bf16.
+        self.disable_fused_shared_loading = _minimax_m3_use_dedicated_bf16_experts(
+            atom_config.quant_config
+        )
         self.language_model = MiniMaxM3SparseForCausalLM(
             atom_config=atom_config,
             prefix=prefix,
