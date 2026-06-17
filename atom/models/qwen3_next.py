@@ -272,7 +272,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         else:
             final_hidden_states = routed_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
@@ -333,6 +333,7 @@ class Qwen3NextAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
             prefix=f"{prefix}.o_proj",
         )
         if is_vllm():
@@ -577,6 +578,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             bias=False,
             input_is_parallel=True,
             quant_config=quant_config,
+            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
             prefix=f"{prefix}.out_proj",
         )
 
@@ -793,9 +795,12 @@ class Qwen3NextDecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
             quant_config=input_norm_quant,
             write_bf16=input_norm_write_bf16,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0,
         )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
         self.layer_scale = getattr(config, "layer_scale", False)
@@ -918,7 +923,11 @@ class Qwen3NextModel(nn.Module):
             layer_num_offset=0,
         )
         if get_pp_group().is_last_rank:
-            self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = Qwen3NextRMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            )
         else:
             self.norm = PPMissingLayer()
 

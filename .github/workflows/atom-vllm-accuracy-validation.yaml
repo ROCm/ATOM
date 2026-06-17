@@ -465,7 +465,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nVLLM_USE_V2_MODEL_RUNNER=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -761,7 +761,7 @@ jobs:
           BENCHMARK_OVERRIDES = {
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384",
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nVLLM_USE_V2_MODEL_RUNNER=1",
               },
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP2": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 32768 --max-model-len 16384",
