@@ -2072,16 +2072,29 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
+            # While self.quant_dtype is resolved from the *layer* prefix, model
+            # checkpoints can keep the MLA a-proj in unquantized form via
+            # `exclude`, like bf16 in Kimi-K2.6-MXFP4. So only fuse when the
+            # attn a-proj is also quantized, or otherwise the fusion would
+            # result in GEMM on packed FP4 activation with bf16 weights, and
+            # lead to un-multipliable shapes.
+            attn_quant_dtype = self.self_attn.quant_dtype
             enable_fp8_input_norm_quant = (
-                self.quant_dtype == dtypes.fp8 and use_triton_gemm()
+                self.quant_dtype == dtypes.fp8
+                and attn_quant_dtype == dtypes.fp8
+                and use_triton_gemm()
             )
-            enable_fp4_input_norm_quant = self.quant_dtype == dtypes.fp4x2 and (
-                use_triton_gemm()
-                or _enable_non_triton_global_mxfp4_input_norm_quant(
-                    config,
-                    quant_config,
-                    self.quant_dtype,
-                    is_mtp_block,
+            enable_fp4_input_norm_quant = (
+                self.quant_dtype == dtypes.fp4x2
+                and attn_quant_dtype == dtypes.fp4x2
+                and (
+                    use_triton_gemm()
+                    or _enable_non_triton_global_mxfp4_input_norm_quant(
+                        config,
+                        quant_config,
+                        self.quant_dtype,
+                        is_mtp_block,
+                    )
                 )
             )
             if enable_fp8_input_norm_quant or enable_fp4_input_norm_quant:
