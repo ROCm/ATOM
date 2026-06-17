@@ -65,7 +65,11 @@
           "label": "DPA TBO",
           "suffix": "-dpa-tbo",
           "extra_args": "--enable-dp-attention --enable-tbo",
+<<<<<<< HEAD
           "env_vars": "GPU_MAX_HW_QUEUES=5",
+=======
+          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_CPU_AFFINITY=1",
+>>>>>>> 55624079 (fix: derive global GPU rank for affinity from config, not TP-local rank)
           "conc_min": 256,
           "conc_max": 1024
         },
