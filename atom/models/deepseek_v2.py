@@ -1836,7 +1836,7 @@ class DeepseekV2MLAAttention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]],
     ) -> torch.Tensor:
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
@@ -2020,12 +2020,32 @@ class DeepseekV2DecoderLayer(nn.Module):
                 reduce_results=not self.fuse_ar_input_norm,
                 prefix=f"{prefix}.mlp",
             )
+        qkv_proj = (
+            self.self_attn.fused_qkv_a_proj
+            if hasattr(self.self_attn, "fused_qkv_a_proj")
+            else None
+        )
+        input_norm_fused_quant = False
+        if qkv_proj is not None:
+            input_norm_fused_quant = (
+                qkv_proj.params_dtype == dtypes.fp8
+                and qkv_proj.quant_type.value
+                in (QuantType.per_1x128.value, QuantType.per_Token.value)
+            )
+        fused_allreduce = (
+            self.fuse_ar_input_norm and self.layer_idx > 0 and not is_mtp_block
+        )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=self.fuse_ar_input_norm
-            and self.layer_idx > 0
-            and not is_mtp_block,
+            fused_allreduce=fused_allreduce,
+            fused_quant=fused_allreduce and input_norm_fused_quant,
+            quant_config=quant_config,
+            prefix=(
+                f"{prefix}.self_attn.fused_qkv_a_proj"
+                if qkv_proj is not None
+                else f"{prefix}.self_attn.q_proj"
+            ),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
