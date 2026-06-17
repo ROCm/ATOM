@@ -102,6 +102,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
     ),
+    # MiniMax-M3 sparse decode: use the AITER ASM paged-attention kernel
+    # (pa_fwd_asm over the page-16 SHUFFLE KV cache) instead of the Triton
+    # split-K decode. Only valid when per-rank num_kv_heads == 1 (tp >= 4);
+    # falls back to the Triton path otherwise. Set to 1 to enable.
+    "ATOM_M3_SPARSE_USE_ASM_PA": lambda: (
+        os.getenv("ATOM_M3_SPARSE_USE_ASM_PA", "0") == "1"
+    ),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"

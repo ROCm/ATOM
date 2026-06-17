@@ -45,11 +45,15 @@ from atom.model_ops.minimax_m3.moe import (
 )
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
+    minimax_m3_fused_qknorm_rope_kv_insert_shuffle,
     minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
+    minimax_m3_sparse_attn_decode_asm,
+    minimax_m3_sparse_attn_prefill_asm,
 )
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
+from atom.utils import envs
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -357,6 +361,7 @@ class MiniMaxM3Attention(nn.Module):
         cache_config: str = "bf16",
     ) -> None:
         super().__init__()
+        self.layer_num = layer_id
         self.hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
@@ -559,6 +564,16 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.index_rotary_emb = self.rotary_emb
         self.kv_cache = torch.tensor([])
         self.index_cache = torch.tensor([])
+        # ASM decode path (ATOM_M3_SPARSE_USE_ASM_PA): page-16 SHUFFLE K/V *views*
+        # of `self.kv_cache`, derived lazily by `_ensure_asm_shuffle_views()`.
+        # The allocation/binding is unchanged from the non-ASM path (the backend
+        # gives us the plain page-128 `self.kv_cache`); we only reinterpret its
+        # bytes as page-16 SHUFFLE here. index cache stays the page-128
+        # `index_cache` above.
+        self.kv_cache_k = torch.tensor([])
+        self.kv_cache_v = torch.tensor([])
+        self.k_scale = self.v_scale = None
+        self._use_asm_pa = bool(envs.ATOM_M3_SPARSE_USE_ASM_PA)
         compilation_config = get_current_atom_config().compilation_config
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer: {self.layer_name}")
@@ -578,6 +593,55 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
         return self.o_proj(attn_output)
 
+    def _ensure_asm_shuffle_views(self) -> None:
+        """Lazily derive the page-16 SHUFFLE K/V views from ``self.kv_cache``.
+
+        The backend binds ``self.kv_cache`` as the plain page-128 combined cache
+        (shape ``[N, 2, 128, num_kv_heads, head_dim]``) -- identical to the
+        non-ASM path, no allocation change. AITER's ``pa_fwd_asm`` / the page-16
+        SHUFFLE writer need a 5D page-16 view, so we reinterpret each layer's K/V
+        slice (no bytes moved): one logical 128-page == 8 contiguous physical
+        16-pages, so ``N`` logical blocks become ``N*8`` physical 16-pages:
+            K: [N*8, num_kv_heads, head_dim//x, 16, x]
+            V: [N*8, num_kv_heads, 16//x, head_dim, x]
+        Both the write (reshape_and_cache asm_layout=True) and the read
+        (pa_fwd_asm) go through THESE views, so the page-16 interpretation is
+        self-consistent regardless of the plain layout. Idempotent: rebuilds only
+        when the underlying ``self.kv_cache`` storage changes.
+        """
+        from atom.model_ops.minimax_m3.sparse_attn import (
+            ASM_PAGE_SIZE,
+            PAGES_PER_SPARSE_BLOCK,
+        )
+
+        if self.kv_cache.numel() == 0:
+            return
+        key_cache, value_cache = self.kv_cache.unbind(1)  # each [N, 128, h, hd]
+        if (
+            self.kv_cache_k.numel() != 0
+            and self.kv_cache_k.data_ptr() == key_cache.data_ptr()
+        ):
+            return  # views already derived from this storage
+        x = 16 // self.kv_cache.element_size()
+        num_blocks = key_cache.shape[0]
+        num_phys16 = num_blocks * PAGES_PER_SPARSE_BLOCK
+        # .view (not .reshape): each unbound slice is contiguous, so this is
+        # guaranteed zero-copy -- writes must land in the real pool, never a copy.
+        self.kv_cache_k = key_cache.view(
+            num_phys16,
+            self.num_kv_heads,
+            self.head_dim // x,
+            ASM_PAGE_SIZE,
+            x,
+        )
+        self.kv_cache_v = value_cache.view(
+            num_phys16,
+            self.num_kv_heads,
+            ASM_PAGE_SIZE // x,
+            self.head_dim,
+            x,
+        )
+
     def _insert_kv(
         self,
         k: torch.Tensor,
@@ -585,23 +649,42 @@ class MiniMaxM3SparseAttention(nn.Module):
         index_k: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        if self.kv_cache.numel() == 0 or self.index_cache.numel() == 0:
+        if self.index_cache.numel() == 0:
             return
-        key_cache, value_cache = self.kv_cache.unbind(1)
-        kv_cache_dtype = (
-            "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
-        )
-        aiter.reshape_and_cache(
-            k.view(-1, self.num_kv_heads, self.head_dim),
-            v.view(-1, self.num_kv_heads, self.head_dim),
-            key_cache,
-            value_cache,
-            slot_mapping,
-            kv_cache_dtype=kv_cache_dtype,
-            k_scale=None,
-            v_scale=None,
-            asm_layout=False,
-        )
+        if self._use_asm_pa:
+            self._ensure_asm_shuffle_views()
+            if self.kv_cache_k.numel() == 0:
+                return
+            # Page-16 SHUFFLE write for the ASM decode path.
+            aiter.reshape_and_cache(
+                k.view(-1, self.num_kv_heads, self.head_dim),
+                v.view(-1, self.num_kv_heads, self.head_dim),
+                self.kv_cache_k,
+                self.kv_cache_v,
+                slot_mapping,
+                kv_cache_dtype="auto",
+                k_scale=None,
+                v_scale=None,
+                asm_layout=True,
+            )
+        else:
+            if self.kv_cache.numel() == 0:
+                return
+            key_cache, value_cache = self.kv_cache.unbind(1)
+            kv_cache_dtype = (
+                "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+            )
+            aiter.reshape_and_cache(
+                k.view(-1, self.num_kv_heads, self.head_dim),
+                v.view(-1, self.num_kv_heads, self.head_dim),
+                key_cache,
+                value_cache,
+                slot_mapping,
+                kv_cache_dtype=kv_cache_dtype,
+                k_scale=None,
+                v_scale=None,
+                asm_layout=False,
+            )
         self.index_cache.view(-1, self.idx_head_dim)[slot_mapping] = index_k.to(
             self.index_cache.dtype
         )
@@ -638,19 +721,36 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.scaling,
         )
         output = torch.empty_like(q)
-        minimax_m3_sparse_attn(
-            q,
-            self.kv_cache,
-            topk_idx,
-            block_tables,
-            cu_seqlens_q,
-            seq_lens,
-            prefix_lens,
-            prefill_metadata.max_query_len,
-            self.num_kv_heads,
-            self.scaling,
-            output,
-        )
+        if self._use_asm_pa:
+            minimax_m3_sparse_attn_prefill_asm(
+                q,
+                self.kv_cache_k,
+                self.kv_cache_v,
+                topk_idx,
+                block_tables,
+                prefill_metadata.query_req_id,
+                prefill_metadata.query_abs_pos,
+                prefill_metadata.per_token_qo_indptr,
+                self.num_kv_heads,
+                self.scaling,
+                output,
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
+            )
+        else:
+            minimax_m3_sparse_attn(
+                q,
+                self.kv_cache,
+                topk_idx,
+                block_tables,
+                cu_seqlens_q,
+                seq_lens,
+                prefix_lens,
+                prefill_metadata.max_query_len,
+                self.num_kv_heads,
+                self.scaling,
+                output,
+            )
         return output
 
     def _run_decode_sparse(
@@ -674,16 +774,37 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.scaling,
         )
         output = torch.empty_like(q)
-        minimax_m3_sparse_attn_decode(
-            q,
-            self.kv_cache,
-            topk_idx,
-            decode_metadata.block_table,
-            decode_metadata.seq_lens,
-            self.num_kv_heads,
-            self.scaling,
-            output,
-        )
+        if self._use_asm_pa:
+            if self.num_kv_heads != 1:
+                raise NotImplementedError(
+                    "ATOM_M3_SPARSE_USE_ASM_PA requires per-rank num_kv_heads == 1 "
+                    "(tensor-parallel size >= 4); ASM PA shares one block_table "
+                    f"across kv heads. Got num_kv_heads={self.num_kv_heads}."
+                )
+            minimax_m3_sparse_attn_decode_asm(
+                q,
+                self.kv_cache_k,
+                self.kv_cache_v,
+                topk_idx,
+                decode_metadata.block_table,
+                decode_metadata.seq_lens,
+                self.num_kv_heads,
+                self.scaling,
+                output,
+                k_scale=self.k_scale,
+                v_scale=self.v_scale,
+            )
+        else:
+            minimax_m3_sparse_attn_decode(
+                q,
+                self.kv_cache,
+                topk_idx,
+                decode_metadata.block_table,
+                decode_metadata.seq_lens,
+                self.num_kv_heads,
+                self.scaling,
+                output,
+            )
         return output
 
     def sparse_attention_forward_impl(
@@ -692,10 +813,17 @@ class MiniMaxM3SparseAttention(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         fwd_ctx = get_forward_context()
+        if self._use_asm_pa:
+            # Derive the page-16 SHUFFLE K/V views from the (plain) self.kv_cache
+            # the backend bound. No-op once derived / when cache is unbound.
+            self._ensure_asm_shuffle_views()
+        # self.kv_cache is the source of truth for "cache bound" in both paths;
+        # the ASM views are derived from it.
+        main_cache_unbound = self.kv_cache.numel() == 0
         if (
             fwd_ctx.context.is_dummy_run
             or fwd_ctx.attn_metadata is None
-            or self.kv_cache.numel() == 0
+            or main_cache_unbound
             or self.index_cache.numel() == 0
         ):
             return torch.empty(
@@ -722,30 +850,55 @@ class MiniMaxM3SparseAttention(nn.Module):
                 (qkv.shape[0], self.index_q_size), dtype=qkv.dtype, device=qkv.device
             )
             cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
-            aiter.fused_qknorm_idxrqknorm(
-                qkv,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                cos_sin_cache,
-                positions,
-                self.num_heads,
-                self.num_kv_heads,
-                self.rotary_emb.rotary_dim,
-                self.q_norm.variance_epsilon,
-                self.index_q_norm.weight,
-                self.index_k_norm.weight,
-                self.num_idx_heads,
-                sparse_metadata.slot_mapping,
-                self.kv_cache,
-                self.index_cache,
-                self.kv_cache.shape[2],
-                q,
-                index_q,
-                sparse_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                None,
-                None,
-            )
+            if self._use_asm_pa:
+                # Triton fallback that writes the main KV cache in page-16
+                # SHUFFLE layout (the aiter fused kernel writes plain page-128).
+                minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos_sin_cache,
+                    positions,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.rotary_emb.rotary_dim,
+                    self.q_norm.variance_epsilon,
+                    self.index_q_norm.weight,
+                    self.index_k_norm.weight,
+                    self.num_idx_heads,
+                    sparse_metadata.slot_mapping,
+                    self.kv_cache_k,
+                    self.kv_cache_v,
+                    self.index_cache,
+                    q,
+                    index_q,
+                    self.idx_head_dim,
+                )
+            else:
+                aiter.fused_qknorm_idxrqknorm(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos_sin_cache,
+                    positions,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.rotary_emb.rotary_dim,
+                    self.q_norm.variance_epsilon,
+                    self.index_q_norm.weight,
+                    self.index_k_norm.weight,
+                    self.num_idx_heads,
+                    sparse_metadata.slot_mapping,
+                    self.kv_cache,
+                    self.index_cache,
+                    self.kv_cache.shape[2],
+                    q,
+                    index_q,
+                    sparse_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    None,
+                    None,
+                )
             q = q.view(-1, self.num_heads, self.head_dim)
             index_q = index_q.view(-1, self.num_idx_heads, self.idx_head_dim)
             if getattr(sparse_metadata, "num_prefills", 0) > 0:

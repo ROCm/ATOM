@@ -662,6 +662,29 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             total_kv_blocks = int(
                 ((seq_lens_cpu + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE).sum()
             )
+            # Per-query-token request id + absolute position, built ONCE here on
+            # the CPU (numpy, no device sync) and reused by every sparse layer's
+            # ASM prefill block-table builder. Layer-invariant: depends only on
+            # cu_seqlens_q + prefix lengths. Uses the host cu_seqlens_q mirror to
+            # avoid a D2H copy (a GPU repeat_interleave would force a sync).
+            cu_np = np.asarray(
+                self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
+                dtype=np.int64,
+            )
+            q_lens_np = cu_np[1:] - cu_np[:bs]
+            total_q = int(cu_np[bs])
+            prefix_np = (seq_lens_cpu - q_lens_np).astype(np.int64)
+            req_id_np = np.repeat(np.arange(bs, dtype=np.int32), q_lens_np)
+            abs_pos_np = (
+                prefix_np[req_id_np]
+                + (np.arange(total_q, dtype=np.int64) - cu_np[req_id_np])
+            ).astype(np.int32)
+            dev = attn_metadata.block_tables.device
+            query_req_id = torch.from_numpy(req_id_np).to(dev, non_blocking=True)
+            query_abs_pos = torch.from_numpy(abs_pos_np).to(dev, non_blocking=True)
+            per_token_qo_indptr = torch.arange(
+                total_q + 1, dtype=torch.int32, device=dev
+            )
             prefill = MiniMaxM3SparsePrefillMetadata(
                 cu_seqlens_q=cu_q,
                 cu_seqlens_k=attn_metadata.cu_seqlens_k,
@@ -671,6 +694,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=attn_metadata.max_seqlen_q,
                 max_seq_len=attn_metadata.max_seqlen_k,
                 total_kv_blocks=total_kv_blocks,
+                query_req_id=query_req_id,
+                query_abs_pos=query_abs_pos,
+                per_token_qo_indptr=per_token_qo_indptr,
             )
             attn_metadata.minimax_m3_sparse_metadata = MiniMaxM3SparseMetadata(
                 seq_lens=seq_lens,

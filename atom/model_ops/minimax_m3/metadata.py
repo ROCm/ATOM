@@ -13,6 +13,15 @@ class MiniMaxM3SparsePrefillMetadata:
     max_query_len: int
     max_seq_len: int
     total_kv_blocks: int
+    # Per-query-token request id and absolute position, layer-INVARIANT (depend
+    # only on cu_seqlens_q + prefix_lens). Built ONCE in prepare_prefill and
+    # reused across all sparse layers by the ASM prefill block-table builder, so
+    # the per-layer build needs no host sync. None on the non-ASM path.
+    query_req_id: torch.Tensor | None = None  # [total_q] int32
+    query_abs_pos: torch.Tensor | None = None  # [total_q] int32
+    # Per-token CSR for pa_fwd_asm prefill (each token a length-1 segment):
+    # arange(total_q + 1). Layer-invariant, built once in prepare_prefill.
+    per_token_qo_indptr: torch.Tensor | None = None  # [total_q+1] int32
 
 
 @dataclass
