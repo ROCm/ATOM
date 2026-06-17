@@ -468,6 +468,19 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self.positions = CpuGpuBuffer(max_num_batched_tokens, **i64_kwargs)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
+    @staticmethod
+    def _get_seq_lens_cpu(common_attn_metadata):
+        import vllm.envs as vllm_envs
+
+        if (
+            vllm_envs.VLLM_USE_V2_MODEL_RUNNER is True
+            and hasattr(common_attn_metadata, "seq_lens_cpu_upper_bound")
+            and common_attn_metadata.seq_lens_cpu_upper_bound is not None
+        ):
+            return common_attn_metadata.seq_lens_cpu_upper_bound
+
+        return common_attn_metadata.seq_lens.cpu()
+
     def build(
         self,
         common_prefix_len: int = 0,
@@ -478,6 +491,8 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
             raise ValueError("ATOM does not support cascade attention yet")
 
         from vllm.v1.attention.backends.utils import split_decodes_prefills_and_extends
+
+        seq_lens = self._get_seq_lens_cpu(common_attn_metadata)
 
         # decode_threshold tracks reorder_batch_threshold so MTP/EAGLE
         # multi-token verification (query_len > 1) routes through decode.
@@ -500,10 +515,6 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         decode_only = num_decodes > 0 and num_extends == 0 and num_prefills == 0
         mixed = not (prefill_only or decode_only)
 
-        # common_attn_metadata._seq_lens_cpu is equal to common_attn_metadata.seq_lens.cpu(),
-        # but using seq_lens.cpu() can get the better performance in low concurrency.
-        # seq_lens = common_attn_metadata._seq_lens_cpu
-        seq_lens = common_attn_metadata.seq_lens.cpu()
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
