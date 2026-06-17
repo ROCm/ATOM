@@ -94,7 +94,7 @@ def _can_use_fused_minimax_m3_attention_preproc(
     *weights: torch.Tensor,
 ) -> bool:
     return (
-        hasattr(aiter, "fused_minimax_m3_qknorm_rope_kv_insert")
+        hasattr(aiter, "fused_qknorm_idxrqknorm")
         and qkv.dim() == 2
         and qkv.is_cuda
         and qkv.dtype in (torch.float16, torch.bfloat16)
@@ -416,7 +416,7 @@ class MiniMaxM3Attention(nn.Module):
                 (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
             )
             cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv.dtype)
-            aiter.fused_minimax_m3_qknorm_rope_kv_insert(
+            aiter.fused_qknorm_idxrqknorm(
                 qkv,
                 self.q_norm.weight,
                 self.k_norm.weight,
@@ -700,7 +700,7 @@ class MiniMaxM3SparseAttention(nn.Module):
                 (qkv.shape[0], self.index_q_size), dtype=qkv.dtype, device=qkv.device
             )
             cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv.dtype)
-            aiter.fused_minimax_m3_qknorm_rope_kv_insert(
+            aiter.fused_qknorm_idxrqknorm(
                 qkv,
                 self.q_norm.weight,
                 self.k_norm.weight,
