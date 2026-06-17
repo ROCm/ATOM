@@ -3257,6 +3257,20 @@ class FusedMoE(torch.nn.Module):
                     f"Unsupported scoring function for non-grouped topk: {scoring_func}"
                 )
 
+        # [balance exp] env-gated: force perfectly balanced round-robin routing
+        # over routed experts (ignore accuracy) to isolate load-imbalance from
+        # launch/sync overhead in the EP dispatch/combine path.
+        import os as _os
+
+        if _os.environ.get("MORI_FORCE_BALANCED_ROUTING", "0") == "1":
+            _nt, _k = topk_ids.shape
+            _ne = router_logits.shape[-1]
+            topk_ids = (
+                (torch.arange(_nt * _k, device=topk_ids.device) % _ne)
+                .reshape(_nt, _k)
+                .to(topk_ids.dtype)
+            )
+
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
