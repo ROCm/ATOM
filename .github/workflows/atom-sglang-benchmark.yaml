@@ -6,11 +6,11 @@ concurrency:
 
 on:
   schedule:
-    # Nightly at 23:00 Beijing time (15:00 UTC).
-    - cron: '0 15 * * 1,3'  # Mon/Wed: SGLang-OOB non-MTP DeepSeek configs
-    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB MTP + Qwen + GLM configs
-    - cron: '0 15 * * 5'    # Fri: SGLang-Mesh all configs
-    - cron: '0 15 * * 6'    # Sat: SGLang-OOB all configs
+    # Nightly at 23:00 Beijing time (15:00 UTC; Mesh Fri +30m). OOB tiers + MI308; Fri Mesh (see load-models).
+    - cron: '0 15 * * 1,3,5'  # Mon/Wed/Fri: SGLang-OOB P0 + MI308
+    - cron: '0 15 * * 2,4'    # Tue/Thu: SGLang-OOB P1 + MI308
+    - cron: '0 15 * * 0,6'    # Sun/Sat: SGLang-OOB P2 + MI308
+    - cron: '30 15 * * 5'    # Fri: SGLang-Mesh all (offset from :00 Fri OOB so cron strings differ)
   workflow_dispatch:
     inputs:
       benchmark_suite:
@@ -170,8 +170,8 @@ jobs:
           WORKLOAD_LABEL="${INPUT_WORKLOAD_LABEL:-SGLang-OOB}"
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             case "${SCHEDULE_CRON}" in
-              "0 14 * * 5") WORKLOAD_LABEL="SGLang-Mesh" ;;
-              "0 14 * * 1,3"|"0 14 * * 2,4"|"0 14 * * 6") WORKLOAD_LABEL="SGLang-OOB" ;;
+              "30 15 * * 5") WORKLOAD_LABEL="SGLang-Mesh" ;;
+              "0 15 * * 1,3,5"|"0 15 * * 2,4"|"0 15 * * 0,6") WORKLOAD_LABEL="SGLang-OOB" ;;
               *) WORKLOAD_LABEL="SGLang-OOB" ;;
             esac
           fi
@@ -468,40 +468,78 @@ jobs:
                   return prefix.startswith("glm")
               return prefix == preset
 
-          def is_oob_mtp(model):
-              return matches_workload(model) and "mtp" in str(model.get("prefix", ""))
+          OOB_P0_PREFIX_ORDER = ["glm-5-1-fp8-tp8"]
+          OOB_P1_PREFIX_ORDER = [
+              "deepseek-v3-2-fp8-tp4",
+              "deepseek-v3-2-fp8-tp4-dp4-ep4",
+              "deepseek-v3-2-fp8-tp8",
+              "deepseek-v3-2-fp8-tp8-dp8-ep8",
+          ]
+          OOB_P2_PREFIX_ORDER = [
+              "deepseek-r1-fp8-tp8",
+              "deepseek-r1-fp8-tp4",
+              "deepseek-r1-fp4-tp8",
+              "deepseek-r1-fp4-tp8-ep8",
+              "deepseek-r1-fp4-tp8-dp8-ep8",
+              "deepseek-r1-fp4-tp8-mtp3",
+              "deepseek-r1-fp4-tp8-mtp1",
+              "deepseek-r1-fp4-tp4",
+              "deepseek-r1-fp4-tp4-dp4-ep4",
+              "deepseek-r1-fp4-mtp3-tp4-dp4-ep4",
+              "deepseek-r1-fp4-mtp3-tp8-dp8-ep8",
+              "qwen3-5-397b-a17b-fp8-tp4",
+              "qwen3-5-397b-a17b-fp8-tp8",
+          ]
 
-          def is_oob_qwen(model):
-              return matches_workload(model) and str(model.get("prefix", "")).startswith("qwen")
+          def is_oob_mi308(model):
+              return matches_workload(model) and "mi308" in str(model.get("prefix", ""))
 
-          def is_oob_glm(model):
-              return matches_workload(model) and str(model.get("prefix", "")).startswith("glm")
+          def first_model_by_prefix(candidates):
+              """Catalog may list the same prefix twice; keep first occurrence order."""
+              by_prefix = {}
+              for model in candidates:
+                  if not matches_workload(model):
+                      continue
+                  prefix = str(model.get("prefix", ""))
+                  if prefix not in by_prefix:
+                      by_prefix[prefix] = model
+              return by_prefix
 
-          def is_oob_non_mtp_deepseek(model):
-              prefix = str(model.get("prefix", ""))
-              return matches_workload(model) and prefix.startswith("deepseek-") and "mtp" not in prefix
+          def scheduled_oob_selection(schedule_cron):
+              schedule_to_tier = {
+                  "0 15 * * 1,3,5": ("OOB-P0", OOB_P0_PREFIX_ORDER),
+                  "0 15 * * 2,4": ("OOB-P1", OOB_P1_PREFIX_ORDER),
+                  "0 15 * * 0,6": ("OOB-P2", OOB_P2_PREFIX_ORDER),
+              }
+              if schedule_cron not in schedule_to_tier:
+                  return "SKIP-UNKNOWN-DAY", []
+              selected_group, tier_order = schedule_to_tier[schedule_cron]
+              by_prefix = first_model_by_prefix(models)
+              tier_prefixes = frozenset(tier_order)
+              selected = []
+              for prefix in tier_order:
+                  model = by_prefix.get(prefix)
+                  if model is not None:
+                      selected.append(model)
+              for prefix in sorted(by_prefix):
+                  if prefix in tier_prefixes:
+                      continue
+                  model = by_prefix[prefix]
+                  if is_oob_mi308(model):
+                      selected.append(model)
+              return selected_group, selected
 
           if event == "schedule":
               schedule_cron = os.environ.get("SCHEDULE_CRON", "")
-              if schedule_cron == "0 14 * * 1,3":
-                  selected_group = "OOB-NON-MTP-DEEPSEEK"
-                  selected = [m for m in models if is_oob_non_mtp_deepseek(m)]
-              elif schedule_cron == "0 14 * * 2,4":
-                  selected_group = "OOB-MTP-QWEN-GLM"
-                  selected = [m for m in models if is_oob_mtp(m) or is_oob_qwen(m) or is_oob_glm(m)]
-              elif schedule_cron == "0 14 * * 5":
+              if schedule_cron == "30 15 * * 5":
                   selected_group = "MESH-ALL"
                   selected = [
                       m
                       for m in models
                       if matches_workload(m) and has_mesh_preset(m, "all")
                   ]
-              elif schedule_cron == "0 14 * * 6":
-                  selected_group = "OOB-ALL"
-                  selected = [m for m in models if matches_workload(m)]
               else:
-                  selected_group = "SKIP-UNKNOWN-DAY"
-                  selected = []
+                  selected_group, selected = scheduled_oob_selection(schedule_cron)
           else:
               if workload_label == "SGLang-Mesh":
                   mesh_preset = normalize_mesh_preset(os.environ.get("MESH_CONFIG_PRESET"))
