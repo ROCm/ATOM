@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from types import MethodType
 from typing import Optional
 
 import torch
@@ -54,6 +55,39 @@ def _use_rtp_sparse_attn_indexer(indexer: object | None) -> None:
         return
     __import__("atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend")
     indexer.sparse_attn_indexer_impl = torch.ops.aiter.rtp_sparse_attn_indexer
+    if getattr(indexer, "_atom_rtp_topk_buffer_patched", False) or not hasattr(
+        indexer, "forward"
+    ):
+        return
+    original_forward = indexer.forward
+
+    def _forward_with_topk_buffer(self, hidden_states, *args, **kwargs):
+        num_tokens = int(hidden_states.shape[0])
+        topk_tokens = getattr(self, "topk_tokens", None)
+        if topk_tokens is None:
+            topk_tokens = getattr(self, "index_topk")
+        topk_tokens = int(topk_tokens)
+        buffer = getattr(self, "topk_indices_buffer", None)
+        needs_new_buffer = (
+            buffer is None
+            or buffer.dim() != 2
+            or buffer.device != hidden_states.device
+            or int(buffer.shape[0]) < num_tokens
+            or int(buffer.shape[1]) < topk_tokens
+        )
+        if needs_new_buffer:
+            buffer = torch.empty(
+                num_tokens,
+                topk_tokens,
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            self.topk_indices_buffer = buffer
+        self.sparse_kv_indices_buffer = self.topk_indices_buffer
+        return original_forward(hidden_states, *args, **kwargs)
+
+    indexer.forward = MethodType(_forward_with_topk_buffer, indexer)
+    indexer._atom_rtp_topk_buffer_patched = True
 
 
 class RTPMLAAttention:
@@ -200,7 +234,19 @@ class RTPMLAAttention:
 def apply_attention_mla_rtpllm_patch() -> None:
     """Switch ATOM's generic Attention symbol to the RTP MLA adapter."""
 
+    import sys
+
     import atom.model_ops as ops
+    import atom.model_ops.base_attention as base_attention
 
     ops.RTPMLAAttention = RTPMLAAttention
     ops.Attention = RTPMLAAttention
+    base_attention.Attention = RTPMLAAttention
+
+    deepseek_v2 = sys.modules.get("atom.models.deepseek_v2")
+    if deepseek_v2 is None:
+        try:
+            import atom.models.deepseek_v2 as deepseek_v2
+        except (ImportError, ModuleNotFoundError):
+            return
+    deepseek_v2.Attention = RTPMLAAttention

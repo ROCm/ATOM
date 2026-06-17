@@ -1,4 +1,3 @@
-from .rtp_full_attention import AttentionForRTPLLM, RTPFullAttention
 from .rtp_mla_attention import RTPMLAAttention, apply_attention_mla_rtpllm_patch
 from .rtp_mla_metadata import (
     GLM5_RTP_BRIDGE_MODE,
@@ -10,12 +9,18 @@ from .rtp_sparse_mla_backend import RTPSparseMlaBackend
 
 
 def __getattr__(name):
-    if name in {"RTPAttention", "RTPFullAttention"}:
-        from .rtp_full_attention import RTPAttention, RTPFullAttention
+    if name == "AttentionForRTPLLM":
+        from .rtp_full_attention import AttentionForRTPLLM
 
-        return {"RTPAttention": RTPAttention, "RTPFullAttention": RTPFullAttention}[
-            name
-        ]
+        return AttentionForRTPLLM
+    if name == "RTPFullAttention":
+        from .rtp_full_attention import RTPFullAttention
+
+        return RTPFullAttention
+    if name == "RTPAttention":
+        from .rtp_full_attention import RTPFullAttention
+
+        return RTPFullAttention
     if name == "apply_attention_gdn_rtpllm_patch":
         from .attention_gdn import apply_attention_gdn_rtpllm_patch
 

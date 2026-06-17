@@ -158,6 +158,43 @@ def test_constructor_swaps_indexer_to_rtp_sparse_indexer_op(monkeypatch):
     assert indexer.sparse_attn_indexer_impl is rtp_op
 
 
+def test_constructor_patches_indexer_forward_to_own_topk_buffer(monkeypatch):
+    default_op = object()
+    rtp_op = object()
+    monkeypatch.setattr(
+        torch.ops.aiter, "rtp_sparse_attn_indexer", rtp_op, raising=False
+    )
+
+    class _ForwardIndexer:
+        def __init__(self):
+            self.topk_tokens = 4
+            self.sparse_attn_indexer_impl = default_op
+            self.sparse_kv_indices_buffer = torch.empty(0, dtype=torch.int32)
+            self.seen_sparse_buffer = None
+
+        def forward(self, hidden_states):
+            self.seen_sparse_buffer = self.sparse_kv_indices_buffer
+            return hidden_states
+
+    indexer = _ForwardIndexer()
+    modules = SimpleNamespace(
+        q_proj=object(),
+        o_proj=object(),
+        kv_b_proj=object(),
+        indexer=indexer,
+        v_head_dim=3,
+    )
+
+    RTPMLAAttention(mla_modules=modules, sparse_backend=object())
+    hidden_states = torch.empty(2, 8)
+    indexer.forward(hidden_states)
+
+    assert indexer.sparse_attn_indexer_impl is rtp_op
+    assert indexer.topk_indices_buffer.shape == (2, 4)
+    assert indexer.topk_indices_buffer.dtype == torch.int32
+    assert indexer.seen_sparse_buffer is indexer.topk_indices_buffer
+
+
 def _run_attention(attention, token_count: int):
     query = torch.empty(token_count, 6)
     compressed_kv = torch.empty(token_count, 8)

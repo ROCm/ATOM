@@ -18,8 +18,18 @@ except (ImportError, ModuleNotFoundError):
 
 from atom.config import KVCacheTensor, get_current_atom_config
 from atom.model_ops.attention_gdn import GatedDeltaNet
-from atom.model_ops.attention_mha import PagedAttentionImpl
-from atom.model_ops.paged_attention import Attention as PagedAttention
+
+try:
+    from atom.model_ops.attention_mha import PagedAttentionImpl
+except (ImportError, ModuleNotFoundError):
+    PagedAttentionImpl = type("PagedAttentionImpl", (), {})
+try:
+    from atom.model_ops.paged_attention import Attention as PagedAttention
+except (ImportError, ModuleNotFoundError):
+    try:
+        from atom.model_ops.paged_attention import PagedAttention
+    except (ImportError, ModuleNotFoundError):
+        PagedAttention = type("PagedAttention", (), {})
 from atom.model_ops.attentions.gdn_attn import (
     GDNAttentionMetadata,
     compute_causal_conv1d_metadata,
@@ -1008,6 +1018,29 @@ class RTPForwardContext:
         return out_view
 
     @classmethod
+    def _build_indexer_block_tables(
+        cls,
+        *,
+        block_table_i32: torch.Tensor,
+        seq_size_per_block: int,
+        kernel_seq_size_per_block: int,
+        cg_max_seq_len: int,
+        in_capture: bool,
+        cg_bufs: dict | None,
+    ) -> torch.Tensor:
+        del (
+            cls,
+            seq_size_per_block,
+            kernel_seq_size_per_block,
+            cg_max_seq_len,
+            in_capture,
+            cg_bufs,
+        )
+        # Base path (e.g. Qwen3.5): keep compact physical table layout and do not
+        # expand to indexer granularity.
+        return block_table_i32
+
+    @classmethod
     def _resolve_plugin_block_table(
         cls,
         *,
@@ -1603,7 +1636,6 @@ class RTPForwardContext:
             context=context,
             num_tokens=int(positions.numel()),
             mla_layer_map=cls._resolve_mla_layer_map(resolved_layer_maps),
-            use_rtp_indexer_cache=cls._use_rtp_indexer_cache(),
         )
 
     @staticmethod
@@ -1669,6 +1701,11 @@ class RTPForwardContext:
             f"(shape={tuple(kv_scale_base.shape)}, block_size={block_size}, "
             f"allowed_last_dims={sorted(allowed_dims)})."
         )
+
+    @classmethod
+    def _resolve_mla_layer_map(cls, layer_maps: LayerMaps) -> Dict[int, Any]:
+        del cls, layer_maps
+        return {}
 
     @staticmethod
     def _build_fallback_indexer_cache(

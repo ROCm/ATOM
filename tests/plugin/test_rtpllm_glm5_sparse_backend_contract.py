@@ -83,6 +83,72 @@ def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
     assert calls[0][6:12] == (128, None, 2048, 64, 4096, 1)
 
 
+def test_rtp_sparse_attn_indexer_uses_rtp_topk_path_when_context_exists(monkeypatch):
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    fake_forward_context = SimpleNamespace(
+        context=SimpleNamespace(is_prefill=False, is_dummy_run=False, batch_size=1),
+        attn_metadata=SimpleNamespace(max_seqlen_q=1),
+    )
+    monkeypatch.setattr(
+        forward_context_mod,
+        "get_forward_context",
+        lambda: fake_forward_context,
+        raising=False,
+    )
+
+    def _unexpected_call(*args, **kwargs):
+        raise AssertionError("RTP context path must not call deepseek sparse indexer")
+
+    fake_deepseek = type(sys)("atom.models.deepseek_v2")
+    fake_deepseek.sparse_attn_indexer = _unexpected_call
+    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
+
+    expected = torch.empty(1)
+    calls = []
+
+    def _fake_topk_only(*args):
+        calls.append(args)
+        return expected
+
+    monkeypatch.setattr(
+        module, "_run_rtp_sparse_attn_indexer_topk_only", _fake_topk_only
+    )
+    tensor = torch.empty(1)
+
+    output = module.rtp_sparse_attn_indexer(
+        tensor,
+        "indexer.prefix",
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        128,
+        None,
+        2048,
+        64,
+        4096,
+        1,
+        torch.empty(1, 2048, dtype=torch.int32),
+        tensor,
+        tensor,
+        1e-6,
+        tensor,
+        tensor,
+        tensor,
+        1.0,
+        True,
+        False,
+    )
+
+    assert output is expected
+    assert len(calls) == 1
+    assert calls[0][-2:] == (
+        fake_forward_context.context,
+        fake_forward_context.attn_metadata,
+    )
+
+
 def test_rtp_sparse_attn_indexer_fake_bridge_forwards_to_main_fake(monkeypatch):
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
     calls = []
@@ -630,6 +696,23 @@ def test_real_sparse_cache_dtype_uses_aiter_fp8_layout():
 
     assert impl._cache_dtype_name(torch.empty(1, 576, dtype=torch.uint8)) == "fp8"
     assert impl._cache_dtype_name(torch.empty(1, 576, dtype=torch.bfloat16)) == "auto"
+
+
+def test_sparse_index_converter_resolves_current_refactored_path(monkeypatch):
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    old_module_name = "atom.plugin.attention_mla_sparse"
+    new_module_name = "atom.plugin.vllm.attention.layer_sparse_mla"
+    monkeypatch.delitem(sys.modules, old_module_name, raising=False)
+
+    fake_new_helpers = type(sys)(new_module_name)
+
+    def fake_convert():
+        return None
+
+    fake_new_helpers.triton_convert_req_index_to_global_index = fake_convert
+    monkeypatch.setitem(sys.modules, new_module_name, fake_new_helpers)
+
+    assert module._resolve_plugin_sparse_index_converter() is fake_convert
 
 
 def test_real_sparse_eager_metadata_workspace_skips_refill(monkeypatch):

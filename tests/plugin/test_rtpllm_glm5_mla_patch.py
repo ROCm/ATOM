@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 _ATOM_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -21,3 +20,31 @@ def test_glm5_wrapper_does_not_import_or_call_deepseek_mla_patch():
 
     assert "apply_deepseek_mla_rtpllm_patch" not in source
 
+
+def test_rtp_mla_patch_updates_deepseek_attention_symbol(monkeypatch):
+    import sys
+    import types
+
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import (
+        RTPMLAAttention,
+        apply_attention_mla_rtpllm_patch,
+    )
+
+    sentinel = object()
+    fake_ops = types.ModuleType("atom.model_ops")
+    fake_ops.Attention = sentinel
+    fake_base_attention = types.ModuleType("atom.model_ops.base_attention")
+    fake_base_attention.Attention = sentinel
+    fake_deepseek = types.ModuleType("atom.models.deepseek_v2")
+    fake_deepseek.Attention = sentinel
+    monkeypatch.setitem(sys.modules, "atom.model_ops", fake_ops)
+    monkeypatch.setitem(
+        sys.modules, "atom.model_ops.base_attention", fake_base_attention
+    )
+    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
+
+    apply_attention_mla_rtpllm_patch()
+
+    assert fake_ops.Attention is RTPMLAAttention
+    assert fake_base_attention.Attention is RTPMLAAttention
+    assert fake_deepseek.Attention is RTPMLAAttention

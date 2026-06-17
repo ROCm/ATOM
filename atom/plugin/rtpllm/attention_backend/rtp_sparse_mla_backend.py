@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import os
 from dataclasses import dataclass
@@ -14,6 +15,25 @@ from atom.utils.custom_register import direct_register_custom_op
 
 class _SparseUnavailable(RuntimeError):
     pass
+
+
+def _resolve_plugin_sparse_index_converter():
+    """Resolve the plugin-style request-local topk to global KV index converter."""
+    errors: list[str] = []
+    for module_name in (
+        # Old GLM5 RTP branch location.
+        "atom.plugin.attention_mla_sparse",
+        # Current refactored plugin location with the same call contract.
+        "atom.plugin.vllm.attention.layer_sparse_mla",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+            return getattr(module, "triton_convert_req_index_to_global_index")
+        except Exception as exc:
+            errors.append(f"{module_name}: {exc}")
+    raise _SparseUnavailable(
+        "plugin sparse MLA index converter unavailable; " + "; ".join(errors)
+    )
 
 
 @dataclass
@@ -751,8 +771,9 @@ class _RealSparseMlaImpl:
     ) -> _AtomSparseMetadata:
         try:
             from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
-            from atom.plugin.attention_mla_sparse import (
-                triton_convert_req_index_to_global_index,
+
+            triton_convert_req_index_to_global_index = (
+                _resolve_plugin_sparse_index_converter()
             )
         except Exception as exc:
             raise _SparseUnavailable(
@@ -1487,6 +1508,8 @@ class RTPSparseMlaBackend:
             return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
 
         if topk_indices is None:
+            if self._default_mock:
+                return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
             raise _SparseUnavailable(
                 "GLM5 RTP sparse MLA requires topk_indices; refusing dense fallback."
             )
@@ -1518,6 +1541,211 @@ class RTPSparseMlaBackend:
                 "GLM5 RTP sparse MLA unavailable; dense fallback is disabled. "
                 f"root_cause={exc}"
             ) from exc
+
+
+def _run_rtp_sparse_attn_indexer_topk_only(
+    hidden_states: torch.Tensor,
+    kv_cache: torch.Tensor,
+    q_input: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: Optional[str],
+    topk_tokens: int,
+    head_dim: int,
+    max_model_len: int,
+    total_seq_lens: int,
+    topk_indices_buffer: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    k_norm_eps: float,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    weights_scale: float,
+    is_neox_style: bool,
+    use_qk_rope_cache_fusion: bool,
+    context: Any,
+    attn_metadata: Any,
+) -> torch.Tensor:
+    from aiter import (
+        cp_gather_indexer_k_quant_cache,
+        dtypes,
+        indexer_k_quant_and_cache,
+        indexer_qk_rope_quant_and_cache,
+        top_k_per_row_decode,
+        top_k_per_row_prefill,
+    )
+    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+    from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+    from atom.config import get_current_atom_config
+
+    slot_mapping = getattr(attn_metadata, "slot_mapping", None)
+    if slot_mapping is None:
+        raise _SparseUnavailable("RTP sparse indexer requires slot_mapping metadata.")
+    if topk_indices_buffer is None:
+        raise _SparseUnavailable("RTP sparse indexer requires topk_indices_buffer.")
+    if topk_indices_buffer.dim() != 2:
+        raise _SparseUnavailable(
+            "RTP sparse indexer requires a 2D topk_indices_buffer; "
+            f"got shape={tuple(topk_indices_buffer.shape)}."
+        )
+
+    if bool(getattr(context, "is_dummy_run", False)):
+        return torch.zeros_like(weights, dtype=torch.float32)
+
+    num_tokens = int(hidden_states.shape[0])
+    if num_tokens <= 0:
+        return weights
+    topk_indices = topk_indices_buffer[:num_tokens, :topk_tokens]
+    if topk_indices.dtype != torch.int32:
+        raise _SparseUnavailable(
+            f"RTP sparse indexer topk buffer must be int32, got {topk_indices.dtype}."
+        )
+
+    runner_block_size = int(get_current_atom_config().kv_cache_block_size)
+    kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
+
+    if use_qk_rope_cache_fusion:
+        q_bf16 = q_input
+        q_fp8 = torch.empty_like(q_bf16, dtype=dtypes.fp8)
+        weights_out = torch.empty(
+            weights.shape, device=weights.device, dtype=torch.float32
+        )
+        indexer_qk_rope_quant_and_cache(
+            q_bf16,
+            q_fp8,
+            weights,
+            weights_out,
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            quant_block_size,
+            scale_fmt,
+            weights_scale,
+            preshuffle=True,
+            is_neox=is_neox_style,
+        )
+        weights = weights_out
+    else:
+        q_fp8 = q_input
+        indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+            preshuffle=True,
+        )
+
+    is_prefill = bool(getattr(context, "is_prefill", False))
+    max_seqlen_k = int(getattr(attn_metadata, "max_seqlen_k", 0) or 0)
+    if is_prefill and max_seqlen_k <= int(topk_tokens):
+        return weights
+
+    if is_prefill:
+        total_seq_lens = int(hidden_states.shape[0])
+        has_cached = bool(getattr(attn_metadata, "has_cached", False))
+        total_kv = (
+            int(getattr(attn_metadata, "total_kv", total_seq_lens))
+            if has_cached
+            else total_seq_lens
+        )
+        k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
+        k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
+        block_tables = getattr(attn_metadata, "block_tables", None)
+        cu_seqlens_q = getattr(attn_metadata, "cu_seqlens_q", None)
+        if block_tables is None or cu_seqlens_q is None:
+            raise _SparseUnavailable(
+                "RTP sparse prefill indexer requires block_tables and cu_seqlens_q."
+            )
+        cu_seqlens_k = (
+            getattr(attn_metadata, "cu_seqlens_k", None) if has_cached else cu_seqlens_q
+        )
+        if cu_seqlens_k is None:
+            raise _SparseUnavailable(
+                "RTP sparse prefill indexer requires cu_seqlens_k."
+            )
+        cp_gather_indexer_k_quant_cache(
+            kv_cache,
+            k_fp8,
+            k_scale.view(dtypes.fp8),
+            block_tables,
+            cu_seqlens_k,
+            preshuffle=True,
+        )
+        cu_seqlen_ks = getattr(attn_metadata, "cu_seqlen_ks", None)
+        cu_seqlen_ke = getattr(attn_metadata, "cu_seqlen_ke", None)
+        if cu_seqlen_ks is None or cu_seqlen_ke is None:
+            raise _SparseUnavailable(
+                "RTP sparse prefill indexer requires cu_seqlen_ks/cu_seqlen_ke."
+            )
+        num_decode_tokens = 0
+        logits = fp8_mqa_logits(
+            Q=q_fp8[num_decode_tokens:num_tokens],
+            KV=k_fp8,
+            kv_scales=k_scale,
+            weights=weights[num_decode_tokens:num_tokens],
+            cu_starts=cu_seqlen_ks,
+            cu_ends=cu_seqlen_ke,
+        )
+        top_k_per_row_prefill(
+            logits=logits,
+            rowStarts=cu_seqlen_ks,
+            rowEnds=cu_seqlen_ke,
+            indices=topk_indices[num_decode_tokens:num_tokens, :topk_tokens],
+            values=None,
+            numRows=logits.shape[0],
+            stride0=logits.stride(0),
+            stride1=logits.stride(1),
+        )
+        return weights
+
+    max_seqlen_q = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
+    num_decode_tokens = int(context.batch_size) * max_seqlen_q
+    kv_cache_for_logits = kv_cache.unsqueeze(-2)
+    padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
+        int(context.batch_size), -1, *q_fp8.shape[1:]
+    )
+    batch_size, next_n, _heads, _dim = padded_q_fp8_decode_tokens.shape
+    logits = torch.empty(
+        [batch_size * next_n, int(max_model_len)],
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    context_lens = getattr(attn_metadata, "context_lens", None)
+    block_tables = getattr(attn_metadata, "block_tables", None)
+    if context_lens is None or block_tables is None:
+        raise _SparseUnavailable(
+            "RTP sparse decode indexer requires context_lens and block_tables."
+        )
+    deepgemm_fp8_paged_mqa_logits(
+        padded_q_fp8_decode_tokens,
+        kv_cache_for_logits,
+        weights[:num_decode_tokens],
+        logits,
+        context_lens,
+        block_tables,
+        int(max_model_len),
+        KVBlockSize=runner_block_size,
+        Preshuffle=True,
+    )
+    top_k_per_row_decode(
+        logits,
+        next_n,
+        context_lens,
+        topk_indices[:num_decode_tokens, :topk_tokens],
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+    )
+    return weights
 
 
 def rtp_sparse_attn_indexer(
@@ -1559,6 +1787,7 @@ def rtp_sparse_attn_indexer(
         and bool(getattr(context, "is_prefill", False))
         and attn_metadata is not None
         and topk_indices_buffer is not None
+        and topk_indices_buffer.dim() == 2
         and positions is not None
     ):
         max_seqlen_k = int(getattr(attn_metadata, "max_seqlen_k", 0) or 0)
@@ -1589,6 +1818,33 @@ def rtp_sparse_attn_indexer(
                 )
                 topk_indices_buffer[:num_tokens, :topk_tokens].copy_(causal_topk)
             return weights
+
+    if context is not None and attn_metadata is not None:
+        return _run_rtp_sparse_attn_indexer_topk_only(
+            hidden_states,
+            kv_cache,
+            q_input,
+            k,
+            weights,
+            quant_block_size,
+            scale_fmt,
+            topk_tokens,
+            head_dim,
+            max_model_len,
+            total_seq_lens,
+            topk_indices_buffer,
+            k_norm_weight,
+            k_norm_bias,
+            k_norm_eps,
+            positions,
+            cos_cache,
+            sin_cache,
+            weights_scale,
+            is_neox_style,
+            use_qk_rope_cache_fusion,
+            context,
+            attn_metadata,
+        )
 
     from atom.models.deepseek_v2 import sparse_attn_indexer
 

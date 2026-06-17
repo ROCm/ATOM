@@ -720,6 +720,10 @@ class ATOMGlm5Moe(DeepSeekV2):
         import atom
         from atom.model_loader.loader import load_model_in_plugin_mode
 
+        prepare_model = getattr(atom, "prepare_model", None)
+        if prepare_model is None:
+            from atom.plugin.prepare import prepare_model
+
         target_device = torch.device(
             self.device if getattr(self, "device", None) else "cuda"
         )
@@ -740,7 +744,7 @@ class ATOMGlm5Moe(DeepSeekV2):
             torch.set_default_dtype(target_dtype)
 
         try:
-            atom_model = atom.prepare_model(config=self, engine="rtpllm")
+            atom_model = prepare_model(config=self, engine="rtpllm")
             if atom_model is None:
                 raise ValueError("ATOM failed to create GLM5 model for rtp-llm plugin")
 
