@@ -1,5 +1,3 @@
-from collections.abc import Iterable
-
 import numpy as np
 import torch
 from torch import nn
@@ -11,10 +9,13 @@ from atom.model_ops.utils import atom_parameter
 from atom.utils.decorators import support_torch_compile
 
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
-from atom.model_config.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
+from atom.model_config.qwen3_5 import (
+    Qwen3_5Config,  # noqa: F401
+    Qwen3_5TextConfig,
+)
 
 from atom.model_config.qwen3_5_moe import (
-    Qwen3_5MoeConfig,
+    Qwen3_5MoeConfig,  # noqa: F401
     Qwen3_5MoeTextConfig,
 )
 from atom.model_ops.moe import FusedMoE
