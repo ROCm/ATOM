@@ -57,10 +57,13 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
+
+ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -817,9 +820,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = GemmaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+        )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
     def forward(
@@ -882,7 +891,11 @@ class MiniMaxM3Model(nn.Module):
         )
 
         if get_pp_group().is_last_rank:
-            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = GemmaRMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            )
         else:
             self.norm = PPMissingLayer()
 

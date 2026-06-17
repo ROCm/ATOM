@@ -619,17 +619,27 @@ class GemmaRMSNorm(nn.Module):
         eps: float = 1e-6,
         quant_config: LayerQuantConfig | None = None,
         write_bf16: bool = False,
+        fused_allreduce: bool = False,
     ) -> None:
         super().__init__()
         self.weight = atom_parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
         self.use_fused_quant = False
         self.write_bf16 = write_bf16
+        self.fused_allreduce = fused_allreduce
+        if fused_allreduce:
+            self.register_buffer(
+                "effective_weight", torch.empty(0), persistent=False
+            )
         if quant_config is not None:
             from aiter import QuantType
 
             if quant_config.quant_type == QuantType.per_1x128:
                 self.use_fused_quant = True
+
+    def process_weights_after_loading(self) -> None:
+        if self.fused_allreduce:
+            self.effective_weight = self.weight.detach() + 1.0
 
     @staticmethod
     def forward_static(
@@ -689,7 +699,7 @@ class GemmaRMSNorm(nn.Module):
 
         fused_qk_rmsnorm_group_quant(
             q=x_2d,
-            q_weight=self.weight.data,
+            q_weight=self.weight,
             q_epsilon=self.variance_epsilon,
             q_out_unquantized=out,
             q_res_out=res_out,
@@ -756,6 +766,24 @@ class GemmaRMSNorm(nn.Module):
             return self._forward_fused_fp8(x, residual)
         return self.forward_cuda(x, residual)
 
+    def forward_fused_allreduce(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert (
+            self.fused_allreduce
+        ), "fused allreduce is not enabled for this GemmaRMSNorm"
+        assert (
+            self.effective_weight.numel() == self.weight.numel()
+        ), "GemmaRMSNorm effective_weight must be initialized after loading"
+        return tensor_model_parallel_fused_allreduce_rmsnorm(
+            x.contiguous(),
+            residual,
+            self.effective_weight,
+            self.variance_epsilon,
+        )
+
 
 def fused_allreduce_gemma_rms_norm(
     hidden_states: torch.Tensor,
@@ -764,6 +792,8 @@ def fused_allreduce_gemma_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm."""
     if get_tensor_model_parallel_world_size() > 1:
+        if norm.fused_allreduce:
+            return norm.forward_fused_allreduce(hidden_states, residual)
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
     return norm(hidden_states, residual)
 
