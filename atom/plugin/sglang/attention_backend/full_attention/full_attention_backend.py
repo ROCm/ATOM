@@ -11,6 +11,8 @@ from __future__ import annotations
 # be handled by ATOM's native backend, making sglang-specific overrides
 # unnecessary.
 
+import math
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -157,6 +159,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         k_buffer, _ = model_runner.token_to_kv_pool.get_kv_buffer(first_full_attn_id)
         num_slots, num_kv_heads, _ = k_buffer.shape
+        cu_num = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.prefill_ps_num_kv_splits = cu_num // math.gcd(
+            getattr(self, "num_kv_head", num_kv_heads), cu_num
+        )
         block_size = self.page_size
         num_blocks = num_slots // block_size
         max_total_tokens = num_blocks * block_size
@@ -167,6 +173,92 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             num_kv_heads, max_total_tokens, dtype=torch.float32, device=self.device
         )
         self.decode_using_pa_ps = self.page_size == 1024
+        self._mtp_debug_counts: dict[tuple[int, int, str], int] = {}
+
+    def _debug_mtp_tensor(self, name: str, tensor: Optional[torch.Tensor]) -> str:
+        if tensor is None:
+            return f"{name}=None"
+        flat = tensor.detach().flatten()
+        if flat.numel() == 0:
+            return f"{name}=empty shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+        sample = flat[: min(6, flat.numel())].to(torch.float32).cpu().tolist()
+        stats_tensor = flat.to(torch.float32)
+        return (
+            f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"min={float(stats_tensor.min().item()):.6g} "
+            f"max={float(stats_tensor.max().item()):.6g} "
+            f"mean={float(stats_tensor.mean().item()):.6g} "
+            f"sample={sample}"
+        )
+
+    def _debug_mtp_target_verify(
+        self,
+        tag: str,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        q: Optional[torch.Tensor] = None,
+        o: Optional[torch.Tensor] = None,
+    ) -> None:
+        if os.getenv("ATOM_DEBUG_MTP_VERIFY", "0") != "1":
+            return
+        rank = -1
+        try:
+            from sglang.srt.distributed import get_tp_group
+
+            rank = int(get_tp_group().rank_in_group)
+        except Exception:
+            rank = int(os.getenv("RANK", "-1"))
+        debug_ranks = {
+            int(x)
+            for x in os.getenv("ATOM_DEBUG_MTP_VERIFY_RANKS", "0").split(",")
+            if x.strip()
+        }
+        if rank not in debug_ranks:
+            return
+        bs = int(forward_batch.batch_size)
+        debug_bs = {
+            int(x)
+            for x in os.getenv("ATOM_DEBUG_MTP_VERIFY_BS", "63,64").split(",")
+            if x.strip()
+        }
+        if bs not in debug_bs:
+            return
+        layer_id = int(getattr(layer, "layer_id", -1))
+        debug_layers = {
+            int(x)
+            for x in os.getenv("ATOM_DEBUG_MTP_VERIFY_LAYERS", "0,1,60").split(",")
+            if x.strip()
+        }
+        if layer_id not in debug_layers:
+            return
+        key = (bs, layer_id, tag)
+        max_hits = int(os.getenv("ATOM_DEBUG_MTP_VERIFY_MAX_HITS", "4"))
+        hits = self._mtp_debug_counts.get(key, 0)
+        if hits >= max_hits:
+            return
+        self._mtp_debug_counts[key] = hits + 1
+
+        md = self.forward_metadata
+        spec_info = getattr(forward_batch, "spec_info", None)
+        draft_num = getattr(spec_info, "draft_token_num", None)
+        pieces = [
+            f"[ATOM_MTP_DEBUG] tag={tag} hit={hits + 1} rank={rank} layer={layer_id} bs={bs}",
+            f"mode={forward_batch.forward_mode}",
+            f"draft_num={draft_num}",
+            f"max_q_len={getattr(md, 'max_q_len', None)}",
+            f"num_kv_splits={getattr(md, 'num_kv_splits', None)}",
+            f"kv_indices_len={None if md.kv_indices is None else md.kv_indices.numel()}",
+            f"work_metadata_shape={None if md.work_metadata is None else tuple(md.work_metadata.shape)}",
+            self._debug_mtp_tensor("seq_lens", forward_batch.seq_lens[:bs]),
+            self._debug_mtp_tensor("req_pool", forward_batch.req_pool_indices[:bs]),
+            self._debug_mtp_tensor("out_cache_loc", getattr(forward_batch, "out_cache_loc", None)),
+            self._debug_mtp_tensor("qo_indptr", md.qo_indptr[: bs + 1] if md.qo_indptr is not None else None),
+            self._debug_mtp_tensor("kv_indptr", md.kv_indptr[: bs + 1] if md.kv_indptr is not None else None),
+            self._debug_mtp_tensor("kv_last_page_len", md.kv_last_page_len[:bs] if md.kv_last_page_len is not None else None),
+            self._debug_mtp_tensor("q", q),
+            self._debug_mtp_tensor("o", o),
+        ]
+        print(" | ".join(pieces), flush=True)
 
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:
         """Largest q length used by MLA CUDA graph speculative paths."""
@@ -350,8 +442,14 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
         elif forward_batch.extend_seq_lens is not None:
             max_q_len = int(forward_batch.extend_seq_lens.max().item())
-        elif getattr(spec_info, "accept_length", None) is not None:
-            max_q_len = int(spec_info.accept_length.max().item())
+        elif (
+            getattr(spec_info, "accept_length", None) is not None
+            or getattr(spec_info, "num_accept_tokens", None) is not None
+        ):
+            accept_lens = getattr(spec_info, "accept_length", None)
+            if accept_lens is None:
+                accept_lens = spec_info.num_accept_tokens
+            max_q_len = int(accept_lens.max().item())
         else:
             raise RuntimeError("MLA draft_extend is missing extend sequence lengths")
 
@@ -621,6 +719,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         reduce_indptr = None
         reduce_final_map = None
         reduce_partial_map = None
+        num_kv_splits = None
         fp8_prefill_kv_indices = None
 
         from sglang.srt.utils import is_gfx95_supported
@@ -630,6 +729,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             and is_gfx95_supported()
         )
         if _use_fp8_prefill_attn:
+            num_kv_splits = self.prefill_ps_num_kv_splits
             tile_q = 256
             qlen_granularity = tile_q // (self.num_head // self.num_kv_head)
             (
@@ -674,6 +774,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            num_kv_splits=num_kv_splits,
             fp8_prefill_kv_indices=fp8_prefill_kv_indices,
         )
 
@@ -1445,7 +1546,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         elif forward_mode.is_draft_extend():
             num_tokens_per_bs = self.speculative_num_steps + 1
             seq_lens = seq_lens[:bs]
-            accept_lens = spec_info.accept_length[:bs]
+            accept_lens = getattr(spec_info, "accept_length", None)
+            if accept_lens is None:
+                accept_lens = spec_info.num_accept_tokens
+            accept_lens = accept_lens[:bs]
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
             kv_indptr = self.kv_indptr[: bs + 1]
@@ -2084,6 +2188,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             md.reduce_final_map,
             md.reduce_partial_map,
             tile_q,
+            md.num_kv_splits,
             output,
             final_lse,
         )
@@ -2278,7 +2383,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                 dtype=self.input_dtype,
             )
+            self._debug_mtp_target_verify("before_mla_decode", layer, forward_batch, q=q)
             self._call_mla_decode_fwd(q, K_Buffer, o, layer)
+            self._debug_mtp_target_verify(
+                "after_mla_decode", layer, forward_batch, q=q, o=o
+            )
             return o
 
         if forward_batch.forward_mode.is_draft_extend(include_v2=True):
