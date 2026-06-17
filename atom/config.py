@@ -525,7 +525,10 @@ class QuantizationConfig:
             for packed_key, packed_value in self.packed_modules_mapping.items():
                 # for self_attn.up_proj and self_attn.gate_up_proj
                 # up_proj in gate_up_proj, so add prefix .
-                if f".{packed_key}" in name:
+                match_key = (
+                    packed_key if packed_key.startswith(".") else f".{packed_key}"
+                )
+                if match_key in name:
                     if isinstance(packed_value, list):
                         # "gate_up_proj" → ["gate_proj", "up_proj"]
                         return [

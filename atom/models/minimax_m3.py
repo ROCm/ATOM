@@ -981,6 +981,10 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
     """Native ATOM text-only view of a MiniMax-M3 VL checkpoint."""
 
     packed_modules_mapping = MiniMaxM3SparseForCausalLM.packed_modules_mapping
+    quant_exclude_name_mapping = {
+        "language_model.model.": "model.",
+        "language_model.lm_head": "lm_head",
+    }
     weights_mapping = {
         "model.language_model.": "language_model.",
     }
