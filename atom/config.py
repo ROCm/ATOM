@@ -592,14 +592,9 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
 
 
 def maybe_enable_glm_dsa_index_cache(hf_config: PretrainedConfig) -> None:
-    """Auto-enable the DSA indexer cache for GLM-5.x (``glm_moe_dsa``).
-
-    GLM-5.2 declares a per-layer IndexShare schedule (``indexer_types`` with
-    "shared" entries, or ``index_topk_freq > 1``) but does not carry the ATOM
-    runtime flag ``use_index_cache`` in its HF config. Without the cache the
-    "shared" layers would have no cached topk to reuse, so enable it implicitly
-    here. No-op for other models or when the flag is already truthy.
-    """
+    """Auto-enable the DSA indexer cache for glm_moe_dsa when the model declares
+    an IndexShare schedule (indexer_types has "shared", or index_topk_freq > 1)
+    but omits the ATOM `use_index_cache` flag. No-op otherwise."""
     if getattr(hf_config, "model_type", None) != "glm_moe_dsa":
         return
     if getattr(hf_config, "use_index_cache", False):
