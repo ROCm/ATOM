@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import Optional
@@ -12,9 +13,11 @@ import triton.language as tl
 from aiter import (
     QuantType,
     concat_and_cache_mla,
+    concat_and_cache_mla_seg,
     dtypes,
     flash_attn_varlen_func,
     fused_qk_rope_concat_and_cache_mla,
+    fused_qk_rope_concat_and_cache_mla_seg,
     get_hip_quant,
 )
 from aiter.jit.utils.chip_info import get_gfx
@@ -40,8 +43,14 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
 )
+concat_and_cache_mla_seg = mark_trace(
+    concat_and_cache_mla_seg, prefix="kv_cache_seg", torch_compile=False
+)
 fused_qk_rope_concat_and_cache_mla = mark_trace(
     fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
+)
+fused_qk_rope_concat_and_cache_mla_seg = mark_trace(
+    fused_qk_rope_concat_and_cache_mla_seg, prefix="rope_and_kv_cache", torch_compile=False
 )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
@@ -51,6 +60,20 @@ mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=F
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+
+# The fused seg MLA kernels (fused_qk_rope_concat_and_cache_mla_seg +
+# concat_and_cache_mla_seg + the gfx1250 mla_decode_fwd asm) share a single
+# segmented KV cache layout (all tokens' nope packed first, then all tokens'
+# pe) and a fixed page size hard-coded in the kernels.
+_MLA_SEG_PAGE_SIZE = 64
+# The gfx1250 decode asm consumes an fp8 Q whose per-head row stride is padded
+# to 768 bytes (poc_kl pack_q_page1_padded layout). q_out is allocated with this
+# padded last dim and sliced to the logical kv_lora_rank + qk_rope_head_dim
+# columns; the padding tail is never read by the decode kernel.
+_MLA_Q_OUT_PADDED_DIM = 768
+# Dims the fused seg kernels are compiled against (KV_LORA / PE_DIM constexprs).
+_MLA_SEG_KV_LORA_RANK = 512
+_MLA_SEG_PE_DIM = 64
 
 if use_triton_gemm():
     try:
@@ -123,6 +146,9 @@ def dynamic_per_batched_tensor_quant(
 
 
 class MLAAttention(nn.Module):
+    # Per-layer counter of finite seg decode steps dumped (debug only).
+    _seg_step_counts: dict = {}
+
     def __init__(
         self,
         num_heads: int,
@@ -181,6 +207,277 @@ class MLAAttention(nn.Module):
             else None
         )
         self.layer_num = layer_num
+        # When the triton MLA backend is selected we keep the original
+        # interleaved KV cache layout (concat_and_cache_mla /
+        # fused_qk_rope_concat_and_cache_mla) and an unpadded 576-wide q_out;
+        # only the gfx1250 asm decode path needs the segmented layout + 768 pad.
+        self.use_triton_mla = bool(envs.ATOM_USE_TRITON_MLA)
+        # One-shot guard so the seg-layout constraint checks run once per layer
+        # instead of on every forward step.
+        self._seg_layout_validated = False
+
+    def _validate_seg_layout(self, attn_metadata, positions) -> None:
+        """Validate the static constraints required by the segmented MLA
+        kernels (fused_qk_rope_concat_and_cache_mla_seg / concat_and_cache_mla_seg
+        / gfx1250 mla_decode_fwd). Runs once per layer."""
+        if self._seg_layout_validated:
+            return
+        page_size = get_current_atom_config().kv_cache_block_size
+        assert page_size == _MLA_SEG_PAGE_SIZE, (
+            "seg MLA kernels require kv_cache_block_size == "
+            f"{_MLA_SEG_PAGE_SIZE}, got {page_size}"
+        )
+        assert self.kv_cache_dtype.startswith("fp8"), (
+            "fused seg MLA write/decode path requires an fp8 kv cache "
+            f"(kv_cache_dtype={self.kv_cache_dtype})"
+        )
+        assert attn_metadata.dtype_q == dtypes.fp8, (
+            f"seg q_out must be fp8, got dtype_q={attn_metadata.dtype_q}"
+        )
+        assert (
+            self.kv_lora_rank == _MLA_SEG_KV_LORA_RANK
+            and self.qk_rope_head_dim == _MLA_SEG_PE_DIM
+        ), (
+            "fused seg kernel is fixed to kv_lora_rank="
+            f"{_MLA_SEG_KV_LORA_RANK}, qk_rope_head_dim={_MLA_SEG_PE_DIM}; got "
+            f"{self.kv_lora_rank}, {self.qk_rope_head_dim}"
+        )
+        cos_dim = self.rotary_emb.cos_cache.shape[-1]
+        assert cos_dim == self.qk_rope_head_dim // 2, (
+            f"cos/sin cache last dim must be {self.qk_rope_head_dim // 2} "
+            f"(reuse_freqs_front_part), got {cos_dim}"
+        )
+        assert positions.dtype == torch.int64, (
+            f"positions must be int64 for the seg kernel, got {positions.dtype}"
+        )
+        assert attn_metadata.slot_mapping.dtype == torch.int64, (
+            "slot_mapping must be int64 for the seg kernel, got "
+            f"{attn_metadata.slot_mapping.dtype}"
+        )
+        self._seg_layout_validated = True
+
+    def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
+        """Reshape the KV cache buffer into the page-level flat seg layout
+        ``[num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)]`` that the
+        seg write kernels expect (they derive page_size from ``stride(0)``).
+
+        The cache is allocated token-major as ``[num_blocks*page_size, ..., entry]``
+        (so ``kv_cache.shape[0]`` is the total slot count, not the block count).
+        A plain view groups every ``page_size`` consecutive token slots into one
+        block, i.e. slot = block*page_size + offset, which matches slot_mapping
+        and the page-level view used on the decode side
+        (``kv_buffer.view(-1, page_size, 1, entry)``). Using
+        ``kv_cache.view(kv_cache.shape[0], -1)`` here is WRONG: it keeps the
+        token-level stride (entry), so the kernel derives page_size=1 and writes
+        an interleaved layout that the page_size=64 decode then misreads."""
+        page_size = get_current_atom_config().kv_cache_block_size
+        entry = self.kv_lora_rank + self.qk_rope_head_dim
+        return kv_cache.view(-1, page_size * entry)
+
+    def _assert_seg_write(
+        self, kv_cache_seg: torch.Tensor, slot_mapping: torch.Tensor
+    ) -> None:
+        """Per-step runtime asserts for the seg KV-cache write path (operates on
+        the page-level seg view from _seg_kv_cache_view). Gated by
+        ATOM_DEBUG_MLA_SEG. Catches layout/stride/slot_mapping mistakes that
+        would otherwise silently scatter the cache to wrong offsets."""
+        if not envs.ATOM_DEBUG_MLA_SEG:
+            return
+        entry = self.kv_lora_rank + self.qk_rope_head_dim
+        num_blocks = kv_cache_seg.shape[0]
+        assert kv_cache_seg.is_contiguous(), "seg kv_cache view must be contiguous"
+        assert (
+            kv_cache_seg.dim() == 2
+            and kv_cache_seg.shape[1] == entry * _MLA_SEG_PAGE_SIZE
+        ), (
+            f"seg kv_cache view shape {tuple(kv_cache_seg.shape)} != "
+            f"[num_blocks, {entry * _MLA_SEG_PAGE_SIZE}]"
+        )
+        assert kv_cache_seg.stride(0) == entry * _MLA_SEG_PAGE_SIZE, (
+            f"seg kv_cache block stride {kv_cache_seg.stride(0)} != "
+            f"page_size*entry {entry * _MLA_SEG_PAGE_SIZE}"
+        )
+        slot = slot_mapping.flatten()
+        valid = slot[slot >= 0]
+        if valid.numel() > 0:
+            max_slot = int(valid.max().item())
+            assert max_slot < num_blocks * _MLA_SEG_PAGE_SIZE, (
+                f"seg slot_mapping max {max_slot} >= "
+                f"num_blocks*page_size {num_blocks * _MLA_SEG_PAGE_SIZE}"
+            )
+
+    def _assert_seg_decode(
+        self,
+        kv_buffer_4d: torch.Tensor,
+        q: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+    ) -> None:
+        """Per-step runtime asserts for the seg decode inputs. Gated by
+        ATOM_DEBUG_MLA_SEG."""
+        if not envs.ATOM_DEBUG_MLA_SEG:
+            return
+        entry = self.kv_lora_rank + self.qk_rope_head_dim
+        num_blocks = kv_buffer_4d.shape[0]
+        assert kv_buffer_4d.shape[1] == _MLA_SEG_PAGE_SIZE, (
+            f"seg decode kv_buffer page_size {kv_buffer_4d.shape[1]} != "
+            f"{_MLA_SEG_PAGE_SIZE}"
+        )
+        assert kv_buffer_4d.shape[-1] == entry, (
+            f"seg decode kv_buffer last dim {kv_buffer_4d.shape[-1]} != {entry}"
+        )
+        assert q.shape[-1] == entry, (
+            f"seg decode q last dim {q.shape[-1]} != {entry}"
+        )
+        # q must keep the padded per-head row stride (768) the asm kernel reads.
+        assert q.stride(-2) == _MLA_Q_OUT_PADDED_DIM, (
+            f"seg decode q per-head stride {q.stride(-2)} != "
+            f"{_MLA_Q_OUT_PADDED_DIM} (padded row stride not preserved)"
+        )
+        # kv_indptr is page-level: total referenced pages == kv_indices length,
+        # and every page id must be a valid physical block.
+        total_pages = int(kv_indptr[-1].item())
+        assert total_pages <= kv_indices.shape[0], (
+            f"seg decode kv_indptr[-1] {total_pages} > kv_indices len "
+            f"{kv_indices.shape[0]}"
+        )
+        if total_pages > 0:
+            max_blk = int(kv_indices[:total_pages].max().item())
+            assert max_blk < num_blocks, (
+                f"seg decode kv_indices max block {max_blk} >= num_blocks "
+                f"{num_blocks}"
+            )
+        # One-shot per-layer diagnostic of the actual runtime config so we can
+        # compare against the asm-supported variants (nhead/decode_qlen) and the
+        # scale story (triton casts fp8 q to bf16 without applying q_scale, while
+        # mla_decode_fwd applies q_scale/kv_scale here).
+        if not getattr(self, "_seg_decode_logged", False):
+            self._seg_decode_logged = True
+            logger.info(
+                "SEG-DECODE layer=%d nhead=%d padded_nh=%d hrf=%d B=%d "
+                "q.shape=%s q.stride=%s q.dtype=%s kv.shape=%s kv.dtype=%s "
+                "kv_indptr[:4]=%s kv_indices[:4]=%s q_scale=%s kv_scale=%s",
+                self.layer_num,
+                self.num_heads,
+                self.padded_num_heads,
+                self.head_repeat_factor,
+                q.shape[0],
+                tuple(q.shape),
+                tuple(q.stride()),
+                str(q.dtype),
+                tuple(kv_buffer_4d.shape),
+                str(kv_buffer_4d.dtype),
+                kv_indptr[:4].tolist(),
+                kv_indices[: min(4, kv_indices.shape[0])].tolist(),
+                None if self._q_scale is None else self._q_scale.flatten()[:1].tolist(),
+                None if self._k_scale is None else self._k_scale.flatten()[:1].tolist(),
+            )
+
+    @staticmethod
+    def _assert_seg_decode_output(o: torch.Tensor) -> None:
+        """Assert the seg decode kernel produced a fully-written, finite output.
+        Gated by ATOM_DEBUG_MLA_SEG. A NaN/inf here points at the asm kernel not
+        writing all of `o` (e.g. unsupported nhead/decode_qlen variant)."""
+        if not envs.ATOM_DEBUG_MLA_SEG:
+            return
+        assert torch.isfinite(o).all(), (
+            "seg decode output `o` contains NaN/inf (asm likely did not write "
+            "the whole buffer for this nhead/decode_qlen variant)"
+        )
+        # Flag fully-zero head rows: with zero-init `o`, an all-zero row means
+        # the asm did not write that (head, token) -> partial write / variant
+        # mismatch. Logged once.
+        if not getattr(MLAAttention, "_seg_zero_row_logged", False):
+            zero_rows = int((o.reshape(o.shape[0], o.shape[1], -1).abs().sum(-1) == 0).sum().item())
+            if zero_rows > 0:
+                MLAAttention._seg_zero_row_logged = True
+                logger.warning(
+                    "SEG-DECODE output has %d all-zero (head,token) rows out of "
+                    "%d -> asm did not write them (partial write / variant "
+                    "mismatch)",
+                    zero_rows,
+                    o.shape[0] * o.shape[1],
+                )
+
+    def _dump_seg_decode_failure(
+        self,
+        *,
+        q,
+        seg_kv_buffer_4d,
+        o,
+        paged_cu_seqlens_q,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_lens,
+        max_q_len,
+        page_size,
+        finite=True,
+        step=0,
+    ) -> None:
+        """Save the exact kernel inputs (compacted to the referenced pages) so
+        they can be replayed offline through `mla_decode_fwd` and an fp32
+        reference. Captures consecutive finite steps for the target layer plus
+        the first non-finite step."""
+        tag = f"OK_step{step:03d}" if finite else "FAIL"
+        if not finite:
+            if getattr(MLAAttention, "_seg_failfile_dumped", False):
+                return
+            MLAAttention._seg_failfile_dumped = True
+        import os
+
+        out_dir = os.path.expanduser(
+            os.environ.get("MLA_DUMP_DIR", "~/mla_decode_dump")
+        )
+        os.makedirs(out_dir, exist_ok=True)
+
+        bs = int(paged_kv_indptr.numel() - 1)
+        total_pages = int(paged_kv_indptr[bs].item())
+        used = paged_kv_indices.to(torch.int64).cpu()[:total_pages]
+        uniq, inverse = torch.unique(used, sorted=True, return_inverse=True)
+        kv_compact = seg_kv_buffer_4d[uniq.to(seg_kv_buffer_4d.device)].detach().cpu()
+
+        bundle = {
+            "layer_num": int(self.layer_num),
+            "q": q.detach().cpu(),
+            "q_stride": tuple(q.stride()),
+            "seg_kv_compact": kv_compact,
+            "kv_indices_remapped": inverse.to(torch.int32),
+            "o": o.detach().cpu(),
+            "qo_indptr": paged_cu_seqlens_q.detach().cpu(),
+            "kv_indptr": paged_kv_indptr.detach().cpu(),
+            "kv_last_page_lens": paged_kv_last_page_lens.detach().cpu(),
+            "max_q_len": int(max_q_len),
+            "page_size": int(page_size),
+            "sm_scale": float(self.scale),
+            "num_heads": int(self.num_heads),
+            "padded_num_heads": int(self.padded_num_heads),
+            "kv_lora_rank": int(self.kv_lora_rank),
+            "qk_rope_head_dim": int(self.qk_rope_head_dim),
+            "v_head_dim": int(self.v_head_dim),
+            "q_scale": None if self._q_scale is None else self._q_scale.detach().cpu(),
+            "kv_scale": None if self._k_scale is None else self._k_scale.detach().cpu(),
+            "q_dtype": str(q.dtype),
+            "kv_dtype": str(seg_kv_buffer_4d.dtype),
+        }
+        fname = (
+            f"seg_decode_FAIL_layer{int(self.layer_num):03d}.pt"
+            if not finite
+            else f"seg_decode_OK_layer{int(self.layer_num):03d}_step{step:03d}.pt"
+        )
+        path = os.path.join(out_dir, fname)
+        torch.save(bundle, path)
+        logger.error(
+            "SEG-DECODE [%s] output at layer=%d -> saved inputs to %s "
+            "(bs=%d total_pages=%d uniq_pages=%d kv_indptr[:4]=%s last_page_lens[:4]=%s)",
+            tag,
+            self.layer_num,
+            path,
+            bs,
+            total_pages,
+            int(uniq.numel()),
+            paged_kv_indptr[:4].tolist(),
+            paged_kv_last_page_lens[:4].tolist(),
+        )
 
     def process_weights_after_loading(self):
         if is_rocm_aiter_fp4bmm_enabled():
@@ -687,7 +984,17 @@ class MLAAttention(nn.Module):
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
 
-        o = torch.empty(
+        # q arrives with a padded per-head row stride (_MLA_Q_OUT_PADDED_DIM);
+        # slice back to the logical kv_lora_rank + qk_rope_head_dim columns. The
+        # slice keeps the padded row stride, which the asm kernel expects. The
+        # triton path uses an unpadded 576-wide q_out, so no slicing is needed.
+        if not self.use_triton_mla:
+            q = q[..., : self.kv_lora_rank + self.qk_rope_head_dim]
+
+        # DEBUG(seg): zero-init instead of empty so any region the decode asm
+        # does not write shows up as 0 rather than garbage (isolates
+        # uninitialized-read bugs in the seg pass).
+        o = torch.zeros(
             B,
             self.padded_num_heads,
             self.kv_lora_rank,
@@ -756,7 +1063,17 @@ class MLAAttention(nn.Module):
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
 
-        o = torch.empty(
+        # q arrives with a padded per-head row stride (_MLA_Q_OUT_PADDED_DIM);
+        # slice back to the logical kv_lora_rank + qk_rope_head_dim columns. The
+        # slice keeps the padded row stride, which the asm kernel expects. The
+        # triton path uses an unpadded 576-wide q_out, so no slicing is needed.
+        if not self.use_triton_mla:
+            q = q[..., : self.kv_lora_rank + self.qk_rope_head_dim]
+
+        # DEBUG(seg): zero-init instead of empty so any region the decode asm
+        # does not write shows up as 0 rather than garbage (isolates
+        # uninitialized-read bugs in the seg pass).
+        o = torch.zeros(
             B,
             self.padded_num_heads,
             self.kv_lora_rank,
@@ -793,12 +1110,49 @@ class MLAAttention(nn.Module):
                 attn_metadata.triton_block_table,
                 attn_metadata.context_lens,
                 attn_metadata.triton_attn_logits,
-                4,  # num_kv_splits
+                # Must match triton_attn_logits.shape[2] allocated in
+                # TritonMLAMetadataBuilder (num_kv_splits=4); the kernel asserts
+                # num_kv_splits == attn_logits.shape[2].
+                attn_metadata.triton_attn_logits.shape[2],  # num_kv_splits
                 self.scale,
                 page_size,
                 k_scale=self._k_scale,
                 v_scale=self._k_scale,
             )
+
+            if envs.ATOM_DUMP_MLA_DECODE and not self.is_sparse_mla:
+                # Dump the token-major (interleaved) KV cache + this layer's
+                # decode inputs so op_tests/test_mla_decode_replay.py can replay
+                # them through AITER mla_decode_fwd vs the Triton reference.
+                from atom.utils.mla_decode_dump import dump_decode_mla
+
+                dump_decode_mla(
+                    layer_num=self.layer_num,
+                    q=q,
+                    kv_buffer_view=kv_c_and_k_pe_cache.view(
+                        -1, page_size, 1, q.shape[-1]
+                    ),
+                    o=o,
+                    qo_indptr=attn_metadata.cu_seqlens_q,
+                    kv_indptr=attn_metadata.kv_indptr,
+                    kv_indices=attn_metadata.kv_indices,
+                    kv_last_page_lens=attn_metadata.kv_last_page_lens,
+                    max_q_len=attn_metadata.max_seqlen_q,
+                    page_size=page_size,
+                    sm_scale=self.scale,
+                    q_scale=self._q_scale,
+                    kv_scale=self._k_scale,
+                    num_kv_splits=1,
+                    context_lens=getattr(attn_metadata, "context_lens", None),
+                    num_heads=self.num_heads,
+                    padded_num_heads=self.padded_num_heads,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    v_head_dim=self.v_head_dim,
+                    head_repeat_factor=self.head_repeat_factor,
+                    is_sparse_mla=self.is_sparse_mla,
+                    kv_layout="interleaved",
+                )
         else:
             kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
             paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
@@ -850,9 +1204,13 @@ class MLAAttention(nn.Module):
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
             page_size = get_current_atom_config().kv_cache_block_size
+            seg_kv_buffer_4d = kv_buffer.view(-1, page_size, 1, q.shape[-1])
+            self._assert_seg_decode(
+                seg_kv_buffer_4d, q, paged_kv_indptr, paged_kv_indices
+            )
             mla_decode_fwd(
                 q,
-                kv_buffer.view(-1, page_size, 1, q.shape[-1]),
+                seg_kv_buffer_4d,
                 o,
                 paged_cu_seqlens_q,
                 paged_kv_indptr,
@@ -860,7 +1218,7 @@ class MLAAttention(nn.Module):
                 paged_kv_last_page_lens,
                 max_q_len,
                 page_size=page_size,
-                num_kv_splits=16,
+                num_kv_splits=2, # asm passes
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,
                 work_indptr=work_indptr,
@@ -871,6 +1229,75 @@ class MLAAttention(nn.Module):
                 q_scale=self._q_scale,
                 kv_scale=self._k_scale,
             )
+
+            if envs.ATOM_DEBUG_MLA_SEG:
+                # Dump several consecutive finite decode steps for one target
+                # layer (default 0) so we can replay an *early* step (correct)
+                # and a *later* step (after the output degrades) and see whether
+                # the incremental decode-write corrupts the KV cache over time.
+                dbg_layer = int(os.environ.get("ATOM_SEG_DUMP_LAYER", "0"))
+                budget = int(os.environ.get("ATOM_SEG_DUMP_STEPS", "40"))
+                finite = bool(torch.isfinite(o).all())
+                cnt = MLAAttention._seg_step_counts.get(self.layer_num, 0)
+                # Also force-capture the first MULTI-PAGE (>=2 pages) finite step
+                # for the target layer, since cross-page gather is a distinct
+                # code path from the (verified-correct) single-page case.
+                n_pages_0 = int(paged_kv_indptr[1].item() - paged_kv_indptr[0].item())
+                want_multipage = (
+                    self.layer_num == dbg_layer
+                    and n_pages_0 >= 2
+                    and not getattr(MLAAttention, "_seg_multipage_dumped", False)
+                )
+                if want_multipage:
+                    MLAAttention._seg_multipage_dumped = True
+                if (not finite) or want_multipage or (
+                    self.layer_num == dbg_layer and cnt < budget
+                ):
+                    if self.layer_num == dbg_layer:
+                        MLAAttention._seg_step_counts[self.layer_num] = cnt + 1
+                    self._dump_seg_decode_failure(
+                        q=q,
+                        seg_kv_buffer_4d=seg_kv_buffer_4d,
+                        o=o,
+                        paged_cu_seqlens_q=paged_cu_seqlens_q,
+                        paged_kv_indptr=paged_kv_indptr,
+                        paged_kv_indices=paged_kv_indices,
+                        paged_kv_last_page_lens=paged_kv_last_page_lens,
+                        max_q_len=max_q_len,
+                        page_size=page_size,
+                        finite=finite,
+                        step=cnt,
+                    )
+            self._assert_seg_decode_output(o)
+
+            if envs.ATOM_DUMP_MLA_DECODE and not self.is_sparse_mla:
+                from atom.utils.mla_decode_dump import dump_decode_mla
+
+                dump_decode_mla(
+                    layer_num=self.layer_num,
+                    q=q,
+                    kv_buffer_view=kv_buffer.view(-1, page_size, 1, q.shape[-1]),
+                    o=o,
+                    qo_indptr=paged_cu_seqlens_q,
+                    kv_indptr=paged_kv_indptr,
+                    kv_indices=paged_kv_indices,
+                    kv_last_page_lens=paged_kv_last_page_lens,
+                    max_q_len=max_q_len,
+                    page_size=page_size,
+                    sm_scale=self.scale,
+                    q_scale=self._q_scale,
+                    kv_scale=self._k_scale,
+                    num_kv_splits=1,
+                    context_lens=getattr(attn_metadata, "context_lens", None),
+                    num_heads=self.num_heads,
+                    padded_num_heads=self.padded_num_heads,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    v_head_dim=self.v_head_dim,
+                    head_repeat_factor=self.head_repeat_factor,
+                    is_sparse_mla=self.is_sparse_mla,
+                    kv_layout="seg",
+                )
 
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :].contiguous()
@@ -910,14 +1337,34 @@ class MLAAttention(nn.Module):
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
-                concat_and_cache_mla(
-                    k_nope,
-                    k_rope.squeeze(1),
-                    kv_cache,
-                    attn_metadata.slot_mapping.flatten(),
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    scale=self._k_scale,
-                )
+                if self.use_triton_mla:
+                    # Triton MLA path: original interleaved per-token layout.
+                    concat_and_cache_mla(
+                        k_nope,
+                        k_rope.squeeze(1),
+                        kv_cache,
+                        attn_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=self._k_scale,
+                    )
+                else:
+                    self._validate_seg_layout(attn_metadata, positions)
+                    # Write the KV cache in the segmented layout so the
+                    # decode-phase mla_decode_fwd (which reads seg layout) sees a
+                    # consistent cache for tokens written during prefill.
+                    # kv_cache is flattened to
+                    # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so
+                    # the kernel derives page_size from stride(0).
+                    kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+                    self._assert_seg_write(kv_cache_seg, attn_metadata.slot_mapping)
+                    concat_and_cache_mla_seg(
+                        k_nope,
+                        k_rope.squeeze(1),
+                        kv_cache_seg,
+                        attn_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=self._k_scale,
+                    )
 
             if attn_metadata.has_cached:
                 chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
@@ -936,34 +1383,77 @@ class MLAAttention(nn.Module):
         else:
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
-            q_out = torch.empty(
-                (
-                    q_nope.shape[0],
-                    self.num_heads,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                ),
-                dtype=attn_metadata.dtype_q,
-                device=q_nope.device,
-            )
-            if kv_cache.numel() > 0:
-                fused_qk_rope_concat_and_cache_mla(
-                    q_nope,
-                    q_rope,
-                    k_nope,
-                    k_rope,
-                    kv_cache.view(
-                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+            if self.use_triton_mla:
+                # Triton MLA path: unpadded 576-wide q_out, interleaved cache.
+                q_out = torch.empty(
+                    (
+                        q_nope.shape[0],
+                        self.num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
-                    q_out,
-                    attn_metadata.slot_mapping,
-                    self._k_scale,
-                    self._q_scale,
-                    positions,
-                    self.rotary_emb.cos_cache,
-                    self.rotary_emb.sin_cache,
-                    is_neox=self.rotary_emb.is_neox_style,
-                    is_nope_first=True,
+                    dtype=attn_metadata.dtype_q,
+                    device=q_nope.device,
                 )
+            else:
+                # Allocate q_out with a padded last dim so each head row has a
+                # 768-byte stride (required by the gfx1250 decode asm). The kernel
+                # only writes the first kv_lora_rank + qk_rope_head_dim columns;
+                # the padding tail is left untouched and never read.
+                # DEBUG(seg): zero-init the padded q_out so the unwritten
+                # [576:768] tail is 0 rather than garbage (the decode asm reads
+                # rows at a 768 stride). Helps isolate uninitialized-read bugs.
+                q_out = torch.zeros(
+                    (
+                        q_nope.shape[0],
+                        self.num_heads,
+                        _MLA_Q_OUT_PADDED_DIM,
+                    ),
+                    dtype=attn_metadata.dtype_q,
+                    device=q_nope.device,
+                )
+            if kv_cache.numel() > 0:
+                if self.use_triton_mla:
+                    fused_qk_rope_concat_and_cache_mla(
+                        q_nope,
+                        q_rope,
+                        k_nope,
+                        k_rope,
+                        # Interleaved layout: [num_blocks, block_size, kv_lora+pe].
+                        kv_cache.view(
+                            kv_cache.shape[0],
+                            -1,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        q_out,
+                        attn_metadata.slot_mapping,
+                        self._k_scale,
+                        self._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        is_nope_first=True,
+                    )
+                else:
+                    self._validate_seg_layout(attn_metadata, positions)
+                    kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+                    self._assert_seg_write(kv_cache_seg, attn_metadata.slot_mapping)
+                    fused_qk_rope_concat_and_cache_mla_seg(
+                        q_nope,
+                        q_rope,
+                        k_nope,
+                        k_rope,
+                        # Flat seg layout: [num_blocks, page_size*(kv_lora + pe)].
+                        kv_cache_seg,
+                        q_out,
+                        attn_metadata.slot_mapping,
+                        self._k_scale,
+                        self._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                    )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
             if context.is_prefill:

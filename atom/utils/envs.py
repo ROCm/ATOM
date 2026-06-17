@@ -34,6 +34,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    # Debug-only: enable per-step runtime assertions in the segmented (aiter)
+    # MLA write/decode path (layout/stride/slot_mapping/index ranges + isfinite
+    # on the decode output). Off by default; set to 1 when debugging seg garbage.
+    "ATOM_DEBUG_MLA_SEG": lambda: os.getenv("ATOM_DEBUG_MLA_SEG", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
@@ -169,6 +173,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FWD_DUMP_LAYER_ATTR", "layer_id"
     ),
     "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
+    # Dump MLA decode inputs/outputs (q/kv/o + metadata) for the aiter decode
+    # path; disabled by default.
+    "ATOM_DUMP_MLA_DECODE": lambda: os.getenv("ATOM_DUMP_MLA_DECODE", "0") == "1",
     # Per-rank weight dump + sys.exit(0) — for byte-equal weight comparison.
     "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
     "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", "0"),
