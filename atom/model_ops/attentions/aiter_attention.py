@@ -47,21 +47,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         device=None,
         model_runner=None,
     ):
-        self.block_size = 1024 if model_runner.block_size == 1024 else 16
-        if envs.ATOM_USE_UNIFIED_ATTN:
-            # SHUFFLE (pre-shuffled) KV cache: use the logical block size directly
-            # as the physical block size so block_ratio == 1 and
-            # unified_attention's block_table needs no logical->physical
-            # conversion. Pass --block-size equal to the performant physical
-            # page: fp8 packs x=16 - 128; bf16 packs x=8 - 64 (both keep a
-            # 128-byte physical page, i.e. block_size // x == 8).
-            expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
-            assert model_runner.block_size == expected, (
-                f"ATOM_USE_UNIFIED_ATTN=1 expects --block-size {expected} "
-                f"for {model_runner.kv_cache_dtype} KV cache (so block_ratio == 1), "
-                f"got --block-size {model_runner.block_size}"
-            )
-            self.block_size = model_runner.block_size
+        # self.block_size = 1024 if model_runner.block_size == 1024 else 16
+        self.block_size = model_runner.block_size if model_runner.block_size in [1024, 256] else 16
+        # if envs.ATOM_USE_UNIFIED_ATTN:
+        #     self.block_size = 128
         assert (
             model_runner.block_size % self.block_size == 0
         ), f"model_runner.block_size must be divisible by block_size but got {model_runner.block_size=}, block_size={self.block_size}, please set --block-size (model_runner.block_size) to be divisible by {self.block_size}"
@@ -240,7 +229,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             1, hf_config.num_key_value_heads // get_tp_group().world_size
         )
         block_size = self.block_size
-
         var = self.model_runner.forward_vars
         max_qlen = var["max_qlen"]
 
@@ -753,7 +741,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ]
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
-        if self.block_size == 1024:
+        if self.block_size in [256, 1024]:
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
             ctx.update(ctx_pa_ps)
 
@@ -876,7 +864,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
 
             # Set PA persistent worker buffers for this ubatch
-            if self.block_size == 1024:
+            if self.block_size in [256, 1024]:
                 self._set_ubatch_pa_buffers(padded_bs, max_seqlen_q, ub_idx)
 
     def _set_ubatch_pa_buffers(self, padded_bs, max_q_len, ubatch_idx):
@@ -922,7 +910,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         max_q_len = var["max_qlen"]
 
         # Compute PA work buffers for this ubatch
-        if self.block_size == 1024:
+        if self.block_size in [256, 1024]:
             self._set_ubatch_pa_buffers(padded_bs, max_q_len, ubatch_idx)
 
         attn = AttentionMetaData(
@@ -943,8 +931,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         return attn
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
-        var = self.model_runner.forward_vars
-        if self.block_size == 1024:
+        var = self.model_runner.forward_vars 
+        if self.block_size in [256, 1024]:
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}

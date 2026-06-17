@@ -8,6 +8,7 @@ import torch
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.jit.utils.chip_info import get_gfx
+from aiter import dtypes
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
 from atom.config import get_current_atom_config
@@ -588,31 +589,100 @@ class PagedAttentionImpl(nn.Module):
 
     @mark_trace(prefix="paged_attention_persistent_asm", torch_compile=False)
     def paged_attention_persistent_asm(
-        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext, sink=None
     ):
         attn_metadata = fwd_ctx.attn_metadata
-        output = torch.empty_like(q)
+        output = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
 
-        aiter.pa_persistent_fwd(
-            Q=q,
-            K=k_cache,
-            V=v_cache,
-            output=output,
-            max_qlen=attn_metadata.max_seqlen_q,
-            qo_indptr=attn_metadata.cu_seqlens_q,
-            kv_indptr=attn_metadata.kv_indptr,
-            kv_indices=attn_metadata.kv_indices,
-            context_lens=attn_metadata.context_lens,
-            K_QScale=k_scale,
-            V_QScale=v_scale,
-            work_indptr=attn_metadata.work_indptr,
-            work_info=attn_metadata.work_info_set,
-            reduce_indptr=attn_metadata.reduce_indptr,
-            reduce_final_map=attn_metadata.reduce_final_map,
-            reduce_partial_map=attn_metadata.reduce_partial_map,
-            softmax_scale=self.scale,
-            mask=1,
-        )
+        if self.sinks is None:
+            aiter.pa_persistent_fwd(
+                Q=q,
+                K=k_cache,
+                V=v_cache,
+                output=output,
+                max_qlen=attn_metadata.max_seqlen_q,
+                qo_indptr=attn_metadata.cu_seqlens_q,
+                kv_indptr=attn_metadata.kv_indptr,
+                kv_indices=attn_metadata.kv_indices,
+                context_lens=attn_metadata.context_lens,
+                K_QScale=k_scale,
+                V_QScale=v_scale,
+                work_indptr=attn_metadata.work_indptr,
+                work_info=attn_metadata.work_info_set,
+                reduce_indptr=attn_metadata.reduce_indptr,
+                reduce_final_map=attn_metadata.reduce_final_map,
+                reduce_partial_map=attn_metadata.reduce_partial_map,
+                softmax_scale=self.scale,
+                mask=1,
+            )
+        else:
+            device = q.device
+            total_s, nhead, v_head_dim = output.shape
+            softmax_scale = self.scale if self.scale is not None else 1.0 / (v_head_dim**0.5)
+            split_o = torch.empty(
+                (
+                    attn_metadata.reduce_partial_map.size(0)
+                    * attn_metadata.max_seqlen_q,
+                    1,
+                    nhead,
+                    v_head_dim,
+                ),
+                dtype=dtypes.fp32,
+                device=device,
+            )
+            split_lse = torch.empty(
+                (
+                    attn_metadata.reduce_partial_map.size(0)
+                    * attn_metadata.max_seqlen_q,
+                    1,
+                    nhead,
+                    1,
+                ),
+                dtype=dtypes.fp32,
+                device=device,
+            )
+            final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+            assert self.num_heads % self.num_kv_heads == 0
+            aiter.pa_decode_bf16_asm(
+                q.to(dtypes.fp8),
+                k_cache,
+                v_cache,
+                attn_metadata.kv_indices,
+                attn_metadata.context_lens,
+                self.scale,
+                attn_metadata.kv_indptr,
+                gqa=self.num_heads // self.num_kv_heads,
+                mtp=attn_metadata.max_seqlen_q,
+                query_scale=self.kv_scale,
+                key_scale=self.kv_scale,
+                value_scale=self.kv_scale,
+                qo_indptr=attn_metadata.cu_seqlens_q,
+                work_indptr=attn_metadata.work_indptr,
+                work_info=attn_metadata.work_info_set,
+                split_o=split_o,
+                split_lse=split_lse,
+                sink=sink,
+            )
+            bs = attn_metadata.cu_seqlens_q.shape[0] - 1
+            if int(attn_metadata.max_seqlen_k) > 256:
+                final_lse = torch.empty(
+                    (bs * attn_metadata.max_seqlen_q, self.num_heads),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+            aiter.pa_reduce_v1(
+                split_o,
+                split_lse,
+                attn_metadata.reduce_indptr,
+                attn_metadata.reduce_final_map,
+                attn_metadata.reduce_partial_map,
+                attn_metadata.max_seqlen_q,
+                16,
+                output.view(
+                    bs * attn_metadata.max_seqlen_q, self.num_heads, self.head_dim
+                ),
+                final_lse,
+            )
 
         return output
 
@@ -739,14 +809,19 @@ class PagedAttentionImpl(nn.Module):
                 return self.prefill_attention_triton
             return self.prefill_attention
         else:
-            if use_unified_attn or self.use_triton_attn or self.use_flash_layout:
+            # if use_unified_attn or self.use_triton_attn or self.use_flash_layout:
+            #     return self.paged_attention_triton
+            # else:
+            #     atom_config = get_current_atom_config()
+            #     if atom_config.kv_cache_block_size == 1024 or (
+            #         atom_config.kv_cache_block_size == 256 and self.sinks is not None
+            #     ):
+            #         return self.paged_attention_persistent_asm
+            #     return self.paged_attention_asm
+            if self.sliding_window != -1:
                 return self.paged_attention_triton
             else:
-                # Only use pa persistent when block_size == 1024
-                atom_config = get_current_atom_config()
-                if atom_config.kv_cache_block_size == 1024:
-                    return self.paged_attention_persistent_asm
-                return self.paged_attention_asm
+                return self.paged_attention_persistent_asm
 
     def forward(
         self,
