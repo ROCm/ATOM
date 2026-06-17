@@ -43,7 +43,7 @@
 | [DeepSeek V2/V3](https://huggingface.co/deepseek-ai) | `DeepseekV3ForCausalLM` | MoE | MLA attention, MTP speculative decoding |
 | [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1) | `MixtralForCausalLM` | MoE | 8 experts, top-2 routing |
 | [GLM-4-MoE](https://huggingface.co/THUDM) | `Glm4MoeForCausalLM` | MoE | |
-| [GLM-5](https://huggingface.co/zai-org/GLM-5-FP8) | `GlmMoeDsaForCausalLM` | MoE | MLA attention, similar to DeepSeek V3.2. See [recipe](recipes/GLM-5.md) |
+| [GLM-5 / GLM-5.2](https://huggingface.co/zai-org/GLM-5.2-FP8) | `GlmMoeDsaForCausalLM` | MoE | MLA + DSA sparse attention, similar to DeepSeek V3.2; GLM-5.2 adds IndexShare. See [recipe](recipes/GLM-5.md) |
 | [GPT-OSS](https://huggingface.co/openai) | `GptOssForCausalLM` | MoE | Sliding window + attention sinks |
 | [Kimi-K2](https://huggingface.co/moonshotai/Kimi-K2-Thinking) | via `--trust-remote-code` | MoE | See [recipe](recipes/Kimi-K2-Thinking.md) |
 | [MiMo V2/V2.5](https://huggingface.co/XiaomiMiMo) | `MiMoV2ForCausalLM` | MoE | Hybrid full + SWA attention, 3-layer MTP. See [recipe](recipes/MiMo-V2.md) |
