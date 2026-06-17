@@ -140,6 +140,7 @@ export RESULT_DIR
 export LOG_ROOT="${SLURM_LOG_ROOT%/}/${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-$(date +%Y%m%d%H%M%S)"
 export SLURM_OUTPUT="${LOG_ROOT}/slurm-%j.out"
 export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
+SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
 
 echo "=== ATOMesh benchmark cell ==="
 echo "cell=${ATOMESH_CELL_ID}"
@@ -174,11 +175,93 @@ if ! command -v sbatch >/dev/null 2>&1; then
   exit 127
 fi
 
+set_slurm_job_log_paths() {
+  local job_id="$1"
+  SLURM_JOB_OUTPUT="${SLURM_OUTPUT//%j/${job_id}}"
+  SLURM_JOB_ERROR="${SLURM_ERROR//%j/${job_id}}"
+  echo "slurm_job_id=${job_id}"
+  echo "slurm_output=${SLURM_JOB_OUTPUT}"
+  echo "slurm_error=${SLURM_JOB_ERROR}"
+}
+
+stream_file_lines() {
+  local file="$1"
+  local prefix="$2"
+  local current_line="$3"
+  local total_lines
+
+  if [[ ! -f "${file}" ]]; then
+    printf '%s\n' "${current_line}"
+    return 0
+  fi
+
+  total_lines="$(wc -l < "${file}" | tr -d ' ')"
+  if [[ "${total_lines}" -gt "${current_line}" ]]; then
+    awk -v start="${current_line}" -v prefix="${prefix}" 'NR > start { print prefix $0 }' "${file}" >&2
+  fi
+  printf '%s\n' "${total_lines}"
+}
+
+stream_slurm_logs_once() {
+  OUT_LINE="$(stream_file_lines "${SLURM_JOB_OUTPUT}" "[slurm.out] " "${OUT_LINE}")"
+  ERR_LINE="$(stream_file_lines "${SLURM_JOB_ERROR}" "[slurm.err] " "${ERR_LINE}")"
+}
+
+monitor_slurm_job() {
+  local job_id="$1"
+  OUT_LINE=0
+  ERR_LINE=0
+
+  echo "=== monitoring Slurm job ${job_id} ==="
+  while squeue -h -j "${job_id}" >/dev/null 2>&1 && [[ -n "$(squeue -h -j "${job_id}" 2>/dev/null)" ]]; do
+    squeue -h -j "${job_id}" -o "[slurm] job=%i state=%T elapsed=%M nodes=%D reason=%R" || true
+    stream_slurm_logs_once
+    sleep "${SLURM_LOG_POLL_INTERVAL}"
+  done
+
+  stream_slurm_logs_once
+}
+
+read_slurm_exit_code() {
+  local job_id="$1"
+  local sacct_line exit_status exit_signal
+
+  SLURM_STATE="unknown"
+  SLURM_EXIT_CODE="unknown"
+  SLURM_JOB_RC=1
+
+  if ! command -v sacct >/dev/null 2>&1; then
+    echo "WARNING: sacct not found; unable to read Slurm job exit code" >&2
+    return 0
+  fi
+
+  sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+  if [[ -z "${sacct_line}" ]]; then
+    return 0
+  fi
+
+  SLURM_STATE="${sacct_line%%|*}"
+  SLURM_EXIT_CODE="${sacct_line##*|}"
+  exit_status="${SLURM_EXIT_CODE%%:*}"
+  exit_signal="${SLURM_EXIT_CODE##*:}"
+
+  if ! [[ "${exit_status}" =~ ^[0-9]+$ ]]; then
+    SLURM_JOB_RC=1
+  elif [[ "${exit_signal}" =~ ^[0-9]+$ && "${exit_status}" -eq 0 && "${exit_signal}" -ne 0 ]]; then
+    SLURM_JOB_RC=$((128 + exit_signal))
+  else
+    SLURM_JOB_RC="${exit_status}"
+  fi
+
+  if [[ "${SLURM_STATE}" != COMPLETED && "${SLURM_JOB_RC}" -eq 0 ]]; then
+    SLURM_JOB_RC=1
+  fi
+}
+
 IFS=',' read -r -a NODE_ARRAY <<< "${NODE_LIST}"
 SBATCH_CMD=(
   sbatch
   --parsable
-  --wait
   --exclusive
   --account "${SLURM_ACCOUNT}"
   --partition "${SLURM_PARTITION}"
@@ -202,8 +285,21 @@ set +e
 JOB_ID="$("${SBATCH_CMD[@]}")"
 SBATCH_RC=$?
 set -e
+JOB_ID="${JOB_ID%%;*}"
 echo "${JOB_ID}" | tee "${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-job-id"
-echo "sbatch exit code: ${SBATCH_RC}"
+
+if [[ "${SBATCH_RC}" -ne 0 ]]; then
+  echo "sbatch submit exit code: ${SBATCH_RC}"
+  exit "${SBATCH_RC}"
+fi
+
+set_slurm_job_log_paths "${JOB_ID}"
+monitor_slurm_job "${JOB_ID}"
+read_slurm_exit_code "${JOB_ID}"
+SBATCH_RC="${SLURM_JOB_RC}"
+echo "slurm_state=${SLURM_STATE}"
+echo "slurm_exit_code=${SLURM_EXIT_CODE}"
+echo "slurm job exit code: ${SBATCH_RC}"
 
 if [[ -d "${LOG_ROOT}" ]]; then
   mkdir -p "${RESULT_DIR}/${ATOMESH_CELL_ID}"
