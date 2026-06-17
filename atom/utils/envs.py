@@ -34,6 +34,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    # Use the block_size=64 *shuffled* KV-cache Triton/Gluon MLA kernels
+    # (aiter.ops.triton.attention.mla.mla_decode_fwd + the shuffled cat/cache
+    # write kernels) instead of the SGLang-style page_size=1 decode path.
+    # Requires ATOM_USE_TRITON_MLA=1 (selects TritonMLABackend).
+    "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
+        os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
@@ -95,9 +102,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
     "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
-    # Force the Triton path for V4 sparse-paged-prefill attention; default backend
-    # is aiter's OPUS kernel (gfx950 fast path). Set to 1 to fall back to Triton
-    # (e.g. for debugging or on non-gfx950 builds).
+    # Force Triton attention fallbacks where available. Set to 1 to bypass
+    # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
@@ -215,6 +221,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
+    ),
+    # --- TBO prefill ubatch splitting ---
+    # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
+    # cutting through a request if needed for perfectly balanced 50/50 ubatches.
+    # Default on; set "0" to fall back to the request-boundary balanced split.
+    "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
+        os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
     ),
 }
 

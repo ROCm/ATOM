@@ -1,6 +1,6 @@
 {
   "name": "http_regular_chat",
-  "model": "test-model",
+  "model": "hf-internal-testing/llama-tokenizer",
   "endpoint": "/v1/chat/completions",
   "route": {
     "worker_kind": "regular",
@@ -20,7 +20,7 @@
     "body": {
       "id": "chatcmpl-test",
       "object": "chat.completion",
-      "model": "test-model",
+      "model": "hf-internal-testing/llama-tokenizer",
       "choices": [
         {
           "index": 0,

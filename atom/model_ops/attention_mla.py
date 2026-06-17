@@ -19,6 +19,13 @@ from aiter import (
 )
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.ops.triton.attention.mla import (
+    mla_decode_fwd as triton_shuffle_mla_decode_fwd,
+)
+from aiter.ops.triton.kv_cache import cat_and_cache_mla as triton_cat_and_cache_mla
+from aiter.ops.triton.fusions.fused_kv_cache import (
+    fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
+)
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
@@ -45,13 +52,29 @@ fused_qk_rope_concat_and_cache_mla = mark_trace(
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
 
+# Shuffled-KV (block_size=64) Triton/Gluon MLA kernels, gated by
+# ATOM_USE_TRITON_MLA and ATOM_USE_TRITON_MLA_SHUFFLE_KV:. Write kernels mirror the aiter
+# concat_and_cache / fused_qk_rope_concat_and_cache_mla but store the cache in
+# the shuffled layout the shuffled decode kernel reads back.
+triton_shuffle_mla_decode_fwd = mark_trace(
+    triton_shuffle_mla_decode_fwd, prefix="mla_decode_shuffle", torch_compile=False
+)
+triton_cat_and_cache_mla = mark_trace(
+    triton_cat_and_cache_mla, prefix="kv_cache_shuffle", torch_compile=False
+)
+triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
+    triton_fused_qk_rope_cat_and_cache_mla,
+    prefix="rope_and_kv_cache_shuffle",
+    torch_compile=False,
+)
+
 # torch.set_printoptions(threshold=10_000)
 
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
 
-if use_triton_gemm():
+if False:
     try:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
             fused_gemm_a8w8_blockscale_preshuffle_split_cat,
@@ -63,10 +86,29 @@ if use_triton_gemm():
         logger.warning(f"Triton fused GEMM split_cat not available: {e}")
         fused_gemm_afp4wfp4_preshuffle_split_cat = None
         fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
+fused_gemm_afp4wfp4_preshuffle_split_cat = None
+fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 
 
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
     return envs.ATOM_USE_TRITON_MXFP4_BMM
+
+
+def _maybe_view_mxfp4_weight_for_gather(
+    kv_b_proj: nn.Module, weight: torch.Tensor
+) -> torch.Tensor:
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is None or weight.dtype != torch.uint8:
+        return weight
+
+    layer_quant_config = getattr(kv_b_proj, "layer_quant_config", None)
+    is_mxfp4 = getattr(kv_b_proj, "params_dtype", None) == dtypes.fp4x2 or (
+        layer_quant_config is not None
+        and getattr(layer_quant_config, "quant_dtype", None) == dtypes.fp4x2
+    )
+    if is_mxfp4:
+        return weight.view(fp4_dtype)
+    return weight
 
 
 if is_rocm_aiter_fp4bmm_enabled():
@@ -357,17 +399,15 @@ class MLAAttention(nn.Module):
             device=prefill_q.device,
             dtype=self.dtype,
         )
-        gather_kv_b_proj(
+        self._gather_cached_kv_b_proj(
             kv_cache,
-            self._k_scale,
             attn_metadata.kv_indptr,
             attn_metadata.kv_indices,
             attn_metadata.cu_seqlens_k,
-            self.kv_b_proj.weight,
-            self.kv_b_proj.weight_scale,
             k_full,
             v_full,
-            weight_preshuffle=getattr(self.kv_b_proj.weight, "is_shuffled", False),
+            getattr(attn_metadata, "shuffle_kv_block_indptr", None),
+            getattr(attn_metadata, "shuffle_kv_block_indices", None),
         )
         output = flash_attn_varlen_func(
             q=prefill_q,
@@ -383,6 +423,50 @@ class MLAAttention(nn.Module):
             causal=True,
         )
         return self.o_proj(output.flatten(start_dim=-2))
+
+    def _gather_cached_kv_b_proj(
+        self,
+        kv_cache: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+        shuffle_kv_block_indptr: Optional[torch.Tensor] = None,
+        shuffle_kv_block_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        weight = self.kv_b_proj.weight
+        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+            # Shuffled KV: read the block_size-shuffled cache with block-granular
+            # CSR indices built by the metadata builder. cu_seqlens_k stays the
+            # token-granular context cumsum (output token positions).
+            kv_buffer = self._shuffled_kv_view(kv_cache)
+            gather_kv_b_proj(
+                kv_buffer.squeeze(1),  # [num_blocks, block_size, kv_lora+rope]
+                self._k_scale,
+                shuffle_kv_block_indptr,
+                shuffle_kv_block_indices,
+                cu_seqlens_k,
+                _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight),
+                getattr(self.kv_b_proj, "weight_scale", None),
+                k_out,
+                v_out,
+                weight_preshuffle=getattr(self.kv_b_proj.weight, "is_shuffled", False),
+                shuffled_kv_cache=True,
+            )
+        else:
+            gather_kv_b_proj(
+                kv_cache,
+                self._k_scale,
+                kv_indptr,
+                kv_indices,
+                cu_seqlens_k,
+                _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight),
+                getattr(self.kv_b_proj, "weight_scale", None),
+                k_out,
+                v_out,
+                weight_preshuffle=getattr(weight, "is_shuffled", False),
+            )
 
     def _forward_prefill_cached_chunked(
         self,
@@ -403,9 +487,9 @@ class MLAAttention(nn.Module):
 
         Step 1 — new-tokens self-attention (causal). New k/v come from
         kv_b_proj on the input latent kv_c_normed; cu_seqlens_k = cu_seqlens_q.
-        Step 2 — per chunk c of the cached prefix: gather_kv_b_proj into the
-        shared workspace, flash_attn(causal=False, return_lse), merge into a
-        running (chunked_out, chunked_lse).
+        Step 2 — per chunk c of the cached prefix: gather expanded K/V into
+        the shared workspace, flash_attn(causal=False, return_lse), merge
+        into a running (chunked_out, chunked_lse).
         Step 3 — final merge of (chunked_out, chunked_lse) with (new_out,
         new_lse). The cached prefix is the "prefix" side (smaller token
         positions), new tokens are the "suffix".
@@ -422,15 +506,13 @@ class MLAAttention(nn.Module):
         if n == 1 or n % 500 == 0:
             logger.info(
                 "MLA chunked-prefill #%d: layer=%d num_chunks=%d "
-                "total_kv=%d cu_seqlens_q[-1]=%d",
+                "total_kv=%s cu_seqlens_q[-1]=%d",
                 n,
                 self.layer_num,
                 chunk_meta.num_chunks,
                 attn_metadata.total_kv,
                 int(attn_metadata.cu_seqlens_q[-1].item()),
             )
-
-        weight_preshuffle = getattr(self.kv_b_proj.weight, "is_shuffled", False)
 
         # Step 1: new-tokens self-attn via kv_b_proj on the latent.
         if k_rope_new.dim() == 2:
@@ -470,17 +552,23 @@ class MLAAttention(nn.Module):
                 continue
             k_chunk = k_workspace[:n_tok]
             v_chunk = v_workspace[:n_tok]
-            gather_kv_b_proj(
+            self._gather_cached_kv_b_proj(
                 kv_cache,
-                self._k_scale,
                 chunk_meta.kv_indptr[c],
                 chunk_meta.kv_indices[c],
                 chunk_meta.cu_seqlens_k[c],
-                self.kv_b_proj.weight,
-                self.kv_b_proj.weight_scale,
                 k_chunk,
                 v_chunk,
-                weight_preshuffle=weight_preshuffle,
+                shuffle_kv_block_indptr=(
+                    chunk_meta.shuffle_kv_block_indptr[c]
+                    if chunk_meta.shuffle_kv_block_indptr is not None
+                    else None
+                ),
+                shuffle_kv_block_indices=(
+                    chunk_meta.shuffle_kv_block_indices[c]
+                    if chunk_meta.shuffle_kv_block_indices is not None
+                    else None
+                ),
             )
             suf_out, suf_lse = flash_attn_varlen_func(
                 q=prefill_q,
@@ -709,6 +797,27 @@ class MLAAttention(nn.Module):
 
         return self._v_up_proj_and_o_proj(o)
 
+    def _shuffled_kv_view(self, kv_cache: torch.Tensor):
+        """View the flat ``[num_token_slots, 1, d]`` MLA cache as the
+        ``[num_blocks, num_kv_heads=1, block_size, d]`` shuffled layout the
+        block_size=64 Triton/Gluon MLA kernels read and write.
+
+        This is a pure view: ``num_token_slots == num_blocks * block_size`` by
+        construction (block_ratio == kv_cache_block_size), and the per-block
+        ``block_size * d`` region is contiguous, which is all the shuffled
+        kernels require (they compute their own within-block byte offsets).
+        """
+        if not hasattr(self, "_shuffle_block_size_cached"):
+            self._shuffle_block_size_cached = int(
+                get_current_atom_config().kv_cache_block_size
+            )
+        block_size = self._shuffle_block_size_cached
+        d = self.kv_lora_rank + self.qk_rope_head_dim
+        num_token_slots = kv_cache.shape[0]
+        num_blocks = num_token_slots // block_size
+        # [num_token_slots, 1, d] -> [num_blocks, block_size, d] -> [.., 1, ..]
+        return kv_cache.view(num_blocks, block_size, d).unsqueeze(1)
+
     def _forward_decode(
         self,
         q: torch.Tensor,
@@ -730,7 +839,28 @@ class MLAAttention(nn.Module):
             device=q.device,
         )
 
-        if hasattr(attn_metadata, "triton_block_table"):
+        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+            # Shuffled block_size=64 Triton/Gluon MLA decode kernel.
+            kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
+            triton_shuffle_mla_decode_fwd(
+                q,  # [num_tokens, num_query_heads, kv_lora_rank + qk_rope_head_dim]
+                kv_buffer,  # [num_blocks, 1, block_size, kv_lora_rank + qk_rope_head_dim]
+                o,
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.context_lens,  # seqused_k
+                int(attn_metadata.max_seqlen_k),  # max_seqlen_kv
+                attn_metadata.block_tables,  # [bs, max_num_blocks_per_seq] (logical)
+                self.scale,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                True,  # causal
+                # q is bf16 (the shuffled fused write does not quantize q), so
+                # no q de-scale; kv carries its own per-tensor scale.
+                None,  # q_descale
+                self._k_scale,  # kv_descale
+                shuffled_kv_cache=True,
+            )
+        elif hasattr(attn_metadata, "triton_block_table"):
             from aiter.ops.triton.attention.mla_decode import decode_attention_fwd
 
             k_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
@@ -868,16 +998,31 @@ class MLAAttention(nn.Module):
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
-                concat_and_cache_mla(
-                    k_nope,
-                    k_rope.squeeze(1),
-                    kv_cache,
-                    attn_metadata.slot_mapping.flatten(),
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    scale=self._k_scale,
-                )
+                if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+                    shuffled_cache = self._shuffled_kv_view(kv_cache)
+                    triton_cat_and_cache_mla(
+                        k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
+                        k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
+                        shuffled_cache,
+                        attn_metadata.slot_mapping.flatten(),
+                        self._k_scale,
+                        apply_scale=True,
+                        shuffled_kv_cache=True,
+                    )
+                else:
+                    concat_and_cache_mla(
+                        k_nope,
+                        k_rope.squeeze(1),
+                        kv_cache,
+                        attn_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=self._k_scale,
+                    )
 
             if attn_metadata.has_cached:
+                # Shuffled KV: the builder nulls mla_chunk_meta, so cached-prefix
+                # prefill always takes the single-pass gather (which is shuffle
+                # aware). The chunked path stays on the plain layout.
                 chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
                 if chunk_meta is not None:
                     output = self._forward_prefill_cached_chunked(
@@ -904,24 +1049,46 @@ class MLAAttention(nn.Module):
                 device=q_nope.device,
             )
             if kv_cache.numel() > 0:
-                fused_qk_rope_concat_and_cache_mla(
-                    q_nope,
-                    q_rope,
-                    k_nope,
-                    k_rope,
-                    kv_cache.view(
-                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                    ),
-                    q_out,
-                    attn_metadata.slot_mapping,
-                    self._k_scale,
-                    self._q_scale,
-                    positions,
-                    self.rotary_emb.cos_cache,
-                    self.rotary_emb.sin_cache,
-                    is_neox=self.rotary_emb.is_neox_style,
-                    is_nope_first=True,
-                )
+                if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+                    shuffled_cache = self._shuffled_kv_view(kv_cache)
+                    triton_fused_qk_rope_cat_and_cache_mla(
+                        q_nope,
+                        q_rope,
+                        k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
+                        k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
+                        shuffled_cache,
+                        attn_metadata.slot_mapping,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        self._k_scale,
+                        self.rotary_emb.is_neox_style,
+                        num_decode_toks_for_zeros=0,
+                        apply_scale=True,
+                        q_out=q_out,
+                        shuffled_kv_cache=True,
+                    )
+                else:
+                    fused_qk_rope_concat_and_cache_mla(
+                        q_nope,
+                        q_rope,
+                        k_nope,
+                        k_rope,
+                        kv_cache.view(
+                            kv_cache.shape[0],
+                            -1,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        q_out,
+                        attn_metadata.slot_mapping,
+                        self._k_scale,
+                        self._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        is_nope_first=True,
+                    )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
             if context.is_prefill:

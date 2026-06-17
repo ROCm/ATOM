@@ -98,6 +98,12 @@ def build_args(config: dict[str, Any], variant: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def build_env_vars(model: dict[str, Any], variant: dict[str, Any]) -> str:
+    """Compose model- and variant-level environment variables."""
+    parts = [p for p in (model.get("env_vars", ""), variant.get("env_vars", "")) if p]
+    return "\n".join(parts)
+
+
 def _iter_variants(catalog: dict[str, Any]):
     """Yield (model, variant) pairs, defaulting to a single base variant."""
     for model in catalog["models"]:
@@ -116,7 +122,7 @@ def _variant_record(model: dict[str, Any], variant: dict[str, Any]) -> dict[str,
         "bench_args": variant.get("bench_args", ""),
         "suffix": variant.get("suffix", ""),
         "runner": model["runner"],
-        "env_vars": model.get("env_vars", ""),
+        "env_vars": build_env_vars(model, variant),
         "conc_min": variant.get("conc_min", DEFAULT_CONC_MIN),
         "conc_max": variant.get("conc_max", DEFAULT_CONC_MAX),
     }
