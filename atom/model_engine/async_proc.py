@@ -15,6 +15,7 @@ This module provides:
 
 import logging
 import multiprocessing
+import os
 import pickle
 import queue
 import threading
@@ -70,6 +71,29 @@ class AsyncIOProc:
         *args,
         **kwargs,
     ):
+        # Per-rank CPU/NUMA pinning. Must run before any large allocation so
+        # Linux first-touch places memory on the local NUMA node (implicit
+        # membind without libnuma). Gated by env so baseline/pinned A/B is free.
+        # The global GPU index is dp_rank * tp_size + tp_rank (see
+        # engine_core_mgr GPU assignment); the `rank` arg is only the TP-local
+        # rank, which is always 0 under DP-attention (tp_size == 1 per engine).
+        if os.environ.get("ATOM_CPU_AFFINITY", "0") == "1":
+            try:
+                cfg = args[0]
+                tp_size = cfg.tensor_parallel_size
+                dp_size = cfg.parallel_config.data_parallel_size
+                dp_rank = cfg.parallel_config.data_parallel_rank
+                world = dp_size * tp_size
+                gpu = dp_rank * tp_size + rank
+                per = os.cpu_count() // world
+                lo = gpu * per
+                os.sched_setaffinity(0, set(range(lo, lo + per)))
+                logger.info(
+                    f"AsyncIOProc({label}): gpu={gpu}/{world} "
+                    f"pinned to cores {lo}-{lo + per - 1}"
+                )
+            except Exception as e:
+                logger.warning(f"AsyncIOProc({label}): CPU affinity skipped: {e}")
         self.label = f"AsyncIOProc({label})"
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
