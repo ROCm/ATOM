@@ -33,6 +33,8 @@ jobs:
             "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
             -o actionlint.tar.gz
           tar -xzf actionlint.tar.gz actionlint
+          rm -f actionlint.tar.gz
+          chmod +x ./actionlint
 
       - name: Run actionlint
         run: ./actionlint -color -shellcheck "" -pyflakes ""

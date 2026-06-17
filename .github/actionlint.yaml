@@ -27,10 +27,13 @@ config-variables: null
 # "ignore" is an array of regular expression patterns. Matched error messages
 # are ignored. This is similar to the "-ignore" command line option.
 paths:
-  .github/workflows/*.yaml:
+  .github/workflows/*.yml:
     ignore:
       - 'maximum number of inputs for "workflow_dispatch" event is 10 but [0-9]+ inputs are provided'
 
+  .github/workflows/*.yaml:
+    ignore:
+      - 'maximum number of inputs for "workflow_dispatch" event is 10 but [0-9]+ inputs are provided'
   .github/workflows/atom-vllm-accuracy-validation.yaml:
     ignore:
       - '"steps" section is missing in job "oot-model-accuracy-priority-[0-9]+"'
