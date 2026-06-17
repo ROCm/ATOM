@@ -582,7 +582,7 @@ jobs:
                   "model_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
                   "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nAITER_AR_1STAGE_MAX_KB=512",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -591,7 +591,7 @@ jobs:
                   "model_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nAITER_AR_1STAGE_MAX_KB=512",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -801,11 +801,11 @@ jobs:
               },
               "Kimi-K2.5-MXFP4 TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nAITER_AR_1STAGE_MAX_KB=512",
               },
               "Kimi-K2.5-MXFP4 TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nAITER_AR_1STAGE_MAX_KB=512",
               },
               "DeepSeek-R1-FP8 TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
