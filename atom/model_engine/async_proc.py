@@ -15,6 +15,7 @@ This module provides:
 
 import logging
 import multiprocessing
+import os
 import pickle
 import queue
 import threading
@@ -70,6 +71,19 @@ class AsyncIOProc:
         *args,
         **kwargs,
     ):
+        # Per-rank CPU/NUMA pinning. Must run before any large allocation so
+        # Linux first-touch places memory on the local NUMA node (implicit
+        # membind without libnuma). Gated by env so baseline/pinned A/B is free.
+        if os.environ.get("ATOM_CPU_AFFINITY", "0") == "1":
+            n_cpu = os.cpu_count()
+            world = int(os.environ.get("ATOM_WORLD_SIZE", "8"))
+            per = n_cpu // world
+            cores = set(range(rank * per, rank * per + per))
+            os.sched_setaffinity(0, cores)
+            logger.info(
+                f"AsyncIOProc({label}): pinned to cores "
+                f"{rank * per}-{rank * per + per - 1} (NUMA node {rank // (world // 2)})"
+            )
         self.label = f"AsyncIOProc({label})"
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
