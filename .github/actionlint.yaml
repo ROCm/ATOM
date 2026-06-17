@@ -34,3 +34,8 @@ paths:
   .github/workflows/*.yaml:
     ignore:
       - 'maximum number of inputs for "workflow_dispatch" event is 10 but [0-9]+ inputs are provided'
+
+  .github/workflows/atom-vllm-accuracy-validation.yaml:
+    ignore:
+      - '"steps" section is missing in job "oot-model-accuracy-priority-[0-9]+"'
+      - '"steps" section must be sequence node but got alias node'
