@@ -5,7 +5,7 @@ import logging
 
 import aiter
 import torch
-from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
+from aiter import dtypes, fused_qk_rope_concat_and_cache_mla_seg
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton import (
     batched_gemm_a16wfp4 as _fp4_bmm_module,
@@ -968,7 +968,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     ),
                     device=decode_ql_nope.device,
                 )
-                aiter.fused_qk_rope_concat_and_cache_mla(
+                aiter.fused_qk_rope_concat_and_cache_mla_seg(
                     decode_ql_nope,
                     decode_q_pe,
                     k_c_normed,
@@ -1204,7 +1204,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             device=ql_nope.device,
         )
         if kv_cache.numel() > 0:
-            fused_qk_rope_concat_and_cache_mla(
+            fused_qk_rope_concat_and_cache_mla_seg(
                 ql_nope,
                 q_pe,
                 k_c_normed,
