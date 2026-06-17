@@ -591,28 +591,6 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
 }
 
 
-def maybe_enable_glm_dsa_index_cache(hf_config: PretrainedConfig) -> None:
-    """Auto-enable the DSA indexer cache for glm_moe_dsa when the model declares
-    an IndexShare schedule (indexer_types has "shared", or index_topk_freq > 1)
-    but omits the ATOM `use_index_cache` flag. No-op otherwise."""
-    if getattr(hf_config, "model_type", None) != "glm_moe_dsa":
-        return
-    if getattr(hf_config, "use_index_cache", False):
-        return
-    indexer_types = getattr(hf_config, "indexer_types", None)
-    shares_indexer = (indexer_types is not None and "shared" in indexer_types) or int(
-        getattr(hf_config, "index_topk_freq", 1) or 1
-    ) > 1
-    if shares_indexer:
-        hf_config.use_index_cache = True
-        logger.info(
-            "glm_moe_dsa: auto-enabled use_index_cache (index_topk_freq=%s, "
-            "indexer_types declared=%s)",
-            getattr(hf_config, "index_topk_freq", None),
-            indexer_types is not None,
-        )
-
-
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
         model,
@@ -689,7 +667,6 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         for field, value in config_dict.items():
             if not hasattr(hf_config, field):
                 setattr(hf_config, field, value)
-        maybe_enable_glm_dsa_index_cache(hf_config)
         return hf_config
     try:
         hf_config = AutoConfig.from_pretrained(
