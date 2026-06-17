@@ -35,14 +35,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
-    # KV cache layout for TritonMHABackend (ATOM_USE_UNIFIED_ATTN path).
-    #   "auto"    -> flash (4D NHD) on RDNA4 (gfx1200/gfx1201) for faster
-    #               decode, 5D SHUFFLE elsewhere (CDNA / gfx1250).
-    #   "flash"   -> force flash (4D NHD).
-    #   "shuffle" -> force 5D SHUFFLE (pre-shuffled).
-    "ATOM_KV_CACHE_LAYOUT": lambda: os.getenv("ATOM_KV_CACHE_LAYOUT", "auto")
-    .strip()
-    .lower(),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.

@@ -38,7 +38,6 @@ This document describes the environment variables used in the ATOM project.
 |----------|------|---------|-------------|
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
-| **ATOM_KV_CACHE_LAYOUT** | str | auto | KV cache layout for the `ATOM_USE_UNIFIED_ATTN` TritonMHABackend. `auto` uses flash (4D NHD) on RDNA4 (gfx1200/gfx1201) for ~1.7-1.8x faster decode and the 5D SHUFFLE layout on CDNA / gfx1250. `flash` / `shuffle` force a layout. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
 | **ATOM_GFX1201_LM_HEAD_FP8** | bool | 1 (true) | On gfx1201/RDNA4, quantize BF16 `lm_head` weights once and run logits projection through Triton `gemm_a8w8`. Set to `0` to force the BF16 `tgemm` path. |
 
