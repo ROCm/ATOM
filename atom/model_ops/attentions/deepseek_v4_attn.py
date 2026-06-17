@@ -1196,6 +1196,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # buffer rows [0:n_d_seqs]. Mixed runs eager, so bs == n_d_seqs (no CG
         # padding). ----
         decode_view = _MixedDecodeView(batch, n_p_seqs)
+        # prepare_decode READS var["cu_seqlens_q"] (it never writes it — the
+        # normal caller, ModelRunner.prepare_inputs, sets it for the whole
+        # batch). For the mixed batch that buffer holds the FULL [prefill|decode]
+        # cumulative seqlens, so the decode rows are offset by n_p_tokens. Reset
+        # it to the decode-local cumulative seqlens (1 token per decode seq,
+        # no MTP in mixed) so swa_write / paged-decode index the 31-token decode
+        # kv correctly instead of running off the end (GPU OOB in swa_write).
+        decode_max_q = batch.num_spec_step + 1
+        var["cu_seqlens_q"].np[: n_d_seqs + 1] = np.arange(
+            0, (n_d_seqs + 1) * decode_max_q, decode_max_q, dtype=np.int32
+        )
         decode_meta, decode_positions = self.prepare_decode(decode_view, n_d_seqs)
 
         # ---- Merge full-tensor fields for the shared forward_impl ops. ----
