@@ -402,6 +402,19 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 torch.float8_e5m2fnuz,
             )
             is_fp8 = quant_config.quant_dtype in fp8_dtypes
+
+            # [fp8-dispatch exp] env-gated MXFP8 (per_1x32) dispatch, FP8 models
+            # only. DSv4 expert GEMM uses q_type=per_1x32 (block-32, e8m0 scale),
+            # so dispatch quantizes a1 to MXFP8 with hidden//32 scale groups.
+            # Gated on is_fp8 so non-FP8 MORI handle config stays untouched.
+            import os as _os
+
+            _fp8_dispatch_exp = (
+                _os.environ.get("MORI_FP8_DISPATCH", "0") == "1" and is_fp8
+            )
+            if _fp8_dispatch_exp:
+                scale_dim = moe.hidden_dim // 32
+
             # For FP8: enable FP8 dispatch in Mori (quantize before communication)
             # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
             use_fp8_dispatch = is_fp8
@@ -430,7 +443,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 quant_dtype=moe.in_dtype,
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
-                scale_type_size=torch.float32.itemsize,
+                # [fp8-dispatch exp] e8m0 byte scale (1B) for MXFP8 dispatch
+                scale_type_size=(1 if _fp8_dispatch_exp else torch.float32.itemsize),
                 max_num_tokens_per_dp_rank=16384,
                 # input_dtype=moe.in_dtype,
                 input_dtype=moe.in_dtype,
@@ -446,9 +460,15 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             atom_config = get_current_atom_config()
             low_latency = getattr(atom_config, "enable_low_latency", False)
 
-            # We not use quant for mori now
-            use_fp8_dispatch = False
-            quant_type = None
+            # [fp8-dispatch exp] env-gated MXFP8 dispatch (DSv4 q_type=per_1x32).
+            # Default off -> baseline bf16 dispatch unchanged. _fp8_dispatch_exp
+            # already includes the is_fp8 check.
+            if _fp8_dispatch_exp:
+                use_fp8_dispatch = True
+                quant_type = QuantType.per_1x32
+            else:
+                use_fp8_dispatch = False
+                quant_type = None
 
             common_args = dict(
                 rank=all2all_manager.rank,
