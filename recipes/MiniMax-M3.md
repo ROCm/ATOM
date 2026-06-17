@@ -223,22 +223,22 @@ Reference result from the validated run on 4xMI355 GPUs:
 
 ```text
 Successful requests:                     160
-Benchmark duration (s):                  240.38
+Benchmark duration (s):                  194.46
 Total input tokens:                      1175032
 Total generated tokens:                  146426
-Request throughput (req/s):              0.67
-Output token throughput (tok/s):         609.14
-Total Token throughput (tok/s):          5497.34
-Mean TTFT (ms):                          565.86
-Median TTFT (ms):                        330.19
-P99 TTFT (ms):                           3415.41
-Mean TPOT (ms):                          24.73
-Median TPOT (ms):                        24.85
-P99 TPOT (ms):                           27.26
-Mean ITL (ms):                           24.72
-Median ITL (ms):                         21.01
-P99 ITL (ms):                            217.94
-Mean E2EL (ms):                          23191.59
-Median E2EL (ms):                        22982.91
-P99 E2EL (ms):                           27542.50
+Request throughput (req/s):              0.82
+Output token throughput (tok/s):         753.00
+Total Token throughput (tok/s):          6795.63
+Mean TTFT (ms):                          487.13
+Median TTFT (ms):                        280.03
+P99 TTFT (ms):                           3126.69
+Mean TPOT (ms):                          20.03
+Median TPOT (ms):                        20.15
+P99 TPOT (ms):                           22.52
+Mean ITL (ms):                           20.03
+Median ITL (ms):                         16.51
+P99 ITL (ms):                            196.23
+Mean E2EL (ms):                          18815.54
+Median E2EL (ms):                        18857.89
+P99 E2EL (ms):                           22813.32
 ```
