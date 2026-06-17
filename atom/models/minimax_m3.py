@@ -40,6 +40,7 @@ from atom.model_ops.minimax_m3.index_topk import (
     minimax_m3_index_topk_decode,
 )
 from atom.model_ops.minimax_m3.moe import (
+    MiniMaxM3Bf16Experts,
     make_minimax_m3_expert_params_mapping,
 )
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -184,8 +185,28 @@ class MiniMaxM3MLP(nn.Module):
         return self.down_proj(x)
 
 
+def _minimax_m3_use_dedicated_bf16_experts(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Whether to route routed experts through the dedicated bf16 triton MoE.
+
+    Native (unquantized) MiniMax-M3 runs through ``MiniMaxM3Bf16Experts`` — a
+    self-contained triton MoE (custom GEMM kernels + SwiGLU-OAI) that does NOT
+    depend on aiter's CK ``fused_moe`` swiglu kernel, so it runs on stock aiter
+    main. Quantized (FP4/MXFP4) checkpoints keep using the generic ``FusedMoE``
+    path, which the dedicated experts do not implement.
+    """
+    if quant_config is None:
+        return True
+    return getattr(quant_config, "quant_method", "") in ("", None)
+
+
 class MiniMaxM3MoE(nn.Module):
-    """MiniMax-M3 routed MoE aligned with the vLLM-ATOM FusedMoE path."""
+    """MiniMax-M3 routed MoE.
+
+    Native bf16 checkpoints use the dedicated ``MiniMaxM3Bf16Experts`` (triton,
+    no aiter-CK swiglu dependency); FP4 checkpoints use the generic ``FusedMoE``.
+    """
 
     def __init__(
         self,
@@ -224,26 +245,49 @@ class MiniMaxM3MoE(nn.Module):
         self.gate.weight.weight_loader_process = old_wlp
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
-        self.experts = FusedMoE(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            params_dtype=params_dtype,
-            reduce_results=False,
-            renormalize=True,
-            activation=ActivationType.Swiglu,
-            scoring_func=getattr(config, "scoring_func", "sigmoid"),
-            e_score_correction_bias=self.e_score_correction_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.experts",
-            config=config,
-            shared_expert_prefix=f"{prefix}.shared_experts",
+        self.use_dedicated_bf16_experts = _minimax_m3_use_dedicated_bf16_experts(
+            quant_config
         )
-        self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
-        self.fuse_shared_experts = (
-            getattr(self.experts, "num_fused_shared_experts", 0) > 0
-        )
+        if self.use_dedicated_bf16_experts:
+            # Dedicated triton experts: own sigmoid routing + SwiGLU-OAI; applies
+            # routed_scaling_factor internally and returns per-rank (un-reduced)
+            # output. Shared experts are never fused into this path.
+            self.experts = MiniMaxM3Bf16Experts(
+                num_experts=config.num_local_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                scoring_func=getattr(config, "scoring_func", "sigmoid"),
+                routed_scaling_factor=self.routed_scaling_factor,
+                swiglu_alpha=getattr(config, "swiglu_alpha", 1.702),
+                swiglu_beta=getattr(config, "swiglu_beta", 1.0),
+                swiglu_limit=getattr(config, "swiglu_limit", 7.0),
+                quant_config=quant_config,
+                params_dtype=params_dtype,
+                prefix=f"{prefix}.experts",
+            )
+            self.fuse_shared_experts = False
+        else:
+            self.experts = FusedMoE(
+                num_experts=config.num_local_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                params_dtype=params_dtype,
+                reduce_results=False,
+                renormalize=True,
+                activation=ActivationType.Swiglu,
+                scoring_func=getattr(config, "scoring_func", "sigmoid"),
+                e_score_correction_bias=self.e_score_correction_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.experts",
+                config=config,
+                shared_expert_prefix=f"{prefix}.shared_experts",
+            )
+            self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+            self.fuse_shared_experts = (
+                getattr(self.experts, "num_fused_shared_experts", 0) > 0
+            )
 
         self.shared_experts: MiniMaxM3MLP | None = None
         if getattr(config, "n_shared_experts", 0) and not self.fuse_shared_experts:
@@ -261,12 +305,21 @@ class MiniMaxM3MoE(nn.Module):
         router_logits = torch.nn.functional.linear(
             hidden_states.float(), self.gate.weight.float()
         )
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
-        if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
-            routed_output = routed_output * self.routed_scaling_factor
+        if self.use_dedicated_bf16_experts:
+            # Dedicated experts apply routed_scaling_factor internally and return
+            # un-reduced output (the decoder's fused all-reduce reduces it).
+            routed_output = self.experts(
+                hidden_states,
+                router_logits,
+                self.e_score_correction_bias,
+            )
+        else:
+            routed_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+            if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
+                routed_output = routed_output * self.routed_scaling_factor
 
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
@@ -513,7 +566,9 @@ class MiniMaxM3SparseAttention(nn.Module):
         if self.kv_cache.numel() == 0 or self.index_cache.numel() == 0:
             return
         key_cache, value_cache = self.kv_cache.unbind(1)
-        kv_cache_dtype = "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+        kv_cache_dtype = (
+            "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+        )
         aiter.reshape_and_cache(
             k.view(-1, self.num_kv_heads, self.head_dim),
             v.view(-1, self.num_kv_heads, self.head_dim),
