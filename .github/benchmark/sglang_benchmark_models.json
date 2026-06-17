@@ -56,46 +56,6 @@
       ]
     },
     {
-      "display": "DeepSeek-V3.2 FP8 TP4",
-      "dashboard_model": "DeepSeek-V3.2-tp4",
-      "workload_label": "SGLang-OOB",
-      "source_path": "deepseek-ai/DeepSeek-V3.2",
-      "path": "deepseek-ai/DeepSeek-V3.2",
-      "prefix": "deepseek-v3-2-fp8-tp4",
-      "extra_args": [
-        "trust_remote_code",
-        "--tensor-parallel-size 4",
-        "aiter_runtime"
-      ],
-      "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
-      "nightly_group": "A",
-      "env_vars": [
-        "deepseek_common",
-        "SGLANG_AITER_FP8_PREFILL_ATTN=0"
-      ]
-    },
-    {
-      "display": "DeepSeek-V3.2 FP8 TP4 DP4 EP4",
-      "dashboard_model": "DeepSeek-V3.2-tp4-dp4-ep4",
-      "workload_label": "SGLang-OOB",
-      "source_path": "deepseek-ai/DeepSeek-V3.2",
-      "path": "deepseek-ai/DeepSeek-V3.2",
-      "prefix": "deepseek-v3-2-fp8-tp4-dp4-ep4",
-      "extra_args": [
-        "trust_remote_code",
-        "--tensor-parallel-size 4 --data-parallel-size 4 --expert-parallel-size 4 --enable-dp-attention",
-        "aiter_runtime"
-      ],
-      "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
-      "nightly_group": "A",
-      "env_vars": [
-        "deepseek_dp_common",
-        "SGLANG_AITER_FP8_PREFILL_ATTN=0"
-      ]
-    },
-    {
       "display": "DeepSeek-V3.2 FP8 TP8 DP8 EP8",
       "dashboard_model": "DeepSeek-V3.2-tp8-dp8-ep8",
       "workload_label": "SGLang-OOB",
