@@ -198,6 +198,15 @@ jobs:
           echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
           echo "Docker: ${DOCKER_IMAGE}"
 
+      - name: Lock GPU clock (determinism)
+        run: |
+          # Container is --privileged so /sys is writable and amd-smi can set
+          # performance determinism (the only working clock-lock on MI355X;
+          # -l HIGH / setperflevel / sysfs writes are all rejected).
+          GPUS=$(docker exec atom-benchmark bash -lc "amd-smi list --csv 2>/dev/null | tail -n +2 | cut -d, -f1 | tr '\n' ' '")
+          echo "Locking GPUs [$GPUS] to 2400 MHz"
+          docker exec atom-benchmark bash -lc "amd-smi set -g $GPUS -d 2400"
+
       - name: Run benchmark
         timeout-minutes: 80
         env:
@@ -295,6 +304,14 @@ jobs:
         with:
           name: benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
+
+      - name: Unlock GPU clock
+        if: always()
+        run: |
+          # Self-hosted bare-metal runner: the clock lock is driver-level and
+          # persists across jobs, so it MUST be restored even on failure.
+          docker exec atom-benchmark bash -lc \
+            'amd-smi set -g $(amd-smi list --csv 2>/dev/null | tail -n +2 | cut -d, -f1 | tr "\n" " ") -l AUTO' || true
 
       - name: Clean Up
         if: always()
@@ -523,6 +540,12 @@ jobs:
           hf-token: ${{ secrets.AMD_HF_TOKEN }}
           download-required: "false"
 
+      - name: Lock GPU clock (determinism)
+        run: |
+          GPUS=$(docker exec atom-regression bash -lc "amd-smi list --csv 2>/dev/null | tail -n +2 | cut -d, -f1 | tr '\n' ' '")
+          echo "Locking GPUs [$GPUS] to 2400 MHz"
+          docker exec atom-regression bash -lc "amd-smi set -g $GPUS -d 2400"
+
       - name: Launch server
         env:
           SERVER_ARGS: ${{ matrix.cell.server_args }}
@@ -647,6 +670,12 @@ jobs:
           name: regression-results-${{ github.run_id }}-${{ matrix.cell.prefix }}
           path: regression-*.json
           if-no-files-found: ignore
+
+      - name: Unlock GPU clock
+        if: always()
+        run: |
+          docker exec atom-regression bash -lc \
+            'amd-smi set -g $(amd-smi list --csv 2>/dev/null | tail -n +2 | cut -d, -f1 | tr "\n" " ") -l AUTO' || true
 
       - name: Clean Up
         if: always()
