@@ -34,15 +34,3 @@ paths:
   .github/workflows/*.yaml:
     ignore:
       - 'maximum number of inputs for "workflow_dispatch" event is 10 but [0-9]+ inputs are provided'
-  .github/workflows/atom-vllm-accuracy-validation.yaml:
-    ignore:
-      - '"steps" section is missing in job "oot-model-accuracy-priority-[0-9]+"'
-      - '"steps" section must be sequence node but got alias node'
-
-  .github/workflows/atom-vllm-test.yaml:
-    ignore:
-      - 'property "lm_eval_num_fewshot" is not defined in object type'
-
-  .github/workflows/docs.yml:
-    ignore:
-      - 'the runner of "peaceiris/actions-gh-pages@v3" action is too old to run on GitHub Actions'
