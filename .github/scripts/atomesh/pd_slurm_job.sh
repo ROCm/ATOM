@@ -20,6 +20,38 @@ fi
 SELECTED_NODES=("${ALLOC_NODES[@]:0:${NUM_NODES}}")
 SELECTED_NODELIST="$(IFS=,; echo "${SELECTED_NODES[*]}")"
 
+pre_cleanup_nodes() {
+  echo "=== pre-cleanup: stop all running containers ==="
+  for node in "${SELECTED_NODES[@]}"; do
+    echo "[pre-cleanup] node=${node}"
+    srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc '
+      set +e
+      echo "host=$(hostname)"
+
+      running=()
+      while read -r id; do
+        [[ -n "${id}" ]] && running+=("${id}")
+      done < <(docker ps -q 2>/dev/null)
+
+      if [[ "${#running[@]}" -gt 0 ]]; then
+        echo "stopping running containers:"
+        docker ps --format "  {{.ID}} {{.Names}} {{.Status}}"
+        docker stop -t 0 "${running[@]}" >/dev/null 2>&1 || true
+      else
+        echo "no running containers"
+      fi
+
+      sleep 2
+      if command -v rocm-smi >/dev/null 2>&1; then
+        rocm-smi --showmemuse 2>/dev/null || true
+      fi
+    ' || true
+  done
+  echo "=== pre-cleanup done ==="
+}
+
+pre_cleanup_nodes
+
 IPS=()
 for node in "${SELECTED_NODES[@]}"; do
   ip="$(srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc "ip route get 1.1.1.1 | awk '/src/ {print \$7; exit}'")"
@@ -92,9 +124,7 @@ cleanup() {
   echo "=== cleanup rc=${rc} ==="
   for node in "${SELECTED_NODES[@]}"; do
     srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc "
-      docker rm -f atomesh-${ATOMESH_CELL_ID}-${SLURM_JOB_ID}-\${SLURM_PROCID:-x} >/dev/null 2>&1 || true
-      pkill -9 -f 'atom.entrypoints.openai_server' >/dev/null 2>&1 || true
-      pkill -9 -f 'atomesh launch' >/dev/null 2>&1 || true
+      docker stop -t 0 atomesh-${ATOMESH_CELL_ID}-${SLURM_JOB_ID}-\${SLURM_PROCID:-x} >/dev/null 2>&1 || true
     " || true
   done
 }
@@ -131,7 +161,7 @@ srun \
       -e DECODE_TP_SIZE="'"${DECODE_TP}"'" \
       -e RUN_DIR="/run_logs/slurm_job-'"${SLURM_JOB_ID}"'" \
       -v "'"${REPO_ROOT}"'":/workspace/ATOM:ro \
-      -v "'"${RUN_DIR}"'":/run_logs/slurm_job-'"${SLURM_JOB_ID}"'" \
+      -v "'"${RUN_DIR}"'":/run_logs/slurm_job-'"${SLURM_JOB_ID}"' \
       -v /mnt:/mnt \
       -v /data:/data \
       -v /it-share:/it-share \
