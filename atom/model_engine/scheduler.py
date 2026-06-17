@@ -31,7 +31,6 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 import struct
-import atomics
 
 logger = logging.getLogger("atom")
 
@@ -1379,20 +1378,20 @@ class Scheduler:
             return
 
         for req_id in kv_connector_output.finished_recving or ():
-            assert (
-                not self.kv_connector.is_producer
-            ), "Only consumer should update recving KV status"
+            assert not self.kv_connector.is_producer, (
+                "Only consumer should update recving KV status"
+            )
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.finished_sending or ():
-            assert (
-                self.kv_connector.is_producer
-            ), "Only producer should free blocks after sending KV"
+            assert self.kv_connector.is_producer, (
+                "Only producer should free blocks after sending KV"
+            )
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert (
-                req_id in self.deferred_free_blocks
-            ), f"req_id={req_id} not found in deferred_free_blocks"
+            assert req_id in self.deferred_free_blocks, (
+                f"req_id={req_id} not found in deferred_free_blocks"
+            )
             self.block_manager.deallocate(self.deferred_free_blocks.pop(req_id))
 
     def get_request_counts(self) -> tuple[int, int]:
@@ -1632,8 +1631,6 @@ class DecodeScheduler(Scheduler):
         # from the _recv_prefill_done background thread.
         self._prefill_lock = threading.Lock()
         self.cu_fraction: Optional[float] = None
-        self.prefill_waiting_tokens = atomics.atomic(width=4, atype=atomics.INT)
-        self.prefill_waiting_tokens.store(0)
 
     def is_finished(self) -> bool:
         return (
@@ -1674,7 +1671,6 @@ class DecodeScheduler(Scheduler):
             self.waiting.popleft()
 
             self.prefill_waiting[seq.id] = seq
-            self.prefill_waiting_tokens.add(seq.num_tokens)
             newly_allocated.append(seq)
         return newly_allocated
 
@@ -1690,7 +1686,6 @@ class DecodeScheduler(Scheduler):
         """
 
         seq = self.prefill_waiting.pop(seq_id, None)
-        self.prefill_waiting_tokens.add(-seq.num_tokens)
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
@@ -1769,7 +1764,7 @@ class DecodeScheduler(Scheduler):
         if self._cu_shm is not None:
             struct.pack_into("I", self._cu_shm.buf, 0, total_tokens_num_decode)
             if prefill_finished:
-                pwait = int(self.prefill_waiting_tokens.load())
+                pwait = sum(seq.num_tokens for seq in self.prefill_waiting.values())
                 self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
         return (
