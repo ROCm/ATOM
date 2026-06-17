@@ -6,11 +6,11 @@ concurrency:
 
 on:
   schedule:
-    # Nightly at 23:00 Beijing time (15:00 UTC).
-    - cron: '0 15 * * 1,3'  # Mon/Wed: SGLang-OOB non-MTP DeepSeek configs
-    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB MTP + Qwen + GLM configs
-    - cron: '0 15 * * 5'    # Fri: SGLang-Mesh all configs
-    - cron: '0 15 * * 6'    # Sat: SGLang-OOB all configs
+    # Nightly at 02:00 Beijing time (18:00 UTC).
+    - cron: '0 18 * * 1,3'  # Mon/Wed: SGLang-OOB non-MTP DeepSeek configs
+    - cron: '0 18 * * 2,4'  # Tue/Thu: SGLang-OOB MTP + Qwen + GLM configs
+    - cron: '0 18 * * 5'    # Fri: SGLang-Mesh all configs
+    - cron: '0 18 * * 6'    # Sat: SGLang-OOB all configs
   workflow_dispatch:
     inputs:
       benchmark_suite:
