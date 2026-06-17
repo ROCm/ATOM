@@ -271,7 +271,7 @@
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-tp4-met",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=1\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
         },
         {
           "tp_size": 1,
@@ -289,7 +289,7 @@
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-aw-tp2",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 32768 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=1\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
         },
         {
           "tp_size": 4,
@@ -298,7 +298,7 @@
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-aw-tp4",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=1\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
         },
         {
           "tp_size": 1,
@@ -316,7 +316,7 @@
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-mtp-tp4-aw",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
-          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=1\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
         }
       ]
     },
