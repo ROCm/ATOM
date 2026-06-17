@@ -3155,44 +3155,7 @@ class FusedMoE(torch.nn.Module):
                     num_routing_experts=num_routing_experts,
                     fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
                 )
-            elif scoring_func == "sigmoid":
-                routing_weights = torch.sigmoid(router_logits.float())
-                scores_for_choice = routing_weights
-                if e_score_correction_bias is not None:
-                    scores_for_choice = scores_for_choice + e_score_correction_bias
-
-                topk_ids = torch.topk(
-                    scores_for_choice, top_k, dim=-1, sorted=False
-                ).indices
-                topk_weights = routing_weights.gather(dim=-1, index=topk_ids)
-
-                if renormalize:
-                    topk_weights = topk_weights / topk_weights.sum(
-                        dim=-1, keepdim=True
-                    ).clamp_min(1e-20)
-
-                if num_fused_shared_experts > 0:
-                    if routed_scaling_factor != 1.0:
-                        topk_weights = topk_weights * routed_scaling_factor
-
-                    import atom.model_ops.topK as _topK_mod
-
-                    assert _topK_mod.aiter_topK_meta_data is not None, (
-                        "AITER topK meta data is not initialized. "
-                        "Please ensure that init_aiter_topK_meta_data is called "
-                        "before this function."
-                    )
-                    total_topk_weights, total_topk_ids = _topK_mod.aiter_topK_meta_data
-                    tokens_num = topk_ids.shape[0]
-                    assert total_topk_weights.shape[0] >= tokens_num
-                    total_topk_ids[:tokens_num, :top_k] = topk_ids.to(torch.int32)
-                    total_topk_weights[:tokens_num, :top_k] = topk_weights
-                    return total_topk_weights[:tokens_num], total_topk_ids[:tokens_num]
-
-                topk_ids = topk_ids.to(torch.int32)
-            elif scoring_func == "sqrtsoftplus":
-                # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
-                # weights gathered from the unbiased sqrt(softplus(.)) values.
+            elif scoring_func in ("sigmoid", "sqrtsoftplus"):
                 tokens_num = router_logits.shape[0]
                 fuse_shared = num_fused_shared_experts > 0
                 if fuse_shared:
@@ -3229,18 +3192,26 @@ class FusedMoE(torch.nn.Module):
                         dtype=torch.float32,
                         device=router_logits.device,
                     )
+
+                # MiniMax-M3 applies the routed scale outside MoE when shared
+                # experts are not fused; DeepSeek-V4 folds it into routing.
+                route_scale = (
+                    routed_scaling_factor
+                    if fuse_shared or scoring_func == "sqrtsoftplus"
+                    else 1.0
+                )
                 topk_gating(
                     topk_weights,
                     topk_ids,
                     router_logits,
                     e_score_correction_bias,
                     renormalize,
-                    routed_scaling_factor,
-                    score_func="sqrtsoftplus",
+                    route_scale,
+                    score_func=scoring_func,
                 )
                 if fuse_shared:
-                    # Switch from the stride-7 routed view back to the full
-                    # 7-col buffer (routed + shared cols) for the fused kernel.
+                    # Switch from the routed view back to the full buffer
+                    # (routed + shared cols) for the fused MoE kernel.
                     topk_weights = total_topk_weights[:tokens_num]
                     topk_ids = total_topk_ids[:tokens_num]
             else:

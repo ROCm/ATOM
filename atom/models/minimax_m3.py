@@ -513,7 +513,9 @@ class MiniMaxM3SparseAttention(nn.Module):
         if self.kv_cache.numel() == 0 or self.index_cache.numel() == 0:
             return
         key_cache, value_cache = self.kv_cache.unbind(1)
-        kv_cache_dtype = "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+        kv_cache_dtype = (
+            "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+        )
         aiter.reshape_and_cache(
             k.view(-1, self.num_kv_heads, self.head_dim),
             v.view(-1, self.num_kv_heads, self.head_dim),

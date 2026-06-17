@@ -910,9 +910,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 prefix_lens = seq_lens - query_lens
                 seq_lens_cpu = np.asarray(context_lens[:scheduled_bs], dtype=np.int64)
                 total_kv_blocks = int(
-                    (
-                        (seq_lens_cpu + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE
-                    ).sum()
+                    ((seq_lens_cpu + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE).sum()
                 )
                 prefill = MiniMaxM3SparsePrefillMetadata(
                     cu_seqlens_q=cu_q[: scheduled_bs + 1],
