@@ -96,6 +96,7 @@ RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && 
       "s3transfer>=0.17.0,<0.18.0" && \
     if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi && \
     if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi && \
+    "${VENV_PYTHON}" -m pip install 'fastapi>=0.115,<0.137' && \
     "${VENV_PYTHON}" -c "import boto3, botocore, s3transfer; print(f'boto3: {boto3.__version__}'); print(f'botocore: {botocore.__version__}'); print(f's3transfer: {s3transfer.__version__}')" && \
     "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" && \
     "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom amd-mori-nightly || true
