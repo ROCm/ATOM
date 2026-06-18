@@ -81,7 +81,10 @@ class AiterMLABackend(AttentionBackend):
 
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def __init__(self, model_runner):
-        self.block_size = 1
+        if envs.ATOM_MLA_PAGE_SIZE > 1:
+            self.block_size = envs.ATOM_MLA_PAGE_SIZE
+        else:
+            self.block_size = 1
         if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
             assert model_runner.block_size == 64, (
                 f"ATOM_USE_TRITON_MLA=1 and ATOM_USE_TRITON_MLA_SHUFFLE_KV=1 expects --block-size 64 "
@@ -114,6 +117,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.dtype_kv,
             is_sparse=self.is_sparse,
             fast_mode=True,
+            max_split_per_batch=16,
         )
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
 
@@ -195,6 +199,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.dtype_kv,
                 is_sparse=True,
                 fast_mode=True,
+                max_split_per_batch=16,
             )
             mla_metadata["sparse_mtp_work_meta_data"] = torch.empty(
                 smt_wmd_size, dtype=smt_wmd_type, device=self.device
