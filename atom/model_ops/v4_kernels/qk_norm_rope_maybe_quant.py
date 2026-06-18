@@ -351,7 +351,7 @@ def qk_norm_rope_maybe_quant(
             BF16 only (requires ``quant_k=False``).
         state_slot_mapping: ``[bs]`` int32 — per-seq SWA ring slot. Required
             when ``swa_kv`` is set.
-        batch_id_per_token: ``[T]`` int64, ``-1`` on CG-pad tokens — token→seq
+        batch_id_per_token: ``[T]`` int32, ``-1`` on CG-pad tokens — token→seq
             map for the fused (flydsl) SWA scatter. Required by the flydsl path.
         swa_cu_seqlens_q: ``[bs+1]`` int — per-seq cumulative seqlens used by
             the Triton-fallback ``swa_write``. Required only on the fallback
