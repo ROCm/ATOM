@@ -51,6 +51,8 @@ models:
       common:
         AITER_BF16_FP8_MOE_BOUND: "0"
         ATOM_MOE_GU_ITLV: "1"
+        GPU_MAX_HW_QUEUES: "5"
+        ATOM_CPU_AFFINITY: "1"
       prefill: {}
       decode: {}
     server:
@@ -60,7 +62,7 @@ models:
         block_size: 16
         gpu_memory_utilization: 0.85
         max_num_seqs: 256
-        extra_args: ""
+        extra_args: "--enable-dp-attention --enable-tbo"
     suites:
       smoke:
         - name: ds-v4-1p1d-tp8-smoke
