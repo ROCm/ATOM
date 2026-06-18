@@ -483,16 +483,18 @@ def find_eval_scores(root: Path) -> list[float]:
     return scores
 
 
-def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
+def write_summary(
+    rows: list[dict[str, Any]], summary_path: Path, gsm8k: float | None
+) -> None:
     lines = [
         "### ATOMesh Model Performance Benchmark Summary",
         "",
-        "| Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | GSM8K |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} |".format(
+            "| {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {gsm8k} |".format(
                 model=row.get("benchmark_model_name", "--"),
                 topology=row.get("display_topology") or row.get("topology", "--"),
                 isl=row.get("random_input_len", "--"),
@@ -508,6 +510,7 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 ttft=fmt(row.get("mean_ttft_ms")),
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
+                gsm8k=fmt(gsm8k),
             )
         )
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -534,7 +537,7 @@ def main() -> None:
     gsm8k = eval_scores[0] if eval_scores else None
     entries, rows = collect_dashboard_entries(bench_paths, args.run_url, gsm8k)
     Path(args.output).write_text(json.dumps(entries, indent=2), encoding="utf-8")
-    write_summary(rows, Path(args.summary))
+    write_summary(rows, Path(args.summary), gsm8k)
     print(
         f"Generated {len(entries)} dashboard entries from {len(rows)} benchmark result(s)"
     )
