@@ -9,7 +9,7 @@ on:
     # Nightly at 23:00 Beijing time (15:00 UTC; Mesh Fri +30m). OOB tiers + MI308; Fri Mesh (see load-models).
     - cron: '0 15 * * 1,3,5'  # Mon/Wed/Fri: SGLang-OOB P0 + MI308
     - cron: '0 15 * * 2,4'    # Tue/Thu: SGLang-OOB P1 + MI308
-    - cron: '0 15 * * 0,6'    # Sun/Sat: SGLang-OOB P2 + MI308
+    - cron: '0 15 * * 6'      # Sat only: SGLang-OOB P2 + MI308 (Sun excluded)
     - cron: '30 15 * * 5'    # Fri: SGLang-Mesh all (offset from :00 Fri OOB so cron strings differ)
   workflow_dispatch:
     inputs:
@@ -173,7 +173,7 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             case "${SCHEDULE_CRON}" in
               "30 15 * * 5") WORKLOAD_LABEL="SGLang-Mesh" ;;
-              "0 15 * * 1,3,5"|"0 15 * * 2,4"|"0 15 * * 0,6") WORKLOAD_LABEL="SGLang-OOB" ;;
+              "0 15 * * 1,3,5"|"0 15 * * 2,4"|"0 15 * * 6") WORKLOAD_LABEL="SGLang-OOB" ;;
               *) WORKLOAD_LABEL="SGLang-OOB" ;;
             esac
           fi
@@ -520,7 +520,7 @@ jobs:
               schedule_to_tier = {
                   "0 15 * * 1,3,5": ("OOB-P0", OOB_P0_PREFIX_ORDER),
                   "0 15 * * 2,4": ("OOB-P1", OOB_P1_PREFIX_ORDER),
-                  "0 15 * * 0,6": ("OOB-P2", OOB_P2_PREFIX_ORDER),
+                  "0 15 * * 6": ("OOB-P2", OOB_P2_PREFIX_ORDER),
               }
               if schedule_cron not in schedule_to_tier:
                   return "SKIP-UNKNOWN-DAY", []
