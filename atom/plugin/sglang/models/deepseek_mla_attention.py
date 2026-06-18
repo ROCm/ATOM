@@ -157,7 +157,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
     ) -> torch.Tensor:
         attn = self.owner_attn
         from aiter import dtypes
-        from atom.model_ops.attention_mla import fused_qk_rope_concat_and_cache_mla
+        from atom.model_ops.attention_mla import fused_qk_rope_concat_and_cache_mla_seg
         from atom.plugin.sglang.models.deepseek_mla_forward import (
             _get_sglang_radix_attn,
             mla_absorbed_bmm,
@@ -212,7 +212,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
                 dtype=q_out_dtype,
                 device=q_nope_out.device,
             )
-            fused_qk_rope_concat_and_cache_mla(
+            fused_qk_rope_concat_and_cache_mla_seg(
                 q_nope_out,
                 q_pe,
                 k_nope,
