@@ -319,6 +319,25 @@ def dp_gather_hidden_and_router(
     return hidden_states, router_logits, original_hidden_size, None
 
 
+def run_dp_collective_with_tbo_overlap(fn):
+    """Run a DP collective, yielding to TBO comm stream when overlap is active."""
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if not tbo_active():
+        return fn()
+
+    from atom.utils.tbo.ubatching import (
+        tbo_switch_to_compute_sync,
+        tbo_yield_and_switch_from_compute_to_comm,
+    )
+
+    tbo_yield_and_switch_from_compute_to_comm()
+    try:
+        return fn()
+    finally:
+        tbo_switch_to_compute_sync()
+
+
 @torch_compile_guard()
 def get_max_tokens_across_dispatchers(input: torch.Tensor) -> int:
     return input.item()
@@ -392,74 +411,90 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
             scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
 
-            # Check if quant_dtype is an FP8 type
             from aiter import QuantType
 
-            fp8_dtypes = (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-                torch.float8_e5m2,
-                torch.float8_e5m2fnuz,
-            )
-            is_fp8 = quant_config.quant_dtype in fp8_dtypes
-
-            # [fp8-dispatch exp] env-gated MXFP8 (per_1x32) dispatch, FP8 models
-            # only. DSv4 expert GEMM uses q_type=per_1x32 (block-32, e8m0 scale),
-            # so dispatch quantizes a1 to MXFP8 with hidden//32 scale groups.
-            # Gated on is_fp8 so non-FP8 MORI handle config stays untouched.
             import os as _os
 
-            # NOTE: drop the is_fp8 guard. DSv4 MXFP8 activation quant is owned by
-            # the aiter GEMM, so quant_config.quant_dtype is None here (is_fp8=False).
-            # We know DSv4 is per_1x32 MXFP8, so gate on the env flag alone.
-            _fp8_dispatch_exp = _os.environ.get("MORI_FP8_DISPATCH", "0") == "1"
-            if _fp8_dispatch_exp:
-                scale_dim = moe.hidden_dim // 32
+            dispatch_quant_dtype: torch.dtype | None = None
+            dispatch_dtype_env = _os.environ.get("MORI_DISPATCH_DTYPE", "auto").strip().lower()
+            if dispatch_dtype_env in ("auto", ""):
+                model_dispatch_quant = MoEActivationQuant.from_model_config(
+                    moe.a_quant_dtype if isinstance(moe.a_quant_dtype, str) else None
+                )
+                if model_dispatch_quant == MoEActivationQuant.FP8:
+                    dispatch_quant_dtype = dtypes.fp8
+                elif model_dispatch_quant == MoEActivationQuant.FP4:
+                    dispatch_quant_dtype = dtypes.fp4x2
+            elif dispatch_dtype_env in ("none", "off", "bf16"):
+                dispatch_quant_dtype = None
+            elif dispatch_dtype_env == "fp8":
+                dispatch_quant_dtype = dtypes.fp8
+            elif dispatch_dtype_env == "fp4":
+                dispatch_quant_dtype = dtypes.fp4x2
+            else:
+                logger.warning(
+                    "Invalid MORI_DISPATCH_DTYPE=%s. Supported: auto|none|bf16|fp8|fp4. Falling back to auto.",
+                    dispatch_dtype_env,
+                )
+                model_dispatch_quant = MoEActivationQuant.from_model_config(
+                    moe.a_quant_dtype if isinstance(moe.a_quant_dtype, str) else None
+                )
+                if model_dispatch_quant == MoEActivationQuant.FP8:
+                    dispatch_quant_dtype = dtypes.fp8
+                elif model_dispatch_quant == MoEActivationQuant.FP4:
+                    dispatch_quant_dtype = dtypes.fp4x2
 
-            # [fp8-cast exp] measurement-only: cast a1 bf16->fp8 before dispatch
-            # (no scale), dispatch via fp8 kernel, cast back to bf16 after so the
-            # GEMM self-quantizes as usual (no scale plumbing, no crash). Lets us
-            # measure the real fp8 dispatch kernel speedup. Accuracy is garbage.
-            _fp8_cast_dispatch = (
-                _os.environ.get("MORI_FP8_DISPATCH_CAST", "0") == "1"
+            # Backward compatibility for the old fp8 env knob.
+            if _os.environ.get("MORI_FP8_DISPATCH", "0") == "1":
+                dispatch_quant_dtype = dtypes.fp8
+
+            if dispatch_quant_dtype is not None and moe.hidden_dim % 32 != 0:
+                logger.warning(
+                    "Disable quantized MORI dispatch because hidden_dim=%d is not divisible by 32.",
+                    moe.hidden_dim,
+                )
+                dispatch_quant_dtype = None
+
+            # phase gating for quantized dispatch. Keep the legacy fp8-only env.
+            _dispatch_quant_decode_only = (
+                _os.environ.get(
+                    "MORI_DISPATCH_DECODE_ONLY",
+                    _os.environ.get("MORI_FP8_DISPATCH_DECODE_ONLY", "0"),
+                )
+                == "1"
             )
 
-            # For FP8: enable FP8 dispatch in Mori (quantize before communication)
-            # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
-            use_fp8_dispatch = is_fp8
-            quant_type = None
-            if use_fp8_dispatch:
-                if quant_config.is_block_quantized:
-                    quant_type = QuantType.per_1x128
-                elif quant_config.is_per_act_token:
-                    quant_type = QuantType.per_Token
+            if dispatch_quant_dtype is not None:
+                scale_dim = moe.hidden_dim // 32
+                scale_type_size = 1  # e8m0 scale
+            else:
+                scale_type_size = torch.float32.itemsize
 
-            # For FP8: use FP8 dtype for communication
-            # For FP4/no quant: use bfloat16
-            # mori_dtype = (
-            #     quant_config.quant_dtype
-            #     if is_fp8 and quant_type is not None
-            #     else torch.bfloat16
-            # )
-            # mori_dtype = torch.bfloat16
+            # Combine quantization mode is provided by the standardized MORI
+            # dispatch/combine API.
+            combine_quant_type = _os.environ.get(
+                "MORI_COMBINE_QUANT_TYPE", "none"
+            ).strip().lower()
+            if combine_quant_type not in {"none", "fp8_direct_cast", "fp8_blockwise"}:
+                logger.warning(
+                    "Invalid MORI_COMBINE_QUANT_TYPE=%s. Supported: none|fp8_direct_cast|fp8_blockwise. Falling back to none.",
+                    combine_quant_type,
+                )
+                combine_quant_type = "none"
 
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
-                # quant_dtype=mori_dtype,
-                # We now use bfloat16 for mori
-                # TODO: To support quant
                 quant_dtype=moe.in_dtype,
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
-                # [fp8-dispatch exp] e8m0 byte scale (1B) for MXFP8 dispatch
-                scale_type_size=(1 if _fp8_dispatch_exp else torch.float32.itemsize),
+                scale_type_size=scale_type_size,
                 max_num_tokens_per_dp_rank=16384,
-                # input_dtype=moe.in_dtype,
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
                 num_experts_per_token=moe.experts_per_token,
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
+                quant_type=combine_quant_type,
             )
             from atom.config import get_current_atom_config
             from atom.utils.tbo.ubatching import tbo_enabled
@@ -469,15 +504,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             atom_config = get_current_atom_config()
             low_latency = getattr(atom_config, "enable_low_latency", False)
 
-            # [fp8-dispatch exp] env-gated MXFP8 dispatch (DSv4 q_type=per_1x32).
-            # Default off -> baseline bf16 dispatch unchanged. _fp8_dispatch_exp
-            # already includes the is_fp8 check.
-            if _fp8_dispatch_exp:
-                use_fp8_dispatch = True
-                quant_type = QuantType.per_1x32
-            else:
-                use_fp8_dispatch = False
-                quant_type = None
+            use_fp8_dispatch = dispatch_quant_dtype == dtypes.fp8
+            quant_type = QuantType.per_1x32 if use_fp8_dispatch else None
 
             common_args = dict(
                 rank=all2all_manager.rank,
@@ -490,6 +518,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
                 data_type_itemsize=moe.in_dtype.itemsize,
                 max_token_type_size=moe.in_dtype.itemsize,
+                scale_type_size=scale_type_size,
+                quant_type=combine_quant_type,
             )
 
             tbo_mori_ops = None
@@ -514,11 +544,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 use_fp8_dispatch=use_fp8_dispatch,
+                dispatch_quant_dtype=dispatch_quant_dtype,
                 quant_type=quant_type,
                 is_async=is_async,
                 tbo_mori_ops=tbo_mori_ops,
                 low_latency=low_latency,
-                fp8_cast_dispatch=_fp8_cast_dispatch,
+                fp8_dispatch_decode_only=_dispatch_quant_decode_only,
+                dispatch_quant_decode_only=_dispatch_quant_decode_only,
             )
 
         return prepare_finalize
@@ -3308,28 +3340,16 @@ class FusedMoE(torch.nn.Module):
             dp_group = get_dp_group()
             dp_eager_mode = not ctx.context.dp_uniform_decode
 
-            from atom.utils.tbo.ubatching import tbo_active
-
-            _tbo = tbo_active()
-            if _tbo:
-                from atom.utils.tbo.ubatching import (
-                    tbo_switch_to_compute_sync,
-                    tbo_yield_and_switch_from_compute_to_comm,
-                )
-
-                tbo_yield_and_switch_from_compute_to_comm()
-
             (
                 hidden_states,
                 router_logits,
                 original_hidden_size,
                 sizes,
-            ) = dp_gather_hidden_and_router(
-                hidden_states, router_logits, dp_eager_mode, ctx, dp_group
+            ) = run_dp_collective_with_tbo_overlap(
+                lambda: dp_gather_hidden_and_router(
+                    hidden_states, router_logits, dp_eager_mode, ctx, dp_group
+                )
             )
-
-            if _tbo:
-                tbo_switch_to_compute_sync()
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -3353,18 +3373,16 @@ class FusedMoE(torch.nn.Module):
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
         if use_dp_gather_scatter:
-            if _tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
             if dp_eager_mode:
-                final_hidden_states = reduce_scatterv(
-                    final_hidden_states, sizes, dp_group
+                final_hidden_states = run_dp_collective_with_tbo_overlap(
+                    lambda: reduce_scatterv(final_hidden_states, sizes, dp_group)
                 )
             else:
-                final_hidden_states = reduce_scatter_with_unpadding(
-                    final_hidden_states, original_hidden_size
+                final_hidden_states = run_dp_collective_with_tbo_overlap(
+                    lambda: reduce_scatter_with_unpadding(
+                        final_hidden_states, original_hidden_size
+                    )
                 )
-            if _tbo:
-                tbo_switch_to_compute_sync()
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
