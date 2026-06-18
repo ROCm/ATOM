@@ -1271,9 +1271,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 ub_state_np = np.zeros(ub_real_reqs, dtype=np.int32)
             var[f"{p}v4_meta_state_slot_groups"].np[:ub_real_reqs] = ub_state_np
             var[f"{p}v4_meta_state_slot_groups"].np[ub_real_reqs:padded_bs] = 0
-            state_slot_np_ub = (
-                var[f"{p}v4_meta_state_slot_groups"].np[:padded_bs].copy()
-            )
+            state_slot_np_ub = var[f"{p}v4_meta_state_slot_groups"].np[:padded_bs].copy()
 
             var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
                 req_start : req_start + ub_real_reqs
@@ -1891,15 +1889,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if T_pad > T:
             hca_indptr_np[T + 1 :].fill(int(hca_indptr_np[T]))
 
-        swa_indptr_gpu = self._stage(
-            f"{buf_prefix_ubatch}v4_kv_indptr_swa", swa_indptr_np
-        )
-        csa_indptr_gpu = self._stage(
-            f"{buf_prefix_ubatch}v4_kv_indptr_csa", csa_indptr_np
-        )
-        hca_indptr_gpu = self._stage(
-            f"{buf_prefix_ubatch}v4_kv_indptr_hca", hca_indptr_np
-        )
+        swa_indptr_gpu = self._stage(f"{buf_prefix_ubatch}v4_kv_indptr_swa", swa_indptr_np)
+        csa_indptr_gpu = self._stage(f"{buf_prefix_ubatch}v4_kv_indptr_csa", csa_indptr_np)
+        hca_indptr_gpu = self._stage(f"{buf_prefix_ubatch}v4_kv_indptr_hca", hca_indptr_np)
         # batch_id_per_token + n_committed_csa_per_seq already staged in
         # `_attach_v4_per_fwd_meta`.
 
@@ -1926,9 +1918,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 swa_pages + block_tables_np_full[bid_expanded, entry_offsets]
             ).astype(np.int32)
         # Stage to GPU (HCA compress section at head; SWA prefix scattered below).
-        hca_indices_gpu = self._stage(
-            f"{buf_prefix_ubatch}v4_kv_indices_hca", hca_indices_np
-        )
+        hca_indices_gpu = self._stage(f"{buf_prefix_ubatch}v4_kv_indices_hca", hca_indices_np)
 
         # ----- Write SWA / CSA / HCA window-prefix paged offsets (1 kernel) -----
         # Kernel computes `n = min(positions[t]+1, win)` and ring-index
@@ -2188,12 +2178,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.swa_pages = swa_pages
 
     def _build_compress_plans(
-        self,
-        extend_lens_np,
-        context_lens_np,
-        *,
-        for_decode_cg: bool,
-        buf_prefix_ubatch: str = "",
+        self, extend_lens_np, context_lens_np, *, for_decode_cg: bool, buf_prefix_ubatch: str = ""
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
 
@@ -2396,7 +2381,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             positions_gpu=positions,
         )
 
-        if self.model_runner.config.enable_tbo_decode and bs > 2:
+        if (
+            self.model_runner.config.enable_tbo_decode
+            and bs > 2
+        ):
             self._prepare_ubatch_decode(
                 scheduled_bs=bs,
                 bs=bs,
@@ -2577,7 +2565,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bs = self.max_bs
         win = self.window_size
         T_dec = self.max_decode_tokens
-        max_q_len = 1 + self.max_spec_steps
         max_blocks = self.max_num_blocks_per_seq // self.block_ratio
 
         for ub_idx in range(self._NUM_TBO_UBATCHES):
