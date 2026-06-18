@@ -263,10 +263,8 @@ class MiniMaxM3MoE(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        # Match vLLM: router weights are stored and computed in fp32.
-        old_wlp = self.gate.weight.weight_loader_process
-        self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
-        self.gate.weight.weight_loader_process = old_wlp
+        # The checkpoint stores router weights as fp32, but routing tolerates bf16
+        # logits. Let the weight loader cast once instead of casting every forward.
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.use_dedicated_bf16_experts = _minimax_m3_use_dedicated_bf16_experts(
@@ -326,9 +324,8 @@ class MiniMaxM3MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
-        router_logits = torch.nn.functional.linear(
-            hidden_states.float(), self.gate.weight.float()
-        )
+        router_logits = self.gate(hidden_states)
+
         if self.use_dedicated_bf16_experts:
             # Dedicated experts apply routed_scaling_factor internally and return
             # un-reduced output (the decoder's fused all-reduce reduces it).
