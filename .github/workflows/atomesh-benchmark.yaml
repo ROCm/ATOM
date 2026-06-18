@@ -80,7 +80,7 @@ jobs:
       - name: Build benchmark matrix
         id: matrix
         env:
-          SUITE: ${{ github.event_name == 'schedule' && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
+          SUITE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
           MODEL_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.model || '' }}
           ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
         run: |

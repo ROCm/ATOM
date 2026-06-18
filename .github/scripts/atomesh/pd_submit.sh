@@ -112,6 +112,8 @@ exports = {
     "MEM_FRACTION": server_args.get("gpu_memory_utilization", 0.85),
     "MAX_NUM_SEQS": server_args.get("max_num_seqs", 256),
     "EXTRA_SERVER_ARGS": server_args.get("extra_args", ""),
+    "PREFILL_EXTRA_SERVER_ARGS": prefill.get("extra_args", ""),
+    "DECODE_EXTRA_SERVER_ARGS": decode.get("extra_args", ""),
     "RUN_EVAL": str(cell.get("run_eval", False)).lower(),
     "EVAL_TASK": accuracy.get("task", "gsm8k"),
     "EVAL_FEWSHOT": accuracy.get("fewshot", 3),

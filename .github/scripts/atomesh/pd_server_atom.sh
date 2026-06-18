@@ -31,6 +31,16 @@ BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MEM_FRACTION="${MEM_FRACTION:-0.85}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
+PREFILL_EXTRA_SERVER_ARGS="${PREFILL_EXTRA_SERVER_ARGS:-}"
+DECODE_EXTRA_SERVER_ARGS="${DECODE_EXTRA_SERVER_ARGS:-}"
+PREFILL_SERVER_ARGS="${EXTRA_SERVER_ARGS}"
+DECODE_SERVER_ARGS="${EXTRA_SERVER_ARGS}"
+if [[ -n "${PREFILL_EXTRA_SERVER_ARGS}" ]]; then
+  PREFILL_SERVER_ARGS="${PREFILL_SERVER_ARGS:+${PREFILL_SERVER_ARGS} }${PREFILL_EXTRA_SERVER_ARGS}"
+fi
+if [[ -n "${DECODE_EXTRA_SERVER_ARGS}" ]]; then
+  DECODE_SERVER_ARGS="${DECODE_SERVER_ARGS:+${DECODE_SERVER_ARGS} }${DECODE_EXTRA_SERVER_ARGS}"
+fi
 
 ISL_LIST="${ISL_LIST:-8192}"
 OSL="${OSL:-1024}"
@@ -199,7 +209,7 @@ start_prefill() {
     "${prefill_parallel[@]}" \
     --max-num-seqs "${MAX_NUM_SEQS}" \
     --kv-transfer-config "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${HANDSHAKE_PORT}}" \
-    ${EXTRA_SERVER_ARGS} \
+    ${PREFILL_SERVER_ARGS} \
     2>&1 | tee "${RUN_DIR}/logs/${log_name}.log" &
   server_pid=$!
 }
@@ -220,7 +230,7 @@ start_decode() {
     --max-num-seqs "${decode_max_num_seqs}" \
     --kv-transfer-config "{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${HANDSHAKE_PORT}}" \
     "${cudagraph_args[@]}" \
-    ${EXTRA_SERVER_ARGS} \
+    ${DECODE_SERVER_ARGS} \
     2>&1 | tee "${RUN_DIR}/logs/decode-rank-${NODE_RANK}.log" &
   server_pid=$!
 }
