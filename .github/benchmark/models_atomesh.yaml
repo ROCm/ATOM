@@ -2,7 +2,7 @@ defaults:
   runner:
     slurm_account: amd-frameworks
     slurm_partition: amd-frameworks
-    slurm_submit_runner: atom-mi355-8gpu-oot-benchmark
+    slurm_submit_runner: atomesh-cicd
     gpus_per_node: 8
     cpus_per_task: 114
     time_limit: "06:00:00"
