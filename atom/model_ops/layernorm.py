@@ -13,7 +13,6 @@ from aiter import (
     rmsnorm2d_fwd_with_add,
 )
 from aiter.dist.communication_op import (
-    tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
@@ -764,7 +763,13 @@ def fused_allreduce_gemma_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm."""
     if get_tensor_model_parallel_world_size() > 1:
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return tensor_model_parallel_fused_allreduce_rmsnorm(
+            hidden_states.contiguous(),
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            gemma_norm=True,
+        )
     return norm(hidden_states, residual)
 
 
