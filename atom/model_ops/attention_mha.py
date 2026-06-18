@@ -654,10 +654,13 @@ class PagedAttentionImpl(nn.Module):
             q_5d = q.view(
                 batch_size, max_seqlen_q, self.num_kv_heads, gqa, self.head_dim
             )
-            q_fp8 = (q_5d / self.kv_scale_float).to(aiter.dtypes.fp8).contiguous()
+            if q_5d.dtype == aiter.dtypes.fp8:
+                q_fp8 = q_5d.contiguous()
+            else:
+                q_fp8 = (q_5d / self.kv_scale_float).to(aiter.dtypes.fp8).contiguous()
             v_cache_5d = self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
-            output = torch.empty_like(q_5d)
+            output = torch.empty(q_5d.shape, dtype=torch.bfloat16, device=q.device)
             # CUDAGraph decode pads scheduled_bs up to graph_bs. PA ASM has no
             # work for padded rows (context_len == 0); zero output so padded rows
             # stay deterministic.
