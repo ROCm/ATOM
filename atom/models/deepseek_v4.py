@@ -1884,7 +1884,7 @@ class DeepseekV4Attention(nn.Module):
             dtype=o.dtype,
             device=o.device,
         ).transpose(0, 1)
-        y = batched_gemm_bf16(o.transpose(0, 1), wo_a, y)
+        y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
         x = self.wo_b(y.transpose(0, 1).flatten(1))
         return x
 
