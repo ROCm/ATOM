@@ -14,6 +14,9 @@ USAGE
 CELL_JSON=""
 RESULT_DIR="${RESULT_DIR:-atomesh-results}"
 DRY_RUN=0
+JOB_ID=""
+SLURM_JOB_ACTIVE=0
+SCANCEL_SENT=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -177,6 +180,40 @@ if ! command -v sbatch >/dev/null 2>&1; then
   exit 127
 fi
 
+scancel_slurm_job() {
+  local reason="$1"
+  if [[ "${SLURM_JOB_ACTIVE}" != "1" || -z "${JOB_ID}" || "${SCANCEL_SENT}" == "1" ]]; then
+    return 0
+  fi
+
+  SCANCEL_SENT=1
+  echo "=== cancelling Slurm job ${JOB_ID}: ${reason} ===" >&2
+  if command -v scancel >/dev/null 2>&1; then
+    scancel "${JOB_ID}" || true
+  else
+    echo "WARNING: scancel not found; unable to cancel Slurm job ${JOB_ID}" >&2
+  fi
+}
+
+on_cancel() {
+  local signal="$1"
+  local rc="$2"
+  scancel_slurm_job "received ${signal}"
+  exit "${rc}"
+}
+
+on_exit() {
+  local rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    scancel_slurm_job "exiting rc=${rc}"
+  fi
+}
+
+trap on_exit EXIT
+trap 'on_cancel HUP 129' HUP
+trap 'on_cancel INT 130' INT
+trap 'on_cancel TERM 143' TERM
+
 set_slurm_job_log_paths() {
   local job_id="$1"
   SLURM_JOB_OUTPUT="${SLURM_OUTPUT//%j/${job_id}}"
@@ -295,9 +332,11 @@ if [[ "${SBATCH_RC}" -ne 0 ]]; then
   exit "${SBATCH_RC}"
 fi
 
+SLURM_JOB_ACTIVE=1
 set_slurm_job_log_paths "${JOB_ID}"
 monitor_slurm_job "${JOB_ID}"
 read_slurm_exit_code "${JOB_ID}"
+SLURM_JOB_ACTIVE=0
 SBATCH_RC="${SLURM_JOB_RC}"
 echo "slurm_state=${SLURM_STATE}"
 echo "slurm_exit_code=${SLURM_EXIT_CODE}"
