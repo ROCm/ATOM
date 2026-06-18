@@ -98,7 +98,12 @@ class tokenIDProcessor:
         # Deferred output is disabled when running in P/D disaggregation mode
         # (kv_transfer_config is set), enabled otherwise.
         # TODO: In P/D disaggregation mode, if have issue, we can disable it
-        self.is_deferred_out = True
+        # Mixed prefill+decode: the deferred GPU-gather path is a known-buggy
+        # follow-up (placeholder accuracy bug + suspected scale-dependent
+        # corruption). Disable deferred when the mixed flag is on.
+        self.is_deferred_out = not getattr(
+            runner.config, "enable_mixed_prefill_decode", False
+        )
 
         self.runner = runner
         device = runner.device
