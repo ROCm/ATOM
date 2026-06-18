@@ -58,6 +58,12 @@ done
 rm -rf ~/.cache/atom/*
 rm -rf ./gpucore.*
 
+# Disable core dumps: a single ROCm fault dumps a 30-50 GB gpucore PER RANK,
+# which on an 8-GPU TP run fills the disk in seconds (and triggers the
+# apport "execvp failed" noise). The debug-agent wrapper already does this;
+# the normal launcher must too, since faults can happen in production runs.
+ulimit -c 0
+
 # Write config header to log (truncates old content).
 # Inherited env vars are dumped explicitly so you never have to wonder
 # whether ATOM_USE_TRITON_MOE / V4_USE_REF_QUANT / etc. were set.
