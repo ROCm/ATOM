@@ -873,6 +873,12 @@ class Compressor(nn.Module):
         )
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
 
+        # Fixed CUDAGraph-stable scratch for `wkv_gate(x)` output on the captured
+        # decode path (lazily sized on first graph forward; see forward()). Keyed
+        # per TBO ubatch id so the two concurrent ubatch threads never share the
+        # same scratch (mirrors the per-ubatch topK / mori buffers).
+        self._combined_cg_buf: dict = {}
+
         # External tensors — assigned by the owning Attention / Indexer at first forward.
         self.kv_cache: Optional[torch.Tensor] = None
         self.rotary_emb: Optional[_V4RoPE] = None
@@ -979,6 +985,25 @@ class Compressor(nn.Module):
         # stride must be 1).
         coff_d = (1 + overlap) * d
         combined = self.wkv_gate(x)
+        # TBO decode: copy `combined` into a fixed-address buffer so CUDAGraph
+        # capture/replay see a stable pointer (allocator may re-place it).
+        from atom.utils.tbo.ubatching import tbo_active, tbo_current_ubatch_id
+
+        _fc = get_forward_context()
+        if getattr(_fc, "in_hipgraph", False) and tbo_active():
+            ub = tbo_current_ubatch_id()
+            n_tok = combined.shape[0]
+            buf = self._combined_cg_buf.get(ub)
+            if buf is None or buf.shape[0] < n_tok or buf.shape[1] != combined.shape[1]:
+                buf = torch.empty(
+                    combined.shape[0],
+                    combined.shape[1],
+                    dtype=combined.dtype,
+                    device=combined.device,
+                )
+                self._combined_cg_buf[ub] = buf
+            buf[:n_tok].copy_(combined)
+            combined = buf[:n_tok]
         kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
@@ -1336,10 +1361,12 @@ class Indexer(nn.Module):
         """
         total_tokens = q_fp8.size(0)
         n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
-        bs = block_tables.size(0)
-        # V4-Pro has no MTP, so next_n = total_tokens // bs = 1. The reshape
-        # also handles future multi-token decode (MTP) without code change.
-        next_n = total_tokens // bs
+        # NOTE: derive the query batch size from the ACTUAL number of query
+        # tokens, NOT from block_tables.size(0). Under TBO the per-ubatch
+        # block_tables / n_committed are padded to a DP-unified bucket and will
+        # get errors if we try to use the padded rows.
+        next_n = max(1, int(get_forward_context().attn_metadata.max_seqlen_q))
+        bs = total_tokens // next_n
         # deepgemm requires Q in [bs, next_n, heads, head_dim], KV in
         # [num_blocks, block_size, n_head=1, hidden_dim+scale_dim] (4D).
         q_4d = q_fp8.view(
@@ -1646,7 +1673,11 @@ class DeepseekV4Attention(nn.Module):
         Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us."""
         fc = get_forward_context()
         current_stream = fc.main_stream
-        use_async_compress = self._use_async_compress and fc.in_hipgraph
+        from atom.utils.tbo.ubatching import tbo_active
+
+        use_async_compress = (
+            self._use_async_compress and fc.in_hipgraph and not tbo_active()
+        )
         has_compressor = self.compressor is not None
         has_indexer = self.indexer is not None and not self.skip_topk
         if use_async_compress:
