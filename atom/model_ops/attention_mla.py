@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import os
 from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import Optional
@@ -20,7 +19,6 @@ from aiter import (
     fused_qk_rope_concat_and_cache_mla_seg,
     get_hip_quant,
 )
-from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
@@ -1031,7 +1029,6 @@ class MLAAttention(nn.Module):
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_indices = self.sparse_kv_indices_buffer
 
-            dp_size = get_dp_group().world_size
             use_persistent_mode = False
 
             # Sparse layers in MTP verify use separate persistent metadata
