@@ -37,6 +37,28 @@ def slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-").lower()
 
 
+def format_display_topology(
+    topology: str,
+    suite_cfg: dict[str, Any],
+    prefill_cfg: dict[str, Any],
+    decode_cfg: dict[str, Any],
+) -> str:
+    if "display_topology" in suite_cfg:
+        return str(suite_cfg["display_topology"])
+
+    parts = [
+        part.upper()
+        for part in re.split(r"[_-]+", topology)
+        if part and not re.fullmatch(r"tp\d*", part, re.IGNORECASE)
+    ]
+    prefill_tp = prefill_cfg.get("tp")
+    decode_tp = decode_cfg.get("tp")
+    if prefill_tp == decode_tp and prefill_tp is not None:
+        parts.append(f"TP{prefill_tp}")
+
+    return "-".join(parts)
+
+
 def load_config(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle) or {}
@@ -121,6 +143,9 @@ def build_cell(
         )
 
     topology = str(suite_cfg["topology"])
+    display_topology = format_display_topology(
+        topology, suite_cfg, prefill_cfg, decode_cfg
+    )
     cell_id = slug(f"{model_name}-{suite_cfg.get('name', topology)}-{suite_name}")
     image = override_image or str(backend_cfg.get("image"))
     return {
@@ -133,7 +158,7 @@ def build_cell(
         "model_path": str(model_cfg["model_path"]),
         "precision": str(model_cfg.get("precision", "")),
         "topology": topology,
-        "display_topology": str(suite_cfg.get("display_topology", topology)),
+        "display_topology": display_topology,
         "nodes": nodes,
         "num_nodes": len(nodes),
         "isl": isl,

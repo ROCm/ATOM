@@ -62,12 +62,11 @@ models:
         block_size: 16
         gpu_memory_utilization: 0.85
         max_num_seqs: 256
-        extra_args: "--enable-dp-attention --enable-tbo"
+        extra_args: ""
     suites:
       smoke:
         - name: ds-v4-1p1d-tp8-smoke
-          topology: 1p1d_tp
-          display_topology: 1P1D-TP8
+          topology: 1p1d
           nodes: [mia1-p02-g42, mia1-p02-g44]
           isl: [8192]
           osl: 1024
@@ -77,8 +76,7 @@ models:
 
       nightly:
         - name: ds-v4-1p1d-tp8
-          topology: 1p1d_tp
-          display_topology: 1P1D-TP8
+          topology: 1p1d
           nodes: [mia1-p02-g42, mia1-p02-g44]
           isl: [8192]
           osl: 1024
@@ -87,7 +85,6 @@ models:
 
         - name: ds-v4-2p1d-dpa-tp8
           topology: 2p1d_dpa
-          display_topology: 2P1D-DPA-TP8
           nodes: [mia1-p02-g42, mia1-p02-g44, mia1-p02-g47]
           isl: [8192]
           osl: 1024
@@ -95,11 +92,11 @@ models:
           prefill:
             workers: 2
             tp: 8
-            enable_dp_attention: true
+            extra_args: "--enable-dp-attention --enable-tbo"
           decode:
             workers: 1
             tp: 8
-            enable_dp_attention: true
+            extra_args: "--enable-dp-attention --enable-tbo"
           run_eval: true
 
     accuracy:
