@@ -425,6 +425,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.long_prefill_token_threshold = config.long_prefill_token_threshold
         self.max_model_len = config.max_model_len
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
@@ -735,6 +736,8 @@ class Scheduler:
                 if not seq.is_partial_prefill:
                     continue
                 remaining = seq.num_prompt_tokens - seq.num_cached_tokens
+                if 0 < self.long_prefill_token_threshold < remaining:
+                    remaining = self.long_prefill_token_threshold
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = min(remaining, budget_remaining)
                 if chunk <= 0:
@@ -834,6 +837,11 @@ class Scheduler:
             num_new_tokens = (
                 seq.num_tokens - num_cached_blocks * self.block_manager.block_size
             )
+            if (
+                self.enable_chunked_prefill
+                and 0 < self.long_prefill_token_threshold < num_new_tokens
+            ):
+                num_new_tokens = self.long_prefill_token_threshold
             budget_remaining = self.max_num_batched_tokens - num_batched_tokens
             if self.enable_chunked_prefill:
                 chunk = min(num_new_tokens, budget_remaining)
