@@ -219,6 +219,8 @@ def load_model_in_plugin_mode(
         model_name_or_path = config.plugin_config.model_config.model
     elif config.plugin_config.is_sglang:
         model_name_or_path = config.plugin_config.model_config.model_path
+    elif config.plugin_config.is_rtpllm:
+        model_name_or_path = config.plugin_config.model_config.ckpt_path
 
     _empty_cache()
     if hf_config_override is not None:

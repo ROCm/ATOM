@@ -6,7 +6,7 @@
 #   1. `amd-smi static --asic` MARKET_NAME
 #   2. `rocm-smi --showproductname` Card Series
 #   3. `rocminfo` Marketing Name
-#   4. <runner_hint> pattern match (mi355 / mi35x / mi325 / mi300 / mi250)
+#   4. <runner_hint> pattern match (mi355 / mi35x / mi325 / mi308 / mi300 / mi250)
 #
 # Step 4 is needed because on freshly-released ASICs (currently MI355X) every
 # in-container SMI tool can still report "Radeon Graphics" until the
@@ -78,6 +78,7 @@ if { [ -z "${GPU_NAME:-}" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; } 
     case "$hint_lc" in
         *mi355*|*mi35x*) GPU_NAME="AMD Instinct MI355X" ;;
         *mi325*) GPU_NAME="AMD Instinct MI325X" ;;
+        *mi308*) GPU_NAME="AMD Instinct MI308X" ;;
         *mi300x*|*mi300*) GPU_NAME="AMD Instinct MI300X" ;;
         *mi250x*|*mi250*) GPU_NAME="AMD Instinct MI250X" ;;
         *mi210*) GPU_NAME="AMD Instinct MI210" ;;

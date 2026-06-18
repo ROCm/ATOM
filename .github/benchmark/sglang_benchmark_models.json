@@ -23,11 +23,18 @@
       "source_path": "deepseek-ai/DeepSeek-R1-0528",
       "path": "deepseek-ai/DeepSeek-R1-0528",
       "prefix": "deepseek-r1-fp8-tp4",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 4", "aiter_runtime"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 4",
+        "aiter_runtime"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
+      "env_vars": [
+        "deepseek_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=0"
+      ]
     },
     {
       "display": "DeepSeek-R1-0528 FP8 TP8",
@@ -35,11 +42,78 @@
       "source_path": "deepseek-ai/DeepSeek-R1-0528",
       "path": "deepseek-ai/DeepSeek-R1-0528",
       "prefix": "deepseek-r1-fp8-tp8",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8", "aiter_runtime"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 8",
+        "aiter_runtime"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
+      "env_vars": [
+        "deepseek_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=0"
+      ]
+    },
+    {
+      "display": "DeepSeek-V3.2 FP8 TP4",
+      "dashboard_model": "DeepSeek-V3.2-tp4",
+      "workload_label": "SGLang-OOB",
+      "source_path": "deepseek-ai/DeepSeek-V3.2",
+      "path": "deepseek-ai/DeepSeek-V3.2",
+      "prefix": "deepseek-v3-2-fp8-tp4",
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 4",
+        "aiter_runtime"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-aac-runner",
+      "nightly_group": "A",
+      "env_vars": [
+        "deepseek_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=0"
+      ]
+    },
+    {
+      "display": "DeepSeek-V3.2 FP8 TP4 DP4 EP4",
+      "dashboard_model": "DeepSeek-V3.2-tp4-dp4-ep4",
+      "workload_label": "SGLang-OOB",
+      "source_path": "deepseek-ai/DeepSeek-V3.2",
+      "path": "deepseek-ai/DeepSeek-V3.2",
+      "prefix": "deepseek-v3-2-fp8-tp4-dp4-ep4",
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 4 --data-parallel-size 4 --expert-parallel-size 4 --enable-dp-attention",
+        "aiter_runtime"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-aac-runner",
+      "nightly_group": "A",
+      "env_vars": [
+        "deepseek_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=0"
+      ]
+    },
+    {
+      "display": "DeepSeek-V3.2 FP8 TP8 DP8 EP8",
+      "dashboard_model": "DeepSeek-V3.2-tp8-dp8-ep8",
+      "workload_label": "SGLang-OOB",
+      "source_path": "deepseek-ai/DeepSeek-V3.2",
+      "path": "deepseek-ai/DeepSeek-V3.2",
+      "prefix": "deepseek-v3-2-fp8-tp8-dp8-ep8",
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 8 --data-parallel-size 8 --expert-parallel-size 8 --enable-dp-attention",
+        "aiter_runtime"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi355-8gpu-aac-runner",
+      "nightly_group": "A",
+      "env_vars": [
+        "deepseek_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=0"
+      ]
     },
     {
       "display": "DeepSeek-V3.2 FP8 TP4",
@@ -87,11 +161,18 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-tp4",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 4", "aiter_runtime"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 4",
+        "aiter_runtime"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
+      "env_vars": [
+        "deepseek_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP8",
@@ -99,11 +180,18 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-tp8",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8", "aiter_runtime"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 8",
+        "aiter_runtime"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
+      "env_vars": [
+        "deepseek_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP4 DP4 EP4",
@@ -112,11 +200,18 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-tp4-dp4-ep4",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 4 --expert-parallel-size 4 --data-parallel-size 4 --enable-dp-attention", "aiter_runtime"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 4 --expert-parallel-size 4 --data-parallel-size 4 --enable-dp-attention",
+        "aiter_runtime"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
+      "env_vars": [
+        "deepseek_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP8 EP8",
@@ -125,7 +220,11 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-V2",
       "path": "amd/DeepSeek-R1-0528-MXFP4-V2",
       "prefix": "deepseek-r1-fp4-tp8-ep8",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8 --expert-parallel-size 8 --data-parallel-size 8 --enable-dp-attention", "aiter_runtime"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 8 --expert-parallel-size 8 --data-parallel-size 8 --enable-dp-attention",
+        "aiter_runtime"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
@@ -138,11 +237,18 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-tp8-dp8-ep8",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8 --expert-parallel-size 8 --data-parallel-size 8 --enable-dp-attention", "aiter_runtime"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 8 --expert-parallel-size 8 --data-parallel-size 8 --enable-dp-attention",
+        "aiter_runtime"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
+      "env_vars": [
+        "deepseek_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP8 MTP1",
@@ -151,11 +257,19 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-tp8-mtp1",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8", "aiter_runtime", "mtp1_common"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 8",
+        "aiter_runtime",
+        "mtp1_common"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
-      "env_vars": ["deepseek_mtp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
+      "env_vars": [
+        "deepseek_mtp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP8 MTP3",
@@ -164,11 +278,20 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-tp8-mtp3",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8", "aiter_runtime", "mtp3_common", "--max-running-requests 256"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 8",
+        "aiter_runtime",
+        "mtp3_common",
+        "--max-running-requests 256"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
-      "env_vars": ["deepseek_mtp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
+      "env_vars": [
+        "deepseek_mtp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 MTP3 TP4 DP4 EP4",
@@ -177,11 +300,20 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-mtp3-tp4-dp4-ep4",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 4 --expert-parallel-size 4 --data-parallel-size 4 --enable-dp-attention", "aiter_runtime", "mtp3_common", "--max-running-requests 4096"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 4 --expert-parallel-size 4 --data-parallel-size 4 --enable-dp-attention",
+        "aiter_runtime",
+        "mtp3_common",
+        "--max-running-requests 4096"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
-      "env_vars": ["deepseek_mtp_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
+      "env_vars": [
+        "deepseek_mtp_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 MTP3 TP8 DP8 EP8",
@@ -190,11 +322,20 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-mtp3-tp8-dp8-ep8",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8 --expert-parallel-size 8 --data-parallel-size 8 --enable-dp-attention", "aiter_runtime", "mtp3_common", "--max-running-requests 4096"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 8 --expert-parallel-size 8 --data-parallel-size 8 --enable-dp-attention",
+        "aiter_runtime",
+        "mtp3_common",
+        "--max-running-requests 4096"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
-      "env_vars": ["deepseek_mtp_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"]
+      "env_vars": [
+        "deepseek_mtp_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ]
     },
     {
       "display": "Qwen3.5-397B-A17B-FP8 TP4",
@@ -203,7 +344,10 @@
       "source_path": "Qwen/Qwen3.5-397B-A17B-FP8",
       "path": "Qwen/Qwen3.5-397B-A17B-FP8",
       "prefix": "qwen3-5-397b-a17b-fp8-tp4",
-      "extra_args": ["--tensor-parallel-size 4", "qwen_reasoning"],
+      "extra_args": [
+        "--tensor-parallel-size 4",
+        "qwen_reasoning"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
@@ -216,7 +360,10 @@
       "source_path": "Qwen/Qwen3.5-397B-A17B-FP8",
       "path": "Qwen/Qwen3.5-397B-A17B-FP8",
       "prefix": "qwen3-5-397b-a17b-fp8-tp8",
-      "extra_args": ["--tensor-parallel-size 8", "qwen_reasoning"],
+      "extra_args": [
+        "--tensor-parallel-size 8",
+        "qwen_reasoning"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
@@ -230,19 +377,39 @@
       "path": "deepseek-ai/DeepSeek-R1-0528",
       "prefix": "deepseek-r1-fp8-mesh-dpa4-ep4",
       "mesh_spec_mode": "none",
-      "mesh_presets": ["all", "fp8-all", "fp8-dpa4-ep4", "fp8-non-mtp", "dpa4-ep4", "non-mtp"],
+      "mesh_presets": [
+        "all",
+        "fp8-all",
+        "fp8-dpa4-ep4",
+        "fp8-non-mtp",
+        "dpa4-ep4",
+        "non-mtp"
+      ],
       "tp_size": 4,
       "dp_size": 4,
       "ep_size": 4,
-      "extra_args": ["trust_remote_code", "aiter_runtime", "--dp-size 4 --enable-dp-attention --ep-size 4 --max-running-requests 4096"],
+      "extra_args": [
+        "trust_remote_code",
+        "aiter_runtime",
+        "--dp-size 4 --enable-dp-attention --ep-size 4 --max-running-requests 4096"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "supported_input_output_pairs": ["8192x1"],
+      "supported_input_output_pairs": [
+        "8192x1"
+      ],
       "supported_concurrency_values_by_pair": {
-        "8192x1": [256, 512, 1024]
+        "8192x1": [
+          256,
+          512,
+          1024
+        ]
       },
-      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"],
+      "env_vars": [
+        "deepseek_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=0"
+      ],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -255,20 +422,45 @@
       "path": "deepseek-ai/DeepSeek-R1-0528",
       "prefix": "deepseek-r1-fp8-mesh-dpa8-ep8",
       "mesh_spec_mode": "none",
-      "mesh_presets": ["all", "fp8-all", "fp8-dpa8-ep8", "fp8-non-mtp", "dpa8-ep8", "non-mtp"],
+      "mesh_presets": [
+        "all",
+        "fp8-all",
+        "fp8-dpa8-ep8",
+        "fp8-non-mtp",
+        "dpa8-ep8",
+        "non-mtp"
+      ],
       "tp_size": 8,
       "dp_size": 8,
       "ep_size": 8,
-      "extra_args": ["trust_remote_code", "aiter_runtime", "--dp-size 8 --enable-dp-attention --ep-size 8 --max-running-requests 4096"],
+      "extra_args": [
+        "trust_remote_code",
+        "aiter_runtime",
+        "--dp-size 8 --enable-dp-attention --ep-size 8 --max-running-requests 4096"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "supported_input_output_pairs": ["8192x1", "1x1024"],
+      "supported_input_output_pairs": [
+        "8192x1",
+        "1x1024"
+      ],
       "supported_concurrency_values_by_pair": {
-        "8192x1": [512, 1024, 2048],
-        "1x1024": [1024, 2048, 4096]
+        "8192x1": [
+          512,
+          1024,
+          2048
+        ],
+        "1x1024": [
+          1024,
+          2048,
+          4096
+        ]
       },
-      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"],
+      "env_vars": [
+        "deepseek_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=0"
+      ],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -281,20 +473,44 @@
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-mesh-tp4",
       "mesh_spec_mode": "none",
-      "mesh_presets": ["all", "fp4-all", "fp4-tp4", "fp4-non-mtp", "tp4", "non-mtp"],
+      "mesh_presets": [
+        "all",
+        "fp4-all",
+        "fp4-tp4",
+        "fp4-non-mtp",
+        "tp4",
+        "non-mtp"
+      ],
       "tp_size": 4,
       "dp_size": 1,
       "ep_size": 1,
-      "extra_args": ["trust_remote_code", "aiter_runtime"],
+      "extra_args": [
+        "trust_remote_code",
+        "aiter_runtime"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "supported_input_output_pairs": ["8192x1", "1x1024"],
+      "supported_input_output_pairs": [
+        "8192x1",
+        "1x1024"
+      ],
       "supported_concurrency_values_by_pair": {
-        "8192x1": [64, 128, 256],
-        "1x1024": [64, 128, 256]
+        "8192x1": [
+          64,
+          128,
+          256
+        ],
+        "1x1024": [
+          64,
+          128,
+          256
+        ]
       },
-      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
+      "env_vars": [
+        "deepseek_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ],
       "case_env_vars_by_pair": {
         "1x1024": "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1"
       }
@@ -307,20 +523,54 @@
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-mesh-tp8",
       "mesh_spec_mode": "none",
-      "mesh_presets": ["all", "fp4-all", "fp4-tp8", "fp4-non-mtp", "tp8", "non-mtp"],
+      "mesh_presets": [
+        "all",
+        "fp4-all",
+        "fp4-tp8",
+        "fp4-non-mtp",
+        "tp8",
+        "non-mtp"
+      ],
       "tp_size": 8,
       "dp_size": 1,
       "ep_size": 1,
-      "extra_args": ["trust_remote_code", "aiter_runtime"],
+      "extra_args": [
+        "trust_remote_code",
+        "aiter_runtime"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "supported_input_output_pairs": ["8192x1", "1x1024"],
+      "supported_input_output_pairs": [
+        "8192x1",
+        "1x1024"
+      ],
       "supported_concurrency_values_by_pair": {
-        "8192x1": [2, 4, 8, 16, 32, 64, 128, 256],
-        "1x1024": [2, 4, 8, 16, 32, 64, 128, 256]
+        "8192x1": [
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256
+        ],
+        "1x1024": [
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256
+        ]
       },
-      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
+      "env_vars": [
+        "deepseek_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ],
       "case_env_vars_by_pair": {
         "1x1024": "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1"
       }
@@ -333,19 +583,39 @@
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-mesh-dpa4-ep4",
       "mesh_spec_mode": "none",
-      "mesh_presets": ["all", "fp4-all", "fp4-dpa4-ep4", "fp4-non-mtp", "dpa4-ep4", "non-mtp"],
+      "mesh_presets": [
+        "all",
+        "fp4-all",
+        "fp4-dpa4-ep4",
+        "fp4-non-mtp",
+        "dpa4-ep4",
+        "non-mtp"
+      ],
       "tp_size": 4,
       "dp_size": 4,
       "ep_size": 4,
-      "extra_args": ["trust_remote_code", "aiter_runtime", "--dp-size 4 --enable-dp-attention --ep-size 4 --max-running-requests 4096"],
+      "extra_args": [
+        "trust_remote_code",
+        "aiter_runtime",
+        "--dp-size 4 --enable-dp-attention --ep-size 4 --max-running-requests 4096"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "supported_input_output_pairs": ["8192x1"],
+      "supported_input_output_pairs": [
+        "8192x1"
+      ],
       "supported_concurrency_values_by_pair": {
-        "8192x1": [256, 512, 1024]
+        "8192x1": [
+          256,
+          512,
+          1024
+        ]
       },
-      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
+      "env_vars": [
+        "deepseek_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -358,20 +628,45 @@
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-mesh-dpa8-ep8",
       "mesh_spec_mode": "none",
-      "mesh_presets": ["all", "fp4-all", "fp4-dpa8-ep8", "fp4-non-mtp", "dpa8-ep8", "non-mtp"],
+      "mesh_presets": [
+        "all",
+        "fp4-all",
+        "fp4-dpa8-ep8",
+        "fp4-non-mtp",
+        "dpa8-ep8",
+        "non-mtp"
+      ],
       "tp_size": 8,
       "dp_size": 8,
       "ep_size": 8,
-      "extra_args": ["trust_remote_code", "aiter_runtime", "--dp-size 8 --enable-dp-attention --ep-size 8 --max-running-requests 4096"],
+      "extra_args": [
+        "trust_remote_code",
+        "aiter_runtime",
+        "--dp-size 8 --enable-dp-attention --ep-size 8 --max-running-requests 4096"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "supported_input_output_pairs": ["8192x1", "1x1024"],
+      "supported_input_output_pairs": [
+        "8192x1",
+        "1x1024"
+      ],
       "supported_concurrency_values_by_pair": {
-        "8192x1": [512, 1024, 2048],
-        "1x1024": [1024, 2048, 4096]
+        "8192x1": [
+          512,
+          1024,
+          2048
+        ],
+        "1x1024": [
+          1024,
+          2048,
+          4096
+        ]
       },
-      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
+      "env_vars": [
+        "deepseek_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -384,20 +679,46 @@
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-mesh-tp4-mtp",
       "mesh_spec_mode": "mtp",
-      "mesh_presets": ["all", "fp4-all", "fp4-tp4-mtp", "fp4-mtp", "tp4-mtp", "mtp"],
+      "mesh_presets": [
+        "all",
+        "fp4-all",
+        "fp4-tp4-mtp",
+        "fp4-mtp",
+        "tp4-mtp",
+        "mtp"
+      ],
       "tp_size": 4,
       "dp_size": 1,
       "ep_size": 1,
-      "extra_args": ["trust_remote_code", "aiter_runtime", "mtp3_common", "--max-running-requests 256"],
+      "extra_args": [
+        "trust_remote_code",
+        "aiter_runtime",
+        "mtp3_common",
+        "--max-running-requests 256"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "supported_input_output_pairs": ["8192x1", "1x1024"],
+      "supported_input_output_pairs": [
+        "8192x1",
+        "1x1024"
+      ],
       "supported_concurrency_values_by_pair": {
-        "8192x1": [64, 128, 256],
-        "1x1024": [64, 128, 256]
+        "8192x1": [
+          64,
+          128,
+          256
+        ],
+        "1x1024": [
+          64,
+          128,
+          256
+        ]
       },
-      "env_vars": ["deepseek_mtp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
+      "env_vars": [
+        "deepseek_mtp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ],
       "case_env_vars_by_pair": {
         "1x1024": "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1"
       }
@@ -410,20 +731,56 @@
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-mesh-tp8-mtp",
       "mesh_spec_mode": "mtp",
-      "mesh_presets": ["all", "fp4-all", "fp4-tp8-mtp", "fp4-mtp", "tp8-mtp", "mtp"],
+      "mesh_presets": [
+        "all",
+        "fp4-all",
+        "fp4-tp8-mtp",
+        "fp4-mtp",
+        "tp8-mtp",
+        "mtp"
+      ],
       "tp_size": 8,
       "dp_size": 1,
       "ep_size": 1,
-      "extra_args": ["trust_remote_code", "aiter_runtime", "mtp3_common", "--max-running-requests 256"],
+      "extra_args": [
+        "trust_remote_code",
+        "aiter_runtime",
+        "mtp3_common",
+        "--max-running-requests 256"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "supported_input_output_pairs": ["8192x1", "1x1024"],
+      "supported_input_output_pairs": [
+        "8192x1",
+        "1x1024"
+      ],
       "supported_concurrency_values_by_pair": {
-        "8192x1": [2, 4, 8, 16, 32, 64, 128, 256],
-        "1x1024": [2, 4, 8, 16, 32, 64, 128, 256]
+        "8192x1": [
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256
+        ],
+        "1x1024": [
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256
+        ]
       },
-      "env_vars": ["deepseek_mtp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
+      "env_vars": [
+        "deepseek_mtp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ],
       "case_env_vars_by_pair": {
         "1x1024": "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1"
       }
@@ -436,19 +793,41 @@
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-mesh-dpa4-ep4-mtp",
       "mesh_spec_mode": "mtp",
-      "mesh_presets": ["all", "fp4-all", "fp4-dpa4-ep4-mtp", "fp4-mtp", "dpa4-ep4-mtp", "mtp"],
+      "mesh_presets": [
+        "all",
+        "fp4-all",
+        "fp4-dpa4-ep4-mtp",
+        "fp4-mtp",
+        "dpa4-ep4-mtp",
+        "mtp"
+      ],
       "tp_size": 4,
       "dp_size": 4,
       "ep_size": 4,
-      "extra_args": ["trust_remote_code", "aiter_runtime", "--dp-size 4 --enable-dp-attention --ep-size 4", "mtp3_common", "--max-running-requests 4096"],
+      "extra_args": [
+        "trust_remote_code",
+        "aiter_runtime",
+        "--dp-size 4 --enable-dp-attention --ep-size 4",
+        "mtp3_common",
+        "--max-running-requests 4096"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "supported_input_output_pairs": ["8192x1"],
+      "supported_input_output_pairs": [
+        "8192x1"
+      ],
       "supported_concurrency_values_by_pair": {
-        "8192x1": [256, 512, 1024]
+        "8192x1": [
+          256,
+          512,
+          1024
+        ]
       },
-      "env_vars": ["deepseek_mtp_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
+      "env_vars": [
+        "deepseek_mtp_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -461,20 +840,47 @@
       "path": "amd/DeepSeek-R1-0528-MXFP4-v2",
       "prefix": "deepseek-r1-fp4-mesh-dpa8-ep8-mtp",
       "mesh_spec_mode": "mtp",
-      "mesh_presets": ["all", "fp4-all", "fp4-dpa8-ep8-mtp", "fp4-mtp", "dpa8-ep8-mtp", "mtp"],
+      "mesh_presets": [
+        "all",
+        "fp4-all",
+        "fp4-dpa8-ep8-mtp",
+        "fp4-mtp",
+        "dpa8-ep8-mtp",
+        "mtp"
+      ],
       "tp_size": 8,
       "dp_size": 8,
       "ep_size": 8,
-      "extra_args": ["trust_remote_code", "aiter_runtime", "--dp-size 8 --enable-dp-attention --ep-size 8", "mtp3_common", "--max-running-requests 4096"],
+      "extra_args": [
+        "trust_remote_code",
+        "aiter_runtime",
+        "--dp-size 8 --enable-dp-attention --ep-size 8",
+        "mtp3_common",
+        "--max-running-requests 4096"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "A",
-      "supported_input_output_pairs": ["8192x1", "1x1024"],
+      "supported_input_output_pairs": [
+        "8192x1",
+        "1x1024"
+      ],
       "supported_concurrency_values_by_pair": {
-        "8192x1": [512, 1024, 2048],
-        "1x1024": [1024, 2048, 4096]
+        "8192x1": [
+          512,
+          1024,
+          2048
+        ],
+        "1x1024": [
+          1024,
+          2048,
+          4096
+        ]
       },
-      "env_vars": ["deepseek_mtp_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=1"],
+      "env_vars": [
+        "deepseek_mtp_dp_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=1"
+      ],
       "case_extra_args_by_pair": {
         "8192x1": "--chunked-prefill-size 65536"
       }
@@ -499,11 +905,98 @@
       "source_path": "zai-org/GLM-5.1-FP8",
       "path": "zai-org/GLM-5.1-FP8",
       "prefix": "glm-5-1-fp8-tp8",
-      "extra_args": ["trust_remote_code", "--tensor-parallel-size 8", "aiter_runtime"],
+      "extra_args": [
+        "trust_remote_code",
+        "--tensor-parallel-size 8",
+        "aiter_runtime"
+      ],
       "bench_args": "",
       "runner": "atom-mi355-8gpu-aac-runner",
       "nightly_group": "B",
-      "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
+      "env_vars": [
+        "deepseek_common",
+        "SGLANG_AITER_FP8_PREFILL_ATTN=0"
+      ]
+    },
+    {
+      "display": "Qwen3.5-397B-A17B-FP8 TP4 MI308",
+      "dashboard_model": "Qwen3.5-397B-A17B-FP8-tp4 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "path": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "prefix": "qwen3-5-397b-a17b-fp8-tp4-mi308",
+      "extra_args": [
+        "--tensor-parallel-size 4",
+        "qwen_reasoning"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "env_vars": "qwen_common"
+    },
+    {
+      "display": "Qwen3.5-397B-A17B-FP8 TP8 MI308",
+      "dashboard_model": "Qwen3.5-397B-A17B-FP8 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "path": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "prefix": "qwen3-5-397b-a17b-fp8-tp8-mi308",
+      "extra_args": [
+        "--tensor-parallel-size 8",
+        "qwen_reasoning"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "env_vars": "qwen_common"
+    },
+    {
+      "display": "Qwen3.5-35B-A3B-FP8 TP1 MI308",
+      "dashboard_model": "Qwen3.5-35B-A3B-FP8 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "Qwen/Qwen3.5-35B-A3B-FP8",
+      "path": "Qwen/Qwen3.5-35B-A3B-FP8",
+      "prefix": "qwen3-5-35b-a3b-fp8-tp1-mi308",
+      "extra_args": [
+        "--tensor-parallel-size 1",
+        "qwen_reasoning"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "env_vars": "qwen_common"
+    },
+    {
+      "display": "Qwen3-32B-FP8 TP1 MI308",
+      "dashboard_model": "Qwen3-32B-FP8 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "Qwen/Qwen3-32B-FP8",
+      "path": "Qwen/Qwen3-32B-FP8",
+      "prefix": "qwen3-32b-fp8-tp1-mi308",
+      "extra_args": [
+        "--tensor-parallel-size 1",
+        "qwen_reasoning"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "env_vars": "qwen_common"
+    },
+    {
+      "display": "Qwen3-32B-FP8 TP8 MI308",
+      "dashboard_model": "Qwen3-32B-FP8 TP8 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "Qwen/Qwen3-32B-FP8",
+      "path": "Qwen/Qwen3-32B-FP8",
+      "prefix": "qwen3-32b-fp8-tp8-mi308",
+      "extra_args": [
+        "--tensor-parallel-size 8",
+        "qwen_reasoning"
+      ],
+      "bench_args": "",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "env_vars": "qwen_common"
     }
   ]
 }

@@ -6,11 +6,11 @@ concurrency:
 
 on:
   schedule:
-    # Nightly at 22:00 Beijing time (14:00 UTC).
-    - cron: '0 14 * * 1,3'  # Mon/Wed: SGLang-OOB non-MTP DeepSeek configs
-    - cron: '0 14 * * 2,4'  # Tue/Thu: SGLang-OOB MTP + Qwen + GLM configs
-    - cron: '0 14 * * 5'    # Fri: SGLang-Mesh all configs
-    - cron: '0 14 * * 6'    # Sat: SGLang-OOB all configs
+    # Nightly at 23:00 Beijing time (15:00 UTC).
+    - cron: '0 15 * * 1,3'  # Mon/Wed: SGLang-OOB non-MTP DeepSeek configs
+    - cron: '0 15 * * 2,4'  # Tue/Thu: SGLang-OOB MTP + Qwen + GLM configs
+    - cron: '0 15 * * 5'    # Fri: SGLang-Mesh all configs
+    - cron: '0 15 * * 6'    # Sat: SGLang-OOB all configs
   workflow_dispatch:
     inputs:
       benchmark_suite:
@@ -41,14 +41,19 @@ on:
           - "deepseek-r1-fp4-mtp3-tp8-dp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-5-397b-a17b-fp8-tp4-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-5-397b-a17b-fp8-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-5-35b-a3b-fp8-tp1-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-32b-fp8-tp1-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-32b-fp8-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-v3-2-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "glm-5-1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "all-deepseek (15 DeepSeek configs x 10 default params)"
           - "all-deepseek-non-mtp (11 DeepSeek non-MTP configs x 10 default params)"
           - "all-deepseek-mtp (4 DeepSeek MTP configs x 10 default params)"
-          - "all-qwen (2 Qwen configs x 10 default params)"
+          - "all-qwen (7 Qwen configs x 10 default params)"
           - "all-glm (1 GLM config x 10 default params)"
-          - "all-oob (18 SGLang-OOB configs x 10 default params)"
+          - "all-oob (23 SGLang-OOB configs x 10 default params)"
         default: "none (do not run SGLang-OOB models)"
       mesh_config_preset:
         description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"

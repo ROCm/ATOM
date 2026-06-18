@@ -124,6 +124,31 @@ on:
         required: false
         type: boolean
         default: false
+      run_mi308_qwen35_397b_a17b_fp8_tp4:
+        description: "MI308 Qwen3.5-397B-A17B-FP8 TP4"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_qwen35_397b_a17b_fp8_tp8:
+        description: "MI308 Qwen3.5-397B-A17B-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_qwen35_35b_a3b_fp8_tp1:
+        description: "MI308 Qwen3.5-35B-A3B-FP8 TP1"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_qwen3_32b_fp8_tp1:
+        description: "MI308 Qwen3-32B-FP8 TP1"
+        required: false
+        type: boolean
+        default: false
+      run_mi308_qwen3_32b_fp8_tp8:
+        description: "MI308 Qwen3-32B-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
       rebuild_atom_base_from_dockerfile:
         description: "Full build image before validation"
         required: false
@@ -196,6 +221,11 @@ jobs:
           RUN_DSR1_FP4_TP8_MTP1: ${{ inputs.run_dsr1_fp4_tp8_mtp1 }}
           RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
           RUN_GLM51_FP8_TP8: ${{ inputs.run_glm51_fp8_tp8 }}
+          RUN_MI308_QWEN35_397B_A17B_FP8_TP4: ${{ inputs.run_mi308_qwen35_397b_a17b_fp8_tp4 }}
+          RUN_MI308_QWEN35_397B_A17B_FP8_TP8: ${{ inputs.run_mi308_qwen35_397b_a17b_fp8_tp8 }}
+          RUN_MI308_QWEN35_35B_A3B_FP8_TP1: ${{ inputs.run_mi308_qwen35_35b_a3b_fp8_tp1 }}
+          RUN_MI308_QWEN3_32B_FP8_TP1: ${{ inputs.run_mi308_qwen3_32b_fp8_tp1 }}
+          RUN_MI308_QWEN3_32B_FP8_TP8: ${{ inputs.run_mi308_qwen3_32b_fp8_tp8 }}
           REBUILD_ATOM_BASE_FROM_DOCKERFILE: ${{ inputs.rebuild_atom_base_from_dockerfile }}
         run: |
           set -euo pipefail
@@ -261,7 +291,7 @@ jobs:
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --page-size 1 --disable-radix-cache",
                   "accuracy_test_threshold": 0.91,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_KIMI_K26_MXFP4_TP8",
@@ -270,7 +300,7 @@ jobs:
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --page-size 1 --disable-radix-cache",
                   "accuracy_test_threshold": 0.91,
                   "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
               {
                   "toggle_env": "RUN_QWEN35_35B_A3B_FP8_TP2",
@@ -417,6 +447,55 @@ jobs:
                   "runner": "atom-mi355-8gpu-conductor-sgl-runner",
               },
           ]
+
+          mi308_models = [
+              {
+                  "toggle_env": "RUN_MI308_QWEN35_397B_A17B_FP8_TP4",
+                  "model_name": "MI308 Qwen3.5-397B-A17B-FP8 TP4",
+                  "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+                  "extra_args": "--tensor-parallel-size 4 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+              },
+              {
+                  "toggle_env": "RUN_MI308_QWEN35_397B_A17B_FP8_TP8",
+                  "model_name": "MI308 Qwen3.5-397B-A17B-FP8 TP8",
+                  "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+                  "extra_args": "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+              },
+              {
+                  "toggle_env": "RUN_MI308_QWEN35_35B_A3B_FP8_TP1",
+                  "model_name": "MI308 Qwen3.5-35B-A3B-FP8 TP1",
+                  "model_path": "Qwen/Qwen3.5-35B-A3B-FP8",
+                  "extra_args": "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+                  "accuracy_test_threshold": 0.76,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+              },
+              {
+                  "toggle_env": "RUN_MI308_QWEN3_32B_FP8_TP1",
+                  "model_name": "MI308 Qwen3-32B-FP8 TP1",
+                  "model_path": "Qwen/Qwen3-32B-FP8",
+                  "extra_args": "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+                  "accuracy_test_threshold": 0.8,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+              },
+              {
+                  "toggle_env": "RUN_MI308_QWEN3_32B_FP8_TP8",
+                  "model_name": "MI308 Qwen3-32B-FP8 TP8",
+                  "model_path": "Qwen/Qwen3-32B-FP8",
+                  "extra_args": "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
+                  "accuracy_test_threshold": 0.8,
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+                  "runner": "atom-mi308-8gpu-plugins-benchmark",
+              },
+          ]
+          models.extend(mi308_models)
 
           selected = []
           for model in models:
