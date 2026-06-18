@@ -415,6 +415,14 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             if _fp8_dispatch_exp:
                 scale_dim = moe.hidden_dim // 32
 
+            # [fp8-cast exp] measurement-only: cast a1 bf16->fp8 before dispatch
+            # (no scale), dispatch via fp8 kernel, cast back to bf16 after so the
+            # GEMM self-quantizes as usual (no scale plumbing, no crash). Lets us
+            # measure the real fp8 dispatch kernel speedup. Accuracy is garbage.
+            _fp8_cast_dispatch = (
+                _os.environ.get("MORI_FP8_DISPATCH_CAST", "0") == "1"
+            )
+
             # For FP8: enable FP8 dispatch in Mori (quantize before communication)
             # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
             use_fp8_dispatch = is_fp8
@@ -509,6 +517,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 is_async=is_async,
                 tbo_mori_ops=tbo_mori_ops,
                 low_latency=low_latency,
+                fp8_cast_dispatch=_fp8_cast_dispatch,
             )
 
         return prepare_finalize

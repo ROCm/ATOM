@@ -113,6 +113,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         is_async: bool = False,
         tbo_mori_ops: list | None = None,
         low_latency: bool = False,
+        fp8_cast_dispatch: bool = False,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
@@ -129,6 +130,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.quant_dtype = quant_dtype
         self._is_async = is_async
         self._low_latency = low_latency
+        self.fp8_cast_dispatch = fp8_cast_dispatch
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -197,6 +199,11 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             a1, scale = quant_func(
                 a1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
             )
+        elif self.fp8_cast_dispatch:
+            # [fp8-cast exp] direct bf16->fp8 cast (no scale) so dispatch runs
+            # the fp8 kernel (half bytes); cast back to bf16 after dispatch so
+            # the GEMM self-quantizes as baseline. Measures dispatch speedup.
+            a1 = a1.to(dtypes.fp8)
 
         block_num, warp_per_block = self._get_dispatch_config()
 
@@ -209,6 +216,11 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         ) = self._sync_mori_op.dispatch(
             a1, topk_weights, scale, topk_ids, block_num, warp_per_block
         )
+
+        if self.fp8_cast_dispatch:
+            # dispatch_a1 is fp8 (mori out uses input.dtype); upcast for GEMM.
+            dispatch_a1 = dispatch_a1.to(torch.bfloat16)
+            dispatch_scale = None
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=dispatch_recv_token_num, expert_num_tokens_cpu=None
