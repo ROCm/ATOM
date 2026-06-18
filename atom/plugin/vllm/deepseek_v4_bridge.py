@@ -1291,7 +1291,7 @@ def get_deepseek_v4_proxy_metadata_from_vllm_context():
     return None
 
 
-def _is_vllm_decode_graph_phase(attn_metadata) -> bool:
+def _is_vllm_decode_graph_phase(attn_metadata, atom_config) -> bool:
     """True when vLLM is inside its CUDA-graph capture window for V4 decode.
 
     vLLM sets ``cudagraph_capturing_enabled=True`` around both the eager warmup
@@ -1303,11 +1303,22 @@ def _is_vllm_decode_graph_phase(attn_metadata) -> bool:
         return False
     try:
         import vllm.compilation.monitor as vllm_monitor
+        from vllm.config import CUDAGraphMode
         from vllm.forward_context import (
             get_forward_context,
             is_forward_context_available,
         )
 
+        vllm_config = getattr(
+            getattr(atom_config, "plugin_config", None), "vllm_config", None
+        )
+        if vllm_config is None:
+            return False
+        if getattr(getattr(vllm_config, "model_config", None), "enforce_eager", False):
+            return False
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        if getattr(compilation_config, "cudagraph_mode", None) == CUDAGraphMode.NONE:
+            return False
         if not is_forward_context_available():
             return False
         vllm_ctx = get_forward_context()
@@ -1366,7 +1377,7 @@ def atom_deepseek_v4_forward_context(
             if reset_slots:
                 reset_deepseek_v4_state_slots(state_model, reset_slots)
     in_hipgraph = bool(getattr(attn_metadata, "in_hipgraph", False)) or (
-        _is_vllm_decode_graph_phase(attn_metadata)
+        _is_vllm_decode_graph_phase(attn_metadata, atom_config)
     )
     is_prefill = attn_metadata.state.value.startswith("prefill")
     batch_size = int(
