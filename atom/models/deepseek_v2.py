@@ -205,9 +205,33 @@ def _extract_layer_index_from_prefix(prefix: str) -> int:
 
 def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
     if not getattr(config, "use_index_cache", False):
-        return False
+        # IndexShare (e.g. GLM-5.2): index_topk_freq > 1 shares the indexer across
+        # layers, so enable the cache even if the config omits the flag; otherwise
+        # there is nothing to skip.
+        if int(getattr(config, "index_topk_freq", 1)) > 1:
+            config.use_index_cache = True
+        else:
+            return False
 
     layer_id = _extract_layer_index_from_prefix(prefix)
+
+    # GLM-5.2 MTP layer (index >= num_hidden_layers) reuses the cached topk.
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if (
+        num_hidden_layers is not None
+        and layer_id >= num_hidden_layers
+        and getattr(config, "index_share_for_mtp_iteration", False)
+    ):
+        return True
+
+    # GLM-5.2 IndexShare: per-layer schedule, "shared" reuses the prior "full"
+    # layer's topk. Authoritative when present; else fall back to pattern/freq.
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        return (
+            0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
+        )
+
     index_topk_pattern = getattr(config, "index_topk_pattern", None)
     if index_topk_pattern is not None:
         return (
@@ -218,7 +242,19 @@ def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
     index_topk_freq = int(getattr(config, "index_topk_freq", 1))
     if index_topk_freq <= 0:
         raise ValueError("index_topk_freq must be a positive integer")
-    return max(layer_id - 1, 0) % index_topk_freq != 0
+    # offset defaults to 1 = prior `layer_id - 1` behavior for DeepSeek configs.
+    offset = int(getattr(config, "index_skip_topk_offset", 1))
+    return max(layer_id - offset, 0) % index_topk_freq != 0
+
+
+def _indexer_weights_shared(config: PretrainedConfig, prefix: str) -> bool:
+    """GLM-5.2 IndexShare: "shared" layers carry no indexer weights (they reuse
+    the prior "full" layer), so don't build params for them. DeepSeek: per-layer."""
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is None:
+        return False
+    layer_id = _extract_layer_index_from_prefix(prefix)
+    return 0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
 
 
 def _fuse_rmsnorm_fp4_quant_fake(
@@ -1806,24 +1842,29 @@ class DeepseekV2MLAAttention(nn.Module):
                 rope_scaling=rope_scaling,
                 is_neox_style=True,
             )
-            self.indexer = Indexer(
-                get_current_atom_config(),
-                config,
-                hidden_size,
-                q_lora_rank,
-                base_quant_config,
-                cache_config,
-                (
-                    _can_fuse_indexer_wk_weights_proj(
-                        config,
-                        model_quant_config,
-                        [f"{prefix}.indexer"],
-                    )
-                    if use_indexer_wk_weights_proj_fusion is None
-                    else use_indexer_wk_weights_proj_fusion
-                ),
-                f"{prefix}.indexer",
-            )
+            if _indexer_weights_shared(config, prefix):
+                # GLM-5.2 IndexShare: reuses prior "full" layer's indexer; the
+                # forward and index-cache binding guard on `indexer is not None`.
+                self.indexer = None
+            else:
+                self.indexer = Indexer(
+                    get_current_atom_config(),
+                    config,
+                    hidden_size,
+                    q_lora_rank,
+                    base_quant_config,
+                    cache_config,
+                    (
+                        _can_fuse_indexer_wk_weights_proj(
+                            config,
+                            model_quant_config,
+                            [f"{prefix}.indexer"],
+                        )
+                        if use_indexer_wk_weights_proj_fusion is None
+                        else use_indexer_wk_weights_proj_fusion
+                    ),
+                    f"{prefix}.indexer",
+                )
         else:
             self.indexer_rope_emb = None
             self.indexer = None
