@@ -1723,30 +1723,37 @@ class DeepseekV4Attention(nn.Module):
         attn_md_top = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         if getattr(attn_md_top, "is_mixed", False):
             n_p = attn_md_top.num_prefill_tokens
+            n_d = x.size(0) - n_p
             p_md = attn_md_top.prefill_attn_metadata
             d_md = attn_md_top.decode_attn_metadata
             ctx = fc.context
             saved_is_prefill = ctx.is_prefill
             saved_input_ids = ctx.input_ids
-            # Prefill segment: rows [0:n_p], pure-prefill path. Slice input_ids
-            # too so the hash-MoE `_hash_topk` (reads ctx.input_ids) matches the
-            # segment's token count.
-            fc.attn_metadata = p_md
-            ctx.is_prefill = True
-            if saved_input_ids is not None:
-                ctx.input_ids = saved_input_ids[:n_p]
-            out_p = self.forward_impl(x[:n_p], positions[:n_p])
-            # Decode segment: rows [n_p:], pure-decode path.
-            fc.attn_metadata = d_md
-            ctx.is_prefill = False
-            if saved_input_ids is not None:
-                ctx.input_ids = saved_input_ids[n_p:]
-            out_d = self.forward_impl(x[n_p:], positions[n_p:])
-            # Restore the top-level mixed context for any caller / later layer.
-            fc.attn_metadata = attn_md_top
-            ctx.is_prefill = saved_is_prefill
-            ctx.input_ids = saved_input_ids
-            return torch.cat([out_p, out_d], dim=0)
+            # Tag the whole mixed dispatch so the trace can distinguish a real
+            # pure-prefill / pure-decode step from the two segments of a mixed
+            # step (which re-enter this method as prefill/decode and would
+            # otherwise only show those inner tags).
+            with torch.profiler.record_function(f"mixed[n_p={n_p} n_d={n_d}]"):
+                # Prefill segment: rows [0:n_p], pure-prefill path. Slice
+                # input_ids too so the hash-MoE `_hash_topk` (reads
+                # ctx.input_ids) matches the segment's token count.
+                fc.attn_metadata = p_md
+                ctx.is_prefill = True
+                if saved_input_ids is not None:
+                    ctx.input_ids = saved_input_ids[:n_p]
+                out_p = self.forward_impl(x[:n_p], positions[:n_p])
+                # Decode segment: rows [n_p:], pure-decode path.
+                fc.attn_metadata = d_md
+                ctx.is_prefill = False
+                if saved_input_ids is not None:
+                    ctx.input_ids = saved_input_ids[n_p:]
+                out_d = self.forward_impl(x[n_p:], positions[n_p:])
+                # Restore the top-level mixed context for any caller / later
+                # layer.
+                fc.attn_metadata = attn_md_top
+                ctx.is_prefill = saved_is_prefill
+                ctx.input_ids = saved_input_ids
+                return torch.cat([out_p, out_d], dim=0)
 
         num_tokens = x.size(0)
         cache_size = self.swa_kv.shape[1]
