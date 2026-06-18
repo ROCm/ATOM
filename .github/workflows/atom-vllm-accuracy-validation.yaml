@@ -1264,9 +1264,9 @@ jobs:
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/shared/data/amd_int/models" ]; then
-            MODEL_CACHE_MOUNT="-v /shared/data/amd_int/models:/models"
-            MODEL_CACHE_DESC="/shared/data/amd_int/models (shared host path)"
+          if [ -d "/shared/data/WRH/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared/data/WRH/models:/models"
+            MODEL_CACHE_DESC="/shared/data/WRH/models (shared host path)"
           elif [ -d "/it-share/models" ]; then
             MODEL_CACHE_MOUNT="-v /it-share/models:/models"
             MODEL_CACHE_DESC="/it-share/models (shared host path)"
