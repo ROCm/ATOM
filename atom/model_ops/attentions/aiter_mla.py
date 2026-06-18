@@ -81,7 +81,10 @@ class AiterMLABackend(AttentionBackend):
 
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def __init__(self, model_runner):
-        self.block_size = 64
+        if envs.ATOM_MLA_PAGE_SIZE > 1:
+            self.block_size = envs.ATOM_MLA_PAGE_SIZE
+        else:
+            self.block_size = 1
         if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
             assert model_runner.block_size == 64, (
                 f"ATOM_USE_TRITON_MLA=1 and ATOM_USE_TRITON_MLA_SHUFFLE_KV=1 expects --block-size 64 "
