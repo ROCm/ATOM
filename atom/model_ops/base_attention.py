@@ -21,7 +21,7 @@ from atom.utils.selector import get_attn_backend
 # op in model file
 class Attention:
     def __new__(cls, *args, **kwargs):
-        from atom.plugin.prepare import is_sglang, is_vllm
+        from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
 
         if is_vllm():
             from atom.plugin.vllm.attention.layer import AttentionForVllm
@@ -31,6 +31,10 @@ class Attention:
             from atom.plugin.sglang.attention import AttentionForSGLang
 
             return AttentionForSGLang(*args, **kwargs)
+        if is_rtpllm():
+            from atom.plugin.rtpllm.attention_backend import AttentionForRTPLLM
+
+            return AttentionForRTPLLM(*args, **kwargs)
 
         from atom.model_ops.paged_attention import Attention as AttentionForAtom
 

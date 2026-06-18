@@ -99,6 +99,62 @@ class PagedAttentionImpl(nn.Module):
 
         self.supports_quant_query_input = False
 
+    def _can_attempt_prefill_sink_asm(self, fwd_ctx: ForwardContext) -> bool:
+        if not fwd_ctx.context.is_prefill:
+            return False
+        if envs.ATOM_FORCE_ATTN_TRITON:
+            return False
+        if not (self.use_flash_layout or envs.ATOM_USE_UNIFIED_ATTN):
+            return False
+        attn_metadata = fwd_ctx.attn_metadata
+        if attn_metadata is None:
+            return False
+        if get_gfx() != "gfx1250":
+            return False
+        if self.head_dim != 64:
+            return False
+        if self.sinks is None:
+            return False
+        if self.sliding_window != -1 or self.alibi_slopes is not None:
+            return False
+        if getattr(attn_metadata, "dropout_p", 0.0) != 0.0:
+            return False
+        if getattr(attn_metadata, "has_cached", False):
+            return False
+        if attn_metadata.cu_seqlens_q is None or attn_metadata.cu_seqlens_k is None:
+            return False
+        if attn_metadata.max_seqlen_q != attn_metadata.max_seqlen_k:
+            return False
+        return True
+
+    def _can_use_prefill_sink_asm(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        fwd_ctx: ForwardContext,
+    ) -> bool:
+        if not self._can_attempt_prefill_sink_asm(fwd_ctx):
+            return False
+        if (
+            q.dtype != torch.bfloat16
+            or k.dtype != torch.bfloat16
+            or v.dtype != torch.bfloat16
+        ):
+            return False
+        if (
+            self.head_dim != 64
+            or q.shape[-1] != 64
+            or k.shape[-1] != 64
+            or v.shape[-1] != 64
+        ):
+            return False
+        if q.shape[0] != k.shape[0] or k.shape[0] != v.shape[0]:
+            return False
+        if q.shape[1] % k.shape[1] != 0:
+            return False
+        return True
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -126,7 +182,7 @@ class PagedAttentionImpl(nn.Module):
             q, k, v, qkv, position, fwd_ctx
         )
 
-        attn_impl = self.dispatch_backend(fwd_ctx)
+        attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
         o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
 
         o = o.view(-1, self.num_heads * self.head_dim)
@@ -242,7 +298,7 @@ class PagedAttentionImpl(nn.Module):
             if (
                 envs.ATOM_USE_UNIFIED_ATTN
                 and self.kv_cache_dtype.startswith("fp8")
-                and not (use_pa_decode_bf16_asm() and self.sliding_window == -1)
+                and not self._can_attempt_prefill_sink_asm(fwd_ctx)
             ):
                 q_out = torch.empty(*q.shape, dtype=k_cache.dtype, device=q.device)
             else:
@@ -792,8 +848,16 @@ class PagedAttentionImpl(nn.Module):
             return self.paged_attention_persistent_asm
         return self.paged_attention_asm
 
-    def dispatch_backend(self, fwd_ctx: ForwardContext):
+    def dispatch_backend(
+        self,
+        fwd_ctx: ForwardContext,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
         if fwd_ctx.context.is_prefill:
+            if self._can_use_prefill_sink_asm(q, k, v, fwd_ctx):
+                return self.prefill_attention
             if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
                 return self.prefill_attention_triton
             return self.prefill_attention

@@ -11,6 +11,7 @@ from __future__ import annotations
 # be handled by ATOM's native backend, making sglang-specific overrides
 # unnecessary.
 
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -167,6 +168,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             num_kv_heads, max_total_tokens, dtype=torch.float32, device=self.device
         )
         self.decode_using_pa_ps = self.page_size == 1024
+        if self.use_mla:
+            cu_num = torch.cuda.get_device_properties(self.device).multi_processor_count
+            self.prefill_ps_num_kv_splits = cu_num // math.gcd(self.num_kv_head, cu_num)
+        else:
+            self.prefill_ps_num_kv_splits = None
 
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:
         """Largest q length used by MLA CUDA graph speculative paths."""
@@ -622,6 +628,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         reduce_final_map = None
         reduce_partial_map = None
         fp8_prefill_kv_indices = None
+        num_kv_splits = None
 
         from sglang.srt.utils import is_gfx95_supported
 
@@ -658,6 +665,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             fp8_prefill_kv_indices = torch.arange(
                 total_s, device=self.device, dtype=torch.int32
             )
+            num_kv_splits = self.prefill_ps_num_kv_splits
 
         self.forward_metadata = ForwardMetadata(
             kv_indptr,
@@ -675,6 +683,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             fp8_prefill_kv_indices=fp8_prefill_kv_indices,
+            num_kv_splits=num_kv_splits,
         )
 
     def _init_extend_mha(self, bs, forward_batch):
@@ -2084,6 +2093,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             md.reduce_final_map,
             md.reduce_partial_map,
             tile_q,
+            md.num_kv_splits,
             output,
             final_lse,
         )
@@ -2212,6 +2222,38 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
     def _call_mla_decode_fwd(self, q, k_buffer, o, layer):
         """Common mla_decode_fwd invocation shared across decode/extend paths."""
         md = self.forward_metadata
+        head_repeat_factor = getattr(self, "head_repeat_factor", 1)
+        if head_repeat_factor > 1:
+            q_in = q.repeat_interleave(head_repeat_factor, dim=1)
+            o_padded = q.new_empty(
+                (q.shape[0], self.num_head_padded, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            mla_decode_fwd(
+                q_in,
+                k_buffer.view(-1, 1, 1, layer.qk_head_dim),
+                o_padded,
+                md.qo_indptr,
+                md.kv_indptr,
+                md.kv_indices,
+                md.kv_last_page_len,
+                md.max_q_len,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                work_meta_data=md.work_metadata,
+                work_indptr=md.work_indptr,
+                work_info_set=md.work_info_set,
+                reduce_indptr=md.reduce_indptr,
+                reduce_final_map=md.reduce_final_map,
+                reduce_partial_map=md.reduce_partial_map,
+                q_scale=layer.k_scale,
+                kv_scale=layer.k_scale,
+                intra_batch_mode=_sglang_aiter.intra_batch_mode,
+                num_kv_splits=md.num_kv_splits,
+            )
+            o.copy_(o_padded[:, ::head_repeat_factor, :])
+            return
+
         mla_decode_fwd(
             q,
             k_buffer.view(-1, 1, 1, layer.qk_head_dim),

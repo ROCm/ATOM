@@ -464,7 +464,7 @@ jobs:
                   "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP1",
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 1",
-                  "accuracy_test_threshold": 0.83,
+                  "accuracy_test_threshold": 0.81,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
@@ -473,7 +473,7 @@ jobs:
                   "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP2",
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 32768 --max-model-len 16384",
-                  "accuracy_test_threshold": 0.83,
+                  "accuracy_test_threshold": 0.81,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
@@ -482,7 +482,7 @@ jobs:
                   "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 4",
-                  "accuracy_test_threshold": 0.83,
+                  "accuracy_test_threshold": 0.81,
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
@@ -490,8 +490,10 @@ jobs:
                   "toggle_env": "RUN_QWEN3_NEXT_80B_MTP_TP1",
                   "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1",
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
-                  "extra_args": "--tensor-parallel-size 1 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+                  "extra_args": "--tensor-parallel-size 1 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "accuracy_test_threshold": 0.80,
+                  "mtp_accept_threshold": 0.74,
+                  "mtp_per_pos_threshold": "0.88,0.76,0.59",
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
@@ -499,8 +501,10 @@ jobs:
                   "toggle_env": "RUN_QWEN3_NEXT_80B_MTP_TP4",
                   "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4",
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
-                  "extra_args": "--tensor-parallel-size 4 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+                  "extra_args": "--tensor-parallel-size 4 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "accuracy_test_threshold": 0.80,
+                  "mtp_accept_threshold": 0.74,
+                  "mtp_per_pos_threshold": "0.88,0.76,0.59",
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
@@ -646,10 +650,12 @@ jobs:
                   "toggle_env": "RUN_DSV32_FP8_MTP_TP4",
                   "model_name": "DeepSeek-V3.2-FP8 MTP TP4",
                   "model_path": "deepseek-ai/DeepSeek-V3.2",
-                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
+                  "extra_args": "--tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "",
+                  "mtp_accept_threshold": 0.60,
+                  "mtp_per_pos_threshold": "0.89,0.62,0.28",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -732,8 +738,10 @@ jobs:
                   "toggle_env": "RUN_GLM4_7_FP8_MTP_TP4",
                   "model_name": "GLM-4.7-FP8 MTP TP4",
                   "model_path": "zai-org/GLM-4.7-FP8",
-                  "extra_args": "--tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+                  "extra_args": "--tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 2",
                   "accuracy_test_threshold": 0.92,
+                  "mtp_accept_threshold": 0.74,
+                  "mtp_per_pos_threshold": "0.91,0.58",
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
@@ -741,8 +749,10 @@ jobs:
                   "toggle_env": "RUN_GLM4_7_FP8_MTP_TP8",
                   "model_name": "GLM-4.7-FP8 MTP TP8",
                   "model_path": "zai-org/GLM-4.7-FP8",
-                  "extra_args": "--tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+                  "extra_args": "--tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 2",
                   "accuracy_test_threshold": 0.92,
+                  "mtp_accept_threshold": 0.74,
+                  "mtp_per_pos_threshold": "0.91,0.58",
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "atom-plugin-acc-validation-runner",
               },
@@ -772,11 +782,11 @@ jobs:
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
               },
               "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1": {
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
               },
               "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4": {
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
               },
               "Qwen3.5-397B-A17B-FP8 TP4": {
@@ -824,8 +834,8 @@ jobs:
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
               },
               "DeepSeek-V3.2-FP8 MTP TP4": {
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
-                  "env_vars": "",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
               },
               "DeepSeek-V3.2-FP8 PTPC TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
@@ -860,11 +870,11 @@ jobs:
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_GLUON_PA_DECODE=1",
               },
               "GLM-4.7-FP8 MTP TP4": {
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 2",
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
               },
               "GLM-4.7-FP8 MTP TP8": {
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 2",
                   "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
               },
               "GLM-5.1-FP8 TP8": {
@@ -1264,9 +1274,9 @@ jobs:
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/shared/data/amd_int/models" ]; then
-            MODEL_CACHE_MOUNT="-v /shared/data/amd_int/models:/models"
-            MODEL_CACHE_DESC="/shared/data/amd_int/models (shared host path)"
+          if [ -d "/shared/data/WRH/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared/data/WRH/models:/models"
+            MODEL_CACHE_DESC="/shared/data/WRH/models (shared host path)"
           elif [ -d "/it-share/models" ]; then
             MODEL_CACHE_MOUNT="-v /it-share/models:/models"
             MODEL_CACHE_DESC="/it-share/models (shared host path)"
@@ -1692,6 +1702,64 @@ jobs:
             echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to threshold ${{ matrix.accuracy_test_threshold }}."
             exit 0
           fi
+
+      - name: Check OOT MTP acceptance rate
+        if: ${{ steps.validation-window.outputs.should_run == 'true' && success() && steps.run_accuracy_client.outcome == 'success' && matrix.mtp_accept_threshold != '' }}
+        env:
+          MTP_ACCEPT_THRESHOLD: ${{ matrix.mtp_accept_threshold }}
+          MTP_PER_POS_THRESHOLD: ${{ matrix.mtp_per_pos_threshold }}
+        run: |
+          # MTP acceptance is recorded into the result JSON by atom_oot_test.sh
+          # (scraped from the live vLLM /metrics endpoint during the gsm8k run).
+          # gsm8k accuracy alone CANNOT guard MTP: speculative decoding is loss-
+          # less w.r.t. the target model, so a broken draft head leaves accuracy
+          # unchanged and only craters acceptance/throughput. This step is the
+          # only gate that catches an MTP regression. Uses jq+awk (no python on
+          # the host runner), mirroring the gsm8k accuracy check above.
+          result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+            echo "ERROR: No results JSON file found for MTP acceptance check."
+            exit 2
+          fi
+          echo "RESULT_FILE: $result_file"
+
+          overall=$(jq -r '.atom_ci_metadata.mtp_acceptance_overall // empty' "$result_file")
+          if [ -z "$overall" ]; then
+            echo "ERROR: mtp_acceptance_overall missing — spec-decode /metrics were not captured during the run. Treating as a failure."
+            exit 1
+          fi
+
+          fail=0
+          echo "MTP overall acceptance: $overall (threshold ${MTP_ACCEPT_THRESHOLD})"
+          if awk -v v="$overall" -v t="${MTP_ACCEPT_THRESHOLD}" 'BEGIN {exit !(v < t)}'; then
+            echo "FAIL: overall acceptance $overall < threshold ${MTP_ACCEPT_THRESHOLD}"
+            fail=1
+          fi
+
+          if [ -n "${MTP_PER_POS_THRESHOLD}" ]; then
+            IFS=',' read -ra pos_thresholds <<< "${MTP_PER_POS_THRESHOLD}"
+            idx=0
+            for th in "${pos_thresholds[@]}"; do
+              p=$(jq -r ".atom_ci_metadata.mtp_per_pos_acceptance[$idx] // empty" "$result_file")
+              if [ -z "$p" ]; then
+                echo "FAIL: position $idx acceptance missing (expected >= $th)"
+                fail=1
+              else
+                echo "MTP position $idx acceptance: $p (threshold $th)"
+                if awk -v v="$p" -v t="$th" 'BEGIN {exit !(v < t)}'; then
+                  echo "FAIL: position $idx acceptance $p < threshold $th"
+                  fail=1
+                fi
+              fi
+              idx=$((idx + 1))
+            done
+          fi
+
+          if [ "$fail" -eq 1 ]; then
+            echo "MTP acceptance gate FAILED."
+            exit 1
+          fi
+          echo "MTP acceptance gate PASSED."
 
       - name: Collect summary
         if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}

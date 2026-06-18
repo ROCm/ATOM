@@ -55,6 +55,10 @@ entry.
         {"label": "DPA", "suffix": "-dpa",
          "extra_args": "--enable-dp-attention",
          "conc_min": 64, "conc_max": 1024},
+        {"label": "DPA TBO", "suffix": "-dpa-tbo",
+         "extra_args": "--enable-dp-attention --enable-tbo",
+         "env_vars": "GPU_MAX_HW_QUEUES=5",
+         "conc_min": 256, "conc_max": 1024},
         {"label": "DPA MTP3", "suffix": "-dpa-mtp3",
          "extra_args": "--method mtp --num-speculative-tokens 3 --enable-dp-attention",
          "bench_args": "--use-chat-template", "conc_min": 64, "conc_max": 1024}
@@ -79,6 +83,7 @@ utilization, …) is passed verbatim through `extra_args`:
 | `tp` | config | `-tp <n>` (omitted if absent, e.g. gpt-oss) |
 | `trust_remote_code` | config | `--trust-remote-code` |
 | `extra_args` | config and/or variant | appended verbatim (server flags) |
+| `env_vars` | model and/or variant | newline-joined container env vars |
 | `bench_args` | variant | passed to the benchmark client (not the server) |
 | `conc_min` / `conc_max` | variant | concurrency band (filters scenarios) |
 | `scenarios` | variant or model | overrides `default_scenarios` |

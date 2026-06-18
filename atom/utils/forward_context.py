@@ -537,7 +537,7 @@ class ForwardContext:
     # True only while the model forward runs inside a CUDAGraph capture
     # block (model_runner.capture_model loop). Components that gate
     # multi-stream side-launches (V4 main Compressor on alt_stream,
-    # indexer.compressor on compress_stream) check this flag: side-stream
+    # indexer.compressor on indexer_stream) check this flag: side-stream
     # work is safe to emit inside a captured graph (graph records the
     # fork-join edges and replay re-uses the same stream layout) but
     # racy in eager mode where launches accumulate across layers and
