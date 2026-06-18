@@ -56,7 +56,9 @@ fused_qk_rope_concat_and_cache_mla = mark_trace(
     fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
 )
 fused_qk_rope_concat_and_cache_mla_seg = mark_trace(
-    fused_qk_rope_concat_and_cache_mla_seg, prefix="rope_and_kv_cache", torch_compile=False
+    fused_qk_rope_concat_and_cache_mla_seg,
+    prefix="rope_and_kv_cache",
+    torch_compile=False,
 )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
@@ -252,9 +254,9 @@ class MLAAttention(nn.Module):
             "fused seg MLA write/decode path requires an fp8 kv cache "
             f"(kv_cache_dtype={self.kv_cache_dtype})"
         )
-        assert attn_metadata.dtype_q == dtypes.fp8, (
-            f"seg q_out must be fp8, got dtype_q={attn_metadata.dtype_q}"
-        )
+        assert (
+            attn_metadata.dtype_q == dtypes.fp8
+        ), f"seg q_out must be fp8, got dtype_q={attn_metadata.dtype_q}"
         assert (
             self.kv_lora_rank == _MLA_SEG_KV_LORA_RANK
             and self.qk_rope_head_dim == _MLA_SEG_PE_DIM
@@ -268,9 +270,9 @@ class MLAAttention(nn.Module):
             f"cos/sin cache last dim must be {self.qk_rope_head_dim // 2} "
             f"(reuse_freqs_front_part), got {cos_dim}"
         )
-        assert positions.dtype == torch.int64, (
-            f"positions must be int64 for the seg kernel, got {positions.dtype}"
-        )
+        assert (
+            positions.dtype == torch.int64
+        ), f"positions must be int64 for the seg kernel, got {positions.dtype}"
         assert attn_metadata.slot_mapping.dtype == torch.int64, (
             "slot_mapping must be int64 for the seg kernel, got "
             f"{attn_metadata.slot_mapping.dtype}"
@@ -1071,7 +1073,7 @@ class MLAAttention(nn.Module):
                 paged_kv_last_page_lens,
                 max_q_len,
                 page_size=page_size,
-                num_kv_splits=4, # asm passes
+                num_kv_splits=4,  # asm passes
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,
                 work_indptr=work_indptr,
