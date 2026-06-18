@@ -106,6 +106,15 @@ class tokenIDProcessor:
         self.is_deferred_out = not getattr(
             runner.config, "enable_mixed_prefill_decode", False
         )
+        # Escape hatch: ATOM_FORCE_DEFERRED=1 forces deferred output ON even
+        # under the mixed flag. Deferred+mixed has a known accuracy bug (not a
+        # crash — verified crash-free at conc 2048 / ISL 8192) but is faster, so
+        # this lets us measure mixed+deferred throughput while the accuracy fix
+        # is pending. Do NOT use for accuracy-sensitive runs.
+        import os as _os
+
+        if _os.environ.get("ATOM_FORCE_DEFERRED") == "1":
+            self.is_deferred_out = True
 
         self.runner = runner
         device = runner.device
