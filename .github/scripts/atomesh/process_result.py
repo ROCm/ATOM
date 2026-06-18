@@ -485,7 +485,7 @@ def find_eval_scores(root: Path) -> list[float]:
 
 def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
     lines = [
-        "### ATOMesh Real P/D Benchmark Summary",
+        "### ATOMesh Model Performance Benchmark Summary",
         "",
         "| Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms |",
         "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
