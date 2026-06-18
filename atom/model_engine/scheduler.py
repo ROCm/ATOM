@@ -758,6 +758,27 @@ class Scheduler:
         if not self.running and not self.waiting:
             return None
 
+        # ---- Decode-first budget reservation (vLLM V1 style) ----
+        # vLLM schedules running decodes BEFORE new prefills within one shared
+        # token budget, so a long prefill chunk can never starve decode out of
+        # the step and mixed batches form naturally. ATOM keeps its existing
+        # prefill-first phase bodies (lower risk), but reserves the in-flight
+        # decodes' token budget up front so the prefill phases below only spend
+        # `max_num_batched_tokens - decode_token_reserve`. The decode phase then
+        # consumes the reserved remainder from the full budget. Net effect is
+        # identical to decode-first for mixed-batch formation. Only active when
+        # mixed batching is enabled; flag-off => reserve 0 => byte-identical to
+        # the old prefill-first behavior.
+        decode_token_reserve = 0
+        if self.enable_mixed_prefill_decode:
+            n_decode_inflight = sum(1 for s in self.running if not s.is_partial_prefill)
+            n_decode_inflight = min(n_decode_inflight, self.max_num_seqs)
+            decode_token_reserve = min(
+                n_decode_inflight * (self.mtp_k + 1),
+                self.max_num_batched_tokens,
+            )
+        prefill_budget = self.max_num_batched_tokens - decode_token_reserve
+
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `_delayer_allows_prefill` so cross-DP alignment still
         # holds when one rank is mid-chunked-prefill: a delayer veto skips
@@ -774,7 +795,7 @@ class Scheduler:
                 remaining = seq.num_tokens - seq.num_cached_tokens
                 if 0 < self.long_prefill_token_threshold < remaining:
                     remaining = self.long_prefill_token_threshold
-                budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+                budget_remaining = prefill_budget - num_batched_tokens
                 chunk = min(remaining, budget_remaining)
                 if chunk <= 0:
                     break
@@ -790,7 +811,7 @@ class Scheduler:
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
-            and num_batched_tokens < self.max_num_batched_tokens
+            and num_batched_tokens < prefill_budget
         ):
             seq = self.waiting.popleft()
 
@@ -888,7 +909,7 @@ class Scheduler:
                 and 0 < self.long_prefill_token_threshold < num_new_tokens
             ):
                 num_new_tokens = self.long_prefill_token_threshold
-            budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+            budget_remaining = prefill_budget - num_batched_tokens
             if self.enable_chunked_prefill:
                 chunk = min(num_new_tokens, budget_remaining)
             else:
@@ -1073,8 +1094,7 @@ class Scheduler:
             logger.info(
                 f"Scheduled {'mixed' if num_seqs_decode > 0 else 'prefill'} batch: "
                 f"{num_seqs_prefill} prefill + {num_seqs_decode} decode, "
-                f"{total_tokens_num_prefill}+{total_tokens_num_decode} tokens, "
-                f"req_ids: {tuple(scheduled_seqs.keys())}"
+                f"{total_tokens_num_prefill}+{total_tokens_num_decode} tokens"
             )
 
         connector_meta_output = None
