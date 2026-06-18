@@ -327,6 +327,22 @@ jobs:
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
+      - name: Configure Docker client config path
+        run: |
+          # Self-hosted runners often have a small or full $HOME; buildx defaults to ~/.docker/buildx
+          # and fails with "no space left on device" on .lock. Point DOCKER_CONFIG + BUILDKIT_TMPDIR
+          # at the job workspace (typically a larger volume than /home).
+          case "${{ matrix.runner }}" in
+            linux-atom-mi35x-4|atom-mi308-8gpu-plugins-benchmark|atom-mi355-8gpu.predownload)
+              echo "DOCKER_CONFIG=${GITHUB_WORKSPACE}/.atom-docker-client" >> "$GITHUB_ENV"
+              echo "BUILDKIT_TMPDIR=${GITHUB_WORKSPACE}/.buildkit-tmp" >> "$GITHUB_ENV"
+              echo "Set DOCKER_CONFIG and BUILDKIT_TMPDIR under workspace."
+              ;;
+            *)
+              echo "Runner ${{ matrix.runner }}: leave DOCKER_CONFIG unset (default ~/.docker)."
+              ;;
+          esac
+
       - name: Ensure Python 3.10+ (install portable 3.10 if needed)
         if: matrix.runner == 'atom-mi308-8gpu-plugins-benchmark'
         id: ensure_python
@@ -386,6 +402,15 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+
+      - name: Ensure Docker client config directory
+        if: contains(fromJSON('["linux-atom-mi35x-4","atom-mi308-8gpu-plugins-benchmark","atom-mi355-8gpu.predownload"]'), matrix.runner)
+        run: |
+          set -euo pipefail
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
+          mkdir -p "${BUILDKIT_TMPDIR}"
+          chmod 700 "${BUILDKIT_TMPDIR}"
 
       - name: Resolve SGLang version metadata
         run: python3 .github/scripts/resolve_sglang_metadata.py
