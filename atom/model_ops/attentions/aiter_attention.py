@@ -564,6 +564,30 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 device="cuda",
             )
             tensors["_minimax_m3_sparse_cache_next"] = 0
+            # fp8 ASM path: per-token dequant scales for the page-16 SHUFFLE main
+            # KV cache, written by fused_qknorm_idxrqknorm /
+            # reshape_and_cache_with_pertoken_quant and read by gluon. Allocated
+            # page-128 here ([num_128_blocks, num_kv_heads, 128]); build_kv_cache_tensor
+            # binds a zero-copy page-16 view ([num_128_blocks*8, nkv, 16]) per layer so
+            # the row stride (16) matches the SHUFFLE page the kernel/gluon index with.
+            # Allocated only for fp8.
+            if config.kv_cache_dtype == "fp8":
+                tensors["minimax_m3_k_scale"] = torch.zeros(
+                    hf_config.num_hidden_layers,
+                    runner.num_physical_kvcache_blocks,
+                    num_kv_heads,
+                    runner.physical_block_size,
+                    dtype=dtypes.fp32,
+                    device="cuda",
+                )
+                tensors["minimax_m3_v_scale"] = torch.zeros(
+                    hf_config.num_hidden_layers,
+                    runner.num_physical_kvcache_blocks,
+                    num_kv_heads,
+                    runner.physical_block_size,
+                    dtype=dtypes.fp32,
+                    device="cuda",
+                )
         return tensors
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -589,12 +613,42 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             module.index_cache = runner.minimax_m3_index_cache[sparse_idx]
             key_cache, value_cache = module.kv_cache.unbind(1)
             module.max_model_len = config.max_model_len
+            # fp8 ASM path: bind this layer's per-token dequant scale slices
+            # (written by the fp8 KV insert, read by gluon). bf16 -> None.
+            k_scale = v_scale = None
+            if config.kv_cache_dtype == "fp8":
+                from atom.model_ops.minimax_m3.sparse_attn import (
+                    ASM_PAGE_SIZE,
+                    PAGES_PER_SPARSE_BLOCK,
+                )
+
+                # The scale buffer is allocated page-128 ([num_128_blocks, nkv, 128]),
+                # but the fp8 write kernel (fused_qknorm_idxrqknorm) and the gluon
+                # reader both index it in the page-16 SHUFFLE layout that mirrors the
+                # main KV cache: [num_128_blocks * 8, nkv, 16]. 128 == 8 * 16, so this
+                # is a pure zero-copy reinterpretation of the same contiguous bytes —
+                # the row stride becomes 16 (== the SHUFFLE page) so a page-16 block id
+                # lands on the right scale. Without this view, gluon multiplies a
+                # page-16 block id by the page-128 row stride (128) and reads scales
+                # 8x out of position, corrupting fp8 attention once blocks are reused.
+                k_scale = runner.minimax_m3_k_scale[layer_id].view(
+                    runner.num_physical_kvcache_blocks * PAGES_PER_SPARSE_BLOCK,
+                    module.num_kv_heads,
+                    ASM_PAGE_SIZE,
+                )
+                v_scale = runner.minimax_m3_v_scale[layer_id].view(
+                    runner.num_physical_kvcache_blocks * PAGES_PER_SPARSE_BLOCK,
+                    module.num_kv_heads,
+                    ASM_PAGE_SIZE,
+                )
+            module.k_scale = k_scale
+            module.v_scale = v_scale
             return KVCacheTensor(
                 layer_num=layer_id,
                 k_cache=key_cache,
                 v_cache=value_cache,
-                k_scale=None,
-                v_scale=None,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
 
         if not (
