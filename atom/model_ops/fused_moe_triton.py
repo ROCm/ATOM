@@ -40,6 +40,7 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
         swizzle_scales as swizzle_scales_cdna4,
     )
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
+    from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 
 from atom.model_ops.moe import MoEActivationQuant
 
@@ -305,9 +306,33 @@ def triton_kernel_fused_experts(
             )
     else:
         # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation.
-        # The activation precision selects the routed GEMM: MXFP4 activations
-        # (a4w4) when act_quant is FP4, otherwise bf16 activations (a16w4).
-        if act_quant == MoEActivationQuant.FP4:
+        # The activation precision selects the routed GEMM: FP8 activations
+        # (a8w4) when act_quant is FP8, MXFP4 activations (a4w4) when FP4,
+        # otherwise bf16 activations (a16w4).
+        if act_quant == MoEActivationQuant.FP8:
+            quant_dtype = torch.float8_e4m3fn
+            if get_arch() == "gfx942":
+                quant_dtype = torch.float8_e4m3fnuz
+
+            hidden_states, a13_mx_scale = dynamic_mxfp8_quant(
+                hidden_states, quant_dtype=quant_dtype
+            )
+            raw_intermediate = moe_gemm_a8w4(
+                hidden_states,
+                w1,
+                a13_mx_scale,
+                w13_scale,
+                None,
+                None,
+                w1_bias,
+                routing_data,
+                gather_indx=gather_indx,
+                gammas=gammas if apply_router_weight_on_input else None,
+                swizzle_mx_scale=w13_swizzle_layout,
+                out_dtype=torch.bfloat16,
+                apply_swiglu=False,
+            )
+        elif act_quant == MoEActivationQuant.FP4:
             hidden_states_fp4, hidden_states_mx_scale = mxfp4_quant(hidden_states)
             raw_intermediate = moe_gemm_a4w4(
                 hidden_states_fp4,
@@ -341,15 +366,30 @@ def triton_kernel_fused_experts(
 
         raw_2d = raw_intermediate.view(M * topk, N)
         intermediate_cache = intermediate_cache.view(M * topk, half_N)
-        fused_clamp_act_mul(
-            raw_2d,
-            out=intermediate_cache,
-            swiglu_limit=swiglu_limit,
-            activation="silu",
-            dtype_quant=None,
-        )
 
-        if act_quant == MoEActivationQuant.FP4:
+        if act_quant == MoEActivationQuant.FP8:
+            intermediate_fp8, a2_mx_scale = fused_clamp_act_mul(
+                raw_2d,
+                swiglu_limit=swiglu_limit,
+                activation="silu",
+                dtype_quant=quant_dtype,
+                scale_dtype_fmt="ue8m0",
+                quant_block_size=32,
+            )
+            output_tensor = moe_gemm_a8w4(
+                intermediate_fp8,
+                w2,
+                a2_mx_scale,
+                w2_scale,
+                None,
+                None,
+                w2_bias,
+                routing_data,
+                scatter_indx=scatter_indx,
+                gammas=None if apply_router_weight_on_input else gammas,
+                swizzle_mx_scale=w2_swizzle_layout,
+            )
+        elif act_quant == MoEActivationQuant.FP4:
             intermediate_fp4, intermediate_mx_scale = mxfp4_quant(intermediate_cache)
             output_tensor = moe_gemm_a4w4(
                 intermediate_fp4,

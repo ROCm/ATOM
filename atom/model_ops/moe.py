@@ -792,6 +792,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
+        self.use_a8w4_prefill = envs.ATOM_USE_A8W4_MOE_PREFILL
+        self.use_a8w4_decode = envs.ATOM_USE_A8W4_MOE_DECODE
 
     def create_weights(
         self,
@@ -985,6 +987,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale = w2_scale
             layer.w13_swizzle_layout = w13_swizzle_layout
             layer.w2_swizzle_layout = w2_swizzle_layout
+
+            if (self.use_a8w4_prefill or self.use_a8w4_decode) and self.act_quant != MoEActivationQuant.FP8:
+                from atom.model_ops.fused_moe_triton import (
+                    _swizzle_scales_for_kernel,
+                )
+
+                w13_s = layer.w13_weight_scale.clone()
+                w13_s, w13_sl = _swizzle_scales_for_kernel(
+                    w13_s, MoEActivationQuant.FP8
+                )
+                w2_s = layer.w2_weight_scale.clone()
+                w2_s, w2_sl = _swizzle_scales_for_kernel(
+                    w2_s, MoEActivationQuant.FP8
+                )
+                layer.w13_weight_scale_a8w4 = w13_s
+                layer.w2_weight_scale_a8w4 = w2_s
+                layer.w13_swizzle_layout_a8w4 = w13_sl
+                layer.w2_swizzle_layout_a8w4 = w2_sl
             return
 
         # shuffle weight
@@ -1065,6 +1085,32 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 triton_kernel_moe_forward,
             )
 
+            act_quant = self.act_quant
+            if self.use_a8w4_prefill or self.use_a8w4_decode:
+                ctx = get_forward_context()
+                is_prefill = ctx.context.is_prefill
+                if (is_prefill and self.use_a8w4_prefill) or (
+                    not is_prefill and self.use_a8w4_decode
+                ):
+                    act_quant = MoEActivationQuant.FP8
+                else:
+                    act_quant = MoEActivationQuant.BF16
+
+            use_a8w4_scales = (
+                act_quant == MoEActivationQuant.FP8
+                and self.act_quant != MoEActivationQuant.FP8
+            )
+            if use_a8w4_scales:
+                w13_scale = layer.w13_weight_scale_a8w4
+                w2_scale = layer.w2_weight_scale_a8w4
+                w13_swizzle = layer.w13_swizzle_layout_a8w4
+                w2_swizzle = layer.w2_swizzle_layout_a8w4
+            else:
+                w13_scale = layer.w13_weight_scale
+                w2_scale = layer.w2_weight_scale
+                w13_swizzle = layer.w13_swizzle_layout
+                w2_swizzle = layer.w2_swizzle_layout
+
             # Check if the model needs custom routing that triton routing()
             # does not support (grouped topk, sigmoid scoring, bias correction).
             needs_custom_routing = (
@@ -1118,10 +1164,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     scatter_idx,
                     topk=n_expts_act,
                     activation=activation,
-                    w13_scale=layer.w13_weight_scale,
-                    w2_scale=layer.w2_weight_scale,
-                    w13_swizzle_layout=layer.w13_swizzle_layout,
-                    w2_swizzle_layout=layer.w2_swizzle_layout,
+                    w13_scale=w13_scale,
+                    w2_scale=w2_scale,
+                    w13_swizzle_layout=w13_swizzle,
+                    w2_swizzle_layout=w2_swizzle,
                     a13_scale=layer.w13_input_scale,
                     a2_scale=layer.w2_input_scale,
                     w1_bias=layer.w13_bias,
@@ -1130,7 +1176,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
                     expert_map=expert_map,
-                    act_quant=self.act_quant,
+                    act_quant=act_quant,
                 )
 
                 # Always-on shared expert(s) via a standalone dense GEMM,
@@ -1154,10 +1200,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 topk=top_k,
                 renormalize=renormalize,
                 activation=activation,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                w13_swizzle_layout=layer.w13_swizzle_layout,
-                w2_swizzle_layout=layer.w2_swizzle_layout,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                w13_swizzle_layout=w13_swizzle,
+                w2_swizzle_layout=w2_swizzle,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 w1_bias=layer.w13_bias,
@@ -1165,7 +1211,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 expert_map=expert_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
-                act_quant=self.act_quant,
+                act_quant=act_quant,
             )
 
         topk_weights, topk_ids = FusedMoE.select_experts(
