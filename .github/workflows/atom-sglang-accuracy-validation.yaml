@@ -200,9 +200,6 @@ jobs:
           RUN_DSR1_FP4_TP8_DP8_EP8: ${{ inputs.run_dsr1_fp4_tp8_dp8_ep8 }}
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
           RUN_DSR1_FP4_TP8_MTP3: ${{ inputs.run_dsr1_fp4_tp8_mtp3 }}
-          RUN_DSR1_FP4_MTP_MOEFP4_TP8: ${{ inputs.run_dsr1_fp4_mtp_moefp4_tp8 }}
-          RUN_DSR1_FP4_MTP_MOEFP4_TP8_DP8_EP8: ${{ inputs.run_dsr1_fp4_mtp_moefp4_tp8_dp8_ep8 }}
-          RUN_DSR1_FP4_MTP_MOEFP4_TP8_MTP3: ${{ inputs.run_dsr1_fp4_mtp_moefp4_tp8_mtp3 }}
           RUN_DSR1_FP4_TP8_MTP1: ${{ inputs.run_dsr1_fp4_tp8_mtp1 }}
           RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
           RUN_GLM51_FP8_TP8: ${{ inputs.run_glm51_fp8_tp8 }}
