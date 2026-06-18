@@ -95,14 +95,18 @@ jobs:
     steps:
       - name: Detect container engine
         run: |
-          if command -v podman > /dev/null 2>&1; then
+          set -euo pipefail
+          # Prefer podman when usable + --group-add keep-groups; otherwise docker + --group-add video.
+          if command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
             echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
-            echo "Container engine: podman"
+            echo "CONTAINER_GROUP_ADD=--group-add keep-groups" >> "$GITHUB_ENV"
+            echo "Container engine: podman (--group-add keep-groups)"
           elif docker info > /dev/null 2>&1; then
             echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
-            echo "Container engine: docker"
+            echo "CONTAINER_GROUP_ADD=--group-add video" >> "$GITHUB_ENV"
+            echo "Container engine: docker (--group-add video)"
           else
-            echo "ERROR: Neither docker nor podman is available on this runner."
+            echo "ERROR: Neither a working podman nor docker is available on this runner."
             exit 1
           fi
 
@@ -262,7 +266,7 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add keep-groups \
+            --ipc=host ${CONTAINER_GROUP_ADD} \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
