@@ -320,6 +320,14 @@ class GenericParser(QuantConfigParser):
             QuantType.per_1x128,
         ):
             quant_type = QuantType.per_1x32
+        # Mxfp8 ``[1, K]`` block to per_1x32.
+        weight_block_size = hf_quant_config.get("weight_block_size")
+        if (
+            isinstance(weight_block_size, (list, tuple))
+            and len(weight_block_size) == 2
+            and weight_block_size[0] == 1
+        ):
+            quant_type = QuantType.per_1x32
         is_dynamic = hf_quant_config.get("is_dynamic", True)
         # Each quantizer uses a different key for excluded layers:
         # Quark -> "exclude", compressed-tensors -> "ignore",

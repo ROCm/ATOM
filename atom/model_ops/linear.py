@@ -32,7 +32,7 @@ from atom.model_ops.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
-from atom.quantization.quark.utils import weight_dequant_fp8
+from atom.quantization.quark.utils import weight_dequant_fp8, weight_dequant_mxfp8
 from torch import nn
 
 logger = logging.getLogger("atom")
@@ -456,6 +456,14 @@ class LinearBase(nn.Module):
         """Gather sharded weight from all TP ranks to reconstruct the full unpartitioned weight."""
         if self.tp_size <= 1 or self.tp_dim is None:
             return weight
+        # NCCL cannot all_gather E8M0 scales (MXFP8 source); gather the raw
+        # bytes as uint8 and reinterpret afterwards. The gather only moves
+        # bytes, so this is bit-exact.
+        if weight.dtype == dtypes.fp8_e8m0:
+            gathered = get_tp_group().all_gather(
+                weight.view(torch.uint8), dim=self.tp_dim
+            )
+            return gathered.view(dtypes.fp8_e8m0)
         return get_tp_group().all_gather(weight, dim=self.tp_dim)
 
     def _shard_quantized_weight(self, q_weight, weight_scale):
@@ -508,7 +516,11 @@ class LinearBase(nn.Module):
             f"Unsupported online quant: "
             f"dtype={online_quant_dtype}, type={online_quant_type}"
         )
-        assert self.quant_type in [QuantType.No, QuantType.per_1x128], (
+        assert self.quant_type in [
+            QuantType.No,
+            QuantType.per_1x128,
+            QuantType.per_1x32,
+        ], (
             f"Unsupported source quant_type for online quantization: "
             f"{self.quant_type} (layer={self.prefix})"
         )
@@ -546,6 +558,9 @@ class LinearBase(nn.Module):
         if self.quant_type == QuantType.per_1x128:
             # dequant per block fp8
             weight = weight_dequant_fp8(weight, weight_scale)
+        elif self.quant_type == QuantType.per_1x32:
+            # dequant MXFP8 (FP8 elements + 1x32 E8M0 shared scale)
+            weight = weight_dequant_mxfp8(weight, weight_scale)
         q_weight, weight_scale = online_quant_func(
             weight, quant_dtype=online_quant_dtype
         )

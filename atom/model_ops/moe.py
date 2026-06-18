@@ -52,7 +52,7 @@ from atom.model_ops.utils import (
 )
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
-from atom.quantization.quark.utils import weight_dequant_fp8
+from atom.quantization.quark.utils import weight_dequant_fp8, weight_dequant_mxfp8
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
@@ -2511,11 +2511,24 @@ class FusedMoE(torch.nn.Module):
             return
 
         quant_func = get_hip_quant(online_quant_type)
-        assert source_quant_type in (QuantType.No, QuantType.per_1x128), (
+        assert source_quant_type in (
+            QuantType.No,
+            QuantType.per_1x128,
+            QuantType.per_1x32,
+        ), (
             f"Unsupported source quant_type for MoE online quantization: "
             f"{source_quant_type} (layer={self.layer_name})"
         )
-        need_dequant = source_quant_type == QuantType.per_1x128
+        need_dequant = source_quant_type in (
+            QuantType.per_1x128,
+            QuantType.per_1x32,
+        )
+
+        def _dequant_func(w: torch.Tensor, sc: torch.Tensor) -> torch.Tensor:
+            # per_1x128 -> deepseek-style square-block FP8; per_1x32 -> MXFP8.
+            if source_quant_type == QuantType.per_1x32:
+                return weight_dequant_mxfp8(w.contiguous(), sc.contiguous())
+            return weight_dequant_fp8(w.contiguous(), sc.contiguous())
 
         # Determine whether each weight needs all_gather to match offline quantization.
         # w13 (column parallel): (E, (2*intermediate/tp, hidden)) — TP dim 0
@@ -2572,13 +2585,13 @@ class FusedMoE(torch.nn.Module):
             if need_dequant:
                 w13_scale = old_w13_scale[expert_id]
                 s1_size = w13_scale.shape[0] // 2
-                w1_bf16 = weight_dequant_fp8(
-                    w13_local[:w1_size].contiguous(),
-                    w13_scale[:s1_size].contiguous(),
+                w1_bf16 = _dequant_func(
+                    w13_local[:w1_size],
+                    w13_scale[:s1_size],
                 )
-                w3_bf16 = weight_dequant_fp8(
-                    w13_local[w1_size:].contiguous(),
-                    w13_scale[s1_size:].contiguous(),
+                w3_bf16 = _dequant_func(
+                    w13_local[w1_size:],
+                    w13_scale[s1_size:],
                 )
             else:
                 w1_bf16 = w13_local[:w1_size]
@@ -2615,9 +2628,9 @@ class FusedMoE(torch.nn.Module):
             # w2 ptpc_fp8 [e, m, n]->[e, m, n//tp]->[e, m, 1]
             w2_local = old_w2_data[expert_id]
             if need_dequant:
-                w2_local = weight_dequant_fp8(
-                    w2_local.contiguous(),
-                    old_w2_scale[expert_id].contiguous(),
+                w2_local = _dequant_func(
+                    w2_local,
+                    old_w2_scale[expert_id],
                 )
             if need_gather_w2:
                 w2_full = tp_group.all_gather(w2_local, dim=1)
