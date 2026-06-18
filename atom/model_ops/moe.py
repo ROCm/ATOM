@@ -409,9 +409,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # Gated on is_fp8 so non-FP8 MORI handle config stays untouched.
             import os as _os
 
-            _fp8_dispatch_exp = (
-                _os.environ.get("MORI_FP8_DISPATCH", "0") == "1" and is_fp8
-            )
+            # NOTE: drop the is_fp8 guard. DSv4 MXFP8 activation quant is owned by
+            # the aiter GEMM, so quant_config.quant_dtype is None here (is_fp8=False).
+            # We know DSv4 is per_1x32 MXFP8, so gate on the env flag alone.
+            _fp8_dispatch_exp = _os.environ.get("MORI_FP8_DISPATCH", "0") == "1"
             if _fp8_dispatch_exp:
                 scale_dim = moe.hidden_dim // 32
 
