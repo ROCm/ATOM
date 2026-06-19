@@ -266,6 +266,44 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     return y
 
 
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    fp8_dtypes = {
+        d
+        for d in (
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e4m3fnuz", None),
+            getattr(torch, "float8_e5m2", None),
+            getattr(torch, "float8_e5m2fnuz", None),
+            dtypes.fp8,
+        )
+        if d is not None
+    }
+    return dtype in fp8_dtypes
+
+
+def _dequantize_fp8_1x32_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Materialize MXFP8 1x32 weights for the BF16 dense-GEMM fallback."""
+    if weight_scale is None:
+        raise RuntimeError("per_1x32 fp8 GEMM fallback requires weight_scale")
+    scale = weight_scale.contiguous()
+    # MiniMax-M3 stores MXFP8 scales as e8m0 bytes.  Reinterpret uint8 storage
+    # before converting to the fallback compute dtype.
+    if scale.dtype == torch.uint8:
+        scale = scale.view(dtypes.fp8_e8m0)
+    if weight.shape[-1] % 32 == 0:
+        return (
+            weight.to(dtype).view(*weight.shape[:-1], weight.shape[-1] // 32, 32)
+            * scale.to(dtype).unsqueeze(-1)
+        ).reshape_as(weight).contiguous()
+    scale = scale.to(dtype).repeat_interleave(32, dim=-1)
+    scale = scale[..., : weight.shape[-1]]
+    return (weight.to(dtype) * scale).contiguous()
+
+
 class LinearBase(nn.Module):
     def __init__(
         self,
@@ -553,6 +591,20 @@ class LinearBase(nn.Module):
             self.weight.data, self.weight_scale.data, _ = normalize_e4m3fn_to_e4m3fnuz(
                 self.weight.data, self.weight_scale.data
             )
+        if self.quant_type == QuantType.per_1x32 and _is_fp8_dtype(self.params_dtype):
+            fallback_dtype = get_current_atom_config().torch_dtype
+            self.weight = atom_parameter(
+                _dequantize_fp8_1x32_weight(
+                    self.weight.data,
+                    self.weight_scale.data,
+                    fallback_dtype,
+                )
+            )
+            self.register_parameter("weight_scale", None)
+            self.quant_type = QuantType.No
+            self.params_dtype = fallback_dtype
+            self.quant_func = get_hip_quant(QuantType.No)
+            return
         if (
             self.source_quant_dtype == torch.bfloat16
             and self.quant_type == QuantType.per_1x32
@@ -800,7 +852,8 @@ class MergedColumnParallelLinear(LinearBase):
                 if param is getattr(self, "weight_scale", None) or param is getattr(
                     self, "input_scale", None
                 ):
-                    shard_size //= 128
+                    if self.quant_type != QuantType.per_1x32:
+                        shard_size //= 128
                 shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
                 self.weight_loader(param, shard, shard_id)
                 current_offset += shard_size

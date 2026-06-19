@@ -1743,6 +1743,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        self.num_experts = num_experts
 
         # TODO hard code for now
         params_dtype = torch.float8_e4m3fn
@@ -1813,22 +1814,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
         elif self.block_quant:
-            w13_weight_scale = atom_parameter(
-                torch.ones(
-                    num_experts,
-                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
-                    (hidden_size + block_k - 1) // block_k,
-                    dtype=torch.float32,
-                )
+            scale_shape_w13 = (
+                num_experts,
+                2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                (hidden_size + block_k - 1) // block_k,
             )
-            w2_weight_scale = atom_parameter(
-                torch.ones(
-                    num_experts,
-                    (hidden_size + block_n - 1) // block_n,
-                    (intermediate_size_per_partition + block_k - 1) // block_k,
-                    dtype=torch.float32,
-                )
+            scale_shape_w2 = (
+                num_experts,
+                (hidden_size + block_n - 1) // block_n,
+                (intermediate_size_per_partition + block_k - 1) // block_k,
             )
+            # MXFP8 checkpoints store 1x32 scales as e8m0 bytes.  Keep the
+            # existing float32 initialization for the original 1x128 path.
+            if self.quant_type == QuantType.per_1x32:
+                w13_scale_data = torch.empty(scale_shape_w13, dtype=dtypes.fp8_e8m0)
+                w2_scale_data = torch.empty(scale_shape_w2, dtype=dtypes.fp8_e8m0)
+            else:
+                w13_scale_data = torch.ones(scale_shape_w13, dtype=torch.float32)
+                w2_scale_data = torch.ones(scale_shape_w2, dtype=torch.float32)
+            w13_weight_scale = atom_parameter(w13_scale_data)
+            w2_weight_scale = atom_parameter(w2_scale_data)
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
             assert self.quant_config.is_dynamic
@@ -1898,6 +1903,37 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale = atom_parameter(layer.w13_weight_scale.data)
             layer.w2_weight = atom_parameter(layer.w2_weight.data)
             layer.w2_weight_scale = atom_parameter(layer.w2_weight_scale.data)
+
+        if self.quant_type == QuantType.per_1x32:
+            # aiter's MXFP8 MoE kernels consume the same gate/up interleaved
+            # layout used by their 1x32 shuffle helpers.  Keep this branch
+            # isolated so the existing 1x128 FP8 path still uses shuffle_weights.
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight,
+                is_guinterleave=True,
+                gate_up=True,
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight,
+                is_guinterleave=True,
+                gate_up=False,
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+
+            w13_scale_2d = layer.w13_weight_scale.reshape(
+                -1, layer.w13_weight_scale.shape[-1]
+            )
+            w2_scale_2d = layer.w2_weight_scale.reshape(
+                -1, layer.w2_weight_scale.shape[-1]
+            )
+            layer.w13_weight_scale = atom_parameter(
+                shuffle_scale(w13_scale_2d, self.num_experts, True, True)
+            )
+            layer.w2_weight_scale = atom_parameter(
+                shuffle_scale(w2_scale_2d, self.num_experts, True, False)
+            )
+            return
 
         shuffle_weights(layer.w13_weight, layer.w2_weight)
 
@@ -2027,8 +2063,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
         # per_Tensor doesn't support num_local_tokens, so fallback to
         # rocm_aiter_fused_moe when using per-tensor or no modular kernel.
+        # Match the 1x32 preshuffled layout above; other FP8 quant modes keep
+        # the historical separated gate/up layout.
+        gate_mode = (
+            GateMode.INTERLEAVE.value
+            if self.quant_type == QuantType.per_1x32
+            else GateMode.SEPARATED.value
+        )
         moe_extra_args = {
-            "gate_mode": GateMode.SEPARATED.value,
+            "gate_mode": gate_mode,
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
@@ -2711,6 +2754,24 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
 
+    @staticmethod
+    def _copy_quant_storage(dst: torch.Tensor, src: torch.Tensor) -> None:
+        """Copy quantized tensors without numeric conversion of byte formats."""
+        if dst.dtype == dtypes.fp4x2:
+            dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            return
+        if dst.dtype == dtypes.fp8_e8m0 and src.dtype == torch.uint8:
+            # e8m0 microscale tensors are byte-encoded; copy_ would convert the
+            # uint8 values numerically instead of preserving the scale bits.
+            dst.view(torch.uint8).copy_(src)
+            return
+        if dst.dtype == torch.uint8 and src.dtype in (
+            torch.float8_e8m0fnu,
+            torch.float8_e4m3fn,
+        ):
+            src = src.view(torch.uint8)
+        dst.copy_(src)
+
     def _load_w13(
         self,
         expert_data: torch.Tensor,
@@ -2733,10 +2794,7 @@ class FusedMoE(torch.nn.Module):
             load_size = loaded_weight.shape[shard_dim]
             if load_size != expert_shard_size:
                 expert_data = expert_data.narrow(shard_dim, 0, load_size)
-            if expert_data.dtype != dtypes.fp4x2:
-                expert_data.copy_(loaded_weight)
-            else:
-                expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+            self._copy_quant_storage(expert_data, loaded_weight)
             return
 
         # Index the loaded weight for tp sharding.
@@ -2762,19 +2820,7 @@ class FusedMoE(torch.nn.Module):
         # the loaded weight size so the copy shape matches.
         if load_shard_size != expert_shard_size:
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
-        if expert_data.dtype != dtypes.fp4x2:
-            # Dtype glue: V4 stores per-1x32 weight scales as float8_e8m0fnu but
-            # FusedMoE allocates them as uint8 (raw byte storage). PyTorch's
-            # copy_() between mismatched float8/uint8 dtypes silently writes
-            # zeros — must reinterpret the source as uint8 first.
-            if expert_data.dtype == torch.uint8 and loaded_weight.dtype in (
-                torch.float8_e8m0fnu,
-                torch.float8_e4m3fn,
-            ):
-                loaded_weight = loaded_weight.view(torch.uint8)
-            expert_data.copy_(loaded_weight)
-        else:
-            expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+        self._copy_quant_storage(expert_data, loaded_weight)
 
     def _load_w2(
         self,
@@ -2790,10 +2836,7 @@ class FusedMoE(torch.nn.Module):
             load_size = loaded_weight.shape[shard_dim]
             if load_size != shard_size:
                 expert_data = expert_data.narrow(shard_dim, 0, load_size)
-            if expert_data.dtype != dtypes.fp4x2:
-                expert_data.copy_(loaded_weight)
-            else:
-                expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+            self._copy_quant_storage(expert_data, loaded_weight)
             return
 
         # Index the loaded weight for tp sharding.
@@ -2807,16 +2850,7 @@ class FusedMoE(torch.nn.Module):
         if load_shard_size != shard_size:
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
-        if expert_data.dtype == dtypes.fp4x2:
-            expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
-        else:
-            # Dtype glue: see _load_w13 for the same uint8/float8 reinterpret.
-            if expert_data.dtype == torch.uint8 and loaded_weight.dtype in (
-                torch.float8_e8m0fnu,
-                torch.float8_e4m3fn,
-            ):
-                loaded_weight = loaded_weight.view(torch.uint8)
-            expert_data.copy_(loaded_weight)
+        self._copy_quant_storage(expert_data, loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int

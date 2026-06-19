@@ -192,14 +192,18 @@ def make_minimax_m3_expert_params_mapping(
                 param_prefix = "experts.w2_"
                 scale_param = "experts.w2_weight_scale"
             for weight_name in weight_names:
-                mapping.append(
-                    (
-                        scale_param,
-                        f"experts.{expert_id}.{weight_name}.scale",
-                        expert_id,
-                        shard_id,
+                # ATOM's generic loader renames ``weight_scale_inv`` to
+                # ``weight_scale`` before expert-prefix matching.  Keep the
+                # original ``.scale`` form for checkpoints that use it directly.
+                for scale_name in ("scale", "weight_scale"):
+                    mapping.append(
+                        (
+                            scale_param,
+                            f"experts.{expert_id}.{weight_name}.{scale_name}",
+                            expert_id,
+                            shard_id,
+                        )
                     )
-                )
                 mapping.append(
                     (
                         param_prefix,
