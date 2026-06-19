@@ -306,6 +306,10 @@ class MiniMaxM3MoE(nn.Module):
                 config=config,
                 shared_expert_prefix=f"{prefix}.shared_experts",
             )
+            if hasattr(self.experts.quant_method, "intermediate_pad"):
+                # MiniMax-M3 pads expert weights at load time; computing the full
+                # padded intermediate avoids backend pad-skip precision issues.
+                self.experts.quant_method.intermediate_pad = 0
             self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
             self.fuse_shared_experts = (
                 getattr(self.experts, "num_fused_shared_experts", 0) > 0

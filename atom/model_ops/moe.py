@@ -1747,6 +1747,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # TODO hard code for now
         params_dtype = torch.float8_e4m3fn
+        intermediate_size_for_weight = intermediate_size_per_partition
 
         if self.block_quant:
             if self.quant_type == QuantType.per_1x128:
@@ -1773,28 +1774,42 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     f"{intermediate_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
+            if self.quant_type == QuantType.per_1x32:
+                # aiter's GU-interleaved MXFP8 scale shuffle packs 8 scale
+                # columns, i.e. 256 weight columns for 1x32 scales. TP8 on
+                # MiniMax-M3 has local intermediate=384, so pad to 512.
+                scale_pack_k = block_k * 8
+                intermediate_size_for_weight = (
+                    (intermediate_size_per_partition + scale_pack_k - 1)
+                    // scale_pack_k
+                    * scale_pack_k
+                )
 
         # WEIGHTS
         w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                2 * intermediate_size_for_weight,
                 hidden_size,
                 dtype=params_dtype,
             )
         )
         layer.register_parameter("w13_weight", w13_weight)
+        if self.quant_type == QuantType.per_1x32:
+            w13_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w2_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition,
+                intermediate_size_for_weight,
                 dtype=params_dtype,
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
+        if self.quant_type == QuantType.per_1x32:
+            w2_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
@@ -1804,7 +1819,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight_scale = atom_parameter(
                 torch.ones(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    2 * intermediate_size_for_weight,
                     dtype=torch.float32,
                 )
             )
@@ -1816,19 +1831,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif self.block_quant:
             scale_shape_w13 = (
                 num_experts,
-                2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                2 * ((intermediate_size_for_weight + block_n - 1) // block_n),
                 (hidden_size + block_k - 1) // block_k,
             )
             scale_shape_w2 = (
                 num_experts,
                 (hidden_size + block_n - 1) // block_n,
-                (intermediate_size_per_partition + block_k - 1) // block_k,
+                (intermediate_size_for_weight + block_k - 1) // block_k,
             )
             # MXFP8 checkpoints store 1x32 scales as e8m0 bytes.  Keep the
             # existing float32 initialization for the original 1x128 path.
             if self.quant_type == QuantType.per_1x32:
                 w13_scale_data = torch.empty(scale_shape_w13, dtype=dtypes.fp8_e8m0)
                 w2_scale_data = torch.empty(scale_shape_w2, dtype=dtypes.fp8_e8m0)
+                w13_scale_data.view(torch.uint8).zero_()
+                w2_scale_data.view(torch.uint8).zero_()
             else:
                 w13_scale_data = torch.ones(scale_shape_w13, dtype=torch.float32)
                 w2_scale_data = torch.ones(scale_shape_w2, dtype=torch.float32)

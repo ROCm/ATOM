@@ -296,9 +296,13 @@ def _dequantize_fp8_1x32_weight(
         scale = scale.view(dtypes.fp8_e8m0)
     if weight.shape[-1] % 32 == 0:
         return (
-            weight.to(dtype).view(*weight.shape[:-1], weight.shape[-1] // 32, 32)
-            * scale.to(dtype).unsqueeze(-1)
-        ).reshape_as(weight).contiguous()
+            (
+                weight.to(dtype).view(*weight.shape[:-1], weight.shape[-1] // 32, 32)
+                * scale.to(dtype).unsqueeze(-1)
+            )
+            .reshape_as(weight)
+            .contiguous()
+        )
     scale = scale.to(dtype).repeat_interleave(32, dim=-1)
     scale = scale[..., : weight.shape[-1]]
     return (weight.to(dtype) * scale).contiguous()
