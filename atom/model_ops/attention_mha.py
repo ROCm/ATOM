@@ -353,8 +353,16 @@ class PagedAttentionImpl(nn.Module):
                 )
             self._cache_format = "SHUFFLE" if asm_layout else "NHD"
 
-        # Prefix cache hit: gather cached KV from paged cache and concat with new tokens
-        if attn_metadata.has_cached:
+        # Prefix-cache hit: gather the full (cached + new) KV from the paged
+        # cache into contiguous k_full/v_full for the varlen prefill kernels.
+        # ONLY the prefill backends consume that gathered K/V; every decode
+        # backend (paged_attention_triton / _asm / _persistent_asm) reads the
+        # paged k_cache/v_cache directly via block_tables and discards k_full.
+        # So gather only when prefilling — guarding on is_prefill avoids an
+        # O(whole KV pool) permute+contiguous whose result decode never uses
+        # (e.g. the Eagle3 MHA draft, which decodes with has_cached every step
+        # and was paying a full ~12GB cache copy per draft iteration).
+        if attn_metadata.has_cached and fwd_ctx.context.is_prefill:
             q, k, v, k_cache, v_cache, k_scale, v_scale = (
                 self._gather_prefix_and_concat_kv(
                     q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
