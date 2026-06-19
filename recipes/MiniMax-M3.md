@@ -179,3 +179,90 @@ Reference results from the validated run on 4xMI355 GPUs:
 | 16 | 160 | 114.35 | 383.04 | 2200.03 | 11.73 | 12.84 | 1280.47 | 11555.95 |
 | 32 | 320 | 163.86 | 512.32 | 4477.16 | 16.74 | 19.12 | 1807.32 | 16161.65 |
 | 64 | 640 | 242.49 | 831.98 | 8566.28 | 25.00 | 29.83 | 2432.75 | 21928.25 |
+
+## EAGLE3 Speculative Decoding
+
+EAGLE3 runs a small single-layer draft model alongside the MiniMax-M3 target to
+propose multiple tokens per step, which the target then verifies. It is lossless
+with respect to the target's greedy output. The draft checkpoint is
+[`Inferact/MiniMax-M3-EAGLE3`](https://huggingface.co/Inferact/MiniMax-M3-EAGLE3).
+Enable it by adding three flags to any of the server commands above:
+
+- `--method eagle3`
+- `--draft-model Inferact/MiniMax-M3-EAGLE3`
+- `--num-speculative-tokens 3`
+
+### Launching Server
+
+The following starts the MXFP4 target with the EAGLE3 draft on 4xMI355 (the FP4
+server command above plus the three speculative-decoding flags):
+
+```bash
+model_path=amd/MiniMax-M3-MXFP4
+draft_path=Inferact/MiniMax-M3-EAGLE3
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --tensor-parallel-size 4 \
+  --server-port 8000 \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.8 \
+  --block-size 128 \
+  --max-model-len 32768 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 32768 \
+  --method eagle3 \
+  --draft-model "$draft_path" \
+  --num-speculative-tokens 3 2>&1 | tee m3-mxfp4-eagle3-server.log
+```
+
+### Accuracy Test
+
+Run GSM8K 5-shot with `lm_eval` (identical to the non-speculative test):
+
+```bash
+model_path=amd/MiniMax-M3-MXFP4
+BS=65
+
+lm_eval \
+  --model local-chat-completions \
+  --model_args "model=$model_path,base_url=http://127.0.0.1:8000/v1/chat/completions,num_concurrent=32,max_gen_toks=16384" \
+  --tasks gsm8k \
+  --num_fewshot 5 \
+  --batch_size "${BS}" \
+  --apply_chat_template \
+  --fewshot_as_multiturn 2>&1 | tee m3-mxfp4-eagle3-bs65-accuracy.log
+```
+
+Validated GSM8K result (strict-match matches the non-speculative MXFP4 baseline):
+
+```text
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9431|±  |0.0064|
+|     |       |strict-match    |     5|exact_match|↑  |0.9439|±  |0.0063|
+```
+
+### Acceptance Rate
+
+With `--num-speculative-tokens 3` the draft proposes 3 tokens per step. Measured
+over the full GSM8K run:
+
+```text
+Average accepted tokens / forward : 3.20    (1 verified + up to 3 speculated)
+Overall draft acceptance rate     : 73.45%  (accepted / total proposed draft tokens)
+Accepted-count distribution       : {0: 14.20%, 1: 12.11%, 2: 12.83%, 3: 60.86%}
+```
+
+Draft tokens are accepted sequentially — position *i* is kept only if every earlier
+position was kept — so the per-position acceptance rate is the marginal probability
+that each draft slot is accepted (`P(accepted ≥ i)`):
+
+| Draft position | Per-position acceptance rate |
+|----------------|------------------------------|
+| 1st            | 85.8%                        |
+| 2nd            | 73.7%                        |
+| 3rd            | 60.9%                        |
+
+The three per-position rates average to the 73.45% overall rate, and 60.86% of
+steps accept all 3 speculated tokens.

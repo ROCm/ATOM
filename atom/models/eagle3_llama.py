@@ -243,6 +243,13 @@ class Eagle3LlamaModel(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    # The single decoder layer is named `midlayer` here, but some EAGLE3
+    # checkpoints ship it as `layers.0.*` (e.g. the torchspec-format
+    # Inferact/MiniMax-M3-EAGLE3) instead of the kimi-k2.5 `midlayer.*` layout.
+    # Translate that prefix on load. No-op for `midlayer.*` checkpoints (the
+    # substring is absent), so both naming conventions load correctly.
+    weights_mapping = {"layers.0.": "midlayer."}
+
     def __init__(self, atom_config: Config, prefix: str = "", layer_offset: int = 0):
         super().__init__()
         config = atom_config.hf_config

@@ -251,8 +251,9 @@ class EagleProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
         if self.speculative_config.method == "eagle3":
-            # Eagle3: load from a separate draft model checkpoint with
-            # independent embed_tokens and lm_head (no sharing).
+            # Eagle3: load the draft fully from its own checkpoint with its own
+            # embed_tokens and lm_head (this draft trains its own lm_head; do not
+            # share the target's).
             load_model(
                 self.model,
                 self.speculative_config.model,
@@ -489,8 +490,13 @@ class EagleProposer:
                     )
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
-                    if has_flat_kv:
-                        # MLA/MHA path: slot derived from flat kv_indices.
+                    if has_flat_kv and "slot_mapping" not in workinfos:
+                        # Token-granular flat-kv path (MLA physical block_size=1):
+                        # kv_indices store per-token slots, so the last entry of
+                        # each seq IS its write slot. Block-paged MHA drafts
+                        # (e.g. MiniMax-M3, block_size>1) cannot use this — their
+                        # kv_indices are block-granular — so their builder returns
+                        # a correctly block-expanded `slot_mapping` and we skip it.
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids

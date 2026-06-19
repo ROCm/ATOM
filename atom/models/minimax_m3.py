@@ -686,10 +686,6 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.index_cache.dtype
         )
 
-    def _prefix_lens(self, cu_seqlens_q: torch.Tensor, seq_lens: torch.Tensor):
-        query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        return seq_lens - query_lens
-
     def _run_prefill_sparse(
         self,
         q: torch.Tensor,
@@ -700,6 +696,11 @@ class MiniMaxM3SparseAttention(nn.Module):
         assert prefill_metadata is not None
         cu_seqlens_q = prefill_metadata.cu_seqlens_q
         seq_lens = prefill_metadata.seq_lens
+        # prefix_lens (already-cached token count per seq). For spec-verify decode
+        # this is the persistent `sparse_prefix_lens` buffer that prepare_decode
+        # fills once per forward and rebinds at CUDAGraph capture, so it tracks
+        # every replay; for real (eager) prefill it is the per-batch tensor
+        # prepare_prefill built. Either way it is correct to read directly here.
         prefix_lens = prefill_metadata.context_lens
         block_tables = prefill_metadata.block_table
         topk_idx = minimax_m3_index_topk(
@@ -733,6 +734,13 @@ class MiniMaxM3SparseAttention(nn.Module):
                 output,
                 k_scale=self.k_scale,
                 v_scale=self.v_scale,
+                # Spec-verify (max_q_len > 1) does not precompute the per-token
+                # metadata, so the ASM kernel takes its on-device fallback. Feed it
+                # the PERSISTENT cu_seqlens_q and the freshly-derived (live)
+                # prefix_lens so that fallback also tracks CUDAGraph replays instead
+                # of asserting / reading frozen metadata.
+                cu_seqlens_q=cu_seqlens_q,
+                prefix_lens=prefix_lens,
             )
         else:
             minimax_m3_sparse_attn(
@@ -999,6 +1007,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        aux_out: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
@@ -1007,6 +1016,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
             )
+
+        # Eagle3 aux = the reduced residual stream entering this layer. It is
+        # exactly the `residual` the fused norm just produced (= all_reduce of
+        # the prior layer's partial output + incoming residual), so capture it
+        # here instead of recomputing it with a separate ad-hoc all_reduce —
+        # that extra collective is not CUDAGraph-safe and produced NaN aux under
+        # CUDAGraph at the MoE/sparse layers.
+        if aux_out is not None:
+            aux_out.append(residual.clone())
 
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
@@ -1058,6 +1076,11 @@ class MiniMaxM3Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # Eagle3 aux hidden states: layer ids whose residual-stream value is
+        # exported to the draft model's fc. Empty unless an Eagle3 drafter
+        # registers them via MiniMaxM3SparseForCausalLM.set_aux_hidden_state_layers.
+        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
+
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -1071,7 +1094,7 @@ class MiniMaxM3Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             hidden_states = (
                 inputs_embeds
@@ -1084,8 +1107,16 @@ class MiniMaxM3Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        # Eagle3 aux = the reduced residual stream entering each selected layer.
+        # The layer captures it from its own (CUDAGraph-safe) fused all-reduce —
+        # see MiniMaxM3DecoderLayer.forward — so no separate ad-hoc collective is
+        # needed here (that produced NaN aux under CUDAGraph).
+        aux_hidden_states: list[torch.Tensor] = []
+        for idx in range(self.start_layer, self.end_layer):
+            aux_out = aux_hidden_states if idx in self.aux_hidden_state_layers else None
+            hidden_states, residual = self.layers[idx](
+                positions, hidden_states, residual, aux_out=aux_out
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1095,6 +1126,8 @@ class MiniMaxM3Model(nn.Module):
         hidden_states, _ = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.norm
         )
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -1189,6 +1222,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Default Eagle3 aux hidden-state layer ids: early / middle / late of
+        the target model, matching vLLM's default (early=2, mid=n//2, late=n-3).
+        """
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
 
 class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
     """Native ATOM text-only view of a MiniMax-M3 VL checkpoint."""
@@ -1249,6 +1292,12 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
 
 
 # Native full VL support will be wired after the MiniMax-M3 vision tower is
