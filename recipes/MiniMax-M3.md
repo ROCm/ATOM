@@ -102,6 +102,7 @@ The following command starts the MiniMax-M3-MXFP4 checkpoint:
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
@@ -139,8 +140,8 @@ Validated GSM8K result:
 local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9393|±  |0.0066|
-|     |       |strict-match    |     5|exact_match|↑  |0.9401|±  |0.0065|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9363|±  |0.0067|
+|     |       |strict-match    |     5|exact_match|↑  |0.9371|±  |0.0067|
 ```
 
 ### Serving Benchmark
@@ -171,58 +172,10 @@ python -m atom.benchmarks.benchmark_serving \
 
 Reference results from the validated run on 4xMI355 GPUs:
 
-```text
-CONC=4
-Successful requests:                     40
-Benchmark duration (s):                  95.43
-Output token throughput (tok/s):         385.66
-Total Token throughput (tok/s):          3466.81
-Mean TTFT (ms):                          332.00
-Mean TPOT (ms):                          9.78
-Mean E2EL (ms):                          9320.09
-
-CONC=8
-Successful requests:                     80
-Benchmark duration (s):                  110.95
-Output token throughput (tok/s):         667.61
-Total Token throughput (tok/s):          5938.72
-Mean TTFT (ms):                          410.90
-Mean TPOT (ms):                          11.34
-Mean E2EL (ms):                          10912.79
-
-CONC=16
-Successful requests:                     160
-Benchmark duration (s):                  141.14
-Output token throughput (tok/s):         1037.49
-Total Token throughput (tok/s):          9363.06
-Mean TTFT (ms):                          538.19
-Mean TPOT (ms):                          14.37
-Mean E2EL (ms):                          13697.50
-
-CONC=32
-Successful requests:                     320
-Benchmark duration (s):                  201.61
-Output token throughput (tok/s):         1468.89
-Total Token throughput (tok/s):          13135.33
-Mean TTFT (ms):                          726.50
-Mean TPOT (ms):                          20.50
-Mean E2EL (ms):                          19709.73
-
-CONC=64
-Successful requests:                     640
-Benchmark duration (s):                  305.21
-Output token throughput (tok/s):         1932.84
-Total Token throughput (tok/s):          17422.23
-Mean TTFT (ms):                          1277.62
-Mean TPOT (ms):                          31.21
-Mean E2EL (ms):                          30078.57
-
-CONC=128
-Successful requests:                     1280
-Benchmark duration (s):                  499.24
-Output token throughput (tok/s):         2359.05
-Total Token throughput (tok/s):          21297.74
-Mean TTFT (ms):                          2205.77
-Mean TPOT (ms):                          51.10
-Mean E2EL (ms):                          49273.04
-```
+| CONC | Requests | Duration (s) | Mean TTFT (ms) | P99 TTFT (ms) | Mean TPOT (ms) | P99 TPOT (ms) | Output tok/s | Total tok/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 40 | 73.27 | 260.77 | 791.33 | 7.50 | 8.33 | 502.35 | 4515.86 |
+| 8 | 80 | 85.64 | 295.52 | 1144.91 | 8.78 | 9.29 | 864.87 | 7693.44 |
+| 16 | 160 | 114.35 | 383.04 | 2200.03 | 11.73 | 12.84 | 1280.47 | 11555.95 |
+| 32 | 320 | 163.86 | 512.32 | 4477.16 | 16.74 | 19.12 | 1807.32 | 16161.65 |
+| 64 | 640 | 242.49 | 831.98 | 8566.28 | 25.00 | 29.83 | 2432.75 | 21928.25 |
