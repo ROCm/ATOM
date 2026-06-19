@@ -1013,16 +1013,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w2_weight.is_shuffled = True
 
         # shuffle scale
-        #
-        # shuffle_scale dispatches on is_n32k4 first: when True it folds the raw
-        # per-expert e8m0 scale into the gfx1250 grouped-MoE "N32K4" layout (a
-        # 32-row super-block folds its k_scale columns into k_scale*32 cols so
-        # each lane reads its full WMMA scaleB operand with one contiguous load),
-        # ignoring is_guinterleave/gate_up. The 256 pad_align on
-        # hidden_size/intermediate_size guarantees rows % 32 == 0 and
-        # (K//32) % 4 == 0, as that layout requires. Otherwise it applies the
-        # gate_up-aware (guinterleave) shuffle. (gfx1250 already rejects
-        # is_guinterleave in __init__, so the two layouts never combine.)
         w13_scale_2d = layer.w13_weight_scale.reshape(
             -1, layer.w13_weight_scale.shape[-1]
         )
@@ -1033,14 +1023,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=True,
-            is_n32k4=self.is_gfx1250,
         )
         shuffled_w2_scale = shuffle_scale(
             w2_scale_2d,
             self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=False,
-            is_n32k4=self.is_gfx1250,
         )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
