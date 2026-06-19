@@ -201,6 +201,8 @@ server command above plus the three speculative-decoding flags):
 model_path=amd/MiniMax-M3-MXFP4
 draft_path=Inferact/MiniMax-M3-EAGLE3
 
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
   --tensor-parallel-size 4 \
@@ -239,8 +241,8 @@ Validated GSM8K result (strict-match matches the non-speculative MXFP4 baseline)
 ```text
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9431|±  |0.0064|
-|     |       |strict-match    |     5|exact_match|↑  |0.9439|±  |0.0063|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9439|±  |0.0064|
+|     |       |strict-match    |     5|exact_match|↑  |0.9447|±  |0.0063|
 ```
 
 ### Acceptance Rate
