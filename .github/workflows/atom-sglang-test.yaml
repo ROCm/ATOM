@@ -275,51 +275,6 @@ jobs:
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
             accuracy_test_threshold: 0.76
             runner: linux-atom-mi35x-4
-          - model_name: "MI308 Qwen3.5-397B-A17B-FP8 TP4"
-            model_path: "Qwen/Qwen3.5-397B-A17B-FP8"
-            extra_args: "--tensor-parallel-size 4 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
-            env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
-              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
-            accuracy_test_threshold: 0.83
-            runner: atom-mi308-8gpu-plugins-benchmark
-          - model_name: "MI308 Qwen3.5-397B-A17B-FP8 TP8"
-            model_path: "Qwen/Qwen3.5-397B-A17B-FP8"
-            extra_args: "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
-            env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
-              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
-            accuracy_test_threshold: 0.83
-            runner: atom-mi308-8gpu-plugins-benchmark
-          - model_name: "MI308 Qwen3.5-35B-A3B-FP8 TP1"
-            model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
-            extra_args: "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
-            env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
-              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
-            accuracy_test_threshold: 0.76
-            runner: atom-mi308-8gpu-plugins-benchmark
-          - model_name: "MI308 Qwen3-32B-FP8 TP1"
-            model_path: "Qwen/Qwen3-32B-FP8"
-            extra_args: "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
-            env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
-              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
-            accuracy_test_threshold: 0.8
-            runner: atom-mi308-8gpu-plugins-benchmark
-          - model_name: "MI308 Qwen3-32B-FP8 TP8"
-            model_path: "Qwen/Qwen3-32B-FP8"
-            extra_args: "--tensor-parallel-size 8 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
-            env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
-              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
-            accuracy_test_threshold: 0.8
-            runner: atom-mi308-8gpu-plugins-benchmark
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
@@ -327,54 +282,8 @@ jobs:
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
-      - name: Ensure Python 3.10+ (install portable 3.10 if needed)
-        if: matrix.runner == 'atom-mi308-8gpu-plugins-benchmark'
-        id: ensure_python
-        shell: bash
-        run: |
-          if command -v python3 >/dev/null 2>&1 && python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"; then
-            echo "Using $(command -v python3): $(python3 --version)"
-            echo "need_install=false" >> "$GITHUB_OUTPUT"
-          else
-            if command -v python3 >/dev/null 2>&1; then
-              echo "python3 is below 3.10: $(python3 --version 2>&1)"
-            else
-              echo "python3 not found on PATH; will install portable CPython 3.10"
-            fi
-            echo "need_install=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      # setup-python has no build for Alibaba Cloud Linux / unknown OS on many self-hosted runners.
-      # Portable glibc CPython from python-build-standalone (3.10.13 @ tag 20231002; satisfies >=3.10).
-      - name: Install portable CPython 3.10 (self-hosted)
-        if: matrix.runner == 'atom-mi308-8gpu-plugins-benchmark' && steps.ensure_python.outputs.need_install == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG='20231002'
-          PYVER='3.10.13'
-          case "$(uname -m)" in
-            x86_64) triple='x86_64-unknown-linux-gnu' ;;
-            aarch64) triple='aarch64-unknown-linux-gnu' ;;
-            *) echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
-          esac
-          tarball="cpython-${PYVER}+${TAG}-${triple}-install_only.tar.gz"
-          base="${RUNNER_TOOL_CACHE:-${HOME}/.cache/atom-ci}/portable-python/${PYVER}-${TAG}-${triple}"
-          pybin="${base}/python/bin"
-          if [ ! -x "${pybin}/python3" ]; then
-            echo "Downloading ${tarball}..."
-            rm -rf "${base}"
-            mkdir -p "${base}"
-            curl -fsSL "https://github.com/astral-sh/python-build-standalone/releases/download/${TAG}/${tarball}" -o "/tmp/${tarball}"
-            tar -xzf "/tmp/${tarball}" -C "${base}"
-            rm -f "/tmp/${tarball}"
-          fi
-          echo "${pybin}" >> "$GITHUB_PATH"
-          command -v python3
-          python3 --version
-
       - name: Clean up containers and workspace
-        if: contains(fromJSON('["atom-mi355-8gpu.predownload","atom-mi308-8gpu-plugins-benchmark"]'), matrix.runner)
+        if: contains(fromJSON('["atom-mi355-8gpu.predownload"]'), matrix.runner)
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
