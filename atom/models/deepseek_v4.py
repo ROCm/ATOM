@@ -32,7 +32,6 @@ import torch.nn.functional as F
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
-    get_hip_quant,
     rope_rotate_activation,
 )
 from aiter import silu_and_mul as aiter_silu_and_mul
@@ -1085,7 +1084,10 @@ class Indexer(nn.Module):
         )
         self.softmax_scale = self.head_dim**-0.5
         # Init-time hoists out of `forward_batched`'s hot path.
-        self._fp8_quant_func = get_hip_quant(QuantType.per_1x128)
+        # FP8 Q quant is fused into `rope_rotate_activation` (per_1x128 over
+        # head_dim); `group_size` is the per-1xN block. head_dim is the index
+        # head dim (128), so there is exactly one scale per (token, head).
+        self._q_quant_group = self.head_dim
         self._weights_scale = self.softmax_scale * self.n_heads**-0.5
         # `deepgemm_fp8_paged_mqa_logits` decode-path output column count:
         # one indexer slot per `compress_ratio` source tokens.
@@ -1157,16 +1159,28 @@ class Indexer(nn.Module):
         q = self.wq_b(qr_full, x_scale=qr_full_scale).view(
             total_tokens, self.n_heads, self.head_dim
         )
-        # self.rotary_emb(positions, q[..., -rd:])
-        # q = rotate_activation(q)
-        rope_rotate_activation(
-            q, q, self.rotary_emb.cos_cache, self.rotary_emb.sin_cache, positions, rd
+        # RoPE + Hadamard-rotate + FP8 quant fused in one kernel. Q is online
+        # (recomputed each fwd, no cache); the bf16 rotated Q is never read back,
+        # so it is quantized in place of being materialized. `out_scale` carries
+        # the per-(token, head) fp8 block scale (head_dim == group => one/row).
+        # `_weights_scale` precomputed in __init__.
+        # self.rotary_emb(positions, q[..., -rd:]); q = rotate_activation(q)
+        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+        q_scale = torch.empty(
+            (total_tokens * self.n_heads, self.head_dim // self._q_quant_group),
+            dtype=dtypes.fp32,
+            device=q.device,
         )
-
-        # FP8 quant Q (still online — Q is recomputed each fwd, no cache).
-        # `_fp8_quant_func` / `_weights_scale` precomputed in __init__.
-        q_2d = q.view(-1, self.head_dim)
-        q_fp8, q_scale = self._fp8_quant_func(q_2d, quant_dtype=dtypes.fp8)
+        rope_rotate_activation(
+            q_fp8,
+            q,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            positions,
+            rd,
+            out_scale=q_scale,
+            group_size=self._q_quant_group,
+        )
         q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
         q_scale = q_scale.view(total_tokens, self.n_heads, 1)
 
