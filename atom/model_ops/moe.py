@@ -797,11 +797,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.use_triton = gfx.startswith("gfx94") or (
                 gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
             )
-        logger.info(f"Mxfp4MoEMethod use_triton = {self.use_triton}")
-        if self.use_triton:
-            from atom.model_ops.utils import has_triton_kernels
-
-            assert has_triton_kernels(), "triton_kernels is not installed"
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
 
     def create_weights(
