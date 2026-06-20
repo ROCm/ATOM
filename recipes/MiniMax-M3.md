@@ -116,7 +116,8 @@ python -m atom.entrypoints.openai_server \
   --block-size 128 \
   --max-model-len 32768 \
   --max-num-seqs 128 \
-  --max-num-batched-tokens 32768 2>&1 | tee "${run_name}-server.log"
+  --max-num-batched-tokens 32768 \
+  --no-enable_prefix_caching 2>&1 | tee "${run_name}-server.log"
 ```
 
 ### Accuracy Test
@@ -238,6 +239,7 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 32768 \
   --max-num-seqs 128 \
   --max-num-batched-tokens 32768 \
+  --no-enable_prefix_caching \
   --method eagle3 \
   --draft-model "$draft_path" \
   --num-speculative-tokens 3 2>&1 | tee m3-mxfp4-eagle3-server.log
