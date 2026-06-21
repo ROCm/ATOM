@@ -1170,6 +1170,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 a2_scale=layer.w2_input_scale,
                 w1_bias=layer.w13_bias,
                 w2_bias=layer.w2_bias,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                 expert_map=expert_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
