@@ -7,6 +7,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
+import logging
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -78,6 +79,7 @@ class MoEActivationQuant(Enum):
         if prefix in ("fp4", "uint8"):
             return MoEActivationQuant.FP4
         return MoEActivationQuant.BF16
+
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -783,14 +785,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or self.quant_type == QuantType.per_1x32
         )
         gfx = get_gfx()
+        self.is_gfx1250 = gfx == "gfx1250"
+        # gfx1250 grouped a8w4 MoE kernel only supports the non-interleaved
+        # (gate|up separated) scale layout; reject is_guinterleave up front.
+        if self.is_gfx1250 and self.is_guinterleave:
+            raise NotImplementedError(
+                "gfx1250 MoE only supports is_guinterleave=False; "
+                "unset ATOM_MOE_GU_ITLV."
+            )
         if envs.is_set("ATOM_USE_TRITON_MOE"):
             self.use_triton = envs.ATOM_USE_TRITON_MOE
         else:
-            self.use_triton = (
-                gfx.startswith("gfx94")
-                or gfx.startswith("gfx12")
-                or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
+            self.use_triton = gfx.startswith("gfx94") or (
+                gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
             )
+        logger.info(f"Mxfp4MoEMethod use_triton = {self.use_triton}")
+        if self.use_triton:
+            from atom.model_ops.utils import has_triton_kernels
+
+            assert has_triton_kernels(), "triton_kernels is not installed"
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
 
     def create_weights(
@@ -1002,19 +1015,56 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w2_weight.is_shuffled = True
 
         # shuffle scale
-        w13_scale_2d = layer.w13_weight_scale.reshape(
-            -1, layer.w13_weight_scale.shape[-1]
-        )
-        w2_scale_2d = layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1])
+        if self.is_gfx1250:
+            # gfx1250 grouped a8w4 MoE kernel reads the e8m0 scale preshuffled by
+            # _grouped_a8w4_prepare_scale_batch (warp_tile = tile_n // n_warp =
+            # 64 // 2 = 32, tile_k = 128). w13 is the (gate|up) operand
+            # (rows = 2*inter, k_dim = model_dim); w2 (down) has
+            # rows = model_dim, k_dim = inter.
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                _grouped_a8w4_prepare_scale_batch,
+            )
 
-        shuffled_w13_scale = shuffle_scale(
-            w13_scale_2d, self.num_experts, self.is_guinterleave, True
-        )
-        shuffled_w2_scale = shuffle_scale(
-            w2_scale_2d, self.num_experts, self.is_guinterleave, False
-        )
-        layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
-        layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
+            _GROUPED_WARP_TILE_N = 64
+            _GROUPED_TILE_K = 256
+            layer.w13_weight_scale = atom_parameter(
+                _grouped_a8w4_prepare_scale_batch(
+                    layer.w13_weight_scale.data,
+                    experts=self.num_experts,
+                    rows=2 * self.intermediate_size,
+                    k_dim=self.hidden_size,
+                    warp_tile=_GROUPED_WARP_TILE_N,
+                    tile_k=_GROUPED_TILE_K,
+                    device=layer.w13_weight_scale.device,
+                )
+            )
+            layer.w2_weight_scale = atom_parameter(
+                _grouped_a8w4_prepare_scale_batch(
+                    layer.w2_weight_scale.data,
+                    experts=self.num_experts,
+                    rows=self.hidden_size,
+                    k_dim=self.intermediate_size,
+                    warp_tile=_GROUPED_WARP_TILE_N,
+                    tile_k=_GROUPED_TILE_K,
+                    device=layer.w2_weight_scale.device,
+                )
+            )
+        else:
+            w13_scale_2d = layer.w13_weight_scale.reshape(
+                -1, layer.w13_weight_scale.shape[-1]
+            )
+            w2_scale_2d = layer.w2_weight_scale.reshape(
+                -1, layer.w2_weight_scale.shape[-1]
+            )
+
+            shuffled_w13_scale = shuffle_scale(
+                w13_scale_2d, self.num_experts, self.is_guinterleave, True
+            )
+            shuffled_w2_scale = shuffle_scale(
+                w2_scale_2d, self.num_experts, self.is_guinterleave, False
+            )
+            layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
+            layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
