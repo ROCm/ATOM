@@ -122,7 +122,7 @@ def triton_kernel_moe_forward(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    activation: str = "silu",
+    activation: ActivationType = ActivationType.Silu,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
     a13_scale: torch.Tensor | None = None,
@@ -179,7 +179,7 @@ def triton_kernel_fused_experts(
     gather_indx,  # GatherIndx -> tensor
     scatter_indx,  # ScatterIndx -> tensor
     topk: int,
-    activation: str = "silu",
+    activation: ActivationType = ActivationType.Silu,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
     w13_swizzle_layout: torch.Tensor | None = None,
