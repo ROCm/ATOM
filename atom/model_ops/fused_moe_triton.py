@@ -305,6 +305,12 @@ def triton_kernel_fused_experts(
         # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation.
         # The activation precision selects the routed GEMM: MXFP4 activations
         # (a4w4) when act_quant is FP4, otherwise bf16 activations (a16w4).
+        if act_quant == MoEActivationQuant.FP8:
+            raise NotImplementedError(
+                "SiLU activation with FP8 act_quant is not implemented in the "
+                "triton MoE kernel. Only the SwiGLU branch supports FP8 "
+                "activations (moe_gemm_a8w4)."
+            )
         if act_quant == MoEActivationQuant.FP4:
             hidden_states_fp4, hidden_states_mx_scale = mxfp4_quant(hidden_states)
             raw_intermediate = moe_gemm_a4w4(
