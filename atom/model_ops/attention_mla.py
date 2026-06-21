@@ -12,13 +12,23 @@ import triton.language as tl
 from aiter import (
     QuantType,
     concat_and_cache_mla,
-    concat_and_cache_mla_seg,
     dtypes,
     flash_attn_varlen_func,
     fused_qk_rope_concat_and_cache_mla,
-    fused_qk_rope_concat_and_cache_mla_seg,
     get_hip_quant,
 )
+
+# The segmented (page_size>1) MLA cache kernels only exist in newer aiter
+# builds. Import them lazily so that the default page_size=1 path keeps working
+# on aiter versions that do not ship the seg variants.
+try:
+    from aiter import (
+        concat_and_cache_mla_seg,
+        fused_qk_rope_concat_and_cache_mla_seg,
+    )
+except ImportError:
+    concat_and_cache_mla_seg = None
+    fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
@@ -48,17 +58,19 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
 )
-concat_and_cache_mla_seg = mark_trace(
-    concat_and_cache_mla_seg, prefix="kv_cache_seg", torch_compile=False
-)
+if concat_and_cache_mla_seg is not None:
+    concat_and_cache_mla_seg = mark_trace(
+        concat_and_cache_mla_seg, prefix="kv_cache_seg", torch_compile=False
+    )
 fused_qk_rope_concat_and_cache_mla = mark_trace(
     fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
 )
-fused_qk_rope_concat_and_cache_mla_seg = mark_trace(
-    fused_qk_rope_concat_and_cache_mla_seg,
-    prefix="rope_and_kv_cache",
-    torch_compile=False,
-)
+if fused_qk_rope_concat_and_cache_mla_seg is not None:
+    fused_qk_rope_concat_and_cache_mla_seg = mark_trace(
+        fused_qk_rope_concat_and_cache_mla_seg,
+        prefix="rope_and_kv_cache",
+        torch_compile=False,
+    )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
 
@@ -239,6 +251,16 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        if self.use_seg_mla and (
+            concat_and_cache_mla_seg is None
+            or fused_qk_rope_concat_and_cache_mla_seg is None
+        ):
+            raise RuntimeError(
+                "ATOM_MLA_PAGE_SIZE > 1 requires the segmented MLA kernels "
+                "(concat_and_cache_mla_seg / fused_qk_rope_concat_and_cache_mla_seg), "
+                "which are not available in the installed aiter build. Upgrade "
+                "aiter or set ATOM_MLA_PAGE_SIZE=1."
+            )
 
     def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Reshape the KV cache buffer into the page-level flat seg layout
@@ -1028,7 +1050,9 @@ class MLAAttention(nn.Module):
                 paged_kv_last_page_lens,
                 max_q_len,
                 page_size=page_size,
-                num_kv_splits=1,  # asm passes
+                # The seg/asm decode path runs with a single kv split; the
+                # original (page_size=1) persistent path keeps 16 splits.
+                num_kv_splits=1 if self.use_seg_mla else 16,
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,
                 work_indptr=work_indptr,
