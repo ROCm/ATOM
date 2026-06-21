@@ -962,6 +962,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.shared_w2_weight_scale = layer.w2_weight_scale.data[
                     -n_shared:
                 ].contiguous()
+                if layer.w13_bias is not None:
+                    layer.shared_w13_bias = layer.w13_bias.data[
+                        -n_shared:
+                    ].contiguous()
+                else:
+                    layer.shared_w13_bias = None
+                if layer.w2_bias is not None:
+                    layer.shared_w2_bias = layer.w2_bias.data[
+                        -n_shared:
+                    ].contiguous()
+                else:
+                    layer.shared_w2_bias = None
 
             (
                 w13_weight,
@@ -1291,6 +1303,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 return gemm_afp4wfp4(act_fp4, weight, act_mx_scale, weight_scale)
             return gemm_a16wfp4(act, weight, weight_scale)
 
+        shared_w13_bias = getattr(layer, "shared_w13_bias", None)
+        shared_w2_bias = getattr(layer, "shared_w2_bias", None)
+
         shared_out = None
         for e in range(layer.num_fused_shared_experts):
             gate_up = _shared_expert_gemm(
@@ -1298,6 +1313,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.shared_w13_weight[e],
                 layer.shared_w13_weight_scale[e],
             )
+            if shared_w13_bias is not None:
+                gate_up = gate_up + shared_w13_bias[e]
             half_n = gate_up.shape[-1] // 2
             intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
             fused_clamp_act_mul(
@@ -1312,6 +1329,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.shared_w2_weight[e],
                 layer.shared_w2_weight_scale[e],
             )
+            if shared_w2_bias is not None:
+                out_e = out_e + shared_w2_bias[e]
             shared_out = out_e if shared_out is None else shared_out + out_e
         return shared_out
 
