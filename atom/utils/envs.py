@@ -42,6 +42,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    "ATOM_USE_A8W4_MOE_PREFILL": lambda: os.getenv("ATOM_USE_A8W4_MOE_PREFILL", "0") == "1",
+    "ATOM_USE_A8W4_MOE_DECODE": lambda: os.getenv("ATOM_USE_A8W4_MOE_DECODE", "0") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
