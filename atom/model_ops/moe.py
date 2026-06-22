@@ -1070,72 +1070,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
-    @staticmethod
-    def _routing_from_topk(
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        num_experts: int,
-    ):
-        """Build AITER Triton routing metadata from preselected experts."""
-        import triton
-        from aiter.ops.triton.moe.moe_routing.routing import (
-            ExptData,
-            RoutingData,
-            sort_tokens,
-            sort_tokens_fused,
-        )
-        from aiter.ops.triton.moe.moe_routing.topk import Bitmatrix
 
-        num_tokens, top_k = topk_ids.shape
-        m = num_tokens * top_k
-        tokens_per_expt = max(1, m // num_experts)
-        block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
-
-        n_cols_pad = triton.cdiv(num_experts, 128) * 128
-        n_cols_words = n_cols_pad // 32
-        bitmatrix_i64 = torch.zeros(
-            (num_tokens, n_cols_words),
-            dtype=torch.int64,
-            device=topk_ids.device,
-        )
-        rows = torch.arange(num_tokens, device=topk_ids.device)
-        topk_ids_i64 = topk_ids.to(torch.int64)
-        for col in range(top_k):
-            expert = topk_ids_i64[:, col]
-            word = expert // 32
-            bit = torch.ones_like(word, dtype=torch.int64) << (expert % 32)
-            bitmatrix_i64[rows, word] = bitmatrix_i64[rows, word] | bit
-
-        bitmatrix_data = bitmatrix_i64.to(torch.uint32)
-        bitmatrix = Bitmatrix(bitmatrix_data, shape=[num_tokens, n_cols_words * 32])
-        if num_tokens <= 16:
-            hist_block_m = triton.next_power_of_2(max(num_tokens, 1))
-            sort_fn = sort_tokens_fused
-        else:
-            hist_block_m = 32
-            sort_fn = sort_tokens
-        (
-            hist,
-            topk_indx,
-            gate_indx,
-            gate_scal,
-            token_offs_raw,
-            token_offs_pad,
-            block_pid_map,
-        ) = sort_fn(
-            topk_weights,
-            topk_ids.to(torch.int16),
-            num_experts,
-            bitmatrix,
-            block_m,
-            hist_block_m,
-        )
-        expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
-        return (
-            RoutingData(block_m, gate_scal, hist, num_experts, top_k, expt_data),
-            topk_indx,
-            gate_indx,
-        )
 
     @mark_trace(prefix="mxfp4_moe", torch_compile=False)
     def apply(
@@ -1176,57 +1111,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # custom routing -- set for deepseek routing n expts act, for grouped topk
                 n_expts_act = top_k
 
-                if (
-                    scoring_func == "sigmoid"
-                    and not use_grouped_topk
-                    and custom_routing_function is None
-                ):
-                    topk_weights, topk_ids = FusedMoE.select_experts(
-                        hidden_states=x,
-                        router_logits=router_logits,
-                        use_grouped_topk=False,
-                        top_k=top_k,
-                        renormalize=renormalize,
-                        topk_group=None,
-                        num_expert_group=None,
-                        custom_routing_function=None,
-                        scoring_func=scoring_func,
-                        e_score_correction_bias=e_score_correction_bias,
-                        num_routing_experts=global_num_experts,
-                        num_fused_shared_experts=0,
-                        fused_shared_experts_scoring_func=None,
-                        routed_scaling_factor=1.0,
-                    )
-                    if (
-                        layer.num_fused_shared_experts > 0
-                        and layer.routed_scaling_factor != 1.0
-                    ):
-                        topk_weights = topk_weights * layer.routed_scaling_factor
-                    routing_data, gather_idx, scatter_idx = self._routing_from_topk(
-                        topk_weights,
-                        topk_ids,
-                        router_logits.shape[-1],
-                    )
-                else:
-                    from aiter.ops.triton.moe.moe_routing.routing import (  # grouped topk included
-                        routing,
-                    )
+                # custom routing
+                from aiter.ops.triton.moe.moe_routing.routing import (  # grouped topk included
+                    routing,
+                )
 
-                    routing_data, gather_idx, scatter_idx = routing(
-                        router_logits,
-                        n_expts_act,
-                        score_mode=scoring_func,
-                        bias=(
-                            e_score_correction_bias.to(torch.float32)
-                            if e_score_correction_bias is not None
-                            else None
-                        ),
-                        renorm=renormalize,
-                        routed_scaling_factor=layer.routed_scaling_factor,
-                        use_grouped_topk=use_grouped_topk,
-                        num_expert_group=num_expert_group,
-                        topk_group=topk_group,
-                    )
+                routing_data, gather_idx, scatter_idx = routing(
+                    router_logits,
+                    n_expts_act,
+                    score_mode=scoring_func,
+                    bias=(
+                        e_score_correction_bias.to(torch.float32)
+                        if e_score_correction_bias is not None
+                        else None
+                    ),
+                    renorm=renormalize,
+                    routed_scaling_factor=layer.routed_scaling_factor,
+                    use_grouped_topk=use_grouped_topk,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                )
                 # Routed-only gate count (no shared-expert widening).
                 n_expts_act = routing_data.n_expts_act
 

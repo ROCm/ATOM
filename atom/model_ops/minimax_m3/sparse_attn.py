@@ -104,6 +104,15 @@ def make_minimax_m3_sparse_decode_metadata(
     )
 
 
+def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
+    fp8_dtypes = (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+    )
+    return kv_cache.dtype in {dtype for dtype in fp8_dtypes if dtype is not None}
+
+
 # ---------------------------------------------------------------------------
 # GQA block-sparse attention (paged). Main heads attend only to the selected
 # blocks. BLOCK_SIZE_K == 128 so each selected block is one page.
@@ -155,6 +164,7 @@ def _gqa_sparse_fwd_kernel(
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_QH: tl.constexpr,
+    FP8_KV_CACHE: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -216,6 +226,9 @@ def _gqa_sparse_fwd_kernel(
                 mask=d_mask[:, None] & pos_mask[None, :],
                 other=0.0,
             )
+            if FP8_KV_CACHE:
+                # Triton/ROCm does not support fp8 as RHS for tl.dot here.
+                k = k.to(q.dtype)
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             # causal: q_abs_pos - k_off >= block_start (c)
             qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
@@ -236,6 +249,8 @@ def _gqa_sparse_fwd_kernel(
                 mask=pos_mask[:, None] & d_mask[None, :],
                 other=0.0,
             )
+            if FP8_KV_CACHE:
+                v = v.to(q.dtype)
             acc_o += tl.dot(p.to(v.dtype), v)
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -307,6 +322,7 @@ def _gqa_sparse_decode_kernel(
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    FP8_KV_CACHE: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # split-K over the topk dimension: pid(0) folds (batch, chunk) together.
@@ -361,6 +377,9 @@ def _gqa_sparse_decode_kernel(
             mask=d_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
+        if FP8_KV_CACHE:
+            # Triton/ROCm does not support fp8 as RHS for tl.dot here.
+            k = k.to(q.dtype)
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
         qk += tl.dot(q, k) * sm_scale_log2e
@@ -378,6 +397,8 @@ def _gqa_sparse_decode_kernel(
             mask=pos_mask[:, None] & d_mask[None, :],
             other=0.0,
         )
+        if FP8_KV_CACHE:
+            v = v.to(q.dtype)
         acc_o += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -506,6 +527,7 @@ def minimax_m3_sparse_attn(
         block_table.stride(0),
         BLOCK_SIZE_Q=1,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        FP8_KV_CACHE=_is_fp8_kv_cache_tensor(kv_cache),
         num_stages=1,
     )
 
@@ -570,6 +592,7 @@ def minimax_m3_sparse_attn_decode(
         block_table.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
+        FP8_KV_CACHE=_is_fp8_kv_cache_tensor(kv_cache),
         num_stages=1,
     )
     merge_grid = (batch, num_heads)
