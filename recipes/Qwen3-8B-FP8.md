@@ -62,13 +62,13 @@ OPENAI_API_KEY=dummy lm_eval \
   --tasks gsm8k --num_fewshot 5 --batch_size 1 --limit 50
 ```
 
-## Verified results on RX 9070 XT (gfx1201, 16 GB), BF16 KV
+## Verified results on RX 9070 XT (gfx1201, 16 GB), BF16 KV, single stream
 
 | ISL / OSL | Mode | TTFT (ms) | TPOT (ms) | Output tok/s |
 |---|---|---:|---:|---:|
-| 18 / 80   | cudagraph | 48  | **20.7** | 38 |
-| 549 / 256 | cudagraph | 801 | **21.7** | **40.4** |
-| 549 / 256 | eager     | 428 | 25.2 | 38 |
+| 18 / 80   | cudagraph | 39  | **18.5** | 53.3 |
+| 549 / 256 | cudagraph | 86  | **18.6** | **52.9** |
+| 549 / 256 | eager     | 93  | 28.6 | 35.6 |
 
 gsm8k 5-shot, n=50:
 
