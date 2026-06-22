@@ -209,12 +209,13 @@ def _topk_index_kernel(
     sparse_ctx_ptr,  # out: [total_q] int32 (or dummy)
     stride_bt_b,
     stride_sbt_n,
+    NUM_KV_HEADS: tl.constexpr,  # kv-head count folded into the emitted row + page id
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     MASK_INIT: tl.constexpr,
     MASK_LOCAL: tl.constexpr,
     pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
-    EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction iff True (num_idx_heads==1)
+    EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction (per-kv-head row + encoded page)
 ):
     tl.static_assert(BLOCK_SIZE_K > BLOCK_SIZE_T)
     pid_q = tl.program_id(0)
@@ -296,10 +297,12 @@ def _topk_index_kernel(
 
     # --- fused sparse block-table build (per-query-token causal compaction) ---
     # Mirrors _build_sparse_block_table_prefill_kernel over the in-register
-    # selection. Only the first index head emits (ASM/gluon needs num_idx_heads
-    # == 1). Token absolute pos p = prefix_len + pid_q (sample_interval == 1);
-    # causal self-block = p // block_size, length p + 1.
-    if EMIT_SPARSE_BT and pid_h == 0:
+    # selection. EVERY kv-head emits its own row (the ASM/gluon path collapses
+    # (token, kv_head) into the row dim). Token absolute pos p = prefix_len + pid_q
+    # (sample_interval == 1); causal self-block = p // block_size, length p + 1.
+    # Page id is kv-head-encoded: (phys16_page)*NUM_KV_HEADS + pid_h; row is
+    # (block_start + pid_q)*NUM_KV_HEADS + pid_h. NUM_KV_HEADS == 1 -> original.
+    if EMIT_SPARSE_BT:
         p = prefix_len + pid_q * sample_interval
         self_blk = p // block_size
         causal_len = p + 1
@@ -318,12 +321,18 @@ def _topk_index_kernel(
 
         bt_row = block_table_ptr + pid_b * stride_bt_b
         bt_logical_page = tl.load(bt_row + bt_blk, mask=bt_valid, other=0).to(tl.int32)
-        bt_base_phys = bt_logical_page * pages_per_block
+        bt_base_phys = bt_logical_page * pages_per_block * NUM_KV_HEADS + pid_h
         bt_dst_base = bt_slot * pages_per_block
 
-        sbt_row = sparse_bt_ptr + (block_start + pid_q) * stride_sbt_n
+        sbt_row = sparse_bt_ptr + (
+            (block_start + pid_q) * NUM_KV_HEADS + pid_h
+        ) * stride_sbt_n
         for pj in range(pages_per_block):
-            tl.store(sbt_row + bt_dst_base + pj, bt_base_phys + pj, mask=bt_valid)
+            tl.store(
+                sbt_row + bt_dst_base + pj,
+                bt_base_phys + pj * NUM_KV_HEADS,
+                mask=bt_valid,
+            )
         bt_n_used = bt_n_valid * pages_per_block
         off_w = tl.arange(0, BLOCK_SIZE_T * pages_per_block)
         tl.store(sbt_row + off_w, tl.zeros_like(off_w), mask=off_w >= bt_n_used)
@@ -334,7 +343,9 @@ def _topk_index_kernel(
         bt_ctx = tl.where(
             bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
         )
-        tl.store(sparse_ctx_ptr + (block_start + pid_q), bt_ctx)
+        tl.store(
+            sparse_ctx_ptr + ((block_start + pid_q) * NUM_KV_HEADS + pid_h), bt_ctx
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -604,11 +615,12 @@ def _topk_index_merge_kernel(
     stride_bt_b,
     stride_sbt_b,
     MAX_Q: tl.constexpr,  # query tokens per request (num_spec + 1; 1 == plain decode)
+    NUM_KV_HEADS: tl.constexpr,  # kv-head count folded into the emitted row + page id
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
-    EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction iff True (num_idx_heads==1)
+    EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction (per-kv-head row + encoded page)
 ):
     pid_t = tl.program_id(0)  # global query-token row
     pid_h = tl.program_id(1)
@@ -674,11 +686,15 @@ def _topk_index_merge_kernel(
         tif_ptrs, topk_idx_final.to(ti_final_ptr.dtype.element_ty), mask=store_mask
     )
 
-    # --- fused sparse block-table build (per-request decode compaction) ---
+    # --- fused sparse block-table build (per-(token, kv-head) compaction) ---
     # Mirrors _build_sparse_block_table_kernel over the in-register selection,
-    # avoiding a second kernel launch + topk_idx HBM round-trip. Only the first
-    # index head emits (ASM/gluon path requires num_idx_heads == 1).
-    if EMIT_SPARSE_BT and pid_h == 0:
+    # avoiding a second kernel launch + topk_idx HBM round-trip. EVERY kv-head
+    # emits its own row: the ASM/gluon path collapses (token, kv_head) into the
+    # row dim so it can run with num_kv_heads_view == 1. The physical page id is
+    # encoded as (phys16_page)*NUM_KV_HEADS + kv_head, matching the collapsed KV
+    # cache view [num_phys16*NUM_KV_HEADS, 1, ...]. NUM_KV_HEADS == 1 reduces to
+    # the original per-token emit (row == pid_t, page == phys16).
+    if EMIT_SPARSE_BT:
         # Per-token tail block: the 128-block containing this token's last causal
         # key (causal_len - 1). MAX_Q == 1 -> self_blk == (seq_len-1)//block_size.
         self_blk = (causal_len - 1) // block_size
@@ -695,13 +711,21 @@ def _topk_index_merge_kernel(
 
         bt_row = block_table_ptr + pid_b * stride_bt_b
         bt_logical_page = tl.load(bt_row + bt_blk, mask=bt_valid, other=0).to(tl.int32)
-        bt_base_phys = bt_logical_page * pages_per_block
+        # Encode kv-head into the page id. The 8 phys16 pages of one 128-block are
+        # NUM_KV_HEADS apart in the collapsed cache view (block-major then kv-head),
+        # so consecutive pj differ by NUM_KV_HEADS, not 1.
+        bt_base_phys = bt_logical_page * pages_per_block * NUM_KV_HEADS + pid_h
         bt_dst_base = bt_slot * pages_per_block
 
-        sbt_row = sparse_bt_ptr + pid_t * stride_sbt_b
+        # Fold kv-head into the row: row = pid_t * NUM_KV_HEADS + pid_h.
+        sbt_row = sparse_bt_ptr + (pid_t * NUM_KV_HEADS + pid_h) * stride_sbt_b
         # write valid slots -> their pages; unused tail -> 0 (in-bounds page id).
         for pj in range(pages_per_block):
-            tl.store(sbt_row + bt_dst_base + pj, bt_base_phys + pj, mask=bt_valid)
+            tl.store(
+                sbt_row + bt_dst_base + pj,
+                bt_base_phys + pj * NUM_KV_HEADS,
+                mask=bt_valid,
+            )
         bt_n_used = bt_n_valid * pages_per_block
         off_w = tl.arange(0, BLOCK_SIZE_T * pages_per_block)
         tl.store(sbt_row + off_w, tl.zeros_like(off_w), mask=off_w >= bt_n_used)
@@ -712,7 +736,7 @@ def _topk_index_merge_kernel(
         bt_ctx = tl.where(
             bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
         )
-        tl.store(sparse_ctx_ptr + pid_t, bt_ctx)
+        tl.store(sparse_ctx_ptr + (pid_t * NUM_KV_HEADS + pid_h), bt_ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -791,14 +815,20 @@ def minimax_m3_index_topk(
         dtype=torch.int32,
         device=idx_q.device,
     )
-    emit = emit_sparse_block_table and num_idx_heads == 1
+    # One emitted row per (query token, kv-head): the ASM/gluon path collapses
+    # kv-head into the row dim, so sparse_bt/ctx are total_q*num_idx_heads rows
+    # and the page ids are kv-head-encoded in the kernel. num_idx_heads == 1
+    # reduces to the original per-token layout.
+    emit = emit_sparse_block_table
     if emit:
         sparse_bt = torch.empty(
-            (total_q, topk * PAGES_PER_SPARSE_BLOCK),
+            (total_q * num_idx_heads, topk * PAGES_PER_SPARSE_BLOCK),
             dtype=torch.int32,
             device=idx_q.device,
         )
-        sparse_ctx = torch.empty((total_q,), dtype=torch.int32, device=idx_q.device)
+        sparse_ctx = torch.empty(
+            (total_q * num_idx_heads,), dtype=torch.int32, device=idx_q.device
+        )
         sbt_arg, sctx_arg = sparse_bt, sparse_ctx
         bt_stride0, sbt_stride0 = block_table.stride(0), sparse_bt.stride(0)
     else:
@@ -829,6 +859,7 @@ def minimax_m3_index_topk(
         sctx_arg,
         bt_stride0,
         sbt_stride0,
+        NUM_KV_HEADS=num_idx_heads,
         MASK_INIT=False,
         MASK_LOCAL=False,
         pages_per_block=PAGES_PER_SPARSE_BLOCK,
@@ -968,14 +999,20 @@ def minimax_m3_index_topk_decode(
         topk_idx_partial.stride(2),
         topk_idx_partial.stride(3),
     )
-    emit = emit_sparse_block_table and num_idx_heads == 1
+    # The fused emit now produces one row per (token, kv-head): the ASM/gluon path
+    # collapses kv-head into the row dim. sparse_bt/ctx are sized total_q*num_idx_heads
+    # and the page ids are kv-head-encoded inside the kernel. num_idx_heads == 1
+    # reduces to the original per-token layout.
+    emit = emit_sparse_block_table
     if emit:
         sparse_bt = torch.empty(
-            (total_q, topk * PAGES_PER_SPARSE_BLOCK),
+            (total_q * num_idx_heads, topk * PAGES_PER_SPARSE_BLOCK),
             dtype=torch.int32,
             device=idx_q.device,
         )
-        sparse_ctx = torch.empty((total_q,), dtype=torch.int32, device=idx_q.device)
+        sparse_ctx = torch.empty(
+            (total_q * num_idx_heads,), dtype=torch.int32, device=idx_q.device
+        )
         sbt_arg, sctx_arg = sparse_bt, sparse_ctx
         bt_stride0, sbt_stride0 = block_table.stride(0), sparse_bt.stride(0)
     else:
@@ -1007,6 +1044,7 @@ def minimax_m3_index_topk_decode(
         bt_stride0,
         sbt_stride0,
         MAX_Q=max_query_len,
+        NUM_KV_HEADS=num_idx_heads,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         pages_per_block=PAGES_PER_SPARSE_BLOCK,
         EMIT_SPARSE_BT=emit,

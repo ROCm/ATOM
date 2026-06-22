@@ -724,9 +724,11 @@ class MiniMaxM3SparseAttention(nn.Module):
         # prepare_prefill built. Either way it is correct to read directly here.
         prefix_lens = prefill_metadata.context_lens
         block_tables = prefill_metadata.block_table
-        # Fuse the sparse block-table build into the topk kernel for the ASM
-        # prefill path (num_kv_heads == 1), saving a build launch + round-trip.
-        fuse_bt = self._use_asm_pa and self.num_kv_heads == 1
+        # Fuse the sparse block-table build into the topk kernel for the ASM prefill
+        # path. The fused emit is kv-head-encoded (one row per (token, kv_head)), so
+        # the ASM path works for num_kv_heads > 1 (the wrapper collapses kv-head into
+        # the row dim).
+        fuse_bt = self._use_asm_pa
         topk_out = minimax_m3_index_topk(
             index_q,
             self.index_cache,
@@ -801,10 +803,12 @@ class MiniMaxM3SparseAttention(nn.Module):
         # per request; q/index_q already carry one row per token. max_query_len == 1
         # is plain decode (one token per request).
         max_query_len = decode_metadata.max_query_len
-        # When using ASM/gluon decode (num_kv_heads == 1), fuse the sparse
-        # block-table build into the topk merge kernel (returns sparse_bt/ctx),
-        # saving a separate build launch + topk_idx round-trip.
-        fuse_bt = self._use_asm_pa and self.num_kv_heads == 1
+        # When using ASM/gluon decode, fuse the sparse block-table build into the
+        # topk merge kernel (returns sparse_bt/ctx), saving a separate build launch
+        # + topk_idx round-trip. The fused emit produces one kv-head-encoded row per
+        # (token, kv_head), so the ASM path works for num_kv_heads > 1 too (the
+        # attention wrapper collapses kv-head into the row dim).
+        fuse_bt = self._use_asm_pa
         topk_out = minimax_m3_index_topk_decode(
             index_q,
             self.index_cache,
@@ -825,14 +829,6 @@ class MiniMaxM3SparseAttention(nn.Module):
             topk_idx, sparse_bt, sparse_ctx = topk_out, None, None
         output = torch.empty_like(q)
         if self._use_asm_pa:
-            if self.num_kv_heads != 1:
-                raise NotImplementedError(
-                    "ATOM_M3_SPARSE_USE_ASM_PA requires per-rank num_kv_heads == 1 "
-                    "(tensor-parallel size >= 4); ASM PA shares one block_table "
-                    f"across kv heads. Got num_kv_heads={self.num_kv_heads}."
-                )
-            # print("sparse_bt: ", sparse_bt)
-            # print("sparse_ctx: ", sparse_ctx, flush=True)
             minimax_m3_sparse_attn_decode_asm(
                 q,
                 self.kv_cache_k,
