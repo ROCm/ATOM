@@ -10,7 +10,6 @@ imported here.
 
 from typing import Optional, Union
 
-import os
 import torch
 import aiter
 from aiter import ActivationType
@@ -39,7 +38,6 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.minimax_m3.index_topk import (
     minimax_m3_index_topk,
     minimax_m3_index_topk_decode,
-    minimax_m3_index_topk_decode_small_q,
 )
 from atom.model_ops.minimax_m3.moe import (
     MiniMaxM3Bf16Experts,
@@ -50,7 +48,6 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     minimax_m3_fused_qknorm_rope_kv_insert_shuffle,
     minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
-    minimax_m3_sparse_attn_decode_small_q,
     minimax_m3_sparse_attn_decode_asm,
     minimax_m3_sparse_attn_prefill_asm,
 )
@@ -900,15 +897,15 @@ class MiniMaxM3SparseAttention(nn.Module):
     ) -> torch.Tensor:
         small_q_metadata = sparse_metadata.small_q_decode
         assert small_q_metadata is not None
-        if self._use_asm_pa or os.getenv("ATOM_M3_SPARSE_ENABLE_BATCHED_SMALL_Q") != "1":
+        if self._use_asm_pa:
             return self._run_decode_sparse_small_q_loop(q, index_q, sparse_metadata)
-        topk_idx = minimax_m3_index_topk_decode_small_q(
+        query_seq_lens = small_q_metadata.query_seq_lens[: q.shape[0]]
+        query_block_table = small_q_metadata.query_block_table[: q.shape[0]]
+        topk_idx = minimax_m3_index_topk_decode(
             index_q,
             self.index_cache,
-            small_q_metadata.block_table,
-            sparse_metadata.seq_lens,
-            small_q_metadata.prefix_lens,
-            small_q_metadata.max_query_len,
+            query_block_table,
+            query_seq_lens,
             sparse_metadata.max_seq_len,
             self.topk_blocks,
             self.init_blocks,
@@ -917,14 +914,12 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.scaling,
         )
         output = torch.empty_like(q)
-        minimax_m3_sparse_attn_decode_small_q(
+        minimax_m3_sparse_attn_decode(
             q,
             self.kv_cache,
             topk_idx,
-            small_q_metadata.block_table,
-            sparse_metadata.seq_lens,
-            small_q_metadata.prefix_lens,
-            small_q_metadata.max_query_len,
+            query_block_table,
+            query_seq_lens,
             self.num_kv_heads,
             self.scaling,
             output,

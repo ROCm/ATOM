@@ -193,7 +193,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # per-forward in-place update in prepare_decode is visible at every
             # replay; filled once per forward and shared by all sparse layers.
             "sparse_prefix_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
-            "sparse_decode_seq_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            "sparse_decode_seq_lens": CpuGpuBuffer(
+                self.max_bs * max_qlen, **i32_kwargs
+            ),
+            "sparse_decode_block_tables": CpuGpuBuffer(
+                self.max_bs * max_qlen,
+                self.max_num_blocks_per_seq // self.block_ratio,
+                **i32_kwargs,
+            ),
         }
         self.model_runner.forward_vars.update(pa_persistent_metadata)
         # Per-ubatch buffers for CUDAGraph TBO
@@ -1004,16 +1011,42 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 )
                 if bs > scheduled_bs:
                     prefix_lens[scheduled_bs:bs].zero_()
+                total_q_capacity = bs * max_seqlen_q
+                query_seq_lens_buf = self.model_runner.forward_vars[
+                    "sparse_decode_seq_lens"
+                ]
+                query_block_tables_buf = self.model_runner.forward_vars[
+                    "sparse_decode_block_tables"
+                ]
+                query_seq_lens_buf.np[:total_q_capacity] = 0
+                query_block_tables_buf.np[:total_q_capacity] = 0
+                cu_q_cpu = self.model_runner.forward_vars["cu_seqlens_q"].np
+                block_tables_np = self.model_runner.forward_vars["block_tables"].np
+                for req_id in range(scheduled_bs):
+                    q_start = int(cu_q_cpu[req_id])
+                    q_end = int(cu_q_cpu[req_id + 1])
+                    q_len = q_end - q_start
+                    prefix_len = int(context_lens[req_id]) - q_len
+                    for qid in range(q_start, q_end):
+                        q_offset = qid - q_start
+                        query_seq_lens_buf.np[qid] = min(
+                            int(context_lens[req_id]), prefix_len + q_offset + 1
+                        )
+                        query_block_tables_buf.np[qid] = block_tables_np[req_id]
+                query_seq_lens = query_seq_lens_buf.copy_to_gpu(total_q_capacity)
+                query_block_table = query_block_tables_buf.copy_to_gpu(
+                    total_q_capacity
+                )
                 sparse_md = make_minimax_m3_sparse_small_q_decode_metadata(
                     seq_lens=seq_lens,
+                    query_seq_lens=query_seq_lens,
+                    query_block_table=query_block_table,
                     prefix_lens=prefix_lens,
                     block_table=attn_metadata.block_tables[:bs],
                     slot_mapping=attn_metadata.slot_mapping,
                     max_query_len=max_seqlen_q,
                     max_seq_len=int(max_seqlen_k),
-                    decode_seq_lens=self.model_runner.forward_vars[
-                        "sparse_decode_seq_lens"
-                    ].gpu[:bs],
+                    decode_seq_lens=query_seq_lens,
                 )
                 attn_metadata.minimax_m3_sparse_metadata = sparse_md
         mrope_positions = self._build_mrope_decode_positions(
@@ -1234,16 +1267,35 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 pf = self.model_runner.forward_vars["sparse_prefix_lens"]
                 prefix_lens = pf.gpu[:bs]
                 torch.sub(seq_lens, query_lens, out=prefix_lens)
+                query_seq_lens = self.model_runner.forward_vars[
+                    "sparse_decode_seq_lens"
+                ].gpu[:total_tokens]
+                query_block_table = self.model_runner.forward_vars[
+                    "sparse_decode_block_tables"
+                ].gpu[:total_tokens]
+                req_ids = torch.arange(bs, dtype=torch.int32, device=self.device)
+                req_ids = torch.repeat_interleave(req_ids, max_q_len)
+                q_offsets = torch.arange(
+                    max_q_len, dtype=torch.int32, device=self.device
+                ).repeat(bs)
+                query_block_table.copy_(
+                    torch.index_select(attn_metadata.block_tables, 0, req_ids.long())
+                )
+                torch.minimum(
+                    seq_lens[req_ids.long()],
+                    prefix_lens[req_ids.long()] + q_offsets + 1,
+                    out=query_seq_lens,
+                )
                 sparse_md = make_minimax_m3_sparse_small_q_decode_metadata(
                     seq_lens=seq_lens,
+                    query_seq_lens=query_seq_lens,
+                    query_block_table=query_block_table,
                     prefix_lens=prefix_lens,
                     block_table=attn_metadata.block_tables,
                     slot_mapping=attn_metadata.slot_mapping,
                     max_query_len=max_q_len,
                     max_seq_len=attn_metadata.max_seqlen_k,
-                    decode_seq_lens=self.model_runner.forward_vars[
-                        "sparse_decode_seq_lens"
-                    ].gpu[:bs],
+                    decode_seq_lens=query_seq_lens,
                 )
                 attn_metadata.minimax_m3_sparse_metadata = sparse_md
 
