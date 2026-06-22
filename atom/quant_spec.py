@@ -372,19 +372,6 @@ class GenericParser(QuantConfigParser):
         return torch.bfloat16
 
     def _infer_qtype(self, cfg: dict, config_str: str) -> QuantType:
-        weight_block_size = cfg.get("weight_block_size")
-        if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
-            # Prefer explicit HF/compressed-tensors block size over regex
-            # heuristics so 1x32 block quantization is not mistaken for 1x128.
-            try:
-                block_m, block_k = (int(v) for v in weight_block_size)
-            except (TypeError, ValueError):
-                block_m = block_k = None
-            if block_m == 1 and block_k == 32:
-                return QuantType.per_1x32
-            if block_m == 128 and block_k == 128:
-                return QuantType.per_1x128
-
         # Check explicit fields
         for key in ("quant_type", "quantization_type", "scheme"):
             val = cfg.get(key)
