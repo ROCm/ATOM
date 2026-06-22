@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -369,7 +368,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
-        activation: str = "silu",
+        activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -934,8 +933,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
-        if os.environ.get("ATOM_V4_TORCH_MOE"):
-            return
+        if self.static_input_scales:
+            layer.w13_input_scale = atom_parameter(
+                layer.w13_input_scale.max().to(torch.float32)
+            )
+            layer.w2_input_scale = atom_parameter(
+                layer.w2_input_scale.max().to(torch.float32)
+            )
 
         if self.use_triton:
             from atom.config import get_current_atom_config
@@ -966,6 +970,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.shared_w2_weight_scale = layer.w2_weight_scale.data[
                     -n_shared:
                 ].contiguous()
+                if layer.w13_bias is not None:
+                    layer.shared_w13_bias = layer.w13_bias.data[-n_shared:].contiguous()
+                else:
+                    layer.shared_w13_bias = None
+                if layer.w2_bias is not None:
+                    layer.shared_w2_bias = layer.w2_bias.data[-n_shared:].contiguous()
+                else:
+                    layer.shared_w2_bias = None
 
             (
                 w13_weight,
@@ -1074,7 +1086,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_fused_experts,
-                fused_routing_from_topk_triton,
+                triton_kernel_moe_forward,
             )
 
             # Check if the model needs custom routing that triton routing()
@@ -1087,47 +1099,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             if needs_custom_routing:
-                # Use ATOM's full-featured select_experts for routing (grouped
-                # topk / sigmoid scoring / bias correction, and the EP local
-                # remap), then triton matmul_ogs for the actual MoE computation.
-                # Routing is routed-only (num_fused_shared_experts not passed):
-                # the always-on shared expert(s) are applied separately by
-                # _apply_shared_experts_dense below, matching the dense-shared
-                # design rather than fusing them into the routed gate.
-                topk_weights, topk_ids = FusedMoE.select_experts(
-                    hidden_states=x,
-                    router_logits=router_logits,
-                    use_grouped_topk=use_grouped_topk,
-                    top_k=top_k,
-                    renormalize=renormalize,
-                    topk_group=topk_group,
-                    num_expert_group=num_expert_group,
-                    custom_routing_function=custom_routing_function,
-                    scoring_func=scoring_func,
-                    e_score_correction_bias=e_score_correction_bias,
+                # custom routing -- set for deepseek routing n expts act, for grouped topk
+                n_expts_act = top_k
+
+                # custom routing
+                from aiter.ops.triton.moe.moe_routing.routing import (  # grouped topk included
+                    routing,
+                )
+
+                routing_data, gather_idx, scatter_idx = routing(
+                    router_logits,
+                    n_expts_act,
+                    score_mode=scoring_func,
+                    bias=(
+                        e_score_correction_bias.to(torch.float32)
+                        if e_score_correction_bias is not None
+                        else None
+                    ),
+                    renorm=renormalize,
                     routed_scaling_factor=layer.routed_scaling_factor,
+                    use_grouped_topk=use_grouped_topk,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
                 )
-                n_expts_act = topk_weights.shape[1]
+                # Routed-only gate count (no shared-expert widening).
+                n_expts_act = routing_data.n_expts_act
 
-                # Convert to triton routing data structures.
-                # The expert_map arg carries the 0/1 expert_mask, but triton routing
-                # remap needs the global-to-local int index map (-1 for non-local)
-                ep_expert_map = layer.expert_map
-                if ep_expert_map is not None:
-                    # local_num_experts already includes the shared-expert slots
-                    # (added in FusedMoE.__init__, "local_num_experts +=
-                    # num_fused_shared_experts"). Routing stays routed-only, so
-                    # those trailing slots simply receive no tokens here.
-                    n_expts_tot = layer.local_num_experts
-                else:
-                    n_expts_tot = router_logits.shape[-1]
-                    if global_num_experts > 0:
-                        n_expts_tot = global_num_experts
-                    n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
+                # Convert to triton routing data structures
+                num_tokens, n_expts_tot = router_logits.shape
 
-                routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
-                    topk_weights, topk_ids, n_expts_tot, expert_map=ep_expert_map
-                )
+                if global_num_experts > 0:
+                    n_expts_tot = global_num_experts
 
                 output = torch.empty_like(x)
                 _moe_result = triton_kernel_fused_experts(
@@ -1149,9 +1151,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w1_bias=layer.w13_bias,
                     w2_bias=layer.w2_bias,
                     swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
-                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
-                    expert_map=ep_expert_map,
+                    expert_map=expert_map,
                     act_quant=self.act_quant,
                 )
 
@@ -1184,8 +1186,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 a2_scale=layer.w2_input_scale,
                 w1_bias=layer.w13_bias,
                 w2_bias=layer.w2_bias,
-                expert_map=layer.expert_map,
-                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                swiglu_limit=getattr(layer, "swiglu_limit", 7.0),
+                expert_map=expert_map,
+                apply_router_weight_on_input=apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 act_quant=self.act_quant,
             )
@@ -1304,6 +1307,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 return gemm_afp4wfp4(act_fp4, weight, act_mx_scale, weight_scale)
             return gemm_a16wfp4(act, weight, weight_scale)
 
+        shared_w13_bias = getattr(layer, "shared_w13_bias", None)
+        shared_w2_bias = getattr(layer, "shared_w2_bias", None)
+
         shared_out = None
         for e in range(layer.num_fused_shared_experts):
             gate_up = _shared_expert_gemm(
@@ -1311,6 +1317,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.shared_w13_weight[e],
                 layer.shared_w13_weight_scale[e],
             )
+            if shared_w13_bias is not None:
+                gate_up = gate_up + shared_w13_bias[e]
             half_n = gate_up.shape[-1] // 2
             intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
             fused_clamp_act_mul(
@@ -1325,6 +1333,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.shared_w2_weight[e],
                 layer.shared_w2_weight_scale[e],
             )
+            if shared_w2_bias is not None:
+                out_e = out_e + shared_w2_bias[e]
             shared_out = out_e if shared_out is None else shared_out + out_e
         return shared_out
 
@@ -3293,10 +3303,7 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            # Non-triton routing consume 0/1 expert_masks indexed by global
-            # expert id. For triton routing that needs index map, read the
-            # layer.expert_map directly in Mxfp4MoEMethod.apply.
-            expert_map=self.expert_mask,
+            expert_map=self.expert_map,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
@@ -3354,10 +3361,7 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            # Non-triton routing consume 0/1 expert_masks indexed by global
-            # expert id. For triton routing that needs index map, read the
-            # layer.expert_map directly in Mxfp4MoEMethod.apply.
-            expert_map=self.expert_mask,
+            expert_map=self.expert_map,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,

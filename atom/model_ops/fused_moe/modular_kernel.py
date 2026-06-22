@@ -362,7 +362,9 @@ class FusedMoEModularKernel(torch.nn.Module):
             topk = topk_ids.shape[1]
             # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay)
             total_valid_tokens = context.graph_bs * topk * dp_size
-            all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
+            all_ranks_decode = getattr(
+                context, "dp_uniform_decode", not context.is_prefill
+            )
             if total_valid_tokens < dispatch_a1.shape[0] and all_ranks_decode:
                 dispatch_a1 = dispatch_a1[:total_valid_tokens]
                 dispatch_ids = dispatch_ids[:total_valid_tokens]

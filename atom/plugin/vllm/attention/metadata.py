@@ -1590,8 +1590,8 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             shared_buffer = torch.zeros([numel], dtype=torch.int32, device=device)
 
         for layer_name in layer_names or []:
-            attention_prefix, indexer, sparse_attn, owner_atom_config = _resolve_indexer(
-                layer_name
+            attention_prefix, indexer, sparse_attn, owner_atom_config = (
+                _resolve_indexer(layer_name)
             )
             if indexer is not None:
                 indexer.sparse_kv_indices_buffer = shared_buffer

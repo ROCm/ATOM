@@ -13,6 +13,7 @@
 
 ## 📢 News
 
+- **[2026/06]** ATOM now supports **GLM-5.2** (`glm_moe_dsa`) in FP8, including the new **IndexShare** DSA schedule (shared layers reuse the preceding full layer's indexer). See [GLM-5.2 recipe](recipes/GLM-5.md#glm-52-indexshare).
 - **[2026/05]** ATOM now supports **Qwen3.5 multimodal image+text inference** on the native engine and OpenAI-compatible chat API. See [Qwen3.5 multimodal recipe](recipes/Qwen3.5_multimodel.md).
 - **[2026/05]** ATOM now supports **online quantization** — re-quantize unquantized or FP8-block source checkpoints to PTPC-FP8 / MXFP4 mixed precision at load time via `--online_quant_config`, no offline re-packing required. See [online quantization guide](docs/online_quantization_guide.md).
 - **[2026/05]** [Dissecting DeepSeek V4 Compressor](https://rocm.github.io/ATOM/dissecting_dsv4_compressor) — interactive animation visualizing how the CSA/HCA compressor state cache works (overlap mechanism, prefill vs decode, bulk compression vs sequential accumulation).
@@ -42,7 +43,7 @@
 | [DeepSeek V2/V3](https://huggingface.co/deepseek-ai) | `DeepseekV3ForCausalLM` | MoE | MLA attention, MTP speculative decoding |
 | [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1) | `MixtralForCausalLM` | MoE | 8 experts, top-2 routing |
 | [GLM-4-MoE](https://huggingface.co/THUDM) | `Glm4MoeForCausalLM` | MoE | |
-| [GLM-5](https://huggingface.co/zai-org/GLM-5-FP8) | `GlmMoeDsaForCausalLM` | MoE | MLA attention, similar to DeepSeek V3.2. See [recipe](recipes/GLM-5.md) |
+| [GLM-5 / GLM-5.2](https://huggingface.co/zai-org/GLM-5.2-FP8) | `GlmMoeDsaForCausalLM` | MoE | MLA + DSA sparse attention, similar to DeepSeek V3.2; GLM-5.2 adds IndexShare. See [recipe](recipes/GLM-5.md) |
 | [GPT-OSS](https://huggingface.co/openai) | `GptOssForCausalLM` | MoE | Sliding window + attention sinks |
 | [Kimi-K2](https://huggingface.co/moonshotai/Kimi-K2-Thinking) | via `--trust-remote-code` | MoE | See [recipe](recipes/Kimi-K2-Thinking.md) |
 | [MiMo V2/V2.5](https://huggingface.co/XiaomiMiMo) | `MiMoV2ForCausalLM` | MoE | Hybrid full + SWA attention, 3-layer MTP. See [recipe](recipes/MiMo-V2.md) |

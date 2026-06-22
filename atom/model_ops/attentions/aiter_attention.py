@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from typing import Type
 
 import aiter
@@ -8,14 +9,15 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
-from atom.model_ops.attention_mha import PagedAttentionImpl
+from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils.forward_context import AttentionMetaData, Context
 from atom.utils.tbo import TokenSplitPrefillState
-from atom.utils import envs
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+
+logger = logging.getLogger("atom")
 
 
 def cdiv(a, b):
@@ -47,7 +49,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         device=None,
         model_runner=None,
     ):
-        self.block_size = 1024 if model_runner.block_size == 1024 else 16
+        self.block_size = (
+            model_runner.block_size if model_runner.block_size in (256, 1024) else 16
+        )
         if envs.ATOM_USE_UNIFIED_ATTN:
             # SHUFFLE (pre-shuffled) KV cache: use the logical block size directly
             # as the physical block size so block_ratio == 1 and
@@ -56,11 +60,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # page: fp8 packs x=16 - 128; bf16 packs x=8 - 64 (both keep a
             # 128-byte physical page, i.e. block_size // x == 8).
             expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
-            assert model_runner.block_size == expected, (
-                f"ATOM_USE_UNIFIED_ATTN=1 expects --block-size {expected} "
-                f"for {model_runner.kv_cache_dtype} KV cache (so block_ratio == 1), "
-                f"got --block-size {model_runner.block_size}"
-            )
+            if model_runner.block_size != expected:
+                logger.warning(
+                    "ATOM_USE_UNIFIED_ATTN=1 expects --block-size %s for %s KV "
+                    "cache (so block_ratio == 1), got --block-size %s. Continuing "
+                    "with the requested block size.",
+                    expected,
+                    model_runner.kv_cache_dtype,
+                    model_runner.block_size,
+                )
             self.block_size = model_runner.block_size
         assert (
             model_runner.block_size % self.block_size == 0
@@ -100,6 +108,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        self._pa_decode_bf16_asm_enabled = (
+            use_pa_decode_bf16_asm() and model_runner.block_size == 256
+        )
 
         pa_persistent_metadata = {
             "max_qlen": max_qlen,
@@ -753,7 +764,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ]
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
-        if self.block_size == 1024:
+        if self.block_size in (256, 1024):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
             ctx.update(ctx_pa_ps)
 
@@ -876,7 +887,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
 
             # Set PA persistent worker buffers for this ubatch
-            if self.block_size == 1024:
+            if self.block_size in (256, 1024):
                 self._set_ubatch_pa_buffers(padded_bs, max_seqlen_q, ub_idx)
 
     def _set_ubatch_pa_buffers(self, padded_bs, max_q_len, ubatch_idx):
@@ -922,7 +933,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         max_q_len = var["max_qlen"]
 
         # Compute PA work buffers for this ubatch
-        if self.block_size == 1024:
+        if self.block_size in (256, 1024):
             self._set_ubatch_pa_buffers(padded_bs, max_q_len, ubatch_idx)
 
         attn = AttentionMetaData(
@@ -944,23 +955,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
-        if self.block_size == 1024:
+        max_seqlen_k = self.model_runner.config.max_model_len
+        max_q_len = int(var["max_qlen"])
+
+        if self.block_size in (256, 1024):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            slot_mapping=var["slot_mapping"].gpu[: bs * max_q_len],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=var["max_qlen"],
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu,
-            max_seqlen_k=self.model_runner.config.max_model_len,
+            max_seqlen_k=max_seqlen_k,
             **ctx_pa_ps,
         )
 
-        positions = var["positions"].copy_to_gpu(bs)
+        positions = var["positions"].copy_to_gpu(bs * max_q_len)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )
