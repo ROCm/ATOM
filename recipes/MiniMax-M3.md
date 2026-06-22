@@ -19,6 +19,7 @@ docker pull rocm/atom-dev:latest
 model_path=${model_path:-amd/MiniMax-M3-MXFP4}
 run_name=${run_name:-m3-mxfp4}
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
