@@ -15,7 +15,7 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -783,13 +783,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or self.quant_type == QuantType.per_1x32
         )
         gfx = get_gfx()
+        self.is_gfx1250 = gfx == "gfx1250"
+        # gfx1250 grouped a8w4 MoE kernel only supports the non-interleaved
+        # (gate|up separated) scale layout; reject is_guinterleave up front.
+        if self.is_gfx1250 and self.is_guinterleave:
+            raise NotImplementedError(
+                "gfx1250 MoE only supports is_guinterleave=False; "
+                "unset ATOM_MOE_GU_ITLV."
+            )
         if envs.is_set("ATOM_USE_TRITON_MOE"):
             self.use_triton = envs.ATOM_USE_TRITON_MOE
         else:
-            self.use_triton = (
-                gfx.startswith("gfx94")
-                or gfx.startswith("gfx12")
-                or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
+            self.use_triton = gfx.startswith("gfx94") or (
+                gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
             )
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
 
@@ -1020,11 +1026,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         w2_scale_2d = layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1])
 
-        shuffled_w13_scale = shuffle_scale(
-            w13_scale_2d, self.num_experts, self.is_guinterleave, True
+        shuffled_w13_scale = moe_shuffle_scale(
+            w13_scale_2d,
+            self.num_experts,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=True,
         )
-        shuffled_w2_scale = shuffle_scale(
-            w2_scale_2d, self.num_experts, self.is_guinterleave, False
+        shuffled_w2_scale = moe_shuffle_scale(
+            w2_scale_2d,
+            self.num_experts,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=False,
         )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
