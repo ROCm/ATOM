@@ -1,9 +1,14 @@
 # Ministral-3-8B-Instruct-2512 on gfx1201 (RX 9070 XT)
 
 Run `mistralai/Ministral-3-8B-Instruct-2512` (natively FP8) on a single
-RDNA4 GPU. All-triton path; the default `AiterBackend` SIGSEGVs on
-gfx1201 because the prebuilt aiter HIP `.so` files in
-`rocm/atom-dev:latest` ship code objects only for gfx94x/95x.
+RDNA4 GPU. ATOM runs attention and GEMM through Triton
+(`ATOM_USE_UNIFIED_ATTN=1`, `ATOM_USE_TRITON_GEMM=1`); the KV-cache write,
+RoPE and norms use native aiter HIP kernels.
+
+> **Navi (gfx1201) prerequisite:** aiter must be built for the arch — see
+> [ROCm/aiter#3846](https://github.com/ROCm/aiter/issues/3846). Short-term
+> fix: build aiter from source with `GPU_ARCHS=gfx1201` (a native build on
+> the card does this automatically).
 
 ## Model
 

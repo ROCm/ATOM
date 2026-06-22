@@ -1,6 +1,8 @@
 # Qwen3-8B-FP8 (block-128) on RX 9070 XT (gfx1201) via ROCm/ATOM
 
-Verified, all-Triton, cudagraph-on path. Same backend setup as the
+Verified path on RX 9070 XT (gfx1201). Attention and GEMM run through
+Triton; same backend setup and the **build-aiter-for-gfx1201** prerequisite
+([ROCm/aiter#3846](https://github.com/ROCm/aiter/issues/3846)) as the
 [Ministral-3-8B recipe](./Ministral-3-8B.md).
 
 ## Model
