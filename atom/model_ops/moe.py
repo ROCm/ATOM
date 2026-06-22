@@ -960,15 +960,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     -n_shared:
                 ].contiguous()
                 if layer.w13_bias is not None:
-                    layer.shared_w13_bias = layer.w13_bias.data[
-                        -n_shared:
-                    ].contiguous()
+                    layer.shared_w13_bias = layer.w13_bias.data[-n_shared:].contiguous()
                 else:
                     layer.shared_w13_bias = None
                 if layer.w2_bias is not None:
-                    layer.shared_w2_bias = layer.w2_bias.data[
-                        -n_shared:
-                    ].contiguous()
+                    layer.shared_w2_bias = layer.w2_bias.data[-n_shared:].contiguous()
                 else:
                     layer.shared_w2_bias = None
 
