@@ -700,40 +700,6 @@ def get_generation_config(model: str) -> GenerationConfig:
         return None
 
 
-_MINIMAX_M3_TEXT_FIELDS = (
-    "vocab_size",
-    "hidden_size",
-    "intermediate_size",
-    "dense_intermediate_size",
-    "shared_intermediate_size",
-    "num_hidden_layers",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "head_dim",
-    "max_position_embeddings",
-    "rms_norm_eps",
-    "rope_theta",
-    "rotary_dim",
-    "partial_rotary_factor",
-    "rope_scaling",
-    "rope_parameters",
-    "hidden_act",
-    "swiglu_alpha",
-    "swiglu_beta",
-    "swiglu_limit",
-    "num_local_experts",
-    "num_experts_per_tok",
-    "n_shared_experts",
-    "scoring_func",
-    "use_routing_bias",
-    "routed_scaling_factor",
-    "moe_layer_freq",
-    "sparse_attention_config",
-    "tie_word_embeddings",
-    "quantization_config",
-)
-
-
 def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
     architectures = getattr(hf_config, "architectures", None) or ()
     if any("MiniMaxM3" in arch for arch in architectures):
@@ -755,15 +721,14 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if text_config is None or text_config is hf_config:
         return
 
-    for attr_name in _MINIMAX_M3_TEXT_FIELDS:
-        if not hasattr(hf_config, attr_name) and hasattr(text_config, attr_name):
-            setattr(hf_config, attr_name, getattr(text_config, attr_name))
-
     if getattr(text_config, "hidden_act", None) == "swigluoai":
         if getattr(text_config, "swiglu_beta", None) is None:
             text_config.swiglu_beta = 1.0
-        if getattr(hf_config, "swiglu_beta", None) is None:
-            hf_config.swiglu_beta = text_config.swiglu_beta
+
+    for attr_name, attr_value in vars(text_config).items():
+        if attr_name.startswith("_") or getattr(hf_config, attr_name, None) is not None:
+            continue
+        setattr(hf_config, attr_name, attr_value)
 
 
 @dataclass
