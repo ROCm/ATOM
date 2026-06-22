@@ -930,9 +930,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale.max().to(torch.float32)
             )
 
-        if os.environ.get("ATOM_V4_TORCH_MOE"):
-            return
-
         if self.use_triton:
             from atom.config import get_current_atom_config
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
@@ -1079,7 +1076,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
-        if self.use_triton and not os.environ.get("ATOM_V4_TORCH_MOE"):
+        if self.use_triton:
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_fused_experts,
                 triton_kernel_moe_forward,
