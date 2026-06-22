@@ -483,6 +483,7 @@ class Scheduler:
                 topic=kv_events_cfg.topic,
                 hwm=kv_events_cfg.hwm,
                 buffer_steps=kv_events_cfg.buffer_steps,
+                replay_endpoint=kv_events_cfg.replay_endpoint,
                 data_parallel_rank=dp_rank,
             )
             logger.info(
@@ -1334,6 +1335,7 @@ class Scheduler:
                     block_hashes=remote_hashes,
                     token_ids=remote_tokens,
                     parent_block_hash=parent_block_hash,
+                    token_offset=num_cached_blocks * bm.block_size,
                 )
         return True
 

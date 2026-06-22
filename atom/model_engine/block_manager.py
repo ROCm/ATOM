@@ -40,14 +40,21 @@ def _make_block_stored(
     parent: int | None,
     block_size: int,
     medium: str = MEDIUM_GPU,
+    token_offset: int | None = None,
 ) -> BlockStored:
-    """Construct a BlockStored event from a coalesced run of new blocks."""
+    """Construct a BlockStored event from a coalesced run of new blocks.
+
+    `token_offset` is the sequence position of the first token of the run's
+    first block, so consumers can map block i to
+    `[token_offset + i*block_size, token_offset + (i+1)*block_size)`.
+    """
     return BlockStored(
         block_hashes=hashes,
         parent_block_hash=parent,
         token_ids=tokens,
         block_size=block_size,
         medium=medium,
+        token_offset=token_offset,
     )
 
 
@@ -251,6 +258,7 @@ class BlockManager:
                     store_run_tokens,
                     store_run_parent,
                     self.block_size,
+                    token_offset=start * self.block_size,
                 )
             )
 
@@ -326,11 +334,14 @@ class BlockManager:
         block_hashes: list[int],
         token_ids: list[int],
         parent_block_hash: int | None = None,
+        token_offset: int | None = None,
     ) -> None:
         """Emit a BlockStored(medium=REMOTE) for blocks received from a remote
         KV transfer producer (Mooncake/MoriIO decode side). Called by the
         KVConnector worker once the transfer completes so external KV-cache
-        consumers (LMCache, etc.) can track remote-resident blocks."""
+        consumers (LMCache, etc.) can track remote-resident blocks.
+
+        `token_offset` is the sequence position of the first remote block."""
         if self._event_log is None or not block_hashes:
             return
         self._event_log.append(
@@ -340,5 +351,6 @@ class BlockManager:
                 parent_block_hash,
                 self.block_size,
                 medium=MEDIUM_REMOTE,
+                token_offset=token_offset,
             )
         )

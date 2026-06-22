@@ -189,6 +189,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KV_EVENTS_ENDPOINT", "tcp://127.0.0.1:5557"
     ),
     "ATOM_KV_EVENTS_TOPIC": lambda: os.getenv("ATOM_KV_EVENTS_TOPIC", ""),
+    # ROUTER endpoint for the replay socket; empty string disables replay.
+    "ATOM_KV_EVENTS_REPLAY_ENDPOINT": lambda: os.getenv(
+        "ATOM_KV_EVENTS_REPLAY_ENDPOINT", ""
+    ),
     "ATOM_KV_EVENTS_HWM": lambda: int(os.getenv("ATOM_KV_EVENTS_HWM", "0") or "0"),
     "ATOM_KV_EVENTS_BUFFER_STEPS": lambda: int(
         os.getenv("ATOM_KV_EVENTS_BUFFER_STEPS", "10000") or "10000"
