@@ -7,6 +7,8 @@ from typing import Type
 import aiter
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils import CpuGpuBuffer, envs
@@ -22,6 +24,36 @@ logger = logging.getLogger("atom")
 
 def cdiv(a, b):
     return (a + b - 1) // b
+
+
+@triton.jit
+def _mtp_decode_slot_mapping_kernel(
+    context_lens_ptr,
+    block_tables_ptr,
+    slot_mapping_ptr,
+    bs,
+    skip_update: tl.constexpr,
+    block_size: tl.constexpr,
+    block_table_stride: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    if not skip_update:
+        seq = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = seq < bs
+
+        ctx = tl.load(context_lens_ptr + seq, mask=mask, other=1).to(tl.int64)
+        last_pos = tl.maximum(ctx - 1, 0)
+        block_col = last_pos // block_size
+        within_block = last_pos - block_col * block_size
+
+        phys_block = tl.load(
+            block_tables_ptr + seq * block_table_stride + block_col,
+            mask=mask,
+            other=0,
+        ).to(tl.int64)
+        tl.store(
+            slot_mapping_ptr + seq, phys_block * block_size + within_block, mask=mask
+        )
 
 
 class AiterBackend(AttentionBackend):
@@ -351,23 +383,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         """
         var = self.model_runner.forward_vars
         slot_mapping = var["slot_mapping"].gpu[:bs]
-        # Warmup/dummy runs before KV allocation: the draft attention is skipped
-        # (PagedAttentionImpl's is_dummy_run guard), so slot_mapping is unused.
-        # The dummy batch's context_lens is the full prefill length, which eagle
-        # bumps by +1 to max_model_len+1 — its derived block column overruns the
-        # block_tables width and would OOB the gather below. No-op during dummy
-        # runs, matching deepseek_v4_attn.prepare_mtp_decode.
-        if get_forward_context().context.is_dummy_run:
-            return {"slot_mapping": slot_mapping}
-        block_size = self.model_runner.block_size
-        ctx = var["context_lens"].gpu[:bs]  # int32, already +1 for this step
-        block_tables = var["block_tables"].gpu[:bs]  # [bs, max_blocks] int32
-        last_pos = (ctx - 1).clamp_min(0).long()
-        block_col = last_pos // block_size
-        within = last_pos - block_col * block_size
-        phys_block = torch.gather(block_tables, 1, block_col.unsqueeze(1)).squeeze(1)
-        slot = phys_block.long() * block_size + within
-        slot_mapping.copy_(slot.to(slot_mapping.dtype))
+        block_tables = var["block_tables"].gpu
+        context_lens = var["context_lens"].gpu
+        # Dummy runs skip the draft attention, so keep this launch as a no-op:
+        # their synthetic context_lens can point past block_tables.
+        _mtp_decode_slot_mapping_kernel[(max(1, triton.cdiv(bs, 128)),)](
+            context_lens,
+            block_tables,
+            slot_mapping,
+            bs,
+            bs == 0 or get_forward_context().context.is_dummy_run,
+            self.model_runner.block_size,
+            block_tables.stride(0),
+            BLOCK=128,
+        )
         return {"slot_mapping": slot_mapping}
 
     def compute_block_bytes(self) -> int:
