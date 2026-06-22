@@ -52,7 +52,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         hf_config = model_runner.config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
         sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-        self._is_minimax_m3_sparse = bool(sparse_cfg)
+        self._has_sparse_attention = bool(sparse_cfg)
         if sparse_cfg and (required_block_size := sparse_cfg.get("sparse_block_size")):
             if model_runner.block_size != required_block_size:
                 raise ValueError(
@@ -632,20 +632,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
-        if self._is_minimax_m3_sparse and not attn_metadata.has_cached:
+        if self._has_sparse_attention and not attn_metadata.has_cached:
             bs = batch.total_seqs_num_prefill
             self.prepare_block_tables(batch)
             attn_metadata.block_tables = self.model_runner.forward_vars[
                 "block_tables"
             ].copy_to_gpu(bs)
-        if self._is_minimax_m3_sparse:
+        if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
-                make_minimax_m3_sparse_prefill_metadata,
+                make_minimax_m3_sparse_prefill_metadata as make_sparse_prefill_metadata,
             )
 
             bs = batch.total_seqs_num_prefill
-            attn_metadata.minimax_m3_sparse_metadata = (
-                make_minimax_m3_sparse_prefill_metadata(
+            attn_metadata.sparse_attention_metadata = (
+                make_sparse_prefill_metadata(
                     cu_seqlens_q=attn_metadata.cu_seqlens_q,
                     seq_lens=attn_metadata.context_lens,
                     block_table=attn_metadata.block_tables,
@@ -849,17 +849,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
-        if self._is_minimax_m3_sparse:
+        if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
-                make_minimax_m3_sparse_decode_metadata,
+                make_minimax_m3_sparse_decode_metadata as make_sparse_decode_metadata,
             )
 
             if max_seqlen_q > 1:
                 raise NotImplementedError(
                     "MiniMax-M3 FP4-only support does not include speculative decode."
                 )
-            attn_metadata.minimax_m3_sparse_metadata = (
-                make_minimax_m3_sparse_decode_metadata(
+            attn_metadata.sparse_attention_metadata = (
+                make_sparse_decode_metadata(
                     seq_lens=attn_metadata.context_lens[:scheduled_bs],
                     block_table=attn_metadata.block_tables[:scheduled_bs],
                     slot_mapping=attn_metadata.slot_mapping,
@@ -1056,9 +1056,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_k=max_seqlen_k,
             **ctx_pa_ps,
         )
-        if self._is_minimax_m3_sparse:
+        if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
-                make_minimax_m3_sparse_decode_metadata,
+                make_minimax_m3_sparse_decode_metadata as make_sparse_decode_metadata,
             )
 
             seq_lens = attn_metadata.context_lens
@@ -1066,8 +1066,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 raise NotImplementedError(
                     "MiniMax-M3 FP4-only support does not include speculative decode."
                 )
-            attn_metadata.minimax_m3_sparse_metadata = (
-                make_minimax_m3_sparse_decode_metadata(
+            attn_metadata.sparse_attention_metadata = (
+                make_sparse_decode_metadata(
                     seq_lens=seq_lens,
                     block_table=attn_metadata.block_tables,
                     slot_mapping=attn_metadata.slot_mapping,

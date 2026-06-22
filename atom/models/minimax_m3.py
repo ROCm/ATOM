@@ -681,7 +681,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             )
 
         attn_metadata = fwd_ctx.attn_metadata
-        sparse_metadata = getattr(attn_metadata, "minimax_m3_sparse_metadata", None)
+        sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
         if sparse_metadata is None:
             sparse_metadata = attn_metadata
         if _can_use_fused_minimax_m3_attention_preproc(
