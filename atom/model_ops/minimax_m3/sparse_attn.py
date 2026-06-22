@@ -2,18 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton kernels for MiniMax M3 block-sparse GQA attention.
 
-The main heads attend only to the blocks selected by the lightning indexer (see
-``index_topk``). Ported from the sglang reference (minimax_sparse_ops), adapted
-to vLLM's paged KV cache: the KV page size is forced to equal the sparse block
-size (128), so one selected block maps to exactly one page.
+Main heads attend only to blocks selected by the lightning indexer. The sparse
+block size is 128, matching the KV page length, so each selected block maps to
+one page in the ``(num_blocks, 2, 128, num_kv_heads, head_dim)`` cache layout.
 
-Main K/V cache layout (vLLM):
-  ``(num_blocks, 2, 128, num_kv_heads, head_dim)``  K=[:,0] V=[:,1]
-
-Only the paths MiniMax M3 uses are implemented: no attention sink, base-2
-(exp2/log2) softmax. The decode kernels use split-K (flash-decoding) over the
-selected blocks with a separate merge step, since one query token per request
-leaves the prefill kernels (which parallelize over the query dim) idle.
+Only the MiniMax M3 paths are implemented: base-2 softmax, no attention sink,
+and split-K decode with a separate merge step.
 """
 
 from dataclasses import dataclass
@@ -114,8 +108,7 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# GQA block-sparse attention (paged). Main heads attend only to the selected
-# blocks. BLOCK_SIZE_K == 128 so each selected block is one page.
+# GQA block-sparse attention. BLOCK_SIZE_K == 128, matching one selected block.
 # ---------------------------------------------------------------------------
 @triton.heuristics(
     {
