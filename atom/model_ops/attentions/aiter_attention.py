@@ -51,18 +51,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     ):
         hf_config = model_runner.config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
-        self._is_minimax_m3_sparse = bool(
-            getattr(text_config, "sparse_attention_config", None)
-        )
-        if self._is_minimax_m3_sparse:
-            from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
-
-            if model_runner.block_size != SPARSE_BLOCK_SIZE:
+        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        self._is_minimax_m3_sparse = bool(sparse_cfg)
+        if sparse_cfg and (required_block_size := sparse_cfg.get("sparse_block_size")):
+            if model_runner.block_size != required_block_size:
                 raise ValueError(
-                    "MiniMax-M3 native sparse attention requires "
-                    f"--block-size {SPARSE_BLOCK_SIZE}, got {model_runner.block_size}."
+                    "Sparse attention requires "
+                    f"--block-size {required_block_size}, got {model_runner.block_size}."
                 )
-            self.block_size = SPARSE_BLOCK_SIZE
+            self.block_size = required_block_size
         else:
             self.block_size = (
                 model_runner.block_size
