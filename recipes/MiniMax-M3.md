@@ -307,6 +307,7 @@ python -m atom.benchmarks.benchmark_serving \
   --request-rate=inf \
   --ignore-eos \
   --save-result \
+  --use-chat-template \
   --percentile-metrics="ttft,tpot,itl,e2el"
 ```
 
