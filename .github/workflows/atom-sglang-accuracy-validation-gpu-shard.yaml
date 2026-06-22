@@ -66,16 +66,22 @@ jobs:
 
       - name: Prepare model cache mount
         run: |
-          MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
           MODEL_CACHE_MOUNT=""
-          MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
+          MODEL_CACHE_ROOT=""
+          MODEL_CACHE_DESC=""
 
-          if [ -d "$(dirname "${MODEL_CACHE_ROOT}")" ]; then
-            mkdir -p "${MODEL_CACHE_ROOT}"
+          if [ -d "/mnt/raid0/pretrained_model" ]; then
+            MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
+          elif [ -d "/data/pretrained_model" ]; then
+            MODEL_CACHE_ROOT="/data/pretrained_model"
             MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           else
-            echo "Warning: $(dirname "${MODEL_CACHE_ROOT}") directory not found on runner; using container-local ${MODEL_CACHE_ROOT}."
+            MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
+            MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
+            echo "Warning: Neither /mnt/raid0/pretrained_model nor /data/pretrained_model exists on runner; using container-local ${MODEL_CACHE_ROOT}."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -83,13 +89,13 @@ jobs:
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
-      #- name: Clean up old containers
-      #  run: |
-      #    containers=$(docker ps -q)
-      #    if [ -n "$containers" ]; then
-      #      docker kill $containers || true
-      #    fi
-      #    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+      - name: Clean up old containers
+        run: |
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
       - name: Start validation container
         run: |
