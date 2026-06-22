@@ -459,7 +459,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         cache_config: str = "bf16",
     ) -> None:
         super().__init__()
-        self.is_minimax_m3_sparse_attention = True
+        self.is_indexed_sparse_attention = True
         self.hidden_size = config.hidden_size
         self.layer_num = layer_id
         self.layer_name = f"{prefix}.attn"

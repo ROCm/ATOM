@@ -465,7 +465,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         from atom.config import KVCacheTensor
         from aiter import dtypes
 
-        if getattr(module, "is_minimax_m3_sparse_attention", False):
+        if getattr(module, "is_indexed_sparse_attention", False):
             runner = self.model_runner
             config = runner.config
             sparse_idx = runner._minimax_m3_sparse_cache_next
