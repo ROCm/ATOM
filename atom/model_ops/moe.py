@@ -243,14 +243,6 @@ def all_gather_with_padding(
     # use_custom=False falls back to torch.distributed.all_gather_into_tensor
     # (NCCL), whose WorkNCCL end-event recorded inside CUDAGraph capture is
     # later queried by the watchdog thread -> hipErrorCapturedEvent crash.
-    #
-    # Under TBO the two micro-batch threads issue this collective concurrently.
-    # The custom CA/IPC all-gather uses a single process-wide signal/workspace,
-    # which two concurrent threads corrupt -> cross-rank deadlock. Fall back to
-    # the stock NCCL all_gather (thread-safe) while a TBO overlap is active.
-    from atom.utils.tbo.ubatching import tbo_active
-
-    use_cag = use_cag and not tbo_active()
     gathered_hidden_states = get_dp_group().all_gather(
         padded_x, use_custom=use_cag, dim=0
     )

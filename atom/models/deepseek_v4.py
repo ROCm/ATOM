@@ -874,9 +874,8 @@ class Compressor(nn.Module):
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
 
         # Fixed CUDAGraph-stable scratch for `wkv_gate(x)` output on the captured
-        # decode path (lazily sized on first graph forward; see forward()). Keyed
-        # per TBO ubatch id so the two concurrent ubatch threads never share the
-        # same scratch (mirrors the per-ubatch topK / mori buffers).
+        # decode path, in TBO, two concurrent ubatch threads never share the
+        # same scratch.
         self._combined_cg_buf: dict = {}
 
         # External tensors — assigned by the owning Attention / Indexer at first forward.

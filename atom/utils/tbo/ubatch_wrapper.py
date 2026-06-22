@@ -404,10 +404,6 @@ class UBatchWrapper(nn.Module):
                 ub_sizes.append(ub_num_tokens)
             return ub_sizes
         else:
-            # Decode: PER-RANK pad target (DP-unified via _decode_ub_padded_bs,
-            # same value on every rank). MoE.pad_for_all_gather pads each rank
-            # to this and the cross-DP all_gather multiplies by dp_size itself,
-            # so we must NOT pre-multiply by dp_size here (that inflated MoE M).
             result = []
             for i in range(N):
                 padded_bs = UBatchWrapper._decode_ub_padded_bs(ctx, i, N, full_graph_bs)
