@@ -22,7 +22,10 @@ from atom.config import Config
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.fused_aux_rmsnorm import fused_group_rmsnorm
+from atom.model_ops.fused_aux_rmsnorm import (
+    fused_dual_rmsnorm_cat,
+    fused_group_rmsnorm,
+)
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
@@ -172,25 +175,52 @@ class Eagle3LlamaDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    def _dual_norm_cat(
+        self, embeds: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """RMS-norm the two inputs and concat into the [N, 2*hidden] QKV input.
+
+        Uses the single-launch fused kernel (one Triton launch normalizes both
+        inputs by their own weight and writes the contiguous concat) instead of
+        two RMSNorm launches + a concat. Falls back to the torch path when the
+        fused kernel's preconditions don't hold (non-CUDA / non-contiguous /
+        shape mismatch). input_layernorm and hidden_norm share rms_norm_eps.
+        """
+        if (
+            embeds.is_cuda
+            and embeds.is_contiguous()
+            and hidden_states.is_contiguous()
+            and embeds.shape == hidden_states.shape
+        ):
+            return fused_dual_rmsnorm_cat(
+                embeds,
+                hidden_states,
+                self.input_layernorm.weight,
+                self.hidden_norm.weight,
+                self.input_layernorm.eps,
+            )
+        normed_embeds = self.input_layernorm(embeds)
+        normed_hidden = self.hidden_norm(hidden_states)
+        return torch.cat([normed_embeds, normed_hidden], dim=-1)
+
     def forward(
         self,
         positions: torch.Tensor,
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        normed_embeds = self.input_layernorm(embeds)
-        normed_hidden = self.hidden_norm(hidden_states)
-        # Concat for attention input: [N, hidden*2]
-        attn_input = torch.cat([normed_embeds, normed_hidden], dim=-1)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attn_input = self._dual_norm_cat(embeds, hidden_states)
         attn_output = self.self_attn(positions, attn_input)
-        # Residual connection on hidden_states
-        hidden_states = hidden_states + attn_output
-        # MLP with pre-norm + residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Fused residual-add + pre-MLP norm in a single kernel:
+        #   residual      = hidden_states + attn_output  (the MLP residual)
+        #   hidden_states = post_attention_layernorm(residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            attn_output, hidden_states
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        # Return the MLP output and its residual; the model fuses the final
+        # residual-add with the output norm (norm_output) or adds plainly.
+        return hidden_states, residual
 
 
 class Eagle3LlamaMLP(nn.Module):
@@ -387,8 +417,16 @@ class Eagle3LlamaModel(nn.Module):
         compute_logits() is norm-aware, so EagleProposer only sees one tensor.
         """
         embeds = self.embed_tokens(input_ids)
-        hidden_states = self.midlayer(positions, embeds, hidden_states)
-        return self.norm(hidden_states) if self.norm_output else hidden_states
+        hidden_states, residual = self.midlayer(positions, embeds, hidden_states)
+        if self.norm_output:
+            # EAGLE 3.1: fused final residual-add + output RMSNorm (one kernel).
+            hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            # EAGLE 3 / K2.5: carry the pre-norm hidden forward; the norm is
+            # deferred to compute_logits, so the add stays standalone here
+            # (byte-equivalent to the legacy path).
+            hidden_states = residual + hidden_states
+        return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Only norm the legacy pre-norm path; norm_output already normed in
