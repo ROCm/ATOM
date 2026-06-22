@@ -73,6 +73,8 @@ class UBatchWrapper(nn.Module):
         N = len(ctx.ubatch_slices)
         compute_stream = torch.cuda.current_stream()
 
+        ub_dp_metadata = self._make_ubatch_dp_metadata(ctx, N)
+
         full_graph_bs = ctx.context.graph_bs
         forward_contexts = []
         ub_inputs = []
@@ -94,10 +96,7 @@ class UBatchWrapper(nn.Module):
             if ctx.context.is_prefill:
                 padded_bs = ub_num_reqs
             else:
-                if i < N - 1:
-                    padded_bs = full_graph_bs // N
-                else:
-                    padded_bs = full_graph_bs - (full_graph_bs // N) * (N - 1)
+                padded_bs = self._decode_ub_padded_bs(ctx, i, N, full_graph_bs)
             ub_ctx = self._make_ubatch_context(
                 original_ctx,
                 ub_slice,
@@ -105,6 +104,7 @@ class UBatchWrapper(nn.Module):
                 i,
                 ub_num_reqs,
                 ub_graph_bs=ub_graph_bs_list[i],
+                dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
             )
             forward_contexts.append(ub_ctx)
             ub_token_slice = (
@@ -214,8 +214,7 @@ class UBatchWrapper(nn.Module):
 
         # Build per-ubatch ForwardContexts from pre-allocated forward_vars.
         full_graph_bs = ctx.context.graph_bs
-        # only padding for all_gather/reduce_scatter pass
-        all_gahter_dp_size = self._get_dp_size() if self.dp_gather_scatter else 1
+        ub_dp_metadata = self._make_ubatch_dp_metadata(ctx, N)
         forward_contexts = []
         ub_inputs = []
         for i, ub_slice in enumerate(ctx.ubatch_slices):
@@ -228,7 +227,8 @@ class UBatchWrapper(nn.Module):
                 ub_slice,
                 padded_bs,
                 i,
-                ub_graph_bs=padded_bs * all_gahter_dp_size,
+                ub_graph_bs=padded_bs,
+                dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
             )
             forward_contexts.append(ub_ctx)
             ub_inputs.append(
@@ -324,6 +324,55 @@ class UBatchWrapper(nn.Module):
         except Exception:
             return 1
 
+    def _make_ubatch_dp_metadata(self, ctx: ForwardContext, N: int):
+        """Build per-ubatch :class:`DPMetadata` so the MoE DP collective uses
+        each ubatch's own per-rank token counts.
+
+        Returns ``None`` when DP is disabled / no dp_metadata on the parent
+        context (the shared metadata is then reused, which is correct for the
+        single-rank case). Otherwise returns a list of length ``N``.
+
+        Each ubatch's per-rank token count is obtained with the same CPU
+        all_reduce that :meth:`DPMetadata.num_tokens_across_dp` uses, one per
+        ubatch. This is a CPU collective (cheap) and keeps every rank's
+        all_gatherv / reduce_scatterv consistently sized.
+        """
+        if ctx.dp_metadata is None:
+            return None
+        from atom.config import get_current_atom_config
+        from atom.utils.forward_context import DPMetadata
+
+        parallel_config = get_current_atom_config().parallel_config
+        metas = []
+        for ub_slice in ctx.ubatch_slices:
+            ub_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
+            metas.append(DPMetadata.make(parallel_config, int(ub_tokens), None))
+        return metas
+
+    @staticmethod
+    def _decode_ub_padded_bs(
+        ctx: ForwardContext, i: int, N: int, full_graph_bs: int
+    ) -> int:
+        """Per-ubatch padded request count for a decode micro-batch.
+
+        Must be IDENTICAL across DP ranks: the MoE all_gather/reduce_scatter
+        pads each ubatch to this size, so a per-rank-local split (which differs
+        when ranks carry different decode batch sizes, e.g. during drain)
+        desyncs the collective and faults. Derive it from the DP-unified
+        ``ub_max_tokens_across_dp`` (MAX-reduced in ModelRunner._preprocess),
+        converting the per-ubatch token max back to a request count via
+        ``max_seqlen_q``. Falls back to the local split only when DP is off or
+        the precomputed value is unavailable.
+        """
+        ub_max = ctx.ub_max_tokens_across_dp
+        if ub_max is not None and len(ub_max) == N:
+            max_q = getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
+            return max(1, ub_max[i] // max_q)
+        # Fallback: local split (single-rank / value not precomputed).
+        if i < N - 1:
+            return full_graph_bs // N
+        return full_graph_bs - (full_graph_bs // N) * (N - 1)
+
     @staticmethod
     def _compute_ub_graph_bs(
         ctx: ForwardContext,
@@ -337,7 +386,9 @@ class UBatchWrapper(nn.Module):
             ``ModelRunner._preprocess`` already packed into the single DP
             all_reduce (``ctx.ub_max_tokens_across_dp``). Falls back to
             local sizes when DP is off / value not precomputed.
-        For decode: padded_bs * dp_size.
+        For decode: per-rank padded_bs (the cross-DP all_gather in MoE's
+            pad_for_all_gather multiplies by dp_size itself, so do NOT
+            pre-multiply here).
         """
         if ctx.context.is_prefill:
             if (
@@ -355,11 +406,8 @@ class UBatchWrapper(nn.Module):
         else:
             result = []
             for i in range(N):
-                if i < N - 1:
-                    padded_bs = full_graph_bs // N
-                else:
-                    padded_bs = full_graph_bs - (full_graph_bs // N) * (N - 1)
-                result.append(padded_bs * dp_size)
+                padded_bs = UBatchWrapper._decode_ub_padded_bs(ctx, i, N, full_graph_bs)
+                result.append(padded_bs)
             return result
 
     def _make_ubatch_context(
@@ -370,6 +418,7 @@ class UBatchWrapper(nn.Module):
         ubatch_idx: int = 0,
         actual_num_reqs: int | None = None,
         ub_graph_bs: int | None = None,
+        dp_metadata=None,
     ) -> ForwardContext:
         """Build a ForwardContext for a single micro-batch."""
         ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
@@ -410,7 +459,7 @@ class UBatchWrapper(nn.Module):
             no_compile_layers=ctx.no_compile_layers,
             kv_cache_data=ctx.kv_cache_data,
             context=ub_context,
-            dp_metadata=ctx.dp_metadata,  # shared across ubatches
+            dp_metadata=dp_metadata if dp_metadata is not None else ctx.dp_metadata,
             spec_decode_metadata=None,  # not supported with TBO
             ubatch_slices=None,  # prevent recursion
             main_stream=ctx.main_stream,
