@@ -19,7 +19,6 @@ The SGLang-ATOM backend keeps the standard SGLang CLI, server APIs, and general 
 Before launching the server, export the SGLang-ATOM settings:
 
 ```bash
-export ATOM_USE_TRITON_MOE=1
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
 export SGLANG_DEFAULT_THINKING=1
@@ -55,7 +54,6 @@ python3 -m sglang.launch_server \
 
 Notes:
 
-- `ATOM_USE_TRITON_MOE=1` is required for V4-Pro's routed-expert path.
 - `SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models` makes SGLang load ATOM's model wrapper instead of the upstream SGLang DeepSeek V4 model.
 - `--disable-radix-cache` is required for the current SGLang-ATOM DeepSeek V4 bridge.
 - The recipe is validated on 8-GPU MI355 runners with TP=8.
