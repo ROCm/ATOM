@@ -35,6 +35,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.v4_kernels.state_writes import swa_write
+
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
 # is unavailable; the dispatch in ``qk_norm_rope_maybe_quant`` will fall
 # back to the Triton kernel.
@@ -316,6 +318,12 @@ def qk_norm_rope_maybe_quant(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
+    swa_kv: Optional[torch.Tensor] = None,
+    state_slot_mapping: Optional[torch.Tensor] = None,
+    batch_id_per_token: Optional[torch.Tensor] = None,
+    swa_cu_seqlens_q: Optional[torch.Tensor] = None,
+    swa_cache_size: Optional[int] = None,
+    swa_write_per_batch: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused per-token RMSNorm + GPT-J interleaved RoPE (+ optional FP8 quant).
 
@@ -333,6 +341,23 @@ def qk_norm_rope_maybe_quant(
         eps: RMSNorm epsilon.
         quant_q, quant_k: independently emit per-row FP8 + per-row fp32 scale.
             ``False`` keeps the bf16 output and returns ``None`` for that scale.
+        swa_kv: ``[num_slots, cache_size, D]`` bf16 SWA ring buffer. When
+            provided, the (bf16) KV row is also written into
+            ``swa_kv[slot, pos % cache_size, :]`` where
+            ``slot = state_slot_mapping[batch_id_per_token[t]]``. The flydsl
+            path fuses this into the qk_norm launch; the Triton fallback emits
+            a separate ``swa_write`` so both backends have identical side
+            effects. Decode-only (prefill writes its SWA tail post-attention).
+            BF16 only (requires ``quant_k=False``).
+        state_slot_mapping: ``[bs]`` int32 — per-seq SWA ring slot. Required
+            when ``swa_kv`` is set.
+        batch_id_per_token: ``[T]`` int32, ``-1`` on CG-pad tokens — token→seq
+            map for the fused (flydsl) SWA scatter. Required by the flydsl path.
+        swa_cu_seqlens_q: ``[bs+1]`` int — per-seq cumulative seqlens used by
+            the Triton-fallback ``swa_write``. Required only on the fallback
+            path when ``swa_kv`` is set.
+        swa_cache_size: SWA ring slot count (``swa_kv.shape[1]``); fallback only.
+        swa_write_per_batch: ``min(max_seqlen_q, cache_size)``; fallback only.
 
     Returns:
         ``(q_out, kv_out, q_scale_or_None, k_scale_or_None)``:
@@ -397,6 +422,10 @@ def qk_norm_rope_maybe_quant(
     # "auto" picks flydsl whenever the shape matches.
     # ------------------------------------------------------------------
     if _FLYDSL_AVAILABLE:
+        # When swa_kv is provided, the flydsl kernel additionally scatters the
+        # post-norm/rope KV row into swa_kv[slot, pos % cache_size, :] in the
+        # same launch (slot = state_slot_mapping[batch_id_per_token[t]]),
+        # replacing a separate swa_write launch. BF16 only (quant_k off).
         return flydsl_qk_norm_rope_quant(
             q,
             kv,
@@ -410,6 +439,9 @@ def qk_norm_rope_maybe_quant(
             quant=quant_q,
             q_out=q_out,
             kv_out=kv_out,
+            swa_kv=swa_kv,
+            state_slot_mapping=state_slot_mapping,
+            batch_id_per_token=batch_id_per_token,
         )
 
     q_scale = (
@@ -476,6 +508,32 @@ def qk_norm_rope_maybe_quant(
         num_warps=num_warps,
         waves_per_eu=1,
     )
+
+    # Triton fallback does not fuse the SWA cache-write — emit it as a separate
+    # launch so callers get identical side effects regardless of which kernel
+    # backend ran (the flydsl path fuses it above). Only fires when the caller
+    # requested it (swa_kv provided) AND supplied the fallback's cu_seqlens_q
+    # path args.
+    if swa_kv is not None:
+        if (
+            swa_cu_seqlens_q is None
+            or swa_cache_size is None
+            or swa_write_per_batch is None
+        ):
+            raise ValueError(
+                "swa_kv requested on the Triton fallback path requires "
+                "swa_cu_seqlens_q, swa_cache_size, and swa_write_per_batch"
+            )
+        swa_write(
+            kv_out,
+            positions,
+            swa_cu_seqlens_q,
+            state_slot_mapping,
+            swa_kv,
+            swa_cache_size,
+            swa_write_per_batch,
+        )
+
     return q_out, kv_out, q_scale, kv_scale
 
 

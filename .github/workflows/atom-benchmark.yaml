@@ -18,10 +18,6 @@ on:
         description: "Benchmark DeepSeek-V4-Pro"
         type: boolean
         default: true
-      glm-5-fp8:
-        description: "Benchmark GLM-5-FP8"
-        type: boolean
-        default: true
       glm-5.1-fp4:
         description: "Benchmark GLM-5.1-MXFP4"
         type: boolean

@@ -55,5 +55,6 @@ aiter_logs
 online_quant_info_*.json
 .claude/plan/
 
-# CI: Docker client config (DOCKER_CONFIG) under workspace for atom-vllm-oot
+# CI: Docker / BuildKit state under workspace (self-hosted CI)
 .atom-docker-client/
+.buildkit-tmp/
