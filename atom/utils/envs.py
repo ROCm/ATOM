@@ -116,6 +116,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_SPARSE_USE_ASM_PA": lambda: (
         os.getenv("ATOM_M3_SPARSE_USE_ASM_PA", "0") == "1"
     ),
+    # EAGLE3 aux fusion: use the fused per-group RMSNorm Triton kernel in
+    # combine_hidden_states (one launch for all aux chunks, writes the fc input
+    # directly) instead of per-chunk RMSNorm + concat. Numerically a plain
+    # RMSNorm; set to 0 to fall back to the torch path.
+    "ATOM_EAGLE_FUSED_AUX_RMSNORM": lambda: (
+        os.getenv("ATOM_EAGLE_FUSED_AUX_RMSNORM", "1") == "1"
+    ),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
