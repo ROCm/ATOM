@@ -223,6 +223,11 @@ class EagleProposer:
         else:
             self.model = model_class(self.config)
 
+        # Distributed-argmax fast path for greedy drafting: all-gather only the
+        # per-rank (max_val, idx) instead of the full [N, vocab] logits. Resolved
+        # once here so the hot loop avoids a per-step hasattr.
+        self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
+
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         max_bs = self.config.max_num_seqs
@@ -418,8 +423,16 @@ class EagleProposer:
                     if i == 0
                     else ret_hidden_states
                 )
-                logits = self.model.compute_logits(sample_hidden_states)
-                new_draft_ids = logits.argmax(dim=-1)
+                # Greedy draft only needs the argmax token. When the draft model
+                # exposes a distributed-argmax path, use it: each TP rank reduces
+                # its vocab shard and we all-gather only [N, 2] per-rank maxima
+                # instead of the full [N, vocab] logits (O(tp) vs O(vocab) comm),
+                # token-identical to compute_logits(...).argmax(-1).
+                if self._draft_argmax_fused:
+                    new_draft_ids = self.model.compute_draft_token(sample_hidden_states)
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
+                    new_draft_ids = logits.argmax(dim=-1)
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
@@ -490,8 +503,7 @@ class EagleProposer:
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,
                     )
-                    for k, v in workinfos.items():
-                        attn_metadata.__dict__[k] = v
+                    attn_metadata.__dict__.update(workinfos)
                     if has_flat_kv and "slot_mapping" not in workinfos:
                         # Token-granular flat-kv path (MLA physical block_size=1):
                         # kv_indices store per-token slots, so the last entry of

@@ -190,3 +190,28 @@ class ParallelLMHead(VocabParallelEmbedding):
             # dist.gather(logits, all_logits, 0)
             # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
+
+    def compute_argmax_token(self, x: torch.Tensor) -> torch.Tensor:
+        """Greedy argmax token over the (TP-sharded) vocab — returns ``[N]`` token
+        ids WITHOUT all-gathering the full ``[N, vocab]`` logits.
+
+        For greedy speculative drafting only the argmax is needed, so each rank
+        reduces its own vocab shard to ``(max_val, global_idx)`` and we all-gather
+        just those ``[N, 2]`` (tp small) instead of the O(vocab) logits. Token
+        selection is identical to a full-logits ``argmax``: the values compared
+        are the same bf16 logits (fp32-packed exactly), and tie-breaking matches
+        the lowest global index — ``torch.max`` picks the lowest local index, and
+        ``argmax`` over ranks picks the lowest rank (== lowest vocab range).
+        """
+        logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
+        if self.tp_size <= 1:
+            return logits.argmax(dim=-1)
+        local_max_val, local_idx = logits.max(dim=-1)  # [N], [N]
+        global_idx = local_idx + self.vocab_start_idx  # [N] global token id
+        # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
+        # per-rank reductions ([N, 2]) instead of the full logits.
+        packed = torch.stack([local_max_val.float(), global_idx.float()], dim=-1)
+        gathered = get_tp_group().all_gather(packed, dim=0).view(self.tp_size, -1, 2)
+        winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
+        token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
+        return token.to(local_idx.dtype)

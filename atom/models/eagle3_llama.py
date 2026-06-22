@@ -467,3 +467,12 @@ class Eagle3LlamaModel(nn.Module):
         if not self.norm_output:
             hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
+
+    def compute_draft_token(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy draft token via distributed argmax — avoids all-gathering the
+        full [N, vocab] logits every draft step. Token-identical to
+        compute_logits(...).argmax(-1); norm handling mirrors compute_logits.
+        """
+        if not self.norm_output:
+            hidden_states = self.norm(hidden_states)
+        return self.lm_head.compute_argmax_token(hidden_states)
