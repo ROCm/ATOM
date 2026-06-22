@@ -1058,8 +1058,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
-
-
     @mark_trace(prefix="mxfp4_moe", torch_compile=False)
     def apply(
         self,
