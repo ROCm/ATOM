@@ -658,18 +658,33 @@ class MiniMaxM3SparseAttention(nn.Module):
             self._ensure_asm_shuffle_views()
             if self.kv_cache_k.numel() == 0:
                 return
-            # Page-16 SHUFFLE write for the ASM decode path.
-            aiter.reshape_and_cache(
-                k.view(-1, self.num_kv_heads, self.head_dim),
-                v.view(-1, self.num_kv_heads, self.head_dim),
-                self.kv_cache_k,
-                self.kv_cache_v,
-                slot_mapping,
-                kv_cache_dtype="auto",
-                k_scale=None,
-                v_scale=None,
-                asm_layout=True,
-            )
+            if self.kv_cache_dtype == "fp8":
+                # Page-16 SHUFFLE fp8 write with per-token dynamic quant; writes
+                # per-token dequant scales into self.k_scale/self.v_scale
+                # ([num_phys_blocks, num_kv_heads, physical_block_size]).
+                aiter.reshape_and_cache_with_pertoken_quant(
+                    k.view(-1, self.num_kv_heads, self.head_dim),
+                    v.view(-1, self.num_kv_heads, self.head_dim),
+                    self.kv_cache_k,
+                    self.kv_cache_v,
+                    self.k_scale,
+                    self.v_scale,
+                    slot_mapping,
+                    asm_layout=True,
+                )
+            else:
+                # Page-16 SHUFFLE bf16 write for the ASM decode path.
+                aiter.reshape_and_cache(
+                    k.view(-1, self.num_kv_heads, self.head_dim),
+                    v.view(-1, self.num_kv_heads, self.head_dim),
+                    self.kv_cache_k,
+                    self.kv_cache_v,
+                    slot_mapping,
+                    kv_cache_dtype="auto",
+                    k_scale=None,
+                    v_scale=None,
+                    asm_layout=True,
+                )
         else:
             if self.kv_cache.numel() == 0:
                 return
@@ -891,6 +906,10 @@ class MiniMaxM3SparseAttention(nn.Module):
                 kv_cache_dtype = (
                     "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
                 )
+                # fp8: the fused op computes per-token dynamic quant and writes the
+                # per-token dequant scales into self.k_scale/self.v_scale (output).
+                fused_k_scale = self.k_scale if self.kv_cache_dtype == "fp8" else None
+                fused_v_scale = self.v_scale if self.kv_cache_dtype == "fp8" else None
                 aiter.fused_qknorm_idxrqknorm(
                     qkv,
                     self.q_norm.weight,
@@ -913,8 +932,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                     index_q,
                     sparse_metadata.slot_mapping,
                     kv_cache_dtype=kv_cache_dtype,
-                    k_scale=None,
-                    v_scale=None,
+                    k_scale=fused_k_scale,
+                    v_scale=fused_v_scale,
                     asm_layout=True,
                 )
             else:

@@ -19,6 +19,7 @@ leaves the prefill kernels (which parallelize over the query dim) idle.
 from dataclasses import dataclass
 
 import numpy as np
+import aiter
 import torch
 
 try:
@@ -1112,7 +1113,13 @@ def minimax_m3_sparse_attn_decode_asm(
     temporary_output = torch.empty(
         *intermediate_shape, head_size, dtype=q.dtype, device=q.device
     )
-    compute_type = torch.bfloat16  # bf16 KV cache (k/v_scale = None)
+    # fp8 KV cache -> fp8 compute_type + per-token scales; bf16 otherwise.
+    is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
+    compute_type = aiter.dtypes.fp8 if is_fp8 else torch.bfloat16
+    # gluon wants per-token scale as [num_blocks, num_kv_heads, kv_block_size, 1];
+    # the M3 scale tensor is [num_phys_blocks, num_kv_heads, physical_block_size].
+    gluon_k_scale = k_scale.unsqueeze(-1) if (is_fp8 and k_scale is not None) else None
+    gluon_v_scale = v_scale.unsqueeze(-1) if (is_fp8 and v_scale is not None) else None
     run_pa_decode_gluon(
         output=output,
         q=q,
@@ -1126,8 +1133,8 @@ def minimax_m3_sparse_attn_decode_asm(
         context_partition_size=context_partition_size,
         compute_type=compute_type,
         q_scale=None,
-        k_scale=k_scale,
-        v_scale=v_scale,
+        k_scale=gluon_k_scale,
+        v_scale=gluon_v_scale,
         exp_sums=exp_sums,
         max_logits=max_logits,
         temporary_output=temporary_output,
@@ -1299,8 +1306,6 @@ def minimax_m3_sparse_attn_prefill_asm(
     that don't populate it), derive it on-device, SYNC-FREE, via searchsorted /
     arange (no .item(), no GPU repeat_interleave).
     """
-    from atom.model_ops.base_attention import run_pa_fwd_asm
-
     assert num_kv_heads == 1, (
         "minimax_m3_sparse_attn_prefill_asm requires per-rank num_kv_heads == 1;"
         f" got {num_kv_heads}."
@@ -1327,16 +1332,85 @@ def minimax_m3_sparse_attn_prefill_asm(
         sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_prefill(
             topk_idx, block_table, query_req_id, query_abs_pos
         )
-    run_pa_fwd_asm(
+
+    _run_prefill_fp8_gluon(
+        q,
+        k_cache,
+        v_cache,
+        sparse_bt,
+        sparse_ctx,
+        num_kv_heads,
+        sm_scale,
+        output,
+        k_scale,
+        v_scale,
+    )
+
+
+
+@torch.no_grad()
+def _run_prefill_fp8_gluon(
+    q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    sparse_bt: torch.Tensor,  # [total_q, topk*8] int32 (per-token 16-page table)
+    sparse_ctx: torch.Tensor,  # [total_q] int32 (per-token causal ctx)
+    num_kv_heads: int,
+    sm_scale: float,
+    output: torch.Tensor,  # [total_q, num_heads, head_dim]
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    """fp8 prefill via the Gluon split-KV decode kernel (per-token-as-decode).
+
+    Each of the ``total_q`` query tokens is treated as an independent length-1
+    "sequence" with its own sparse 16-page block_table + causal context_len --
+    identical setup to ``minimax_m3_sparse_attn_decode_asm``, just with
+    ``num_seqs == total_q``. This avoids the pa_fwd_asm maskless-fp8 NaN bug at
+    the 256-token boundary (see caller).
+    """
+    from atom.model_ops.base_attention import run_pa_decode_gluon
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    num_seqs, num_q_heads_total, head_size = q.shape
+    query_group_size = num_q_heads_total // num_kv_heads
+    max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+    context_partition_size = 256
+    intermediate_shape = (
+        num_seqs,
+        num_kv_heads,
+        max_context_partition_num,
+        query_group_size,
+    )
+    exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+    max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+    temporary_output = torch.empty(
+        *intermediate_shape, head_size, dtype=q.dtype, device=q.device
+    )
+    # gluon wants per-token scale as [num_blocks, num_kv_heads, kv_block_size, 1];
+    # the M3 scale tensor is [num_phys_blocks, num_kv_heads, physical_block_size].
+    gluon_k_scale = k_scale.unsqueeze(-1) if k_scale is not None else None
+    gluon_v_scale = v_scale.unsqueeze(-1) if v_scale is not None else None
+    run_pa_decode_gluon(
+        output=output,
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
-        block_tables=sparse_bt,
         context_lens=sparse_ctx,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        out=output,
-        qo_indptr=qo_indptr,
-        max_qlen=1,
-        high_precision=0,
+        block_tables=sparse_bt,
+        softmax_scale=sm_scale,
+        max_seqlen_q=1,
+        max_context_partition_num=max_context_partition_num,
+        context_partition_size=context_partition_size,
+        compute_type=aiter.dtypes.fp8,
+        q_scale=None,
+        k_scale=gluon_k_scale,
+        v_scale=gluon_v_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        alibi_slopes=None,
+        sinks=None,
+        sliding_window=-1,
+        ps=True,
     )
