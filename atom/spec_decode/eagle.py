@@ -368,10 +368,12 @@ class EagleProposer:
         input_ids.scatter_(0, last_token_indices, next_token_ids)
         positions = target_positions + 1
 
-        # Eagle3: project concatenated aux hidden states through fc
+        # Eagle3: project the per-layer aux hidden states through fc. Pass the
+        # list straight through (no pre-concat) — combine_hidden_states norms
+        # each chunk and concatenates once, so the extra [N, num_aux*H] concat
+        # here (immediately re-split inside) is pure overhead.
         if aux_hidden_states is not None:
-            concat_aux = torch.cat(aux_hidden_states, dim=-1)
-            hidden_states = self.model.combine_hidden_states(concat_aux)
+            hidden_states = self.model.combine_hidden_states(aux_hidden_states)
         else:
             hidden_states = target_hidden_states
 

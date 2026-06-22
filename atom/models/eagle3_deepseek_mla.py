@@ -37,6 +37,7 @@ from atom.config import Config
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.fused_aux_rmsnorm import fused_group_rmsnorm
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -45,6 +46,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.models.deepseek_v2 import yarn_get_mscale
+from atom.utils import envs
 from torch import nn
 
 
@@ -347,14 +349,56 @@ class Eagle3DeepseekMLAModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
 
-    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.fc_norm is not None:
-            chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
-            hidden_states = torch.cat(
+    def combine_hidden_states(self, aux_hidden_states) -> torch.Tensor:
+        # Accepts a list/tuple of per-layer aux tensors (preferred — skips an
+        # extra concat) or a single pre-concatenated tensor (back-compat).
+        is_list = isinstance(aux_hidden_states, (list, tuple))
+        if self.fc_norm is None:
+            if is_list:
+                fc_in = (
+                    aux_hidden_states[0]
+                    if len(aux_hidden_states) == 1
+                    else torch.cat(aux_hidden_states, dim=-1)
+                )
+            else:
+                fc_in = aux_hidden_states
+            return self.fc(fc_in)
+
+        # fc_norm path: per-group RMSNorm, then fc. Prefer the single-launch
+        # fused kernel over per-chunk RMSNorm + concat.
+        x = torch.cat(aux_hidden_states, dim=-1) if is_list else aux_hidden_states
+        if (
+            envs.ATOM_EAGLE_FUSED_AUX_RMSNORM
+            and x.is_cuda
+            and x.is_contiguous()
+            and x.shape[-1] == self.num_aux_hidden_states * self.fc_norm[0].dim
+        ):
+            fc_in = fused_group_rmsnorm(
+                x,
+                self._fc_norm_weight_stacked(),
+                self.fc_norm[0].eps,
+                self.num_aux_hidden_states,
+            )
+        else:
+            chunks = (
+                aux_hidden_states
+                if is_list
+                else x.chunk(self.num_aux_hidden_states, dim=-1)
+            )
+            fc_in = torch.cat(
                 [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
                 dim=-1,
             )
-        return self.fc(hidden_states)
+        return self.fc(fc_in)
+
+    def _fc_norm_weight_stacked(self) -> torch.Tensor:
+        """Per-group fc_norm weights stacked to [num_aux, H] (cached)."""
+        ref = self.fc_norm[0].weight
+        w = getattr(self, "_fc_norm_w_cache", None)
+        if w is None or w.device != ref.device or w.dtype != ref.dtype:
+            w = torch.stack([m.weight for m in self.fc_norm], dim=0).contiguous()
+            self._fc_norm_w_cache = w
+        return w
 
     def forward(
         self,
