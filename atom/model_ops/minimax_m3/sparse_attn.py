@@ -50,7 +50,7 @@ class MiniMaxM3SparseMetadata:
     decode: MiniMaxM3SparseDecodeMetadata | None = None
 
 
-def make_minimax_m3_sparse_prefill_metadata(
+def make_sparse_prefill_metadata(
     *,
     cu_seqlens_q: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -80,7 +80,7 @@ def make_minimax_m3_sparse_prefill_metadata(
     )
 
 
-def make_minimax_m3_sparse_decode_metadata(
+def make_sparse_decode_metadata(
     *,
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,

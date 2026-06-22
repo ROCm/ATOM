@@ -440,7 +440,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             sparse_layers = sum(
                 1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
             )
-            tensors["minimax_m3_index_cache"] = torch.zeros(
+            tensors["sparse_attention_index_cache"] = torch.zeros(
                 sparse_layers,
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
@@ -448,7 +448,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 dtype=config.torch_dtype,
                 device="cuda",
             )
-            tensors["_minimax_m3_sparse_cache_next"] = 0
+            tensors["_sparse_attention_cache_next"] = 0
         return tensors
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -468,10 +468,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if getattr(module, "is_indexed_sparse_attention", False):
             runner = self.model_runner
             config = runner.config
-            sparse_idx = runner._minimax_m3_sparse_cache_next
-            runner._minimax_m3_sparse_cache_next += 1
+            sparse_idx = runner._sparse_attention_cache_next
+            runner._sparse_attention_cache_next += 1
             module.kv_cache = runner.kv_cache[:, layer_id].permute(1, 0, 2, 3, 4)
-            module.index_cache = runner.minimax_m3_index_cache[sparse_idx]
+            module.index_cache = runner.sparse_attention_index_cache[sparse_idx]
             key_cache, value_cache = module.kv_cache.unbind(1)
             module.max_model_len = config.max_model_len
             return KVCacheTensor(
@@ -640,7 +640,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ].copy_to_gpu(bs)
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
-                make_minimax_m3_sparse_prefill_metadata as make_sparse_prefill_metadata,
+                make_sparse_prefill_metadata,
             )
 
             bs = batch.total_seqs_num_prefill
@@ -851,7 +851,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
-                make_minimax_m3_sparse_decode_metadata as make_sparse_decode_metadata,
+                make_sparse_decode_metadata,
             )
 
             if max_seqlen_q > 1:
@@ -1058,7 +1058,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
-                make_minimax_m3_sparse_decode_metadata as make_sparse_decode_metadata,
+                make_sparse_decode_metadata,
             )
 
             seq_lens = attn_metadata.context_lens
