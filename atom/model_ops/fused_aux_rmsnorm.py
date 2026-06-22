@@ -88,3 +88,107 @@ def fused_group_rmsnorm(
         num_warps=num_warps,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Dual-input RMSNorm + concat (EAGLE3 draft decoder-layer attention input)
+#
+# The Eagle3 draft decoder layer normalizes two same-shaped ``[N, H]`` inputs
+# (``embeds`` with ``input_layernorm``, ``hidden_states`` with ``hidden_norm``)
+# and concatenates them into the ``[N, 2H]`` QKV input.  The naive path is two
+# RMSNorm launches + a concat (3 launches; the concat re-reads + re-writes 2NH).
+# This kernel does it in a single launch that writes each normalized half
+# straight into the contiguous ``[N, 2H]`` output, cutting memory traffic from
+# ~8NH (norm+norm+cat) to ~4NH.  Plain RMSNorm math (``x * rstd * w``, fp32
+# reduction) — matches ``atom.model_ops.layernorm.RMSNorm`` and the sibling
+# ``fused_group_rmsnorm`` above.
+#
+# Raw Triton (no custom-op wrapper): the EAGLE3 draft is built with
+# ``CompilationLevel.NO_COMPILATION`` (eagle.py), so its forward always runs
+# eager and never enters Dynamo — same as ``fused_group_rmsnorm`` above.
+#
+# grid = (n_rows, 2): program (row, 0) normalizes ``a`` -> out[:, :H], program
+# (row, 1) normalizes ``b`` -> out[:, H:].  2*n_rows programs (vs n_rows) keeps
+# occupancy up at small batch (EAGLE decode N == bs).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fused_dual_rmsnorm_cat_kernel(
+    a_ptr,  # [N, H] contiguous
+    b_ptr,  # [N, H] contiguous
+    wa_ptr,  # [H]
+    wb_ptr,  # [H]
+    out_ptr,  # [N, 2H] contiguous
+    H,
+    eps,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    g = tl.program_id(1)  # 0 -> (a, wa) into out[:, :H]; 1 -> (b, wb) into out[:, H:]
+    col = tl.arange(0, BLOCK_H)
+    mask = col < H
+
+    # g is uniform across the program (one (row, half) per program), so this is
+    # uniform control flow — no divergence, and avoids selecting between two
+    # base pointers (unsupported in Triton). Weights are reused across rows of
+    # the same half, so keep them resident with evict_last.
+    if g == 0:
+        x = tl.load(a_ptr + row * H + col, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(
+            wa_ptr + col, mask=mask, other=0.0, eviction_policy="evict_last"
+        ).to(tl.float32)
+    else:
+        x = tl.load(b_ptr + row * H + col, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(
+            wb_ptr + col, mask=mask, other=0.0, eviction_policy="evict_last"
+        ).to(tl.float32)
+
+    var = tl.sum(x * x, axis=0) / H
+    rstd = tl.rsqrt(var + eps)
+    y = x * rstd * w
+    tl.store(
+        out_ptr + row * (2 * H) + g * H + col,
+        y.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def fused_dual_rmsnorm_cat(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    w_a: torch.Tensor,
+    w_b: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """RMS-norm two ``[N, H]`` inputs by their own weights into one ``[N, 2H]``.
+
+    ``out[:, :H] = rmsnorm(a, w_a)``, ``out[:, H:] = rmsnorm(b, w_b)`` — the
+    concatenated attention input for the Eagle3 draft decoder layer, produced
+    in a single Triton launch (no separate per-input norm + concat).
+
+    Args:
+        a, b: contiguous ``[N, H]`` inputs (same shape).
+        w_a, w_b: per-input RMSNorm weights ``[H]``.
+        eps: RMSNorm epsilon (shared by both norms).
+
+    Returns:
+        contiguous ``[N, 2H]`` with the two normalized halves side by side.
+    """
+    n_rows, H = a.shape
+    out = torch.empty((n_rows, 2 * H), dtype=a.dtype, device=a.device)
+    BLOCK_H = triton.next_power_of_2(H)
+    num_warps = 8 if BLOCK_H >= 4096 else (4 if BLOCK_H >= 1024 else 2)
+    grid = (n_rows, 2)
+    _fused_dual_rmsnorm_cat_kernel[grid](
+        a,
+        b,
+        w_a,
+        w_b,
+        out,
+        H,
+        float(eps),
+        BLOCK_H=BLOCK_H,
+        num_warps=num_warps,
+    )
+    return out

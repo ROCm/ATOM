@@ -22,7 +22,10 @@ from atom.config import Config
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.fused_aux_rmsnorm import fused_group_rmsnorm
+from atom.model_ops.fused_aux_rmsnorm import (
+    fused_dual_rmsnorm_cat,
+    fused_group_rmsnorm,
+)
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
@@ -196,17 +199,41 @@ class Eagle3LlamaDecoderLayer(nn.Module):
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
+    def _dual_norm_cat(
+        self, embeds: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """RMS-norm embeds and the carried hidden by their own weights and concat
+        into the [N, 2*hidden] QKV input.
+
+        Single fused Triton launch (one [N, 2H] write) instead of two RMSNorm
+        launches + a concat. Falls back to the aiter RMSNorm + torch.cat path
+        when the kernel's preconditions don't hold (non-CUDA / non-contiguous /
+        shape mismatch). input_layernorm and hidden_norm share rms_norm_eps.
+        """
+        if (
+            embeds.is_cuda
+            and embeds.is_contiguous()
+            and hidden_states.is_contiguous()
+            and embeds.shape == hidden_states.shape
+        ):
+            return fused_dual_rmsnorm_cat(
+                embeds,
+                hidden_states,
+                self.input_layernorm.weight,
+                self.hidden_norm.weight,
+                self.input_layernorm.eps,
+            )
+        normed_embeds = self.input_layernorm(embeds)
+        normed_hidden = self.hidden_norm(hidden_states)
+        return torch.cat([normed_embeds, normed_hidden], dim=-1)
+
     def forward(
         self,
         positions: torch.Tensor,
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Dual-norm input: normalize embeds and the carried hidden separately
-        # (aiter RMSNorm) and concat into the [N, 2*hidden] QKV input.
-        normed_embeds = self.input_layernorm(embeds)
-        normed_hidden = self.hidden_norm(hidden_states)
-        attn_input = torch.cat([normed_embeds, normed_hidden], dim=-1)
+        attn_input = self._dual_norm_cat(embeds, hidden_states)
         attn_output = self.self_attn(positions, attn_input)
         # Fused (all-reduce +) residual-add + pre-MLP norm in one kernel:
         #   residual      = [all_reduce(attn_output)] + hidden_states
