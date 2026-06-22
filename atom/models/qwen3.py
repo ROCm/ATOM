@@ -24,11 +24,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Iterable, Union
+
 import torch
 
 # import torch.distributed as dist
-from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
 from aiter.rotary_embedding import get_rope
 from atom.config import Config
@@ -43,20 +43,12 @@ from atom.model_ops.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers import Qwen3Config
 
 from atom.model_loader.loader import load_model_in_plugin_mode
 from atom.models.utils import maybe_prefix
-
-ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT = (
-    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
-)
-ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT = (
-    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT
-)
 
 
 class Qwen3Attention(nn.Module):
@@ -132,10 +124,9 @@ class Qwen3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        x_scale: Optional[torch.Tensor] = None,
         **model_kwargs: dict[str, Any] | None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
+        qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q = self.q_norm(q)
@@ -172,23 +163,12 @@ class Qwen3MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         assert hidden_act == "silu"
-        self.fused_act_quant = ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT
-        self.act_fn = SiluAndMul(
-            fused_quant=self.fused_act_quant, quant_config=quant_config
-        )
-        self.quant_type = quant_config.get_layer_quant_config(prefix).quant_type
+        self.act_fn = SiluAndMul()
 
-    def forward(self, x, x_scale: Optional[torch.Tensor] = None):
-        x = self.gate_up_proj(x, x_scale=x_scale)
-        scale = getattr(self.down_proj, "input_scale", None)
-        x = self.act_fn(x, scale)
-        if self.fused_act_quant and (
-            scale is not None or self.quant_type.value == QuantType.per_1x32.value
-        ):
-            x, scale = x
-        else:
-            scale = None
-        x = self.down_proj(x, x_scale=scale)
+    def forward(self, x):
+        gate_up = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x = self.down_proj(x)
         return x
 
 
@@ -203,13 +183,8 @@ class Qwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         kv_cache_dtype = atom_config.kv_cache_dtype
-        quant_config = atom_config.quant_config
         self.layer_num = layer_num
         rope_params = config.rope_parameters
-        self.use_fused_rmsnorm_quant = (
-            ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
-        )
-        self.quant_type = quant_config.get_layer_quant_config(prefix).quant_type
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -229,20 +204,12 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
-            quant_config=quant_config,
+            quant_config=atom_config.quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            fused_quant=self.use_fused_rmsnorm_quant,
-            quant_config=quant_config,
-        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            fused_quant=self.use_fused_rmsnorm_quant,
-            quant_config=quant_config,
+            config.hidden_size, eps=config.rms_norm_eps
         )
 
     def forward(
@@ -252,44 +219,16 @@ class Qwen3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         **model_kwargs: dict[str, Any] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        scale = getattr(self.self_attn.qkv_proj, "input_scale", None)
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states, x_scale=scale)
+            hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual, x_scale=scale
-            )
-        if self.use_fused_rmsnorm_quant and (
-            scale is not None
-            or self.quant_type.value
-            in (QuantType.per_1x32.value, QuantType.per_1x128.value)
-        ):
-            hidden_states, scale = hidden_states
-        else:
-            scale = None
-
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            x_scale=scale,
-            **model_kwargs,
+            positions=positions, hidden_states=hidden_states, **model_kwargs
         )
-
-        scale = getattr(self.mlp.gate_up_proj, "input_scale", None)
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual, scale
-        )
-        if self.use_fused_rmsnorm_quant and (
-            scale is not None
-            or self.quant_type.value
-            in (QuantType.per_1x32.value, QuantType.per_1x128.value)
-        ):
-            hidden_states, scale = hidden_states
-        else:
-            scale = None
-
-        hidden_states = self.mlp(hidden_states, x_scale=scale)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
