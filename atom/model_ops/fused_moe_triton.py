@@ -131,7 +131,7 @@ def triton_kernel_moe_forward(
     w2_swizzle_layout: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float = 7.0,
     apply_router_weight_on_input: bool = False,
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
