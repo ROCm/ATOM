@@ -313,7 +313,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Ensure Docker client config directory
-        if: contains(fromJSON('["linux-atom-mi35x-4","atom-mi308-8gpu-plugins-benchmark","atom-mi355-8gpu.predownload"]'), matrix.runner)
+        if: contains(fromJSON('["atom-mi308-8gpu-plugins-benchmark","atom-mi355-8gpu.predownload"]'), matrix.runner)
         run: |
           set -euo pipefail
           mkdir -p "$DOCKER_CONFIG"
