@@ -797,6 +797,10 @@ class MiniMaxM3SparseAttention(nn.Module):
     ) -> torch.Tensor:
         decode_metadata = sparse_metadata.decode
         assert decode_metadata is not None
+        # Spec-decode (EAGLE verify) packs max_query_len = num_spec+1 query tokens
+        # per request; q/index_q already carry one row per token. max_query_len == 1
+        # is plain decode (one token per request).
+        max_query_len = decode_metadata.max_query_len
         # When using ASM/gluon decode (num_kv_heads == 1), fuse the sparse
         # block-table build into the topk merge kernel (returns sparse_bt/ctx),
         # saving a separate build launch + topk_idx round-trip.
@@ -813,6 +817,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.num_kv_heads,
             self.scaling,
             emit_sparse_block_table=fuse_bt,
+            max_query_len=max_query_len,
         )
         if fuse_bt:
             topk_idx, sparse_bt, sparse_ctx = topk_out
@@ -826,6 +831,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                     "(tensor-parallel size >= 4); ASM PA shares one block_table "
                     f"across kv heads. Got num_kv_heads={self.num_kv_heads}."
                 )
+            # print("sparse_bt: ", sparse_bt)
+            # print("sparse_ctx: ", sparse_ctx, flush=True)
             minimax_m3_sparse_attn_decode_asm(
                 q,
                 self.kv_cache_k,
@@ -851,7 +858,88 @@ class MiniMaxM3SparseAttention(nn.Module):
                 self.num_kv_heads,
                 self.scaling,
                 output,
+                max_query_len=max_query_len,
             )
+
+        # --- env-gated decode-vs-prefill diagnostic (ATOM_M3_DECODE_DEBUG=1) ---
+        # Re-run the SAME real q/index_q/seq_lens through the PREFILL route (the
+        # proven per-token reference) and log per-token cosine vs the decode output.
+        # Token 0 matching but tokens 1.. diverging localizes a per-token bug in the
+        # live decode data/dispatch. Layer 0 only, first few calls, rank 0.
+        import os as _os
+
+        _dbg_layer = int(_os.environ.get("ATOM_M3_DECODE_DEBUG_LAYER", "3"))
+        if (
+            _os.environ.get("ATOM_M3_DECODE_DEBUG", "0") == "1"
+            and self.layer_num == _dbg_layer
+            and max_query_len > 1
+        ):
+            try:
+                self._m3_dbg_calls = getattr(self, "_m3_dbg_calls", 0) + 1
+                if self._m3_dbg_calls <= 2:
+                    import torch as _t
+                    from atom.model_ops.minimax_m3.sparse_attn import (
+                        minimax_m3_index_topk,
+                        minimax_m3_sparse_attn_prefill_asm,
+                    )
+
+                    bt = decode_metadata.block_table
+                    seq_lens = decode_metadata.seq_lens
+                    batch = seq_lens.shape[0]
+                    mq = max_query_len
+                    # prefill-style cu_seqlens_q / prefix_lens (each request has mq
+                    # query tokens at the end of its sequence).
+                    cu = _t.arange(
+                        0, (batch + 1) * mq, mq, dtype=_t.int32, device=q.device
+                    )
+                    qlens = cu[1 : batch + 1] - cu[:batch]
+                    prefix = (seq_lens - qlens).to(_t.int32)
+                    # PREFILL ASM reference: reads the SAME SHUFFLE kv_cache_k/_v the
+                    # decode path uses (valid under ASM_PA, unlike the page-128
+                    # self.kv_cache which holds SHUFFLE bytes). Per-token topk emitted
+                    # fused, then per-token gluon attention -- the proven path.
+                    tk_p, sbt_p, sctx_p = minimax_m3_index_topk(
+                        index_q, self.index_cache, bt, cu, seq_lens, prefix,
+                        mq, sparse_metadata.max_seq_len, self.topk_blocks,
+                        self.init_blocks, self.local_blocks, self.num_kv_heads,
+                        self.scaling, emit_sparse_block_table=True,
+                    )
+                    out_p = _t.empty_like(q)
+                    minimax_m3_sparse_attn_prefill_asm(
+                        q, self.kv_cache_k, self.kv_cache_v, tk_p, bt,
+                        None, None, None, self.num_kv_heads, self.scaling, out_p,
+                        k_scale=self.k_scale, v_scale=self.v_scale,
+                        cu_seqlens_q=cu, prefix_lens=prefix,
+                        sparse_bt=sbt_p, sparse_ctx=sctx_p,
+                    )
+                    od = output.reshape(batch, mq, -1).float()
+                    op = out_p.reshape(batch, mq, -1).float()
+                    for tk in range(mq):
+                        a = od[:, tk].flatten()
+                        b = op[:, tk].flatten()
+                        cos = _t.nn.functional.cosine_similarity(
+                            a.double(), b.double(), dim=0
+                        ).item()
+                        # also report cos vs the SAME-token prefill, and the topk
+                        # selection agreement, to localize topk vs attention.
+                        print(
+                            f"[M3_DECODE_DBG] call={self._m3_dbg_calls} "
+                            f"asm_pa={self._use_asm_pa} tok={tk} "
+                            f"decode-vs-prefillASM cos={cos:.6f}",
+                            flush=True,
+                        )
+                    # topk agreement (decode topk_idx vs prefill topk_idx)
+                    if sparse_bt is not None:
+                        bt_eq = _t.equal(sparse_bt, sbt_p)
+                        ctx_eq = _t.equal(sparse_ctx, sctx_p)
+                        print(
+                            f"[M3_DECODE_DBG] call={self._m3_dbg_calls} "
+                            f"sparse_bt_equal={bt_eq} sparse_ctx_equal={ctx_eq}",
+                            flush=True,
+                        )
+            except Exception as _e:  # never break the run on a diag failure
+                import traceback as _tb
+                print(f"[M3_DECODE_DBG] error: {_e}\n{_tb.format_exc()}", flush=True)
         return output
 
     def _run_decode_sparse_small_q_loop(

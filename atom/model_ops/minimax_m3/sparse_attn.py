@@ -55,6 +55,14 @@ class MiniMaxM3SparsePrefillMetadata:
 class MiniMaxM3SparseDecodeMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
+    # Spec-decode (EAGLE verify) packs `max_query_len = num_spec + 1` query tokens
+    # per request, each with its own causal cutoff. max_query_len == 1 is plain
+    # decode (one token per request) and leaves cu_seqlens_q / prefix_lens unused.
+    max_query_len: int = 1
+    # [batch+1] int32 query-token CSR; [batch] int32 already-cached length per req.
+    # Both None for plain decode (max_query_len == 1).
+    cu_seqlens_q: torch.Tensor | None = None
+    prefix_lens: torch.Tensor | None = None
 
 
 @dataclass
@@ -158,8 +166,17 @@ def make_minimax_m3_sparse_decode_metadata(
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
     max_seq_len: int,
+    max_query_len: int = 1,
+    cu_seqlens_q: torch.Tensor | None = None,
+    prefix_lens: torch.Tensor | None = None,
 ) -> MiniMaxM3SparseMetadata:
-    decode = MiniMaxM3SparseDecodeMetadata(seq_lens=seq_lens, block_table=block_table)
+    decode = MiniMaxM3SparseDecodeMetadata(
+        seq_lens=seq_lens,
+        block_table=block_table,
+        max_query_len=max_query_len,
+        cu_seqlens_q=cu_seqlens_q,
+        prefix_lens=prefix_lens,
+    )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
         max_seq_len=max_seq_len,
@@ -657,6 +674,7 @@ def _gqa_sparse_decode_kernel(
     stride_l_b,
     stride_l_h,
     stride_bt_b,
+    MAX_Q: tl.constexpr,  # query tokens per request (num_spec + 1; 1 == plain decode)
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
@@ -665,18 +683,25 @@ def _gqa_sparse_decode_kernel(
     FP8_KV_CACHE: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
-    # split-K over the topk dimension: pid(0) folds (batch, chunk) together.
+    # split-K over the topk dimension: pid(0) folds (query-token-row, chunk).
+    # batch_size here is the ROW count (total_q == num_requests * MAX_Q). pid_t is
+    # the global query-token row; the request index b = pid_t // MAX_Q indexes
+    # seq_lens / block_table, while pid_t indexes q / topk_idx / output.
     pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
-    pid_b = pid_bc % batch_size
+    pid_t = pid_bc % batch_size
     pid_c = pid_bc // batch_size
+    pid_b = pid_t // MAX_Q  # request index
+    tok = pid_t % MAX_Q  # token position within the request (0..MAX_Q-1)
     pid_h = pid_kh * gqa_group_size
     chunk_size_topk = (max_topk + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
     chunk_start_topk = pid_c * chunk_size_topk
     chunk_end_compiletime = chunk_start_topk + chunk_size_topk
-    seq_len = tl.load(seq_lens + pid_b)
+    req_seq_len = tl.load(seq_lens + pid_b)
+    # Per-token causal length (MAX_Q == 1 -> seq_len, unchanged).
+    seq_len = req_seq_len - MAX_Q + tok + 1
     # number of valid (non-padded) selected blocks for this request
     off_t = tl.arange(0, BLOCK_SIZE_T)
-    idx_base = t_ptr + pid_kh * stride_th + pid_b * stride_tn
+    idx_base = t_ptr + pid_kh * stride_th + pid_t * stride_tn
     topk_idx = tl.load(idx_base + off_t * stride_tk, mask=off_t < max_topk, other=-1)
     real_topk = tl.sum((topk_idx >= 0).to(tl.int32), axis=0)
     chunk_end_topk = tl.minimum(chunk_end_compiletime, real_topk)
@@ -690,7 +715,7 @@ def _gqa_sparse_decode_kernel(
     lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
     q_ptrs = tl.make_block_ptr(
-        base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
+        base=q_ptr + pid_t * stride_qn + pid_h * stride_qh,
         shape=(gqa_group_size, head_dim),
         strides=(stride_qh, stride_qd),
         offsets=(0, 0),
@@ -746,7 +771,7 @@ def _gqa_sparse_decode_kernel(
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
     acc_o = acc_o * scale[:, None]
     o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
+        base=o_ptr + pid_c * stride_o_c + pid_t * stride_o_b + pid_h * stride_o_h,
         shape=(gqa_group_size, head_dim),
         strides=(stride_o_h, stride_o_d),
         offsets=(0, 0),
@@ -755,7 +780,7 @@ def _gqa_sparse_decode_kernel(
     )
     tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
     lse_ptrs = tl.make_block_ptr(
-        base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
+        base=lse_ptr + pid_c * stride_l_c + pid_t * stride_l_b + pid_h * stride_l_h,
         shape=(gqa_group_size,),
         strides=(stride_l_h,),
         offsets=(0,),
@@ -875,17 +900,25 @@ def minimax_m3_sparse_attn(
 
 @torch.no_grad()
 def minimax_m3_sparse_attn_decode(
-    q: torch.Tensor,  # [batch, num_heads, head_dim]
+    q: torch.Tensor,  # [total_q == batch*max_query_len, num_heads, head_dim]
     kv_cache: torch.Tensor,  # [num_blocks, 2, 128, num_kv_heads, head_dim]
-    topk_idx: torch.Tensor,  # [num_kv_heads, batch, topk]
+    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk]
     block_table: torch.Tensor,  # [batch, max_blocks]
     seq_lens: torch.Tensor,  # [batch] int32
     num_kv_heads: int,
     sm_scale: float,
-    output: torch.Tensor,  # [batch, num_heads, head_dim]
+    output: torch.Tensor,  # [total_q, num_heads, head_dim]
+    max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
 ) -> None:
-    """GQA block-sparse attention for decode (split-K over the top-k blocks)."""
-    batch, num_heads, head_dim = q.shape
+    """GQA block-sparse attention for decode (split-K over the top-k blocks).
+
+    For spec-decode (``max_query_len > 1``) ``q``/``topk_idx``/``output`` carry one
+    row per query token (``total_q = batch*max_query_len``); each token attends its
+    own causal window ``seq_len - max_query_len + tok + 1``. ``max_query_len == 1``
+    is plain decode (one token per request), unchanged.
+    """
+    total_q, num_heads, head_dim = q.shape
+    batch = total_q  # rows == query tokens; the kernel folds (row, chunk)
     max_topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
     # split-K over the selected blocks; chunk count is shape-constant (cuda graph).
@@ -931,6 +964,7 @@ def minimax_m3_sparse_attn_decode(
         lse_partial.stride(1),
         lse_partial.stride(2),
         block_table.stride(0),
+        MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         FP8_KV_CACHE=_is_fp8_kv_cache_tensor(kv_cache),
