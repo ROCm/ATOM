@@ -1211,6 +1211,8 @@ class Scheduler:
                     # `output tokens=95` for max_tokens=100, mtp_k=3). Non-MTP
                     # path: mtp_k = num_rejected = 0 → behavior unchanged.
                     leave_reason = "max_tokens"
+                elif num_tokens >= self.max_model_len:
+                    leave_reason = "max_model_len"
 
             # Drop accepted-draft tokens past the stop position (MTP only —
             # for non-spec the sampler emits exactly 1 token so this is a
