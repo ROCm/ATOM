@@ -2,7 +2,7 @@ name: Nightly Docker Release
 
 on:
   schedule:
-    - cron: '0 14 * * *'  # Every day at 22:00 Beijing Time (UTC+8)
+    - cron: '48 13 * * *'  # Every day at 21:48 Beijing Time (UTC+8)
   workflow_dispatch:
     inputs:
       base_image:
