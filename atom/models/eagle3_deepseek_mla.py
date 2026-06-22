@@ -46,7 +46,6 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.models.deepseek_v2 import yarn_get_mscale
-from atom.utils import envs
 from torch import nn
 
 
@@ -364,12 +363,13 @@ class Eagle3DeepseekMLAModel(nn.Module):
                 fc_in = aux_hidden_states
             return self.fc(fc_in)
 
-        # fc_norm path: per-group RMSNorm, then fc. Prefer the single-launch
-        # fused kernel over per-chunk RMSNorm + concat.
+        # fc_norm path: per-group RMSNorm, then fc. Use the single-launch fused
+        # kernel (one RMSNorm over all aux chunks) instead of per-chunk RMSNorm
+        # + concat; fall back to the torch path only when the fused kernel's
+        # preconditions don't hold (non-CUDA / non-contiguous / shape mismatch).
         x = torch.cat(aux_hidden_states, dim=-1) if is_list else aux_hidden_states
         if (
-            envs.ATOM_EAGLE_FUSED_AUX_RMSNORM
-            and x.is_cuda
+            x.is_cuda
             and x.is_contiguous()
             and x.shape[-1] == self.num_aux_hidden_states * self.fc_norm[0].dim
         ):
