@@ -100,8 +100,7 @@ class PagedAttentionImpl(nn.Module):
         self.supports_quant_query_input = False
 
     def process_weights_after_loading(self):
-        atom_config = get_current_atom_config()
-        if atom_config.kv_cache_block_size in (256, 1024):
+        if use_pa_decode_bf16_asm():
             if self.sinks is not None and self.sinks.dtype != torch.float32:
                 self.sinks.data = self.sinks.data.to(torch.float32).contiguous()
 
@@ -846,7 +845,7 @@ class PagedAttentionImpl(nn.Module):
         if self.use_triton_attn or self.use_flash_layout:
             return self.paged_attention_triton
 
-        if atom_config.kv_cache_block_size in (256, 1024):
+        if use_pa_decode_bf16_asm():
             return self.paged_attention_persistent_asm
         return self.paged_attention_asm
 
