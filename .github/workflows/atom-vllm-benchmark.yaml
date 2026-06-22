@@ -1114,7 +1114,8 @@ jobs:
           MODELS_JSON: ${{ needs.load-models.outputs.models_json }}
           PARAMS_JSON: ${{ needs.parse-param-lists.outputs.matrix_json }}
         run: |
-          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          BENCHMARK_MATRIX_FILE="${RUNNER_TEMP:-/tmp}/benchmark_matrix.json"
+          python3 - <<'PY' > "${BENCHMARK_MATRIX_FILE}"
           import json
           import os
 
@@ -1226,20 +1227,27 @@ jobs:
 
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
-          )"
-          echo "benchmark_matrix=${BENCHMARK_MATRIX}" >> "$GITHUB_OUTPUT"
-          if [ "${BENCHMARK_MATRIX}" = '{"include":[]}' ]; then
+          {
+            echo "benchmark_matrix<<EOF"
+            cat "${BENCHMARK_MATRIX_FILE}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          if python3 - "${BENCHMARK_MATRIX_FILE}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as matrix_file:
+              payload = json.load(matrix_file)
+          include = payload.get("include", [])
+          if not include:
+              sys.exit(1)
+          print(f"Benchmark matrix cells: {len(include)}")
+          PY
+          then
+            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
+          else
             echo "has_benchmark_cells=false" >> "$GITHUB_OUTPUT"
             echo "No eligible benchmark cases remain after model-specific parameter filtering."
-          else
-            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
-            BENCHMARK_MATRIX="${BENCHMARK_MATRIX}" python3 - <<'PY'
-          import json
-          import os
-
-          payload = json.loads(os.environ["BENCHMARK_MATRIX"])
-          print(f"Benchmark matrix cells: {len(payload.get('include', []))}")
-          PY
           fi
 
       - name: Persist benchmark matrix payload
