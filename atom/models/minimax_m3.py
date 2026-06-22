@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Inference-only MiniMax-M3 model support for ATOM.
-
-This file provides the native ATOM language backbone.  vLLM plugin-specific
-attention/cache integration lives under ``atom.plugin.vllm`` and must not be
-imported here.
-"""
+"""Inference-only MiniMax-M3 model support for ATOM."""
 
 from typing import Optional, Union
 

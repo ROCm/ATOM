@@ -200,12 +200,10 @@ class PagedAttentionImpl(nn.Module):
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
         # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
-        gqa = self.num_heads // self.num_kv_heads
         use_triton_attn = (
             envs.ATOM_FORCE_ATTN_TRITON
             or self.sliding_window != -1
             or self.head_dim != 128
-            or (attn_metadata.block_tables is not None and gqa == 16)
         )
         self.use_triton_attn = use_triton_attn
 
