@@ -214,8 +214,6 @@ class UBatchWrapper(nn.Module):
 
         # Build per-ubatch ForwardContexts from pre-allocated forward_vars.
         full_graph_bs = ctx.context.graph_bs
-        # only padding for all_gather/reduce_scatter pass
-        all_gahter_dp_size = self._get_dp_size() if self.dp_gather_scatter else 1
         ub_dp_metadata = self._make_ubatch_dp_metadata(ctx, N)
         forward_contexts = []
         ub_inputs = []
@@ -229,7 +227,7 @@ class UBatchWrapper(nn.Module):
                 ub_slice,
                 padded_bs,
                 i,
-                ub_graph_bs=padded_bs * all_gahter_dp_size,
+                ub_graph_bs=padded_bs,
                 dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
             )
             forward_contexts.append(ub_ctx)
@@ -388,7 +386,9 @@ class UBatchWrapper(nn.Module):
             ``ModelRunner._preprocess`` already packed into the single DP
             all_reduce (``ctx.ub_max_tokens_across_dp``). Falls back to
             local sizes when DP is off / value not precomputed.
-        For decode: padded_bs * dp_size.
+        For decode: per-rank padded_bs (the cross-DP all_gather in MoE's
+            pad_for_all_gather multiplies by dp_size itself, so do NOT
+            pre-multiply here).
         """
         if ctx.context.is_prefill:
             if (
@@ -404,12 +404,14 @@ class UBatchWrapper(nn.Module):
                 ub_sizes.append(ub_num_tokens)
             return ub_sizes
         else:
-            # Decode: use the DP-unified per-ubatch padded_bs (same value on
-            # every rank) so MoE's pad_for_all_gather sizes match cross-rank.
+            # Decode: PER-RANK pad target (DP-unified via _decode_ub_padded_bs,
+            # same value on every rank). MoE.pad_for_all_gather pads each rank
+            # to this and the cross-DP all_gather multiplies by dp_size itself,
+            # so we must NOT pre-multiply by dp_size here (that inflated MoE M).
             result = []
             for i in range(N):
                 padded_bs = UBatchWrapper._decode_ub_padded_bs(ctx, i, N, full_graph_bs)
-                result.append(padded_bs * dp_size)
+                result.append(padded_bs)
             return result
 
     def _make_ubatch_context(
