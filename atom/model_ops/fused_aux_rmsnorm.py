@@ -18,7 +18,6 @@ matches ``atom.model_ops.layernorm.RMSNorm`` (NOT the Gemma ``1+w`` variant).
 import torch
 import triton
 import triton.language as tl
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
 @triton.jit
@@ -83,111 +82,6 @@ def fused_group_rmsnorm(
         out,
         n_rows,
         num_groups,
-        H,
-        float(eps),
-        BLOCK_H=BLOCK_H,
-        num_warps=num_warps,
-    )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Dual-input RMSNorm + concat (EAGLE3 draft decoder-layer attention input)
-#
-# The Eagle3 draft decoder layer normalizes two same-shaped ``[N, H]`` inputs
-# (``embeds`` with ``input_layernorm``, ``hidden_states`` with ``hidden_norm``)
-# and concatenates them into the ``[N, 2H]`` QKV input.  The naive path is two
-# RMSNorm launches + a concat (3 launches, 3 allocs); this kernel does it in a
-# single launch that writes each normalized half straight into the contiguous
-# ``[N, 2H]`` output.  Plain RMSNorm math (``x * rstd * w``, fp32 reduction) —
-# matches ``atom.model_ops.layernorm.RMSNorm``.
-#
-# Registered as an ``aiter::`` custom op (``torch_compile_guard``) so it stays
-# opaque to Dynamo: the Eagle3-Llama draft model is ``@support_torch_compile``
-# and this runs inside its traced ``forward``.
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _fused_dual_rmsnorm_cat_kernel(
-    a_ptr,  # [N, H] contiguous
-    b_ptr,  # [N, H] contiguous
-    wa_ptr,  # [H]
-    wb_ptr,  # [H]
-    out_ptr,  # [N, 2H] contiguous
-    H,
-    eps,
-    BLOCK_H: tl.constexpr,
-):
-    row = tl.program_id(0)
-    g = tl.program_id(1)  # 0 -> (a, wa) into out[:, :H]; 1 -> (b, wb) into out[:, H:]
-    col = tl.arange(0, BLOCK_H)
-    mask = col < H
-
-    # g is uniform across the program (one (row, half) per program), so this is
-    # uniform control flow — cheaper than masked loads from both inputs, and
-    # avoids selecting between two base pointers (unsupported in Triton).
-    if g == 0:
-        x = tl.load(a_ptr + row * H + col, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(wa_ptr + col, mask=mask, other=0.0).to(tl.float32)
-    else:
-        x = tl.load(b_ptr + row * H + col, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(wb_ptr + col, mask=mask, other=0.0).to(tl.float32)
-
-    var = tl.sum(x * x, axis=0) / H
-    rstd = 1.0 / tl.sqrt(var + eps)
-    y = x * rstd * w
-    tl.store(
-        out_ptr + row * (2 * H) + g * H + col,
-        y.to(out_ptr.dtype.element_ty),
-        mask=mask,
-    )
-
-
-def _fused_dual_rmsnorm_cat_fake(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    w_a: torch.Tensor,
-    w_b: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    n_rows, H = a.shape
-    return torch.empty((n_rows, 2 * H), dtype=a.dtype, device=a.device)
-
-
-@torch_compile_guard(gen_fake=_fused_dual_rmsnorm_cat_fake, mutates_args=[])
-def fused_dual_rmsnorm_cat(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    w_a: torch.Tensor,
-    w_b: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    """RMS-norm two ``[N, H]`` inputs by their own weights into one ``[N, 2H]``.
-
-    ``out[:, :H] = rmsnorm(a, w_a)``, ``out[:, H:] = rmsnorm(b, w_b)`` — the
-    concatenated attention input for the Eagle3 draft decoder layer, produced
-    in a single Triton launch (no separate per-input norm + concat).
-
-    Args:
-        a, b: contiguous ``[N, H]`` inputs (same shape).
-        w_a, w_b: per-input RMSNorm weights ``[H]``.
-        eps: RMSNorm epsilon (shared by both norms).
-
-    Returns:
-        contiguous ``[N, 2H]`` with the two normalized halves side by side.
-    """
-    n_rows, H = a.shape
-    out = torch.empty((n_rows, 2 * H), dtype=a.dtype, device=a.device)
-    BLOCK_H = triton.next_power_of_2(H)
-    num_warps = 8 if BLOCK_H >= 4096 else (4 if BLOCK_H >= 1024 else 2)
-    grid = (n_rows, 2)
-    _fused_dual_rmsnorm_cat_kernel[grid](
-        a,
-        b,
-        w_a,
-        w_b,
-        out,
         H,
         float(eps),
         BLOCK_H=BLOCK_H,
