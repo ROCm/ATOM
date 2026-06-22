@@ -202,11 +202,18 @@ class PagedAttentionImpl(nn.Module):
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
         # Fall back to Triton/Gluon when explicitly requested or for layouts
-        # unsupported by AITer PA ASM.
+        # unsupported by AITer PA ASM. The non-persistent ASM PA decode
+        # (paged_attention_asm -> pa_fwd, ps=0) only ships blkSz=16 kernels for
+        # every dtype/gqa, so a block_size=128 cache can never resolve a kernel
+        # (get_heuristic_kernel aborts). block_size 256/1024 is served by the
+        # persistent ASM path in _dispatch_decode; everything else must use
+        # Triton. This also keeps the KV-cache write layout (asm_layout below)
+        # consistent with the decode kernel that reads it.
         use_triton_attn = (
             self.force_triton_attn
             or self.sliding_window != -1
             or self.head_dim != 128
+            or get_current_atom_config().kv_cache_block_size == 128
         )
         self.use_triton_attn = use_triton_attn
 
