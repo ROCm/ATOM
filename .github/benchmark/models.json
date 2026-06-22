@@ -99,15 +99,6 @@
       ]
     },
     {
-      "display": "GLM-5-FP8",
-      "path": "zai-org/GLM-5-FP8",
-      "prefix": "glm-5-fp8",
-      "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 8, "kv_cache_dtype": "fp8" },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
-    },
-    {
       "display": "GLM-5.2-FP8",
       "path": "zai-org/GLM-5.2-FP8",
       "prefix": "glm-5-2-fp8",

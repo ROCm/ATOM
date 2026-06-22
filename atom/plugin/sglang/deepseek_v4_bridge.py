@@ -515,7 +515,7 @@ class _V4SGLangDecodeGraphBuffers:
         self.state_slot = i32(s)
         self.n_csa = i32(s)
         self.n_hca = i32(s)
-        self.batch_id = CpuGpuBuffer(t, dtype=torch.int64, device=device)
+        self.batch_id = CpuGpuBuffer(t, dtype=torch.int32, device=device)
         self.block_tables = i32(s, self.max_blocks)
         self.indptr_swa = i32(t + 1)
         self.indptr_csa = i32(t + 1)
@@ -668,11 +668,11 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
 
     if total:
         pos_np = (seq_np[:total] - 1).astype(np.int32)
-        batch_np = np.arange(total, dtype=np.int64)
+        batch_np = np.arange(total, dtype=np.int32)
     else:
         pos_np = np.zeros(0, dtype=np.int32)
-        batch_np = np.zeros(0, dtype=np.int64)
-    batch_pad = np.full(t_pad, -1, dtype=np.int64)
+        batch_np = np.zeros(0, dtype=np.int32)
+    batch_pad = np.full(t_pad, -1, dtype=np.int32)
     if total:
         batch_pad[:total] = batch_np
 
@@ -794,7 +794,7 @@ def build_atom_v4_attention_metadata_from_sglang(
     if is_decode:
         lens = np.ones(num_reqs, dtype=np.int32)
         q_np = np.arange(num_reqs + 1, dtype=np.int32)
-        batch_np = np.arange(num_reqs, dtype=np.int64)
+        batch_np = np.arange(num_reqs, dtype=np.int32)
         pos_np = positions[:num_reqs].detach().cpu().numpy().astype(np.int32)
     else:
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
@@ -817,7 +817,7 @@ def build_atom_v4_attention_metadata_from_sglang(
         lens = extend_lens[:num_reqs].astype(np.int32)
         q_np = np.zeros(num_reqs + 1, dtype=np.int32)
         q_np[1:] = np.cumsum(lens, dtype=np.int32)
-        batch_np = np.repeat(np.arange(num_reqs, dtype=np.int64), lens)
+        batch_np = np.repeat(np.arange(num_reqs, dtype=np.int32), lens)
         pos_np = positions[: int(lens.sum())].detach().cpu().numpy().astype(np.int32)
 
     total = int(lens.sum())
