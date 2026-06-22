@@ -11,13 +11,13 @@ from atom.quant_spec import LayerQuantConfig
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.utils.arch import aiter_hip_kernels_supported
 
-# aiter HIP silu_and_mul emits gfx9-only instructions; route to torch-native
-# (F.silu(x) * y) on RDNA/other unsupported arches.
-_AITER_HIP_ACT_SUPPORTED = aiter_hip_kernels_supported()
-
 from aiter import (
     QuantType,
 )
+
+# aiter HIP silu_and_mul emits gfx9-only instructions; route to torch-native
+# (F.silu(x) * y) on RDNA/other unsupported arches.
+_AITER_HIP_ACT_SUPPORTED = aiter_hip_kernels_supported()
 
 
 def mxfp4_act_mul_quant_fuse_fake(
