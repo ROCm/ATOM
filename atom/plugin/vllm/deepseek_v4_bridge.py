@@ -433,9 +433,10 @@ class _V4DecodeMetaBuffers:
         self.state_slot = i32(S)
         self.n_csa = i32(S)
         self.n_hca = i32(S)
-        # Per-token mapping (sized to padded token count). int64 to match the
-        # numpy fancy-index source and the kernel's batch_id dtype.
-        self.batch_id = CpuGpuBuffer(T, dtype=torch.int64, device=device)
+        # Per-token mapping (sized to padded token count). int32: accepted by
+        # torch advanced-indexing AND by the fused flydsl SWA scatter (which
+        # loads batch_id as int32); matches the in-tree model_runner path.
+        self.batch_id = CpuGpuBuffer(T, dtype=torch.int32, device=device)
         # Ragged cumsums (T + 1) and ragged index pools (worst-case per-token
         # slot counts): SWA = win, CSA = win + index_topk, HCA = win + hca.
         self.indptr_swa = i32(T + 1)
@@ -804,7 +805,7 @@ def build_atom_v4_attention_metadata(
     if seq_lens_cpu is None:
         seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
     seq_np = seq_lens_cpu[:num_reqs].numpy().astype(np.int32)
-    batch_np = np.repeat(np.arange(num_reqs, dtype=np.int64), lens)
+    batch_np = np.repeat(np.arange(num_reqs, dtype=np.int32), lens)
     md = AttentionMetaData(
         cu_seqlens_q=common_attn_metadata.query_start_loc,
         cu_seqlens_k=common_attn_metadata.query_start_loc,

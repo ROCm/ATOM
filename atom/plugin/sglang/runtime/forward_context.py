@@ -138,7 +138,42 @@ def _set_atom_forward_context(
     forward_mode = forward_batch.forward_mode
     # This value is only used by ATOM-side MoE padding in the SGLang wrapper.
     max_seqlen_q = 1 if forward_mode.is_decode_or_idle() else 0
-    attn_metadata = AttentionMetaData(max_seqlen_q=max_seqlen_q)
+    attn_metadata = None
+    try:
+        from atom.plugin.sglang.deepseek_v4_bridge import (
+            build_atom_v4_attention_metadata_from_sglang,
+            maybe_get_proxy_pool_from_sglang_backend,
+        )
+
+        try:
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            attn_metadata = getattr(backend, "atom_v4_graph_metadata", None)
+        except Exception:
+            attn_metadata = None
+
+        if attn_metadata is None:
+            backend = getattr(forward_batch, "attn_backend", None)
+            attn_metadata = getattr(backend, "atom_v4_graph_metadata", None)
+
+        proxy_pool, req_to_token_pool = maybe_get_proxy_pool_from_sglang_backend()
+        if attn_metadata is None and getattr(
+            proxy_pool, "is_atom_v4_proxy_pool", False
+        ):
+            attn_metadata = build_atom_v4_attention_metadata_from_sglang(
+                forward_batch,
+                positions,
+                proxy_pool=proxy_pool,
+                req_to_token_pool=req_to_token_pool,
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to build ATOM DeepSeek-V4 metadata for SGLang"
+        ) from exc
+
+    if attn_metadata is None:
+        attn_metadata = AttentionMetaData(max_seqlen_q=max_seqlen_q)
     batch_size = int(forward_batch.batch_size)
     is_dummy_run = _is_dummy_forward(forward_batch)
     is_prefill = forward_mode.is_prefill()

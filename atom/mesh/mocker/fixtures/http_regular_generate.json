@@ -1,6 +1,6 @@
 {
   "name": "http_regular_generate",
-  "model": "test-model",
+  "model": "hf-internal-testing/llama-tokenizer",
   "endpoint": "/generate",
   "route": {
     "worker_kind": "regular",

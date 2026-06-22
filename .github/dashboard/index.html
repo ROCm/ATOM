@@ -73,7 +73,8 @@
     .filter-dropdown.open { display: block; }
     .filter-dropdown label { display: flex; align-items: center; gap: 8px; padding: 4px 12px; font-size: 12px; cursor: pointer; color: var(--text-secondary); }
     .filter-dropdown label:hover { background: var(--bg-tertiary); }
-    .filter-dropdown input[type="checkbox"] { accent-color: var(--ui); }
+    .filter-dropdown input[type="checkbox"],
+    .filter-dropdown input[type="radio"] { accent-color: var(--ui); }
     .filter-dropdown .sep { border-top: 1px solid var(--border); margin: 4px 0; }
     .filter-reset { background: none; color: var(--text-tertiary); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
     .filter-reset:hover { color: var(--text-secondary); background: var(--bg-tertiary); }
@@ -551,27 +552,63 @@ function parseBenchName(name) {
 // Parse all runs sorted by date descending
 const allRuns = Object.values(rawData.entries).flat().sort((a, b) => b.date - a.date);
 
+function hardwareFromGpuName(name) {
+  const text = String(name || '').toLowerCase();
+  if (text.includes('mi355') || text.includes('mi35x')) return 'mi355x';
+  if (text.includes('mi325')) return 'mi325x';
+  if (text.includes('mi308')) return 'mi308x';
+  if (text.includes('mi300')) return 'mi300x';
+  if (text.includes('mi250')) return 'mi250x';
+  if (text.includes('mi210')) return 'mi210';
+  return 'unknown';
+}
+
+function parseBenchExtra(extra) {
+  const meta = { hardware: 'unknown' };
+  if (!extra) return meta;
+  const rm = extra.match(/Run:\s*(https:\/\/\S+)/);
+  if (rm) meta.runUrl = rm[1];
+  const gm = extra.match(/GPU:\s*([^|]+)/);
+  if (gm) {
+    meta.gpuName = gm[1].trim().replace(/\bAMD\b/gi, '').replace(/\bInstinct\b/gi, '').replace(/\s+/g, ' ').trim();
+    meta.hardware = hardwareFromGpuName(meta.gpuName);
+  }
+  const vm = extra.match(/VRAM:\s*(\d+)GB/);
+  if (vm) meta.gpuVramGb = +vm[1];
+  const rcm = extra.match(/ROCm:\s*([\d.]+)/);
+  if (rcm) meta.rocmVersion = rcm[1];
+  const dm = extra.match(/Docker:\s*([^|]+)/);
+  if (dm) meta.ootImageTag = dm[1].trim();
+  return meta;
+}
+
 // For each run, parse benches into structured configs
 function parseRunConfigs(run) {
-  const configs = {}; // key: "backend|model|isl/osl|conc"
+  const configs = {}; // key: "backend|model|isl/osl|conc|hardware"
+  const hardwareByBaseKey = {};
   for (const b of run.benches) {
     const p = parseBenchName(b.name);
     if (!p || p.isAccuracy || !p.islOsl || p.islOsl === '0/0') continue;
-    const key = `${p.backend}|${p.model}|${p.islOsl}|${p.conc}`;
-    if (!configs[key]) configs[key] = { backend: p.backend, model: p.model, islOsl: p.islOsl, conc: p.conc, commit: run.commit, date: run.date, runUrl: '' };
+    const baseKey = `${p.backend}|${p.model}|${p.islOsl}|${p.conc}`;
+    const meta = parseBenchExtra(b.extra);
+    if (meta.hardware !== 'unknown') hardwareByBaseKey[baseKey] = meta.hardware;
+  }
+  for (const b of run.benches) {
+    const p = parseBenchName(b.name);
+    if (!p || p.isAccuracy || !p.islOsl || p.islOsl === '0/0') continue;
+    const baseKey = `${p.backend}|${p.model}|${p.islOsl}|${p.conc}`;
+    const meta = parseBenchExtra(b.extra);
+    const hardware = meta.hardware !== 'unknown' ? meta.hardware : (hardwareByBaseKey[baseKey] || 'unknown');
+    const key = `${baseKey}|${hardware}`;
+    if (!configs[key]) configs[key] = { backend: p.backend, model: p.model, islOsl: p.islOsl, conc: p.conc, hardware, commit: run.commit, date: run.date, runUrl: '' };
     configs[key][p.metric] = b.value;
     if (b.extra) {
       configs[key]._extra = b.extra;
-      const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/);
-      if (rm) configs[key].runUrl = rm[1];
-      const gm = b.extra.match(/GPU:\s*([^|]+)/);
-      if (gm) configs[key]._gpu_name = gm[1].trim().replace(/\bAMD\b/gi, '').replace(/\bInstinct\b/gi, '').replace(/\s+/g, ' ').trim();
-      const vm = b.extra.match(/VRAM:\s*(\d+)GB/);
-      if (vm) configs[key]._gpu_vram_gb = +vm[1];
-      const rcm = b.extra.match(/ROCm:\s*([\d.]+)/);
-      if (rcm) configs[key]._rocm_version = rcm[1];
-      const dm = b.extra.match(/Docker:\s*([^|]+)/);
-      if (dm) configs[key]._oot_image_tag = dm[1].trim();
+      if (meta.runUrl) configs[key].runUrl = meta.runUrl;
+      if (meta.gpuName) configs[key]._gpu_name = meta.gpuName;
+      if (meta.gpuVramGb != null) configs[key]._gpu_vram_gb = meta.gpuVramGb;
+      if (meta.rocmVersion) configs[key]._rocm_version = meta.rocmVersion;
+      if (meta.ootImageTag) configs[key]._oot_image_tag = meta.ootImageTag;
     }
   }
   return configs;
@@ -616,12 +653,12 @@ for (const run of allRuns) {
 // Different benchmark runs for the same commit may have different Docker tags,
 // dates, and run URLs; pick the newest run's metadata so all configKeys are consistent.
 // Note: _gpu_count/_tp are NOT unified — they are real per-config values tied to throughput data.
-// Key by (backend, cid7): different backends (ATOM, ATOM-vLLM, ATOM-sglang)
+// Key by (backend, hardware, cid7): different backends and GPU platforms can
 // legitimately use different Docker images on the same commit.
-const _commitMeta = {}; // "backend|cid7" -> metadata from newest run
+const _commitMeta = {}; // "backend|hardware|cid7" -> metadata from newest run
 for (const history of Object.values(historyMap)) {
   for (const cfg of history) {
-    const mk = cfg.backend + '|' + cfg.commit.id.slice(0, 7);
+    const mk = cfg.backend + '|' + cfg.hardware + '|' + cfg.commit.id.slice(0, 7);
     if (!_commitMeta[mk] || cfg.date > _commitMeta[mk].date) {
       _commitMeta[mk] = { date: cfg.date, runUrl: cfg.runUrl, _oot_image_tag: cfg._oot_image_tag, _gpu_name: cfg._gpu_name, _gpu_vram_gb: cfg._gpu_vram_gb, _rocm_version: cfg._rocm_version };
     }
@@ -629,7 +666,7 @@ for (const history of Object.values(historyMap)) {
 }
 for (const history of Object.values(historyMap)) {
   for (const cfg of history) {
-    const meta = _commitMeta[cfg.backend + '|' + cfg.commit.id.slice(0, 7)];
+    const meta = _commitMeta[cfg.backend + '|' + cfg.hardware + '|' + cfg.commit.id.slice(0, 7)];
     if (!meta) continue;
     // Don't overwrite cfg.date — each nightly run's date must stay distinct for trends
     if (meta.runUrl) cfg.runUrl = meta.runUrl;
@@ -787,6 +824,8 @@ const allBackends = [...new Set(Object.keys(historyMap).map(k => k.split('|')[0]
 const allModels = [...new Set(Object.keys(historyMap).map(k => k.split('|')[1]))].sort(_lc);
 const allIslOsl = [...new Set(Object.keys(historyMap).map(k => k.split('|')[2]))].sort();
 const allConc = [...new Set(Object.keys(historyMap).map(k => +k.split('|')[3]))].sort((a, b) => a - b);
+const allHardware = [...new Set(Object.values(latestConfigs).map(cfg => cfg.hardware || 'unknown'))].sort(_lc);
+const defaultHardware = allHardware.includes('mi355x') ? 'mi355x' : (allHardware[0] || 'unknown');
 const allTrendModelKeys = [...new Set(Object.values(latestConfigs).map(cfg => `${cfg.backend}|${cfg.model}`))].sort(_lc);
 
 /* ================================================================
@@ -799,7 +838,7 @@ const PERF_METRICS = [
   { key: 'TTFT',        label: 'TTFT',              unit: 'ms',    lower: true },
 ];
 const state = {
-  filters: { backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc] },
+  filters: { backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc], hardware: [defaultHardware] },
   activeTab: 'performance',
   perfMetric: 'Total Tput',
   trendModelKey: allTrendModelKeys[0] || '',
@@ -814,6 +853,7 @@ function filteredConfigs() {
     if (!state.filters.models.includes(cfg.model)) continue;
     if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
     if (!state.filters.conc.includes(cfg.conc)) continue;
+    if (!state.filters.hardware.includes(cfg.hardware || 'unknown')) continue;
     out[key] = cfg;
   }
   return out;
@@ -824,6 +864,11 @@ function filteredConfigs() {
    ================================================================ */
 // ISL/OSL compact format: "1024/1024" → "1k/1k", "8192/1024" → "8k/1k"
 function fmtIslOsl(s) { return s.replace(/\d+/g, n => +n >= 1024 ? parseFloat((+n / 1024).toPrecision(3)) + 'k' : n); }
+function fmtHardware(s) { return s === 'unknown' ? 'Unknown' : String(s).toUpperCase(); }
+function selectedHardware() {
+  const hw = state.filters.hardware[0];
+  return hw && allHardware.includes(hw) ? hw : defaultHardware;
+}
 
 // Model family grouping: "DeepSeek-R1-0528-mtp3" → family "DeepSeek-R1-0528", variant "mtp3"
 function modelFamily(name) {
@@ -1073,13 +1118,22 @@ _updateEl.textContent = 'Updated ' + relTime(rawData.lastUpdate);
 if (_isStale) { _updateEl.classList.add('stale'); _updateEl.textContent += ' — data may be stale'; }
 const repoLink = document.getElementById('repo-link');
 repoLink.href = rawData.repoUrl; repoLink.textContent = rawData.repoUrl.replace('https://github.com/', '');
-// Append GPU platform info to header meta from first available config
-const _firstCfgWithGpu = Object.values(latestConfigs).find(c => c._gpu_name);
-if (_firstCfgWithGpu) {
-  const metaEl = document.querySelector('.meta');
-  const gpuSpan = document.createElement('span');
-  gpuSpan.textContent = ' · ' + _firstCfgWithGpu._gpu_name + (_firstCfgWithGpu._rocm_version ? ' · ROCm ' + _firstCfgWithGpu._rocm_version : '');
-  metaEl.appendChild(gpuSpan);
+const _headerGpuMeta = document.createElement('span');
+_headerGpuMeta.id = 'header-gpu-meta';
+document.querySelector('.meta').appendChild(_headerGpuMeta);
+
+function updateHeaderGpuMeta() {
+  const span = document.getElementById('header-gpu-meta');
+  if (!span) return;
+  const entries = Object.values(filteredConfigs());
+  if (!entries.length) { span.textContent = ''; return; }
+
+  const newest = entries.reduce((a, b) => (a.date >= b.date ? a : b));
+
+  const hw = selectedHardware();
+  let text = hw !== 'unknown' ? ' · ' + fmtHardware(hw) : '';
+  if (newest._rocm_version) text += ' · ROCm ' + newest._rocm_version;
+  span.textContent = text;
 }
 document.getElementById('dl-btn').onclick = () => {
   const a = document.createElement('a');
@@ -1093,8 +1147,9 @@ document.getElementById('dl-btn').onclick = () => {
 const filterDefs = [
   { id: 'backends', label: 'Backend', options: allBackends },
   { id: 'models', label: 'Model', options: allModels },
-  { id: 'islOsl', label: 'ISL/OSL', options: allIslOsl },
+  { id: 'islOsl', label: 'ISL/OSL', options: allIslOsl, format: fmtIslOsl },
   { id: 'conc', label: 'Concurrency', options: allConc.map(String) },
+  { id: 'hardware', label: 'Hardware', options: allHardware, format: fmtHardware },
 ];
 
 function getFilterState(id) {
@@ -1106,6 +1161,10 @@ function updateFilterBadge(id) {
   const btn = document.querySelector(`.filter-btn[data-filter="${id}"]`);
   if (!btn) return;
   const def = filterDefs.find(d => d.id === id);
+  if (id === 'hardware') {
+    btn.innerHTML = `${fmtHardware(selectedHardware())} ▾`;
+    return;
+  }
   const sel = getFilterState(id);
   const allSelected = sel.length === def.options.length;
   btn.innerHTML = allSelected ? `${def.label} ▾` : `${def.label} ▾<span class="count">${sel.length}</span>`;
@@ -1119,12 +1178,20 @@ function renderFilters() {
     const allSelected = sel.length === d.options.length;
     const group = document.createElement('div');
     group.className = 'filter-group';
-    group.innerHTML = `<button class="filter-btn" data-filter="${d.id}">${d.label} ▾${allSelected ? '' : '<span class="count">' + sel.length + '</span>'}</button>
-      <div class="filter-dropdown" id="fd-${d.id}">
-        <label><input type="checkbox" value="__all__" ${allSelected ? 'checked' : ''}> All</label>
-        <div class="sep"></div>
-        ${d.options.map(o => `<label><input type="checkbox" value="${o}" ${sel.includes(o) ? 'checked' : ''}> ${d.id === 'islOsl' ? fmtIslOsl(o) : o}</label>`).join('')}
-      </div>`;
+    if (d.id === 'hardware') {
+      const selected = selectedHardware();
+      group.innerHTML = `<button class="filter-btn" data-filter="${d.id}">${fmtHardware(selected)} ▾</button>
+        <div class="filter-dropdown" id="fd-${d.id}">
+          ${d.options.map(o => `<label><input type="radio" name="hardware-filter" value="${o}" ${selected === o ? 'checked' : ''}> ${d.format ? d.format(o) : o}</label>`).join('')}
+        </div>`;
+    } else {
+      group.innerHTML = `<button class="filter-btn" data-filter="${d.id}">${d.label} ▾${allSelected ? '' : '<span class="count">' + sel.length + '</span>'}</button>
+        <div class="filter-dropdown" id="fd-${d.id}">
+          <label><input type="checkbox" value="__all__" ${allSelected ? 'checked' : ''}> All</label>
+          <div class="sep"></div>
+          ${d.options.map(o => `<label><input type="checkbox" value="${o}" ${sel.includes(o) ? 'checked' : ''}> ${d.format ? d.format(o) : o}</label>`).join('')}
+        </div>`;
+    }
     bar.appendChild(group);
   }
   // Filter summary
@@ -1149,7 +1216,9 @@ function renderFilters() {
     state.filters.models = [...allModels];
     state.filters.islOsl = [...allIslOsl];
     state.filters.conc = [...allConc];
+    state.filters.hardware = [defaultHardware];
     renderFilters();
+    updateHeaderGpuMeta();
     renderActiveTab();
     renderKPICards();
     syncToHash();
@@ -1188,6 +1257,16 @@ function renderFilters() {
   bar.querySelectorAll('.filter-dropdown').forEach(dd => {
     dd.addEventListener('change', (e) => {
       const filterId = dd.id.replace('fd-', '');
+      if (filterId === 'hardware') {
+        if (e.target.type !== 'radio') return;
+        state.filters.hardware = [e.target.value];
+        updateFilterBadge('hardware');
+        updateHeaderGpuMeta();
+        renderActiveTab();
+        renderKPICards();
+        syncToHash();
+        return;
+      }
       const allCb = dd.querySelector('input[value="__all__"]');
       const itemCbs = [...dd.querySelectorAll('input:not([value="__all__"])')];
       if (e.target.value === '__all__') {
@@ -1201,8 +1280,8 @@ function renderFilters() {
       } else {
         state.filters[filterId] = selected;
       }
-      // Only update badge — dropdown stays open
       updateFilterBadge(filterId);
+      updateHeaderGpuMeta();
       renderActiveTab();
       renderKPICards();
       syncToHash();
@@ -1258,7 +1337,8 @@ function renderKPICards() {
     const c = latestConfigs[k];
     return c && state.filters.backends.includes(c.backend) &&
       state.filters.models.includes(c.model) &&
-      state.filters.islOsl.includes(c.islOsl) && state.filters.conc.includes(c.conc);
+      state.filters.islOsl.includes(c.islOsl) && state.filters.conc.includes(c.conc) &&
+      state.filters.hardware.includes(c.hardware || 'unknown');
   });
   const regCount = filteredRegKeys.length;
   const criticalCount = filteredRegKeys.filter(k => regressions[k].severity === 'critical').length;
@@ -1987,7 +2067,7 @@ function renderTrendsTab() {
 
   // Mode+model selector — keeps native and ATOM-vLLM trend lines distinct
   const trendOptions = [...new Set(Object.values(latestConfigs)
-    .filter(cfg => state.filters.backends.includes(cfg.backend) && state.filters.models.includes(cfg.model))
+    .filter(cfg => state.filters.backends.includes(cfg.backend) && state.filters.models.includes(cfg.model) && state.filters.hardware.includes(cfg.hardware || 'unknown'))
     .map(cfg => `${cfg.backend}|${cfg.model}`))]
     .sort((a, b) => _lc(a.split('|')[1], b.split('|')[1]));
   if (!trendOptions.includes(state.trendModelKey)) state.trendModelKey = trendOptions[0] || '';
@@ -2066,7 +2146,8 @@ function renderTrendsTab() {
       // Respect global ISL/OSL and Concurrency filters
       if (!state.filters.islOsl.includes(parts[2])) continue;
       if (!state.filters.conc.includes(+parts[3])) continue;
-      const seriesLabel = fmtIslOsl(parts[2]) + ' c=' + parts[3];
+      if (!state.filters.hardware.includes(parts[4] || 'unknown')) continue;
+      const seriesLabel = fmtIslOsl(parts[2]) + ' c=' + parts[3] + ' · ' + fmtHardware(parts[4] || 'unknown');
       const color = getModelColor(trendBackend, trendModel);
 
       const pointMap = {};
@@ -2221,7 +2302,7 @@ function renderDataTab() {
   const csvBtn = document.getElementById('copy-csv-btn');
   if (csvBtn) {
     csvBtn.addEventListener('click', () => {
-      const header = 'Date,Commit,Backend,Model,ISL/OSL,Concurrency,TP,Total Throughput (tok/s),TPOT (ms),TTFT (ms),Run URL';
+      const header = 'Date,Commit,Backend,Model,ISL/OSL,Concurrency,Hardware,TP,Total Throughput (tok/s),TPOT (ms),TTFT (ms),Run URL';
       const rows = [];
       for (const run of allRuns) {
         const configs = parseRunConfigs(run);
@@ -2230,7 +2311,8 @@ function renderDataTab() {
           if (!state.filters.models.includes(cfg.model)) continue;
           if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
           if (!state.filters.conc.includes(cfg.conc)) continue;
-          rows.push([fmtDate(cfg.date), cfg.commit.id?.slice(0,7), cfg.backend, cfg.model, cfg.islOsl, cfg.conc,
+          if (!state.filters.hardware.includes(cfg.hardware || 'unknown')) continue;
+          rows.push([fmtDate(cfg.date), cfg.commit.id?.slice(0,7), cfg.backend, cfg.model, cfg.islOsl, cfg.conc, cfg.hardware || 'unknown',
             cfg._tp ?? cfg._gpu_count ?? '', cfg['Total Tput'] ?? '', cfg.TPOT ?? '', cfg.TTFT ?? '', cfg.runUrl].join(','));
         }
       }
@@ -2286,6 +2368,7 @@ function renderDataTable() {
       if (!state.filters.models.includes(cfg.model)) continue;
       if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
       if (!state.filters.conc.includes(cfg.conc)) continue;
+      if (!state.filters.hardware.includes(cfg.hardware || 'unknown')) continue;
       rows.push({ key, cfg, runDate: run.date });
     }
   }
@@ -2355,7 +2438,8 @@ function renderTimeline() {
       state.filters.backends.includes(c.backend) &&
       state.filters.models.includes(c.model) &&
       state.filters.islOsl.includes(c.islOsl) &&
-      state.filters.conc.includes(c.conc));
+      state.filters.conc.includes(c.conc) &&
+      state.filters.hardware.includes(c.hardware || 'unknown'));
     if (entries.length === 0) continue;
     const commitId = run.commit.id.slice(0, 7);
     const backends = [...new Set(entries.map(([, c]) => c.backend))];
@@ -2554,6 +2638,7 @@ function syncToHash() {
   if (state.filters.models.length !== allModels.length) parts.push('model=' + state.filters.models.join(','));
   if (state.filters.islOsl.length !== allIslOsl.length) parts.push('isl=' + state.filters.islOsl.join(','));
   if (state.filters.conc.length !== allConc.length) parts.push('conc=' + state.filters.conc.join(','));
+  parts.push('hardware=' + selectedHardware());
   if (state.activeTab !== 'performance') parts.push('tab=' + state.activeTab);
   hashUpdateFromCode = true;
   window.location.hash = parts.join('&');
@@ -2569,6 +2654,10 @@ function readFromHash() {
     if (k === 'model') state.filters.models = v.split(',').filter(m => allModels.includes(m));
     if (k === 'isl') state.filters.islOsl = v.split(',').filter(i => allIslOsl.includes(i));
     if (k === 'conc') state.filters.conc = v.split(',').map(Number).filter(c => allConc.includes(c));
+    if (k === 'hardware') {
+      const hw = v.split(',')[0];
+      state.filters.hardware = hw && allHardware.includes(hw) ? [hw] : [defaultHardware];
+    }
     if (k === 'tab') {
       state.activeTab = v;
       document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === v));
@@ -2963,6 +3052,7 @@ function renderMtpAcceptanceMiniChart(key) {
 
 // Re-render everything (used by theme toggle)
 function renderAll() {
+  updateHeaderGpuMeta();
   renderKPICards();
   renderActiveTab();
 }
@@ -2972,6 +3062,7 @@ function renderAll() {
    ================================================================ */
 readFromHash();
 renderFilters();
+updateHeaderGpuMeta();
 renderKPICards();
 renderActiveTab();
 
@@ -2982,6 +3073,7 @@ window.addEventListener('hashchange', () => {
   if (hashUpdateFromCode) { hashUpdateFromCode = false; return; }
   readFromHash();
   renderFilters();
+  updateHeaderGpuMeta();
   renderKPICards();
   renderActiveTab();
 });

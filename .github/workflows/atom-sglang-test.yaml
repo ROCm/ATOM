@@ -8,6 +8,10 @@ on:
       - '**/*.md'
       - 'docs/**'
       - 'atom/plugin/vllm/**'
+      - 'atom/mesh/**'
+      - '.github/workflows/atomesh-*.yaml'
+      - '.github/scripts/atomesh_*.sh'
+      - '.github/dashboard/atomesh_*.html'
       - '.github/workflows/atom-vllm-*.yaml'
       - '.github/benchmark/oot_models_accuracy.json'
       - 'LICENSE'
@@ -279,7 +283,7 @@ jobs:
 
     steps:
       - name: Clean up containers and workspace
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: contains(fromJSON('["atom-mi355-8gpu.predownload"]'), matrix.runner)
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)

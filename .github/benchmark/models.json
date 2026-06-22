@@ -65,6 +65,7 @@
           "label": "DPA TBO",
           "suffix": "-dpa-tbo",
           "extra_args": "--enable-dp-attention --enable-tbo",
+          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_CPU_AFFINITY=1",
           "conc_min": 256,
           "conc_max": 1024
         },
@@ -98,12 +99,12 @@
       ]
     },
     {
-      "display": "GLM-5-FP8",
-      "path": "zai-org/GLM-5-FP8",
-      "prefix": "glm-5-fp8",
+      "display": "GLM-5.2-FP8",
+      "path": "zai-org/GLM-5.2-FP8",
+      "prefix": "glm-5-2-fp8",
       "runner": "atom-mi355-8gpu.predownload",
       "env_vars": "",
-      "config": { "tp": 8, "kv_cache_dtype": "fp8" },
+      "config": { "tp": 8, "kv_cache_dtype": "fp8", "extra_args": "--gpu-memory-utilization 0.8" },
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     },
     {

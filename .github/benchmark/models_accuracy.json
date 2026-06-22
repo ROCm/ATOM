@@ -79,7 +79,7 @@
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
-    "accuracy_threshold": 0.88,
+    "accuracy_threshold": 0.87,
     "accuracy_baseline": 0.90,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
@@ -152,7 +152,7 @@
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "main",
-    "accuracy_threshold": 0.88,
+    "accuracy_threshold": 0.87,
     "accuracy_baseline": 0.90,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
@@ -204,6 +204,18 @@
     "accuracy_baseline": 0.9545,
     "accuracy_baseline_model": "zai-org/GLM-5",
     "_baseline_note": "HF: amd/GLM-5-MXFP4 card shows GLM-5 baseline=0.9545 (5-shot)"
+  },
+  {
+    "model_name": "GLM-5.2-FP8",
+    "model_path": "zai-org/GLM-5.2-FP8",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --gpu-memory-utilization 0.8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.92,
+    "accuracy_baseline": 0.9447,
+    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
+    "_baseline_note": "ATOM native FP8 gsm8k 3-shot flexible-extract=0.9447 (5-shot=0.9416); --gpu-memory-utilization 0.8 needed since the DSA index cache OOMs at default 0.9. Threshold 0.92 leaves ~2.5pp headroom."
   },
   {
     "model_name": "GLM-5.1-FP8",

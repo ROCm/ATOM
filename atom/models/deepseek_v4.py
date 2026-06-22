@@ -26,15 +26,12 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Tuple, cast
 if TYPE_CHECKING:
     from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
 
-import threading
-
 import aiter
 import torch
 import torch.nn.functional as F
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
-    get_hip_quant,
     rope_rotate_activation,
 )
 from aiter import silu_and_mul as aiter_silu_and_mul
@@ -82,6 +79,7 @@ from atom.model_ops.sparse_attn_v4 import (
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
+from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (
@@ -102,34 +100,6 @@ from atom.utils.forward_context import AttnState, get_forward_context
 from torch import nn
 
 logger = logging.getLogger(__name__)
-
-# Per-device auxiliary stream for TBO-adjacent collectives (DP input_ids
-# all-gather hoisted into DeepseekV4ForCausalLM.forward, MoE combine_outputs
-# TP all-reduce). Submitting these on a dedicated stream keeps the main
-# compute lane free of nccl interleaving so it can hardware-overlap with
-# TBO's own comm_stream.
-_TBO_COMM_STREAM: dict = {}
-_TBO_COMM_STREAM_LOCK = threading.Lock()
-
-
-def _run_on_tbo_comm_stream(fn, *args, **kwargs):
-    # Without TBO there is no second compute/comm stream to overlap with,
-    # so the side-stream hop only adds event/sync overhead. Run inline.
-    if not get_current_atom_config().enable_tbo:
-        return fn(*args, **kwargs)
-    device = torch.cuda.current_device()
-    with _TBO_COMM_STREAM_LOCK:
-        side = _TBO_COMM_STREAM.get(device)
-        if side is None:
-            side = torch.cuda.Stream(device=device)
-            _TBO_COMM_STREAM[device] = side
-    main = torch.cuda.current_stream()
-    side.wait_stream(main)
-    with torch.cuda.stream(side):
-        result = fn(*args, **kwargs)
-    main.wait_stream(side)
-    return result
-
 
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
@@ -1114,7 +1084,10 @@ class Indexer(nn.Module):
         )
         self.softmax_scale = self.head_dim**-0.5
         # Init-time hoists out of `forward_batched`'s hot path.
-        self._fp8_quant_func = get_hip_quant(QuantType.per_1x128)
+        # FP8 Q quant is fused into `rope_rotate_activation` (per_1x128 over
+        # head_dim); `group_size` is the per-1xN block. head_dim is the index
+        # head dim (128), so there is exactly one scale per (token, head).
+        self._q_quant_group = self.head_dim
         self._weights_scale = self.softmax_scale * self.n_heads**-0.5
         # `deepgemm_fp8_paged_mqa_logits` decode-path output column count:
         # one indexer slot per `compress_ratio` source tokens.
@@ -1186,16 +1159,28 @@ class Indexer(nn.Module):
         q = self.wq_b(qr_full, x_scale=qr_full_scale).view(
             total_tokens, self.n_heads, self.head_dim
         )
-        # self.rotary_emb(positions, q[..., -rd:])
-        # q = rotate_activation(q)
-        rope_rotate_activation(
-            q, q, self.rotary_emb.cos_cache, self.rotary_emb.sin_cache, positions, rd
+        # RoPE + Hadamard-rotate + FP8 quant fused in one kernel. Q is online
+        # (recomputed each fwd, no cache); the bf16 rotated Q is never read back,
+        # so it is quantized in place of being materialized. `out_scale` carries
+        # the per-(token, head) fp8 block scale (head_dim == group => one/row).
+        # `_weights_scale` precomputed in __init__.
+        # self.rotary_emb(positions, q[..., -rd:]); q = rotate_activation(q)
+        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+        q_scale = torch.empty(
+            (total_tokens * self.n_heads, self.head_dim // self._q_quant_group),
+            dtype=dtypes.fp32,
+            device=q.device,
         )
-
-        # FP8 quant Q (still online — Q is recomputed each fwd, no cache).
-        # `_fp8_quant_func` / `_weights_scale` precomputed in __init__.
-        q_2d = q.view(-1, self.head_dim)
-        q_fp8, q_scale = self._fp8_quant_func(q_2d, quant_dtype=dtypes.fp8)
+        rope_rotate_activation(
+            q_fp8,
+            q,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            positions,
+            rd,
+            out_scale=q_scale,
+            group_size=self._q_quant_group,
+        )
         q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
         q_scale = q_scale.view(total_tokens, self.n_heads, 1)
 
@@ -1436,7 +1421,7 @@ class DeepseekV4Attention(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        compress_stream: Optional[torch.cuda.Stream] = None,
+        indexer_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -1591,7 +1576,7 @@ class DeepseekV4Attention(nn.Module):
             self.indexer.compressor.rotary_emb = self.rotary_emb
 
         self.alt_stream = alt_stream
-        self.compress_stream = compress_stream
+        self.indexer_stream = indexer_stream
         self._use_async_compress = (
             self.alt_stream is not None and self.compressor is not None
         )
@@ -1657,7 +1642,7 @@ class DeepseekV4Attention(nn.Module):
         """Fire Compressor(s) on side streams, return immediately.
 
         Main Compressor → alt_stream (CSA + HCA).
-        Indexer Compressor → compress_stream (CSA only).
+        Indexer Compressor → indexer_stream (CSA only).
         Waits resolve instantly: side streams ~25us, main Q/KV chain ~87us."""
         fc = get_forward_context()
         current_stream = fc.main_stream
@@ -1668,7 +1653,7 @@ class DeepseekV4Attention(nn.Module):
             if has_compressor:
                 self.alt_stream.wait_stream(current_stream)
             if has_indexer:
-                self.compress_stream.wait_stream(current_stream)
+                self.indexer_stream.wait_stream(current_stream)
 
             if has_compressor:
                 with torch.cuda.stream(self.alt_stream):
@@ -1679,7 +1664,7 @@ class DeepseekV4Attention(nn.Module):
                         block_tables=block_tables,
                     )
             if has_indexer:
-                with torch.cuda.stream(self.compress_stream):
+                with torch.cuda.stream(self.indexer_stream):
                     self.indexer.compressor(
                         x,
                         plan=plan,
@@ -1783,6 +1768,16 @@ class DeepseekV4Attention(nn.Module):
         # from 4 (1.12×) to 32k (1.04×); used for both decode and prefill.
         # Optional FP8 quant outputs left off — downstream sparse_attn /
         # swa_write are still bf16.
+        # Decode folds the SWA cache-write into qk_norm_rope_maybe_quant: the
+        # post-norm/rope KV row is written into swa_kv[slot, pos%cache, :]
+        # (slot = state_slot_mapping[batch_id_per_token[t]]). The flydsl path
+        # fuses it into the kernel launch; the Triton fallback emits a separate
+        # swa_write internally — either way the bridge owns the SWA write, so
+        # no backend dispatch is needed here. Prefill writes its in-chunk SWA
+        # tail after sparse_attn, so it passes swa_kv=None and never fuses.
+        # For decode, write_per_batch (= min(max_seqlen_q, cache_size)) >=
+        # tokens-per-seq, so the fused per-token scatter (gated on batch_id>=0)
+        # covers exactly the tokens the old standalone swa_write did.
         q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
             q,
             kv_pre,
@@ -1796,19 +1791,15 @@ class DeepseekV4Attention(nn.Module):
             self.eps,
             quant_q=False,
             quant_k=False,
+            swa_kv=self.swa_kv if is_decode else None,
+            state_slot_mapping=state_slot_mapping if is_decode else None,
+            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
+            swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
+            swa_cache_size=cache_size if is_decode else None,
+            swa_write_per_batch=(
+                min(attn_md.max_seqlen_q, cache_size) if is_decode else None
+            ),
         )
-        if is_decode:
-            # SWA write per-token in decode (prefill writes after sparse_attn
-            # below so the in-chunk SWA tail is captured post-attention).
-            swa_write(
-                kv,
-                positions,
-                attn_md.cu_seqlens_q,
-                state_slot_mapping,
-                self.swa_kv,
-                cache_size,
-                min(attn_md.max_seqlen_q, cache_size),
-            )
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
@@ -1818,7 +1809,7 @@ class DeepseekV4Attention(nn.Module):
             if self.compressor is not None:
                 current_stream.wait_stream(self.alt_stream)
             if self.indexer is not None:
-                current_stream.wait_stream(self.compress_stream)
+                current_stream.wait_stream(self.indexer_stream)
         # ===== Compressor + Indexer =====
         if self.indexer is not None and not self.skip_topk:
             indexer_topk_batched = self.indexer.forward_batched(
@@ -2213,26 +2204,17 @@ class MoE(nn.Module):
         ), "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
         ids = fwd_input_ids.flatten()
         num_tokens = gating_output.shape[0]
-        ids = ids[:num_tokens].clamp(0, self.gate.tid2eid.shape[0] - 1)
-        topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
-        scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
-        topk_weights = scores.gather(dim=-1, index=topk_ids.long())
-        if renormalize:
-            topk_weights = topk_weights / topk_weights.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-20)
-        topk_weights = topk_weights * self.routed_scaling_factor
+        assert (
+            ids.shape[0] == num_tokens
+        ), f"input_ids length {ids.shape[0]} does not match gating_output num_tokens {num_tokens}"
+        tid2eid = self.gate.tid2eid
 
-        # Fused shared expert: the custom_routing_function path in
-        # `select_experts` (moe.py:3055) returns early and bypasses the
-        # sqrtsoftplus fused-shared branch (moe.py:3108). Without this block the
-        # returned topk_ids are [N, top_k] with ids in 0..n_routed-1 only — the
-        # shared expert (slot n_routed_experts) never appears, so moe_sorting
-        # assigns it no tokens and its contribution (≈40% of the layer output)
-        # is silently dropped. Replicate the shared-col append: write the routed
-        # weights/ids into the first `top_k` columns of the global topK buffer
-        # and return the full [N, top_k + n_shared] view (last cols pre-filled
-        # with shared id = n_routed_experts and weight = shared_experts_score).
+        # Fused-shared expert: the custom_routing_function path bypasses
+        # select_experts' shared-expert append, so the shared expert (slot
+        # n_routed_experts) would never be routed and its ~40% contribution
+        # dropped. When shared is fused, write the routed result into the first
+        # `topk` columns of the global topK buffer (shared cols pre-filled) and
+        # return the full [N, topk + n_shared] view.
         num_fused_shared = getattr(self.experts, "num_fused_shared_experts", 0)
         if num_fused_shared > 0:
             import atom.model_ops.topK as _topK_mod
@@ -2242,12 +2224,33 @@ class MoE(nn.Module):
                 "init_aiter_topK_meta_data must run before hash-layer routing."
             )
             total_topk_weights, total_topk_ids = _topK_mod.aiter_topK_meta_data
-            n_tokens = topk_ids.shape[0]
-            assert total_topk_weights.shape[0] >= n_tokens
-            total_topk_ids[:n_tokens, :topk] = topk_ids
-            total_topk_weights[:n_tokens, :topk] = topk_weights
-            return total_topk_weights[:n_tokens], total_topk_ids[:n_tokens]
+            assert total_topk_weights.shape[0] >= num_tokens
+            hash_topk_triton(
+                ids,
+                gating_output,
+                tid2eid,
+                renormalize,
+                self.routed_scaling_factor,
+                total_topk_ids[:num_tokens, :topk],
+                total_topk_weights[:num_tokens, :topk],
+            )
+            return total_topk_weights[:num_tokens], total_topk_ids[:num_tokens]
 
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+        )
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+        )
+        hash_topk_triton(
+            ids,
+            gating_output,
+            tid2eid,
+            renormalize,
+            self.routed_scaling_factor,
+            topk_ids,
+            topk_weights,
+        )
         return topk_weights, topk_ids
 
     def routed_expert_forward(
@@ -2294,7 +2297,7 @@ class MoE(nn.Module):
         if shared is not None:
             routed = routed + shared
         if self.tp_size > 1:
-            routed = _run_on_tbo_comm_stream(tensor_model_parallel_all_reduce, routed)
+            routed = tensor_model_parallel_all_reduce(routed)
         return routed
 
     def single_stream_moe_forward(
@@ -2369,7 +2372,7 @@ class Block(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        compress_stream: Optional[torch.cuda.Stream] = None,
+        indexer_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -2379,7 +2382,7 @@ class Block(nn.Module):
             args,
             prefix=f"{prefix}.attn",
             alt_stream=alt_stream,
-            compress_stream=compress_stream,
+            indexer_stream=indexer_stream,
         )
         self.ffn = MoE(layer_id, args, prefix=f"{prefix}.ffn", alt_stream=alt_stream)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -2679,13 +2682,13 @@ class DeepseekV4Model(nn.Module):
         # directly. At TP>1 each rank holds vocab_size/tp rows.
         self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
         # alt_stream: dual-stream MoE (shared_experts // routed_experts) AND
-        # Main Compressor overlap. compress_stream: Indexer Compressor overlap.
+        # Main Compressor overlap. indexer_stream: Indexer Compressor overlap.
         # Both allocated once, shared across all blocks. Attention runs before
         # MoE in each block, so attn and MoE never contend for alt_stream.
         self.alt_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
-        self.compress_stream: Optional[torch.cuda.Stream] = (
+        self.indexer_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
         self.layers = nn.ModuleList(
@@ -2695,7 +2698,7 @@ class DeepseekV4Model(nn.Module):
                     args,
                     prefix=f"layers.{layer_id}",
                     alt_stream=self.alt_stream,
-                    compress_stream=self.compress_stream,
+                    indexer_stream=self.indexer_stream,
                 )
                 for layer_id in range(args.n_layers)
             ]
@@ -2854,11 +2857,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
             # gate sees DP-gathered gating_output, so gather ids to match. Run
-            # the gather INLINE on the compute stream. The original side-stream
-            # hop (_run_on_tbo_comm_stream) coordinated this ids all-gather with
-            # a DIFFERENT stream/sync than the MoE hidden/router DP gather under
-            # TBO → mismatched DP layouts → wrong V4 hash routing (GSM8K
-            # 0.95→0.87). NOTE: do NOT wrap this in the TBO ping-pong
+            # the gather INLINE on the compute stream. Running this all-gather on
+            # a side stream coordinated it with a DIFFERENT stream/sync than the
+            # MoE hidden/router DP gather under TBO → mismatched DP layouts →
+            # wrong V4 hash routing (GSM8K 0.95→0.87). NOTE: do NOT wrap this in
+            # the TBO ping-pong
             # (tbo_yield_and_switch_*) — injecting an extra yield at forward top
             # desyncs the ping-pong ring and collapses accuracy to ~0.54
             # (measured). The ids tensor is [N,1] int (tiny vs hidden [N,7168]),

@@ -6,11 +6,11 @@ concurrency:
 
 on:
   schedule:
-    # Nightly at 22:00 Beijing time (14:00 UTC).
-    - cron: '0 14 * * 1,3'  # Mon/Wed: SGLang-OOB non-MTP DeepSeek configs
-    - cron: '0 14 * * 2,4'  # Tue/Thu: SGLang-OOB MTP + Qwen configs
-    - cron: '0 14 * * 5'    # Fri: SGLang-Mesh all configs
-    - cron: '0 14 * * 6'    # Sat: SGLang-OOB all configs
+    # Nightly at 23:00 Beijing time (15:00 UTC; Mesh Fri +30m). OOB tiers + MI308; Fri Mesh (see load-models).
+    - cron: '0 15 * * 1,3,5'  # Mon/Wed/Fri: SGLang-OOB P0 + MI308
+    - cron: '0 15 * * 2,4'    # Tue/Thu: SGLang-OOB P1 + MI308
+    - cron: '0 15 * * 6'      # Sat only: SGLang-OOB P2 + MI308 (Sun excluded)
+    - cron: '30 15 * * 5'    # Fri: SGLang-Mesh all (offset from :00 Fri OOB so cron strings differ)
   workflow_dispatch:
     inputs:
       benchmark_suite:
@@ -27,22 +27,35 @@ on:
           - "none (do not run SGLang-OOB models)"
           - "deepseek-r1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-v3-2-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-v3-2-fp8-tp4-dp4-ep4 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-v3-2-fp8-tp8-dp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp4-dp4-ep4 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
-          - "deepseek-r1-fp4-tp4-dp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-r1-fp4-tp8-dp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-mtp3 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-tp8-mtp1 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-mtp3-tp4-dp4-ep4 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "deepseek-r1-fp4-mtp3-tp8-dp8-ep8 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp4 (1024x1024/8192x1024: [4,8,16,32,64])"
           - "qwen3-5-397b-a17b-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
-          - "all-deepseek (11 DeepSeek configs x 10 default params)"
-          - "all-deepseek-non-mtp (7 DeepSeek non-MTP configs x 10 default params)"
+          - "qwen3-5-397b-a17b-fp8-tp4-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-5-397b-a17b-fp8-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-5-35b-a3b-fp8-tp1-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-32b-fp8-tp1-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "qwen3-32b-fp8-tp8-mi308 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "deepseek-v3-2-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "glm-5-1-fp8-tp8 (1024x1024/8192x1024: [4,8,16,32,64])"
+          - "all-deepseek (15 DeepSeek configs x 10 default params)"
+          - "all-deepseek-non-mtp (11 DeepSeek non-MTP configs x 10 default params)"
           - "all-deepseek-mtp (4 DeepSeek MTP configs x 10 default params)"
-          - "all-qwen (2 Qwen configs x 10 default params)"
-          - "all-oob (13 SGLang-OOB configs x 10 default params)"
+          - "all-deepseek-v3-2 (4 DeepSeek-V3.2 FP8 OOB configs x 10 default params)"
+          - "all-deepseek-v3-2_glm_qwen (DeepSeek-V3.2 + GLM + Qwen OOB configs x 10 default params)"
+          - "all-qwen (7 Qwen configs x 10 default params)"
+          - "all-glm (1 GLM config x 10 default params)"
+          - "all-oob (23 SGLang-OOB configs x 10 default params)"
         default: "none (do not run SGLang-OOB models)"
       mesh_config_preset:
         description: "SGLang-Mesh config subset (ignored for SGLang-OOB)"
@@ -159,8 +172,8 @@ jobs:
           WORKLOAD_LABEL="${INPUT_WORKLOAD_LABEL:-SGLang-OOB}"
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             case "${SCHEDULE_CRON}" in
-              "0 14 * * 5") WORKLOAD_LABEL="SGLang-Mesh" ;;
-              "0 14 * * 1,3"|"0 14 * * 2,4"|"0 14 * * 6") WORKLOAD_LABEL="SGLang-OOB" ;;
+              "30 15 * * 5") WORKLOAD_LABEL="SGLang-Mesh" ;;
+              "0 15 * * 1,3,5"|"0 15 * * 2,4"|"0 15 * * 6") WORKLOAD_LABEL="SGLang-OOB" ;;
               *) WORKLOAD_LABEL="SGLang-OOB" ;;
             esac
           fi
@@ -451,41 +464,93 @@ jobs:
                   return prefix.startswith("deepseek-") and "mtp" not in prefix
               if preset == "all-deepseek-mtp":
                   return prefix.startswith("deepseek-") and "mtp" in prefix
+              if preset == "all-deepseek-v3-2":
+                  return prefix.startswith("deepseek-v3-2-")
+              if preset == "all-deepseek-v3-2_glm_qwen":
+                  # Union of three families: each model matches one branch; the workflow runs all selected models.
+                  return (
+                      prefix.startswith("deepseek-v3-2-")
+                      or prefix.startswith("glm")
+                      or prefix.startswith("qwen")
+                  )
               if preset == "all-qwen":
                   return prefix.startswith("qwen")
+              if preset == "all-glm":
+                  return prefix.startswith("glm")
               return prefix == preset
 
-          def is_oob_mtp(model):
-              return matches_workload(model) and "mtp" in str(model.get("prefix", ""))
+          OOB_P0_PREFIX_ORDER = ["glm-5-1-fp8-tp8"]
+          OOB_P1_PREFIX_ORDER = [
+              "deepseek-v3-2-fp8-tp4",
+              "deepseek-v3-2-fp8-tp4-dp4-ep4",
+              "deepseek-v3-2-fp8-tp8",
+              "deepseek-v3-2-fp8-tp8-dp8-ep8",
+          ]
+          OOB_P2_PREFIX_ORDER = [
+              "deepseek-r1-fp8-tp8",
+              "deepseek-r1-fp8-tp4",
+              "deepseek-r1-fp4-tp8",
+              "deepseek-r1-fp4-tp8-ep8",
+              "deepseek-r1-fp4-tp8-dp8-ep8",
+              "deepseek-r1-fp4-tp8-mtp3",
+              "deepseek-r1-fp4-tp8-mtp1",
+              "deepseek-r1-fp4-tp4",
+              "deepseek-r1-fp4-tp4-dp4-ep4",
+              "deepseek-r1-fp4-mtp3-tp4-dp4-ep4",
+              "deepseek-r1-fp4-mtp3-tp8-dp8-ep8",
+              "qwen3-5-397b-a17b-fp8-tp4",
+              "qwen3-5-397b-a17b-fp8-tp8",
+          ]
 
-          def is_oob_qwen(model):
-              return matches_workload(model) and str(model.get("prefix", "")).startswith("qwen")
+          def is_oob_mi308(model):
+              return matches_workload(model) and "mi308" in str(model.get("prefix", ""))
 
-          def is_oob_non_mtp_deepseek(model):
-              prefix = str(model.get("prefix", ""))
-              return matches_workload(model) and prefix.startswith("deepseek-") and "mtp" not in prefix
+          def first_model_by_prefix(candidates):
+              """Catalog may list the same prefix twice; keep first occurrence order."""
+              by_prefix = {}
+              for model in candidates:
+                  if not matches_workload(model):
+                      continue
+                  prefix = str(model.get("prefix", ""))
+                  if prefix not in by_prefix:
+                      by_prefix[prefix] = model
+              return by_prefix
+
+          def scheduled_oob_selection(schedule_cron):
+              schedule_to_tier = {
+                  "0 15 * * 1,3,5": ("OOB-P0", OOB_P0_PREFIX_ORDER),
+                  "0 15 * * 2,4": ("OOB-P1", OOB_P1_PREFIX_ORDER),
+                  "0 15 * * 6": ("OOB-P2", OOB_P2_PREFIX_ORDER),
+              }
+              if schedule_cron not in schedule_to_tier:
+                  return "SKIP-UNKNOWN-DAY", []
+              selected_group, tier_order = schedule_to_tier[schedule_cron]
+              by_prefix = first_model_by_prefix(models)
+              tier_prefixes = frozenset(tier_order)
+              selected = []
+              for prefix in tier_order:
+                  model = by_prefix.get(prefix)
+                  if model is not None:
+                      selected.append(model)
+              for prefix in sorted(by_prefix):
+                  if prefix in tier_prefixes:
+                      continue
+                  model = by_prefix[prefix]
+                  if is_oob_mi308(model):
+                      selected.append(model)
+              return selected_group, selected
 
           if event == "schedule":
               schedule_cron = os.environ.get("SCHEDULE_CRON", "")
-              if schedule_cron == "0 14 * * 1,3":
-                  selected_group = "OOB-NON-MTP-DEEPSEEK"
-                  selected = [m for m in models if is_oob_non_mtp_deepseek(m)]
-              elif schedule_cron == "0 14 * * 2,4":
-                  selected_group = "OOB-MTP-QWEN"
-                  selected = [m for m in models if is_oob_mtp(m) or is_oob_qwen(m)]
-              elif schedule_cron == "0 14 * * 5":
+              if schedule_cron == "30 15 * * 5":
                   selected_group = "MESH-ALL"
                   selected = [
                       m
                       for m in models
                       if matches_workload(m) and has_mesh_preset(m, "all")
                   ]
-              elif schedule_cron == "0 14 * * 6":
-                  selected_group = "OOB-ALL"
-                  selected = [m for m in models if matches_workload(m)]
               else:
-                  selected_group = "SKIP-UNKNOWN-DAY"
-                  selected = []
+                  selected_group, selected = scheduled_oob_selection(schedule_cron)
           else:
               if workload_label == "SGLang-Mesh":
                   mesh_preset = normalize_mesh_preset(os.environ.get("MESH_CONFIG_PRESET"))
@@ -537,7 +602,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       benchmark_matrix: ${{ steps.build.outputs.benchmark_matrix }}
+      benchmark_matrix_mi355: ${{ steps.build.outputs.benchmark_matrix_mi355 }}
+      benchmark_matrix_mi308: ${{ steps.build.outputs.benchmark_matrix_mi308 }}
       has_benchmark_cells: ${{ steps.build.outputs.has_benchmark_cells }}
+      has_benchmark_cells_mi355: ${{ steps.build.outputs.has_benchmark_cells_mi355 }}
+      has_benchmark_cells_mi308: ${{ steps.build.outputs.has_benchmark_cells_mi308 }}
     steps:
       - name: Combine models and params
         id: build
@@ -545,9 +614,10 @@ jobs:
           MODELS_JSON: ${{ needs.load-models.outputs.models_json }}
           PARAMS_JSON: ${{ needs.parse-param-lists.outputs.matrix_json }}
         run: |
-          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          python3 - <<'PY'
           import json
           import os
+          import sys
 
           models = json.loads(os.environ["MODELS_JSON"])
           params = json.loads(os.environ["PARAMS_JSON"])
@@ -592,20 +662,35 @@ jobs:
                       continue
                   if supported_concurrency_values and int(param["concurrency"]) not in supported_concurrency_values:
                       continue
-                  
+
                   include.append({"model": model, "params": param})
 
-          print(json.dumps({"include": include}))
+          def is_mi308_row(row):
+              return "mi308" in str(row["model"].get("runner", ""))
+
+          mi308_rows = [row for row in include if is_mi308_row(row)]
+          mi355_rows = [row for row in include if not is_mi308_row(row)]
+
+          sep = (",", ":")
+          full = json.dumps({"include": include}, separators=sep)
+          j355 = json.dumps({"include": mi355_rows}, separators=sep)
+          j308 = json.dumps({"include": mi308_rows}, separators=sep)
+
+          gh_out = os.environ["GITHUB_OUTPUT"]
+          with open(gh_out, "a", encoding="utf-8") as fh:
+              fh.write(f"benchmark_matrix={full}\n")
+              fh.write(f"benchmark_matrix_mi355={j355}\n")
+              fh.write(f"benchmark_matrix_mi308={j308}\n")
+              fh.write("has_benchmark_cells=" + ("false" if not include else "true") + "\n")
+              fh.write("has_benchmark_cells_mi355=" + ("false" if not mi355_rows else "true") + "\n")
+              fh.write("has_benchmark_cells_mi308=" + ("false" if not mi308_rows else "true") + "\n")
+
+          if not include:
+              print("No eligible benchmark cases remain after model-specific parameter filtering.", file=sys.stderr)
+          else:
+              print(f"Benchmark matrix (full): {full}", file=sys.stderr)
+              print(f"MI355 shard cells: {len(mi355_rows)}, MI308 shard cells: {len(mi308_rows)}", file=sys.stderr)
           PY
-          )"
-          echo "benchmark_matrix=${BENCHMARK_MATRIX}" >> "$GITHUB_OUTPUT"
-          if [ "${BENCHMARK_MATRIX}" = '{"include":[]}' ]; then
-            echo "has_benchmark_cells=false" >> "$GITHUB_OUTPUT"
-            echo "No eligible benchmark cases remain after model-specific parameter filtering."
-          else
-            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
-            echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
-          fi
 
   build-sglang-image:
     name: Build custom SGLang benchmark image
@@ -714,614 +799,65 @@ jobs:
           docker rmi "${{ steps.image-meta.outputs.sglang_image_tag }}" || true
           docker rmi atom_sglang_base:ci || true
 
-  benchmark:
-    name: SGLang ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
+  benchmark-mi355:
+    name: SGLang benchmark (MI355 / non-MI308 runners)
     needs: [resolve-atom-source, build-benchmark-matrix, build-sglang-image]
     if: >-
       always()
       && needs.resolve-atom-source.result == 'success'
       && needs.build-benchmark-matrix.result == 'success'
       && (needs.build-sglang-image.result == 'success' || needs.build-sglang-image.result == 'skipped')
-      && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.build-benchmark-matrix.outputs.benchmark_matrix) }}
-    runs-on: ${{ matrix.model.runner }}
-    timeout-minutes: 240
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells_mi355 == 'true'
     permissions:
       actions: read
       contents: write
-    env:
-      MODEL_NAME: ${{ matrix.model.display }}
-      DASHBOARD_MODEL_NAME: ${{ matrix.model.dashboard_model || '' }}
-      MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
-      MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
-      SGLANG_EXTRA_ARGS: ${{ matrix.model.extra_args }}
-      BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
-      MESH_SERVER_MODE: ${{ inputs.mesh_server_mode || 'sglang-atom' }}
-      MESH_SPEC_MODE: ${{ matrix.model.mesh_spec_mode || 'none' }}
-      MESH_TP_SIZE: ${{ matrix.model.tp_size || '' }}
-      MESH_DP_SIZE: ${{ matrix.model.dp_size || '' }}
-      MESH_EP_SIZE: ${{ matrix.model.ep_size || '' }}
-      CASE_EXTRA_ARGS_BY_PAIR: ${{ toJson(matrix.model.case_extra_args_by_pair) }}
-      CASE_ENV_VARS_BY_PAIR: ${{ toJson(matrix.model.case_env_vars_by_pair) }}
-      RESULT_PREFIX: ${{ matrix.model.prefix }}
-      ISL: ${{ matrix.params.input_length }}
-      OSL: ${{ matrix.params.output_length }}
-      CONC: ${{ matrix.params.concurrency }}
-      RANDOM_RANGE_RATIO: ${{ matrix.params.random_range_ratio }}
-      RESULT_FILENAME: ${{ matrix.model.prefix }}-${{ matrix.params.input_length }}-${{ matrix.params.output_length }}-${{ matrix.params.concurrency }}-${{ matrix.params.random_range_ratio }}
-      WORKLOAD_LABEL: ${{ matrix.model.workload_label || needs.resolve-atom-source.outputs.workload_label }}
-      CONTAINER_NAME: atom_sglang_benchmark_${{ strategy.job-index }}
-      CONTAINER_RESULT_DIR: /tmp/sglang-benchmark-results
-      CONTAINER_BENCH_SERVING_DIR: /tmp/sglang-benchmark/bench_serving
-      SGLANG_IMAGE_TAG: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
-      SGLANG_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.sglang_image_source }}
-      BENCH_SERVING_REPO_URL: https://github.com/kimbochen/bench_serving.git
-      ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
-      ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
-      SGLANG_REF_USED: ${{ needs.resolve-atom-source.outputs.selected_sglang_ref }}
-      SGLANG_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
-      PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
-      UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
-    steps:
-      - name: Detect container engine
-        run: |
-          if command -v podman > /dev/null 2>&1; then
-            echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
-            echo "Container engine: podman"
-          elif docker info > /dev/null 2>&1; then
-            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
-            echo "Container engine: docker"
-          else
-            echo "ERROR: Neither docker nor podman is available on this runner."
-            exit 1
-          fi
+    uses: ./.github/workflows/atom-sglang-benchmark-gpu-shard.yaml
+    secrets: inherit
+    with:
+      shard_suffix: mi355
+      benchmark_matrix_json: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix_mi355 }}
+      mesh_server_mode: ${{ inputs.mesh_server_mode || 'sglang-atom' }}
+      atom_repository: ${{ needs.resolve-atom-source.outputs.atom_repository }}
+      atom_ref: ${{ needs.resolve-atom-source.outputs.atom_ref }}
+      workload_label: ${{ needs.resolve-atom-source.outputs.workload_label }}
+      prebuilt_sglang_image: ${{ needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
+      sglang_image_source: ${{ needs.resolve-atom-source.outputs.sglang_image_source }}
+      selected_sglang_ref: ${{ needs.resolve-atom-source.outputs.selected_sglang_ref }}
+      selected_sglang_version: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
+      publish_to_dashboard: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
+      upload_to_custom_dashboard: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
+      sglang_image_tag: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
+      atom_source_sha_for_checkout: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
 
-      #- name: Clean up containers and workspace
-      #  run: |
-      #    echo "=== Cleaning up containers on $(hostname) ==="
-      #    containers=$($CONTAINER_ENGINE ps -q)
-      #    if [ -n "$containers" ]; then
-      #      $CONTAINER_ENGINE kill $containers || true
-      #    fi
-      #    $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
-      #    $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged docker.io/rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
-
-      - name: Checkout benchmark ATOM source
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.ATOM_SOURCE_REPOSITORY }}
-          ref: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
-          fetch-depth: 1
-
-      - name: Record benchmark source revision
-        run: |
-          SOURCE_SHA="$(git rev-parse HEAD)"
-          echo "ATOM_SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
-          echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${SGLANG_IMAGE_SOURCE} image ${SGLANG_IMAGE_TAG}"
-
-      - name: Container Engine Login
-        run: |
-          set -euo pipefail
-          IMG="${SGLANG_IMAGE_TAG}"
-          if [[ "${IMG}" != */* ]]; then
-            IMG="docker.io/library/${IMG}"
-          else
-            reg="${IMG%%/*}"
-            if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
-              IMG="docker.io/${IMG}"
-            fi
-          fi
-          echo "SGLANG_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
-          REG="${IMG%%/*}"
-          echo "Logging in to registry: ${REG}"
-          echo "${{ secrets.DOCKER_PASSWORD }}" | $CONTAINER_ENGINE login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
-
-      - name: Set HF_TOKEN
-        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
-
-      - name: Pull SGLang benchmark image
-        run: |
-          set -euo pipefail
-          IMG="${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
-          if [[ -z "${IMG}" ]]; then
-            echo "ERROR: SGLang image reference is empty."
-            exit 1
-          fi
-          echo "Pulling SGLang benchmark image: ${IMG} (workflow tag: ${SGLANG_IMAGE_TAG})"
-          pull_ok=false
-          for attempt in 1 2 3; do
-            echo "Pull attempt ${attempt}/3: ${IMG}"
-            if $CONTAINER_ENGINE pull "${IMG}"; then
-              pull_ok=true
-              break
-            fi
-            sleep $((attempt * 10))
-          done
-
-          if [[ "${pull_ok}" != "true" && "${CONTAINER_ENGINE}" == "podman" ]]; then
-            echo "Plain podman pull failed; retrying with docker transport."
-            if $CONTAINER_ENGINE pull "docker://${IMG}"; then
-              pull_ok=true
-            fi
-          fi
-
-          if [[ "${pull_ok}" != "true" ]]; then
-            echo "ERROR: Failed to pull SGLang benchmark image: ${IMG}"
-            exit 1
-          fi
-
-      - name: Prepare model cache mount
-        run: |
-          MODEL_CACHE_MOUNT=""
-          MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/it-share/models" ]; then
-            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
-            MODEL_CACHE_DESC="/it-share/models (shared host path)"
-          elif [ -d "/models" ]; then
-            MODEL_CACHE_MOUNT="-v /models:/models"
-            MODEL_CACHE_DESC="/models (shared host path)"
-          elif [ -d "/data/models" ]; then
-            MODEL_CACHE_MOUNT="-v /data/models:/models"
-            MODEL_CACHE_DESC="/data/models (shared host path)"
-          else
-            echo "No shared host model cache found; using container-local /models."
-          fi
-
-          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
-          echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
-          echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
-
-      - name: Start SGLang benchmark container
-        run: |
-          if [ -f "/etc/podinfo/gha-render-devices" ]; then
-            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
-          else
-            DEVICE_FLAG="--device /dev/dri"
-          fi
-
-          MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
-          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
-
-          printf '%s\n' "${{ matrix.model.env_vars }}" | sed 's/^[[:space:]]*//' > /tmp/oot_env_file.txt
-          CASE_KEY="${ISL}x${OSL}"
-          CASE_ENV_VARS="$(
-            CASE_ENV_VARS_BY_PAIR="${CASE_ENV_VARS_BY_PAIR:-null}" CASE_KEY="${CASE_KEY}" python3 - <<'PY'
-          import json
-          import os
-
-          raw = os.environ.get("CASE_ENV_VARS_BY_PAIR") or "null"
-          try:
-              mapping = json.loads(raw)
-          except json.JSONDecodeError:
-              mapping = None
-          if isinstance(mapping, dict):
-              value = mapping.get(os.environ["CASE_KEY"], "")
-              if value:
-                  print(value)
-          PY
-          )"
-          if [[ -n "${CASE_ENV_VARS}" ]]; then
-            printf '%s\n' "${CASE_ENV_VARS}" >> /tmp/oot_env_file.txt
-          fi
-
-          # Podman + crun: avoid "create keyring ... Disk quota exceeded" (kernel user-keyring
-          # quota on shared runners). Docker ignores CONTAINERS_CONF_OVERRIDE; Podman reads it.
-          ATOM_SGLANG_PODMAN_CONF=""
-          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
-            ATOM_SGLANG_PODMAN_CONF="$(mktemp "${TMPDIR:-/tmp}/atom-sglang-containers-conf.XXXXXX")"
-            printf '%s\n' '[containers]' 'keyring=false' > "${ATOM_SGLANG_PODMAN_CONF}"
-            _atom_sglang_prev_exit_body="$(trap -p EXIT | sed -nE "s/^trap -- '(.*)' EXIT$/\1/p" || true)"
-            cleanup_atom_podman_conf() {
-              rm -f "${ATOM_SGLANG_PODMAN_CONF:-}"
-              if [[ -n "${_atom_sglang_prev_exit_body:-}" ]]; then
-                eval "${_atom_sglang_prev_exit_body}"
-              fi
-            }
-            trap cleanup_atom_podman_conf EXIT
-          fi
-
-          container_engine_run() {
-            if [[ "${CONTAINER_ENGINE}" != "podman" ]]; then
-              "${CONTAINER_ENGINE}" "$@"
-              return
-            fi
-            CONTAINERS_CONF_OVERRIDE="${ATOM_SGLANG_PODMAN_CONF}" "${CONTAINER_ENGINE}" "$@"
-          }
-
-          container_engine_run run -dt --device=/dev/kfd $DEVICE_FLAG \
-            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-            $MODEL_MOUNT \
-            -w /workspace \
-            --ipc=host --group-add keep-groups \
-            --privileged \
-            --cap-add=SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            --env-file /tmp/oot_env_file.txt \
-            -e HF_TOKEN="${HF_TOKEN:-}" \
-            --name "$CONTAINER_NAME" \
-            --entrypoint /bin/bash \
-            "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" \
-            -lc 'trap "exit 0" TERM INT; sleep infinity & wait'
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Collect GPU info (inside container)
-        id: gpu-info
-        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
-
-      - name: Download model if needed
-        run: |
-          model_dir="${MODEL_PATH}"
-          if [[ "${model_dir}" = /models/* ]]; then
-            model_dir="/models/${model_dir#/models/}"
-          elif [[ "${model_dir}" = /it-share/models/* ]]; then
-            model_dir="/models/${model_dir#/it-share/models/}"
-          elif [[ "${model_dir}" = /data/models/* ]]; then
-            model_dir="/models/${model_dir#/data/models/}"
-          elif [[ "${model_dir}" != /* ]]; then
-            model_dir="/models/${model_dir}"
-          fi
-          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "/models directory found, downloading model to ${model_dir}"
-            if ! $CONTAINER_ENGINE exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download \"${MODEL_SOURCE_PATH}\" --local-dir \"$model_dir\""; then
-              echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
-              exit 1
-            fi
-          else
-            echo "/models directory not mounted; skipping model download"
-          fi
-
-      - name: Resolve SGLang model path
-        run: |
-          model_dir="${MODEL_PATH}"
-          if [[ "${model_dir}" = /models/* ]]; then
-            model_dir="/models/${model_dir#/models/}"
-          elif [[ "${model_dir}" = /it-share/models/* ]]; then
-            model_dir="/models/${model_dir#/it-share/models/}"
-          elif [[ "${model_dir}" = /data/models/* ]]; then
-            model_dir="/models/${model_dir#/data/models/}"
-          elif [[ "${model_dir}" != /* ]]; then
-            model_dir="/models/${model_dir}"
-          fi
-          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "SGLANG_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
-            echo "Using mounted model path: ${model_dir}"
-          else
-            echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_SOURCE_PATH}" >> "$GITHUB_ENV"
-            echo "Using model id: ${MODEL_SOURCE_PATH}"
-          fi
-
-      - name: Prepare SGLang benchmark runner in container
-        run: |
-          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
-            set -euo pipefail
-            rm -rf \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
-            mkdir -p \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
-            git clone --depth 1 \"${BENCH_SERVING_REPO_URL}\" \"${CONTAINER_BENCH_SERVING_DIR}\"
-            test -f \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\"
-          "
-
-      - name: Run SGLang benchmark
-        timeout-minutes: 240
-        env:
-          MAX_WAIT_RETRIES: "120"
-          STREAM_SGLANG_LOGS: "1"
-        run: |
-          set -euo pipefail
-          echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
-          EFFECTIVE_BENCHMARK_RUNNER="sglang_atom"
-          EFFECTIVE_SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}"
-          CASE_KEY="${ISL}x${OSL}"
-          CASE_EXTRA_ARGS="$(
-            CASE_EXTRA_ARGS_BY_PAIR="${CASE_EXTRA_ARGS_BY_PAIR:-null}" CASE_KEY="${CASE_KEY}" python3 - <<'PY'
-          import json
-          import os
-
-          raw = os.environ.get("CASE_EXTRA_ARGS_BY_PAIR") or "null"
-          try:
-              mapping = json.loads(raw)
-          except json.JSONDecodeError:
-              mapping = None
-          if isinstance(mapping, dict):
-              value = mapping.get(os.environ["CASE_KEY"], "")
-              if value:
-                  print(value)
-          PY
-          )"
-          if [[ -n "${CASE_EXTRA_ARGS}" ]]; then
-            EFFECTIVE_SGLANG_EXTRA_ARGS="${EFFECTIVE_SGLANG_EXTRA_ARGS} ${CASE_EXTRA_ARGS}"
-          fi
-          BENCH_NUM_PROMPTS="$(( CONC * 10 ))"
-          BENCH_NUM_WARMUPS="$(( 2 * CONC ))"
-          if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && "${MESH_DP_SIZE:-1}" -gt 1 && "${MESH_EP_SIZE:-1}" -gt 1 ]]; then
-            BENCH_NUM_PROMPTS="$(( CONC * 3 ))"
-            BENCH_NUM_WARMUPS="${CONC}"
-          fi
-          if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && "${MESH_SERVER_MODE}" == "sglang-mori" ]]; then
-            case "${SGLANG_IMAGE_TAG}" in
-              lmsysorg/sglang-rocm*|docker.io/lmsysorg/sglang-rocm*) ;;
-              *)
-                echo "ERROR: mesh_server_mode=sglang-mori requires docker_image to start with lmsysorg/sglang-rocm."
-                echo "Current image: ${SGLANG_IMAGE_TAG}"
-                exit 1
-                ;;
-            esac
-            EFFECTIVE_BENCHMARK_RUNNER="mori_sglang_mesh"
-            $CONTAINER_ENGINE exec \
-              -e MODEL="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
-              -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
-              -e TP="${MESH_TP_SIZE}" \
-              -e DP_SIZE="${MESH_DP_SIZE:-1}" \
-              -e EP_SIZE="${MESH_EP_SIZE:-1}" \
-              -e CONC="${CONC}" \
-              -e ISL="${ISL}" \
-              -e OSL="${OSL}" \
-              -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
-              -e RESULT_FILENAME="${RESULT_FILENAME}" \
-              -e RESULT_DIR="${CONTAINER_RESULT_DIR}" \
-              -e BENCH_SERVING_DIR="${CONTAINER_BENCH_SERVING_DIR}" \
-              -e SERVER_EXTRA_ARGS="${EFFECTIVE_SGLANG_EXTRA_ARGS}" \
-              -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
-              -e SPEC_MODE="${MESH_SPEC_MODE}" \
-              -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
-              -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
-              "$CONTAINER_NAME" bash -lc "
-                set -euo pipefail
-                bash .github/scripts/atom_sglang_mesh_benchmark.sh
-              "
-          else
-            if [[ "${WORKLOAD_LABEL}" == "SGLang-Mesh" && -n "${MESH_TP_SIZE}" ]]; then
-              EFFECTIVE_SGLANG_EXTRA_ARGS="--tensor-parallel-size ${MESH_TP_SIZE} ${EFFECTIVE_SGLANG_EXTRA_ARGS}"
-            fi
-            $CONTAINER_ENGINE exec -d \
-              -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
-              -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
-              -e SGLANG_EXTRA_ARGS="${EFFECTIVE_SGLANG_EXTRA_ARGS}" \
-              -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
-              -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
-              -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
-              "$CONTAINER_NAME" bash -lc "
-                set -euo pipefail
-                bash .github/scripts/atom_sglang_test.sh start
-              "
-
-            last_sglang_log_line=0
-
-            emit_new_sglang_logs() {
-              if [ "${STREAM_SGLANG_LOGS}" != "1" ]; then
-                return 0
-              fi
-
-              current_line_count=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'if [ -f /tmp/atom_sglang.log ]; then wc -l < /tmp/atom_sglang.log; else echo 0; fi' 2>/dev/null || echo 0)
-              current_line_count=${current_line_count//$'\r'/}
-              if [ "${current_line_count:-0}" -le "${last_sglang_log_line}" ]; then
-                return 0
-              fi
-
-              echo ""
-              echo "========== New SGLang log output =========="
-              $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "sed -n '$((last_sglang_log_line + 1)),${current_line_count}p' /tmp/atom_sglang.log" || true
-              last_sglang_log_line=${current_line_count}
-            }
-
-            for ((i=1; i<=MAX_WAIT_RETRIES; i++)); do
-              if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'curl -fsS http://127.0.0.1:8000/v1/models >/dev/null 2>&1'; then
-                emit_new_sglang_logs
-                echo "SGLang server is ready."
-                break
-              fi
-
-              emit_new_sglang_logs
-
-              server_status=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc '
-                if [ -f /tmp/atom_sglang.pid ]; then
-                  pid=$(cat /tmp/atom_sglang.pid)
-                  if kill -0 "$pid" 2>/dev/null; then
-                    echo running
-                  else
-                    echo dead
-                  fi
-                elif pgrep -f "sglang.launch_server" >/dev/null 2>&1; then
-                  echo running
-                else
-                  echo starting
-                fi
-              ' 2>/dev/null || echo unknown)
-
-              if [ "${server_status}" = "dead" ]; then
-                echo "SGLang server process exited before becoming ready."
-                $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/atom_sglang.log || true' || true
-                exit 1
-              fi
-
-              echo "Waiting for SGLang server... (${i}/${MAX_WAIT_RETRIES}; status=${server_status})"
-              sleep "${WAIT_INTERVAL_SEC:-30}"
-            done
-
-            if ! $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'curl -fsS http://127.0.0.1:8000/v1/models >/dev/null 2>&1'; then
-              echo "SGLang server did not become ready in time."
-              emit_new_sglang_logs
-              $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc 'tail -n 200 /tmp/atom_sglang.log || true' || true
-              exit 1
-            fi
-
-            TRUST_REMOTE_CODE_ARG=""
-            if [[ "${EFFECTIVE_SGLANG_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
-              TRUST_REMOTE_CODE_ARG="--trust-remote-code"
-            fi
-
-            $CONTAINER_ENGINE exec \
-              -e ISL="${ISL}" \
-              -e OSL="${OSL}" \
-              -e CONC="${CONC}" \
-              -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
-              -e RESULT_FILENAME="${RESULT_FILENAME}" \
-              -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
-              "$CONTAINER_NAME" bash -lc "
-                set -euo pipefail
-                rm -rf \"${CONTAINER_RESULT_DIR}\"
-                mkdir -p \"${CONTAINER_RESULT_DIR}\"
-                PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
-                  --model=\"${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
-                  --backend=sglang \
-                  --base-url=http://127.0.0.1:8000 \
-                  --dataset-name=random \
-                  --random-input-len=\"${ISL}\" \
-                  --random-output-len=\"${OSL}\" \
-                  --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
-                  --num-prompts=\"${BENCH_NUM_PROMPTS}\" \
-                  --max-concurrency=\"${CONC}\" \
-                  ${TRUST_REMOTE_CODE_ARG} \
-                  --num-warmups=\"${BENCH_NUM_WARMUPS}\" \
-                  --request-rate=inf \
-                  --ignore-eos \
-                  --save-result \
-                  --percentile-metrics=\"ttft,tpot,itl,e2el\" \
-                  --result-dir=\"${CONTAINER_RESULT_DIR}\" \
-                  --result-filename=\"${RESULT_FILENAME}.json\" \
-                  ${BENCH_EXTRA_ARGS:-}
-              "
-          fi
-
-          $CONTAINER_ENGINE exec -i \
-            -e RESULT_PATH="${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" \
-            -e ISL="${ISL}" \
-            -e OSL="${OSL}" \
-            -e EXTRA_ARGS_TEXT="${EFFECTIVE_SGLANG_EXTRA_ARGS}" \
-            -e DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
-            -e ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
-            -e ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
-            -e ATOM_SOURCE_SHA="${ATOM_SOURCE_SHA}" \
-            -e SGLANG_REF_USED="${SGLANG_REF_USED}" \
-            -e SGLANG_VERSION_USED="${SGLANG_VERSION_USED}" \
-            -e SGLANG_IMAGE_SOURCE="${SGLANG_IMAGE_SOURCE}" \
-            -e SGLANG_IMAGE_TAG_USED="${SGLANG_IMAGE_TAG}" \
-            -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
-            -e UPLOAD_TO_CUSTOM_DASHBOARD="${UPLOAD_TO_CUSTOM_DASHBOARD}" \
-            -e WORKLOAD_LABEL="${WORKLOAD_LABEL}" \
-            -e BENCHMARK_RUNNER="${EFFECTIVE_BENCHMARK_RUNNER}" \
-            -e MESH_SERVER_MODE="${MESH_SERVER_MODE}" \
-            -e MESH_SPEC_MODE="${MESH_SPEC_MODE}" \
-            -e MESH_TP_SIZE="${MESH_TP_SIZE}" \
-            -e MESH_DP_SIZE="${MESH_DP_SIZE}" \
-            -e MESH_EP_SIZE="${MESH_EP_SIZE}" \
-            "$CONTAINER_NAME" python3 - <<'PY'
-          import json
-          import os
-          import re
-
-          result_path = os.environ["RESULT_PATH"]
-          with open(result_path, encoding="utf-8") as f:
-              data = json.load(f)
-
-          data["random_input_len"] = int(os.environ["ISL"])
-          data["random_output_len"] = int(os.environ["OSL"])
-          workload_label = os.environ.get("WORKLOAD_LABEL") or "SGLang-OOB"
-          data["workload_label"] = workload_label
-          data["benchmark_backend"] = workload_label
-          data["dashboard_backend"] = "ATOM-SGLang"
-
-          display_name = os.environ.get("DASHBOARD_MODEL_NAME", "")
-          if display_name:
-              data["benchmark_model_name"] = display_name
-
-          extra_args_text = os.environ.get("EXTRA_ARGS_TEXT", "")
-          tp_match = re.search(
-              r"(?:--tensor-parallel-size|--tp-size|--tp|(?:^|\s)-tp)\s+(\d+)",
-              extra_args_text,
-          )
-          if tp_match:
-              data["tensor_parallel_size"] = int(tp_match.group(1))
-          elif os.environ.get("MESH_TP_SIZE"):
-              data["tensor_parallel_size"] = int(os.environ["MESH_TP_SIZE"])
-          dp_match = re.search(
-              r"(?:--data-parallel-size|--dp-size|--dp|(?:^|\s)-dp)\s+(\d+)",
-              extra_args_text,
-          )
-          if dp_match:
-              data["data_parallel_size"] = int(dp_match.group(1))
-          elif os.environ.get("MESH_DP_SIZE"):
-              data["data_parallel_size"] = int(os.environ["MESH_DP_SIZE"])
-          ep_match = re.search(r"(?:--expert-parallel-size|--ep-size)\s+(\d+)", extra_args_text)
-          if ep_match:
-              data["expert_parallel_size"] = int(ep_match.group(1))
-          elif os.environ.get("MESH_EP_SIZE"):
-              data["expert_parallel_size"] = int(os.environ["MESH_EP_SIZE"])
-          data["enable_dp_attention"] = "--enable-dp-attention" in extra_args_text
-          data["benchmark_runner"] = os.environ.get("BENCHMARK_RUNNER", "")
-          data["mesh_server_mode"] = os.environ.get("MESH_SERVER_MODE", "")
-          data["spec_mode"] = os.environ.get("MESH_SPEC_MODE", "")
-
-          data["atom_source_repository"] = os.environ.get("ATOM_SOURCE_REPOSITORY", "")
-          data["atom_source_ref"] = os.environ.get("ATOM_SOURCE_REF", "")
-          data["atom_source_sha"] = os.environ.get("ATOM_SOURCE_SHA", "")
-          data["sglang_ref"] = os.environ.get("SGLANG_REF_USED", "")
-          data["sglang_version"] = os.environ.get("SGLANG_VERSION_USED", "")
-          data["sglang_image_source"] = os.environ.get("SGLANG_IMAGE_SOURCE", "")
-          data["sglang_image_tag"] = os.environ.get("SGLANG_IMAGE_TAG_USED", "")
-          data["dashboard_publish_allowed"] = (
-              os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
-              and workload_label != "SGLang-Mesh"
-          )
-          data["custom_dashboard_publish_allowed"] = (
-              os.environ.get("UPLOAD_TO_CUSTOM_DASHBOARD", "false").lower() == "true"
-          )
-
-          with open(result_path, "w", encoding="utf-8") as f:
-              json.dump(data, f, indent=2)
-          PY
-
-          $CONTAINER_ENGINE cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json"
-
-      - name: Inject GPU metadata into benchmark results
-        run: |
-          shopt -s nullglob
-          for f in "${RESULT_PREFIX}"-*.json; do
-            GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
-            GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
-            ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
-            RESULT_PATH="$f" \
-            python3 -c "
-          import json, os
-          p = os.environ['RESULT_PATH']
-          with open(p) as f:
-              d = json.load(f)
-          d['gpu_name'] = os.environ.get('GPU_NAME', '')
-          d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
-          d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
-          with open(p, 'w') as f:
-              json.dump(d, f, indent=2)
-          "
-          done
-
-      - name: Collect benchmark result
-        run: |
-          if [ ! -f "${RESULT_FILENAME}.json" ]; then
-            echo "ERROR: Benchmark result file ${RESULT_FILENAME}.json was not generated for ${MODEL_NAME}."
-            exit 1
-          fi
-
-      - name: Upload benchmark result
-        uses: actions/upload-artifact@v7
-        with:
-          name: sglang-benchmark-${{ env.RESULT_FILENAME }}
-          path: ${{ env.RESULT_FILENAME }}.json
-
-      - name: Clean up SGLang benchmark container
-        if: always()
-        run: |
-          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
-          $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
-          $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
-          if [[ "${SGLANG_IMAGE_SOURCE}" == "rebuild" ]]; then
-            $CONTAINER_ENGINE rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
-          else
-            echo "Keeping prebuilt SGLang image cached on runner: ${SGLANG_IMAGE_TAG}"
-          fi
+  benchmark-mi308:
+    name: SGLang benchmark (MI308 runners)
+    needs: [resolve-atom-source, build-benchmark-matrix, build-sglang-image]
+    if: >-
+      always()
+      && needs.resolve-atom-source.result == 'success'
+      && needs.build-benchmark-matrix.result == 'success'
+      && (needs.build-sglang-image.result == 'success' || needs.build-sglang-image.result == 'skipped')
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells_mi308 == 'true'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/atom-sglang-benchmark-gpu-shard.yaml
+    secrets: inherit
+    with:
+      shard_suffix: mi308
+      benchmark_matrix_json: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix_mi308 }}
+      mesh_server_mode: ${{ inputs.mesh_server_mode || 'sglang-atom' }}
+      atom_repository: ${{ needs.resolve-atom-source.outputs.atom_repository }}
+      atom_ref: ${{ needs.resolve-atom-source.outputs.atom_ref }}
+      workload_label: ${{ needs.resolve-atom-source.outputs.workload_label }}
+      prebuilt_sglang_image: ${{ needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
+      sglang_image_source: ${{ needs.resolve-atom-source.outputs.sglang_image_source }}
+      selected_sglang_ref: ${{ needs.resolve-atom-source.outputs.selected_sglang_ref }}
+      selected_sglang_version: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
+      publish_to_dashboard: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
+      upload_to_custom_dashboard: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
+      sglang_image_tag: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
+      atom_source_sha_for_checkout: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
 
   summarize-benchmark-result:
     if: >-
@@ -1330,7 +866,7 @@ jobs:
       && needs.build-benchmark-matrix.result == 'success'
       && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     name: Summarize SGLang benchmark result
-    needs: [resolve-atom-source, build-benchmark-matrix, benchmark]
+    needs: [resolve-atom-source, build-benchmark-matrix, benchmark-mi355, benchmark-mi308]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout ATOM repo

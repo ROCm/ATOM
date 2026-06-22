@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from aiter import QuantType, dtypes, get_hip_quant
-from aiter.utility import fp4_utils
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mla import (
     dynamic_per_batched_tensor_quant,

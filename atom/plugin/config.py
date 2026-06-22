@@ -17,6 +17,7 @@ class PluginConfig:
     is_plugin_mode: bool = False
     is_vllm: bool = False
     is_sglang: bool = False
+    is_rtpllm: bool = False
 
     # vllm specific
     vllm_config: Any = None
@@ -33,6 +34,10 @@ class PluginConfig:
     sglang_aiter_rank_id: int = 0
     sglang_dist_init_addr: Optional[str] = None
     sglang_port_args: Any = None
+
+    # rtp-llm specific
+    rtpllm_model_config: Any = None
+    rtpllm_parallelism_config: Any = None
 
 
 def _normalize_sglang_parallel_config(
@@ -140,6 +145,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         is_plugin_mode=True,
         is_vllm=True,
         is_sglang=False,
+        is_rtpllm=False,
         # vllm specific
         vllm_config=config,
         vllm_scheduler_config=vllm_scheduler_config,
@@ -307,6 +313,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         is_plugin_mode=True,
         is_vllm=False,
         is_sglang=True,
+        is_rtpllm=False,
         # sglang specific
         sglang_model_opt_config=sgl_model_opt_config,
         sglang_load_config=sgl_load_config,
@@ -349,6 +356,80 @@ def _generate_atom_config_from_sglang_config(config: Any):
     )
 
 
+def _generate_atom_config_from_rtpllm_config(config: Any):
+    from atom.config import Config, ParallelConfig, CompilationConfig
+
+    rtpllm_model_config = getattr(config, "model_config", None)
+    rtpllm_parallelism_config = getattr(config, "parallelism_config", None)
+    if rtpllm_model_config is None:
+        raise ValueError(
+            "rtpllm plugin expects config.model_config to be available "
+            "(BaseModel instance is recommended)."
+        )
+
+    tp_size = getattr(rtpllm_parallelism_config, "tp_size", 1)
+    tp_rank = getattr(rtpllm_parallelism_config, "tp_rank", 0)
+    max_generate_batch_size = getattr(config, "max_generate_batch_size", 512)
+    max_model_len = getattr(rtpllm_model_config, "max_seq_len", None) or 8192
+
+    # rtp-llm plugin path follows ATOM plugin-mode execution, so ATOM should not
+    # perform its own torch compile/cudagraph policy.
+    rtpllm_compilation_config = CompilationConfig(
+        level=0,
+        use_cudagraph=False,
+        cudagraph_mode=None,
+    )
+
+    plugin_config = PluginConfig(
+        # common config
+        model_config=rtpllm_model_config,
+        rank=tp_rank,
+        is_plugin_mode=True,
+        is_vllm=False,
+        is_sglang=False,
+        is_rtpllm=True,
+        # rtp-llm specific
+        rtpllm_model_config=rtpllm_model_config,
+        rtpllm_parallelism_config=rtpllm_parallelism_config,
+    )
+
+    kv_cache_dtype = "bf16"
+    if hasattr(rtpllm_model_config, "attn_config") and hasattr(
+        rtpllm_model_config.attn_config, "kv_cache_dtype"
+    ):
+        raw_kv_dtype = str(rtpllm_model_config.attn_config.kv_cache_dtype).lower()
+        if "fp8" in raw_kv_dtype:
+            kv_cache_dtype = "fp8"
+        elif "int8" in raw_kv_dtype:
+            kv_cache_dtype = "int8"
+
+    # Keep RTP behavior aligned with SGLang plugin semantics:
+    # only enable EP when ep_size > 1; pure TP (ep_size == 1) must not use EP.
+    rtpllm_ep_size = getattr(rtpllm_parallelism_config, "ep_size", 1)
+
+    return Config(
+        model=rtpllm_model_config.ckpt_path,
+        max_num_batched_tokens=max(16384, max_generate_batch_size),
+        max_num_seqs=max_generate_batch_size,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=0.9,
+        tensor_parallel_size=tp_size,
+        enforce_eager=True,
+        parallel_config=ParallelConfig(data_parallel_size=1, data_parallel_rank=0),
+        kv_cache_dtype=kv_cache_dtype,
+        enable_prefix_caching=False,
+        port=None,
+        torch_profiler_dir=None,
+        compilation_config=rtpllm_compilation_config,
+        asyncio_mode=False,
+        load_dummy=False,
+        enable_expert_parallel=bool(rtpllm_ep_size > 1),
+        master_addr=None,
+        enable_dp_attention=False,
+        plugin_config=plugin_config,
+    )
+
+
 def generate_atom_config_for_plugin_mode(config: Any = None):
     """
     Generate the atom config in plugin mode, be called when create the custom model
@@ -360,13 +441,15 @@ def generate_atom_config_for_plugin_mode(config: Any = None):
 
     logger.info("Generate atom config for plugin mode from passed config")
     atom_config = None
-    from atom.plugin import is_vllm, is_sglang
+    from atom.plugin import is_vllm, is_sglang, is_rtpllm
     from atom.config import set_current_atom_config
 
     if is_vllm():
         atom_config = _generate_atom_config_from_vllm_config(config)
     elif is_sglang():
         atom_config = _generate_atom_config_from_sglang_config(config)
+    elif is_rtpllm():
+        atom_config = _generate_atom_config_from_rtpllm_config(config)
     else:
         raise ValueError(
             "Make sure ATOM is running in plugin mode; "
