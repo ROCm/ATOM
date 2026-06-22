@@ -26,9 +26,6 @@ export ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT=0
 export ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0
 ```
 
-`ATOM_LM_HEAD_FP8=1` (default on) lazily quantizes lm_head to FP8;
-set `=0` to keep the BF16 hipBLASLt path.
-
 ## Required CLI flags
 
 - `--level 0` — torch.compile not supported with this backend
