@@ -7,6 +7,42 @@ EXTRA_ARGS=("${@:3}")
 ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
 ATOM_SERVER_PORT=${ATOM_SERVER_PORT:-8000}
 
+print_device_mapping_debug() {
+  [ "${ATOM_DEBUG_DEVICE_MAPPING:-0}" = "1" ] || return 0
+
+  echo ""
+  echo "========== PyTorch HIP device mapping before ATOM launch =========="
+  python3 - <<'PY'
+import os
+
+keys = [
+    "HIP_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "LOCAL_RANK",
+    "RANK",
+    "WORLD_SIZE",
+]
+for key in keys:
+    print(f"{key}={os.environ.get(key)}")
+
+try:
+    import torch
+except Exception as exc:
+    print(f"torch import failed: {type(exc).__name__}: {exc}")
+    raise SystemExit(0)
+
+print(f"torch.version.hip={getattr(torch.version, 'hip', None)}")
+print(f"torch.cuda.is_available={torch.cuda.is_available()}")
+try:
+    count = torch.cuda.device_count()
+    print(f"torch.cuda.device_count={count}")
+    for index in range(count):
+        print(f"device[{index}]={torch.cuda.get_device_name(index)}")
+except Exception as exc:
+    print(f"torch cuda probe failed: {type(exc).__name__}: {exc}")
+PY
+}
 
 if [ "$TYPE" == "launch" ]; then
   echo ""
@@ -35,6 +71,11 @@ if [ "$TYPE" == "launch" ]; then
 
   ATOM_SERVER_LOG="/tmp/atom_server.log"
   SERVER_PORT_ARGS=("--server-port" "$ATOM_SERVER_PORT")
+  print_device_mapping_debug
+  echo ""
+  echo "========== ATOM server command =========="
+  echo "PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model $MODEL_PATH ${SERVER_PORT_ARGS[@]} $PROFILER_ARGS ${EXTRA_ARGS[@]}"
+  echo "=========================================="
   PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${SERVER_PORT_ARGS[@]}" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
   tail -f "$ATOM_SERVER_LOG" &

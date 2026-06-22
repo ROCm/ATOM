@@ -763,7 +763,7 @@ mod tests {
             .worker_startup_timeout_secs(60)
             .worker_startup_check_interval_secs(5)
             .enable_metrics("0.0.0.0", 9090)
-            .log_dir("/var/log/sglang")
+            .log_dir("/var/log/atomesh")
             .log_level("info")
             .max_concurrent_requests(64)
             .build_unchecked();
@@ -812,7 +812,7 @@ mod tests {
             .worker_startup_timeout_secs(600)
             .worker_startup_check_interval_secs(20)
             .enable_metrics("::", 9999) // IPv6 any
-            .log_dir("/opt/logs/sglang")
+            .log_dir("/opt/logs/atomesh")
             .log_level("trace")
             .max_concurrent_requests(64)
             .build_unchecked();

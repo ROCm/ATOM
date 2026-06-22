@@ -219,6 +219,8 @@ def load_model_in_plugin_mode(
         model_name_or_path = config.plugin_config.model_config.model
     elif config.plugin_config.is_sglang:
         model_name_or_path = config.plugin_config.model_config.model_path
+    elif config.plugin_config.is_rtpllm:
+        model_name_or_path = config.plugin_config.model_config.ckpt_path
 
     _empty_cache()
     if hf_config_override is not None:
@@ -310,10 +312,14 @@ def load_model(
         module_prefix = matching_name.split("shared_expert", 1)[0]
         shared_expert_prefix = layer_prefix + matching_name.rstrip(".")
         routed_expert_prefix = layer_prefix + f"{module_prefix}experts"
-        model_quant_config = getattr(getattr(model, "args", None), "quant_config", None)
+        model_quant_config = getattr(
+            getattr(model, "atom_config", None), "quant_config", None
+        )
         if model_quant_config is None:
             model_quant_config = getattr(model, "quant_config", None)
-        if model_quant_config is not None:
+        if model_quant_config is not None and hasattr(
+            model_quant_config, "get_layer_quant_config"
+        ):
             return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
                 model_quant_config,
                 shared_expert_prefix=shared_expert_prefix,
@@ -612,7 +618,8 @@ def load_model(
                                 "",
                                 expert_id,
                             )
-                            loaded_weights_record.add(prefix + name)
+                            loaded_weights_record.add(prefix + fused_name)
+                            continue
                         try:
                             param = model.get_parameter(name)
                         except AttributeError:
@@ -729,7 +736,7 @@ def load_model(
         logger.info("Weight post-processing started (includes online quantization)")
     pp_start = time.perf_counter()
 
-    for _, module in model.named_modules():
+    for module_name, module in model.named_modules():
         if hasattr(module, "process_weights_after_loading"):
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
@@ -740,6 +747,15 @@ def load_model(
             quant_method.process_weights_after_loading(module)
         if isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)
+
+        # Online quantization creates new params (e.g. weight_scale) that are
+        # not present in the source checkpoint. Record them as "loaded" so the
+        # plugin host's strict weight tracking (e.g. vLLM's default loader)
+        # does not flag them as uninitialized.
+        if getattr(module, "_online_quant_info", None) is not None:
+            for param_name, _ in module.named_parameters(recurse=False):
+                full_name = f"{module_name}.{param_name}" if module_name else param_name
+                loaded_weights_record.add(prefix + full_name)
 
     if has_online_quant:
         pp_elapsed = time.perf_counter() - pp_start

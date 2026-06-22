@@ -218,6 +218,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def request_finished(self, seq: Sequence) -> None:
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
+        drafts = getattr(seq, "spec_token_ids", None)
+        draft_token_ids = (
+            [int(x) for x in drafts] if drafts is not None and len(drafts) else []
+        )
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
@@ -230,6 +234,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "dp_rank": self.dp_rank,
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
+            "draft_token_ids": draft_token_ids,
             "local_slot_index": getattr(seq, "per_req_cache_group", -1),
         }
 
@@ -864,90 +869,98 @@ class MooncakeConnector(KVConnectorBase):
 
     def _execute_transfer(self, request_data: dict) -> None:
         """Compute offsets and perform RDMA write for a single request."""
-        req_id = request_data["request_id"]
-        transfer_id = request_data.get("transfer_id", req_id)
-        consumer_host = request_data["consumer_host"]
-        consumer_rpc_port = request_data["consumer_rpc_port"]
-        dst_block_ids = request_data["dst_block_ids"]
-        notify_host = request_data["notify_host"]
-        notify_port = request_data["notify_port"]
-        consumer_tp_size = request_data.get("consumer_tp_size", self.tp_size)
-        consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
-        has_slot_data = request_data.get("is_v4", False)
+        try:
+            req_id = request_data["request_id"]
+            transfer_id = request_data.get("transfer_id", req_id)
+            consumer_host = request_data["consumer_host"]
+            consumer_rpc_port = request_data["consumer_rpc_port"]
+            dst_block_ids = request_data["dst_block_ids"]
+            notify_host = request_data["notify_host"]
+            notify_port = request_data["notify_port"]
+            consumer_tp_size = request_data.get("consumer_tp_size", self.tp_size)
+            consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
+            has_slot_data = request_data.get("is_v4", False)
 
-        logger.info(
-            "[PRODUCER] _execute_transfer: req_id=%s, transfer_id=%s, "
-            "consumer=%s:%s, dst_blocks=%d, has_slot_data=%s",
-            req_id,
-            transfer_id,
-            consumer_host,
-            consumer_rpc_port,
-            len(dst_block_ids),
-            has_slot_data,
-        )
-
-        prefill_data = self._wait_for_prefill_data(transfer_id)
-        if prefill_data is None:
-            logger.error(
-                "[PRODUCER] Timed out waiting for prefill data for "
-                "transfer_id=%s (req_id=%s). Available keys: %s",
-                transfer_id,
+            logger.info(
+                "[PRODUCER] _execute_transfer: req_id=%s, transfer_id=%s, "
+                "consumer=%s:%s, dst_blocks=%d, has_slot_data=%s",
                 req_id,
-                list(self._completed_prefills.keys()),
+                transfer_id,
+                consumer_host,
+                consumer_rpc_port,
+                len(dst_block_ids),
+                has_slot_data,
             )
-            return
 
-        src_block_ids = prefill_data["block_ids"]
-        target = f"{consumer_host}:{consumer_rpc_port}"
-
-        if hasattr(self.transfer_engine, "get_first_buffer_address"):
-            remote_buf = self.transfer_engine.get_first_buffer_address(target)
-            if remote_buf == 0:
+            prefill_data = self._wait_for_prefill_data(transfer_id)
+            if prefill_data is None:
                 logger.error(
-                    "[PRODUCER] Consumer %s has NO registered buffers.",
+                    "[PRODUCER] Timed out waiting for prefill data for "
+                    "transfer_id=%s (req_id=%s). Available keys: %s",
+                    transfer_id,
+                    req_id,
+                    list(self._completed_prefills.keys()),
+                )
+                return
+
+            src_block_ids = prefill_data["block_ids"]
+            target = f"{consumer_host}:{consumer_rpc_port}"
+
+            if hasattr(self.transfer_engine, "get_first_buffer_address"):
+                remote_buf = self.transfer_engine.get_first_buffer_address(target)
+                if remote_buf == 0:
+                    logger.error(
+                        "[PRODUCER] Consumer %s has NO registered buffers.",
+                        target,
+                    )
+
+            if has_slot_data:
+                self._execute_block_slot_transfer(
+                    request_data,
                     target,
+                    src_block_ids,
+                    dst_block_ids,
+                    prefill_data,
+                    req_id,
+                )
+            else:
+                self._execute_block_transfer(
+                    request_data,
+                    target,
+                    src_block_ids,
+                    dst_block_ids,
+                    req_id,
                 )
 
-        if has_slot_data:
-            self._execute_block_slot_transfer(
-                request_data,
-                target,
-                src_block_ids,
-                dst_block_ids,
-                prefill_data,
-                req_id,
-            )
-        else:
-            self._execute_block_transfer(
-                request_data,
-                target,
-                src_block_ids,
-                dst_block_ids,
-                req_id,
-            )
+            # Notify consumer — all data (blocks + state for V4) is written.
+            self._send_write_done(notify_host, notify_port, req_id)
 
-        # Notify consumer — all data (blocks + state for V4) is written.
-        self._send_write_done(notify_host, notify_port, req_id)
+            # Track refcount for multi-consumer TP fan-out.
+            all_done = False
+            with self._transfer_refcount_lock:
+                if transfer_id not in self._transfer_refcount:
+                    self._transfer_refcount[transfer_id] = consumers_per_rank
+                self._transfer_refcount[transfer_id] -= 1
+                if self._transfer_refcount[transfer_id] <= 0:
+                    self._transfer_refcount.pop(transfer_id)
+                    all_done = True
 
-        # Track refcount for multi-consumer TP fan-out.
-        all_done = False
-        with self._transfer_refcount_lock:
-            if transfer_id not in self._transfer_refcount:
-                self._transfer_refcount[transfer_id] = consumers_per_rank
-            self._transfer_refcount[transfer_id] -= 1
-            if self._transfer_refcount[transfer_id] <= 0:
-                self._transfer_refcount.pop(transfer_id)
-                all_done = True
-
-        if all_done:
-            with self._completion_lock:
-                self.done_sending.add(transfer_id)
-            with self._completed_prefills_lock:
-                self._completed_prefills.pop(transfer_id, None)
-            logger.info(
-                "[PRODUCER] All %d consumers served for transfer_id=%s",
-                consumers_per_rank,
-                transfer_id,
+            if all_done:
+                with self._completion_lock:
+                    self.done_sending.add(transfer_id)
+                with self._completed_prefills_lock:
+                    self._completed_prefills.pop(transfer_id, None)
+                logger.info(
+                    "[PRODUCER] All %d consumers served for transfer_id=%s",
+                    consumers_per_rank,
+                    transfer_id,
+                )
+        except Exception:
+            logger.exception(
+                "[PRODUCER] transfer FAILED for req %s (transfer_id=%s); "
+                "consumer will not receive write-done and will time out.",
+                request_data.get("request_id"),
+                request_data.get("transfer_id"),
             )
 
     def _execute_block_transfer(
@@ -1058,6 +1071,10 @@ class MooncakeConnector(KVConnectorBase):
         if self._gather_slot is not None and consumer_staging_addr:
             producer_pool_idx = self._acquire_staging_slot()
             self._gather_slot(src_slot, producer_pool_idx)
+            # Synchronize on the gather kernel before NIC starts reading the
+            # staging buffer. Without this, the RDMA can race the still-in-flight
+            # gather kernel on TBO prefill (page fault under high concurrency).
+            torch.cuda.current_stream().synchronize()
             slot_src.append(
                 self._staging_base_addr + producer_pool_idx * self._staging_slot_bytes
             )

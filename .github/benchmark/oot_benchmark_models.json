@@ -37,6 +37,28 @@
       ]
     },
     {
+      "choice_label": "DeepSeek-V4-Pro",
+      "source_path": "deepseek-ai/DeepSeek-V4-Pro",
+      "path": "deepseek-ai/DeepSeek-V4-Pro",
+      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "nightly_group": "B",
+      "variants": [
+        {
+          "tp_size": 8,
+          "display": "DeepSeek-V4-Pro TP8 (OOB)",
+          "dashboard_model": "DeepSeek-V4-Pro",
+          "prefix": "deepseek-v4-pro-tp8-oob",
+          "supported_input_output_pairs": [
+            "1024x1024",
+            "8192x1024"
+          ],
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --gpu-memory-utilization 0.9 --max-num-seqs 512 --tokenizer-mode deepseek_v4",
+          "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1"
+        }
+      ]
+    },
+    {
       "choice_label": "gpt-oss-120b",
       "source_path": "openai/gpt-oss-120b",
       "path": "openai/gpt-oss-120b",
@@ -50,7 +72,7 @@
           "dashboard_model": "gpt-oss-120b-tp1",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1"
+          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1\nVLLM_USE_V2_MODEL_RUNNER=1"
         },
         {
           "tp_size": 1,
@@ -59,7 +81,7 @@
           "prefix": "gpt-oss-120b-aw-tp1",
           "bench_args": "",
           "extra_args": "--trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
-          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1"
+          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_ROCM_USE_AITER=1\nVLLM_USE_V2_MODEL_RUNNER=1"
         },
         {
           "tp_size": 2,
@@ -275,7 +297,7 @@
           "dashboard_model": "Qwen3-Next-80B-A3B-Instruct-FP8-mtp-tp1",
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-mtp-tp1-aw",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
           "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
         },
         {
@@ -284,7 +306,7 @@
           "dashboard_model": "Qwen3-Next-80B-A3B-Instruct-FP8-mtp-tp4",
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-mtp-tp4-aw",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":1, \"method\": \"mtp\"}'",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0\nGATED_DELTA_RULE_TRITON_AUTOTUNE=1"
         }
       ]
@@ -320,8 +342,8 @@
           "dashboard_model": "DeepSeek-V3.2-FP8-MTP-aw-tp4",
           "prefix": "deepseek-v3-2-fp8-mtp-aw-tp4",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\"}'",
-          "env_vars": ""
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --speculative-config '{\"num_speculative_tokens\":3, \"method\": \"mtp\", \"rejection_sample_method\": \"synthetic\", \"synthetic_acceptance_rates\": [0.9,0.8,0.6]}'",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0"
         }
       ]
     },
@@ -383,7 +405,7 @@
           "dashboard_model": "GLM-4.7-FP8-mtp-aw-tp4",
           "prefix": "glm-4-7-fp8-mtp-aw-tp4",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --speculative-config.method mtp --speculative-config.num_speculative_tokens 2",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
         },
         {
@@ -392,7 +414,7 @@
           "dashboard_model": "GLM-4.7-FP8-mtp-aw-tp8",
           "prefix": "glm-4-7-fp8-mtp-aw-tp8",
           "bench_args": "",
-          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 1",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --speculative-config.method mtp --speculative-config.num_speculative_tokens 2",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
         }
       ]

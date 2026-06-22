@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from typing import Type
 
 import aiter
@@ -8,12 +9,15 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
-from atom.model_ops.attention_mha import PagedAttentionImpl
+from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+
+logger = logging.getLogger("atom")
 
 
 def cdiv(a, b):
@@ -45,10 +49,41 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         device=None,
         model_runner=None,
     ):
-        self.block_size = 1024 if model_runner.block_size == 1024 else 16
+        self.block_size = (
+            model_runner.block_size if model_runner.block_size in (256, 1024) else 16
+        )
+        if envs.ATOM_USE_UNIFIED_ATTN:
+            # SHUFFLE (pre-shuffled) KV cache: use the logical block size directly
+            # as the physical block size so block_ratio == 1 and
+            # unified_attention's block_table needs no logical->physical
+            # conversion. Pass --block-size equal to the performant physical
+            # page: fp8 packs x=16 - 128; bf16 packs x=8 - 64 (both keep a
+            # 128-byte physical page, i.e. block_size // x == 8).
+            expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
+            if model_runner.block_size != expected:
+                logger.warning(
+                    "ATOM_USE_UNIFIED_ATTN=1 expects --block-size %s for %s KV "
+                    "cache (so block_ratio == 1), got --block-size %s. Continuing "
+                    "with the requested block size.",
+                    expected,
+                    model_runner.kv_cache_dtype,
+                    model_runner.block_size,
+                )
+            self.block_size = model_runner.block_size
+        assert (
+            model_runner.block_size % self.block_size == 0
+        ), f"model_runner.block_size must be divisible by block_size but got {model_runner.block_size=}, block_size={self.block_size}, please set --block-size (model_runner.block_size) to be divisible by {self.block_size}"
         super().__init__(model_runner)
         config = model_runner.config
         hf_config = config.hf_config
+        from atom.utils import envs as _envs
+
+        self._tbo_token_split = bool(
+            config.enable_tbo and _envs.ATOM_TBO_PREFILL_TOKEN_SPLIT
+        )
+        # Snapshot of the current prefill batch, set by
+        # `_stash_tbo_token_split_prefill_state`; None when not token-splitting.
+        self._tbo_prefill_state = None
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
         # For speculative decode (MTP), max_qlen = num_speculative_tokens + 1
         if (
@@ -73,6 +108,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        self._pa_decode_bf16_asm_enabled = (
+            use_pa_decode_bf16_asm() and model_runner.block_size == 256
+        )
 
         pa_persistent_metadata = {
             "max_qlen": max_qlen,
@@ -475,11 +513,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 runner.physical_block_size,
                 x,
             )
+            # V cache uses the same 5D SHUFFLE layout as the MiMo-V2 per-module
+            # allocator above: [num_blocks, num_kv_heads, block_size//x, head_dim, x].
             v_cache = runner.kv_cache[1, attn_idx].view(
                 runner.num_physical_kvcache_blocks,
                 runner.num_kv_heads,
+                runner.physical_block_size // x,
                 hf_config.head_dim,
-                runner.physical_block_size,
+                x,
             )
             if config.kv_cache_dtype == "fp8":
                 module.k_scale = runner.kv_scale[0, attn_idx]
@@ -503,7 +544,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         runner = self.model_runner
-        if not hasattr(runner, "kv_cache") or runner.kv_cache is None:
+        has_unified_kv = hasattr(runner, "kv_cache") and runner.kv_cache is not None
+        # for MiMoV2 model per layer kv binding
+        has_per_layer_kv = (
+            hasattr(runner, "_kv_layer_cache_store") and runner._kv_layer_cache_store
+        )
+        if not has_unified_kv and not has_per_layer_kv:
             return None
 
         block_regions: list[KVTransferRegion] = []
@@ -541,6 +587,114 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             slot_regions=[],
             num_blocks=runner.num_physical_kvcache_blocks,
         )
+
+    def prepare_prefill(self, batch: ScheduledBatch):
+        attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
+        if self._tbo_token_split:
+            self._stash_tbo_token_split_prefill_state(batch)
+        return attn_metadata, positions
+
+    # ================================================================
+    # TBO PREFILL TOKEN-SPLIT (ATOM_TBO_PREFILL_TOKEN_SPLIT) — MHA path
+    # ================================================================
+
+    def _stash_tbo_token_split_prefill_state(self, batch: ScheduledBatch):
+        """Snapshot full-batch block_tables / cu_tokens / num_cached so a later
+        micro-batch can rebuild the straddled request's cached prefix."""
+        self._tbo_prefill_state = None
+        if not batch.block_tables:
+            return
+        bs = batch.total_seqs_num_prefill
+        # Per-request prefix-cache hit length (tokens already in the paged cache
+        # from previous steps). A straddled/ubatch request's FULL visible K is
+        # num_cached + (its tokens in this ubatch), so the gather must include it.
+        self._tbo_prefill_state = TokenSplitPrefillState(
+            block_tables=[
+                np.asarray(bt, dtype=np.int32) for bt in batch.block_tables[:bs]
+            ],
+            cu_tokens=np.asarray(
+                self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
+                dtype=np.int64,
+            ).copy(),
+            num_cached=np.asarray(batch.num_cached_tokens[:bs], dtype=np.int64),
+        )
+
+    def build_ubatch_prefill_metadata(
+        self,
+        attn_metadata: AttentionMetaData,
+        ub_slice,
+        padded_bs: int,
+        ubatch_idx: int = 0,
+    ) -> AttentionMetaData:
+        del ubatch_idx
+        from atom.utils.tbo.ubatch_splitting import split_attn_metadata
+
+        ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+        self._attach_tbo_token_split_straddle_prefix(ub_attn, ub_slice)
+        return ub_attn
+
+    def _attach_tbo_token_split_straddle_prefix(self, ub_attn, ub_slice):
+        """Re-attach the straddled request's already-cached first half as a
+        paged cached prefix (block_tables + context_lens) so ubatch 1's dense
+        attention sees the tokens ubatch 0 wrote. No-op when not straddling."""
+        from atom.utils.tbo import compute_straddle_split_info
+
+        state = self._tbo_prefill_state
+        if state is None:
+            return
+        block_tables_host = state.block_tables
+        cu_tokens = state.cu_tokens
+
+        info = compute_straddle_split_info(cu_tokens, ub_slice)
+        if not info.is_straddling:
+            return
+
+        rs = ub_slice.request_slice
+        first_req = info.first_req
+        ub_num_reqs = info.ub_num_reqs
+        prefix_len = info.prefix_len
+        device = self.device
+
+        new_lens = (
+            cu_tokens[rs.start + 1 : rs.stop + 1] - cu_tokens[rs.start : rs.stop]
+        ).astype(np.int64)
+        new_lens[0] -= prefix_len  # first request is the straddled one
+        # Visible K per request = prior-step prefix cache (num_cached) + the
+        # straddle prefix written by ubatch 0 (only req0) + this ubatch's new
+        # tokens. Missing the num_cached term made the gather read from the
+        # cached-prefix blocks instead of the freshly-written new blocks.
+        if state.num_cached is not None:
+            cached = state.num_cached[rs.start : rs.stop].astype(np.int64)
+        else:
+            cached = np.zeros(ub_num_reqs, dtype=np.int64)
+        ctx_lens = cached + new_lens
+        ctx_lens[0] += prefix_len
+        total_kv = int(ctx_lens.sum())
+
+        max_blocks = max(
+            (len(block_tables_host[first_req + i]) for i in range(ub_num_reqs)),
+            default=1,
+        )
+        bt = np.zeros((ub_num_reqs, max_blocks), dtype=np.int32)
+        for i in range(ub_num_reqs):
+            row = block_tables_host[first_req + i]
+            bt[i, : len(row)] = row
+
+        cu_k = np.zeros(ub_num_reqs + 1, dtype=np.int32)
+        np.cumsum(ctx_lens.astype(np.int32), out=cu_k[1:])
+
+        ub_attn.has_cached = True
+        ub_attn.total_kv = total_kv
+        ub_attn.context_lens = torch.from_numpy(ctx_lens.astype(np.int32)).to(
+            device, non_blocking=True
+        )
+        ub_attn.block_tables = torch.from_numpy(bt).to(device, non_blocking=True)
+        ub_attn.cu_seqlens_k = torch.from_numpy(cu_k).to(device, non_blocking=True)
+        ub_attn.seq_starts = torch.zeros(ub_num_reqs, dtype=torch.int32, device=device)
+        ub_attn.num_cached_tokens = torch.from_numpy(ctx_lens.astype(np.int32)).to(
+            device, non_blocking=True
+        )
+        ub_attn.max_seqlen_k = int(ctx_lens.max())
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
@@ -610,7 +764,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ]
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
-        if self.block_size == 1024:
+        if self.block_size in (256, 1024):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
             ctx.update(ctx_pa_ps)
 
@@ -733,7 +887,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
 
             # Set PA persistent worker buffers for this ubatch
-            if self.block_size == 1024:
+            if self.block_size in (256, 1024):
                 self._set_ubatch_pa_buffers(padded_bs, max_seqlen_q, ub_idx)
 
     def _set_ubatch_pa_buffers(self, padded_bs, max_q_len, ubatch_idx):
@@ -779,7 +933,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         max_q_len = var["max_qlen"]
 
         # Compute PA work buffers for this ubatch
-        if self.block_size == 1024:
+        if self.block_size in (256, 1024):
             self._set_ubatch_pa_buffers(padded_bs, max_q_len, ubatch_idx)
 
         attn = AttentionMetaData(
@@ -801,23 +955,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
-        if self.block_size == 1024:
+        max_seqlen_k = self.model_runner.config.max_model_len
+        max_q_len = int(var["max_qlen"])
+
+        if self.block_size in (256, 1024):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            slot_mapping=var["slot_mapping"].gpu[: bs * max_q_len],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=var["max_qlen"],
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu,
-            max_seqlen_k=self.model_runner.config.max_model_len,
+            max_seqlen_k=max_seqlen_k,
             **ctx_pa_ps,
         )
 
-        positions = var["positions"].copy_to_gpu(bs)
+        positions = var["positions"].copy_to_gpu(bs * max_q_len)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )

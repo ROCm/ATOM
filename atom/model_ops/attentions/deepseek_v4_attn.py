@@ -121,14 +121,15 @@ class AttentionMetaData_DSV4(AttentionMetaData):
 
     # ----- Per-fwd hoisted (built in `_attach_v4_per_fwd_meta`) -----
     batch_id_per_token: Optional[torch.Tensor] = None
-    """[padded_T] int64 GPU — the SINGLE per-token mapping
-    (token_idx → seq_idx). int64 dtype is required by PyTorch fancy-index
-    (used in the indexer); triton kernels (swa_write, csa_translate_pack)
-    read int64 fine. Padded tail [T:padded_T] = -1 sentinel; consumer
-    kernels skip on `bid < 0`. All other per-token quantities resolved as
-    `per_seq_data[batch_id_per_token[t]]` — no [T] aliases of seq data."""
+    """[padded_T] int32 GPU — the SINGLE per-token mapping
+    (token_idx → seq_idx). int32 indices are accepted by PyTorch
+    advanced-indexing (used in the indexer); triton kernels (swa_write,
+    csa_translate_pack) and the fused flydsl SWA scatter read int32. Padded
+    tail [T:padded_T] = -1 sentinel; consumer kernels skip on `bid < 0`. All
+    other per-token quantities resolved as `per_seq_data[batch_id_per_token[t]]`
+    — no [T] aliases of seq data."""
     batch_id_per_token_cpu: Optional[Any] = None
-    """[T] int64 — CPU mirror of the unpadded batch_id slice. Built once in
+    """[T] int32 — CPU mirror of the unpadded batch_id slice. Built once in
     `_attach_v4_per_fwd_meta` (host-side `np.repeat`); reused by
     `_attach_v4_paged_decode_meta` for indptr fancy-index math. Avoids a
     duplicate `np.repeat` per fwd. None for prefill paths that don't go
@@ -720,7 +721,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return None
 
         num_slots = runner.max_per_req_cache_slots
-        swa_pages = num_slots * self.window_size
+        swa_pages = num_slots * self.win_with_spec
         elem_bf16 = 2
         elem_fp32 = 4
 
@@ -754,7 +755,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
 
         # Slot regions: SWA per layer
-        swa_slot_bytes = self.window_size * self.head_dim * elem_bf16
+        swa_slot_bytes = self.win_with_spec * self.head_dim * elem_bf16
         for layer_id in range(self.num_layers):
             uv = runner.v4_unified_kv[layer_id]
             slot_regions.append(
@@ -849,7 +850,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         per-seq committed count and cumsums it on CPU.
 
         Reuses two shared GPU tensors also set by `_attach_v4_per_fwd_meta`:
-          - `attn_metadata.batch_id_per_token`        [padded_T] int64
+          - `attn_metadata.batch_id_per_token`        [padded_T] int32
           - `attn_metadata.n_committed_csa_per_seq`   [bs] int32
 
         DECODE fast path: returns a minimal dict with only
@@ -944,7 +945,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "total_committed": total_committed,
             "cu_committed_gpu": cu_committed_gpu,
             "n_committed_per_seq_gpu": n_committed_per_seq_gpu,  # int32, [bs]
-            "batch_id_per_token_gpu": batch_id_per_token_gpu,  # int64, [total_tokens]
+            "batch_id_per_token_gpu": batch_id_per_token_gpu,  # int32, [total_tokens]
             # Prefill-only fields below — decode never consults them. NOT
             # in pre-allocated buffers (per-fwd derived); CG capture path
             # would see stale pointers, but the decode path doesn't touch
@@ -1328,17 +1329,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         positions_np = np.asarray(var["positions"].np[ts.start : ts.stop])
         full_cu = var["cu_seqlens_q"].np
-        ub_cu = np.asarray(full_cu[rs.start : rs.stop + 1], dtype=np.int32).copy()
-        ub_cu -= ub_cu[0]
-
-        extend_lens_np = (ub_cu[1:] - ub_cu[:ub_num_reqs]).astype(np.int32)
-        # Slice the full batch's `var["context_lens"]` (populated by
-        # `super().prepare_prefill`) for this ubatch — mathematically equals
-        # `start_pos + extend_lens` but reads from the canonical source.
-        # `.copy()` so the swap-into-front below doesn't alias.
-        context_lens_np = np.asarray(
-            var["context_lens"].np[rs.start : rs.stop], dtype=np.int32
-        ).copy()
+        req_global_starts = full_cu[rs.start : rs.stop].astype(np.int64)
+        req_global_ends = full_cu[rs.start + 1 : rs.stop + 1].astype(np.int64)
+        clamped_starts = np.maximum(req_global_starts, ts.start)
+        clamped_ends = np.minimum(req_global_ends, ts.stop)
+        extend_lens_np = (clamped_ends - clamped_starts).astype(np.int32)
+        ub_cu = np.zeros(ub_num_reqs + 1, dtype=np.int32)
+        np.cumsum(extend_lens_np, dtype=np.int32, out=ub_cu[1:])
+        ub_start_pos_for_ctx = positions_np[ub_cu[:ub_num_reqs]].astype(np.int32)
+        context_lens_np = (ub_start_pos_for_ctx + extend_lens_np).astype(np.int32)
         from atom.model_ops.v4_kernels import make_compress_plans
 
         if self._unique_compress_ratios_overlap:
@@ -1408,6 +1407,25 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         finally:
             bt[:ub_num_reqs] = saved_bt
             var["context_lens"].np[:ub_num_reqs] = saved_ctx
+
+        # `split_attn_metadata` computed ub_attn.cu_seqlens_q/k from RAW request
+        # boundaries (orig_cu[rs] - base), which is WRONG for a straddling
+        # request under token-midpoint splits: it counts the request's FULL
+        # length instead of only the portion owned by this ubatch, so
+        # cu_seqlens_q[-1] > ub_num_tokens and any kernel indexing by it goes
+        # out of bounds (SIGABRT / GPU memory fault). Overwrite with the
+        # token-window-clamped `ub_cu` already computed above. For non-
+        # straddling splits these are identical, so this is a no-op there.
+        ub_cu_gpu = torch.from_numpy(
+            np.ascontiguousarray(ub_cu[: ub_num_reqs + 1], dtype=np.int32)
+        ).to(self.device, non_blocking=True)
+        ub_attn.cu_seqlens_q = ub_cu_gpu
+        if extend_lens_np.size > 0:
+            ub_attn.max_seqlen_q = int(extend_lens_np.max())
+        # cu_seqlens_k consistent with the clamped q lens (V4 prefill prefix KV
+        # is read via per-ratio kv_indices_prefix_* buffers, not cu_seqlens_k).
+        if ub_attn.cu_seqlens_k is not None:
+            ub_attn.cu_seqlens_k = ub_cu_gpu
 
         # Clone all GPU tensors that are views into shared CpuGpuBuffers.
         # Without this, building the next ubatch overwrites this ubatch's
@@ -1492,9 +1510,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # re-running `np.repeat(arange, token_num_per_seq)` (saves ~10μs/fwd
         # at bs=1024 + one allocation).
         batch_id_unpadded_np = np.repeat(
-            np.arange(scheduled_bs, dtype=np.int64), token_num_per_seq
+            np.arange(scheduled_bs, dtype=np.int32), token_num_per_seq
         )
-        batch_id_per_token_np = np.full(padded_total_tokens, -1, dtype=np.int64)
+        batch_id_per_token_np = np.full(padded_total_tokens, -1, dtype=np.int32)
         batch_id_per_token_np[:total_tokens] = batch_id_unpadded_np
         attn_metadata.batch_id_per_token_cpu = batch_id_unpadded_np
 
@@ -1617,9 +1635,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # ----- Per-seq scalars (CPU numpy) -----
         # The single per-token mapping. Built once in `_attach_v4_per_fwd_meta`
         # — both the GPU staging tensor and the unpadded CPU mirror — so we
-        # just borrow both here. int64 (numpy fancy-index source dtype is
+        # just borrow both here. int32 (numpy fancy-index source dtype is
         # irrelevant; consumers below produce int32 outputs).
-        batch_id_per_token_np = attn_metadata.batch_id_per_token_cpu  # [T] int64
+        batch_id_per_token_np = attn_metadata.batch_id_per_token_cpu  # [T] int32
         batch_id_per_token_gpu = attn_metadata.batch_id_per_token
 
         # Read pre-computed `ctx // {4,128}` from attn_metadata — populated by
@@ -1916,9 +1934,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if block_tables_gpu is None:
             block_tables_gpu = var["block_tables"].gpu[:scheduled_bs]
         state_slot_per_seq_gpu = attn_metadata.state_slot_mapping[:scheduled_bs]
-        # batch_id_per_token is int64 in storage (PyTorch fancy-index
-        # compatibility upstream); kernel uses tl.load which is dtype-agnostic
-        # but cast for safety + consistency.
+        # batch_id_per_token is int32 in storage (accepted by PyTorch
+        # advanced-indexing and the fused flydsl SWA scatter); the kernel uses
+        # tl.load which is dtype-agnostic.
         bid_per_token_gpu = attn_metadata.batch_id_per_token[:T]
 
         # ----- Allocate output buffers (exact sizes known from CPU totals) -----
@@ -2253,13 +2271,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `_attach_v4_per_fwd_meta`.
         bufs["v4_n_committed_csa_per_seq"] = CpuGpuBuffer(bs, **i32)
         # Single per-token mapping shared across ALL V4 consumers:
-        #   - swa_write / csa_translate_pack (triton kernels, read int64 fine)
-        #   - _build_v4_indexer_meta (PyTorch fancy index, REQUIRES int64)
-        # int64 dtype satisfies the PyTorch constraint with one buffer rather
-        # than maintaining an int32 + int64 mirror. Sized to `mnbt`
-        # (worst-case prefill total tokens) since swa_write fires on prefill
-        # paths too. Phase B decode only uses [:T_dec] of this buffer.
-        bufs["v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i64)
+        #   - swa_write / csa_translate_pack (triton kernels)
+        #   - _build_v4_indexer_meta (PyTorch fancy index — int32 indices are
+        #     accepted by torch advanced-indexing)
+        #   - the fused SWA scatter in qk_norm_rope_maybe_quant (flydsl kernel
+        #     loads it as int32; the MTP-draft path also supplies int32 via the
+        #     cu_seqlens_q slice, so int32 keeps both decode paths uniform).
+        # Sized to `mnbt` (worst-case prefill total tokens) since swa_write
+        # fires on prefill paths too. Phase B decode only uses [:T_dec].
+        bufs["v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i32)
 
         # _build_v4_indexer_meta (CSA only — but allocate unconditionally;
         # never accessed when CSA layers are absent).

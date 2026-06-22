@@ -3,10 +3,14 @@ import logging
 from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.models.glm4_moe import Glm4MoeForCausalLM
-from atom.models.deepseek_v2 import DeepseekV3ForCausalLM
+from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
 from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
+from atom.models.qwen3_5 import (
+    Qwen3_5MoeForConditionalGenerationTextOnly,
+    Qwen3_5ForConditionalGenerationTextOnly,
+)
 from atom.config import Config
-from atom.plugin.prepare import is_vllm, is_sglang
+from atom.plugin.prepare import is_vllm, is_sglang, is_rtpllm
 
 logger = logging.getLogger("atom")
 
@@ -15,21 +19,35 @@ _ATOM_SUPPORTED_MODELS = {
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
+    "DeepseekV32ForCausalLM": DeepseekV3ForCausalLM,
+    "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
     "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
+    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGenerationTextOnly,
+    "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationTextOnly,
 }
 
 if is_sglang():
+    from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
     from atom.models.qwen3_next import Qwen3NextForCausalLM
     from atom.models.qwen3_5 import (
         Qwen3_5ForCausalLM,
         Qwen3_5MoeForCausalLM,
     )
+    from atom.models.kimi_k25 import KimiK25ForCausalLM
 
     _ATOM_SUPPORTED_MODELS.update(
         {
+            "DeepseekV4ForCausalLM": DeepseekV4ForCausalLM,
             "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
             "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
             "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
+            # ROCm/ATOM#1078: route Kimi-K2.x through ATOM's quant-aware model
+            # path (KimiK25ForCausalLM -> DeepseekV2ForCausalLM). The standalone
+            # engine already registers this in atom/model_engine/model_runner.py;
+            # the SGLang plugin path was missing it, so launches fell back to
+            # sglang's native model and failed weight loading on the excluded
+            # (BF16) attention projections.
+            "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
         }
     )
 
@@ -48,6 +66,9 @@ def _register_custom_attention_to_sglang() -> None:
     from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
         ATOMAttnBackendForSgl,
     )
+    from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
+        ATOMDeepseekV4BackendForSgl,
+    )
 
     # here register the custom attention backend with the name "aiter"
     # as sglang defines the fixed attention backend choices, which must be
@@ -62,7 +83,20 @@ def _register_custom_attention_to_sglang() -> None:
 
     @register_attention_backend("aiter")
     def create_atom_backend(runner):
+        arches = getattr(runner.model_config.hf_config, "architectures", None) or []
+        if any("DeepseekV4" in str(arch) for arch in arches):
+            logger.info(
+                "Use ATOMDeepseekV4BackendForSgl for DeepSeek-V4 through SGLang aiter backend choice"
+            )
+            return ATOMDeepseekV4BackendForSgl(runner)
         return ATOMAttnBackendForSgl(runner)
+
+    @register_attention_backend("dsv4")
+    def create_dsv4_backend(runner):
+        logger.info(
+            "Create ATOMDeepseekV4BackendForSgl through SGLang dsv4 backend choice"
+        )
+        return ATOMDeepseekV4BackendForSgl(runner)
 
 
 def register_ops_to_sglang(atom_config: Config) -> None:
@@ -86,6 +120,8 @@ def set_attn_cls() -> None:
         logger.info("Use Attention dispatcher for vLLM")
     elif is_sglang():
         logger.info("Use Attention dispatcher for SGLang")
+    elif is_rtpllm():
+        logger.info("Use Attention dispatcher for rtp-llm")
 
 
 def init_aiter_dist(config: Config) -> None:
@@ -130,6 +166,11 @@ def init_aiter_dist(config: Config) -> None:
         else:
             dp_master_ip = "127.0.0.1"
             dp_master_port = config.plugin_config.sglang_port_args.nccl_port
+    elif config.plugin_config.is_rtpllm:
+        import os
+
+        dp_master_ip = os.getenv("MASTER_ADDR", "127.0.0.1")
+        dp_master_port = int(os.getenv("MASTER_PORT", "29500"))
 
     distributed_init_method = get_distributed_init_method(dp_master_ip, dp_master_port)
 
