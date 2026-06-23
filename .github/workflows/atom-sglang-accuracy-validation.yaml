@@ -109,6 +109,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_mi355_all:
+        description: "Run all MI355 accuracy cases"
+        required: false
+        type: boolean
+        default: false
       run_mi308_all:
         description: "Run all MI308 gsm8k accuracy cases (Qwen on atom-mi308-8gpu-plugins-benchmark)"
         required: false
@@ -187,6 +192,7 @@ jobs:
           RUN_DSR1_FP4_TP8_MTP1: ${{ inputs.run_dsr1_fp4_tp8_mtp1 }}
           RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
           RUN_GLM51_FP8_TP8: ${{ inputs.run_glm51_fp8_tp8 }}
+          RUN_MI355_ALL: ${{ inputs.run_mi355_all }}
           RUN_MI308_ALL: ${{ inputs.run_mi308_all }}
           REBUILD_ATOM_BASE_FROM_DOCKERFILE: ${{ inputs.rebuild_atom_base_from_dockerfile }}
         run: |
@@ -200,6 +206,7 @@ jobs:
           import sys
 
           event = os.environ["GITHUB_EVENT_NAME"]
+          run_mi355_all = os.environ.get("RUN_MI355_ALL", "").lower() == "true"
           run_mi308_all = os.environ.get("RUN_MI308_ALL", "").lower() == "true"
           models = [
               {
@@ -436,7 +443,7 @@ jobs:
                   # MI308-only rows: nightly schedule, or manual when run_mi308_all is checked.
                   enabled = (event != "workflow_dispatch") or run_mi308_all
               else:
-                  enabled = event != "workflow_dispatch" or os.environ.get(toggle, "").lower() == "true"
+                  enabled = event != "workflow_dispatch" or run_mi355_all or os.environ.get(toggle, "").lower() == "true"
               if enabled:
                   selected.append({k: v for k, v in model.items() if k != "toggle_env"})
 
