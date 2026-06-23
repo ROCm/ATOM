@@ -324,9 +324,10 @@ def _topk_index_kernel(
         bt_base_phys = bt_logical_page * pages_per_block * NUM_KV_HEADS + pid_h
         bt_dst_base = bt_slot * pages_per_block
 
-        sbt_row = sparse_bt_ptr + (
-            (block_start + pid_q) * NUM_KV_HEADS + pid_h
-        ) * stride_sbt_n
+        sbt_row = (
+            sparse_bt_ptr
+            + ((block_start + pid_q) * NUM_KV_HEADS + pid_h) * stride_sbt_n
+        )
         for pj in range(pages_per_block):
             tl.store(
                 sbt_row + bt_dst_base + pj,
@@ -868,6 +869,8 @@ def minimax_m3_index_topk(
     if emit:
         return topk_idx, sparse_bt, sparse_ctx
     return topk_idx
+
+
 @torch.no_grad()
 def minimax_m3_index_topk_decode(
     idx_q: torch.Tensor,  # [total_q == batch*max_query_len, num_idx_heads, head_dim]
@@ -901,10 +904,9 @@ def minimax_m3_index_topk_decode(
     assert (
         num_idx_heads == num_kv_heads
     ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    assert total_q % max_query_len == 0, (
-        f"total_q {total_q} not divisible by max_query_len {max_query_len}"
-    )
-    batch = total_q // max_query_len
+    assert (
+        total_q % max_query_len == 0
+    ), f"total_q {total_q} not divisible by max_query_len {max_query_len}"
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     score = torch.empty(
         (num_idx_heads, total_q, max_block),

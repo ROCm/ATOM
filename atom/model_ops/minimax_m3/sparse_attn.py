@@ -66,16 +66,6 @@ class MiniMaxM3SparseDecodeMetadata:
 
 
 @dataclass
-class MiniMaxM3SparseSmallQDecodeMetadata:
-    query_seq_lens: torch.Tensor
-    query_block_table: torch.Tensor
-    prefix_lens: torch.Tensor
-    block_table: torch.Tensor
-    max_query_len: int
-    decode_seq_lens: torch.Tensor | None = None
-
-
-@dataclass
 class MiniMaxM3SparseMetadata:
     seq_lens: torch.Tensor
     max_seq_len: int
@@ -83,7 +73,6 @@ class MiniMaxM3SparseMetadata:
     num_prefills: int
     prefill: MiniMaxM3SparsePrefillMetadata | None = None
     decode: MiniMaxM3SparseDecodeMetadata | None = None
-    small_q_decode: MiniMaxM3SparseSmallQDecodeMetadata | None = None
 
 
 def _build_prefill_query_metadata(
@@ -184,37 +173,6 @@ def make_minimax_m3_sparse_decode_metadata(
         num_prefills=0,
         prefill=None,
         decode=decode,
-    )
-
-
-def make_minimax_m3_sparse_small_q_decode_metadata(
-    *,
-    seq_lens: torch.Tensor,
-    query_seq_lens: torch.Tensor,
-    query_block_table: torch.Tensor,
-    prefix_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    max_query_len: int,
-    max_seq_len: int,
-    decode_seq_lens: torch.Tensor | None = None,
-) -> MiniMaxM3SparseMetadata:
-    small_q_decode = MiniMaxM3SparseSmallQDecodeMetadata(
-        query_seq_lens=query_seq_lens,
-        query_block_table=query_block_table,
-        prefix_lens=prefix_lens,
-        block_table=block_table,
-        max_query_len=max_query_len,
-        decode_seq_lens=decode_seq_lens,
-    )
-    return MiniMaxM3SparseMetadata(
-        seq_lens=seq_lens,
-        max_seq_len=max_seq_len,
-        slot_mapping=slot_mapping,
-        num_prefills=0,
-        prefill=None,
-        decode=None,
-        small_q_decode=small_q_decode,
     )
 
 
@@ -1448,7 +1406,6 @@ def minimax_m3_sparse_attn_prefill_asm(
         k_scale,
         v_scale,
     )
-
 
 
 @torch.no_grad()

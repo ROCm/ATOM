@@ -188,19 +188,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             ),
-            # MiniMax-M3 sparse spec-verify prefix length (cached-token count per
-            # seq). Persistent so CUDAGraph captures a stable address and the
-            # per-forward in-place update in prepare_decode is visible at every
-            # replay; filled once per forward and shared by all sparse layers.
-            "sparse_prefix_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
-            "sparse_decode_seq_lens": CpuGpuBuffer(
-                self.max_bs * max_qlen, **i32_kwargs
-            ),
-            "sparse_decode_block_tables": CpuGpuBuffer(
-                self.max_bs * max_qlen,
-                self.max_num_blocks_per_seq // self.block_ratio,
-                **i32_kwargs,
-            ),
         }
         self.model_runner.forward_vars.update(pa_persistent_metadata)
         # Per-ubatch buffers for CUDAGraph TBO
