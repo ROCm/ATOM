@@ -300,7 +300,12 @@ jobs:
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'atom-mi35x-8gpu-oot-acc'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
-          containers=$(docker ps -q)
+          if ! docker ps >/tmp/docker-ps.out 2>/tmp/docker-ps.err; then
+            echo "::warning::Docker is unavailable on this runner. Skipping pre-cleanup."
+            cat /tmp/docker-ps.err || true
+            exit 0
+          fi
+          containers=$(cat /tmp/docker-ps.out)
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
@@ -314,6 +319,10 @@ jobs:
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'atom-mi35x-8gpu-oot-acc'
         run: |
           set -euo pipefail
+          if [ -z "${DOCKER_CONFIG:-}" ]; then
+            echo "DOCKER_CONFIG is unset for runner ${{ matrix.runner }}; using Docker's default config path."
+            exit 0
+          fi
           mkdir -p "$DOCKER_CONFIG"
           chmod 700 "$DOCKER_CONFIG"
 
