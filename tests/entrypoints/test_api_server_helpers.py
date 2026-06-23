@@ -171,3 +171,37 @@ class TestBuildSamplingParams:
                 ignore_eos=False,
                 n=0,
             )
+
+
+class TestValidateContextLength:
+    """Oversized OpenAI requests should fail before entering the scheduler."""
+
+    def test_equal_to_max_model_len_is_allowed(self):
+        api_server._validate_context_length(
+            num_prompt_tokens=120,
+            max_tokens=8,
+            max_model_len=128,
+        )
+
+    def test_total_over_max_model_len_is_rejected(self):
+        with pytest.raises(ValueError, match="maximum context length is 128"):
+            api_server._validate_context_length(
+                num_prompt_tokens=121,
+                max_tokens=8,
+                max_model_len=128,
+            )
+
+    def test_prompt_alone_over_max_model_len_is_rejected(self):
+        with pytest.raises(ValueError, match="prompt contains at least 129"):
+            api_server._validate_context_length(
+                num_prompt_tokens=129,
+                max_tokens=0,
+                max_model_len=128,
+            )
+
+    def test_missing_max_model_len_skips_validation(self):
+        api_server._validate_context_length(
+            num_prompt_tokens=129,
+            max_tokens=8,
+            max_model_len=None,
+        )
