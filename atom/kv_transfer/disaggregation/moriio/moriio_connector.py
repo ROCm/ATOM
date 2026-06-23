@@ -197,7 +197,12 @@ class MoRIIOConnector(KVConnectorBase):
             )
             self._ping_thread.start()
 
-    def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, Any],
+        transfer_tensors: Any = None,
+        num_blocks: int | None = None,
+    ) -> None:
         """Register all KV cache tensors for RDMA and start the handshake listener.
 
         Must be called after model loading and KV cache allocation, before any

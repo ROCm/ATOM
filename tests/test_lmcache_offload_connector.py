@@ -1172,3 +1172,134 @@ def test_finished_recv_matches_string_req_id():
 
     assert sched._update_waiting_for_remote_kv(SimpleNamespace(id=123)) is True
     assert sched.finished_recving_kv_req_ids == []
+
+
+# ── MLA (DeepSeek R1/V3, Kimi) offload support ──────────────────────────────
+#
+# MLA stores a single per-layer latent cache viewed token-major as
+# ``(num_blocks * block_size, 1, latent)`` with no separate V/scale tensors,
+# so a segment's dim 0 is the *token* count, not the block count. The codec
+# must therefore take num_blocks explicitly and derive per-block byte strides
+# from it (segment_bytes / num_blocks) rather than assuming dim 0 == blocks.
+
+
+def _install_byte_addressing_fused(codec: ATOMKVByteCodec) -> None:
+    """Mock fused staging that addresses each physical block as a raw byte
+    slice — block ``b`` maps to bytes ``[b*nbytes : (b+1)*nbytes]`` of the
+    flattened segment, exactly like the Triton kernel. Unlike the block-major
+    ``_install_fake_fused_chunk_major`` (which index_selects on dim 0), this is
+    correct for MLA's token-major single-tensor layout."""
+
+    def _pack(
+        segments, seg_block_bytes, chunk_block_counts, flat_block_ids, device_buf
+    ) -> None:
+        offset = 0
+        cursor = 0
+        for count in chunk_block_counts:
+            ids = flat_block_ids[cursor : cursor + count]
+            cursor += count
+            for seg, nbytes in zip(segments, seg_block_bytes):
+                flat = seg.view(torch.uint8).reshape(-1)
+                for b in ids:
+                    device_buf[offset : offset + nbytes].copy_(
+                        flat[b * nbytes : (b + 1) * nbytes]
+                    )
+                    offset += nbytes
+
+    def _unpack(
+        device_buf, segments, seg_block_bytes, chunk_block_counts, flat_block_ids
+    ) -> None:
+        offset = 0
+        cursor = 0
+        for count in chunk_block_counts:
+            ids = flat_block_ids[cursor : cursor + count]
+            cursor += count
+            for seg, nbytes in zip(segments, seg_block_bytes):
+                flat = seg.view(torch.uint8).reshape(-1)
+                for b in ids:
+                    flat[b * nbytes : (b + 1) * nbytes].copy_(
+                        device_buf[offset : offset + nbytes]
+                    )
+                    offset += nbytes
+
+    codec._fused_kv_staging = SimpleNamespace(
+        fused_pack_chunk_major=_pack,
+        fused_unpack_chunk_major=_unpack,
+    )
+
+
+def test_codec_mla_token_major_block_accounting():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks, block_size, latent = 4, 2, 3
+    # MLA: single latent k_cache, token-major (num_blocks*block_size, 1, latent),
+    # no V / scale tensors.
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(
+                num_blocks * block_size * latent, dtype=torch.uint8
+            ).reshape(num_blocks * block_size, 1, latent),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+
+    # Block count comes from the explicit arg, not tensor.shape[0] (= tokens).
+    assert codec.num_blocks == num_blocks
+    # One physical block spans block_size tokens of `latent` bytes each.
+    assert codec.bytes_per_block == block_size * latent
+
+    # A segment whose element count is not divisible by num_blocks is rejected.
+    with pytest.raises(ValueError):
+        ATOMKVByteCodec(
+            {
+                "l0": SimpleNamespace(
+                    k_cache=torch.arange(7, dtype=torch.uint8),
+                    v_cache=None,
+                    k_scale=None,
+                    v_scale=None,
+                )
+            },
+            num_blocks=num_blocks,
+        )
+
+
+def test_codec_mla_round_trip_byte_identical():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks, block_size, latent = 4, 2, 3
+    n = num_blocks * block_size * latent
+    original = torch.arange(n, dtype=torch.uint8).reshape(
+        num_blocks * block_size, 1, latent
+    )
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=original.clone(), v_cache=None, k_scale=None, v_scale=None
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+    _install_byte_addressing_fused(codec)
+
+    block_id_groups = [[0, 1], [2, 3]]
+    device_buf = torch.empty(
+        num_blocks * codec.bytes_per_block, dtype=torch.uint8, device=codec.device
+    )
+
+    # Gather: each physical block is block_size*latent contiguous bytes.
+    codec.gpu_to_chunk_major_device_buffer(device_buf, block_id_groups)
+    flat = original.view(torch.uint8).reshape(num_blocks, -1)
+    expected = torch.cat([flat[0], flat[1], flat[2], flat[3]])
+    assert torch.equal(device_buf.cpu(), expected.cpu())
+
+    # Scatter back into a zeroed cache reproduces the original byte-for-byte.
+    kv_caches["l0"].k_cache.zero_()
+    codec.chunk_major_device_buffer_to_gpu(device_buf, block_id_groups)
+    assert torch.equal(kv_caches["l0"].k_cache, original)

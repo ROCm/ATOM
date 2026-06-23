@@ -1592,7 +1592,14 @@ class ModelRunner:
             for i, kv_cache_tensor in enumerate(kv_cache_tensors)
         }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
-        set_kv_cache_data(kv_cache_data, config, transfer_tensors)
+        # Pass the physical block count so the offload connector can byte-slice
+        # MLA's token-major latent cache (shape[0] is tokens, not blocks there).
+        set_kv_cache_data(
+            kv_cache_data,
+            config,
+            transfer_tensors,
+            num_blocks=self.num_physical_kvcache_blocks,
+        )
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by

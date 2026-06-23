@@ -96,7 +96,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._lookup_server = None
 
     # -- lifecycle --------------------------------------------------------
-    def register_kv_caches(self, kv_caches: dict, transfer_tensors=None) -> None:
+    def register_kv_caches(
+        self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
+    ) -> None:
         from aiter.dist.parallel_state import get_tp_group
         from lmcache.v1.cache_engine import LMCacheEngineBuilder
         from lmcache.v1.memory_management import MemoryFormat
@@ -110,7 +112,10 @@ class LMCacheOffloadConnector(KVConnectorBase):
             cfg, getattr(self._config, "kv_transfer_config", None)
         )
         self.chunk_size = int(cfg.chunk_size)
-        self._codec = ATOMKVByteCodec(kv_caches)
+        # num_blocks is the physical block count (num_physical_kvcache_blocks),
+        # threaded from the model runner. MLA stores its KV token-major, so the
+        # codec can't infer the block count from tensor.shape[0]; pass it.
+        self._codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
         base_meta = offcfg.build_lmcache_metadata(self._config, cfg, world, rank)
         meta = ATOMRawBytesLMCacheMetadata(
             base_meta,
