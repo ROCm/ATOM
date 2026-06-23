@@ -1006,7 +1006,6 @@ async def completions(request: CompletionRequest):
                     seq_ids,
                     tokenizer,
                     cleanup_streaming_request,
-                    tools=request.tools,
                 )
             else:
                 seq_id, stream_queue = await setup_streaming_request(
@@ -1023,7 +1022,6 @@ async def completions(request: CompletionRequest):
                     seq_id,
                     tokenizer,
                     cleanup_streaming_request,
-                    tools=request.tools,
                 )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
