@@ -171,10 +171,32 @@ class TestChatCompletionRequest:
         )
         assert req.temperature == 1.0
         assert req.max_tokens == 8192
+        assert req.get_max_tokens() == 8192
         assert req.stream is False
         assert req.top_p == 1.0
         assert req.top_k == -1
         assert req.n == 1
+
+    def test_max_completion_tokens_sets_effective_limit(self):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_completion_tokens": 16,
+            }
+        )
+        assert req.max_tokens == 8192
+        assert req.max_completion_tokens == 16
+        assert req.get_max_tokens() == 16
+
+    def test_max_tokens_still_sets_effective_limit(self):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 32,
+            }
+        )
+        assert req.max_tokens == 32
+        assert req.get_max_tokens() == 32
 
     def test_n_greater_than_one(self):
         req = ChatCompletionRequest.model_validate(
@@ -229,7 +251,19 @@ class TestCompletionRequest:
         req = CompletionRequest(prompt="Hello world")
         assert req.prompt == "Hello world"
         assert req.max_tokens == 8192
+        assert req.get_max_tokens() == 8192
         assert req.n == 1
+
+    def test_max_completion_tokens_sets_effective_limit(self):
+        req = CompletionRequest.model_validate(
+            {
+                "prompt": "Hello world",
+                "max_completion_tokens": 16,
+            }
+        )
+        assert req.max_tokens == 8192
+        assert req.max_completion_tokens == 16
+        assert req.get_max_tokens() == 16
 
     def test_extra_fields_ignored(self):
         req = CompletionRequest.model_validate(

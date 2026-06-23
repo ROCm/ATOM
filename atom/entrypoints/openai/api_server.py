@@ -178,6 +178,43 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
     return n
 
 
+def _validate_context_length(
+    num_prompt_tokens: int,
+    max_tokens: int,
+    max_model_len: Optional[int],
+) -> None:
+    if max_model_len is None:
+        return
+
+    requested_output_tokens = max(0, int(max_tokens or 0))
+    total_tokens = int(num_prompt_tokens) + requested_output_tokens
+    if total_tokens <= int(max_model_len):
+        return
+
+    raise ValueError(
+        f"This model's maximum context length is {max_model_len} tokens. "
+        f"However, you requested {requested_output_tokens} output tokens and "
+        f"your prompt contains at least {num_prompt_tokens} input tokens, for "
+        f"a total of at least {total_tokens} tokens. Please reduce the length "
+        f"of the input prompt or the number of requested output tokens."
+    )
+
+
+def _get_engine_max_model_len() -> Optional[int]:
+    config = getattr(engine, "config", None)
+    if config is None:
+        config = getattr(getattr(engine, "io_processor", None), "config", None)
+    return getattr(config, "max_model_len", None)
+
+
+def _validate_sequence_context_length(seq) -> None:
+    _validate_context_length(
+        seq.num_prompt_tokens,
+        seq.max_tokens,
+        _get_engine_max_model_len(),
+    )
+
+
 def _has_multimodal_content(messages: List[Any]) -> bool:
     for message in messages:
         content = getattr(message, "content", None)
@@ -387,6 +424,11 @@ async def generate_async(
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
+    try:
+        _validate_sequence_context_length(seq)
+    except Exception:
+        engine.io_processor.requests.pop(seq.id, None)
+        raise
     engine.core_mgr.add_request([seq])
 
     while True:
@@ -473,6 +515,11 @@ async def generate_async_multimodal(
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
+    try:
+        _validate_sequence_context_length(seq)
+    except Exception:
+        engine.io_processor.requests.pop(seq.id, None)
+        raise
     engine.core_mgr.add_request([seq])
 
     while True:
@@ -572,6 +619,12 @@ async def generate_async_fanout(
         )
 
     seqs = await loop.run_in_executor(None, do_preprocess)
+    try:
+        _validate_sequence_context_length(seqs[0])
+    except Exception:
+        for seq in seqs:
+            engine.io_processor.requests.pop(seq.id, None)
+        raise
     engine.core_mgr.add_request(seqs)
     num_tokens_input = seqs[0].num_prompt_tokens
 
@@ -668,7 +721,18 @@ async def setup_streaming_request(
         _seq_id_to_request_id[seq.id] = request_id
         return seq
 
-    seq = await executor_loop.run_in_executor(None, do_preprocess)
+    seq = None
+    try:
+        seq = await executor_loop.run_in_executor(None, do_preprocess)
+        _validate_sequence_context_length(seq)
+    except Exception:
+        _stream_queues.pop(request_id, None)
+        _stream_loops.pop(request_id, None)
+        _request_start_times.pop(request_id, None)
+        if seq is not None:
+            _seq_id_to_request_id.pop(seq.id, None)
+            engine.io_processor.requests.pop(seq.id, None)
+        raise
     seq_id = seq.id
 
     logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}")
@@ -742,7 +806,18 @@ async def setup_streaming_request_fanout(
             _seq_id_to_request_id[seq.id] = request_id
         return seqs
 
-    seqs = await executor_loop.run_in_executor(None, do_preprocess)
+    seqs = []
+    try:
+        seqs = await executor_loop.run_in_executor(None, do_preprocess)
+        _validate_sequence_context_length(seqs[0])
+    except Exception:
+        _stream_queues.pop(request_id, None)
+        _stream_loops.pop(request_id, None)
+        _request_start_times.pop(request_id, None)
+        for seq in seqs:
+            _seq_id_to_request_id.pop(seq.id, None)
+            engine.io_processor.requests.pop(seq.id, None)
+        raise
     seq_ids = [seq.id for seq in seqs]
     logger.info(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
@@ -821,7 +896,7 @@ async def chat_completions(request: ChatCompletionRequest):
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
-            max_tokens=request.max_tokens,
+            max_tokens=request.get_max_tokens(),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
@@ -963,7 +1038,7 @@ async def completions(request: CompletionRequest):
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
-            max_tokens=request.max_tokens,
+            max_tokens=request.get_max_tokens(),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
