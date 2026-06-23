@@ -159,6 +159,43 @@ class Eagle3DraftBuilder:
             v_scale=getattr(module, "v_scale", None),
         )
 
+    def get_kv_transfer_tensors(self) -> list:
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
+        runner = self.model_runner
+        if not hasattr(runner, "eagle3_kv_cache"):
+            return []
+
+        regions: list[KVTransferRegion] = []
+        cache = runner.eagle3_kv_cache
+        for layer_id in range(self.num_layers):
+            for kv in range(2):
+                t = cache[kv, layer_id]
+                regions.append(
+                    KVTransferRegion(
+                        base_addr=t.data_ptr(),
+                        total_bytes=t.numel() * t.element_size(),
+                        unit_bytes=t.stride(0) * t.element_size(),
+                    )
+                )
+        scale = runner.eagle3_kv_scale
+        if (
+            self.model_runner.config.kv_cache_dtype == "fp8"
+            and scale is not None
+            and scale.numel() > 0
+        ):
+            for layer_id in range(self.num_layers):
+                for kv in range(2):
+                    t = scale[kv, layer_id]
+                    regions.append(
+                        KVTransferRegion(
+                            base_addr=t.data_ptr(),
+                            total_bytes=t.numel() * t.element_size(),
+                            unit_bytes=t.stride(0) * t.element_size(),
+                        )
+                    )
+        return regions
+
 
 class EagleProposer:
 
@@ -223,6 +260,11 @@ class EagleProposer:
         else:
             self.model = model_class(self.config)
 
+        # Distributed-argmax fast path for greedy drafting: all-gather only the
+        # per-rank (max_val, idx) instead of the full [N, vocab] logits. Resolved
+        # once here so the hot loop avoids a per-step hasattr.
+        self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
+
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         max_bs = self.config.max_num_seqs
@@ -251,8 +293,9 @@ class EagleProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
         if self.speculative_config.method == "eagle3":
-            # Eagle3: load from a separate draft model checkpoint with
-            # independent embed_tokens and lm_head (no sharing).
+            # Eagle3: load the draft fully from its own checkpoint with its own
+            # embed_tokens and lm_head (this draft trains its own lm_head; do not
+            # share the target's).
             load_model(
                 self.model,
                 self.speculative_config.model,
@@ -415,8 +458,16 @@ class EagleProposer:
                     if i == 0
                     else ret_hidden_states
                 )
-                logits = self.model.compute_logits(sample_hidden_states)
-                new_draft_ids = logits.argmax(dim=-1)
+                # Greedy draft only needs the argmax token. When the draft model
+                # exposes a distributed-argmax path, use it: each TP rank reduces
+                # its vocab shard and we all-gather only [N, 2] per-rank maxima
+                # instead of the full [N, vocab] logits (O(tp) vs O(vocab) comm),
+                # token-identical to compute_logits(...).argmax(-1).
+                if self._draft_argmax_fused:
+                    new_draft_ids = self.model.compute_draft_token(sample_hidden_states)
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
+                    new_draft_ids = logits.argmax(dim=-1)
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
@@ -425,6 +476,17 @@ class EagleProposer:
                         # TODO: FIX this condition after we support3 attention head numbers=32
                         and self.runner.attn_metadata_builder.num_attention_heads != 32
                     )
+                    fuse_mtp_metadata_update = (
+                        positions.ndim == 1
+                        and getattr(
+                            self.runner.attn_metadata_builder,
+                            "fuse_mtp_decode_position_update",
+                            False,
+                        )
+                    )
+                    mtp_positions = positions
+                    mtp_positions_out = positions if fuse_mtp_metadata_update else None
+                    mtp_last_token_indices = None
                     if i == 0:
                         i0_max_seqlen_q = attn_metadata.max_seqlen_q
                         attn_metadata.max_seqlen_q = 1
@@ -457,9 +519,17 @@ class EagleProposer:
                                 num_reject_tokens, dim=0
                             )
                         if positions.ndim == 1:
-                            positions = torch.index_select(
-                                positions, 0, last_token_indices
-                            )
+                            if fuse_mtp_metadata_update:
+                                mtp_positions = positions
+                                positions = torch.empty(
+                                    bs, dtype=positions.dtype, device=positions.device
+                                )
+                                mtp_positions_out = positions
+                                mtp_last_token_indices = last_token_indices
+                            else:
+                                positions = torch.index_select(
+                                    positions, 0, last_token_indices
+                                )
                         else:
                             # MRoPE positions keep the token axis last (e.g.
                             # [3, num_tokens] for Qwen3.5), so select columns
@@ -473,8 +543,17 @@ class EagleProposer:
                     attn_metadata.max_seqlen_k += 1
                     # Update context_lens for each draft step (needed by both
                     # MHA attention and MLA+sparse indexer)
-                    attn_metadata.context_lens[:bs] += 1
-                    positions += 1
+                    if not fuse_mtp_metadata_update:
+                        attn_metadata.context_lens[:bs] += 1
+                        positions += 1
+                        mtp_positions = positions
+                    mtp_decode_kwargs = {}
+                    if fuse_mtp_metadata_update:
+                        mtp_decode_kwargs = {
+                            "update_context_lens": True,
+                            "positions_out": mtp_positions_out,
+                            "last_token_indices": mtp_last_token_indices,
+                        }
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
                         (
@@ -483,14 +562,19 @@ class EagleProposer:
                             else i0_max_seqlen_q
                         ),
                         attn_metadata.max_seqlen_k,
-                        positions,
+                        mtp_positions,
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,
+                        **mtp_decode_kwargs,
                     )
-                    for k, v in workinfos.items():
-                        attn_metadata.__dict__[k] = v
-                    if has_flat_kv:
-                        # MLA/MHA path: slot derived from flat kv_indices.
+                    attn_metadata.__dict__.update(workinfos)
+                    if has_flat_kv and "slot_mapping" not in workinfos:
+                        # Token-granular flat-kv path (MLA physical block_size=1):
+                        # kv_indices store per-token slots, so the last entry of
+                        # each seq IS its write slot. Block-paged MHA drafts
+                        # (e.g. MiniMax-M3, block_size>1) cannot use this — their
+                        # kv_indices are block-granular — so their builder returns
+                        # a correctly block-expanded `slot_mapping` and we skip it.
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
