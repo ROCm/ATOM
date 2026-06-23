@@ -10,7 +10,10 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils import CpuGpuBuffer, envs
-from atom.utils.block_convert import kv_indices_generate_triton
+from atom.utils.block_convert import (
+    block_table_convert_triton,
+    kv_indices_generate_triton,
+)
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils.forward_context import AttentionMetaData, Context
 from atom.utils.tbo import TokenSplitPrefillState
@@ -49,9 +52,27 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         device=None,
         model_runner=None,
     ):
-        self.block_size = (
-            model_runner.block_size if model_runner.block_size in (256, 1024) else 16
+        hf_config = model_runner.config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        from atom.config import _is_minimax_m3_config
+
+        self._has_sparse_attention = bool(sparse_cfg) and _is_minimax_m3_config(
+            hf_config
         )
+        if self._has_sparse_attention and (
+            sparse_block_size := sparse_cfg.get("sparse_block_size")
+        ):
+            # MiniMax-M3 sparse kernels operate on sparse_attention_config's
+            # block size. The scheduler/KV manager block size may be larger as
+            # long as it is divisible by this logical attention block size.
+            self.block_size = sparse_block_size
+        else:
+            self.block_size = (
+                model_runner.block_size
+                if model_runner.block_size in (256, 1024)
+                else 16
+            )
         if envs.ATOM_USE_UNIFIED_ATTN:
             # SHUFFLE (pre-shuffled) KV cache: use the logical block size directly
             # as the physical block size so block_ratio == 1 and
@@ -70,6 +91,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     model_runner.block_size,
                 )
             self.block_size = model_runner.block_size
+
         assert (
             model_runner.block_size % self.block_size == 0
         ), f"model_runner.block_size must be divisible by block_size but got {model_runner.block_size=}, block_size={self.block_size}, please set --block-size (model_runner.block_size) to be divisible by {self.block_size}"
@@ -108,6 +130,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        if self._has_sparse_attention and self.block_ratio > 1:
+            self.model_runner.forward_vars["sparse_attention_block_tables"] = (
+                CpuGpuBuffer(
+                    self.max_bs,
+                    self.max_num_blocks_per_seq,
+                    **i32_kwargs,
+                )
+            )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -309,6 +339,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         config = runner.config
         hf_config = config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
         num_kv_heads = runner._get_num_kv_heads()
         total_num_layers = runner._get_total_num_layers()
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
@@ -377,6 +408,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             * runner.physical_block_size
             * 4  # float32 kv_scale
         )
+        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        if sparse_cfg:
+            sparse_layers = sum(
+                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
+            )
+            index_dim = sparse_cfg["sparse_index_dim"]
+            block_bytes += (
+                sparse_layers
+                * runner.physical_block_size
+                * index_dim
+                * torch.empty((), dtype=config.torch_dtype).element_size()
+            )
         return block_bytes
 
     def allocate_kv_cache_tensors(
@@ -394,6 +437,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         config = runner.config
         hf_config = config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
 
         if runner.is_mimo_v2():
             # Per-layer allocation deferred (each module gets its own
@@ -404,7 +448,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "_kv_layer_cache_store": [],
             }
 
-        return {
+        tensors = {
             "kv_cache": torch.zeros(
                 2,
                 hf_config.num_hidden_layers,
@@ -425,6 +469,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 device="cuda",
             ),
         }
+        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        if sparse_cfg:
+            sparse_layers = sum(
+                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
+            )
+            tensors["sparse_attention_index_cache"] = torch.zeros(
+                sparse_layers,
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                sparse_cfg["sparse_index_dim"],
+                dtype=config.torch_dtype,
+                device="cuda",
+            )
+            tensors["_sparse_attention_cache_next"] = 0
+        return tensors
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one MHA (non-MLA) attention module to its KV slice.
@@ -439,6 +498,24 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         """
         from atom.config import KVCacheTensor
         from aiter import dtypes
+
+        if getattr(module, "is_indexed_sparse_attention", False):
+            runner = self.model_runner
+            config = runner.config
+            sparse_idx = runner._sparse_attention_cache_next
+            runner._sparse_attention_cache_next += 1
+            key_cache, value_cache = module.bind_kv_cache(
+                runner.kv_cache[:, layer_id],
+                runner.sparse_attention_index_cache[sparse_idx],
+                config.max_model_len,
+            )
+            return KVCacheTensor(
+                layer_num=layer_id,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                k_scale=None,
+                v_scale=None,
+            )
 
         if not (
             hasattr(module, "base_attention")
@@ -537,6 +614,31 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             v_scale=module.v_scale,
         )
 
+    def _get_sparse_attention_block_tables(
+        self,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        bs: int,
+    ) -> torch.Tensor:
+        """Return MiniMax-M3 sparse-kernel block tables.
+
+        `block_tables` is produced by the scheduler at `model_runner.block_size`
+        granularity. MiniMax-M3 sparse attention indexes blocks at
+        `sparse_block_size` granularity, so when the scheduler block is larger
+        we expand each scheduler page id into its logical sparse pages.
+        """
+        if self.block_ratio == 1:
+            return block_tables
+        sparse_block_tables = self.model_runner.forward_vars[
+            "sparse_attention_block_tables"
+        ].gpu[:bs]
+        return block_table_convert_triton(
+            block_tables,
+            sparse_block_tables,
+            seq_lens,
+            self.block_ratio,
+        )
+
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.types import (
             KVTransferRegion,
@@ -590,6 +692,32 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
+        if self._has_sparse_attention and not attn_metadata.has_cached:
+            bs = batch.total_seqs_num_prefill
+            self.prepare_block_tables(batch)
+            attn_metadata.block_tables = self.model_runner.forward_vars[
+                "block_tables"
+            ].copy_to_gpu(bs)
+        if self._has_sparse_attention:
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_prefill_metadata,
+            )
+
+            bs = batch.total_seqs_num_prefill
+            sparse_block_tables = self._get_sparse_attention_block_tables(
+                attn_metadata.block_tables[:bs],
+                attn_metadata.context_lens[:bs],
+                bs,
+            )
+            attn_metadata.sparse_attention_metadata = make_sparse_prefill_metadata(
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                seq_lens=attn_metadata.context_lens,
+                block_table=sparse_block_tables,
+                slot_mapping=attn_metadata.slot_mapping,
+                max_query_len=attn_metadata.max_seqlen_q,
+                max_seq_len=attn_metadata.max_seqlen_k,
+                num_prefills=bs,
+            )
         if self._tbo_token_split:
             self._stash_tbo_token_split_prefill_state(batch)
         return attn_metadata, positions
@@ -784,6 +912,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
+        if self._has_sparse_attention:
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_decode_metadata,
+            )
+
+            if max_seqlen_q > 1:
+                raise NotImplementedError(
+                    "MiniMax-M3 FP4-only support does not include speculative decode."
+                )
+            sparse_block_tables = self._get_sparse_attention_block_tables(
+                attn_metadata.block_tables[:scheduled_bs],
+                attn_metadata.context_lens[:scheduled_bs],
+                scheduled_bs,
+            )
+            attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
+                seq_lens=attn_metadata.context_lens[:scheduled_bs],
+                block_table=sparse_block_tables,
+                slot_mapping=attn_metadata.slot_mapping,
+                max_seq_len=int(max_seqlen_k),
+            )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q
         )
@@ -962,19 +1110,41 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
+        total_tokens = bs * max_q_len
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[: bs * max_q_len],
+            slot_mapping=var["slot_mapping"].gpu[:total_tokens],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
-            max_seqlen_q=var["max_qlen"],
+            max_seqlen_q=max_q_len,
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu,
             max_seqlen_k=max_seqlen_k,
             **ctx_pa_ps,
         )
+        if self._has_sparse_attention:
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_decode_metadata,
+            )
 
-        positions = var["positions"].copy_to_gpu(bs * max_q_len)
+            seq_lens = attn_metadata.context_lens
+            if max_q_len > 1:
+                raise NotImplementedError(
+                    "MiniMax-M3 FP4-only support does not include speculative decode."
+                )
+            sparse_block_tables = self._get_sparse_attention_block_tables(
+                attn_metadata.block_tables,
+                seq_lens,
+                bs,
+            )
+            attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
+                seq_lens=seq_lens,
+                block_table=sparse_block_tables,
+                slot_mapping=attn_metadata.slot_mapping,
+                max_seq_len=attn_metadata.max_seqlen_k,
+            )
+
+        positions = var["positions"].copy_to_gpu(total_tokens)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )

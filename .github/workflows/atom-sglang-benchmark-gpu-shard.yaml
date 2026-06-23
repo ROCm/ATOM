@@ -197,6 +197,9 @@ jobs:
           elif [ -d "/data/models" ]; then
             MODEL_CACHE_MOUNT="-v /data/models:/models"
             MODEL_CACHE_DESC="/data/models (shared host path)"
+          elif [ -d "/mnt/raid0/pretrained_model" ]; then
+            MODEL_CACHE_MOUNT="-v /mnt/raid0/pretrained_model:/models"
+            MODEL_CACHE_DESC="/mnt/raid0/pretrained_model (shared host path)"
           else
             echo "No shared host model cache found; using container-local /models."
           fi
@@ -216,7 +219,9 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          printf '%s\n' "${{ matrix.model.env_vars }}" | sed 's/^[[:space:]]*//' > /tmp/oot_env_file.txt
+          OOT_ENV_FILE="${RUNNER_TEMP:-${GITHUB_WORKSPACE:-$PWD}}/oot_env_file.txt"
+          mkdir -p "$(dirname "${OOT_ENV_FILE}")"
+          printf '%s\n' "${{ matrix.model.env_vars }}" | sed 's/^[[:space:]]*//' > "${OOT_ENV_FILE}"
           CASE_KEY="${ISL}x${OSL}"
           CASE_ENV_VARS="$(
             CASE_ENV_VARS_BY_PAIR="${CASE_ENV_VARS_BY_PAIR:-null}" CASE_KEY="${CASE_KEY}" python3 - <<'PY'
@@ -235,7 +240,7 @@ jobs:
           PY
           )"
           if [[ -n "${CASE_ENV_VARS}" ]]; then
-            printf '%s\n' "${CASE_ENV_VARS}" >> /tmp/oot_env_file.txt
+            printf '%s\n' "${CASE_ENV_VARS}" >> "${OOT_ENV_FILE}"
           fi
 
           # Podman + crun: avoid "create keyring ... Disk quota exceeded" (kernel user-keyring
@@ -272,7 +277,7 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
-            --env-file /tmp/oot_env_file.txt \
+            --env-file "${OOT_ENV_FILE}" \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
             --entrypoint /bin/bash \
