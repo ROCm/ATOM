@@ -9,6 +9,7 @@ import triton.language as tl
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.fusions.lm_head_argmax import local_argmax_pack
 
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
@@ -241,12 +242,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
             return logits.argmax(dim=-1)
-        local_max_val, local_idx = logits.max(dim=-1)  # [N], [N]
-        global_idx = local_idx + self.vocab_start_idx  # [N] global token id
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.
-        packed = torch.stack([local_max_val.float(), global_idx.float()], dim=-1)
+        packed = local_argmax_pack(logits, self.vocab_start_idx)
         gathered = get_tp_group().all_gather(packed, dim=0).view(self.tp_size, -1, 2)
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
         token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
-        return token.to(local_idx.dtype)
+        return token.to(torch.long)
