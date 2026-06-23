@@ -902,6 +902,36 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
         self._attach_tbo_token_split_straddle_prefix(ub_attn, ub_slice)
+        if self._is_minimax_m3_sparse:
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_minimax_m3_sparse_prefill_metadata,
+            )
+
+            ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
+            sparse_md = make_minimax_m3_sparse_prefill_metadata(
+                cu_seqlens_q=ub_attn.cu_seqlens_q,
+                seq_lens=ub_attn.context_lens,
+                block_table=ub_attn.block_tables,
+                slot_mapping=ub_attn.slot_mapping,
+                max_query_len=ub_attn.max_seqlen_q,
+                max_seq_len=ub_attn.max_seqlen_k,
+                num_prefills=ub_num_reqs,
+            )
+
+            src_sparse_md = getattr(attn_metadata, "minimax_m3_sparse_metadata", None)
+            src_prefill = getattr(src_sparse_md, "prefill", None)
+            if src_prefill is not None and src_prefill.query_req_id is not None:
+                ts = ub_slice.token_slice
+                rs = ub_slice.request_slice
+                ub_prefill = sparse_md.prefill
+                ub_prefill.query_req_id = src_prefill.query_req_id[ts] - rs.start
+                ub_prefill.query_abs_pos = src_prefill.query_abs_pos[ts]
+                ub_prefill.per_token_qo_indptr = torch.arange(
+                    ts.stop - ts.start + 1,
+                    dtype=torch.int32,
+                    device=ub_attn.slot_mapping.device,
+                )
+            ub_attn.minimax_m3_sparse_metadata = sparse_md
         return ub_attn
 
     def _attach_tbo_token_split_straddle_prefix(self, ub_attn, ub_slice):
@@ -1229,6 +1259,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens=var[f"{p}context_lens"].gpu[:padded_bs],
             block_tables=var[f"{p}block_tables"].gpu[:padded_bs],
             max_seqlen_q=max_q_len,
+            max_seqlen_k=self.model_runner.config.max_model_len,
             cu_seqlens_q=var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
             kv_indptr=var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
             kv_indices=var[f"{p}kv_indices"].gpu,
@@ -1239,6 +1270,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             reduce_final_map=var[f"{p}reduce_final_map"],
             reduce_partial_map=var[f"{p}reduce_partial_map"],
         )
+        if self._is_minimax_m3_sparse:
+            if max_q_len > 1:
+                raise NotImplementedError(
+                    "MiniMax M3 sparse TBO decode with max_q_len > 1 is not "
+                    "implemented."
+                )
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_minimax_m3_sparse_decode_metadata,
+            )
+
+            attn.minimax_m3_sparse_metadata = make_minimax_m3_sparse_decode_metadata(
+                seq_lens=attn.context_lens,
+                block_table=attn.block_tables,
+                slot_mapping=attn.slot_mapping,
+                max_seq_len=attn.max_seqlen_k,
+            )
         return attn
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
