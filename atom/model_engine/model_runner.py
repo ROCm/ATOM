@@ -567,6 +567,7 @@ class tokenIDProcessor:
             )
         return ret
 
+
 @contextmanager
 def _init_weight_params_on_meta():
     """Construct a model with all `nn.Parameter`s on the meta device (no
@@ -693,16 +694,16 @@ class ModelRunner:
                 model_class, "quant_exclude_name_mapping", {}
             ),
         )
-        #self.model = model_class(config)
-        if config.disagg_is_decode:                                                                     
-                # Decode imports prefill's weights via CUDA IPC and owns no weight                          
-                # memory. Build on the meta device so construction allocates zero GPU                       
-                # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);                           
-                # import_model_weight_ipc_handles() materializes params from prefill,                       
-                # and RoPE caches are recomputed locally below.                                             
-                with _init_weight_params_on_meta():                                                                  
-                    self.model = model_class(config)                                                                                                                    
-        else:                                                                                           
+        # self.model = model_class(config)
+        if config.disagg_is_decode:
+            # Decode imports prefill's weights via CUDA IPC and owns no weight
+            # memory. Build on the meta device so construction allocates zero GPU
+            # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);
+            # import_model_weight_ipc_handles() materializes params from prefill,
+            # and RoPE caches are recomputed locally below.
+            with _init_weight_params_on_meta():
+                self.model = model_class(config)
+        else:
             self.model = model_class(config)
         fused_shared_expert_load_fn = None
         if hasattr(self.model, "load_fused_expert_weights"):
@@ -1845,7 +1846,6 @@ class ModelRunner:
             + str([p for p in paths if not os.path.exists(p)])
         )
 
-    
     def export_model_weight_ipc_handles(self) -> list[str] | None:
         """Export all model parameters as CUDA IPC handles (prefill process only).
 

@@ -174,9 +174,7 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
                 setattr(mod, attr, t)
 
     leftover = [n for n, p in model.named_parameters() if p.is_meta] + [
-        n
-        for n, b in model.named_buffers()
-        if isinstance(b, torch.Tensor) and b.is_meta
+        n for n, b in model.named_buffers() if isinstance(b, torch.Tensor) and b.is_meta
     ]
     if leftover:
         logger.warning(
