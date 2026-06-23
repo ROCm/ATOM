@@ -151,6 +151,41 @@ class VocabParallelEmbedding(nn.Module):
         # return y
 
 
+class ReplicatedEmbedding(nn.Module):
+    """Full vocab embedding replicated on every TP rank (no sharding).
+
+    Each rank holds the complete ``[num_embeddings, embedding_dim]`` table and
+    does a purely local lookup, so the forward needs **no all-reduce** — unlike
+    ``VocabParallelEmbedding``, which shards the vocab and must all-reduce the
+    masked partial lookups to reconstruct the full vector.
+
+    Trades ``(tp-1)/tp`` of the embedding's memory per rank for one fewer
+    collective per embed. Use ONLY where the embedding is independent of any
+    sharded ``lm_head`` (e.g. the EAGLE3 draft, whose embed/lm_head are separate
+    tensors). Do NOT use for an embedding shared/tied with a TP-sharded lm_head
+    or with the target model's sharded embedding.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.weight = atom_parameter(
+            torch.empty(num_embeddings, embedding_dim),
+        )
+        self.weight.weight_loader = self.weight_loader
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        # Full (un-sharded) copy: every rank gets the complete table.
+        assert param.data.size() == loaded_weight.size(), (
+            f"ReplicatedEmbedding expects the full weight "
+            f"{tuple(param.data.size())}, got {tuple(loaded_weight.size())}"
+        )
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor):
+        return F.embedding(x, self.weight)
+
+
 class ParallelLMHead(VocabParallelEmbedding):
 
     def __init__(
