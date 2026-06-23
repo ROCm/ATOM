@@ -146,3 +146,155 @@ Reference MXFP8 results from the validated run on 4xMI355 GPUs:
 | 16 | 160 | 143.25 | 414.95 | 2411.41 | 14.80 | 16.44 | 1022.17 | 9224.81 |
 | 32 | 320 | 208.34 | 565.02 | 4936.02 | 21.42 | 24.16 | 1421.47 | 12711.25 |
 | 64 | 640 | 305.81 | 893.93 | 9610.43 | 31.69 | 37.31 | 1929.04 | 17387.94 |
+
+## EAGLE3 Speculative Decoding
+
+EAGLE3 runs a small single-layer draft model alongside the MiniMax-M3 target to
+propose multiple tokens per step, which the target then verifies. It is lossless
+with respect to the target's greedy output. The draft checkpoint is
+[`Inferact/MiniMax-M3-EAGLE3`](https://huggingface.co/Inferact/MiniMax-M3-EAGLE3).
+Enable it by adding three flags to any of the server commands above:
+
+- `--method eagle3`
+- `--draft-model Inferact/MiniMax-M3-EAGLE3`
+- `--num-speculative-tokens 3`
+
+### Launching Server
+
+The following starts the MXFP4 target with the EAGLE3 draft on 4xMI355 (the FP4
+server command above plus the three speculative-decoding flags):
+
+```bash
+model_path=amd/MiniMax-M3-MXFP4
+model_path=MiniMaxAI/MiniMax-M3-MXFP8
+draft_path=Inferact/MiniMax-M3-EAGLE3
+
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_M3_SPARSE_USE_ASM_PA=1
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --tensor-parallel-size 4 \
+  --server-port 8000 \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.8 \
+  --kv_cache_dtype fp8 \
+  --block-size 128 \
+  --max-model-len 32768 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 32768 \
+  --no-enable_prefix_caching \
+  --method eagle3 \
+  --draft-model "$draft_path" \
+  --num-speculative-tokens 3 2>&1 | tee m3-mxfp4-eagle3-server.log
+```
+
+### Accuracy Test
+
+Run GSM8K 5-shot with `lm_eval` (identical to the non-speculative test):
+
+```bash
+model_path=amd/MiniMax-M3-MXFP4
+model_path=MiniMaxAI/MiniMax-M3-MXFP8
+BS=65
+
+lm_eval \
+  --model local-chat-completions \
+  --model_args "model=$model_path,base_url=http://127.0.0.1:8000/v1/chat/completions,num_concurrent=32,max_gen_toks=16384" \
+  --tasks gsm8k \
+  --num_fewshot 5 \
+  --batch_size "${BS}" \
+  --apply_chat_template \
+  --fewshot_as_multiturn 2>&1 | tee m3-mxfp4-eagle3-bs65-accuracy.log
+```
+
+Validated MXFP4+EAGLE GSM8K result:
+
+```text
+local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9416|±  |0.0062|
+|     |       |strict-match    |     5|exact_match|↑  |0.9419|±  |0.0062|
+```
+
+Validated MXFP8+EAGLE GSM8K result:
+
+```text
+local-chat-completions ({'model': 'MiniMaxAI/MiniMax-M3-MXFP8', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9500|±  |0.0061|
+|     |       |strict-match    |     5|exact_match|↑  |0.9494|±  |0.0061|
+```
+
+### Serving Benchmark
+
+The following script can be used to benchmark online serving throughput and latency:
+
+```bash
+model_path=${model_path:-amd/MiniMax-M3-MXFP4}
+ISL=8192
+OSL=1024
+CONC=16
+
+python -m atom.benchmarks.benchmark_serving \
+  --model="$model_path" \
+  --backend=vllm \
+  --base-url=http://localhost:8000 \
+  --dataset-name=random \
+  --random-input-len="${ISL}" \
+  --random-output-len="${OSL}" \
+  --random-range-ratio=0.8 \
+  --num-prompts=$(( CONC * 10 )) \
+  --max-concurrency="${CONC}" \
+  --request-rate=inf \
+  --ignore-eos \
+  --save-result \
+  --use-chat-template \
+  --percentile-metrics="ttft,tpot,itl,e2el"
+```
+
+Reference MXFP4 EAGLE3 results from our run on 4xMI355 GPUs:
+
+| CONC | Requests | Duration (s) | Mean TTFT (ms) | P99 TTFT (ms) | Mean TPOT (ms) | P99 TPOT (ms) | Output tok/s | Total tok/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 40 | 60.37 | 317.29 | 960.98 | 6.05 | 11.85 | 610.59 | 5581.65 |
+| 8 | 80 | 77.51 | 352.55 | 1414.16 | 7.77 | 18.81 | 957.06 | 8602.10 |
+| 16 | 160 | 103.68 | 498.39 | 4218.43 | 10.03 | 22.49 | 1414.41 | 13210.97 |
+| 32 | 320 | 139.89 | 642.88 | 5327.78 | 13.91 | 33.04 | 2120.00 | 19933.90 |
+| 64 | 640 | 213.19 | 979.37 | 10432.72 | 21.05 | 51.05 | 2771.30 | 24947.04 |
+
+Reference MXFP8 EAGLE3 results from our run on 4xMI355 GPUs:
+
+| CONC | Requests | Duration (s) | Mean TTFT (ms) | P99 TTFT (ms) | Mean TPOT (ms) | P99 TPOT (ms) | Output tok/s | Total tok/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 40 | 71.58 | 305.42 | 725.69 | 7.17 | 13.13 | 514.96 | 4723.03 |
+| 8 | 80 | 92.76 | 761.62 | 5615.31 | 8.83 | 19.75 | 799.67 | 7211.16 |
+| 16 | 160 | 118.81 | 502.76 | 2852.45 | 11.45 | 24.82 | 1234.39 | 12124.02 |
+| 32 | 320 | 165.54 | 681.16 | 5616.00 | 16.37 | 34.57 | 1791.67 | 16501.51 |
+| 64 | 640 | 249.99 | 1026.47 | 11151.09 | 24.90 | 59.52 | 2363.39 | 22374.37 |
+
+### Acceptance Rate
+
+With `--num-speculative-tokens 3` the draft proposes 3 tokens per step. Measured
+over the full GSM8K run:
+
+```text
+Average accepted tokens / forward : 3.20    (1 verified + up to 3 speculated)
+Overall draft acceptance rate     : 73.45%  (accepted / total proposed draft tokens)
+Accepted-count distribution       : {0: 14.20%, 1: 12.11%, 2: 12.83%, 3: 60.86%}
+```
+
+Draft tokens are accepted sequentially — position *i* is kept only if every earlier
+position was kept — so the per-position acceptance rate is the marginal probability
+that each draft slot is accepted (`P(accepted ≥ i)`):
+
+| Draft position | Per-position acceptance rate |
+|----------------|------------------------------|
+| 1st            | 85.8%                        |
+| 2nd            | 73.7%                        |
+| 3rd            | 60.9%                        |
+
+The three per-position rates average to the 73.45% overall rate, and 60.86% of
+steps accept all 3 speculated tokens.

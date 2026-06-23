@@ -550,6 +550,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        aux_out: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
@@ -558,6 +559,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
             )
+
+        # Eagle3 aux hidden state = the all-reduced residual stream entering this
+        # layer (post input-norm). Captured here, not as `hidden_states + residual`
+        # in the model loop, because M3's fused all-reduce RMSNorm leaves that sum
+        # TP-partial / NaN-prone under CUDAGraph.
+        if aux_out is not None:
+            aux_out.append(residual.clone())
 
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
@@ -609,6 +617,10 @@ class MiniMaxM3Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # Eagle3 aux hidden-state capture layer ids. Empty unless an Eagle3 drafter
+        # registers them via MiniMaxM3SparseForCausalLM.set_aux_hidden_state_layers.
+        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
+
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -635,9 +647,11 @@ class MiniMaxM3Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        aux_hidden_states: list[torch.Tensor] = []
         for idx in range(self.start_layer, self.end_layer):
+            aux_out = aux_hidden_states if idx in self.aux_hidden_state_layers else None
             hidden_states, residual = self.layers[idx](
-                positions, hidden_states, residual
+                positions, hidden_states, residual, aux_out=aux_out
             )
 
         if not get_pp_group().is_last_rank:
@@ -648,6 +662,8 @@ class MiniMaxM3Model(nn.Module):
         hidden_states, _ = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.norm
         )
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -705,6 +721,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.get_input_embeddings(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Default Eagle3 aux hidden-state layer ids: early / middle / late of
+        the target model (early=2, mid=n//2, late=n-3), matching vLLM's default.
+        """
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def forward(
         self,
@@ -770,6 +796,12 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.language_model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
 
     def forward(
         self,
