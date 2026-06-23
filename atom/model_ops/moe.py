@@ -720,6 +720,8 @@ def rocm_aiter_fused_moe_impl(
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    swiglu_limit: float = 0.0,
+    gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
 
@@ -740,6 +742,8 @@ def rocm_aiter_fused_moe_impl(
         w2_scale,
         a1_scale,
         a2_scale,
+        swiglu_limit=swiglu_limit,
+        gate_mode=gate_mode,
     )
 
 
@@ -757,6 +761,8 @@ def rocm_aiter_fused_moe_fake(
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    swiglu_limit: float = 0.0,
+    gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1707,6 +1713,10 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                moe_extra_args={
+                    "gate_mode": GateMode.SEPARATED.value,
+                    "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
+                },
             )
         else:
             return torch.ops.aiter.rocm_aiter_fused_moe(
@@ -1723,6 +1733,8 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
+                gate_mode=GateMode.SEPARATED.value,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
             )
 
 
@@ -1764,7 +1776,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
         # TODO hard code for now
         params_dtype = torch.float8_e4m3fn
 
@@ -1834,21 +1845,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
         elif self.block_quant:
+            scale_shape_w13 = (
+                num_experts,
+                2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                (hidden_size + block_k - 1) // block_k,
+            )
+            scale_shape_w2 = (
+                num_experts,
+                (hidden_size + block_n - 1) // block_n,
+                (intermediate_size_per_partition + block_k - 1) // block_k,
+            )
             w13_weight_scale = atom_parameter(
-                torch.ones(
-                    num_experts,
-                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
-                    (hidden_size + block_k - 1) // block_k,
-                    dtype=torch.float32,
-                )
+                torch.ones(scale_shape_w13, dtype=torch.float32)
             )
             w2_weight_scale = atom_parameter(
-                torch.ones(
-                    num_experts,
-                    (hidden_size + block_n - 1) // block_n,
-                    (intermediate_size_per_partition + block_k - 1) // block_k,
-                    dtype=torch.float32,
-                )
+                torch.ones(scale_shape_w2, dtype=torch.float32)
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -2046,8 +2057,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_fused_shared_experts=layer.num_fused_shared_experts,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        # per_Tensor doesn't support num_local_tokens, so fallback to
-        # rocm_aiter_fused_moe when using per-tensor or no modular kernel.
+        moe_extra_args = {"swiglu_limit": getattr(layer, "swiglu_limit", 0.0)}
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
             return torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
@@ -2063,6 +2073,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 doweight_stage1=apply_router_weight_on_input,
+                **moe_extra_args,
             )
         return self.fused_experts(
             hidden_states=x,
@@ -2081,6 +2092,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            moe_extra_args=moe_extra_args,
         )
 
 
@@ -2726,6 +2738,24 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
 
+    @staticmethod
+    def _copy_quant_storage(dst: torch.Tensor, src: torch.Tensor) -> None:
+        """Copy quantized tensors without numeric conversion of byte formats."""
+        if dst.dtype == dtypes.fp4x2:
+            dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            return
+        if dst.dtype == dtypes.fp8_e8m0 and src.dtype == torch.uint8:
+            # e8m0 microscale tensors are byte-encoded; copy_ would convert the
+            # uint8 values numerically instead of preserving the scale bits.
+            dst.view(torch.uint8).copy_(src)
+            return
+        if dst.dtype == torch.uint8 and src.dtype in (
+            torch.float8_e8m0fnu,
+            torch.float8_e4m3fn,
+        ):
+            src = src.view(torch.uint8)
+        dst.copy_(src)
+
     def _load_w13(
         self,
         expert_data: torch.Tensor,
@@ -2748,10 +2778,7 @@ class FusedMoE(torch.nn.Module):
             load_size = loaded_weight.shape[shard_dim]
             if load_size != expert_shard_size:
                 expert_data = expert_data.narrow(shard_dim, 0, load_size)
-            if expert_data.dtype != dtypes.fp4x2:
-                expert_data.copy_(loaded_weight)
-            else:
-                expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+            self._copy_quant_storage(expert_data, loaded_weight)
             return
 
         # Index the loaded weight for tp sharding.
@@ -2777,19 +2804,7 @@ class FusedMoE(torch.nn.Module):
         # the loaded weight size so the copy shape matches.
         if load_shard_size != expert_shard_size:
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
-        if expert_data.dtype != dtypes.fp4x2:
-            # Dtype glue: V4 stores per-1x32 weight scales as float8_e8m0fnu but
-            # FusedMoE allocates them as uint8 (raw byte storage). PyTorch's
-            # copy_() between mismatched float8/uint8 dtypes silently writes
-            # zeros — must reinterpret the source as uint8 first.
-            if expert_data.dtype == torch.uint8 and loaded_weight.dtype in (
-                torch.float8_e8m0fnu,
-                torch.float8_e4m3fn,
-            ):
-                loaded_weight = loaded_weight.view(torch.uint8)
-            expert_data.copy_(loaded_weight)
-        else:
-            expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+        self._copy_quant_storage(expert_data, loaded_weight)
 
     def _load_w2(
         self,
@@ -2805,10 +2820,7 @@ class FusedMoE(torch.nn.Module):
             load_size = loaded_weight.shape[shard_dim]
             if load_size != shard_size:
                 expert_data = expert_data.narrow(shard_dim, 0, load_size)
-            if expert_data.dtype != dtypes.fp4x2:
-                expert_data.copy_(loaded_weight)
-            else:
-                expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+            self._copy_quant_storage(expert_data, loaded_weight)
             return
 
         # Index the loaded weight for tp sharding.
@@ -2822,16 +2834,7 @@ class FusedMoE(torch.nn.Module):
         if load_shard_size != shard_size:
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
-        if expert_data.dtype == dtypes.fp4x2:
-            expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
-        else:
-            # Dtype glue: see _load_w13 for the same uint8/float8 reinterpret.
-            if expert_data.dtype == torch.uint8 and loaded_weight.dtype in (
-                torch.float8_e8m0fnu,
-                torch.float8_e4m3fn,
-            ):
-                loaded_weight = loaded_weight.view(torch.uint8)
-            expert_data.copy_(loaded_weight)
+        self._copy_quant_storage(expert_data, loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
@@ -3170,26 +3173,7 @@ class FusedMoE(torch.nn.Module):
                     num_routing_experts=num_routing_experts,
                     fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
                 )
-            elif scoring_func == "sigmoid":
-                routing_weights = torch.sigmoid(router_logits.float())
-                scores_for_choice = routing_weights
-                if e_score_correction_bias is not None:
-                    scores_for_choice = scores_for_choice + e_score_correction_bias
-
-                topk_ids = torch.topk(
-                    scores_for_choice, top_k, dim=-1, sorted=False
-                ).indices
-                topk_weights = routing_weights.gather(dim=-1, index=topk_ids)
-
-                if renormalize:
-                    topk_weights = topk_weights / topk_weights.sum(
-                        dim=-1, keepdim=True
-                    ).clamp_min(1e-20)
-
-                topk_ids = topk_ids.to(torch.int32)
-            elif scoring_func == "sqrtsoftplus":
-                # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
-                # weights gathered from the unbiased sqrt(softplus(.)) values.
+            elif scoring_func in ("sigmoid", "sqrtsoftplus"):
                 tokens_num = router_logits.shape[0]
                 fuse_shared = num_fused_shared_experts > 0
                 if fuse_shared:
@@ -3226,18 +3210,26 @@ class FusedMoE(torch.nn.Module):
                         dtype=torch.float32,
                         device=router_logits.device,
                     )
+
+                # MiniMax-M3 applies the routed scale outside MoE when shared
+                # experts are not fused; DeepSeek-V4 folds it into routing.
+                route_scale = (
+                    routed_scaling_factor
+                    if fuse_shared or scoring_func == "sqrtsoftplus"
+                    else 1.0
+                )
                 topk_gating(
                     topk_weights,
                     topk_ids,
                     router_logits,
                     e_score_correction_bias,
                     renormalize,
-                    routed_scaling_factor,
-                    score_func="sqrtsoftplus",
+                    route_scale,
+                    score_func=scoring_func,
                 )
                 if fuse_shared:
-                    # Switch from the stride-7 routed view back to the full
-                    # 7-col buffer (routed + shared cols) for the fused kernel.
+                    # Switch from the routed view back to the full buffer
+                    # (routed + shared cols) for the fused MoE kernel.
                     topk_weights = total_topk_weights[:tokens_num]
                     topk_ids = total_topk_ids[:tokens_num]
             else:
