@@ -5,6 +5,8 @@ import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _MAX_BLOCK_M = 131072
+# One program reduces one row, so small row counts underutilize the GPU.
+_MIN_ROWS_FOR_FUSED_ARGMAX = 16
 
 
 @triton.jit
@@ -12,7 +14,6 @@ def _lm_head_argmax_pack_kernel(
     logits_ptr,
     packed_ptr,
     vocab_start_idx,
-    N: tl.constexpr,
     M: tl.constexpr,
     stride_logits_n: tl.constexpr,
     stride_logits_m: tl.constexpr,
@@ -45,6 +46,15 @@ def _lm_head_argmax_pack_fake(
     return torch.empty((logits.shape[0], 2), dtype=torch.float32, device=logits.device)
 
 
+def _torch_lm_head_argmax_pack(
+    logits: torch.Tensor,
+    vocab_start_idx: int,
+) -> torch.Tensor:
+    local_max_val, local_idx = logits.max(dim=-1)
+    global_idx = local_idx + vocab_start_idx
+    return torch.stack([local_max_val.float(), global_idx.float()], dim=-1)
+
+
 @torch_compile_guard(gen_fake=_lm_head_argmax_pack_fake)
 def lm_head_argmax_pack(logits: torch.Tensor, vocab_start_idx: int) -> torch.Tensor:
     """Reduce local LM-head logits and pack (max_val, global_idx) as fp32."""
@@ -54,10 +64,8 @@ def lm_head_argmax_pack(logits: torch.Tensor, vocab_start_idx: int) -> torch.Ten
     N, M = logits.shape
     if N == 0:
         return torch.empty((0, 2), dtype=torch.float32, device=logits.device)
-    if M > _MAX_BLOCK_M:
-        local_max_val, local_idx = logits.max(dim=-1)
-        global_idx = local_idx + vocab_start_idx
-        return torch.stack([local_max_val.float(), global_idx.float()], dim=-1)
+    if N < _MIN_ROWS_FOR_FUSED_ARGMAX or M > _MAX_BLOCK_M:
+        return _torch_lm_head_argmax_pack(logits, vocab_start_idx)
 
     packed = torch.empty((N, 2), dtype=torch.float32, device=logits.device)
     block_m = triton.next_power_of_2(M)
@@ -67,7 +75,6 @@ def lm_head_argmax_pack(logits: torch.Tensor, vocab_start_idx: int) -> torch.Ten
         logits,
         packed,
         vocab_start_idx,
-        N=N,
         M=M,
         stride_logits_n=logits.stride(0),
         stride_logits_m=logits.stride(1),
