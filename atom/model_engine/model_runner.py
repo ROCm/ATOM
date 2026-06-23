@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -567,6 +567,31 @@ class tokenIDProcessor:
             )
         return ret
 
+@contextmanager
+def _init_weight_params_on_meta():
+    """Construct a model with all `nn.Parameter`s on the meta device (no
+    persistent GPU weight allocation), leaving the default device unchanged so
+    init code that explicitly targets CUDA (e.g. aiter RoPE) and buffers work
+    normally. Each parameter is briefly created on the real device then replaced
+    with a meta tensor, so the transient peak is one parameter, not the whole
+    model. Used by decode in disagg, which fills params from prefill via IPC.
+    """
+    orig_register = torch.nn.Module.register_parameter
+
+    def register_parameter(self, name, param):
+        orig_register(self, name, param)
+        p = self._parameters.get(name)
+        if p is not None:
+            self._parameters[name] = torch.nn.Parameter(
+                p.detach().to("meta"), requires_grad=p.requires_grad
+            )
+
+    torch.nn.Module.register_parameter = register_parameter
+    try:
+        yield
+    finally:
+        torch.nn.Module.register_parameter = orig_register
+
 
 class ModelRunner:
 
@@ -668,7 +693,17 @@ class ModelRunner:
                 model_class, "quant_exclude_name_mapping", {}
             ),
         )
-        self.model = model_class(config)
+        #self.model = model_class(config)
+        if config.disagg_is_decode:                                                                     
+                # Decode imports prefill's weights via CUDA IPC and owns no weight                          
+                # memory. Build on the meta device so construction allocates zero GPU                       
+                # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);                           
+                # import_model_weight_ipc_handles() materializes params from prefill,                       
+                # and RoPE caches are recomputed locally below.                                             
+                with _init_weight_params_on_meta():                                                                  
+                    self.model = model_class(config)                                                                                                                    
+        else:                                                                                           
+            self.model = model_class(config)
         fused_shared_expert_load_fn = None
         if hasattr(self.model, "load_fused_expert_weights"):
             fused_shared_expert_load_fn = self.model.load_fused_expert_weights
@@ -757,8 +792,9 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
         self._done_event = torch.cuda.Event()
-        self.warmup_model()
-        logger.info(f"Model warmup done: {config.model}")
+        if not config.disagg_is_decode:
+            self.warmup_model()
+            logger.info(f"Model warmup done: {config.model}")
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -1809,6 +1845,7 @@ class ModelRunner:
             + str([p for p in paths if not os.path.exists(p)])
         )
 
+    
     def export_model_weight_ipc_handles(self) -> list[str] | None:
         """Export all model parameters as CUDA IPC handles (prefill process only).
 
@@ -1845,6 +1882,17 @@ class ModelRunner:
         import_model_weights(self.model, handles)
         gc.collect()
         torch.cuda.empty_cache()
+        # Surface any tensor prefill didn't export (would crash later in forward).
+        leftover = [n for n, p in self.model.named_parameters() if p.is_meta] + [
+            n
+            for n, b in self.model.named_buffers()
+            if isinstance(b, torch.Tensor) and b.is_meta
+        ]
+        if leftover:
+            logger.warning(
+                f"ModelRunner rank {self.rank}: {len(leftover)} tensors still on "
+                f"meta after IPC import (not materialized): {leftover[:10]}"
+            )
         logger.info(
             f"ModelRunner rank {self.rank}: weight IPC import complete — own weights freed"
         )

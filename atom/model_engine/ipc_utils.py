@@ -17,8 +17,12 @@ Phase 2 (weight sharing):
   - import_model_weights         — called by DecodeEngineCore at startup (frees own copy)
 """
 
+import logging
+
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger("atom")
 
 
 def _export_tensor(t: torch.Tensor) -> dict:
@@ -85,10 +89,6 @@ def import_kv_cache(meta: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
 # ---------------------------------------------------------------------------
 
 
-_MLA_ABSORBED_ATTRS = ("W_K", "W_K_scale", "W_V", "W_V_scale")
-_MLA_ABSORBED_PREFIX = "__mla__"
-
-
 def export_model_weight_handles(model: nn.Module) -> dict:
     """Export all model parameter tensors as CUDA IPC handles.
 
@@ -100,16 +100,28 @@ def export_model_weight_handles(model: nn.Module) -> dict:
     after load_model() completes.  Returns a dict {key: meta_dict}.
     """
     handles = {}
-    for name, param in model.named_parameters():
-        handles[name] = _export_tensor(param.data)
-
-    # Export MLA absorbed weights (non-Parameter tensor attributes).
+    # Parameters. remove_duplicate=False so a Parameter registered under multiple
+    # names (e.g. e_score_correction_bias, shared by gate + experts) is exported
+    # under EVERY name — otherwise the consumer only materializes one of the
+    # aliased registrations and the other stays on meta.
+    for name, param in model.named_parameters(remove_duplicate=False):
+        handles[f"__param__{name}"] = _export_tensor(param.data)
+    # Registered buffers (non-persistent included).
+    for name, buf in model.named_buffers():
+        if isinstance(buf, torch.Tensor) and buf.is_cuda and buf.numel() > 0:
+            handles[f"__buf__{name}"] = _export_tensor(buf)
+    # Plain tensor attributes set by process_weights_after_loading() — e.g. the
+    # MLA absorbed W_K/W_V — which are neither Parameters nor registered buffers.
     for mod_name, mod in model.named_modules():
-        for attr in _MLA_ABSORBED_ATTRS:
-            t = getattr(mod, attr, None)
-            if t is not None and isinstance(t, torch.Tensor) and t.is_cuda:
-                key = f"{_MLA_ABSORBED_PREFIX}{mod_name}.{attr}"
-                handles[key] = _export_tensor(t)
+        for attr, val in list(mod.__dict__.items()):
+            if (
+                isinstance(val, torch.Tensor)
+                and not isinstance(val, nn.Parameter)
+                and val.is_cuda
+                and val.numel() > 0
+            ):
+                key = f"{mod_name}.{attr}" if mod_name else attr
+                handles[f"__attr__{key}"] = _export_tensor(val)
 
     return handles
 
@@ -125,16 +137,49 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
     are allocated.  The decode process's original weight tensors are freed when
     their reference counts drop to zero.
     """
-    params = dict(model.named_parameters())
     modules = dict(model.named_modules())
+    # remove_duplicate=False to match the export and to materialize every
+    # registration of a shared Parameter (see export note).
+    params = dict(model.named_parameters(remove_duplicate=False))
+    buffers = dict(model.named_buffers())
 
-    for name, meta in handles.items():
-        if name.startswith(_MLA_ABSORBED_PREFIX):
-            # MLA absorbed tensor: restore as plain attribute on the module.
-            rest = name[len(_MLA_ABSORBED_PREFIX) :]  # "<mod_name>.<attr>"
-            mod_name, _, attr = rest.rpartition(".")
-            mod = modules.get(mod_name)
+    for key, meta in handles.items():
+        t = _import_tensor(meta)
+        if key.startswith("__param__"):
+            # Rebuild the Parameter around the imported CUDA view (set_data fails
+            # for meta->cuda). Create the slot if the consumer's meta model lacks
+            # it (process_weights_after_loading may add params on the producer).
+            name = key[len("__param__") :]
+            parent, _, attr = name.rpartition(".")
+            mod = modules.get(parent, model)
+            rg = params[name].requires_grad if name in params else False
+            mod._parameters[attr] = nn.Parameter(t, requires_grad=rg)
+        elif key.startswith("__buf__"):
+            # Keep decode's locally-built real buffers (e.g. RoPE caches built
+            # during construction); only fill buffers it is missing or left on
+            # meta (those created inside process_weights_after_loading).
+            name = key[len("__buf__") :]
+            existing = buffers.get(name)
+            if existing is None or existing.is_meta:
+                parent, _, attr = name.rpartition(".")
+                mod = modules.get(parent, model)
+                if mod is not None:
+                    mod._buffers[attr] = t
+        elif key.startswith("__attr__"):
+            # Plain tensor attribute (e.g. MLA W_K/W_V from process_weights).
+            name = key[len("__attr__") :]
+            parent, _, attr = name.rpartition(".")
+            mod = modules.get(parent, model)
             if mod is not None:
-                setattr(mod, attr, _import_tensor(meta))
-        elif name in params:
-            params[name].data = _import_tensor(meta)
+                setattr(mod, attr, t)
+
+    leftover = [n for n, p in model.named_parameters() if p.is_meta] + [
+        n
+        for n, b in model.named_buffers()
+        if isinstance(b, torch.Tensor) and b.is_meta
+    ]
+    if leftover:
+        logger.warning(
+            f"[WT-IMPORT] {len(leftover)} tensors still on meta after import "
+            f"(not exported by producer): {leftover[:12]}"
+        )
