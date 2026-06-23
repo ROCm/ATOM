@@ -13,6 +13,7 @@
 
 ## 📢 News
 
+- **[2026/06]** Experimental **Navi 4 (RDNA4 / gfx1201)** support — AMD Radeon RX 9070 / RX 9070 XT and Radeon AI PRO R9700. See the [Qwen3-8B-FP8](recipes/Qwen3-8B-FP8.md) and [Ministral-3-8B](recipes/Ministral-3-8B.md) recipes.
 - **[2026/06]** ATOM now supports **GLM-5.2** (`glm_moe_dsa`) in FP8, including the new **IndexShare** DSA schedule (shared layers reuse the preceding full layer's indexer). See [GLM-5.2 recipe](recipes/GLM-5.md#glm-52-indexshare).
 - **[2026/05]** ATOM now supports **Qwen3.5 multimodal image+text inference** on the native engine and OpenAI-compatible chat API. See [Qwen3.5 multimodal recipe](recipes/Qwen3.5_multimodel.md).
 - **[2026/05]** ATOM now supports **online quantization** — re-quantize unquantized or FP8-block source checkpoints to PTPC-FP8 / MXFP4 mixed precision at load time via `--online_quant_config`, no offline re-packing required. See [online quantization guide](docs/online_quantization_guide.md).
