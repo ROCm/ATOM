@@ -27,14 +27,21 @@ def cdiv(a, b):
 
 
 @triton.jit
-def _mtp_decode_slot_mapping_kernel(
+def _mtp_prepare_decode_metadata_kernel(
     context_lens_ptr,
     block_tables_ptr,
     slot_mapping_ptr,
+    positions_in_ptr,
+    positions_out_ptr,
+    last_token_indices_ptr,
     bs,
     skip_update: tl.constexpr,
+    update_context_lens: tl.constexpr,
+    update_positions: tl.constexpr,
+    select_positions: tl.constexpr,
     block_size: tl.constexpr,
     block_table_stride: tl.constexpr,
+    position_stride: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     if not skip_update:
@@ -42,6 +49,17 @@ def _mtp_decode_slot_mapping_kernel(
         mask = seq < bs
 
         ctx = tl.load(context_lens_ptr + seq, mask=mask, other=1).to(tl.int64)
+        if update_context_lens:
+            ctx += 1
+            tl.store(context_lens_ptr + seq, ctx, mask=mask)
+
+        if update_positions:
+            pos_idx = seq
+            if select_positions:
+                pos_idx = tl.load(last_token_indices_ptr + seq, mask=mask, other=0)
+            pos = tl.load(positions_in_ptr + pos_idx, mask=mask, other=0)
+            tl.store(positions_out_ptr + seq * position_stride, pos + 1, mask=mask)
+
         last_pos = tl.maximum(ctx - 1, 0)
         block_col = last_pos // block_size
         within_block = last_pos - block_col * block_size
@@ -71,6 +89,7 @@ class AiterBackend(AttentionBackend):
 
 
 class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
+    fuse_mtp_decode_position_update = True
     BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
 
     def __init__(
@@ -353,15 +372,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         positions: torch.Tensor,
         only_update: bool = False,
         num_reject_tokens: torch.Tensor = None,
+        *,
+        update_context_lens: bool = False,
+        positions_out: torch.Tensor | None = None,
+        last_token_indices: torch.Tensor | None = None,
     ):
         """Per-draft-step metadata for a block-paged MHA Eagle3 draft.
 
         Called by EagleProposer.propose at mid-step iters. The draft's decode
         kernels (``paged_attention_{asm,triton}``) read ``block_tables`` +
-        ``context_lens``, both already bumped for this step by eagle (writing
-        in place into ``forward_vars``). The block_size==1024 persistent path
-        is the only one consuming ``kv_indptr``/``kv_indices``; MiniMax-M3 runs
-        at ``--block-size 128`` so the kernel never reads them — no rebuild.
+        ``context_lens``. Eagle can pre-bump ``context_lens`` before this call,
+        or ask this fused kernel to update it in place. The block_size==1024
+        persistent path is the only one consuming ``kv_indptr``/``kv_indices``;
+        MiniMax-M3 runs at ``--block-size 128`` so the kernel never reads them -
+        no rebuild.
 
         The one value we must (re)compute is the write slot for the new draft
         token in the draft's own block-paged KV cache:
@@ -373,23 +397,36 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         a bare block id for ``B > 1``.
 
         ``only_update`` / ``num_reject_tokens`` are MLA/V4-specific knobs and are
-        unused here: ``context_lens`` is already correct and there are no
-        persistent worker buffers to roll over for ``block_size != 1024``.
+        unused here: there are no persistent worker buffers to roll over for
+        ``block_size != 1024``.
         """
         var = self.model_runner.forward_vars
         slot_mapping = var["slot_mapping"].gpu[:bs]
         block_tables = var["block_tables"].gpu
         context_lens = var["context_lens"].gpu
+        update_positions = positions_out is not None
+        select_positions = update_positions and last_token_indices is not None
+        if positions_out is None:
+            positions_out = positions
+        if last_token_indices is None:
+            last_token_indices = slot_mapping
         # Dummy runs skip the draft attention, so keep this launch as a no-op:
         # their synthetic context_lens can point past block_tables.
-        _mtp_decode_slot_mapping_kernel[(max(1, triton.cdiv(bs, 128)),)](
+        _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(bs, 128)),)](
             context_lens,
             block_tables,
             slot_mapping,
+            positions,
+            positions_out,
+            last_token_indices,
             bs,
             bs == 0 or get_forward_context().context.is_dummy_run,
+            update_context_lens,
+            update_positions,
+            select_positions,
             self.model_runner.block_size,
             block_tables.stride(0),
+            positions_out.stride(0) if update_positions else 1,
             BLOCK=128,
         )
         return {"slot_mapping": slot_mapping}
