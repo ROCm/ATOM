@@ -197,6 +197,9 @@ jobs:
           elif [ -d "/data/models" ]; then
             MODEL_CACHE_MOUNT="-v /data/models:/models"
             MODEL_CACHE_DESC="/data/models (shared host path)"
+          elif [ -d "/mnt/raid0/pretrained_model" ]; then
+            MODEL_CACHE_MOUNT="-v /mnt/raid0/pretrained_model:/models"
+            MODEL_CACHE_DESC="/mnt/raid0/pretrained_model (shared host path)"
           else
             echo "No shared host model cache found; using container-local /models."
           fi
