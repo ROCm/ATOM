@@ -2199,8 +2199,20 @@ class ModelRunner:
         """Collect finished send/recv status from the KV connector."""
         connector = get_kvconnector()
         if connector is None:
-            return KVConnectorOutput(finished_sending=[], finished_recving=[])
-        done_sending, done_recving = connector.get_finished()
+            return KVConnectorOutput()
+
+        finished = connector.get_finished()
+        # New connectors may return the full KVConnectorOutput so they can
+        # report richer states. LMCache offload uses failed_recving to wake a
+        # request for local recompute, and finished_saving to release blocks
+        # whose free was deferred while a background save read their KV.
+        if isinstance(finished, KVConnectorOutput):
+            return finished
+
+        # Legacy P/D connectors still return the old
+        # (done_sending, done_recving) tuple. Normalize it so EngineCore and
+        # Scheduler only need to consume KVConnectorOutput.
+        done_sending, done_recving = finished
 
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
