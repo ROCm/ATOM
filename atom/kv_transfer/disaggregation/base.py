@@ -21,7 +21,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 
 
 class KVConnectorBase(ABC):
@@ -48,8 +48,11 @@ class KVConnectorBase(ABC):
         ...
 
     @abstractmethod
-    def get_finished(self) -> tuple[set, set]:
-        """Return ``(done_sending, done_recving)`` request ID sets.
+    def get_finished(self) -> tuple[set, set] | KVConnectorOutput:
+        """Return transfer completion status.
+
+        Older connectors may return ``(done_sending, done_recving)``. Connectors
+        that need richer semantics can return :class:`KVConnectorOutput`.
 
         Called by the worker each engine step to report transfer status.
         """

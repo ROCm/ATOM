@@ -134,3 +134,12 @@ KVConnectorFactory.register(
     scheduler_module="atom.kv_transfer.disaggregation.mooncake.mooncake_connector",
     scheduler_class="MooncakeConnectorScheduler",
 )
+
+
+# ATOM standalone CPU/NVMe KV offload backend (registers "lmcache_offload").
+# Import is lightweight (offload/__init__ only records module paths as strings;
+# the connector module is imported lazily by create_connector when selected).
+try:
+    import atom.kv_transfer.offload  # noqa: F401,E402
+except Exception as _e:  # pragma: no cover - offload optional (needs lmcache)
+    logger.debug("lmcache_offload backend not registered: %s", _e)
