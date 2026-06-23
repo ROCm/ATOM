@@ -72,6 +72,7 @@ support_model_arch_dict = {
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
+    "Step3p5ForCausalLM": "atom.models.step3p5.Step3p5ForCausalLM",
     "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
     "Mistral3ForConditionalGeneration": "atom.models.mistral3.Mistral3TextOnly",
@@ -1202,11 +1203,22 @@ class ModelRunner:
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
         hf_config = self.config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            assert hf_config.num_key_value_heads % self.world_size == 0
-            return hf_config.num_key_value_heads // self.world_size
+        num_kv_heads_cfg = getattr(
+            hf_config,
+            "num_key_value_heads",
+            getattr(hf_config, "num_attention_groups", None),
+        )
+        if num_kv_heads_cfg is None:
+            raise ValueError(
+                "Model config has neither 'num_key_value_heads' nor "
+                "'num_attention_groups'; cannot determine number of KV heads "
+                f"for {getattr(hf_config, 'architectures', hf_config)}"
+            )
+        if num_kv_heads_cfg >= self.world_size:
+            assert num_kv_heads_cfg % self.world_size == 0
+            return num_kv_heads_cfg // self.world_size
         else:
-            assert self.world_size % hf_config.num_key_value_heads == 0
+            assert self.world_size % num_kv_heads_cfg == 0
             return 1
 
     def _mrope_positions_view(self, num_tokens: int) -> torch.Tensor:
@@ -1455,11 +1467,22 @@ class ModelRunner:
         self.num_physical_kvcache_blocks = (
             num_kvcache_blocks * self.attn_metadata_builder.block_ratio
         )
-        if hf_config.num_key_value_heads >= self.world_size:
-            assert hf_config.num_key_value_heads % self.world_size == 0
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads_cfg = getattr(
+            hf_config,
+            "num_key_value_heads",
+            getattr(hf_config, "num_attention_groups", None),
+        )
+        if num_kv_heads_cfg is None:
+            raise ValueError(
+                "Model config has neither 'num_key_value_heads' nor "
+                "'num_attention_groups'; cannot determine number of KV heads "
+                f"for {getattr(hf_config, 'architectures', hf_config)}"
+            )
+        if num_kv_heads_cfg >= self.world_size:
+            assert num_kv_heads_cfg % self.world_size == 0
+            num_kv_heads = num_kv_heads_cfg // self.world_size
         else:
-            assert self.world_size % hf_config.num_key_value_heads == 0
+            assert self.world_size % num_kv_heads_cfg == 0
             num_kv_heads = 1
         # Promote to self so attention builders' build_kv_cache_tensor()
         # hooks can access it without re-deriving from hf_config.

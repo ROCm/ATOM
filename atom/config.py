@@ -1041,6 +1041,29 @@ class Config:
             elif len(cuda_graph_sizes) > 1:
                 self.graph_bs = cuda_graph_sizes
 
+    def _uses_sliding_window(self) -> bool:
+        """True iff the model uses sliding-window attention (global or interleaved).
+
+        Prefix caching's classical KV pool cannot restore the per-request SWA
+        buffer on a cache hit, so SWA models must run with it disabled.
+        """
+        hf = self.hf_config
+        # Global sliding_window field (Step-3.5=512, Gemma, Mistral, Qwen-SWA, ...).
+        sw = getattr(hf, "sliding_window", None)
+        if isinstance(sw, int) and not isinstance(sw, bool) and sw > 0:
+            return True
+        # Interleaved SWA via layer_types
+        # (Step-3.5: ['full_attention', 'sliding_attention', ...]).
+        layer_types = getattr(hf, "layer_types", None) or []
+        if any("sliding" in str(t) for t in layer_types):
+            return True
+        # DeepSeek-V4: model_type is remapped to deepseek_v3, so detect SWA via the
+        # preserved architectures name (kept as a fallback).
+        arches = getattr(hf, "architectures", None) or []
+        if any("DeepseekV4" in str(a) for a in arches):
+            return True
+        return False
+
     def __post_init__(self):
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
@@ -1164,16 +1187,32 @@ class Config:
             v4_block_size = 128
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
-            # TODO: V4's per-request SWA buffer cannot be restored from the classical
-            # KV pool on prefix cache hit, so disable prefix caching silently.
-            if self.enable_prefix_caching:
-                import logging
 
-                logging.getLogger(__name__).warning(
-                    "DeepSeek-V4 does not support prefix caching "
-                    "(SWA buffer is not cacheable); disabling automatically."
+        # SWA models cannot restore the per-request sliding-window KV buffer from the
+        # classical KV pool on a prefix-cache hit, so disable prefix caching for any
+        # sliding-window model (DeepSeek-V4, Step-3.5, ...). Generalizes main's
+        # original V4-only guard, which left Step-3.5/SWA exposed to a merge default
+        # flip (enable_prefix_caching default False->True). Non-SWA models keep
+        # main's prefix-caching optimization.
+        if self._uses_sliding_window():
+            import logging
+
+            _log = logging.getLogger(__name__)
+            if self.enable_prefix_caching:
+                _log.warning(
+                    "Model uses sliding-window attention (SWA buffer is not "
+                    "cacheable); disabling prefix caching automatically."
                 )
                 self.enable_prefix_caching = False
+            if self.enable_chunked_prefill:
+                # Conservative: SWA + chunked prefill cross-chunk window correctness
+                # is unverified on GPU; restore the pre-merge-safe default (off).
+                # TODO: re-enable after SWA + chunked-prefill GPU validation.
+                _log.warning(
+                    "Model uses sliding-window attention; disabling chunked "
+                    "prefill (SWA + chunked prefill unverified)."
+                )
+                self.enable_chunked_prefill = False
 
     def compute_hash(self) -> str:
         """

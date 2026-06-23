@@ -58,7 +58,9 @@ def main():
     engine_args = EngineArgs.from_cli_args(args)
     llm = engine_args.create_engine()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=getattr(args, "trust_remote_code", False)
+    )
 
     sampling_params = SamplingParams(
         temperature=args.temperature, max_tokens=args.max_tokens
@@ -70,9 +72,6 @@ def main():
         for p in prompts
     ]
     print("This is prompts:", prompts)
-    # print("Warming up...")
-    # _ = llm.generate(["warmup"], sampling_params)
-    # print("Warm up done")
 
     print("\n" + "=" * 70)
     print("Starting profiling...")
