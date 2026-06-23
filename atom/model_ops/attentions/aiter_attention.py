@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     block_table_convert_triton,
     kv_indices_generate_triton,
@@ -73,6 +73,25 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 if model_runner.block_size in (256, 1024)
                 else 16
             )
+        if envs.ATOM_USE_UNIFIED_ATTN:
+            # SHUFFLE (pre-shuffled) KV cache: use the logical block size directly
+            # as the physical block size so block_ratio == 1 and
+            # unified_attention's block_table needs no logical->physical
+            # conversion. Pass --block-size equal to the performant physical
+            # page: fp8 packs x=16 - 128; bf16 packs x=8 - 64 (both keep a
+            # 128-byte physical page, i.e. block_size // x == 8).
+            expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
+            if model_runner.block_size != expected:
+                logger.warning(
+                    "ATOM_USE_UNIFIED_ATTN=1 expects --block-size %s for %s KV "
+                    "cache (so block_ratio == 1), got --block-size %s. Continuing "
+                    "with the requested block size.",
+                    expected,
+                    model_runner.kv_cache_dtype,
+                    model_runner.block_size,
+                )
+            self.block_size = model_runner.block_size
+
         assert (
             model_runner.block_size % self.block_size == 0
         ), f"model_runner.block_size must be divisible by block_size but got {model_runner.block_size=}, block_size={self.block_size}, please set --block-size (model_runner.block_size) to be divisible by {self.block_size}"
