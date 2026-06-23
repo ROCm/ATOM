@@ -105,7 +105,9 @@ checkpoint.
 ```bash
 model_path=${model_path:-amd/MiniMax-M3-MXFP4}
 run_name=${run_name:-m3-mxfp4}
+
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_M3_SPARSE_USE_ASM_PA=1
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
@@ -113,6 +115,7 @@ python -m atom.entrypoints.openai_server \
   --server-port 8000 \
   --trust-remote-code \
   --gpu-memory-utilization 0.8 \
+  --kv_cache_dtype fp8 \
   --block-size 128 \
   --max-model-len 32768 \
   --max-num-seqs 128 \
@@ -228,6 +231,7 @@ model_path=MiniMaxAI/MiniMax-M3-MXFP8
 draft_path=Inferact/MiniMax-M3-EAGLE3
 
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_M3_SPARSE_USE_ASM_PA=1
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
@@ -235,6 +239,7 @@ python -m atom.entrypoints.openai_server \
   --server-port 8000 \
   --trust-remote-code \
   --gpu-memory-utilization 0.8 \
+  --kv_cache_dtype fp8 \
   --block-size 128 \
   --max-model-len 32768 \
   --max-num-seqs 128 \
