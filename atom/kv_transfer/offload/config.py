@@ -69,16 +69,29 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
 
     hf = config.hf_config
     num_layers = int(getattr(hf, "num_hidden_layers"))
-    num_kv_heads = int(
-        getattr(hf, "num_key_value_heads", getattr(hf, "num_attention_heads"))
-    )
     tp = int(getattr(config, "tensor_parallel_size", world_size) or 1)
-    num_kv_heads_local = max(1, num_kv_heads // tp)
-    head_dim = int(
-        getattr(hf, "head_dim", 0) or (hf.hidden_size // hf.num_attention_heads)
-    )
     kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
     model_name = str(getattr(config, "model", "atom-model"))
+
+    # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent
+    # cache (kv_lora_rank + qk_rope_head_dim), not TP-sharded K/V heads. These
+    # dims are bookkeeping only — the codec moves opaque bytes either way. We
+    # keep use_mla=False because our BINARY storage bypasses LMCache's own MLA
+    # GPU-connector format path; only kv_shape needs to reflect reality.
+    if getattr(hf, "kv_lora_rank", None) is not None:
+        latent = int(getattr(hf, "kv_lora_rank")) + int(
+            getattr(hf, "qk_rope_head_dim", 0)
+        )
+        kv_shape = (num_layers, 1, int(cfg.chunk_size), 1, latent)
+    else:
+        num_kv_heads = int(
+            getattr(hf, "num_key_value_heads", getattr(hf, "num_attention_heads"))
+        )
+        num_kv_heads_local = max(1, num_kv_heads // tp)
+        head_dim = int(
+            getattr(hf, "head_dim", 0) or (hf.hidden_size // hf.num_attention_heads)
+        )
+        kv_shape = (num_layers, 2, int(cfg.chunk_size), num_kv_heads_local, head_dim)
 
     return LMCacheMetadata(
         model_name=model_name,
@@ -87,7 +100,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
         worker_id=worker_id,
         local_worker_id=worker_id,
         kv_dtype=kv_dtype,
-        kv_shape=(num_layers, 2, int(cfg.chunk_size), num_kv_heads_local, head_dim),
+        kv_shape=kv_shape,
         use_mla=False,
         chunk_size=int(cfg.chunk_size),
         # Shared id so the scheduler's ZMQ LookupClient and each worker's

@@ -40,12 +40,28 @@ logger = logging.getLogger("atom")
 class ATOMKVByteCodec:
     """Per-block byte mover between paged GPU KV tensors and flat buffers."""
 
-    def __init__(self, kv_caches: dict) -> None:
+    def __init__(self, kv_caches: dict, num_blocks: int | None = None) -> None:
         """``kv_caches``: ordered ``{layer_name: KVCacheTensor}`` from
         ``register_kv_caches``. We flatten every movable per-layer tensor (K, V,
-        and fp8 scales when present) into one ordered segment list. Each segment
-        is a GPU tensor shaped ``[num_blocks, ...]``; segment[block_id] is a
-        contiguous block slice we copy as raw bytes."""
+        and fp8 scales when present) into one ordered segment list.
+
+        Each segment is a contiguous GPU tensor whose first ``num_blocks``
+        equal slices are the per-physical-block payloads we copy as raw bytes.
+        Two layouts must both work:
+
+        * **Standard MHA/GQA** — block-major ``[num_blocks, ...]`` (e.g. ATOM's
+          x-packed K ``(nb, H, D//x, bs, x)`` and strided V), so dim 0 IS the
+          block count.
+        * **MLA** (DeepSeek R1/V3, Kimi) — a single 576-dim latent cache viewed
+          token-major as ``(num_blocks * block_size, 1, 576)`` with no separate
+          V/scale tensors, so dim 0 is the *token* count.
+
+        Because the contiguous byte layout is identical (block ``b`` always
+        starts at ``b * bytes_per_physical_block``), we don't branch on layout:
+        we take ``num_blocks`` explicitly and derive each segment's per-block
+        byte stride as ``segment_bytes / num_blocks``. ``num_blocks`` falls back
+        to ``segment.shape[0]`` (the block-major assumption) when not supplied,
+        preserving the original non-MLA behaviour."""
         self._segments: list[torch.Tensor] = []
         for _name, kvt in kv_caches.items():
             for t in (
@@ -61,21 +77,37 @@ class ATOMKVByteCodec:
             raise ValueError("ATOMKVByteCodec: no movable KV tensors registered")
 
         first = self._segments[0]
-        self.num_blocks: int = int(first.shape[0])
         self._device = first.device
+        self.num_blocks: int = (
+            int(num_blocks) if num_blocks is not None else int(first.shape[0])
+        )
+        if self.num_blocks <= 0:
+            raise ValueError(
+                f"ATOMKVByteCodec: num_blocks must be > 0, got {self.num_blocks}"
+            )
         for seg in self._segments:
             if seg.device != self._device:
                 raise ValueError(
                     "ATOMKVByteCodec: all KV tensors must be on the same device"
                 )
-            if int(seg.shape[0]) != self.num_blocks:
+            if not seg.is_contiguous():
                 raise ValueError(
-                    "ATOMKVByteCodec: all KV tensors must have the same block count"
+                    "ATOMKVByteCodec: KV tensors must be contiguous for byte copy"
+                )
+            if seg.numel() % self.num_blocks != 0:
+                raise ValueError(
+                    "ATOMKVByteCodec: KV tensor size "
+                    f"{seg.numel()} not divisible by num_blocks={self.num_blocks} "
+                    f"(shape={tuple(seg.shape)})"
                 )
 
-        # Bytes for one block of each segment (block is dim 0).
+        # Bytes for one physical block of each segment. Works for both
+        # block-major (numel = num_blocks * per_block) and token-major MLA
+        # (numel = num_blocks * block_size * per_token) because both reduce to
+        # the same contiguous per-block stride.
         self._seg_block_bytes: list[int] = [
-            int(t[0].numel()) * t.element_size() for t in self._segments
+            (int(t.numel()) // self.num_blocks) * t.element_size()
+            for t in self._segments
         ]
         self.bytes_per_block: int = sum(self._seg_block_bytes)
         self._fused_kv_staging = None

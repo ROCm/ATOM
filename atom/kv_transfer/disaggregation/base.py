@@ -31,11 +31,17 @@ class KVConnectorBase(ABC):
 
     @abstractmethod
     def register_kv_caches(
-        self, kv_caches: dict[str, Any], transfer_tensors: Any = None
+        self,
+        kv_caches: dict[str, Any],
+        transfer_tensors: Any = None,
+        num_blocks: int | None = None,
     ) -> None:
         """Register local KV cache tensors for remote access.
 
-        Called once after model loading and KV cache allocation.
+        Called once after model loading and KV cache allocation. ``num_blocks``
+        is the physical KV block count (used by the offload connector to
+        byte-slice MLA's token-major latent cache); connectors that don't need
+        it may ignore it.
         """
         ...
 
