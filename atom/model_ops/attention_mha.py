@@ -99,6 +99,11 @@ class PagedAttentionImpl(nn.Module):
 
         self.supports_quant_query_input = False
 
+    def process_weights_after_loading(self):
+        if use_pa_decode_bf16_asm():
+            if self.sinks is not None and self.sinks.dtype != torch.float32:
+                self.sinks.data = self.sinks.data.to(torch.float32).contiguous()
+
     def _can_attempt_prefill_sink_asm(self, fwd_ctx: ForwardContext) -> bool:
         if not fwd_ctx.context.is_prefill:
             return False
@@ -660,7 +665,6 @@ class PagedAttentionImpl(nn.Module):
             # CUDAGraph decode pads scheduled_bs up to graph_bs. PA ASM has no
             # work for padded rows (context_len == 0); zero output so padded rows
             # stay deterministic.
-            output.zero_()
             split_rows = max(
                 1,
                 int(attn_metadata.reduce_partial_map.numel()) * max_seqlen_q,
@@ -675,8 +679,6 @@ class PagedAttentionImpl(nn.Module):
                 dtype=torch.float32,
                 device=q.device,
             )
-            split_o.zero_()
-            split_lse.fill_(float("-inf"))
 
             aiter.pa_decode_bf16_asm(
                 Q=q_fp8,
@@ -843,7 +845,7 @@ class PagedAttentionImpl(nn.Module):
         if self.use_triton_attn or self.use_flash_layout:
             return self.paged_attention_triton
 
-        if atom_config.kv_cache_block_size in (256, 1024):
+        if use_pa_decode_bf16_asm():
             return self.paged_attention_persistent_asm
         return self.paged_attention_asm
 
