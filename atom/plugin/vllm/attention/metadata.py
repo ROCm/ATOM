@@ -766,35 +766,15 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self,
         common_attn_metadata=None,
     ):
-        num_reqs = common_attn_metadata.num_reqs
-        num_tokens = common_attn_metadata.num_actual_tokens
-        decode_metadata = AiterMhaPhaseMetadata(
-            max_query_len=common_attn_metadata.max_query_len,
-            max_seq_len=common_attn_metadata.max_seq_len,
-            query_start_loc=common_attn_metadata.query_start_loc,
+        self.total_tokens = (
+            self.model_config.max_model_len
+            * self.vllm_config.scheduler_config.max_num_partial_prefills
         )
-        return AiterMhaMetadataForVllm(
-            num_actual_tokens=num_tokens,
-            num_actual_kv_tokens=0,
-            max_query_len=common_attn_metadata.max_query_len,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            max_seq_len=common_attn_metadata.max_seq_len,
-            seq_lens=common_attn_metadata.seq_lens,
-            block_table=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            num_decodes=num_reqs,
-            num_decode_tokens=num_tokens,
-            num_prefills=0,
-            num_prefill_tokens=0,
-            num_extends=0,
-            num_extend_tokens=0,
-            decode_metadata=decode_metadata,
-            prefill_metadata=None,
-            extend_metadata=None,
-            use_cascade=False,
-            common_prefix_len=0,
-            total_tokens=0,
+        attn_metadata = self.build(
+            common_prefix_len=0, common_attn_metadata=common_attn_metadata
         )
+        self.total_tokens = 0
+        return attn_metadata
 
 
 class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):

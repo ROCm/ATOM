@@ -186,21 +186,10 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
     ):
         if self.calculate_kv_scales and key is not None and value is not None:
             self.calc_kv_scales(query, key, value)
-        if positions is None:
-            from vllm.forward_context import (
-                get_forward_context as get_vllm_forward_context,
-                is_forward_context_available,
-            )
-
-            if is_forward_context_available():
-                positions = get_vllm_forward_context().additional_kwargs.get(
-                    "atom_positions"
-                )
         return torch.ops.aiter.atom_vllm_mha_attention(
             query,
             key,
             value,
-            self.kv_cache,
             self.layer_name,
             positions,
             q_scale,
@@ -736,6 +725,19 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         if attn_metadata is None:
             return output.fill_(0)
 
+        # vLLM's compiled unified_attention custom op does not pass positions into
+        # impl.forward. ATOMModelBase stashes them on vLLM ForwardContext as
+        # additional_kwargs["atom_positions"] (see atom/plugin/vllm/model_wrapper.py).
+        if position is None:
+            from vllm.forward_context import (
+                get_forward_context as get_vllm_forward_context,
+                is_forward_context_available,
+            )
+
+            if is_forward_context_available():
+                position = get_vllm_forward_context().additional_kwargs.get(
+                    "atom_positions"
+                )
         if position is None:
             sfc = get_current_atom_config().compilation_config.static_forward_context
             position = sfc.get("positions")
