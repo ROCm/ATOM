@@ -275,6 +275,23 @@ jobs:
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
             accuracy_test_threshold: 0.76
             runner: linux-atom-mi35x-4
+          - model_name: "DeepSeek-V4-Pro TP8"
+            model_path: "deepseek-ai/DeepSeek-V4-Pro"
+            extra_args: "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4"
+            env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
+              AITER_BF16_FP8_MOE_BOUND=0
+              ATOM_MOE_GU_ITLV=1
+              SGLANG_DEFAULT_THINKING=1
+              SGLANG_DSV4_REASONING_EFFORT=max
+              SGLANG_USE_AITER=1
+              SGLANG_DSV4_FP4_EXPERTS=true
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              TORCHINDUCTOR_COMPILE_THREADS=128
+            lm_eval_num_fewshot: 5
+            lm_eval_num_concurrent: 8
+            accuracy_test_threshold: 0.94
+            runner: atom-mi355-8gpu.predownload
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
@@ -539,6 +556,8 @@ jobs:
           MAX_WAIT_RETRIES: "120"
           STREAM_SGLANG_LOGS: "1"
           LM_EVAL_TASK: "gsm8k"
+          LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot || '3' }}
+          LM_EVAL_NUM_CONCURRENT: ${{ matrix.lm_eval_num_concurrent || '65' }}
         run: |
           docker exec \
             -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
@@ -548,6 +567,8 @@ jobs:
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
+            -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
+            -e LM_EVAL_NUM_CONCURRENT="${LM_EVAL_NUM_CONCURRENT}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
               bash .github/scripts/atom_sglang_test.sh accuracy
