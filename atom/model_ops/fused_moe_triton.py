@@ -314,15 +314,19 @@ def triton_kernel_fused_experts(
             if get_arch() == "gfx942":
                 quant_dtype = torch.float8_e4m3fnuz
 
-            hidden_states, a13_mx_scale = dynamic_mxfp8_quant(
-                hidden_states, quant_dtype=quant_dtype
-            )
+            fp8_max = torch.finfo(quant_dtype).max
+            if a13_scale is not None:
+                a13_scale = a13_scale.max().to(torch.float32)
+            else:
+                a13_scale = hidden_states.abs().max().clamp(min=1e-12) / fp8_max
+
+            hidden_states = downcast_to_static_fp8(hidden_states, a13_scale)
             raw_intermediate = moe_gemm_a8w4(
                 hidden_states,
                 w1,
-                a13_mx_scale,
-                w13_scale,
                 None,
+                w13_scale,
+                a13_scale,
                 None,
                 w1_bias,
                 routing_data,
