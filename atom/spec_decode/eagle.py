@@ -159,6 +159,43 @@ class Eagle3DraftBuilder:
             v_scale=getattr(module, "v_scale", None),
         )
 
+    def get_kv_transfer_tensors(self) -> list:
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
+        runner = self.model_runner
+        if not hasattr(runner, "eagle3_kv_cache"):
+            return []
+
+        regions: list[KVTransferRegion] = []
+        cache = runner.eagle3_kv_cache
+        for layer_id in range(self.num_layers):
+            for kv in range(2):
+                t = cache[kv, layer_id]
+                regions.append(
+                    KVTransferRegion(
+                        base_addr=t.data_ptr(),
+                        total_bytes=t.numel() * t.element_size(),
+                        unit_bytes=t.stride(0) * t.element_size(),
+                    )
+                )
+        scale = runner.eagle3_kv_scale
+        if (
+            self.model_runner.config.kv_cache_dtype == "fp8"
+            and scale is not None
+            and scale.numel() > 0
+        ):
+            for layer_id in range(self.num_layers):
+                for kv in range(2):
+                    t = scale[kv, layer_id]
+                    regions.append(
+                        KVTransferRegion(
+                            base_addr=t.data_ptr(),
+                            total_bytes=t.numel() * t.element_size(),
+                            unit_bytes=t.stride(0) * t.element_size(),
+                        )
+                    )
+        return regions
+
 
 class EagleProposer:
 
