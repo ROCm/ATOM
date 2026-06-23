@@ -66,6 +66,7 @@ async def stream_chat_response(
     seq_id: int,
     tokenizer,
     cleanup_fn,
+    tools=None,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
 
@@ -77,7 +78,7 @@ async def stream_chat_response(
     num_tokens_input = _prompt_token_count(prompt, tokenizer)
     num_tokens_output = 0
     reasoning_filter = ReasoningFilter()
-    tool_parser = ToolCallStreamParser()
+    tool_parser = ToolCallStreamParser(tools=tools)
     has_tool_calls = False
 
     # Send initial role chunk
@@ -170,6 +171,7 @@ def _build_chat_choice(
     raw_text: str,
     finish_reason: Optional[str],
     index: int = 0,
+    tools=None,
 ) -> Dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
 
@@ -178,7 +180,7 @@ def _build_chat_choice(
     without duplicating the logic.
     """
     reasoning_content, content_with_tools = separate_reasoning(raw_text)
-    content, tool_calls = parse_tool_calls(content_with_tools)
+    content, tool_calls = parse_tool_calls(content_with_tools, tools)
 
     message: Dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning_content is not None:
@@ -199,13 +201,18 @@ def build_chat_response(
     model: str,
     raw_text: str,
     final_output: Dict[str, Any],
+    tools=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
     response = ChatCompletionResponse(
         id=request_id,
         created=int(time.time()),
         model=model,
-        choices=[_build_chat_choice(raw_text, final_output["finish_reason"], index=0)],
+        choices=[
+            _build_chat_choice(
+                raw_text, final_output["finish_reason"], index=0, tools=tools
+            )
+        ],
         usage={
             "prompt_tokens": final_output["num_tokens_input"],
             "completion_tokens": final_output["num_tokens_output"],
@@ -229,6 +236,7 @@ def build_chat_response_multi(
     request_id: str,
     model: str,
     final_outputs: List[Dict[str, Any]],
+    tools=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling.
 
@@ -240,7 +248,7 @@ def build_chat_response_multi(
     """
     assert final_outputs, "build_chat_response_multi requires at least one output"
     choices = [
-        _build_chat_choice(out["text"], out["finish_reason"], index=i)
+        _build_chat_choice(out["text"], out["finish_reason"], index=i, tools=tools)
         for i, out in enumerate(final_outputs)
     ]
     prompt_tokens = final_outputs[0]["num_tokens_input"]
@@ -276,6 +284,7 @@ async def stream_chat_response_fanout(
     seq_ids: List[int],
     tokenizer,
     cleanup_fn,
+    tools=None,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
     into a single SSE stream, tagging every chunk with ``choices[0].index``.
@@ -288,7 +297,7 @@ async def stream_chat_response_fanout(
     num_tokens_input = _prompt_token_count(prompt, tokenizer)
     num_tokens_output = [0] * n
     reasoning_filters = [ReasoningFilter() for _ in range(n)]
-    tool_parsers = [ToolCallStreamParser() for _ in range(n)]
+    tool_parsers = [ToolCallStreamParser(tools=tools) for _ in range(n)]
     has_tool_calls = [False] * n
     finished = [False] * n
     kv_transfer_params_value = None
