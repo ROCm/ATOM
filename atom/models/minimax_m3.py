@@ -384,7 +384,6 @@ class MiniMaxM3Attention(nn.Module):
             layer_num=layer_id,
             use_mla=False,
             rotary_emb=None,
-            force_triton_attn=True,
             prefix=f"{prefix}.attn",
         )
 
@@ -542,6 +541,21 @@ class MiniMaxM3SparseAttention(nn.Module):
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
+
+    def bind_kv_cache(
+        self,
+        layer_kv_cache: torch.Tensor,
+        index_cache: torch.Tensor,
+        max_model_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Bind runner-owned caches using MiniMax-M3 sparse kernel layout."""
+        # Runner stores one layer as [2, blocks, block_size, heads, dim].
+        # MiniMax-M3 sparse kernels consume [blocks, 2, block_size, heads, dim].
+        # permute creates a stride view, so this does not copy the KV cache.
+        self.kv_cache = layer_kv_cache.permute(1, 0, 2, 3, 4)
+        self.index_cache = index_cache
+        self.max_model_len = max_model_len
+        return self.kv_cache.unbind(1)
 
     def forward(
         self,
