@@ -10,6 +10,7 @@ from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
+from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
@@ -151,6 +152,41 @@ class VocabParallelEmbedding(nn.Module):
         # return y
 
 
+class ReplicatedEmbedding(nn.Module):
+    """Full vocab embedding replicated on every TP rank (no sharding).
+
+    Each rank holds the complete ``[num_embeddings, embedding_dim]`` table and
+    does a purely local lookup, so the forward needs **no all-reduce** — unlike
+    ``VocabParallelEmbedding``, which shards the vocab and must all-reduce the
+    masked partial lookups to reconstruct the full vector.
+
+    Trades ``(tp-1)/tp`` of the embedding's memory per rank for one fewer
+    collective per embed. Use ONLY where the embedding is independent of any
+    sharded ``lm_head`` (e.g. the EAGLE3 draft, whose embed/lm_head are separate
+    tensors). Do NOT use for an embedding shared/tied with a TP-sharded lm_head
+    or with the target model's sharded embedding.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.weight = atom_parameter(
+            torch.empty(num_embeddings, embedding_dim),
+        )
+        self.weight.weight_loader = self.weight_loader
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        # Full (un-sharded) copy: every rank gets the complete table.
+        assert param.data.size() == loaded_weight.size(), (
+            f"ReplicatedEmbedding expects the full weight "
+            f"{tuple(param.data.size())}, got {tuple(loaded_weight.size())}"
+        )
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor):
+        return F.embedding(x, self.weight)
+
+
 class ParallelLMHead(VocabParallelEmbedding):
 
     def __init__(
@@ -206,12 +242,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
             return logits.argmax(dim=-1)
-        local_max_val, local_idx = logits.max(dim=-1)  # [N], [N]
-        global_idx = local_idx + self.vocab_start_idx  # [N] global token id
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.
-        packed = torch.stack([local_max_val.float(), global_idx.float()], dim=-1)
+        packed = lm_head_argmax_pack(logits, self.vocab_start_idx)
         gathered = get_tp_group().all_gather(packed, dim=0).view(self.tp_size, -1, 2)
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
         token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
-        return token.to(local_idx.dtype)
+        return token.to(torch.long)

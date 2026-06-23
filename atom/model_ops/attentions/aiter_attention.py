@@ -27,14 +27,21 @@ def cdiv(a, b):
 
 
 @triton.jit
-def _mtp_decode_slot_mapping_kernel(
+def _mtp_prepare_decode_metadata_kernel(
     context_lens_ptr,
     block_tables_ptr,
     slot_mapping_ptr,
+    positions_in_ptr,
+    positions_out_ptr,
+    last_token_indices_ptr,
     bs,
     skip_update: tl.constexpr,
+    update_context_lens: tl.constexpr,
+    update_positions: tl.constexpr,
+    select_positions: tl.constexpr,
     block_size: tl.constexpr,
     block_table_stride: tl.constexpr,
+    position_stride: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     if not skip_update:
@@ -42,6 +49,17 @@ def _mtp_decode_slot_mapping_kernel(
         mask = seq < bs
 
         ctx = tl.load(context_lens_ptr + seq, mask=mask, other=1).to(tl.int64)
+        if update_context_lens:
+            ctx += 1
+            tl.store(context_lens_ptr + seq, ctx, mask=mask)
+
+        if update_positions:
+            pos_idx = seq
+            if select_positions:
+                pos_idx = tl.load(last_token_indices_ptr + seq, mask=mask, other=0)
+            pos = tl.load(positions_in_ptr + pos_idx, mask=mask, other=0)
+            tl.store(positions_out_ptr + seq * position_stride, pos + 1, mask=mask)
+
         last_pos = tl.maximum(ctx - 1, 0)
         block_col = last_pos // block_size
         within_block = last_pos - block_col * block_size
@@ -71,6 +89,7 @@ class AiterBackend(AttentionBackend):
 
 
 class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
+    fuse_mtp_decode_position_update = True
     BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
 
     def __init__(
@@ -186,19 +205,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "kv_indices": CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
-                **i32_kwargs,
-            ),
-            # MiniMax-M3 sparse spec-verify prefix length (cached-token count per
-            # seq). Persistent so CUDAGraph captures a stable address and the
-            # per-forward in-place update in prepare_decode is visible at every
-            # replay; filled once per forward and shared by all sparse layers.
-            "sparse_prefix_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
-            "sparse_decode_seq_lens": CpuGpuBuffer(
-                self.max_bs * max_qlen, **i32_kwargs
-            ),
-            "sparse_decode_block_tables": CpuGpuBuffer(
-                self.max_bs * max_qlen,
-                self.max_num_blocks_per_seq // self.block_ratio,
                 **i32_kwargs,
             ),
         }
@@ -366,15 +372,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         positions: torch.Tensor,
         only_update: bool = False,
         num_reject_tokens: torch.Tensor = None,
+        *,
+        update_context_lens: bool = False,
+        positions_out: torch.Tensor | None = None,
+        last_token_indices: torch.Tensor | None = None,
     ):
         """Per-draft-step metadata for a block-paged MHA Eagle3 draft.
 
         Called by EagleProposer.propose at mid-step iters. The draft's decode
         kernels (``paged_attention_{asm,triton}``) read ``block_tables`` +
-        ``context_lens``, both already bumped for this step by eagle (writing
-        in place into ``forward_vars``). The block_size==1024 persistent path
-        is the only one consuming ``kv_indptr``/``kv_indices``; MiniMax-M3 runs
-        at ``--block-size 128`` so the kernel never reads them — no rebuild.
+        ``context_lens``. Eagle can pre-bump ``context_lens`` before this call,
+        or ask this fused kernel to update it in place. The block_size==1024
+        persistent path is the only one consuming ``kv_indptr``/``kv_indices``;
+        MiniMax-M3 runs at ``--block-size 128`` so the kernel never reads them -
+        no rebuild.
 
         The one value we must (re)compute is the write slot for the new draft
         token in the draft's own block-paged KV cache:
@@ -386,23 +397,36 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         a bare block id for ``B > 1``.
 
         ``only_update`` / ``num_reject_tokens`` are MLA/V4-specific knobs and are
-        unused here: ``context_lens`` is already correct and there are no
-        persistent worker buffers to roll over for ``block_size != 1024``.
+        unused here: there are no persistent worker buffers to roll over for
+        ``block_size != 1024``.
         """
         var = self.model_runner.forward_vars
         slot_mapping = var["slot_mapping"].gpu[:bs]
         block_tables = var["block_tables"].gpu
         context_lens = var["context_lens"].gpu
+        update_positions = positions_out is not None
+        select_positions = update_positions and last_token_indices is not None
+        if positions_out is None:
+            positions_out = positions
+        if last_token_indices is None:
+            last_token_indices = slot_mapping
         # Dummy runs skip the draft attention, so keep this launch as a no-op:
         # their synthetic context_lens can point past block_tables.
-        _mtp_decode_slot_mapping_kernel[(max(1, triton.cdiv(bs, 128)),)](
+        _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(bs, 128)),)](
             context_lens,
             block_tables,
             slot_mapping,
+            positions,
+            positions_out,
+            last_token_indices,
             bs,
             bs == 0 or get_forward_context().context.is_dummy_run,
+            update_context_lens,
+            update_positions,
+            select_positions,
             self.model_runner.block_size,
             block_tables.stride(0),
+            positions_out.stride(0) if update_positions else 1,
             BLOCK=128,
         )
         return {"slot_mapping": slot_mapping}
@@ -564,6 +588,30 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 device="cuda",
             )
             tensors["_minimax_m3_sparse_cache_next"] = 0
+            # fp8 ASM path: per-token dequant scales for the page-16 SHUFFLE main
+            # KV cache, written by fused_qknorm_idxrqknorm /
+            # reshape_and_cache_with_pertoken_quant and read by gluon. Allocated
+            # page-128 here ([num_128_blocks, num_kv_heads, 128]); build_kv_cache_tensor
+            # binds a zero-copy page-16 view ([num_128_blocks*8, nkv, 16]) per layer so
+            # the row stride (16) matches the SHUFFLE page the kernel/gluon index with.
+            # Allocated only for fp8.
+            if config.kv_cache_dtype == "fp8":
+                tensors["minimax_m3_k_scale"] = torch.zeros(
+                    hf_config.num_hidden_layers,
+                    runner.num_physical_kvcache_blocks,
+                    num_kv_heads,
+                    runner.physical_block_size,
+                    dtype=dtypes.fp32,
+                    device="cuda",
+                )
+                tensors["minimax_m3_v_scale"] = torch.zeros(
+                    hf_config.num_hidden_layers,
+                    runner.num_physical_kvcache_blocks,
+                    num_kv_heads,
+                    runner.physical_block_size,
+                    dtype=dtypes.fp32,
+                    device="cuda",
+                )
         return tensors
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -589,12 +637,42 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             module.index_cache = runner.minimax_m3_index_cache[sparse_idx]
             key_cache, value_cache = module.kv_cache.unbind(1)
             module.max_model_len = config.max_model_len
+            # fp8 ASM path: bind this layer's per-token dequant scale slices
+            # (written by the fp8 KV insert, read by gluon). bf16 -> None.
+            k_scale = v_scale = None
+            if config.kv_cache_dtype == "fp8":
+                from atom.model_ops.minimax_m3.sparse_attn import (
+                    ASM_PAGE_SIZE,
+                    PAGES_PER_SPARSE_BLOCK,
+                )
+
+                # The scale buffer is allocated page-128 ([num_128_blocks, nkv, 128]),
+                # but the fp8 write kernel (fused_qknorm_idxrqknorm) and the gluon
+                # reader both index it in the page-16 SHUFFLE layout that mirrors the
+                # main KV cache: [num_128_blocks * 8, nkv, 16]. 128 == 8 * 16, so this
+                # is a pure zero-copy reinterpretation of the same contiguous bytes —
+                # the row stride becomes 16 (== the SHUFFLE page) so a page-16 block id
+                # lands on the right scale. Without this view, gluon multiplies a
+                # page-16 block id by the page-128 row stride (128) and reads scales
+                # 8x out of position, corrupting fp8 attention once blocks are reused.
+                k_scale = runner.minimax_m3_k_scale[layer_id].view(
+                    runner.num_physical_kvcache_blocks * PAGES_PER_SPARSE_BLOCK,
+                    module.num_kv_heads,
+                    ASM_PAGE_SIZE,
+                )
+                v_scale = runner.minimax_m3_v_scale[layer_id].view(
+                    runner.num_physical_kvcache_blocks * PAGES_PER_SPARSE_BLOCK,
+                    module.num_kv_heads,
+                    ASM_PAGE_SIZE,
+                )
+            module.k_scale = k_scale
+            module.v_scale = v_scale
             return KVCacheTensor(
                 layer_num=layer_id,
                 k_cache=key_cache,
                 v_cache=value_cache,
-                k_scale=None,
-                v_scale=None,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
 
         if not (
@@ -980,75 +1058,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if self._is_minimax_m3_sparse:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_minimax_m3_sparse_decode_metadata,
-                make_minimax_m3_sparse_small_q_decode_metadata,
             )
 
-            if max_seqlen_q <= 1:
-                attn_metadata.minimax_m3_sparse_metadata = (
-                    make_minimax_m3_sparse_decode_metadata(
-                        seq_lens=attn_metadata.context_lens[:scheduled_bs],
-                        block_table=attn_metadata.block_tables[:scheduled_bs],
-                        slot_mapping=attn_metadata.slot_mapping,
-                        max_seq_len=int(max_seqlen_k),
-                    )
-                )
-            else:
-                cu_q = attn_metadata.cu_seqlens_q
-                seq_lens = attn_metadata.context_lens[:bs]
-                # Spec-verify (decode with q>1, EAGLE) is CUDAGraph-captured, so
-                # prefix_lens must come from a PERSISTENT buffer: a fresh
-                # seq_lens-query_lens tensor would freeze at capture time and feed
-                # the sparse indexer a stale causal length on every replay. Write
-                # it once per forward into sparse_prefix_lens (padding seqs -> 0)
-                # and bind it as the metadata's context_lens.
-                query_lens = cu_q[1 : scheduled_bs + 1] - cu_q[:scheduled_bs]
-                pf = self.model_runner.forward_vars["sparse_prefix_lens"]
-                prefix_lens = pf.gpu[:bs]
-                torch.sub(
-                    seq_lens[:scheduled_bs],
-                    query_lens,
-                    out=prefix_lens[:scheduled_bs],
-                )
-                if bs > scheduled_bs:
-                    prefix_lens[scheduled_bs:bs].zero_()
-                total_q_capacity = bs * max_seqlen_q
-                query_seq_lens_buf = self.model_runner.forward_vars[
-                    "sparse_decode_seq_lens"
-                ]
-                query_block_tables_buf = self.model_runner.forward_vars[
-                    "sparse_decode_block_tables"
-                ]
-                query_seq_lens_buf.np[:total_q_capacity] = 0
-                query_block_tables_buf.np[:total_q_capacity] = 0
-                cu_q_cpu = self.model_runner.forward_vars["cu_seqlens_q"].np
-                block_tables_np = self.model_runner.forward_vars["block_tables"].np
-                for req_id in range(scheduled_bs):
-                    q_start = int(cu_q_cpu[req_id])
-                    q_end = int(cu_q_cpu[req_id + 1])
-                    q_len = q_end - q_start
-                    prefix_len = int(context_lens[req_id]) - q_len
-                    for qid in range(q_start, q_end):
-                        q_offset = qid - q_start
-                        query_seq_lens_buf.np[qid] = min(
-                            int(context_lens[req_id]), prefix_len + q_offset + 1
-                        )
-                        query_block_tables_buf.np[qid] = block_tables_np[req_id]
-                query_seq_lens = query_seq_lens_buf.copy_to_gpu(total_q_capacity)
-                query_block_table = query_block_tables_buf.copy_to_gpu(
-                    total_q_capacity
-                )
-                sparse_md = make_minimax_m3_sparse_small_q_decode_metadata(
-                    seq_lens=seq_lens,
-                    query_seq_lens=query_seq_lens,
-                    query_block_table=query_block_table,
-                    prefix_lens=prefix_lens,
-                    block_table=attn_metadata.block_tables[:bs],
+            # Both plain decode (q==1) and spec-verify (q==num_spec+1) use the
+            # DECODE sparse path; the decode kernels handle q>1 per-token causal
+            # internally (each token attends seq_len - max_q + tok + 1 keys).
+            attn_metadata.minimax_m3_sparse_metadata = (
+                make_minimax_m3_sparse_decode_metadata(
+                    seq_lens=attn_metadata.context_lens[:scheduled_bs],
+                    block_table=attn_metadata.block_tables[:scheduled_bs],
                     slot_mapping=attn_metadata.slot_mapping,
-                    max_query_len=max_seqlen_q,
                     max_seq_len=int(max_seqlen_k),
-                    decode_seq_lens=query_seq_lens,
+                    max_query_len=max_seqlen_q,
                 )
-                attn_metadata.minimax_m3_sparse_metadata = sparse_md
+            )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q
         )
@@ -1242,63 +1265,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if self._is_minimax_m3_sparse:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_minimax_m3_sparse_decode_metadata,
-                make_minimax_m3_sparse_small_q_decode_metadata,
             )
 
             seq_lens = attn_metadata.context_lens
-            if max_q_len <= 1:
-                attn_metadata.minimax_m3_sparse_metadata = (
-                    make_minimax_m3_sparse_decode_metadata(
-                        seq_lens=seq_lens,
-                        block_table=attn_metadata.block_tables,
-                        slot_mapping=attn_metadata.slot_mapping,
-                        max_seq_len=attn_metadata.max_seqlen_k,
-                    )
-                )
-            else:
-                # Spec-verify capture: bind the persistent prefix_lens buffer (the
-                # same one prepare_decode updates in-place each replay) as the
-                # metadata's context_lens, so the captured sparse kernels read live
-                # values. The value written here is only the capture-warmup seed.
-                query_lens = (
-                    attn_metadata.cu_seqlens_q[1 : bs + 1]
-                    - attn_metadata.cu_seqlens_q[:bs]
-                )
-                pf = self.model_runner.forward_vars["sparse_prefix_lens"]
-                prefix_lens = pf.gpu[:bs]
-                torch.sub(seq_lens, query_lens, out=prefix_lens)
-                query_seq_lens = self.model_runner.forward_vars[
-                    "sparse_decode_seq_lens"
-                ].gpu[:total_tokens]
-                query_block_table = self.model_runner.forward_vars[
-                    "sparse_decode_block_tables"
-                ].gpu[:total_tokens]
-                req_ids = torch.arange(bs, dtype=torch.int32, device=self.device)
-                req_ids = torch.repeat_interleave(req_ids, max_q_len)
-                q_offsets = torch.arange(
-                    max_q_len, dtype=torch.int32, device=self.device
-                ).repeat(bs)
-                query_block_table.copy_(
-                    torch.index_select(attn_metadata.block_tables, 0, req_ids.long())
-                )
-                torch.minimum(
-                    seq_lens[req_ids.long()],
-                    prefix_lens[req_ids.long()] + q_offsets + 1,
-                    out=query_seq_lens,
-                )
-                sparse_md = make_minimax_m3_sparse_small_q_decode_metadata(
+            # Both plain decode (q==1) and spec-verify (q==num_spec+1) capture use
+            # the DECODE sparse path; the decode kernels handle q>1 per-token causal
+            # internally (no separate prefill graph). seq_lens is the captured warmup
+            # seed; prepare_decode updates context_lens in place each replay.
+            attn_metadata.minimax_m3_sparse_metadata = (
+                make_minimax_m3_sparse_decode_metadata(
                     seq_lens=seq_lens,
-                    query_seq_lens=query_seq_lens,
-                    query_block_table=query_block_table,
-                    prefix_lens=prefix_lens,
                     block_table=attn_metadata.block_tables,
                     slot_mapping=attn_metadata.slot_mapping,
-                    max_query_len=max_q_len,
                     max_seq_len=attn_metadata.max_seqlen_k,
-                    decode_seq_lens=query_seq_lens,
+                    max_query_len=max_q_len,
                 )
-                attn_metadata.minimax_m3_sparse_metadata = sparse_md
-
+            )
         positions = var["positions"].copy_to_gpu(total_tokens)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs

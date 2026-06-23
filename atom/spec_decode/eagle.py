@@ -478,6 +478,17 @@ class EagleProposer:
                         # TODO: FIX this condition after we support3 attention head numbers=32
                         and self.runner.attn_metadata_builder.num_attention_heads != 32
                     )
+                    fuse_mtp_metadata_update = (
+                        positions.ndim == 1
+                        and getattr(
+                            self.runner.attn_metadata_builder,
+                            "fuse_mtp_decode_position_update",
+                            False,
+                        )
+                    )
+                    mtp_positions = positions
+                    mtp_positions_out = positions if fuse_mtp_metadata_update else None
+                    mtp_last_token_indices = None
                     if i == 0:
                         i0_max_seqlen_q = attn_metadata.max_seqlen_q
                         attn_metadata.max_seqlen_q = 1
@@ -510,9 +521,17 @@ class EagleProposer:
                                 num_reject_tokens, dim=0
                             )
                         if positions.ndim == 1:
-                            positions = torch.index_select(
-                                positions, 0, last_token_indices
-                            )
+                            if fuse_mtp_metadata_update:
+                                mtp_positions = positions
+                                positions = torch.empty(
+                                    bs, dtype=positions.dtype, device=positions.device
+                                )
+                                mtp_positions_out = positions
+                                mtp_last_token_indices = last_token_indices
+                            else:
+                                positions = torch.index_select(
+                                    positions, 0, last_token_indices
+                                )
                         else:
                             # MRoPE positions keep the token axis last (e.g.
                             # [3, num_tokens] for Qwen3.5), so select columns
@@ -526,8 +545,17 @@ class EagleProposer:
                     attn_metadata.max_seqlen_k += 1
                     # Update context_lens for each draft step (needed by both
                     # MHA attention and MLA+sparse indexer)
-                    attn_metadata.context_lens[:bs] += 1
-                    positions += 1
+                    if not fuse_mtp_metadata_update:
+                        attn_metadata.context_lens[:bs] += 1
+                        positions += 1
+                        mtp_positions = positions
+                    mtp_decode_kwargs = {}
+                    if fuse_mtp_metadata_update:
+                        mtp_decode_kwargs = {
+                            "update_context_lens": True,
+                            "positions_out": mtp_positions_out,
+                            "last_token_indices": mtp_last_token_indices,
+                        }
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
                         (
@@ -536,9 +564,10 @@ class EagleProposer:
                             else i0_max_seqlen_q
                         ),
                         attn_metadata.max_seqlen_k,
-                        positions,
+                        mtp_positions,
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,
+                        **mtp_decode_kwargs,
                     )
                     attn_metadata.__dict__.update(workinfos)
                     if has_flat_kv and "slot_mapping" not in workinfos:

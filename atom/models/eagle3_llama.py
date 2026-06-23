@@ -21,7 +21,11 @@ from aiter.rotary_embedding import get_rope
 from atom.config import Config
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.embed_head import (
+    ParallelLMHead,
+    ReplicatedEmbedding,
+    VocabParallelEmbedding,
+)
 from atom.model_ops.fused_aux_rmsnorm import (
     fused_dual_rmsnorm_cat,
     fused_group_rmsnorm,
@@ -331,10 +335,20 @@ class Eagle3LlamaModel(nn.Module):
         self.num_aux_hidden_states = num_aux
         self.norm_output = getattr(config, "norm_output", False)
 
-        # Independent embedding (vocab matches target model)
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
-        )
+        # Independent embedding (vocab matches target model). The draft embed is
+        # NOT shared with the (still TP-sharded) lm_head, so it can be replicated
+        # full on every rank — a local lookup with no post-embedding all-reduce.
+        # Bit-identical to the sharded path; on by default (trades memory for one
+        # fewer collective per draft step). Falls back to the sharded embedding
+        # when ATOM_EAGLE_REPLICATE_EMBED=0.
+        if envs.ATOM_EAGLE_REPLICATE_EMBED:
+            self.embed_tokens = ReplicatedEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
 
         # Aux fusion: [N, target_hidden_size * num_aux] -> [N, hidden_size]
         self.fc = ReplicatedLinear(

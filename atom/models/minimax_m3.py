@@ -45,7 +45,6 @@ from atom.model_ops.minimax_m3.moe import (
 )
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
-    minimax_m3_fused_qknorm_rope_kv_insert_shuffle,
     minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
     minimax_m3_sparse_attn_decode_asm,
@@ -94,11 +93,13 @@ def _rope_theta(config: PretrainedConfig) -> float:
 
 def _can_use_fused_minimax_m3_attention_preproc(
     qkv: torch.Tensor,
+    use_asm_pa: bool,
     rotary_emb: nn.Module,
     *weights: torch.Tensor,
 ) -> bool:
     return (
         hasattr(aiter, "fused_qknorm_idxrqknorm")
+        or use_asm_pa
         and qkv.dim() == 2
         and qkv.is_cuda
         and qkv.dtype in (torch.float16, torch.bfloat16)
@@ -453,16 +454,17 @@ class MiniMaxM3Attention(nn.Module):
                 self.num_kv_heads,
                 self.rotary_emb.rotary_dim,
                 self.q_norm.variance_epsilon,
-                None,
-                None,
-                0,
-                None,
-                None,
-                None,
-                0,
-                q,
-                None,
-                None,
+                None,  # index_q_norm_weight
+                None,  # index_k_norm_weight
+                0,  # num_index_heads
+                None,  # slot_mapping
+                None,  # kv_cache_k
+                None,  # kv_cache_v
+                None,  # index_cache
+                0,  # block_size
+                q,  # q_out
+                None,  # index_q_out
+                None,  # index_slot_mapping
             )
             _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             attn_output = self.attn(q, k, v)
@@ -656,18 +658,33 @@ class MiniMaxM3SparseAttention(nn.Module):
             self._ensure_asm_shuffle_views()
             if self.kv_cache_k.numel() == 0:
                 return
-            # Page-16 SHUFFLE write for the ASM decode path.
-            aiter.reshape_and_cache(
-                k.view(-1, self.num_kv_heads, self.head_dim),
-                v.view(-1, self.num_kv_heads, self.head_dim),
-                self.kv_cache_k,
-                self.kv_cache_v,
-                slot_mapping,
-                kv_cache_dtype="auto",
-                k_scale=None,
-                v_scale=None,
-                asm_layout=True,
-            )
+            if self.kv_cache_dtype == "fp8":
+                # Page-16 SHUFFLE fp8 write with per-token dynamic quant; writes
+                # per-token dequant scales into self.k_scale/self.v_scale
+                # ([num_phys_blocks, num_kv_heads, physical_block_size]).
+                aiter.reshape_and_cache_with_pertoken_quant(
+                    k.view(-1, self.num_kv_heads, self.head_dim),
+                    v.view(-1, self.num_kv_heads, self.head_dim),
+                    self.kv_cache_k,
+                    self.kv_cache_v,
+                    self.k_scale,
+                    self.v_scale,
+                    slot_mapping,
+                    asm_layout=True,
+                )
+            else:
+                # Page-16 SHUFFLE bf16 write for the ASM decode path.
+                aiter.reshape_and_cache(
+                    k.view(-1, self.num_kv_heads, self.head_dim),
+                    v.view(-1, self.num_kv_heads, self.head_dim),
+                    self.kv_cache_k,
+                    self.kv_cache_v,
+                    slot_mapping,
+                    kv_cache_dtype="auto",
+                    k_scale=None,
+                    v_scale=None,
+                    asm_layout=True,
+                )
         else:
             if self.kv_cache.numel() == 0:
                 return
@@ -700,14 +717,17 @@ class MiniMaxM3SparseAttention(nn.Module):
         assert prefill_metadata is not None
         cu_seqlens_q = prefill_metadata.cu_seqlens_q
         seq_lens = prefill_metadata.seq_lens
-        # prefix_lens (already-cached token count per seq). For spec-verify decode
-        # this is the persistent `sparse_prefix_lens` buffer that prepare_decode
-        # fills once per forward and rebinds at CUDAGraph capture, so it tracks
-        # every replay; for real (eager) prefill it is the per-batch tensor
-        # prepare_prefill built. Either way it is correct to read directly here.
+        # prefix_lens (already-cached token count per seq), the per-batch tensor
+        # prepare_prefill built. Spec-verify (q>1) no longer routes here — it goes
+        # through the decode path (max_query_len), so this is real-prefill only.
         prefix_lens = prefill_metadata.context_lens
         block_tables = prefill_metadata.block_table
-        topk_idx = minimax_m3_index_topk(
+        # Fuse the sparse block-table build into the topk kernel for the ASM prefill
+        # path. The fused emit is kv-head-encoded (one row per (token, kv_head)), so
+        # the ASM path works for num_kv_heads > 1 (the wrapper collapses kv-head into
+        # the row dim).
+        fuse_bt = self._use_asm_pa
+        topk_out = minimax_m3_index_topk(
             index_q,
             self.index_cache,
             block_tables,
@@ -721,7 +741,12 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.local_blocks,
             self.num_kv_heads,
             self.scaling,
+            emit_sparse_block_table=fuse_bt,
         )
+        if fuse_bt:
+            topk_idx, sparse_bt, sparse_ctx = topk_out
+        else:
+            topk_idx, sparse_bt, sparse_ctx = topk_out, None, None
         output = torch.empty_like(q)
         if self._use_asm_pa:
             minimax_m3_sparse_attn_prefill_asm(
@@ -745,6 +770,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                 # of asserting / reading frozen metadata.
                 cu_seqlens_q=cu_seqlens_q,
                 prefix_lens=prefix_lens,
+                sparse_bt=sparse_bt,
+                sparse_ctx=sparse_ctx,
             )
         else:
             minimax_m3_sparse_attn(
@@ -770,7 +797,17 @@ class MiniMaxM3SparseAttention(nn.Module):
     ) -> torch.Tensor:
         decode_metadata = sparse_metadata.decode
         assert decode_metadata is not None
-        topk_idx = minimax_m3_index_topk_decode(
+        # Spec-decode (EAGLE verify) packs max_query_len = num_spec+1 query tokens
+        # per request; q/index_q already carry one row per token. max_query_len == 1
+        # is plain decode (one token per request).
+        max_query_len = decode_metadata.max_query_len
+        # When using ASM/gluon decode, fuse the sparse block-table build into the
+        # topk merge kernel (returns sparse_bt/ctx), saving a separate build launch
+        # + topk_idx round-trip. The fused emit produces one kv-head-encoded row per
+        # (token, kv_head), so the ASM path works for num_kv_heads > 1 too (the
+        # attention wrapper collapses kv-head into the row dim).
+        fuse_bt = self._use_asm_pa
+        topk_out = minimax_m3_index_topk_decode(
             index_q,
             self.index_cache,
             decode_metadata.block_table,
@@ -781,15 +818,15 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.local_blocks,
             self.num_kv_heads,
             self.scaling,
+            emit_sparse_block_table=fuse_bt,
+            max_query_len=max_query_len,
         )
+        if fuse_bt:
+            topk_idx, sparse_bt, sparse_ctx = topk_out
+        else:
+            topk_idx, sparse_bt, sparse_ctx = topk_out, None, None
         output = torch.empty_like(q)
         if self._use_asm_pa:
-            if self.num_kv_heads != 1:
-                raise NotImplementedError(
-                    "ATOM_M3_SPARSE_USE_ASM_PA requires per-rank num_kv_heads == 1 "
-                    "(tensor-parallel size >= 4); ASM PA shares one block_table "
-                    f"across kv heads. Got num_kv_heads={self.num_kv_heads}."
-                )
             minimax_m3_sparse_attn_decode_asm(
                 q,
                 self.kv_cache_k,
@@ -802,6 +839,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                 output,
                 k_scale=self.k_scale,
                 v_scale=self.v_scale,
+                sparse_bt=sparse_bt,
+                sparse_ctx=sparse_ctx,
             )
         else:
             minimax_m3_sparse_attn_decode(
@@ -813,117 +852,111 @@ class MiniMaxM3SparseAttention(nn.Module):
                 self.num_kv_heads,
                 self.scaling,
                 output,
+                max_query_len=max_query_len,
             )
-        return output
 
-    def _run_decode_sparse_small_q_loop(
-        self,
-        q: torch.Tensor,
-        index_q: torch.Tensor,
-        sparse_metadata,
-    ) -> torch.Tensor:
-        small_q_metadata = sparse_metadata.small_q_decode
-        assert small_q_metadata is not None
-        max_query_len = small_q_metadata.max_query_len
-        total_q = q.shape[0]
-        assert total_q % max_query_len == 0
-        batch = total_q // max_query_len
-        output = torch.empty_like(q)
-        decode_seq_lens = small_q_metadata.decode_seq_lens
-        if decode_seq_lens is None:
-            decode_seq_lens = torch.empty_like(sparse_metadata.seq_lens[:batch])
-        for q_offset in range(max_query_len):
-            torch.add(
-                small_q_metadata.prefix_lens[:batch],
-                q_offset + 1,
-                out=decode_seq_lens[:batch],
-            )
-            torch.minimum(
-                sparse_metadata.seq_lens[:batch],
-                decode_seq_lens[:batch],
-                out=decode_seq_lens[:batch],
-            )
-            q_slice = q[q_offset::max_query_len]
-            index_q_slice = index_q[q_offset::max_query_len]
-            topk_idx = minimax_m3_index_topk_decode(
-                index_q_slice,
-                self.index_cache,
-                small_q_metadata.block_table[:batch],
-                decode_seq_lens[:batch],
-                sparse_metadata.max_seq_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                self.scaling,
-            )
-            if self._use_asm_pa:
-                if self.num_kv_heads != 1:
-                    raise NotImplementedError(
-                        "ATOM_M3_SPARSE_USE_ASM_PA requires per-rank "
-                        f"num_kv_heads == 1. Got num_kv_heads={self.num_kv_heads}."
+        # --- env-gated decode-vs-prefill diagnostic (ATOM_M3_DECODE_DEBUG=1) ---
+        # Re-run the SAME real q/index_q/seq_lens through the PREFILL route (the
+        # proven per-token reference) and log per-token cosine vs the decode output.
+        # Token 0 matching but tokens 1.. diverging localizes a per-token bug in the
+        # live decode data/dispatch. Layer 0 only, first few calls, rank 0.
+        import os as _os
+
+        _dbg_layer = int(_os.environ.get("ATOM_M3_DECODE_DEBUG_LAYER", "3"))
+        if (
+            _os.environ.get("ATOM_M3_DECODE_DEBUG", "0") == "1"
+            and self.layer_num == _dbg_layer
+            and max_query_len > 1
+        ):
+            try:
+                self._m3_dbg_calls = getattr(self, "_m3_dbg_calls", 0) + 1
+                if self._m3_dbg_calls <= 2:
+                    import torch as _t
+                    from atom.model_ops.minimax_m3.sparse_attn import (
+                        minimax_m3_index_topk,
+                        minimax_m3_sparse_attn_prefill_asm,
                     )
-                minimax_m3_sparse_attn_decode_asm(
-                    q_slice,
-                    self.kv_cache_k,
-                    self.kv_cache_v,
-                    topk_idx,
-                    small_q_metadata.block_table[:batch],
-                    decode_seq_lens[:batch],
-                    self.num_kv_heads,
-                    self.scaling,
-                    output[q_offset::max_query_len],
-                    k_scale=self.k_scale,
-                    v_scale=self.v_scale,
-                )
-            else:
-                minimax_m3_sparse_attn_decode(
-                    q_slice,
-                    self.kv_cache,
-                    topk_idx,
-                    small_q_metadata.block_table[:batch],
-                    decode_seq_lens[:batch],
-                    self.num_kv_heads,
-                    self.scaling,
-                    output[q_offset::max_query_len],
-                )
-        return output
 
-    def _run_decode_sparse_small_q(
-        self,
-        q: torch.Tensor,
-        index_q: torch.Tensor,
-        sparse_metadata,
-    ) -> torch.Tensor:
-        small_q_metadata = sparse_metadata.small_q_decode
-        assert small_q_metadata is not None
-        if self._use_asm_pa:
-            return self._run_decode_sparse_small_q_loop(q, index_q, sparse_metadata)
-        query_seq_lens = small_q_metadata.query_seq_lens[: q.shape[0]]
-        query_block_table = small_q_metadata.query_block_table[: q.shape[0]]
-        topk_idx = minimax_m3_index_topk_decode(
-            index_q,
-            self.index_cache,
-            query_block_table,
-            query_seq_lens,
-            sparse_metadata.max_seq_len,
-            self.topk_blocks,
-            self.init_blocks,
-            self.local_blocks,
-            self.num_kv_heads,
-            self.scaling,
-        )
-        output = torch.empty_like(q)
-        minimax_m3_sparse_attn_decode(
-            q,
-            self.kv_cache,
-            topk_idx,
-            query_block_table,
-            query_seq_lens,
-            self.num_kv_heads,
-            self.scaling,
-            output,
-        )
+                    bt = decode_metadata.block_table
+                    seq_lens = decode_metadata.seq_lens
+                    batch = seq_lens.shape[0]
+                    mq = max_query_len
+                    # prefill-style cu_seqlens_q / prefix_lens (each request has mq
+                    # query tokens at the end of its sequence).
+                    cu = _t.arange(
+                        0, (batch + 1) * mq, mq, dtype=_t.int32, device=q.device
+                    )
+                    qlens = cu[1 : batch + 1] - cu[:batch]
+                    prefix = (seq_lens - qlens).to(_t.int32)
+                    # PREFILL ASM reference: reads the SAME SHUFFLE kv_cache_k/_v the
+                    # decode path uses (valid under ASM_PA, unlike the page-128
+                    # self.kv_cache which holds SHUFFLE bytes). Per-token topk emitted
+                    # fused, then per-token gluon attention -- the proven path.
+                    tk_p, sbt_p, sctx_p = minimax_m3_index_topk(
+                        index_q,
+                        self.index_cache,
+                        bt,
+                        cu,
+                        seq_lens,
+                        prefix,
+                        mq,
+                        sparse_metadata.max_seq_len,
+                        self.topk_blocks,
+                        self.init_blocks,
+                        self.local_blocks,
+                        self.num_kv_heads,
+                        self.scaling,
+                        emit_sparse_block_table=True,
+                    )
+                    out_p = _t.empty_like(q)
+                    minimax_m3_sparse_attn_prefill_asm(
+                        q,
+                        self.kv_cache_k,
+                        self.kv_cache_v,
+                        tk_p,
+                        bt,
+                        None,
+                        None,
+                        None,
+                        self.num_kv_heads,
+                        self.scaling,
+                        out_p,
+                        k_scale=self.k_scale,
+                        v_scale=self.v_scale,
+                        cu_seqlens_q=cu,
+                        prefix_lens=prefix,
+                        sparse_bt=sbt_p,
+                        sparse_ctx=sctx_p,
+                    )
+                    od = output.reshape(batch, mq, -1).float()
+                    op = out_p.reshape(batch, mq, -1).float()
+                    for tk in range(mq):
+                        a = od[:, tk].flatten()
+                        b = op[:, tk].flatten()
+                        cos = _t.nn.functional.cosine_similarity(
+                            a.double(), b.double(), dim=0
+                        ).item()
+                        # also report cos vs the SAME-token prefill, and the topk
+                        # selection agreement, to localize topk vs attention.
+                        print(
+                            f"[M3_DECODE_DBG] call={self._m3_dbg_calls} "
+                            f"asm_pa={self._use_asm_pa} tok={tk} "
+                            f"decode-vs-prefillASM cos={cos:.6f}",
+                            flush=True,
+                        )
+                    # topk agreement (decode topk_idx vs prefill topk_idx)
+                    if sparse_bt is not None:
+                        bt_eq = _t.equal(sparse_bt, sbt_p)
+                        ctx_eq = _t.equal(sparse_ctx, sctx_p)
+                        print(
+                            f"[M3_DECODE_DBG] call={self._m3_dbg_calls} "
+                            f"sparse_bt_equal={bt_eq} sparse_ctx_equal={ctx_eq}",
+                            flush=True,
+                        )
+            except Exception as _e:  # never break the run on a diag failure
+                import traceback as _tb
+
+                print(f"[M3_DECODE_DBG] error: {_e}\n{_tb.format_exc()}", flush=True)
         return output
 
     def sparse_attention_forward_impl(
@@ -955,6 +988,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_metadata = attn_metadata
         if _can_use_fused_minimax_m3_attention_preproc(
             qkv,
+            self._use_asm_pa,
             self.rotary_emb,
             self.q_norm.weight,
             self.k_norm.weight,
@@ -970,9 +1004,18 @@ class MiniMaxM3SparseAttention(nn.Module):
             )
             cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
             if self._use_asm_pa:
-                # Triton fallback that writes the main KV cache in page-16
-                # SHUFFLE layout (the aiter fused kernel writes plain page-128).
-                minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
+                # Fused aiter CUDA kernel writing the main KV cache in page-16
+                # SHUFFLE layout (asm_layout=True), matching the page-16 SHUFFLE
+                # K/V views. ~2-4x faster than the Triton shuffle writer; block_size
+                # is the SHUFFLE page (16 == kv_cache_k.shape[3]), not 128.
+                kv_cache_dtype = (
+                    "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+                )
+                # fp8: the fused op computes per-token dynamic quant and writes the
+                # per-token dequant scales into self.k_scale/self.v_scale (output).
+                fused_k_scale = self.k_scale if self.kv_cache_dtype == "fp8" else None
+                fused_v_scale = self.v_scale if self.kv_cache_dtype == "fp8" else None
+                aiter.fused_qknorm_idxrqknorm(
                     qkv,
                     self.q_norm.weight,
                     self.k_norm.weight,
@@ -989,11 +1032,23 @@ class MiniMaxM3SparseAttention(nn.Module):
                     self.kv_cache_k,
                     self.kv_cache_v,
                     self.index_cache,
+                    self.kv_cache_k.shape[3],  # SHUFFLE page size (== ASM_PAGE_SIZE)
                     q,
                     index_q,
-                    self.idx_head_dim,
+                    sparse_metadata.slot_mapping,
+                    kv_cache_dtype=kv_cache_dtype,
+                    k_scale=fused_k_scale,
+                    v_scale=fused_v_scale,
+                    asm_layout=True,
                 )
             else:
+                # page-128 path: the op takes separate K/V caches. Pass the
+                # key/value slices of the fused [N, 2, block_size, nkv, hd] cache
+                # (zero-copy views); asm_layout=False selects page-128 addressing.
+                key_cache, value_cache = self.kv_cache.unbind(1)
+                kv_cache_dtype = (
+                    "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+                )
                 aiter.fused_qknorm_idxrqknorm(
                     qkv,
                     self.q_norm.weight,
@@ -1008,69 +1063,67 @@ class MiniMaxM3SparseAttention(nn.Module):
                     self.index_k_norm.weight,
                     self.num_idx_heads,
                     sparse_metadata.slot_mapping,
-                    self.kv_cache,
+                    key_cache,
+                    value_cache,
                     self.index_cache,
                     self.kv_cache.shape[2],
                     q,
                     index_q,
                     sparse_metadata.slot_mapping,
-                    self.kv_cache_dtype,
-                    None,
-                    None,
+                    kv_cache_dtype=kv_cache_dtype,
+                    k_scale=None,
+                    v_scale=None,
+                    asm_layout=False,
                 )
             q = q.view(-1, self.num_heads, self.head_dim)
             index_q = index_q.view(-1, self.num_idx_heads, self.idx_head_dim)
-            if getattr(sparse_metadata, "small_q_decode", None) is not None:
-                output = self._run_decode_sparse_small_q(q, index_q, sparse_metadata)
-            elif getattr(sparse_metadata, "num_prefills", 0) > 0:
+            if getattr(sparse_metadata, "num_prefills", 0) > 0:
                 output = self._run_prefill_sparse(q, index_q, sparse_metadata)
             else:
                 output = self._run_decode_sparse(q, index_q, sparse_metadata)
             return output.view(-1, self.q_size)
 
-        q, k, v, index_q, index_k = qkv.split(
-            [
-                self.q_size,
-                self.kv_size,
-                self.kv_size,
-                self.index_q_size,
-                self.idx_head_dim,
-            ],
-            dim=-1,
-        )
-        q, k = _minimax_m3_gemma_qk_norm(
-            q,
-            k,
-            self.q_norm,
-            self.k_norm,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )
-        q, k = self.rotary_emb(positions, q, k)
+        # q, k, v, index_q, index_k = qkv.split(
+        #     [
+        #         self.q_size,
+        #         self.kv_size,
+        #         self.kv_size,
+        #         self.index_q_size,
+        #         self.idx_head_dim,
+        #     ],
+        #     dim=-1,
+        # )
+        # q, k = _minimax_m3_gemma_qk_norm(
+        #     q,
+        #     k,
+        #     self.q_norm,
+        #     self.k_norm,
+        #     self.num_heads,
+        #     self.num_kv_heads,
+        #     self.head_dim,
+        # )
+        # q, k = self.rotary_emb(positions, q, k)
 
-        index_q, index_k = _minimax_m3_gemma_qk_norm(
-            index_q,
-            index_k,
-            self.index_q_norm,
-            self.index_k_norm,
-            self.num_idx_heads,
-            1,
-            self.idx_head_dim,
-        )
-        index_q, index_k = self.index_rotary_emb(positions, index_q, index_k)
+        # index_q, index_k = _minimax_m3_gemma_qk_norm(
+        #     index_q,
+        #     index_k,
+        #     self.index_q_norm,
+        #     self.index_k_norm,
+        #     self.num_idx_heads,
+        #     1,
+        #     self.idx_head_dim,
+        # )
+        # index_q, index_k = self.index_rotary_emb(positions, index_q, index_k)
 
-        self._insert_kv(k, v, index_k, sparse_metadata.slot_mapping)
+        # self._insert_kv(k, v, index_k, sparse_metadata.slot_mapping)
 
-        q = q.view(-1, self.num_heads, self.head_dim)
-        index_q = index_q.view(-1, self.num_idx_heads, self.idx_head_dim)
-        if getattr(sparse_metadata, "small_q_decode", None) is not None:
-            output = self._run_decode_sparse_small_q(q, index_q, sparse_metadata)
-        elif getattr(sparse_metadata, "num_prefills", 0) > 0:
-            output = self._run_prefill_sparse(q, index_q, sparse_metadata)
-        else:
-            output = self._run_decode_sparse(q, index_q, sparse_metadata)
-        return output.view(-1, self.q_size)
+        # q = q.view(-1, self.num_heads, self.head_dim)
+        # index_q = index_q.view(-1, self.num_idx_heads, self.idx_head_dim)
+        # if getattr(sparse_metadata, "num_prefills", 0) > 0:
+        #     output = self._run_prefill_sparse(q, index_q, sparse_metadata)
+        # else:
+        #     output = self._run_decode_sparse(q, index_q, sparse_metadata)
+        # return output.view(-1, self.q_size)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
