@@ -272,8 +272,6 @@ jobs:
             model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
             extra_args: "--tensor-parallel-size 2 --attention-backend ROCM_AITER_FA"
-            # FIXME: Remove these temporary Qwen3.5 workarounds after the
-            # aiter fix landed
             env_vars: |
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
@@ -299,7 +297,7 @@ jobs:
           fi
 
       - name: Clean up containers and workspace
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'atom-mi35x-8gpu-oot-acc'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
@@ -313,7 +311,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Ensure Docker client config directory
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'atom-mi35x-8gpu-oot-acc'
         run: |
           set -euo pipefail
           mkdir -p "$DOCKER_CONFIG"
@@ -510,7 +508,7 @@ jobs:
           model_dir="/models/${{ matrix.model_path }}"
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             model_use_lock="true"
-            if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+            if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ] || [ "${{ matrix.runner }}" = "atom-mi35x-8gpu-oot-acc" ]; then
               model_use_lock="false"
             fi
             echo "Using shared model download script for ${model_dir} (MODEL_USE_LOCK=${model_use_lock})"
