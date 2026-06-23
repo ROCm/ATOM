@@ -250,7 +250,7 @@ jobs:
               ATOM_MOE_GU_ITLV=1
             lm_eval_num_fewshot: 20
             accuracy_test_threshold: 0.94
-            runner: linux-atom-mi35x-4
+            runner: atom-mi35x-8gpu-oot-acc
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
@@ -279,7 +279,7 @@ jobs:
               ATOM_USE_CUSTOM_ALL_GATHER=0
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.76
-            runner: linux-atom-mi35x-4
+            runner: atom-mi35x-8gpu-oot-acc
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
