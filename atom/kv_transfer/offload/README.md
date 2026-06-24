@@ -14,6 +14,11 @@ For the **vLLM-plugin** offload path (LMCache driven through vLLM's own connecto
 API), and for the LMCache-from-source ROCm build steps both paths need, see
 [`recipes/atom_vllm/LMCache-KV-Cache-Offload.md`](../../../recipes/atom_vllm/LMCache-KV-Cache-Offload.md).
 
+New to this module? Read top to bottom: the early sections give the big picture;
+the byte-level deep dives ([Key Modules](#key-modules-in-depth),
+[Relationship to LMCache](#relationship-to-lmcache-reuse-vs-override)) come later.
+Unfamiliar terms are in the [Glossary](#glossary).
+
 ## Design at a Glance
 
 Two ideas carry the whole module:
@@ -47,199 +52,6 @@ Two ideas carry the whole module:
 | `atom_lmcache_gpu_connector.py` | `ATOMLMCacheGPUConnector`: LMCache `GPUConnectorInterface` impl. Bounded GPU staging + two-stage (pack ↔ copy) pipeline. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
 | `triton_kv_staging.py` | Triton fused chunk-major pack/unpack kernels (the fast staging path). |
-
-## Key Modules in Depth
-
-`connector.py` (the scheduler/worker orchestration) is covered under
-[Architecture](#architecture). The rest of this section details the
-**byte-movement stack** — the part that makes ATOM's KV layout work with LMCache —
-and the two support files.
-
-### `atom_kv_byte_codec.py` — the layout bridge
-
-This is the keystone. The two sides store KV in incompatible layouts:
-
-**What LMCache expects — token-major.** Its GPU connectors only accept the clean
-NHD/HND family (`KV_2LTD` etc.), i.e. KV indexed roughly as
-`[layer, k/v, token, head, head_dim]`, contiguous in `head_dim` then token.
-`normalize_kv_and_discover_format` rejects anything else.
-
-**What AITER actually stores — x-packed, head-major, paged.** Per layer
-(`bs` = block size, `H` = local KV heads, `D` = head dim, `x = 16 // elem_bytes`,
-so `x=16` for fp8 / `x=8` for bf16):
-
-| Tensor | Shape | Notes |
-|--------|-------|-------|
-| `k_cache` | `(num_blocks, H, D//x, bs, x)` | head-major; `D` split into `D//x` outer × `x` inner, with `bs` between → not token-contiguous |
-| `v_cache` | `(num_blocks, H, …, bs, …)` | strided, head-major (exact split is model-dependent) |
-| `k_scale`, `v_scale` (fp8) | `(num_blocks, H, bs)` | one fp32 scale per (head, token) in a block |
-
-This is a **persistent HBM storage layout** (not the transient LDS bank "swizzle"),
-and is specific to this ATOM AITER path — stock vLLM's `rocm_aiter_fa` uses the
-clean token-major `(2,nb,bs,H,D)` that LMCache handles natively.
-
-**How the bridge works — gather/scatter of opaque bytes, no transcode.** The codec
-never reinterprets values. A whole *block* of any of those tensors
-(`tensor[block_id]`) is contiguous in memory, so one block's KV is just a set of
-contiguous byte slices (per layer: K, V, and fp8 scales). The codec gathers the
-blocks of an LMCache chunk into a **chunk-major `uint8`** buffer —
-`[chunk: seg0 blocks | seg1 blocks | …]` — which LMCache stores as an opaque blob;
-on reload it scatters the exact bytes back to the exact block slots. The only
-transformation is *which bytes land where* (a paged-block gather into contiguous
-chunk order), never the bit pattern — so the round-trip is byte-identical and the
-AITER kernel reads back its native layout. LMCache only ever sees a `uint8` array
-keyed per chunk; it needs to know nothing about `x`, heads, or paging.
-
-**Three terms that make the rest precise:**
-
-- **segment** — one movable per-layer KV tensor. The codec enumerates, for every
-  layer, up to four: `k_cache`, `v_cache`, and (fp8) `k_scale`, `v_scale`. Flattened
-  across all layers this is one ordered list — an N-layer fp8 model has `4N`
-  segments (`2N` for bf16). The codec is deliberately agnostic to which kind a
-  segment is; it only requires a `[num_blocks, …]` tensor whose per-block slice is
-  contiguous. `seg_block_bytes = segment[0].numel() × elem_size`.
-- **block** — one slot on a segment's dim 0: `segment[block_id]`, a contiguous byte
-  run. `bytes_per_block` = Σ `seg_block_bytes` over all segments (one block across
-  every layer/tensor).
-- **MemoryObj** — LMCache's storage unit for one chunk. Here it is **not** a typed
-  KV tensor but a flat, contiguous `uint8` blob of `nblocks × bytes_per_block`
-  bytes (`nblocks = chunk_size / block_size`). The honest `MemoryFormat` for raw
-  bytes would be `BINARY`, but LMCache's LocalCPU allocator rejects `BINARY` for a
-  normal MemoryObj allocation. So we set `engine.fmt = KV_2LTD` — any format the
-  allocator *accepts* — purely to pass that check; the value is otherwise inert,
-  because `ATOMRawBytesLMCacheMetadata` already overrides `get_shapes`/`get_dtypes`
-  to force a flat `uint8` of exactly this size. The buffer you get is the opaque
-  blob we want regardless of `fmt`. Internally it is **segment-major, then
-  block-major**:
-
-  ```
-  one MemoryObj  (= 1 chunk = nblocks blocks):
-    [ L0.K : blk0 blk1 … blk_{n-1} ]   each blk = seg_block_bytes, raw AITER bytes
-    [ L0.V : blk0 … blk_{n-1} ]
-    [ L0.kS: blk0 … blk_{n-1} ]        (fp8 only)
-    [ L0.vS: blk0 … blk_{n-1} ]        (fp8 only)
-    [ L1.K : … ] …                     segments in codec order, all layers
-  ```
-
-  e.g. the chunk2 run: `block=32`, `chunk=256` → `nblocks=8`,
-  `bytes_per_block=2,095,104` → one MemoryObj = `8 × 2,095,104 = 16,760,832` bytes.
-
-- **Construction** — from the registered `{layer: KVCacheTensor}`, it flattens
-  every movable per-layer tensor into one ordered **segment** list: `k_cache`,
-  `v_cache`, and (fp8) `k_scale`, `v_scale`. Each segment is `[num_blocks, …]`, so
-  `segment[block_id]` is a contiguous block slice. `bytes_per_block` is the sum of
-  one block's bytes across all segments.
-- **What it moves** — `gpu_to_chunk_major_device_buffer` (gather) and
-  `chunk_major_device_buffer_to_gpu` (scatter) move scattered GPU blocks ↔ a
-  chunk-major `uint8` staging buffer. The buffer layout is MemoryObj-compatible:
-  `[chunk0: seg0 blocks | seg1 blocks | …][chunk1: …]`.
-- **Why it's correct** — bytes are never reinterpreted, so the round-trip is
-  bit-identical and the attention kernel reads back its own layout. Validates
-  block-id range, rejects duplicate blocks, requires a `uint8` device buffer.
-- **Hard dependency** — both directions require the Triton fused staging kernel;
-  there is no slow Python fallback on the production path.
-
-### `triton_kv_staging.py` — fused chunk-major pack/unpack
-
-The fast path the codec stands on. Two JIT kernels (`_pack_chunk_major_kernel`,
-`_unpack_chunk_major_kernel`) move every `(chunk, segment)` tile in **one launch**
-instead of thousands of per-block copies.
-
-- **Grid** — `(num_chunks × num_segments, ceil(max_tile_bytes / 1024))`: one
-  program per `(chunk, segment)` per 1 KiB tile.
-- **Gather/scatter** — each program resolves `block_ids[block_offset + local_block]`
-  to a physical block, then byte-copies through `uint8` pointers. Operating on raw
-  bytes side-steps ROCm's fp8 indexed-copy kernels entirely.
-- **`_build_meta`** — precomputes segment base pointers, per-segment prefix bytes,
-  and per-chunk block/byte offsets as device int64 tensors, so the kernel does
-  pure address arithmetic. Also validates `device_buf` size and `block_ids` length.
-
-### `atom_lmcache_gpu_connector.py` — the LMCache `GPUConnectorInterface`
-
-The adapter LMCache's `engine.store()` / `engine.retrieve()` actually call. It
-turns LMCache's *token ranges* into ATOM *block ranges* and drives bounded staging.
-
-- **Range → blocks** — `_range_block_ids` maps a chunk's `[start, end)` tokens to
-  `block_ids[start//bs : ceil(end/bs)]`, enforcing block-aligned starts.
-- **Bounded, pipelined staging** — `_iter_transfer_groups` packs chunks into
-  groups capped by `OFFLOAD_GPU_STAGING_CHUNKS`; `_run_staged_pipeline` runs each
-  group through a two-stage, event-synced pipeline (pack stream ↔ copy stream) so
-  packing the next group overlaps copying the current one.
-- **save vs load** — `batched_from_gpu` = pack(Triton) → copy-to-MemoryObj;
-  `batched_to_gpu` = copy-from-MemoryObj → unpack(Triton). State is thread-local,
-  so the load and save executors own **separate** staging buffers (see the HBM
-  formula under [Save / Load Data Flow](#save--load-data-flow)).
-- **Observability** — keeps per-transfer stats (bytes, groups, pack/copy/sync ms,
-  effective GiB/s) surfaced by the connector's `OFFLOAD_PROFILE` logging.
-
-### `atom_lmcache_staging.py` — staging primitives
-
-Small but load-bearing. `_ThreadTransferState` lazily creates, per thread, the two
-CUDA streams (`pack_stream`, `copy_stream`) and a `_StagingBuffer` holding the
-device tensor plus `ready`/`free` CUDA events that gate the pipeline hand-off.
-Also the `_env_flag/_env_int/_env_optional_int` helpers that parse the `OFFLOAD_*`
-knobs. This per-thread isolation is exactly why load and save never contend.
-
-### `config.py` & `metadata.py` — wiring and descriptors
-
-- **`config.py`** — `build_lmcache_config()` reads `LMCACHE_*` env, forces
-  `use_gds=False` (cufile hangs without NVMe-GDS hardware), and sets
-  `lookup_server_worker_ids=[0]` so rank 0 is the authoritative lookup answerer at
-  TP>1. `build_lmcache_metadata()` fills `kv_shape` from `hf_config` and pins a
-  shared `engine_id` so the scheduler's lookup client and the workers' lookup
-  servers derive the **same** ZMQ socket path.
-- **`metadata.py`** — `ATOMRawBytesLMCacheMetadata` overrides LMCache's allocation
-  to hand out opaque `uint8` MemoryObjs (`get_shapes` returns
-  `nblocks × bytes_per_block`) and asserts `chunk_size % block_size == 0`. The
-  dataclasses `LoadSpec` / `SaveSpec` / `LMCacheReqMeta` / `LMCacheOffloadMetadata`
-  are the per-request descriptors that travel scheduler → worker each step.
-
-## Relationship to LMCache: reuse vs. override
-
-This connector is **thin** — it reuses LMCache's storage engine wholesale and
-overrides only the two seams where ATOM's KV layout is incompatible. We did **not**
-fork LMCache. The single integration point is
-`LMCacheEngineBuilder.get_or_create(id, config, metadata, gpu_connector, …)`: we
-pass our own `metadata` and `gpu_connector` and otherwise let LMCache run.
-
-### 1. Reused as-is (not reimplemented)
-
-| LMCache module / class | How we use it | Where |
-|---|---|---|
-| `lmcache.v1.config.LMCacheEngineConfig` | `from_env()` builds config from `LMCACHE_*` | `config.py:23` |
-| `lmcache.v1.metadata.LMCacheMetadata` | base metadata (then wrapped, see below) | `config.py:83` |
-| `lmcache.v1.cache_engine.LMCacheEngineBuilder` | `get_or_create()` builds the engine; we call `engine.store()` / `engine.retrieve()` / `engine.lookup_unpin()` / `post_init()` | `connector.py:126,259,326,197,138` |
-| `lmcache.v1.memory_management.MemoryFormat` | `KV_2LTD` fed to `engine.fmt` (allocator check) | `connector.py:137` |
-| `lmcache.v1.lookup_client.factory.LookupClientFactory` | `create_lookup_server()` (worker) / `create_lookup_client()` (scheduler); client `.lookup()` / `.clear_lookup_status()` | `connector.py:144,454,467,503` |
-
-**Core idea:** LMCache is used as a *storage-orchestration engine*. Chunking, key
-generation, lookup pins, CPU/NVMe put/get, and eviction are all left to it — one
-`engine.store()` in, one `engine.retrieve()` out.
-
-### 2. What we override / hook (the parts we had to write)
-
-These are the only places we diverge from stock LMCache. **If you port to a new
-LMCache version, these are what to re-check.**
-
-| Ours | Replaces (LMCache default) | Why it must change | How it's wired / what changed |
-|---|---|---|---|
-| **`ATOMLMCacheGPUConnector`** | LMCache's stock vLLM `GPUConnectorInterface` (the GPU↔MemoryObj mover) | The stock connectors only emit **token-major** KV (`KV_2LTD` etc.) via `normalize_kv_and_discover_format`, which rejects ATOM's x-packed head-major AITER layout | Passed as the `gpu_connector` arg to `get_or_create` (`connector.py:120,126`). LMCache's engine calls our `batched_from_gpu` / `batched_to_gpu` instead of its own. **This is the main hook.** |
-| **`ATOMRawBytesLMCacheMetadata`** | `LMCacheMetadata`'s allocation shape/dtype | MemoryObjs must be allocated as **opaque `uint8` blobs** (`nblocks × bytes_per_block`), not typed KV tensors | Wraps the base metadata and overrides `get_shapes()` / `get_dtypes()` / `get_num_groups()`; passed as `meta` to `get_or_create` (`metadata.py`, `connector.py:115`) |
-| **`ATOMKVByteCodec`** | *(nothing — new component)* | LMCache has no concept of AITER's paged x-packed byte layout | Owned by `ATOMLMCacheGPUConnector`; does the actual block-byte gather/scatter via Triton |
-| `engine.fmt = KV_2LTD` + `post_init()` | the format LMCache would pick for allocation | `BINARY` (the honest format for raw bytes) is **rejected** by the LocalCPU allocator; we set an *accepted* format only to pass that check — the real shape is forced by our metadata, so the value is otherwise inert | `connector.py:137-138` |
-| `get_or_create(…, lambda t,s: None, lambda o,s: o)` | LMCache's trailing token-processing / output-transform callbacks | We don't use LMCache's token-shaping hooks — our codec moves raw bytes | Passed as no-op / identity callables (`connector.py:131-132`) |
-| `cfg.lookup_server_worker_ids = [0]` | default: every rank answers lookup, client takes `min()` | At TP>1 a non-rank-0 shard returning 0 would zero out a real hit; rank 0 is made authoritative | `config.py` (see [TP > 1 Notes](#tp--1-notes)) |
-| `cfg.use_gds = False` | LMCache may enable cufile GDS | cufile init hangs without NVMe-GDS hardware here | `config.py` |
-
-### 3. Fully delegated to LMCache (we never touch the implementation)
-
-Driven only indirectly through `engine.store()` / `engine.retrieve()`:
-
-- **StorageManager** — CPU (L2) / NVMe (L3) put/get and capacity management
-- **ChunkedTokenDatabase** — token → 256-token chunk key generation / hashing
-- **LocalCPUBackend / LocalDiskBackend** — the two storage tiers
-- **lookup pins + ZMQ LookupServer/Client transport** — cross-process hit query (we call only the factory and client methods, never the implementation)
-- **eviction** — the cache replacement policy
 
 ## Architecture
 
@@ -312,6 +124,30 @@ Runs in each TP-rank worker. It does the actual byte movement.
   and the scheduler recomputes.
 - **`get_finished()`** — polled post-forward; returns completion sets that the
   scheduler turns into wakes (see protocol below).
+
+## Request Lifecycle
+
+Following one request end to end ties the pieces together:
+
+1. **Lookup.** A new request arrives; the scheduler's
+   `get_num_new_matched_tokens` asks the rank-0 `LookupServer` over ZMQ how many
+   prompt tokens LMCache holds. If that hit exceeds the HBM prefix cache, it
+   records a `LoadSpec` and **parks** the sequence in `WAITING_FOR_REMOTE_KVS`.
+2. **Decide.** After blocks are allocated, `_decide_load_after_alloc` re-checks the
+   *real* HBM floor and chooses load vs. recompute (see
+   [When Does a Reload Actually Happen?](#when-does-a-reload-actually-happen)).
+3. **Enqueue.** `build_connector_meta` emits an `LMCacheReqMeta`; the worker's
+   `start_load_kv` submits the load to the load daemon and returns — the RPC
+   thread stays free to run `forward`.
+4. **Move.** The daemon runs `engine.retrieve`, which drives
+   `ATOMLMCacheGPUConnector`: MemoryObj → staging buffer → HBM blocks (Triton
+   unpack), bit-identical.
+5. **Wake.** Post-forward, `get_finished` returns `finished_recving` (success) or
+   `failed_recving` (recompute). The scheduler wakes the seq, which prefills only
+   the still-uncached **suffix**.
+6. **Save.** As prefill computes new chunks, the scheduler emits saves; the save
+   daemon stores them fire-and-forget to CPU/NVMe. Blocks whose free was deferred
+   are released on `finished_saving`.
 
 ## Completion Protocol
 
@@ -497,6 +333,193 @@ corrupt write:
   returning 0 made the scheduler always recompute.
 - **Load is all-or-nothing.** If any rank's shard is missing, `_do_load_req`
   reports `failed_recving` and the scheduler recomputes — no half-loaded state.
+
+## Key Modules in Depth
+
+`connector.py` (the scheduler/worker orchestration) is covered under
+[Architecture](#architecture). The rest of this section details the
+**byte-movement stack** — the part that makes ATOM's KV layout work with LMCache —
+and the two support files.
+
+### `atom_kv_byte_codec.py` — the layout bridge
+
+This is the keystone. The two sides store KV in incompatible layouts:
+
+**What LMCache expects — token-major.** Its GPU connectors only accept the clean
+NHD/HND family (`KV_2LTD` etc.), i.e. KV indexed roughly as
+`[layer, k/v, token, head, head_dim]`, contiguous in `head_dim` then token.
+`normalize_kv_and_discover_format` rejects anything else.
+
+**What AITER actually stores — x-packed, head-major, paged.** Per layer
+(`bs` = block size, `H` = local KV heads, `D` = head dim, `x = 16 // elem_bytes`,
+so `x=16` for fp8 / `x=8` for bf16):
+
+| Tensor | Shape | Notes |
+|--------|-------|-------|
+| `k_cache` | `(num_blocks, H, D//x, bs, x)` | head-major; `D` split into `D//x` outer × `x` inner, with `bs` between → not token-contiguous |
+| `v_cache` | `(num_blocks, H, …, bs, …)` | strided, head-major (exact split is model-dependent) |
+| `k_scale`, `v_scale` (fp8) | `(num_blocks, H, bs)` | one fp32 scale per (head, token) in a block |
+
+This is a **persistent HBM storage layout** (not the transient LDS bank "swizzle"),
+and is specific to this ATOM AITER path — stock vLLM's `rocm_aiter_fa` uses the
+clean token-major `(2,nb,bs,H,D)` that LMCache handles natively.
+
+**How the bridge works — gather/scatter of opaque bytes, no transcode.** The codec
+never reinterprets values. A whole *block* of any of those tensors
+(`tensor[block_id]`) is contiguous in memory, so one block's KV is just a set of
+contiguous byte slices (per layer: K, V, and fp8 scales). The codec gathers the
+blocks of an LMCache chunk into a **chunk-major `uint8`** buffer —
+`[chunk: seg0 blocks | seg1 blocks | …]` — which LMCache stores as an opaque blob;
+on reload it scatters the exact bytes back to the exact block slots. The only
+transformation is *which bytes land where* (a paged-block gather into contiguous
+chunk order), never the bit pattern — so the round-trip is byte-identical and the
+AITER kernel reads back its native layout. LMCache only ever sees a `uint8` array
+keyed per chunk; it needs to know nothing about `x`, heads, or paging.
+
+**Three terms that make the rest precise:**
+
+- **segment** — one movable per-layer KV tensor. The codec enumerates, for every
+  layer, up to four: `k_cache`, `v_cache`, and (fp8) `k_scale`, `v_scale`. Flattened
+  across all layers this is one ordered list — an N-layer fp8 model has `4N`
+  segments (`2N` for bf16). The codec is deliberately agnostic to which kind a
+  segment is; it only requires a `[num_blocks, …]` tensor whose per-block slice is
+  contiguous. `seg_block_bytes = segment[0].numel() × elem_size`.
+- **block** — one slot on a segment's dim 0: `segment[block_id]`, a contiguous byte
+  run. `bytes_per_block` = Σ `seg_block_bytes` over all segments (one block across
+  every layer/tensor).
+- **MemoryObj** — LMCache's storage unit for one chunk. Here it is **not** a typed
+  KV tensor but a flat, contiguous `uint8` blob of `nblocks × bytes_per_block`
+  bytes (`nblocks = chunk_size / block_size`). The honest `MemoryFormat` for raw
+  bytes would be `BINARY`, but LMCache's LocalCPU allocator rejects `BINARY` for a
+  normal MemoryObj allocation. So we set `engine.fmt = KV_2LTD` — any format the
+  allocator *accepts* — purely to pass that check; the value is otherwise inert,
+  because `ATOMRawBytesLMCacheMetadata` already overrides `get_shapes`/`get_dtypes`
+  to force a flat `uint8` of exactly this size. The buffer you get is the opaque
+  blob we want regardless of `fmt`. Internally it is **segment-major, then
+  block-major**:
+
+  ```
+  one MemoryObj  (= 1 chunk = nblocks blocks):
+    [ L0.K : blk0 blk1 … blk_{n-1} ]   each blk = seg_block_bytes, raw AITER bytes
+    [ L0.V : blk0 … blk_{n-1} ]
+    [ L0.kS: blk0 … blk_{n-1} ]        (fp8 only)
+    [ L0.vS: blk0 … blk_{n-1} ]        (fp8 only)
+    [ L1.K : … ] …                     segments in codec order, all layers
+  ```
+
+  e.g. the chunk2 run: `block=32`, `chunk=256` → `nblocks=8`,
+  `bytes_per_block=2,095,104` → one MemoryObj = `8 × 2,095,104 = 16,760,832` bytes.
+
+**API & guarantees.** The two entry points are
+`gpu_to_chunk_major_device_buffer` (gather) and `chunk_major_device_buffer_to_gpu`
+(scatter), both moving scattered GPU blocks ↔ the chunk-major `uint8` staging
+buffer described above; the segment list is built once at construction from the
+registered `{layer: KVCacheTensor}`. The codec validates the block-id range,
+rejects duplicate blocks, and requires a `uint8` device buffer. Both directions
+**require** the Triton fused staging kernel — there is no slow Python fallback on
+the production path.
+
+### `triton_kv_staging.py` — fused chunk-major pack/unpack
+
+The fast path the codec stands on. Two JIT kernels (`_pack_chunk_major_kernel`,
+`_unpack_chunk_major_kernel`) move every `(chunk, segment)` tile in **one launch**
+instead of thousands of per-block copies.
+
+- **Grid** — `(num_chunks × num_segments, ceil(max_tile_bytes / 1024))`: one
+  program per `(chunk, segment)` per 1 KiB tile.
+- **Gather/scatter** — each program resolves `block_ids[block_offset + local_block]`
+  to a physical block, then byte-copies through `uint8` pointers. Operating on raw
+  bytes side-steps ROCm's fp8 indexed-copy kernels entirely.
+- **`_build_meta`** — precomputes segment base pointers, per-segment prefix bytes,
+  and per-chunk block/byte offsets as device int64 tensors, so the kernel does
+  pure address arithmetic. Also validates `device_buf` size and `block_ids` length.
+
+### `atom_lmcache_gpu_connector.py` — the LMCache `GPUConnectorInterface`
+
+The adapter LMCache's `engine.store()` / `engine.retrieve()` actually call. It
+turns LMCache's *token ranges* into ATOM *block ranges* and drives bounded staging.
+
+- **Range → blocks** — `_range_block_ids` maps a chunk's `[start, end)` tokens to
+  `block_ids[start//bs : ceil(end/bs)]`, enforcing block-aligned starts.
+- **Bounded, pipelined staging** — `_iter_transfer_groups` packs chunks into
+  groups capped by `OFFLOAD_GPU_STAGING_CHUNKS`; `_run_staged_pipeline` runs each
+  group through a two-stage, event-synced pipeline (pack stream ↔ copy stream) so
+  packing the next group overlaps copying the current one.
+- **save vs load** — `batched_from_gpu` = pack(Triton) → copy-to-MemoryObj;
+  `batched_to_gpu` = copy-from-MemoryObj → unpack(Triton). State is thread-local,
+  so the load and save executors own **separate** staging buffers (see the HBM
+  formula under [Save / Load Data Flow](#save--load-data-flow)).
+- **Observability** — keeps per-transfer stats (bytes, groups, pack/copy/sync ms,
+  effective GiB/s) surfaced by the connector's `OFFLOAD_PROFILE` logging.
+
+### `atom_lmcache_staging.py` — staging primitives
+
+Small but load-bearing. `_ThreadTransferState` lazily creates, per thread, the two
+CUDA streams (`pack_stream`, `copy_stream`) and a `_StagingBuffer` holding the
+device tensor plus `ready`/`free` CUDA events that gate the pipeline hand-off.
+Also the `_env_flag/_env_int/_env_optional_int` helpers that parse the `OFFLOAD_*`
+knobs. This per-thread isolation is exactly why load and save never contend.
+
+### `config.py` & `metadata.py` — wiring and descriptors
+
+- **`config.py`** — `build_lmcache_config()` reads `LMCACHE_*` env, forces
+  `use_gds=False` (cufile hangs without NVMe-GDS hardware), and sets
+  `lookup_server_worker_ids=[0]` so rank 0 is the authoritative lookup answerer at
+  TP>1. `build_lmcache_metadata()` fills `kv_shape` from `hf_config` and pins a
+  shared `engine_id` so the scheduler's lookup client and the workers' lookup
+  servers derive the **same** ZMQ socket path.
+- **`metadata.py`** — `ATOMRawBytesLMCacheMetadata` overrides LMCache's allocation
+  to hand out opaque `uint8` MemoryObjs (`get_shapes` returns
+  `nblocks × bytes_per_block`) and asserts `chunk_size % block_size == 0`. The
+  dataclasses `LoadSpec` / `SaveSpec` / `LMCacheReqMeta` / `LMCacheOffloadMetadata`
+  are the per-request descriptors that travel scheduler → worker each step.
+
+## Relationship to LMCache: reuse vs. override
+
+This connector is **thin** — it reuses LMCache's storage engine wholesale and
+overrides only the two seams where ATOM's KV layout is incompatible. We did **not**
+fork LMCache. The single integration point is
+`LMCacheEngineBuilder.get_or_create(id, config, metadata, gpu_connector, …)`: we
+pass our own `metadata` and `gpu_connector` and otherwise let LMCache run.
+
+### 1. Reused as-is (not reimplemented)
+
+| LMCache module / class | How we use it |
+|---|---|
+| `lmcache.v1.config.LMCacheEngineConfig` | `from_env()` builds config from `LMCACHE_*` (`config.py`) |
+| `lmcache.v1.metadata.LMCacheMetadata` | base metadata, then wrapped (see below) |
+| `lmcache.v1.cache_engine.LMCacheEngineBuilder` | `get_or_create()` builds the engine; we call `engine.store()` / `engine.retrieve()` / `engine.lookup_unpin()` / `post_init()` |
+| `lmcache.v1.memory_management.MemoryFormat` | `KV_2LTD` fed to `engine.fmt` (allocator check) |
+| `lmcache.v1.lookup_client.factory.LookupClientFactory` | `create_lookup_server()` (worker) / `create_lookup_client()` (scheduler); client `.lookup()` / `.clear_lookup_status()` |
+
+**Core idea:** LMCache is used as a *storage-orchestration engine*. Chunking, key
+generation, lookup pins, CPU/NVMe put/get, and eviction are all left to it — one
+`engine.store()` in, one `engine.retrieve()` out.
+
+### 2. What we override / hook (the parts we had to write)
+
+These are the only places we diverge from stock LMCache. **If you port to a new
+LMCache version, these are what to re-check.**
+
+| Ours | Replaces (LMCache default) | Why it must change | How it's wired / what changed |
+|---|---|---|---|
+| **`ATOMLMCacheGPUConnector`** | LMCache's stock vLLM `GPUConnectorInterface` (the GPU↔MemoryObj mover) | The stock connectors only emit **token-major** KV (`KV_2LTD` etc.) via `normalize_kv_and_discover_format`, which rejects ATOM's x-packed head-major AITER layout | Passed as the `gpu_connector` arg to `get_or_create`. LMCache's engine calls our `batched_from_gpu` / `batched_to_gpu` instead of its own. **This is the main hook.** |
+| **`ATOMRawBytesLMCacheMetadata`** | `LMCacheMetadata`'s allocation shape/dtype | MemoryObjs must be allocated as **opaque `uint8` blobs** (`nblocks × bytes_per_block`), not typed KV tensors | Wraps the base metadata and overrides `get_shapes()` / `get_dtypes()` / `get_num_groups()`; passed as `meta` to `get_or_create` |
+| **`ATOMKVByteCodec`** | *(nothing — new component)* | LMCache has no concept of AITER's paged x-packed byte layout | Owned by `ATOMLMCacheGPUConnector`; does the actual block-byte gather/scatter via Triton |
+| `engine.fmt = KV_2LTD` + `post_init()` | the format LMCache would pick for allocation | `BINARY` (the honest format for raw bytes) is **rejected** by the LocalCPU allocator; we set an *accepted* format only to pass that check — the real shape is forced by our metadata, so the value is otherwise inert | `connector.py` `register_kv_caches` |
+| `get_or_create(…, lambda t,s: None, lambda o,s: o)` | LMCache's trailing token-processing / output-transform callbacks | We don't use LMCache's token-shaping hooks — our codec moves raw bytes | Passed as no-op / identity callables |
+| `cfg.lookup_server_worker_ids = [0]` | default: every rank answers lookup, client takes `min()` | At TP>1 a non-rank-0 shard returning 0 would zero out a real hit; rank 0 is made authoritative | `config.py` (see [TP > 1 Notes](#tp--1-notes)) |
+| `cfg.use_gds = False` | LMCache may enable cufile GDS | cufile init hangs without NVMe-GDS hardware here | `config.py` |
+
+### 3. Fully delegated to LMCache (we never touch the implementation)
+
+Driven only indirectly through `engine.store()` / `engine.retrieve()`:
+
+- **StorageManager** — CPU (L2) / NVMe (L3) put/get and capacity management
+- **ChunkedTokenDatabase** — token → 256-token chunk key generation / hashing
+- **LocalCPUBackend / LocalDiskBackend** — the two storage tiers
+- **lookup pins + ZMQ LookupServer/Client transport** — cross-process hit query (we call only the factory and client methods, never the implementation)
+- **eviction** — the cache replacement policy
 
 ## Configuration
 
@@ -702,6 +725,23 @@ python3 multi-round-qa.py \
 - **GDS / NVMe-direct is disabled.** `config.py` forces `use_gds=False` (cufile
   init hangs without NVMe-GDS hardware here); the NVMe tier goes through LMCache's
   host path.
+
+## Glossary
+
+| Term | Meaning |
+|------|---------|
+| **HBM prefix cache (L1)** | ATOM's native on-GPU KV reuse. `num_cached_tokens` = how many prompt tokens it already holds for a request. |
+| **HBM-cached (`hbm`)** | Tokens resident in the HBM prefix cache for this request — the floor a load must never go below. |
+| **lookup hit / lmcache-cached (`lmc`)** | Tokens LMCache holds in CPU/NVMe for this request's prefix, reported by the lookup. |
+| **chunk** | LMCache's storage + key granularity (256 tokens). One MemoryObj per chunk. |
+| **block** | ATOM's KV paging unit (`--block-size` tokens). `chunk = chunk_size / block_size` blocks. |
+| **segment** | One movable per-layer KV tensor (`k_cache`/`v_cache`/`k_scale`/`v_scale`). See the codec. |
+| **shard** | One TP rank's slice of a layer's KV. Loads are all-or-nothing across shards. |
+| **park** | Suspend a sequence in `WAITING_FOR_REMOTE_KVS` until its load completes. |
+| **suffix prefill / offload-wake** | Resuming a parked seq to prefill only the still-uncached suffix (vs the P/D decode-jump). |
+| **P/D** | Prefill/Decode disaggregation — the sibling connector this module shares base/factory/types with. |
+| **RPC thread** | The worker thread that runs per-step engine calls; must stay free for `forward`, so copies run on daemons. |
+| **completion sets** | `finished_recving` / `failed_recving` / `finished_saving`, returned by `get_finished()` and turned into wakes. |
 
 ## See Also
 
