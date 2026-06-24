@@ -780,7 +780,7 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
 class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
     """vLLM-only dense MLA metadata builder."""
 
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
     query_len_support = QueryLenSupport.UNIFORM
 
