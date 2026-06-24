@@ -18,7 +18,6 @@ from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
-    get_forward_context,
 )
 from atom.utils.tbo import TokenSplitPrefillState
 
