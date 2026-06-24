@@ -2,16 +2,8 @@
 
 This recipe shows how to run `deepseek-ai/DeepSeek-V4-Flash` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
-## Step 1: Pull the OOT Docker & install ATOM branch hexwang/enable_dsv4
 
-```bash
-docker pull rocm/atom-dev:vllm-latest
-cd /app/ATOM
-git fetch origin hexwang/enable_dsv4
-git checkout hexwang/enable_dsv4
-```
-
-## Step 2: Launch vLLM Server
+## Step 1: Launch vLLM Server
 
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
@@ -44,7 +36,7 @@ Notes:
 - The command above serves on port `8001`; update the accuracy command below if you change the port.
 - The profiler writes torch traces to `./vllm_profile`. Remove `--profiler-config` if profiling is not needed.
 
-## Step 3: Performance Benchmark
+## Step 2: Performance Benchmark
 
 Users can use the default vLLM bench command for performance benchmarking.
 
@@ -68,7 +60,7 @@ vllm bench serve \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 
-## Step 4: Accuracy Validation
+## Step 3: Accuracy Validation
 
 The accuracy can be verified on the GSM8K dataset with `lm_eval`:
 
