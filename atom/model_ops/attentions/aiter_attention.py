@@ -343,57 +343,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "reduce_partial_map": reduce_partial_map,
         }
 
-    def prepare_mtp_decode(
-        self,
-        bs: int,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
-        positions: torch.Tensor,
-        only_update: bool = False,
-        num_reject_tokens: torch.Tensor = None,
-    ):
-        """Per-draft-step metadata for a block-paged MHA Eagle3 draft.
-
-        Called by EagleProposer.propose at mid-step iters. The draft's decode
-        kernels (``paged_attention_{asm,triton}``) read ``block_tables`` +
-        ``context_lens``, both already bumped for this step by eagle (writing
-        in place into ``forward_vars``). The block_size==1024 persistent path
-        is the only one consuming ``kv_indptr``/``kv_indices``; MiniMax-M3 runs
-        at ``--block-size 128`` so the kernel never reads them — no rebuild.
-
-        The one value we must (re)compute is the write slot for the new draft
-        token in the draft's own block-paged KV cache:
-
-            slot = block_tables[seq, (ctx-1)//B] * B + (ctx-1) % B,   B = block_size
-
-        Returned under ``slot_mapping`` so EagleProposer skips its token-granular
-        (MLA physical block_size==1) flat-kv slot derivation, which would yield
-        a bare block id for ``B > 1``.
-
-        ``only_update`` / ``num_reject_tokens`` are MLA/V4-specific knobs and are
-        unused here: ``context_lens`` is already correct and there are no
-        persistent worker buffers to roll over for ``block_size != 1024``.
-        """
-        var = self.model_runner.forward_vars
-        slot_mapping = var["slot_mapping"].gpu[:bs]
-        # Warmup/dummy runs before KV allocation: the draft attention is skipped
-        # (PagedAttentionImpl's is_dummy_run guard), so slot_mapping is unused.
-        # The dummy batch's context_lens is the full prefill length, which eagle
-        # bumps by +1 to max_model_len+1 — its derived block column overruns the
-        # block_tables width and would OOB the gather below. No-op during dummy
-        # runs, matching deepseek_v4_attn.prepare_mtp_decode.
-        if get_forward_context().context.is_dummy_run:
-            return {"slot_mapping": slot_mapping}
-        block_size = self.model_runner.block_size
-        ctx = var["context_lens"].gpu[:bs]  # int32, already +1 for this step
-        block_tables = var["block_tables"].gpu[:bs]  # [bs, max_blocks] int32
-        last_pos = (ctx - 1).clamp_min(0).long()
-        block_col = last_pos // block_size
-        within = last_pos - block_col * block_size
-        phys_block = torch.gather(block_tables, 1, block_col.unsqueeze(1)).squeeze(1)
-        slot = phys_block.long() * block_size + within
-        slot_mapping.copy_(slot.to(slot_mapping.dtype))
-        return {"slot_mapping": slot_mapping}
 
     def compute_block_bytes(self) -> int:
         """Standard split-K/V MHA per-block bytes.
