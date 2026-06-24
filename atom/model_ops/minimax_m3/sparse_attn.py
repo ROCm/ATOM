@@ -12,6 +12,7 @@ and split-K decode with a separate merge step.
 
 from dataclasses import dataclass
 
+import aiter  # noqa: F401  (used by the gluon PA runners for aiter.dtypes.fp8)
 import torch
 
 try:
@@ -1091,3 +1092,299 @@ def minimax_m3_build_sparse_block_table_prefill(
         BLOCK_SIZE_T=triton.next_power_of_2(topk),
     )
     return sparse_bt, sparse_ctx
+
+
+# ---------------------------------------------------------------------------
+# Gluon paged-attention runners over the page-16 SHUFFLE KV cache (fp8|bf16).
+# decode + prefill (per-token-as-decode); fp8 selected by the cache dtype.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def minimax_m3_sparse_attn_decode_asm(
+    q: torch.Tensor,  # [batch, num_heads, head_dim==128]
+    k_cache: torch.Tensor,  # SHUFFLE K [num_blocks, num_kv_heads, head_dim//x, 16, x]
+    v_cache: torch.Tensor,  # SHUFFLE V [num_blocks, num_kv_heads, 16//x, head_dim, x]
+    topk_idx: torch.Tensor,  # [num_kv_heads, batch, topk] int32
+    block_table: torch.Tensor,  # [batch, max_blocks] int32, logical 128-granularity
+    seq_lens: torch.Tensor,  # [batch] int32
+    num_kv_heads: int,
+    sm_scale: float,
+    output: torch.Tensor,  # [batch, num_heads, head_dim]
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
+    sparse_ctx: torch.Tensor | None = None,
+) -> None:
+    """Block-sparse decode attention via the AITER Gluon paged-attention kernel.
+
+    The lightning-indexer's selected logical 128-blocks are compacted into a
+    dense PHYSICAL 16-page block_table (each 128-block -> 8 pages, tail packed
+    last) + exact context_lens, then fed to the Gluon split-KV paged-attention
+    decode kernel (``pa_decode_gluon``) over the page-16 SHUFFLE KV cache. The
+    split-KV (flash-decoding) implementation is more efficient than the monolithic
+    ASM kernel at low concurrency (few decode sequences), where it parallelizes
+    over KV partitions to keep the GPU busy.
+
+    If ``sparse_bt`` / ``sparse_ctx`` are provided (built fused inside the topk
+    merge kernel), the standalone compaction launch is skipped.
+
+    Requires per-rank num_kv_heads == 1 (the indexer top-k is per-kv-head; one
+    shared block_table cannot express per-kv-head selection) and head_dim == 128.
+    """
+    from atom.model_ops.base_attention import run_pa_decode_gluon
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    assert q.shape[-1] == 128, "Gluon paged-attention requires head_dim == 128."
+
+    if sparse_bt is None or sparse_ctx is None:
+        # Standalone (non-fused) build is num_kv_heads==1 only; the fused topk emit
+        # is what produces the kv-head-collapsed sparse_bt/ctx for num_kv_heads>1.
+        assert num_kv_heads == 1, (
+            "minimax_m3_sparse_attn_decode_asm with num_kv_heads>1 requires the "
+            "kv-head-encoded sparse_bt/sparse_ctx from the fused topk emit."
+        )
+        sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table(
+            topk_idx, block_table, seq_lens
+        )
+
+    # Collapse (token, kv_head) into the row dim so gluon runs with an effective
+    # num_kv_heads_view == 1. ZERO data copy: q/cache/output/scale are views, and
+    # sparse_bt already encodes the kv-head in its page ids (page = phys16*Hkv+kvh,
+    # matching the collapsed cache view [num_phys16*Hkv, 1, ...]).
+    #   q:    [T, Hq, 128]               -> [T*Hkv, g, 128]   (g = Hq // Hkv)
+    #   kv:   [num_phys16, Hkv, ...]      -> [num_phys16*Hkv, 1, ...]
+    #   out:  [T, Hq, 128]               -> [T*Hkv, g, 128]
+    # Hkv == 1 is the identity (no shape change).
+    assert q.is_contiguous(), "decode_asm requires contiguous q for the kv-head view"
+    T, num_q_heads_total, head_size = q.shape
+    g = num_q_heads_total // num_kv_heads
+    q_view = q.view(T * num_kv_heads, g, head_size)
+    out_view = output.view(T * num_kv_heads, g, head_size)
+    # .view (not .reshape): the SHUFFLE cache slices are contiguous, so collapsing
+    # (num_phys16, Hkv) -> num_phys16*Hkv is guaranteed zero-copy; a copy here would
+    # silently break the page-id encoding alignment.
+    nph16, _hkv = k_cache.shape[0], k_cache.shape[1]
+    k_cache_view = k_cache.view(nph16 * _hkv, 1, *k_cache.shape[2:])
+    v_cache_view = v_cache.view(nph16 * _hkv, 1, *v_cache.shape[2:])
+
+    num_seqs = T * num_kv_heads
+    num_kv_heads_view = 1
+    query_group_size = g
+    max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
+    context_partition_size = 256
+    intermediate_shape = (
+        num_seqs,
+        num_kv_heads_view,
+        max_context_partition_num,
+        query_group_size,
+    )
+    exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+    max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+    temporary_output = torch.empty(
+        *intermediate_shape, head_size, dtype=q.dtype, device=q.device
+    )
+    # fp8 KV cache -> fp8 compute_type + per-token scales; bf16 otherwise. The scale
+    # tensor [num_phys16, Hkv, pbs] collapses the same way as the cache.
+    is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
+    compute_type = aiter.dtypes.fp8 if is_fp8 else torch.bfloat16
+    if is_fp8 and k_scale is not None:
+        # [num_phys16, Hkv, pbs] -> [num_phys16*Hkv, 1, pbs, 1], matching the cache.
+        pbs = k_scale.shape[-1]
+        gluon_k_scale = k_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
+        gluon_v_scale = v_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
+    else:
+        gluon_k_scale = gluon_v_scale = None
+    run_pa_decode_gluon(
+        output=out_view,
+        q=q_view,
+        k_cache=k_cache_view,
+        v_cache=v_cache_view,
+        context_lens=sparse_ctx,
+        block_tables=sparse_bt,
+        softmax_scale=sm_scale,
+        max_seqlen_q=1,
+        max_context_partition_num=max_context_partition_num,
+        context_partition_size=context_partition_size,
+        compute_type=compute_type,
+        q_scale=None,
+        k_scale=gluon_k_scale,
+        v_scale=gluon_v_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        alibi_slopes=None,
+        sinks=None,
+        sliding_window=-1,
+        ps=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ASM paged-attention PREFILL path (per-token-as-decode).
+#
+# In M3 sparse attention each prefill query token attends its OWN per-token top-k
+
+
+@torch.no_grad()
+def _run_prefill_fp8_gluon(
+    q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    sparse_bt: torch.Tensor,  # [total_q, topk*8] int32 (per-token 16-page table)
+    sparse_ctx: torch.Tensor,  # [total_q] int32 (per-token causal ctx)
+    num_kv_heads: int,
+    sm_scale: float,
+    output: torch.Tensor,  # [total_q, num_heads, head_dim]
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    """fp8 prefill via the Gluon split-KV decode kernel (per-token-as-decode).
+
+    Each of the ``total_q`` query tokens is treated as an independent length-1
+    "sequence" with its own sparse 16-page block_table + causal context_len --
+    identical setup to ``minimax_m3_sparse_attn_decode_asm``, just with
+    ``num_seqs == total_q``. This avoids the pa_fwd_asm maskless-fp8 NaN bug at
+    the 256-token boundary (see caller).
+    """
+    from atom.model_ops.base_attention import run_pa_decode_gluon
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    # Collapse (token, kv_head) -> row so gluon runs num_kv_heads_view == 1, mirroring
+    # minimax_m3_sparse_attn_decode_asm. sparse_bt/ctx are already [T*Hkv, ...] with
+    # kv-head-encoded page ids. Zero-copy views; Hkv == 1 is the identity.
+    assert q.is_contiguous(), "prefill gluon requires contiguous q for the kv-head view"
+    T, num_q_heads_total, head_size = q.shape
+    g = num_q_heads_total // num_kv_heads
+    q_view = q.view(T * num_kv_heads, g, head_size)
+    out_view = output.view(T * num_kv_heads, g, head_size)
+    nph16, _hkv = k_cache.shape[0], k_cache.shape[1]
+    k_cache_view = k_cache.view(nph16 * _hkv, 1, *k_cache.shape[2:])
+    v_cache_view = v_cache.view(nph16 * _hkv, 1, *v_cache.shape[2:])
+
+    num_seqs = T * num_kv_heads
+    num_kv_heads_view = 1
+    query_group_size = g
+    max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
+    context_partition_size = 256
+    intermediate_shape = (
+        num_seqs,
+        num_kv_heads_view,
+        max_context_partition_num,
+        query_group_size,
+    )
+    exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+    max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+    temporary_output = torch.empty(
+        *intermediate_shape, head_size, dtype=q.dtype, device=q.device
+    )
+    # compute_type / scales follow the actual KV-cache dtype (this helper serves
+    # both bf16 and fp8); the scale tensor collapses like the cache.
+    is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
+    compute_type = aiter.dtypes.fp8 if is_fp8 else torch.bfloat16
+    if is_fp8 and k_scale is not None:
+        pbs = k_scale.shape[-1]
+        gluon_k_scale = k_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
+        gluon_v_scale = v_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
+    else:
+        gluon_k_scale = gluon_v_scale = None
+    run_pa_decode_gluon(
+        output=out_view,
+        q=q_view,
+        k_cache=k_cache_view,
+        v_cache=v_cache_view,
+        context_lens=sparse_ctx,
+        block_tables=sparse_bt,
+        softmax_scale=sm_scale,
+        max_seqlen_q=1,
+        max_context_partition_num=max_context_partition_num,
+        context_partition_size=context_partition_size,
+        compute_type=compute_type,
+        q_scale=None,
+        k_scale=gluon_k_scale,
+        v_scale=gluon_v_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        alibi_slopes=None,
+        sinks=None,
+        sliding_window=-1,
+        ps=True,
+    )
+
+
+@torch.no_grad()
+def minimax_m3_sparse_attn_prefill_asm(
+    q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
+    k_cache: torch.Tensor,  # SHUFFLE K [num_blocks, num_kv_heads, head_dim//x, 16, x]
+    v_cache: torch.Tensor,  # SHUFFLE V [num_blocks, num_kv_heads, 16//x, head_dim, x]
+    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk] int32
+    block_table: torch.Tensor,  # [batch, max_blocks] int32, logical 128-granularity
+    query_req_id: (
+        torch.Tensor | None
+    ),  # [total_q] int32, precomputed in prepare_prefill
+    query_abs_pos: (
+        torch.Tensor | None
+    ),  # [total_q] int32, precomputed in prepare_prefill
+    qo_indptr: torch.Tensor | None,  # [total_q+1] int32, per-token CSR (precomputed)
+    num_kv_heads: int,
+    sm_scale: float,
+    output: torch.Tensor,  # [total_q, num_heads, head_dim]
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,  # [batch+1] int32, for the fallback
+    prefix_lens: torch.Tensor | None = None,  # [batch] int32, for the fallback
+    sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
+    sparse_ctx: torch.Tensor | None = None,
+) -> None:
+    """Block-sparse PREFILL via AITER ASM pa_fwd_asm, per-token-as-decode.
+
+    Each query token is a length-1 segment (qo_indptr=[0..total_q], max_qlen=1)
+    with its own causal-capped block_table/context_len. The per-token metadata
+    (query_req_id, query_abs_pos, qo_indptr) is layer-invariant and built once in
+    prepare_prefill, so the hot path has zero host sync. Requires per-rank
+    num_kv_heads == 1 and head_dim == 128.
+
+    Fallback: if the precomputed metadata is None (e.g. spec-decode prefill paths
+    that don't populate it), derive it on-device, SYNC-FREE, via searchsorted /
+    arange (no .item(), no GPU repeat_interleave).
+    """
+    assert q.shape[-1] == 128, "ASM paged-attention requires head_dim == 128."
+
+    total_q = q.shape[0]
+    device = q.device
+    if qo_indptr is None:
+        qo_indptr = torch.arange(total_q + 1, dtype=torch.int32, device=device)
+
+    if sparse_bt is None or sparse_ctx is None:
+        # Non-fused fallback build is per-token (num_kv_heads==1) only; num_kv_heads>1
+        # requires the kv-head-encoded sparse_bt/ctx from the fused topk emit.
+        assert num_kv_heads == 1, (
+            "minimax_m3_sparse_attn_prefill_asm with num_kv_heads>1 requires the "
+            "kv-head-encoded sparse_bt/sparse_ctx from the fused topk emit."
+        )
+        if query_req_id is None or query_abs_pos is None:
+            # Sync-free on-device derivation: req_id[n] = #(cu_seqlens_q[1:] <= n),
+            # abs_pos[n] = prefix_lens[req] + (n - cu_seqlens_q[req]).
+            assert cu_seqlens_q is not None and prefix_lens is not None
+            pos = torch.arange(total_q, dtype=torch.int32, device=device)
+            query_req_id = torch.searchsorted(
+                cu_seqlens_q[1:].contiguous(), pos, right=True
+            ).to(torch.int32)
+            query_abs_pos = (
+                prefix_lens[query_req_id] + (pos - cu_seqlens_q[query_req_id])
+            ).to(torch.int32)
+        sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_prefill(
+            topk_idx, block_table, query_req_id, query_abs_pos
+        )
+
+    _run_prefill_fp8_gluon(
+        q,
+        k_cache,
+        v_cache,
+        sparse_bt,
+        sparse_ctx,
+        num_kv_heads,
+        sm_scale,
+        output,
+        k_scale,
+        v_scale,
+    )

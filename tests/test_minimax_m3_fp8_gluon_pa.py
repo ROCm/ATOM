@@ -414,3 +414,116 @@ def test_topk_decode_emit_matches_standalone_builder():
     torch.testing.assert_close(topk_idx2, topk_idx)
     torch.testing.assert_close(sctx, sctx_ref)
     torch.testing.assert_close(sbt, sbt_ref)
+
+
+# ── Task 3: gluon PA decode runner parity vs Triton reference ──────────────────
+
+
+def _shuffle_k_p16(k_pages):
+    nb, nkv, ps, hd = k_pages.shape
+    x = 16 // k_pages.element_size()
+    return k_pages.view(nb, nkv, ps, hd // x, x).permute(0, 1, 3, 2, 4).contiguous()
+
+
+def _shuffle_v_p16(v_pages):
+    nb, nkv, ps, hd = v_pages.shape
+    x = 16 // v_pages.element_size()
+    return v_pages.view(nb, nkv, ps // x, x, hd).permute(0, 1, 2, 4, 3).contiguous()
+
+
+@_gpu
+@pytest.mark.parametrize("num_heads", [8, 16])
+def test_gluon_decode_asm_matches_triton(num_heads):
+    """minimax_m3_sparse_attn_decode_asm (gluon over page-16 SHUFFLE) matches the
+    Triton split-K reference (minimax_m3_sparse_attn_decode over the plain page-128
+    cache) on the SAME K/V data + topk selection, within bf16 noise."""
+    from atom.model_ops.minimax_m3.sparse_attn import (
+        SPARSE_BLOCK_SIZE,
+        minimax_m3_sparse_attn_decode,
+        minimax_m3_sparse_attn_decode_asm,
+    )
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    dtype = torch.bfloat16
+    num_kv_heads = 1
+    block = SPARSE_BLOCK_SIZE  # 128
+    pages_per_block = block // 16
+    seq_lens = [300, 130, 512]
+    batch = len(seq_lens)
+    topk = 16
+    sm_scale = HEAD_DIM**-0.5
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=dev)
+
+    max_seq = max(seq_lens)
+    max_blocks = (max_seq + block - 1) // block
+    num_logical = batch * max_blocks + 4
+
+    kv_plain = torch.zeros(
+        num_logical, 2, block, num_kv_heads, HEAD_DIM, dtype=dtype, device=dev
+    )
+    perm = torch.randperm(num_logical, device=dev)[: batch * max_blocks]
+    block_table = perm.view(batch, max_blocks).to(torch.int32)
+    for b in range(batch):
+        sl = seq_lens[b]
+        nb = (sl + block - 1) // block
+        for j in range(nb):
+            page = int(block_table[b, j])
+            valid = min(block, sl - j * block)
+            kv_plain[page, 0, :valid, 0] = torch.randn(
+                valid, HEAD_DIM, dtype=dtype, device=dev
+            )
+            kv_plain[page, 1, :valid, 0] = torch.randn(
+                valid, HEAD_DIM, dtype=dtype, device=dev
+            )
+
+    # page-16 SHUFFLE cache from the SAME data (logical block L -> phys 16-pages
+    # L*8 .. L*8+7).
+    num_p16 = num_logical * pages_per_block
+    k_src = kv_plain[:, 0].permute(0, 2, 1, 3)  # [num_logical, nkv, 128, hd]
+    v_src = kv_plain[:, 1].permute(0, 2, 1, 3)
+    k_pages = (
+        k_src.reshape(num_logical, num_kv_heads, pages_per_block, 16, HEAD_DIM)
+        .permute(0, 2, 1, 3, 4)
+        .reshape(num_p16, num_kv_heads, 16, HEAD_DIM)
+        .contiguous()
+    )
+    v_pages = (
+        v_src.reshape(num_logical, num_kv_heads, pages_per_block, 16, HEAD_DIM)
+        .permute(0, 2, 1, 3, 4)
+        .reshape(num_p16, num_kv_heads, 16, HEAD_DIM)
+        .contiguous()
+    )
+    k_shuf = _shuffle_k_p16(k_pages)
+    v_shuf = _shuffle_v_p16(v_pages)
+
+    q = torch.randn(batch, num_heads, HEAD_DIM, dtype=dtype, device=dev)
+
+    topk_idx = torch.full(
+        (num_kv_heads, batch, topk), -1, dtype=torch.int32, device=dev
+    )
+    for b in range(batch):
+        nb = (seq_lens[b] + block - 1) // block
+        sel = sorted(set([nb - 1] + list(range(min(topk, nb)))))[:topk]
+        topk_idx[0, b, : len(sel)] = torch.tensor(sel, dtype=torch.int32, device=dev)
+
+    ref_out = torch.empty(batch, num_heads, HEAD_DIM, dtype=dtype, device=dev)
+    minimax_m3_sparse_attn_decode(
+        q, kv_plain, topk_idx, block_table, seq_lens_t, num_kv_heads, sm_scale, ref_out
+    )
+
+    asm_out = torch.empty(batch, num_heads, HEAD_DIM, dtype=dtype, device=dev)
+    minimax_m3_sparse_attn_decode_asm(
+        q,
+        k_shuf,
+        v_shuf,
+        topk_idx,
+        block_table,
+        seq_lens_t,
+        num_kv_heads,
+        sm_scale,
+        asm_out,
+    )
+
+    assert torch.isfinite(asm_out).all()
+    torch.testing.assert_close(asm_out, ref_out, atol=3e-2, rtol=5e-2)
