@@ -34,8 +34,17 @@ OpenAI format:
 import ast
 import json
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def _unique_tool_call_id() -> str:
+    # OpenAI tool_call ids must be unique across the whole conversation, not just
+    # within one response. A per-response index (call_0, call_1, ...) collides
+    # across turns -> clients (e.g. qwen-code) dedupe by id and silently ignore
+    # every repeat, causing an infinite tool-call retry loop. Use a random id.
+    return f"call_{uuid.uuid4().hex}"
 
 
 @dataclass
@@ -149,7 +158,7 @@ def _parse_qwen_function(
         if pname:
             args[pname] = _coerce_param_value(pval, types.get(pname))
     return ToolCall(
-        id=f"call_{index}",
+        id=_unique_tool_call_id(),
         type="function",
         function={"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
     )
@@ -335,7 +344,7 @@ class ToolCallStreamParser:
         _content, tool_calls = _parse_qwen_xml(self.buf, self.tools)
         self.buf = ""
         for tc in tool_calls:
-            tc.id = f"call_{self.current_index}"
+            tc.id = _unique_tool_call_id()
             results.append(
                 (
                     "tool_call_start",
