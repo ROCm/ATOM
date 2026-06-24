@@ -70,7 +70,11 @@ jobs:
           MODEL_CACHE_ROOT=""
           MODEL_CACHE_DESC=""
 
-          if [ -d "/mnt/raid0/pretrained_model" ]; then
+          if [ -d "/shared/data/WRH/models" ]; then
+            MODEL_CACHE_ROOT="/shared/data/WRH/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
+          elif [ -d "/mnt/raid0/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
             MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
@@ -89,13 +93,13 @@ jobs:
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
-      - name: Clean up old containers
-        run: |
-          containers=$(docker ps -q)
-          if [ -n "$containers" ]; then
-            docker kill $containers || true
-          fi
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+      #- name: Clean up old containers
+      #  run: |
+      #    containers=$(docker ps -q)
+      #    if [ -n "$containers" ]; then
+      #      docker kill $containers || true
+      #    fi
+      #    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
       - name: Start validation container
         run: |
@@ -117,7 +121,6 @@ jobs:
             $MODEL_MOUNT \
             -w /workspace \
             --ipc=host --group-add video \
-            --shm-size=16G \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
