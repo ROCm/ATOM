@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -177,6 +179,14 @@ mkdir -p "${LOG_ROOT}"
 
 if ! command -v sbatch >/dev/null 2>&1; then
   echo "ERROR: sbatch not found; use --dry-run on non-Slurm runners" >&2
+  echo "PATH=${PATH}" >&2
+  echo "host=$(hostname) user=$(id -un)" >&2
+  for candidate in /usr/local/slurm-24.05.5.1/bin/sbatch /usr/bin/sbatch /etc/alternatives/sbatch; do
+    if [[ -e "${candidate}" || -L "${candidate}" ]]; then
+      printf '%s -> %s\n' "${candidate}" "$(readlink -f "${candidate}" 2>/dev/null || true)" >&2
+      ls -l "${candidate}" >&2 2>/dev/null || true
+    fi
+  done
   exit 127
 fi
 
