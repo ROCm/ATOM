@@ -28,10 +28,14 @@ def cdiv(a, b):
 
 
 def _is_indexed_sparse_attention(module) -> bool:
-    """True for MiniMax-M3 sparse attention. The flag may live on the Attention
-    layer or on its impl (SparseMHAPagedAttentionImpl sets it as a class attr)."""
-    if getattr(module, "is_indexed_sparse_attention", False):
-        return True
+    """True only for the MiniMax-M3 sparse ``Attention`` layer (the one that owns
+    the sparse impl), so binding reads ``module.impl``.
+
+    ``model.modules()`` walks both the outer ``MiniMaxM3SparseAttention`` wrapper
+    AND its child ``Attention`` layer. Only the child carries ``.impl`` (a
+    ``SparseMHAPagedAttentionImpl``) and the KV-cache slot; the wrapper must be
+    skipped (return None from build_kv_cache_tensor). So key off the impl flag,
+    NOT the wrapper's own ``is_indexed_sparse_attention`` class attribute."""
     impl = getattr(module, "impl", None)
     return bool(getattr(impl, "is_indexed_sparse_attention", False))
 

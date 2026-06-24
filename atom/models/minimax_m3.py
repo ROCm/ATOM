@@ -377,23 +377,25 @@ class MiniMaxM3Attention(nn.Module):
             kv_cache_dtype=cache_config,
             layer_num=layer_id,
             use_mla=False,
-            rotary_emb=None,
+            rotary_emb=self.rotary_emb,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
             prefix=f"{prefix}.attn",
         )
 
-    def _qk_norm_rope(
-        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        q, k = _minimax_m3_gemma_qk_norm(
-            q,
-            k,
-            self.q_norm,
-            self.k_norm,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )
-        return self.rotary_emb(positions, q, k)
+    # def _qk_norm_rope(
+    #     self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+    # ) -> tuple[torch.Tensor, torch.Tensor]:
+    #     q, k = _minimax_m3_gemma_qk_norm(
+    #         q,
+    #         k,
+    #         self.q_norm,
+    #         self.k_norm,
+    #         self.num_heads,
+    #         self.num_kv_heads,
+    #         self.head_dim,
+    #     )
+    #     return self.rotary_emb(positions, q, k)
 
     def forward(
         self,
@@ -401,42 +403,43 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        if _can_use_fused_minimax_m3_attention_preproc(
-            qkv, self.rotary_emb, self.q_norm.weight, self.k_norm.weight
-        ):
-            qkv = qkv.contiguous()
-            q = torch.empty(
-                (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
-            )
-            cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
-            aiter.fused_qknorm_idxrqknorm(
-                qkv,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                cos_sin_cache,
-                positions,
-                self.num_heads,
-                self.num_kv_heads,
-                self.rotary_emb.rotary_dim,
-                self.q_norm.variance_epsilon,
-                None,
-                None,
-                0,
-                None,
-                None,
-                None,
-                0,
-                q,
-                None,
-                None,
-            )
-            _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            attn_output = self.attn(q, k, v)
-            return self.o_proj(attn_output)
+        # if _can_use_fused_minimax_m3_attention_preproc(
+        #     qkv, self.rotary_emb, self.q_norm.weight, self.k_norm.weight
+        # ):
+        #     qkv = qkv.contiguous()
+        #     q = torch.empty(
+        #         (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
+        #     )
+        #     cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
+        #     aiter.fused_qknorm_idxrqknorm(
+        #         qkv,
+        #         self.q_norm.weight,
+        #         self.k_norm.weight,
+        #         cos_sin_cache,
+        #         positions,
+        #         self.num_heads,
+        #         self.num_kv_heads,
+        #         self.rotary_emb.rotary_dim,
+        #         self.q_norm.variance_epsilon,
+        #         index_q_norm_weight=None,
+        #         index_k_norm_weight=None,
+        #         num_index_heads=0,
+        #         slot_mapping=None,
+        #         kv_cache_k=None,
+        #         kv_cache_v=None,
+        #         index_cache=None,
+        #         block_size=0,
+        #         q_out=q,
+        #         index_q_out=None,
+        #         index_slot_mapping=None,
+        #     )
+        #     _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        #     attn_output = self.attn(q, k, v)
+        #     return self.o_proj(attn_output)
 
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._qk_norm_rope(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        # q, k = self._qk_norm_rope(positions, q, k)
+        attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
         return self.o_proj(attn_output)
 
 
