@@ -283,3 +283,134 @@ def test_fused_qknorm_rope_kv_insert_shuffle_roundtrip():
         torch.testing.assert_close(
             index_cache.view(-1, HEAD_DIM)[slot], ik_ref[token], rtol=1e-2, atol=1e-2
         )
+
+
+# ── Task 2: sparse block-table builders + topk EMIT glue ───────────────────────
+
+
+@_gpu
+def test_build_sparse_block_table_expands_x8_tail_last():
+    """Each selected logical 128-block expands to 8 contiguous physical 16-pages
+    (logical_page*8 + j); the partial tail block is packed last; context_lens
+    reflect full blocks (128 each) + the tail remainder."""
+    from atom.model_ops.minimax_m3.sparse_attn import (
+        PAGES_PER_SPARSE_BLOCK,
+        SPARSE_BLOCK_SIZE,
+        minimax_m3_build_sparse_block_table,
+    )
+
+    dev = "cuda"
+    G = PAGES_PER_SPARSE_BLOCK  # 8
+    topk = 3
+    batch = 2
+    # logical block_table maps logical 128-block -> physical 128-page id.
+    # req 0: logical blocks {0,1,2} -> phys {5,6,7}
+    # req 1: logical blocks {0,1}   -> phys {3,4}
+    block_table = torch.tensor(
+        [[5, 6, 7, 0], [3, 4, 0, 0]], dtype=torch.int32, device=dev
+    )
+    # req 0: seq_len 300 -> last (tail) logical block = (300-1)//128 = 2
+    # req 1: seq_len 200 -> tail logical block = (200-1)//128 = 1
+    seq_lens = torch.tensor([300, 200], dtype=torch.int32, device=dev)
+    # topk_idx [1, batch, topk] 0-indexed logical 128-blocks, -1 pad.
+    # req 0 selects {0,1,2} (2 is the tail). req 1 selects {0,1} + pad.
+    topk_idx = torch.tensor([[[0, 1, 2], [0, 1, -1]]], dtype=torch.int32, device=dev)
+
+    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table(
+        topk_idx, block_table, seq_lens
+    )
+
+    assert sparse_bt.shape == (batch, topk * G)
+    assert sparse_ctx.shape == (batch,)
+
+    # req 0: full blocks {0,1} -> phys logical {5,6} first (slots 0,1), tail
+    # block 2 -> phys logical 7 last (slot 2). Each expands *8.
+    # slot order: [block0 pages, block1 pages, tail(block2) pages]
+    exp0 = []
+    for logical_phys in (5, 6, 7):  # full(0)->5, full(1)->6, tail(2)->7
+        exp0 += [logical_phys * G + j for j in range(G)]
+    torch.testing.assert_close(
+        sparse_bt[0].cpu(), torch.tensor(exp0, dtype=torch.int32)
+    )
+    # ctx: 2 full blocks * 128 + tail tokens (300 - 2*128 = 44) = 300
+    assert sparse_ctx[0].item() == 300
+
+    # req 1: full block {0}->phys5? no: req1 block_table phys {3,4}. tail is
+    # logical block 1 -> phys 4 (packed last); full block 0 -> phys 3 (slot 0).
+    exp1 = []
+    for logical_phys in (3, 4):  # full(0)->3, tail(1)->4
+        exp1 += [logical_phys * G + j for j in range(G)]
+    # remaining (topk*G - 2*G) slots are zero-padded.
+    exp1 += [0] * (topk * G - len(exp1))
+    torch.testing.assert_close(
+        sparse_bt[1].cpu(), torch.tensor(exp1, dtype=torch.int32)
+    )
+    # ctx: 1 full block *128 + tail (200 - 1*128 = 72) = 200
+    assert sparse_ctx[1].item() == 200
+    assert SPARSE_BLOCK_SIZE == 128
+
+
+@_gpu
+def test_topk_decode_emit_matches_standalone_builder():
+    """The fused EMIT_SPARSE_BT path in minimax_m3_index_topk_decode must produce
+    the same (sparse_bt, sparse_ctx) as the standalone builder run on its
+    topk_idx (num_idx_heads == 1)."""
+    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
+    from atom.model_ops.minimax_m3.sparse_attn import (
+        minimax_m3_build_sparse_block_table,
+    )
+
+    dev = "cuda"
+    torch.manual_seed(7)
+    head_dim = 128
+    num_kv_heads = 1
+    batch = 5
+    topk, init_blocks, local_blocks = 4, 1, 1
+    max_seq_len = 1024
+    sm_scale = head_dim**-0.5
+
+    max_blocks = max_seq_len // 128
+    # index_kv_cache must hold every physical page referenced by block_table.
+    num_blocks = batch * max_blocks + 1
+    idx_q = torch.randn(batch, num_kv_heads, head_dim, device=dev) * 0.1
+    index_kv_cache = torch.randn(num_blocks, 128, head_dim, device=dev) * 0.1
+    block_table = torch.arange(
+        batch * max_blocks, dtype=torch.int32, device=dev
+    ).reshape(batch, max_blocks)
+    seq_lens = torch.randint(130, max_seq_len, (batch,), dtype=torch.int32, device=dev)
+
+    # non-emit: plain topk_idx, then standalone builder
+    topk_idx = minimax_m3_index_topk_decode(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        seq_lens,
+        max_seq_len,
+        topk,
+        init_blocks,
+        local_blocks,
+        num_kv_heads,
+        sm_scale,
+    )
+    sbt_ref, sctx_ref = minimax_m3_build_sparse_block_table(
+        topk_idx, block_table, seq_lens
+    )
+
+    # emit: fused inside the merge kernel
+    topk_idx2, sbt, sctx = minimax_m3_index_topk_decode(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        seq_lens,
+        max_seq_len,
+        topk,
+        init_blocks,
+        local_blocks,
+        num_kv_heads,
+        sm_scale,
+        emit_sparse_block_table=True,
+    )
+
+    torch.testing.assert_close(topk_idx2, topk_idx)
+    torch.testing.assert_close(sctx, sctx_ref)
+    torch.testing.assert_close(sbt, sbt_ref)

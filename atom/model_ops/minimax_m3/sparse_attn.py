@@ -857,3 +857,237 @@ def minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
         x=x,
         ASM_PAGE=16,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sparse block-table builders: compact selected logical 128-blocks into a
+# dense page-16 block_table + context_lens for the ASM/gluon paged-attention
+# decode/prefill path. Each selected 128-block expands into
+# PAGES_PER_SPARSE_BLOCK == 8 contiguous physical 16-pages.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _build_sparse_block_table_kernel(
+    t_ptr,  # topk_idx: [1, batch, topk] int32, 0-indexed 128-blocks, -1 pad
+    block_table_ptr,  # logical block_table [batch, max_blocks] int32 (128-granularity)
+    seq_lens_ptr,  # [batch] int32
+    sparse_bt_ptr,  # out: compacted 16-page block_table [batch, topk*8] int32
+    sparse_ctx_ptr,  # out: compacted context_lens [batch] int32
+    max_topk,
+    sm_block_size: tl.constexpr,  # logical sparse block size (128)
+    pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
+    asm_page_size: tl.constexpr,  # physical page size (16)
+    stride_tn,
+    stride_tk,
+    stride_bt_b,
+    stride_sbt_b,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    seq_len = tl.load(seq_lens_ptr + pid_b)
+    # logical 128-block containing the last valid token (the partial tail block).
+    last_blk = (seq_len - 1) // sm_block_size
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    t_row = t_ptr + pid_b * stride_tn
+    sbt_row = sparse_bt_ptr + pid_b * stride_sbt_b
+
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    blk = tl.load(t_row + off_t * stride_tk, mask=off_t < max_topk, other=-1)
+    valid = blk >= 0
+    is_tail = valid & (blk == last_blk)
+    is_full = valid & (blk != last_blk)
+
+    # Stable compaction in units of SPARSE BLOCKS: full blocks first (in
+    # selection order), tail block last. Each sparse block then expands to
+    # `pages_per_block` physical 16-pages.
+    n_full = tl.sum(is_full.to(tl.int32), axis=0)
+    n_valid = tl.sum(valid.to(tl.int32), axis=0)
+    earlier_full = tl.cumsum(is_full.to(tl.int32), axis=0) - is_full.to(tl.int32)
+    slot = tl.where(is_full, earlier_full, n_full)  # tail -> slot n_full
+
+    # logical 128-page id of each selected block -> 8 physical 16-pages:
+    #   physical = logical_id * pages_per_block + j   (matches block_convert)
+    logical_page = tl.load(bt_row + blk, mask=valid, other=0).to(tl.int32)
+    base_phys = logical_page * pages_per_block  # [BLOCK_SIZE_T]
+    dst_base = slot * pages_per_block  # [BLOCK_SIZE_T]
+
+    # Write EVERY destination slot so the output buffer can be torch.empty (no
+    # memset): valid selected blocks -> their physical pages; all remaining slots
+    # (padding beyond n_valid, or BLOCK_SIZE_T > max_topk) -> 0 (an in-bounds page
+    # id; masked out by context_lens at attention time). Avoids the per-call
+    # torch.zeros memset that dominates at low concurrency.
+    for j in range(pages_per_block):
+        tl.store(sbt_row + dst_base + j, base_phys + j, mask=valid)
+    # zero the unused tail [n_valid*pages_per_block : width).
+    n_used = n_valid * pages_per_block
+    off_w = tl.arange(0, BLOCK_SIZE_T * pages_per_block)
+    tl.store(sbt_row + off_w, tl.zeros_like(off_w), mask=off_w >= n_used)
+
+    # true valid token count: full blocks contribute 128 each, tail the remainder.
+    tail_tokens = seq_len - last_blk * sm_block_size
+    has_tail = tl.sum(is_tail.to(tl.int32), axis=0) > 0
+    ctx = n_full * sm_block_size + tl.where(has_tail, tail_tokens, 0)
+    ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * sm_block_size, seq_len))
+    tl.store(sparse_ctx_ptr + pid_b, ctx)
+
+
+@torch.no_grad()
+def minimax_m3_build_sparse_block_table(
+    topk_idx: torch.Tensor,  # [1, batch, topk] int32 (num_kv_heads == 1)
+    block_table: torch.Tensor,  # [batch, max_blocks] int32, logical 128-granularity
+    seq_lens: torch.Tensor,  # [batch] int32
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compact per-request selected 128-blocks into a dense 16-page block_table +
+    context_lens for `pa_fwd_asm`.
+
+    Each selected logical 128-block expands to its 8 physical 16-pages
+    (``logical_id * 8 + j``, matching ``block_convert``). The partial tail block
+    is packed last so pa_fwd_asm's tail mask (context_lens % 16) lands on it.
+
+    Returns (sparse_bt [batch, topk*8] int32, sparse_ctx_lens [batch] int32).
+    The compacted width is fixed (topk*8), so the grid is shape-constant
+    (cudagraph-safe).
+    """
+    assert topk_idx.shape[0] == 1, "ASM PA decode requires num_kv_heads == 1"
+    batch = topk_idx.shape[1]
+    topk = topk_idx.shape[-1]
+    width = topk * PAGES_PER_SPARSE_BLOCK
+    # Both buffers are FULLY written by the kernel (sparse_bt: every slot incl.
+    # padding -> 0; sparse_ctx: one entry per program), so torch.empty is safe and
+    # skips the per-call memset that hurts low-concurrency decode.
+    sparse_bt = torch.empty((batch, width), dtype=torch.int32, device=topk_idx.device)
+    sparse_ctx = torch.empty((batch,), dtype=torch.int32, device=topk_idx.device)
+    _build_sparse_block_table_kernel[(batch,)](
+        topk_idx,
+        block_table,
+        seq_lens,
+        sparse_bt,
+        sparse_ctx,
+        topk,
+        SPARSE_BLOCK_SIZE,
+        PAGES_PER_SPARSE_BLOCK,
+        ASM_PAGE_SIZE,
+        topk_idx.stride(1),
+        topk_idx.stride(2),
+        block_table.stride(0),
+        sparse_bt.stride(0),
+        BLOCK_SIZE_T=triton.next_power_of_2(topk),
+    )
+    return sparse_bt, sparse_ctx
+
+
+# qo_indptr=[0,1,...,total_q] (each token a length-1 segment). Verified: pa_fwd_asm
+# honors per-token block_table/context_len indexing under qo_indptr.
+#
+# Causal: query token at absolute pos p sees keys k_abs <= p. So its effective
+# length is p+1: full selected blocks below the self-block (p//128) contribute 128
+# each; the self-block (packed LAST so pa_fwd_asm's tail mask lands on it)
+# contributes p%128 + 1. Selected blocks above the self-block are causally invalid
+# (the causal indexer should not pick them, but we mask defensively by excluding
+# any block with blk > p//128).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _build_sparse_block_table_prefill_kernel(
+    t_ptr,  # topk_idx: [1, total_q, topk] int32, 0-indexed 128-blocks, -1 pad
+    block_table_ptr,  # logical block_table [batch, max_blocks] int32 (128-granularity)
+    req_id_ptr,  # [total_q] int32: request index b of each query token (precomputed)
+    abs_pos_ptr,  # [total_q] int32: absolute position p of each query token (precomputed)
+    sparse_bt_ptr,  # out: compacted 16-page block_table [total_q, topk*8] int32
+    sparse_ctx_ptr,  # out: compacted context_lens [total_q] int32
+    max_topk,
+    sm_block_size: tl.constexpr,  # logical sparse block size (128)
+    pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
+    stride_tn,
+    stride_tk,
+    stride_bt_b,
+    stride_sbt_n,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    pid_n = tl.program_id(0)  # query token index (global)
+    # req_id / abs_pos are layer-invariant and precomputed once in prepare_prefill
+    # (numpy, no device sync), reused across all sparse layers -> no per-layer D2H.
+    b = tl.load(req_id_ptr + pid_n)
+    p = tl.load(abs_pos_ptr + pid_n)
+    causal_len = p + 1
+    self_blk = p // sm_block_size  # logical block containing this query token
+
+    bt_row = block_table_ptr + b * stride_bt_b
+    t_row = t_ptr + pid_n * stride_tn
+    sbt_row = sparse_bt_ptr + pid_n * stride_sbt_n
+
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    blk = tl.load(t_row + off_t * stride_tk, mask=off_t < max_topk, other=-1)
+    # causal: drop any selected block strictly above the self-block.
+    valid = (blk >= 0) & (blk <= self_blk)
+    is_tail = valid & (blk == self_blk)
+    is_full = valid & (blk < self_blk)
+
+    n_full = tl.sum(is_full.to(tl.int32), axis=0)
+    n_valid = tl.sum(valid.to(tl.int32), axis=0)
+    earlier_full = tl.cumsum(is_full.to(tl.int32), axis=0) - is_full.to(tl.int32)
+    slot = tl.where(is_full, earlier_full, n_full)  # tail -> slot n_full
+
+    logical_page = tl.load(bt_row + blk, mask=valid, other=0).to(tl.int32)
+    base_phys = logical_page * pages_per_block
+    dst_base = slot * pages_per_block
+
+    # Write EVERY destination slot so the output buffer can be torch.empty (no
+    # memset): valid selected blocks -> their physical pages; the unused tail ->
+    # 0 (in-bounds page id, masked out by context_lens at attention time).
+    for j in range(pages_per_block):
+        tl.store(sbt_row + dst_base + j, base_phys + j, mask=valid)
+    n_used = n_valid * pages_per_block
+    off_w = tl.arange(0, BLOCK_SIZE_T * pages_per_block)
+    tl.store(sbt_row + off_w, tl.zeros_like(off_w), mask=off_w >= n_used)
+
+    # full blocks contribute 128 each; tail (self-block) contributes p%128 + 1.
+    tail_tokens = causal_len - self_blk * sm_block_size
+    has_tail = tl.sum(is_tail.to(tl.int32), axis=0) > 0
+    ctx = n_full * sm_block_size + tl.where(has_tail, tail_tokens, 0)
+    ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * sm_block_size, causal_len))
+    tl.store(sparse_ctx_ptr + pid_n, ctx)
+
+
+@torch.no_grad()
+def minimax_m3_build_sparse_block_table_prefill(
+    topk_idx: torch.Tensor,  # [1, total_q, topk] int32 (num_kv_heads == 1)
+    block_table: torch.Tensor,  # [batch, max_blocks] int32, logical 128-granularity
+    query_req_id: torch.Tensor,  # [total_q] int32, precomputed in prepare_prefill
+    query_abs_pos: torch.Tensor,  # [total_q] int32, precomputed in prepare_prefill
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-query-token compacted 16-page block_table + causal context_lens.
+
+    Returns (sparse_bt [total_q, topk*8], sparse_ctx [total_q]). Each query token
+    becomes a length-1 "request" for pa_fwd_asm; its causal cutoff (absolute pos
+    p, so length p+1) is folded into context_len with the self-block packed last.
+
+    ``query_req_id`` / ``query_abs_pos`` are layer-invariant and built ONCE in
+    prepare_prefill (host numpy, no device sync) -> this per-layer build is fully
+    on-device with zero D2H.
+    """
+    assert topk_idx.shape[0] == 1, "ASM PA prefill requires num_kv_heads == 1"
+    total_q = topk_idx.shape[1]
+    topk = topk_idx.shape[-1]
+    device = topk_idx.device
+
+    width = topk * PAGES_PER_SPARSE_BLOCK
+    # Fully written by the kernel (every slot incl. padding -> 0; one ctx per
+    # program), so torch.empty is safe and skips the per-call memset.
+    sparse_bt = torch.empty((total_q, width), dtype=torch.int32, device=device)
+    sparse_ctx = torch.empty((total_q,), dtype=torch.int32, device=device)
+    _build_sparse_block_table_prefill_kernel[(total_q,)](
+        topk_idx,
+        block_table,
+        query_req_id,
+        query_abs_pos,
+        sparse_bt,
+        sparse_ctx,
+        topk,
+        SPARSE_BLOCK_SIZE,
+        PAGES_PER_SPARSE_BLOCK,
+        topk_idx.stride(1),
+        topk_idx.stride(2),
+        block_table.stride(0),
+        sparse_bt.stride(0),
+        BLOCK_SIZE_T=triton.next_power_of_2(topk),
+    )
+    return sparse_bt, sparse_ctx
