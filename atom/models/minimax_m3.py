@@ -105,7 +105,6 @@ def _minimax_m3_cos_sin_cache(
     return cos_sin_cache
 
 
-
 def make_minimax_m3_expert_params_mapping(
     num_experts: int,
 ) -> list[tuple[str, str, int, str]]:
@@ -343,7 +342,6 @@ class MiniMaxM3Attention(nn.Module):
             k_norm=self.k_norm,
             prefix=f"{prefix}.attn",
         )
-
 
     def forward(
         self,

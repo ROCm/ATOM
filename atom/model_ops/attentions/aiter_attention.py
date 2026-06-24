@@ -343,7 +343,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "reduce_partial_map": reduce_partial_map,
         }
 
-
     def compute_block_bytes(self) -> int:
         """Standard split-K/V MHA per-block bytes.
 

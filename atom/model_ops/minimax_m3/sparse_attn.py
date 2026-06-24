@@ -129,8 +129,9 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
         "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
-        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
-        * triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_QH": lambda args: (
+            args["BLOCK_SIZE_Q"] * triton.next_power_of_2(args["gqa_group_size"])
+        ),
     }
 )
 @triton.jit
