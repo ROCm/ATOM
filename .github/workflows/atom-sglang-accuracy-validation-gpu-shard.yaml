@@ -100,7 +100,7 @@ jobs:
       - name: Prepare model cache mount
         run: |
           MODEL_CACHE_MOUNT=""
-          MODEL_CACHE_ROOT=""
+          MODEL_CACHE_ROOT="/models"
           MODEL_CACHE_DESC=""
 
           if [ -d "/shared/data/WRH/models" ]; then
