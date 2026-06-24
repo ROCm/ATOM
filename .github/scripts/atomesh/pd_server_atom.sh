@@ -163,23 +163,31 @@ wait_http() {
 }
 
 wait_router_closed() {
-  local deadline=$(( $(date +%s) + WAIT_SERVER_TIMEOUT ))
-  while curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; do
-    if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
-      set +e
-      wait "${server_pid}"
-      local rc=$?
-      set -e
-      [[ "${rc}" -eq 0 ]] && rc=1
-      echo "[wait][FAIL] worker process exited while router was still alive rc=${rc}" >&2
-      exit "${rc}"
-    fi
-    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
-      echo "[wait] router still alive after timeout; exiting worker"
-      break
+  local miss_count=0
+  local max_misses=3
+  echo "[wait] router shutdown http://${NODE0_ADDR}:${ROUTER_PORT}/health"
+  while true; do
+    if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; then
+      miss_count=0
+      if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
+        set +e
+        wait "${server_pid}"
+        local rc=$?
+        set -e
+        [[ "${rc}" -eq 0 ]] && rc=1
+        echo "[wait][FAIL] worker process exited while router was still alive rc=${rc}" >&2
+        exit "${rc}"
+      fi
+    else
+      miss_count=$((miss_count + 1))
+      if [[ "${miss_count}" -ge "${max_misses}" ]]; then
+        break
+      fi
+      echo "[wait] router health miss ${miss_count}/${max_misses}; continuing"
     fi
     sleep 10
   done
+  echo "[wait][OK] router closed"
 }
 
 write_metadata() {
@@ -333,13 +341,13 @@ if [[ "${NODE_RANK}" -eq 0 ]]; then
 elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
   start_prefill "prefill-rank-${NODE_RANK}"
   trap 'kill ${server_pid:-0} 2>/dev/null || true' EXIT
-  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}" || true
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   kill "${server_pid}" 2>/dev/null || true
 else
   start_decode
   trap 'kill ${server_pid:-0} 2>/dev/null || true' EXIT
-  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}" || true
+  wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   kill "${server_pid}" 2>/dev/null || true
 fi
