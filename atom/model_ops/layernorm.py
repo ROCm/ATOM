@@ -761,8 +761,18 @@ def fused_allreduce_gemma_rms_norm(
     residual: torch.Tensor,
     norm: GemmaRMSNorm,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm."""
-    if get_tensor_model_parallel_world_size() > 1:
+    """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm.
+
+    Gated by ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION (default on): when enabled and
+    TP>1, the upstream RowParallel linear skips its all-reduce and this op fuses
+    all-reduce + residual-add + Gemma RMSNorm. When disabled, the linear does its
+    own all-reduce and this falls back to a plain residual-add + Gemma RMSNorm
+    (so the reduce_results and fusion toggles MUST move together).
+    """
+    if (
+        get_tensor_model_parallel_world_size() > 1
+        and envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+    ):
         return tensor_model_parallel_fused_allreduce_rmsnorm(
             hidden_states.contiguous(),
             residual,
