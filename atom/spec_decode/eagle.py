@@ -476,13 +476,10 @@ class EagleProposer:
                         # TODO: FIX this condition after we support3 attention head numbers=32
                         and self.runner.attn_metadata_builder.num_attention_heads != 32
                     )
-                    fuse_mtp_metadata_update = (
-                        positions.ndim == 1
-                        and getattr(
-                            self.runner.attn_metadata_builder,
-                            "fuse_mtp_decode_position_update",
-                            False,
-                        )
+                    fuse_mtp_metadata_update = positions.ndim == 1 and getattr(
+                        self.runner.attn_metadata_builder,
+                        "fuse_mtp_decode_position_update",
+                        False,
                     )
                     mtp_positions = positions
                     mtp_positions_out = positions if fuse_mtp_metadata_update else None
