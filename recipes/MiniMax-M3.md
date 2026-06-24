@@ -1,4 +1,4 @@
-# MiniMax-M3 MXFP4 Usage Guide
+# MiniMax-M3 MXFP4/MXFP8 Usage Guide
 
 [MiniMax-M3-MXFP4](https://huggingface.co/amd/MiniMax-M3-MXFP4) and [MiniMax-M3-MXFP8](https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8) are supported by the native ATOM OpenAI-compatible server path.
 
@@ -10,13 +10,9 @@ Pull the latest development image:
 docker pull rocm/atom-dev:latest
 ```
 
-## MXFP4/MXFP8 on 4xMI355 GPUs
+## MXFP4 on 4xMI355 GPUs
 
 ### Launching Server
-
-MXFP4 and MXFP8 use the same launch path.  Set
-`model_path=MiniMaxAI/MiniMax-M3-MXFP8 run_name=m3-mxfp8` to run the MXFP8
-checkpoint.
 
 ```bash
 model_path=${model_path:-amd/MiniMax-M3-MXFP4}
@@ -36,6 +32,34 @@ python -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 32768 \
   --no-enable_prefix_caching 2>&1 | tee "${run_name}-server.log"
 ```
+
+## MXFP8 on 4xMI355 GPUs
+
+### Launching Server
+
+For the MXFP8 model, online quant is used to convert the linear weights in attention module and first 3 dense MLP layers to PTPC FP8 format, which are originally equipped with 1*32 block scale.
+The MoE weights keep unchanged. Check **--online_quant_config** in the script below for more details.
+
+```bash
+model_path=${model_path:-MiniMaxAI/MiniMax-M3-MXFP8}
+run_name=${run_name:-m3-mxfp8}
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --tensor-parallel-size 4 \
+  --server-port 8000 \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.8 \
+  --block-size 128 \
+  --max-model-len 32768 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 32768 \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+  --no-enable_prefix_caching 2>&1 | tee "${run_name}-server.log"
+```
+
 
 ### Accuracy Test
 
@@ -72,7 +96,7 @@ Validated MXFP8 GSM8K result:
 local-chat-completions ({'model': 'MiniMaxAI/MiniMax-M3-MXFP8', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9469|±  |0.0062|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9484|±  |0.0061|
 |     |       |strict-match    |     5|exact_match|↑  |0.9477|±  |0.0061|
 ```
 
