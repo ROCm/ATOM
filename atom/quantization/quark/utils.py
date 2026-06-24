@@ -106,8 +106,7 @@ _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 def weight_dequant_mxfp8(
     x: torch.Tensor, s: torch.Tensor, block_size: int = 32
 ) -> torch.Tensor:
-    """Dequantize an MXFP8 weight to the default float dtype.
-    """
+    """Dequantize an MXFP8 weight to the default float dtype."""
     assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
     M, K = x.shape
     assert K % block_size == 0, f"K={K} not divisible by block_size={block_size}"
