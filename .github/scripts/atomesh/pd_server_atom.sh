@@ -54,6 +54,7 @@ RUN_EVAL="${RUN_EVAL:-false}"
 EVAL_TASK="${EVAL_TASK:-gsm8k}"
 EVAL_FEWSHOT="${EVAL_FEWSHOT:-3}"
 EVAL_LIMIT="${EVAL_LIMIT:-}"
+EVAL_CONCURRENCY="${EVAL_CONCURRENCY:-16}"
 
 WAIT_SERVER_TIMEOUT="${WAIT_SERVER_TIMEOUT:-2500}"
 WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
@@ -310,16 +311,54 @@ run_eval() {
   if [[ -n "${EVAL_LIMIT}" ]]; then
     limit_arg=(--limit "${EVAL_LIMIT}")
   fi
-  local eval_conc
-  eval_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
-  local tag
-  tag="$(date +%Y%m%d%H%M%S)_gsm8k_${TOPOLOGY}_c${eval_conc}"
-  lm_eval --model local-completions \
-    --model_args "model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/completions,num_concurrent=${eval_conc},max_retries=3,tokenized_requests=False,trust_remote_code=True" \
-    --tasks gsm8k \
-    --num_fewshot "${EVAL_FEWSHOT}" \
-    "${limit_arg[@]}" \
-    --output_path "${RUN_DIR}/eval_results/${tag}"
+
+  IFS=',' read -r -a eval_concs <<< "${EVAL_CONCURRENCY}"
+  local eval_conc tag result_dir
+  for eval_conc in "${eval_concs[@]}"; do
+    eval_conc="${eval_conc//[[:space:]]/}"
+    [[ -n "${eval_conc}" ]] || continue
+    tag="$(date +%Y%m%d%H%M%S)_gsm8k_${TOPOLOGY}_c${eval_conc}"
+    result_dir="${RUN_DIR}/eval_results/${tag}"
+
+    echo ""
+    echo "========================================="
+    echo "[eval] gsm8k concurrent=${eval_conc}"
+    echo "========================================="
+
+    lm_eval --model local-completions \
+      --model_args "model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/completions,num_concurrent=${eval_conc},max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+      --tasks gsm8k \
+      --num_fewshot "${EVAL_FEWSHOT}" \
+      "${limit_arg[@]}" \
+      --output_path "${result_dir}"
+
+    python3 - "${result_dir}" "${eval_conc}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+result_dir = Path(sys.argv[1])
+eval_conc = sys.argv[2]
+json_files = list(result_dir.rglob("*.json")) if result_dir.is_dir() else []
+if not json_files:
+    print("[eval] ERROR: no result JSON found")
+    raise SystemExit(1)
+
+result_file = max(json_files, key=lambda path: path.stat().st_mtime)
+data = json.loads(result_file.read_text(encoding="utf-8"))
+score = (
+    data.get("results", {})
+    .get("gsm8k", {})
+    .get("exact_match,flexible-extract", "N/A")
+)
+print("=========================================")
+print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
+print("=========================================")
+print(json.dumps(data.get("results", {}), indent=2))
+PY
+  done
+
+  echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
 }
 
 write_metadata

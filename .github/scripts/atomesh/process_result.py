@@ -17,6 +17,7 @@ RESULT_RE = re.compile(
 )
 TOPOLOGY_RE = re.compile(r"(?P<p>\d+)p(?P<d>\d+)d", re.IGNORECASE)
 TP_RE = re.compile(r"tp(?P<tp>\d+)", re.IGNORECASE)
+EVAL_CONC_RE = re.compile(r"(?:^|[_-])c(?P<conc>\d+)(?:$|[_-])", re.IGNORECASE)
 
 
 def number(*values: Any) -> float | None:
@@ -443,7 +444,7 @@ def dashboard_point_entry(point: dict[str, Any], extra: str) -> dict[str, Any] |
 def collect_dashboard_entries(
     paths: list[Path],
     run_url: str | None,
-    gsm8k: float | None,
+    gsm8k_scores: dict[int, float],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     entries: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
@@ -457,6 +458,9 @@ def collect_dashboard_entries(
         if not fields:
             continue
         payload = enrich_payload(path, payload, fields)
+        gsm8k = gsm8k_scores.get(int(payload.get("max_concurrency", fields["conc"])))
+        if gsm8k is not None:
+            payload["gsm8k"] = gsm8k
         extra = extra_text(payload, run_url, payload.get("slurm_job_id"))
         point = perf_point(path, payload, fields, run_url, gsm8k)
         point_entry = dashboard_point_entry(point, extra)
@@ -466,11 +470,22 @@ def collect_dashboard_entries(
     return entries, rows
 
 
-def find_eval_scores(root: Path) -> list[float]:
-    scores = []
+def eval_concurrency(path: Path) -> int | None:
+    for part in reversed(path.parts):
+        match = EVAL_CONC_RE.search(part)
+        if match:
+            return int(match.group("conc"))
+    return None
+
+
+def find_eval_scores(root: Path) -> dict[int, float]:
+    scores = {}
     for path in sorted(root.rglob("results*.json")):
         payload = read_json(path)
         if not payload:
+            continue
+        conc = eval_concurrency(path)
+        if conc is None:
             continue
         result = payload.get("results", {}).get("gsm8k", {})
         score = number(
@@ -479,13 +494,11 @@ def find_eval_scores(root: Path) -> list[float]:
             result.get("acc"),
         )
         if score is not None:
-            scores.append(score)
+            scores[conc] = score
     return scores
 
 
-def write_summary(
-    rows: list[dict[str, Any]], summary_path: Path, gsm8k: float | None
-) -> None:
+def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
     lines = [
         "### ATOMesh Model Performance Benchmark Summary",
         "",
@@ -510,7 +523,7 @@ def write_summary(
                 ttft=fmt(row.get("mean_ttft_ms")),
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
-                gsm8k=fmt(gsm8k),
+                gsm8k=fmt(row.get("gsm8k")),
             )
         )
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -533,13 +546,13 @@ def main() -> None:
 
     root = Path(args.result_dir)
     bench_paths = list(root.rglob("pd-*.json"))
-    eval_scores = find_eval_scores(root)
-    gsm8k = eval_scores[0] if eval_scores else None
-    entries, rows = collect_dashboard_entries(bench_paths, args.run_url, gsm8k)
+    gsm8k_scores = find_eval_scores(root)
+    entries, rows = collect_dashboard_entries(bench_paths, args.run_url, gsm8k_scores)
     Path(args.output).write_text(json.dumps(entries, indent=2), encoding="utf-8")
-    write_summary(rows, Path(args.summary), gsm8k)
+    write_summary(rows, Path(args.summary))
     print(
-        f"Generated {len(entries)} dashboard entries from {len(rows)} benchmark result(s)"
+        f"Generated {len(entries)} dashboard entries from {len(rows)} benchmark result(s) "
+        f"and {len(gsm8k_scores)} GSM8K score(s)"
     )
 
 
