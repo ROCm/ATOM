@@ -130,7 +130,7 @@ jobs:
           path: atomesh-matrix.json
 
   run-model-benchmark:
-    name: Run ATOMesh P/D (${{ matrix.id }})
+    name: ${{ matrix.id }}
     needs: [load-config]
     if: >-
       needs.load-config.outputs.has_matrix == 'true'
