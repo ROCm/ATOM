@@ -178,10 +178,36 @@ jobs:
         id: gpu-info
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.runner }}"
 
+      - name: Resolve local model path
+        run: |
+          set -euo pipefail
+          if [ -z "${MODEL_CACHE_MOUNT}" ]; then
+            echo "SGLANG_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
+            echo "No shared model cache mount; local model resolution skipped."
+            exit 0
+          fi
+
+          model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
+          if $CONTAINER_ENGINE exec \
+            -e MODEL_DIR="$model_dir" \
+            "$CONTAINER_NAME" \
+            bash -lc '[ -f "$MODEL_DIR/config.json" ]'; then
+            echo "Resolved local model path: ${model_dir}"
+            echo "SGLANG_MODEL_AVAILABLE_LOCALLY=true" >> "$GITHUB_ENV"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
+          else
+            echo "Local model path not found for ${{ matrix.model_path }} under ${model_dir}."
+            echo "SGLANG_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Download model if needed
         run: |
           set -euo pipefail
           model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
+          if [ "${SGLANG_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
+            echo "Using local model path ${SGLANG_RESOLVED_MODEL_PATH}; skip download."
+            exit 0
+          fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
             if ! $CONTAINER_ENGINE exec \
@@ -246,6 +272,10 @@ jobs:
       - name: Resolve SGLANG model path
         if: success()
         run: |
+          if [ "${SGLANG_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
+            echo "Using previously resolved local model path: ${SGLANG_RESOLVED_MODEL_PATH}"
+            exit 0
+          fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_CACHE_ROOT}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: ${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
