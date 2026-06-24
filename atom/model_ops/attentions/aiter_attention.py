@@ -569,87 +569,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         from aiter import dtypes
 
         if _is_indexed_sparse_attention(module):
-            # MiniMax-M3 sparse attention. Binding is ADDITIVE: the standard
-            # 5D-SHUFFLE K/V + real fp8 scales (same as the plain MHA path below)
-            # PLUS the page-128 indexer-key cache bound onto the impl. The impl's
-            # rope_cache reads K/V/scale off the returned KVCacheTensor and the
-            # index cache off self.index_cache; no model-level bind_kv_cache.
-            from atom.model_ops.minimax_m3.sparse_attn import (
-                ASM_PAGE_SIZE,
-                PAGES_PER_SPARSE_BLOCK,
-            )
-
+            # MiniMax-M3 sparse attention. The KV cache uses the SAME allocation
+            # and binding as standard MHA — we only additionally bind the separate
+            # indexer-key cache here, then fall through to the standard branch for
+            # all K/V + scale binding (it sets module.k_cache/v_cache/k_scale/
+            # v_scale and returns the KVCacheTensor). The standard binding is
+            # page-128 SHUFFLE; SparseMHAPagedAttentionImpl.rope_cache re-views it
+            # to page-16 SHUFFLE (zero-copy) at attention time. index_cache is a
+            # genuinely separate cache (not derivable from the KV cache), so the
+            # runner assigns each sparse layer its own slice here.
             runner = self.model_runner
-            config = runner.config
-            hf_config = config.hf_config
-            impl = module.impl
-
             sparse_idx = runner._sparse_attention_cache_next
             runner._sparse_attention_cache_next += 1
-
-            # MiniMax-M3 ASM/gluon path reinterprets the page-128 KV storage as
-            # page-16 SHUFFLE: each logical 128-block is 8 contiguous physical
-            # 16-pages, so num_phys16 = num_blocks * 8 and the page dim is 16
-            # (NOT physical_block_size=128). The fused-insert writes and the gluon
-            # PA read both go through THESE views; using the page-128 geometry
-            # silently writes/reads the wrong slots -> garbage attention.
-            #   storage per layer: [num_blocks, 128, num_kv_heads, head_dim]
-            #   K: [num_blocks*8, num_kv_heads, head_dim//x, 16, x]
-            #   V: [num_blocks*8, num_kv_heads, 16//x, head_dim, x]
-            x = 16 // runner.kv_cache.element_size()
-            num_phys16 = runner.num_physical_kvcache_blocks * PAGES_PER_SPARSE_BLOCK
-            k_cache = runner.kv_cache[0, layer_id].view(
-                num_phys16,
-                runner.num_kv_heads,
-                hf_config.head_dim // x,
-                ASM_PAGE_SIZE,
-                x,
-            )
-            v_cache = runner.kv_cache[1, layer_id].view(
-                num_phys16,
-                runner.num_kv_heads,
-                ASM_PAGE_SIZE // x,
-                hf_config.head_dim,
-                x,
-            )
-            if config.kv_cache_dtype == "fp8":
-                # The scale buffer is stored page-128 [num_blocks, nkv, 128] but
-                # the fp8 write (fused_qknorm_idxrqknorm) and the gluon reader both
-                # index it in the SAME page-16 SHUFFLE layout as the KV cache:
-                # [num_blocks*8, nkv, 16]. 128 == 8*16 so this is a zero-copy
-                # reinterpretation; the row stride becomes 16 so a page-16 block id
-                # lands on the right scale. Without this view, gluon multiplies a
-                # page-16 block id by the page-128 row stride (128) and reads scales
-                # 8x out of position, corrupting fp8 attention once blocks reuse.
-                k_scale = runner.kv_scale[0, layer_id].view(
-                    num_phys16,
-                    runner.num_kv_heads,
-                    ASM_PAGE_SIZE,
-                )
-                v_scale = runner.kv_scale[1, layer_id].view(
-                    num_phys16,
-                    runner.num_kv_heads,
-                    ASM_PAGE_SIZE,
-                )
-                module.k_scale = k_scale
-                module.v_scale = v_scale
-                impl.k_scale = k_scale
-                impl.v_scale = v_scale
-
-            module.max_model_len = config.max_model_len
-            module.k_cache = k_cache
-            module.v_cache = v_cache
-            # Indexer-key cache lives on the impl (page-128 [blocks, 128, idx_dim]).
-            impl.index_cache = runner.sparse_attention_index_cache[sparse_idx]
-            impl.max_model_len = config.max_model_len
-
-            return KVCacheTensor(
-                layer_num=layer_id,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                k_scale=module.k_scale,
-                v_scale=module.v_scale,
-            )
+            module.impl.index_cache = runner.sparse_attention_index_cache[sparse_idx]
+            module.impl.max_model_len = runner.config.max_model_len
+            # NOTE: no return — fall through to the standard MHA binding below.
 
         if not (
             hasattr(module, "base_attention")
