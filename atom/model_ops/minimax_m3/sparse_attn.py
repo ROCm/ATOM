@@ -23,6 +23,14 @@ except ModuleNotFoundError:
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 
+# Page-16 SHUFFLE layout for the AITER ASM / gluon paged-attention path. The KV
+# cache is allocated with physical page size 16 (the ASM kernel page), and each
+# logical sparse block (128 tokens) spans PAGES_PER_SPARSE_BLOCK contiguous
+# physical 16-pages. Used by the fused SHUFFLE KV-insert and the sparse
+# block-table builders.
+ASM_PAGE_SIZE = 16
+PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE  # 8
+
 
 @dataclass
 class MiniMaxM3SparsePrefillMetadata:
@@ -605,4 +613,247 @@ def minimax_m3_sparse_attn_decode(
         output.stride(1),
         output.stride(2),
         NUM_TOPK_CHUNKS=num_topk_chunks,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fused qknorm + RoPE + KV insert (SHUFFLE main cache writer).
+#
+# Fused Gemma-RMSNorm + partial-NeoX-RoPE + page-16 SHUFFLE KV insert.
+# This lets AITER ASM paged-attention (``pa_fwd_asm``) read the M3 main KV
+# cache during decode.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _gemma_norm_rope_head(
+    row_ptr,  # pointer to this head's input row (head_dim contiguous)
+    w_ptr,  # norm weight [head_dim]
+    cos_ptr,  # [half] cos for this token
+    sin_ptr,  # [half] sin for this token
+    HEAD_DIM: tl.constexpr,
+    ROT_HALF: tl.constexpr,  # rotary_dim // 2
+    eps,
+):
+    """Gemma (1+w) RMSNorm in fp32 + partial NeoX RoPE; returns fp32 [HEAD_DIM].
+
+    Processes the head as low/high halves so the rope pairing (d, d+half) is a
+    plain elementwise op between the two half-vectors (no register permutation).
+    """
+    d = tl.arange(0, HEAD_DIM)
+    vals = tl.load(row_ptr + d).to(tl.float32)
+    w = tl.load(w_ptr + d).to(tl.float32)
+    var = tl.sum(vals * vals, axis=0) / HEAD_DIM
+    normed = vals * tl.rsqrt(var + eps) * (1.0 + w)  # [HEAD_DIM] fp32
+
+    # rotate-half partner: for d in [0,half) partner = normed[d+half];
+    #                      for d in [half,rot) partner = normed[d-half].
+    dh = tl.arange(0, HEAD_DIM)
+    is_low = dh < ROT_HALF
+    in_rot = dh < (2 * ROT_HALF)
+    partner_idx = tl.where(is_low, dh + ROT_HALF, dh - ROT_HALF)
+    # gather partner from `normed` via masked load of the head again (same source,
+    # post-norm): recompute is cheap and avoids register permute. Load partner raw
+    # then norm it with its own weight.
+    pvals = tl.load(row_ptr + partner_idx, mask=in_rot, other=0.0).to(tl.float32)
+    pw = tl.load(w_ptr + partner_idx, mask=in_rot, other=0.0).to(tl.float32)
+    # partner shares the SAME rms variance (same head), so normed partner:
+    p_normed = pvals * tl.rsqrt(var + eps) * (1.0 + pw)
+
+    # cos/sin per d: index j = d for low, d-half for high (both in [0,half)).
+    j = tl.where(is_low, dh, dh - ROT_HALF)
+    cos = tl.load(cos_ptr + j, mask=in_rot, other=0.0)
+    sin = tl.load(sin_ptr + j, mask=in_rot, other=0.0)
+    # low:  normed*cos - partner*sin ; high: normed*cos + partner*sin
+    sign = tl.where(is_low, -1.0, 1.0)
+    roped = normed * cos + sign * p_normed * sin
+    return tl.where(in_rot, roped, normed)
+
+
+@triton.jit
+def _fused_qknorm_rope_kv_insert_shuffle_kernel(
+    qkv_ptr,  # [num_tokens, row_elems]
+    q_norm_w_ptr,  # [head_dim]
+    k_norm_w_ptr,  # [head_dim]
+    iq_norm_w_ptr,  # [idx_head_dim]
+    ik_norm_w_ptr,  # [idx_head_dim]
+    cos_sin_ptr,  # [max_pos, rotary_dim]  (first half cos, second half sin)
+    positions_ptr,  # [num_tokens] int64
+    slot_mapping_ptr,  # [num_tokens] int64 (logical slot = block*128 + offset)
+    q_out_ptr,  # [num_tokens, num_heads*head_dim]
+    iq_out_ptr,  # [num_tokens, num_index_heads*idx_head_dim]
+    kc_ptr,  # SHUFFLE K [nb, nkv, head_dim//x, 16, x]  (contiguous)
+    vc_ptr,  # SHUFFLE V [nb, nkv, 16//x, head_dim, x]  (contiguous)
+    index_cache_ptr,  # [*, idx_head_dim]  flat page-128 (contiguous)
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    num_index_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    idx_head_dim: tl.constexpr,
+    rotary_dim: tl.constexpr,
+    eps,
+    row_elems: tl.constexpr,
+    x: tl.constexpr,  # 16 // itemsize
+    ASM_PAGE: tl.constexpr,  # 16
+):
+    """Fused Gemma-RMSNorm + partial-NeoX-RoPE + SHUFFLE KV insert, one token/program.
+
+    Sub-ops (match the PyTorch reference exactly):
+      (1) q[num_heads]        : norm(q_norm) + rope            -> q_out
+      (2) index_q[niq]        : norm(iq_norm) + rope           -> iq_out
+      (3) k[num_kv_heads]     : norm(k_norm) + rope            -> SHUFFLE K cache
+      (4) v[num_kv_heads]     : raw                            -> SHUFFLE V cache
+      (5) index_k[1]          : norm(ik_norm) + rope           -> index_cache (page-128 flat)
+    """
+    tok = tl.program_id(0)
+    half = rotary_dim // 2
+    pos = tl.load(positions_ptr + tok)
+    cos_row = cos_sin_ptr + pos * rotary_dim  # [:half] cos
+    sin_row = cos_sin_ptr + pos * rotary_dim + half  # [half:] sin
+
+    # qkv row layout: [q (nq*hd) | k (nkv*hd) | v (nkv*hd) | iq (niq*idx) | ik (idx)]
+    q_base = 0
+    k_base = num_heads * head_dim
+    v_base = k_base + num_kv_heads * head_dim
+    iq_base = v_base + num_kv_heads * head_dim
+    ik_base = iq_base + num_index_heads * idx_head_dim
+    row = qkv_ptr + tok * row_elems
+    d = tl.arange(0, head_dim)
+
+    # ----- (1) q heads -----
+    for h in tl.static_range(num_heads):
+        out = _gemma_norm_rope_head(
+            row + q_base + h * head_dim,
+            q_norm_w_ptr,
+            cos_row,
+            sin_row,
+            head_dim,
+            half,
+            eps,
+        )
+        tl.store(
+            q_out_ptr + tok * (num_heads * head_dim) + h * head_dim + d,
+            out.to(q_out_ptr.dtype.element_ty),
+        )
+
+    # ----- (2) index_q heads -----
+    for h in tl.static_range(num_index_heads):
+        out = _gemma_norm_rope_head(
+            row + iq_base + h * idx_head_dim,
+            iq_norm_w_ptr,
+            cos_row,
+            sin_row,
+            idx_head_dim,
+            half,
+            eps,
+        )
+        di = tl.arange(0, idx_head_dim)
+        tl.store(
+            iq_out_ptr + tok * (num_index_heads * idx_head_dim) + h * idx_head_dim + di,
+            out.to(iq_out_ptr.dtype.element_ty),
+        )
+
+    slot = tl.load(slot_mapping_ptr + tok)
+    page = slot // ASM_PAGE
+    s = slot % ASM_PAGE
+    valid_slot = slot >= 0
+
+    # ----- (3) k heads -> SHUFFLE K, (4) v heads -> SHUFFLE V -----
+    # K [nb, nkv, hd//x, 16, x]: off(d) = ((page*nkv+h)*(hd//x)+d//x)*16*x + s*x + d%x
+    # V [nb, nkv, 16//x, hd, x]: off(d) = ((page*nkv+h)*(16//x)+s//x)*hd*x + d*x + s%x
+    for h in tl.static_range(num_kv_heads):
+        kout = _gemma_norm_rope_head(
+            row + k_base + h * head_dim,
+            k_norm_w_ptr,
+            cos_row,
+            sin_row,
+            head_dim,
+            half,
+            eps,
+        )
+        k_off = (
+            ((page * num_kv_heads + h) * (head_dim // x) + d // x) * (ASM_PAGE * x)
+            + s * x
+            + (d % x)
+        )
+        tl.store(kc_ptr + k_off, kout.to(kc_ptr.dtype.element_ty), mask=valid_slot)
+
+        vvals = tl.load(row + v_base + h * head_dim + d)  # raw, no norm/rope
+        v_off = (
+            ((page * num_kv_heads + h) * (ASM_PAGE // x) + s // x) * (head_dim * x)
+            + d * x
+            + (s % x)
+        )
+        tl.store(vc_ptr + v_off, vvals.to(vc_ptr.dtype.element_ty), mask=valid_slot)
+
+    # ----- (5) index_k -> index_cache page-128 flat scatter -----
+    ikout = _gemma_norm_rope_head(
+        row + ik_base, ik_norm_w_ptr, cos_row, sin_row, idx_head_dim, half, eps
+    )
+    di = tl.arange(0, idx_head_dim)
+    tl.store(
+        index_cache_ptr + slot * idx_head_dim + di,
+        ikout.to(index_cache_ptr.dtype.element_ty),
+        mask=valid_slot,
+    )
+
+
+@torch.no_grad()
+def minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
+    qkv: torch.Tensor,  # [num_tokens, q_size + 2*kv_size + iq_size + ik_size]
+    q_norm_weight: torch.Tensor,  # [head_dim]
+    k_norm_weight: torch.Tensor,  # [head_dim]
+    cos_sin_cache: torch.Tensor,  # [max_pos, rotary_dim]
+    positions: torch.Tensor,  # [num_tokens] int
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    eps: float,
+    index_q_norm_weight: torch.Tensor,  # [idx_head_dim]
+    index_k_norm_weight: torch.Tensor,  # [idx_head_dim]
+    num_index_heads: int,
+    slot_mapping: torch.Tensor,  # [num_tokens] int64 logical slots
+    kv_cache_k: torch.Tensor,  # SHUFFLE K cache [phys, num_kv_heads, head_dim//x, 16, x]
+    kv_cache_v: torch.Tensor,  # SHUFFLE V cache [phys, num_kv_heads, 16//x, head_dim, x]
+    index_cache: torch.Tensor,  # index K cache, viewable as [-1, idx_head_dim]
+    q_out: torch.Tensor,  # [num_tokens, q_size] normed+roped q
+    index_q_out: torch.Tensor,  # [num_tokens, iq_size] normed+roped index_q
+    idx_head_dim: int,
+) -> None:
+    """Fused Gemma-RMSNorm + partial-NeoX-RoPE + page-16 SHUFFLE KV insert (Triton).
+
+    One fused kernel doing q/index_q norm+rope (-> q_out/index_q_out), k norm+rope
+    + raw v -> SHUFFLE K/V cache, and index_k norm+rope -> page-128 index cache.
+    Math matches the AITER fused op oracle; K/V writes match
+    ``reshape_and_cache(asm_layout=True)``.
+    """
+    num_tokens = qkv.shape[0]
+    head_dim = q_norm_weight.shape[-1]
+    x = 16 // kv_cache_k.element_size()
+    assert head_dim == 128, "M3 fused shuffle insert requires head_dim == 128"
+    assert kv_cache_k.is_contiguous() and kv_cache_v.is_contiguous()
+    assert index_cache.is_contiguous()
+
+    _fused_qknorm_rope_kv_insert_shuffle_kernel[(num_tokens,)](
+        qkv,
+        q_norm_weight,
+        k_norm_weight,
+        index_q_norm_weight,
+        index_k_norm_weight,
+        cos_sin_cache,
+        positions,
+        slot_mapping,
+        q_out,
+        index_q_out,
+        kv_cache_k,
+        kv_cache_v,
+        index_cache,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        num_index_heads=num_index_heads,
+        head_dim=head_dim,
+        idx_head_dim=idx_head_dim,
+        rotary_dim=rotary_dim,
+        eps=eps,
+        row_elems=qkv.shape[1],
+        x=x,
+        ASM_PAGE=16,
     )

@@ -88,3 +88,198 @@ def test_attention_accepts_impl_cls_kwarg():
     assert "impl_cls" in params, "Attention.__init__ must accept impl_cls"
     # Default None so existing models fall back to attn_backend.get_impl_cls().
     assert params["impl_cls"].default is None
+
+
+# ── Task 1: page-16 constants + fused SHUFFLE KV-insert ────────────────────────
+
+import torch  # noqa: E402
+
+_HAS_CUDA = torch.cuda.is_available()
+_gpu = pytest.mark.skipif(not _HAS_CUDA, reason="requires CUDA/ROCm")
+
+HEAD_DIM = 128
+ROTARY_DIM = 64
+
+
+def _gemma_rmsnorm(x, weight, eps):
+    xf = x.float()
+    var = xf.pow(2).mean(dim=-1, keepdim=True)
+    return xf * torch.rsqrt(var + eps) * (1.0 + weight.float())
+
+
+def _apply_rope_neox_partial(x, positions, cos_sin_cache, rotary_dim):
+    half = rotary_dim // 2
+    cos_sin = cos_sin_cache[positions].float()
+    cos = cos_sin[..., :half].unsqueeze(1)
+    sin = cos_sin[..., half:].unsqueeze(1)
+    rot = x[..., :rotary_dim]
+    x1 = rot[..., :half]
+    x2 = rot[..., half:]
+    out = x.clone()
+    out[..., :half] = x1 * cos - x2 * sin
+    out[..., half:rotary_dim] = x2 * cos + x1 * sin
+    return out
+
+
+def _norm_rope_ref(x, weight, positions, cos_sin_cache, eps, dtype):
+    normed = _gemma_rmsnorm(x.float(), weight, eps)
+    return _apply_rope_neox_partial(normed, positions, cos_sin_cache, ROTARY_DIM).to(
+        dtype
+    )
+
+
+def _make_cos_sin_cache(max_pos, rotary_dim, dtype):
+    base = 5_000_000.0
+    inv_freq = 1.0 / (
+        base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device="cuda")
+            / rotary_dim
+        )
+    )
+    positions = torch.arange(max_pos, dtype=torch.float32, device="cuda")
+    freqs = torch.einsum("i,j->ij", positions, inv_freq)
+    return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype)
+
+
+def test_page16_constants():
+    from atom.model_ops.minimax_m3.sparse_attn import (
+        ASM_PAGE_SIZE,
+        PAGES_PER_SPARSE_BLOCK,
+        SPARSE_BLOCK_SIZE,
+    )
+
+    assert ASM_PAGE_SIZE == 16
+    assert PAGES_PER_SPARSE_BLOCK == SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE == 8
+
+
+@_gpu
+def test_fused_qknorm_rope_kv_insert_shuffle_roundtrip():
+    """The fused Gemma-RMSNorm + partial-NeoX-RoPE + page-16 SHUFFLE KV insert
+    must match a pure-PyTorch reference for q_out/index_q_out and round-trip the
+    K/V/index caches at each token's slot."""
+    from atom.model_ops.minimax_m3.sparse_attn import (
+        minimax_m3_fused_qknorm_rope_kv_insert_shuffle,
+    )
+
+    torch.manual_seed(123)
+    dtype = torch.bfloat16
+    eps = 1e-6
+    max_pos = 4096
+    num_tokens = 17
+    block_size = 16  # ASM_PAGE
+    num_heads, num_kv_heads, num_index_heads = 16, 4, 4
+    x = 16 // dtype.itemsize  # bf16 -> 8
+
+    q_w = torch.randn(HEAD_DIM, dtype=dtype, device="cuda") * 0.1
+    k_w = torch.randn(HEAD_DIM, dtype=dtype, device="cuda") * 0.1
+    iq_w = torch.randn(HEAD_DIM, dtype=dtype, device="cuda") * 0.1
+    ik_w = torch.randn(HEAD_DIM, dtype=dtype, device="cuda") * 0.1
+    cos_sin = _make_cos_sin_cache(max_pos, ROTARY_DIM, dtype)
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
+
+    q_size = num_heads * HEAD_DIM
+    kv_size = num_kv_heads * HEAD_DIM
+    iq_size = num_index_heads * HEAD_DIM
+    ik_size = HEAD_DIM
+    qkv = torch.randn(
+        num_tokens, q_size + 2 * kv_size + iq_size + ik_size, dtype=dtype, device="cuda"
+    )
+    qkv_orig = qkv.clone()
+
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    num_phys_blocks = num_blocks + 1
+    slot_mapping = torch.randperm(
+        num_phys_blocks * block_size, dtype=torch.int64, device="cuda"
+    )[:num_tokens]
+
+    kv_cache_k = torch.zeros(
+        num_phys_blocks,
+        num_kv_heads,
+        HEAD_DIM // x,
+        block_size,
+        x,
+        dtype=dtype,
+        device="cuda",
+    )
+    kv_cache_v = torch.zeros(
+        num_phys_blocks,
+        num_kv_heads,
+        block_size // x,
+        HEAD_DIM,
+        x,
+        dtype=dtype,
+        device="cuda",
+    )
+    index_cache = torch.zeros(
+        num_phys_blocks, block_size, HEAD_DIM, dtype=dtype, device="cuda"
+    )
+    q_out = torch.empty(num_tokens, q_size, dtype=dtype, device="cuda")
+    index_q_out = torch.empty(num_tokens, iq_size, dtype=dtype, device="cuda")
+
+    minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
+        qkv,
+        q_w,
+        k_w,
+        cos_sin,
+        positions,
+        num_heads,
+        num_kv_heads,
+        ROTARY_DIM,
+        eps,
+        iq_w,
+        ik_w,
+        num_index_heads,
+        slot_mapping,
+        kv_cache_k,
+        kv_cache_v,
+        index_cache,
+        q_out,
+        index_q_out,
+        HEAD_DIM,
+    )
+
+    q_in, k_in, v_in, iq_in, ik_in = qkv_orig.split(
+        [q_size, kv_size, kv_size, iq_size, ik_size], dim=-1
+    )
+    q_ref = _norm_rope_ref(
+        q_in.view(num_tokens, num_heads, HEAD_DIM), q_w, positions, cos_sin, eps, dtype
+    ).view(num_tokens, q_size)
+    iq_ref = _norm_rope_ref(
+        iq_in.view(num_tokens, num_index_heads, HEAD_DIM),
+        iq_w,
+        positions,
+        cos_sin,
+        eps,
+        dtype,
+    ).view(num_tokens, iq_size)
+    k_ref = _norm_rope_ref(
+        k_in.view(num_tokens, num_kv_heads, HEAD_DIM),
+        k_w,
+        positions,
+        cos_sin,
+        eps,
+        dtype,
+    )
+    ik_ref = _norm_rope_ref(
+        ik_in.view(num_tokens, 1, HEAD_DIM), ik_w, positions, cos_sin, eps, dtype
+    ).view(num_tokens, HEAD_DIM)
+    v_ref = v_in.view(num_tokens, num_kv_heads, HEAD_DIM)
+
+    torch.testing.assert_close(q_out, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(index_q_out, iq_ref, rtol=1e-2, atol=1e-2)
+
+    d = torch.arange(HEAD_DIM, device="cuda")
+    for token in range(num_tokens):
+        slot = slot_mapping[token].item()
+        phys, intra = slot // block_size, slot % block_size
+        for h in range(num_kv_heads):
+            k_back = kv_cache_k[phys, h, d // x, intra, d % x]
+            torch.testing.assert_close(k_back, k_ref[token, h], rtol=1e-2, atol=1e-2)
+            v_back = kv_cache_v[phys, h, intra // x, d, intra % x]
+            torch.testing.assert_close(v_back, v_ref[token, h], rtol=0, atol=0)
+        torch.testing.assert_close(
+            index_cache.view(-1, HEAD_DIM)[slot], ik_ref[token], rtol=1e-2, atol=1e-2
+        )
