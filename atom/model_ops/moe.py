@@ -146,6 +146,30 @@ class FusedMoEParallelConfig:
             tp_size = tp_size_
             tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
 
+        # PCP moe_pcp_merge: fold the prefill-context-parallel dim into the MoE
+        # tensor/expert sharding so the W=pcp_size redundant copies become real
+        # shards (intermediate//W*tp or expert//W*tp). The flattened rank MUST be
+        # `pcp_rank * tp_size + tp_rank`: this makes each TP group [0..tp-1] own a
+        # contiguous half and its PCP partner own the other half, so the existing
+        # tp all_reduce + the new pcp reduce_scatter (two orthogonal groups) sum
+        # all W*tp shards. The reversed mapping would make PCP partners overlap
+        # and double-count. ep_size/ep_rank below inherit tp_size/tp_rank, so EP
+        # is covered by the same flatten.
+        from aiter.dist.parallel_state import (
+            get_prefill_context_model_parallel_rank,
+            get_prefill_context_model_parallel_world_size,
+        )
+
+        pcp_merge = (
+            parallel_config.parallel_config.moe_pcp_merge
+            and get_prefill_context_model_parallel_world_size() > 1
+        )
+        if pcp_merge:
+            pcp_size = get_prefill_context_model_parallel_world_size()
+            pcp_rank = get_prefill_context_model_parallel_rank()
+            tp_rank = pcp_rank * tp_size + tp_rank
+            tp_size = pcp_size * tp_size
+
         atom_config = get_current_atom_config()
 
         if not use_ep:

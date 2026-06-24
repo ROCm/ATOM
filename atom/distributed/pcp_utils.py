@@ -111,6 +111,61 @@ def pcp_allgather_rerange(
     return out
 
 
+# ==== MoE-path PCP collectives (scheme B, rank-major gather + reduce_scatter) ====
+# Used by the MoE merge path (moe_pcp_merge_forward custom op). Because that op
+# is opaque to Dynamo (the collectives run eagerly inside it, NOT in the compiled
+# graph), we use the NATURAL collectives — no all-reduce emulation needed. The
+# earlier all-reduce-only scheme was a workaround for "collectives miscompiled
+# inside the @support_torch_compile graph"; with the opaque-op fix (方向C) the
+# gather/scatter no longer live in the traced graph, so plain all_gather /
+# reduce_scatter are correct and cheaper (all_gather moves W× fewer bytes).
+#
+# Rank-major all_gather + reduce_scatter are a mutually-inverse pair:
+#   - gather (1/W -> full): all_gather(dim=0) concats rank-major, so rank r's
+#     1/W stripe lands at rows [r*L:(r+1)*L]. MoE is per-token so the rank-major
+#     (not global) order is fine.
+#   - reduce_scatter (full partial-sum -> 1/W): sums the pcp-half across ranks
+#     AND scatters dim0 back so rank r receives the summed chunk r == its own
+#     original stripe tokens. No rerange/slice needed.
+
+
+def pcp_allgather_rankmajor(
+    input_: torch.Tensor, pcp_size: Optional[int] = None
+) -> torch.Tensor:
+    """Gather this rank's 1/W stripe shard into the full rank-major sequence
+    via a plain all_gather (dim=0). Inverse of pcp_reduce_scatter."""
+    if pcp_size is None:
+        pcp_size = get_pcp_world_size()
+    if pcp_size <= 1:
+        return input_
+    return get_pcp_group().all_gather(input_.contiguous(), dim=0)
+
+
+def pcp_reduce_scatter(
+    input_: torch.Tensor, pcp_size: Optional[int] = None
+) -> torch.Tensor:
+    """Sum the pcp-half across ranks and scatter dim0 back to this rank's 1/W
+    stripe via a plain reduce_scatter (dim=0). Inverse of pcp_allgather_rankmajor."""
+    if pcp_size is None:
+        pcp_size = get_pcp_world_size()
+    if pcp_size <= 1:
+        return input_
+    return get_pcp_group().reduce_scatter(input_.contiguous(), dim=0)
+
+
+def pcp_all_reduce(input_: torch.Tensor, pcp_size: Optional[int] = None) -> torch.Tensor:
+    """All-reduce (sum) over the PCP group, no token reshaping. DECODE path:
+    tokens are pcp-redundant (every rank holds the same full batch), so just sum
+    the pcp-half of the intermediate that combine_outputs' tp all_reduce missed.
+    Uses aiter's compile-safe custom-op all_reduce.
+    """
+    if pcp_size is None:
+        pcp_size = get_pcp_world_size()
+    if pcp_size <= 1:
+        return input_
+    return get_pcp_group().all_reduce(input_)
+
+
 def pcp_round_robin_query_indices(
     n_global_q: int, pcp_size: Optional[int] = None, pcp_rank: Optional[int] = None
 ) -> torch.Tensor:
