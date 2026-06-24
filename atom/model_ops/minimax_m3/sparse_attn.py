@@ -35,6 +35,7 @@ PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE  # 8
 
 @dataclass
 class MiniMaxM3SparsePrefillMetadata:
+    qo_indptr: torch.Tensor
     cu_seqlens_q: torch.Tensor
     seq_lens: torch.Tensor
     context_lens: torch.Tensor
@@ -70,10 +71,13 @@ def make_sparse_prefill_metadata(
     max_query_len: int,
     max_seq_len: int,
     num_prefills: int,
+    num_prefill_tokens: int,
 ) -> MiniMaxM3SparseMetadata:
     query_lens = cu_seqlens_q[1 : num_prefills + 1] - cu_seqlens_q[:num_prefills]
     prefix_lens = seq_lens - query_lens
+    qo_indptr = torch.arange(num_prefill_tokens, dtype=torch.int32, device="cuda")
     prefill = MiniMaxM3SparsePrefillMetadata(
+        qo_indptr=qo_indptr,
         cu_seqlens_q=cu_seqlens_q,
         seq_lens=seq_lens,
         context_lens=prefix_lens,

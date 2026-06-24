@@ -732,6 +732,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=attn_metadata.max_seqlen_q,
                 max_seq_len=attn_metadata.max_seqlen_k,
                 num_prefills=bs,
+                num_prefill_tokens=batch.total_tokens_num_prefill,
             )
         if self._tbo_token_split:
             self._stash_tbo_token_split_prefill_state(batch)

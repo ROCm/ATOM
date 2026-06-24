@@ -886,40 +886,6 @@ class PagedAttentionImpl(nn.Module):
         )
 
 
-def _minimax_m3_cos_sin_cache(
-    rotary_emb: nn.Module,
-    query: torch.Tensor,
-) -> torch.Tensor:
-    """Build (and cache on the rope module) the concatenated [cos, sin] table the
-    AITER fused qknorm+rope op expects, matching the model dtype/device."""
-    cache_name = "_minimax_m3_cos_sin_cache"
-    cos_cache = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
-    cached = getattr(rotary_emb, cache_name, None)
-    expected_shape = (*cos_cache.shape[:-1], cos_cache.shape[-1] * 2)
-    if (
-        cached is not None
-        and cached.dtype == query.dtype
-        and cached.device == query.device
-        and tuple(cached.shape) == expected_shape
-    ):
-        return cached
-
-    sin_cache = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
-    if cos_cache.dtype != query.dtype or cos_cache.device != query.device:
-        cos_cache = cos_cache.to(device=query.device, dtype=query.dtype)
-        sin_cache = sin_cache.to(device=query.device, dtype=query.dtype)
-    cos_sin_cache = torch.cat([cos_cache, sin_cache], dim=-1).contiguous()
-
-    if torch.compiler.is_compiling():
-        return cos_sin_cache
-
-    if cache_name in rotary_emb._buffers:
-        rotary_emb._buffers[cache_name] = cos_sin_cache
-    else:
-        rotary_emb.register_buffer(cache_name, cos_sin_cache, persistent=False)
-    return cos_sin_cache
-
-
 class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """MiniMax-M3 sparse attention as a first-class ``PagedAttentionImpl``.
 
@@ -1097,6 +1063,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         index_q = torch.empty(
             (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
         )
+        from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
+
         cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
 
         is_fp8 = self.kv_cache_dtype == "fp8"
@@ -1164,6 +1132,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         sm = getattr(attn_metadata, "sparse_attention_metadata", None)
         return sm if sm is not None else attn_metadata
 
+    @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
     def _sparse_prefill(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
@@ -1206,7 +1175,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             block_tables,
             None,  # query_req_id -> sync-free on-device fallback
             None,  # query_abs_pos -> sync-free on-device fallback
-            None,  # qo_indptr -> arange(total_q+1)
+            prefill_md.qo_indptr,  # qo_indptr -> arange(total_q+1)
             self.num_kv_heads,
             self.scale,
             output,
@@ -1217,9 +1186,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             sparse_bt=sparse_bt,
             sparse_ctx=sparse_ctx,
         )
+        output = output.view(*q.shape)
         self._index_q = None
         return output
 
+    @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
     def _sparse_decode(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
@@ -1265,4 +1236,5 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             sparse_ctx=sparse_ctx,
         )
         self._index_q = None
+        output = output.view(*q.shape)
         return output
