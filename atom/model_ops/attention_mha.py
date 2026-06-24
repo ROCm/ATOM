@@ -884,3 +884,108 @@ class PagedAttentionImpl(nn.Module):
         return self.forward_impl(
             q=query, k=key, v=value, position=position, q_scale=q_scale, qkv=qkv
         )
+
+
+class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
+    """MiniMax-M3 sparse attention as a first-class ``PagedAttentionImpl``.
+
+    Plugged into the standard ``Attention`` layer via ``impl_cls=`` so it reuses
+    the generic per-layer custom op (``unified_attention_with_output_base``) for
+    its torch.compile boundary, and the standard ``AiterAttentionMetadataBuilder``
+    for KV-cache allocation/binding. Only two framework hooks are overridden:
+
+    * :meth:`rope_cache` — MiniMax-M3 fused qk-norm + rope + page-16 SHUFFLE
+      KV-insert + indexer-key insert (``aiter.fused_qknorm_idxrqknorm`` /
+      ``minimax_m3_fused_qknorm_rope_kv_insert_shuffle``). Returns the rotated
+      query in the parent's 7-tuple contract and stashes the rotated indexer
+      query on ``self._index_q`` for :meth:`dispatch_backend` (the parent tuple
+      has no slot for it; per-layer forward is single-threaded behind the op).
+    * :meth:`dispatch_backend` — selects the M3 sparse prefill/decode runners
+      (index top-k -> page-16 sparse block table -> gluon PA), with fp8 vs bf16
+      chosen by the KV cache dtype, not an env gate.
+
+    All indexer state (norms, rope, top-k params, index_cache handle) lives on
+    this impl instance — the model holds no sparse-attention runtime state.
+    """
+
+    is_indexed_sparse_attention = True
+
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+        alibi_slopes: list[float] | None = None,
+        sliding_window: Optional[int] = None,
+        kv_cache_dtype="bf16",
+        logits_soft_cap: float | None = None,
+        attn_type=None,
+        kv_sharing_target_layer_name: int | None = None,
+        layer_num=0,
+        mla_modules: Optional[MLAModules] = None,
+        sinks: Optional[nn.Parameter] = None,
+        rotary_emb: Optional[torch.nn.Module] = None,
+        q_norm: Optional[torch.nn.Module] = None,
+        k_norm: Optional[torch.nn.Module] = None,
+        # --- MiniMax-M3 sparse-attention indexer kwargs (all impl-local) ---
+        index_q_norm: Optional[torch.nn.Module] = None,
+        index_k_norm: Optional[torch.nn.Module] = None,
+        index_rotary_emb: Optional[torch.nn.Module] = None,
+        index_q_size: int = 0,
+        index_head_dim: int = 0,
+        topk: int = 0,
+        init_blocks: int = 0,
+        local_blocks: int = 0,
+        **kwargs,
+    ):
+        super().__init__(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=alibi_slopes,
+            sliding_window=sliding_window,
+            kv_cache_dtype=kv_cache_dtype,
+            logits_soft_cap=logits_soft_cap,
+            attn_type=attn_type,
+            kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+            layer_num=layer_num,
+            mla_modules=mla_modules,
+            sinks=sinks,
+            rotary_emb=rotary_emb,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            **kwargs,
+        )
+        # Indexer submodules + top-k parameters (impl-local state).
+        self.index_q_norm = index_q_norm
+        self.index_k_norm = index_k_norm
+        self.index_rotary_emb = index_rotary_emb
+        self.index_q_size = index_q_size
+        self.index_head_dim = index_head_dim
+        self.topk = topk
+        self.init_blocks = init_blocks
+        self.local_blocks = local_blocks
+        # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
+        # the page-128 indexer-key cache. None until the runner binds it.
+        self.index_cache: Optional[torch.Tensor] = None
+        # Rotated indexer query produced by rope_cache, consumed (and cleared) by
+        # dispatch_backend within the same single-threaded layer forward.
+        self._index_q: Optional[torch.Tensor] = None
+
+    # NOTE: rope_cache / dispatch_backend are skeleton delegations to the parent
+    # so the standard (non-sparse) path stays functional as the TDD floor. The
+    # MiniMax-M3 sparse behavior is filled in by Tasks 4 and 5.
+    @mark_trace(prefix="rope_cache", torch_compile=False)
+    def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
+        return super().rope_cache(q, k, v, qkv, position, fwd_ctx)
+
+    def dispatch_backend(
+        self,
+        fwd_ctx: ForwardContext,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        return super().dispatch_backend(fwd_ctx, q, k, v)
