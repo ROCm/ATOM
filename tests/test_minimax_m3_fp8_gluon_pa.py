@@ -655,3 +655,105 @@ def test_rope_cache_override_writes_caches_and_stashes_index_q(kv_cache_dtype):
         # fused op wrote per-token dequant scales
         assert (k_scale != 0).any()
         assert (v_scale != 0).any()
+
+
+# ── Task 5: SparseMHAPagedAttentionImpl.dispatch_backend override ───────────────
+
+
+@_gpu
+@pytest.mark.parametrize("kv_cache_dtype", ["bf16", "fp8"])
+def test_dispatch_backend_decode_runs_and_clears_index_q(kv_cache_dtype):
+    """dispatch_backend returns the decode callable; running it consumes
+    self._index_q (set by rope_cache), produces finite [tokens, nh, hd] output,
+    and clears _index_q afterwards."""
+    from types import SimpleNamespace
+
+    import aiter
+
+    dev = "cuda"
+    head_dim = 128
+    num_heads, num_kv_heads = 16, 1
+    batch = 4
+    block_size = 16
+    x = 16 // (1 if kv_cache_dtype == "fp8" else 2)
+    sparse_block = 128
+    pages_per_block = sparse_block // block_size
+
+    impl, _ = _build_sparse_impl(num_heads, num_kv_heads, head_dim, kv_cache_dtype, dev)
+
+    cache_dt = aiter.dtypes.fp8 if kv_cache_dtype == "fp8" else torch.bfloat16
+    # enough physical 16-pages to back the logical block table
+    max_seq = 512
+    max_blocks = max_seq // sparse_block
+    num_logical = batch * max_blocks + 2
+    num_phys16 = num_logical * pages_per_block
+    k_cache = torch.zeros(
+        num_phys16,
+        num_kv_heads,
+        head_dim // x,
+        block_size,
+        x,
+        dtype=cache_dt,
+        device=dev,
+    )
+    v_cache = torch.zeros(
+        num_phys16,
+        num_kv_heads,
+        block_size // x,
+        head_dim,
+        x,
+        dtype=cache_dt,
+        device=dev,
+    )
+    if kv_cache_dtype == "fp8":
+        # per physical 16-page, per kv head, block_size scales
+        k_scale = (
+            torch.rand(num_phys16, num_kv_heads, block_size, device=dev) * 0.01 + 0.01
+        )
+        v_scale = (
+            torch.rand(num_phys16, num_kv_heads, block_size, device=dev) * 0.01 + 0.01
+        )
+    else:
+        k_scale = v_scale = None
+    # fill caches with non-zero data so attention has something to read
+    k_cache.copy_((torch.randn_like(k_cache.float()) * 0.1).to(cache_dt))
+    v_cache.copy_((torch.randn_like(v_cache.float()) * 0.1).to(cache_dt))
+
+    # index cache is page-128 3D [num_logical_128, 128, idx_head_dim], indexed by
+    # the logical 128-granularity block_table inside the index-topk kernel.
+    impl.index_cache = (
+        torch.randn(
+            num_logical, sparse_block, head_dim, device=dev, dtype=torch.bfloat16
+        )
+        * 0.1
+    )
+
+    # logical block table: each request owns a contiguous logical range.
+    block_table = torch.arange(
+        batch * max_blocks, dtype=torch.int32, device=dev
+    ).reshape(batch, max_blocks)
+    seq_lens = torch.randint(130, max_seq, (batch,), dtype=torch.int32, device=dev)
+
+    decode_md = SimpleNamespace(block_table=block_table, seq_lens=seq_lens)
+    sparse_md = SimpleNamespace(decode=decode_md, prefill=None, max_seq_len=max_seq)
+    attn_md = SimpleNamespace(sparse_attention_metadata=sparse_md)
+    fwd_ctx = SimpleNamespace(
+        attn_metadata=attn_md, context=SimpleNamespace(is_prefill=False)
+    )
+
+    # rope_cache stashes _index_q; emulate by setting a valid indexer query.
+    impl._index_q = (
+        torch.randn(batch, num_kv_heads, head_dim, device=dev, dtype=torch.bfloat16)
+        * 0.1
+    )
+
+    backend = impl.dispatch_backend(fwd_ctx, None, None, None)
+    assert backend == impl._sparse_decode
+
+    q = torch.randn(batch, num_heads, head_dim, device=dev, dtype=torch.bfloat16) * 0.1
+    out = backend(q, None, None, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+
+    assert out.shape == (batch, num_heads, head_dim)
+    assert torch.isfinite(out).all()
+    # _index_q consumed + cleared
+    assert impl._index_q is None
