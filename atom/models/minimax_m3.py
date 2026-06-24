@@ -165,6 +165,14 @@ def _minimax_m3_gemma_qk_norm(
     )
 
 
+# When on (default), the RowParallel o_proj / down_proj / MoE skip their own
+# all-reduce and the following Gemma RMSNorm fuses all-reduce + residual-add +
+# norm (fused_allreduce_gemma_rms_norm). Set ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0
+# to disable: linears all-reduce themselves and the norm runs unfused. Both sides
+# read this same flag so they always move together.
+ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+
+
 class MiniMaxM3MLP(nn.Module):
     def __init__(
         self,
@@ -297,7 +305,7 @@ class MiniMaxM3MoE(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 params_dtype=params_dtype,
-                reduce_results=False,
+                reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                 renormalize=True,
                 activation=ActivationType.Swiglu,
                 scoring_func=getattr(config, "scoring_func", "sigmoid"),
@@ -322,7 +330,7 @@ class MiniMaxM3MoE(nn.Module):
                 config=config,
                 intermediate_size=config.intermediate_size * config.n_shared_experts,
                 quant_config=quant_config,
-                reduce_results=False,
+                reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                 prefix=f"{prefix}.shared_experts",
             )
 
@@ -388,7 +396,7 @@ class MiniMaxM3Attention(nn.Module):
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
-            reduce_results=False,
+            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -546,7 +554,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
-            reduce_results=False,
+            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -1164,7 +1172,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config=config,
                 intermediate_size=config.dense_intermediate_size,
                 quant_config=quant_config,
-                reduce_results=False,
+                reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                 prefix=f"{prefix}.mlp",
             )
 
