@@ -26,6 +26,7 @@ python -m atom.entrypoints.openai_server \
   --server-port 8000 \
   --trust-remote-code \
   --gpu-memory-utilization 0.8 \
+  --kv_cache_dtype fp8 \
   --block-size 128 \
   --max-model-len 32768 \
   --max-num-seqs 128 \
