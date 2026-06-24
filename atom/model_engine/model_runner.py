@@ -74,6 +74,10 @@ support_model_arch_dict = {
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
     "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
+    "Mistral3ForConditionalGeneration": "atom.models.mistral3.Mistral3TextOnly",
+    "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
+    "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -2311,9 +2315,9 @@ class ModelRunner:
                     context.positions = mrope_positions
                 num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
                 num_tokens += num_pad
-                # Create ubatch slices for TBO capture (need >= 2 requests)
+                # Create ubatch slices for TBO capture (need > 2 requests)
                 ubatch_slices = None
-                if is_tbo and self.config.enable_tbo_decode and bs >= 2:
+                if is_tbo and self.config.enable_tbo_decode and bs > 2:
                     ubatch_slices = maybe_create_ubatch_slices(
                         num_reqs=bs,
                         num_tokens=num_tokens,

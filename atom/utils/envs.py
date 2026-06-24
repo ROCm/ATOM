@@ -42,6 +42,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
@@ -228,6 +229,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default on; set "0" to fall back to the request-boundary balanced split.
     "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
         os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
+    ),
+    # --- NUMA binding ---
+    # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
+    # and preferred memory. Default off so baseline/pinned A/B stays clean.
+    "ATOM_NUMA_BIND": lambda: os.getenv("ATOM_NUMA_BIND", "0") == "1",
+    # Auto-detect the GPU->NUMA-node mapping (amdsmi first, sysfs fallback).
+    # Default on, so `ATOM_NUMA_BIND=1` alone is zero-config.
+    "ATOM_AUTO_NUMA_BIND": lambda: os.getenv("ATOM_AUTO_NUMA_BIND", "1") == "1",
+    # Explicit per-global-rank node ids (comma separated), overriding auto, e.g.
+    # ATOM_NUMA_NODE="0,0,0,0,1,1,1,1". A single value applies to all ranks.
+    "ATOM_NUMA_NODE": lambda: os.getenv("ATOM_NUMA_NODE", ""),
+    # Raise instead of warn when binding fails.
+    "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
+        os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
 }
 

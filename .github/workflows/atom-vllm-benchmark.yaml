@@ -21,6 +21,18 @@ on:
         options:
           - InferenceMax bench
           - vLLM bench
+      benchmark_group:
+        description: "Optional manual benchmark group. Leave as none to use model slots."
+        type: choice
+        default: none
+        options:
+          - none
+          - AW-P0
+          - AW-P0+MET-P0
+          - AW-ALL
+          - AW-P1+P2+MET-P0
+          - AW-ALL+MET-P1
+          - AW-P0+OOB
       model_slot_1:
         description: "Manual selection slot 1: choose a model + TP size candidate."
         type: choice
@@ -821,6 +833,7 @@ jobs:
       - uses: actions/checkout@v6
       - id: load
         env:
+          BENCHMARK_GROUP: ${{ inputs.benchmark_group || 'none' }}
           MODEL_SLOT_1: ${{ inputs.model_slot_1 || 'none' }}
           MODEL_SLOT_2: ${{ inputs.model_slot_2 || 'none' }}
           MODEL_SLOT_3: ${{ inputs.model_slot_3 || 'none' }}
@@ -962,6 +975,7 @@ jobs:
               for m in all_variants
               if str(m.get("display", "")).endswith("(OOB)")
           }
+          aw_all = AW_P0 | AW_P1 | AW_P2
 
           if event == "schedule":
               created_at = os.environ.get("SCHEDULE_CREATED_AT", "")
@@ -987,7 +1001,6 @@ jobs:
               # Hour buckets use 15:00 to split ~10:00 daytime vs delayed
               # previous-evening scheduled runs.
               is_daytime_slot = (not is_delayed_evening_slot) and beijing_hour < 15
-              aw_all = AW_P0 | AW_P1 | AW_P2
 
               if beijing_weekday == 5:  # Saturday
                   if is_daytime_slot:
@@ -1042,29 +1055,61 @@ jobs:
                           file=sys.stderr,
                       )
           else:
-              variant_map = {}
-              for family in families:
-                  for variant in family["variants"]:
-                      variant_map[str(variant["display"])] = flatten_variant(
-                          family, variant
-                      )
-
-              seen_prefixes = set()
-              for slot_idx in range(1, 9):
-                  label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
-                  if not label or label == none_choice:
-                      continue
-                  selected_variant = variant_map.get(label)
-                  if selected_variant is None:
-                      available = ", ".join(sorted(variant_map))
+              group_map = {
+                  "AW-P0": AW_P0,
+                  "AW-P0+MET-P0": AW_P0 | MET_P0,
+                  "AW-ALL": aw_all,
+                  "AW-P1+P2+MET-P0": AW_P1 | AW_P2 | MET_P0,
+                  "AW-ALL+MET-P1": aw_all | MET_P1,
+                  "AW-P0+OOB": AW_P0 | OOB_DISPLAYS,
+              }
+              requested_group = os.environ.get("BENCHMARK_GROUP", "").strip()
+              if requested_group and requested_group != none_choice:
+                  target_displays = group_map.get(requested_group)
+                  if target_displays is None:
+                      available = ", ".join([none_choice] + sorted(group_map))
                       raise SystemExit(
-                          f"Unknown benchmark model variant choice {label!r}. Available choices: {available}"
+                          f"Unknown benchmark group {requested_group!r}. Available choices: {available}"
                       )
-                  prefix = str(selected_variant["prefix"])
-                  if prefix in seen_prefixes:
-                      continue
-                  selected.append(selected_variant)
-                  seen_prefixes.add(prefix)
+                  selected_group = requested_group
+                  selected = select_by_display(all_variants, target_displays)
+                  missing = target_displays - {
+                      str(m.get("display", "")) for m in selected
+                  }
+                  if missing:
+                      print(
+                          "Warning: manual group targets missing from catalog: "
+                          + ", ".join(sorted(missing)),
+                          file=sys.stderr,
+                      )
+                  if not selected:
+                      raise SystemExit(
+                          f"No benchmark model variants were selected for group {requested_group}."
+                      )
+              else:
+                  variant_map = {}
+                  for family in families:
+                      for variant in family["variants"]:
+                          variant_map[str(variant["display"])] = flatten_variant(
+                              family, variant
+                          )
+
+                  seen_prefixes = set()
+                  for slot_idx in range(1, 9):
+                      label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
+                      if not label or label == none_choice:
+                          continue
+                      selected_variant = variant_map.get(label)
+                      if selected_variant is None:
+                          available = ", ".join(sorted(variant_map))
+                          raise SystemExit(
+                              f"Unknown benchmark model variant choice {label!r}. Available choices: {available}"
+                          )
+                      prefix = str(selected_variant["prefix"])
+                      if prefix in seen_prefixes:
+                          continue
+                      selected.append(selected_variant)
+                      seen_prefixes.add(prefix)
 
           if selected_group:
               print(
@@ -1114,7 +1159,8 @@ jobs:
           MODELS_JSON: ${{ needs.load-models.outputs.models_json }}
           PARAMS_JSON: ${{ needs.parse-param-lists.outputs.matrix_json }}
         run: |
-          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          BENCHMARK_MATRIX_FILE="${RUNNER_TEMP:-/tmp}/benchmark_matrix.json"
+          python3 - <<'PY' > "${BENCHMARK_MATRIX_FILE}"
           import json
           import os
 
@@ -1226,20 +1272,27 @@ jobs:
 
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
-          )"
-          echo "benchmark_matrix=${BENCHMARK_MATRIX}" >> "$GITHUB_OUTPUT"
-          if [ "${BENCHMARK_MATRIX}" = '{"include":[]}' ]; then
+          {
+            echo "benchmark_matrix<<EOF"
+            cat "${BENCHMARK_MATRIX_FILE}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          if python3 - "${BENCHMARK_MATRIX_FILE}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as matrix_file:
+              payload = json.load(matrix_file)
+          include = payload.get("include", [])
+          if not include:
+              sys.exit(1)
+          print(f"Benchmark matrix cells: {len(include)}")
+          PY
+          then
+            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
+          else
             echo "has_benchmark_cells=false" >> "$GITHUB_OUTPUT"
             echo "No eligible benchmark cases remain after model-specific parameter filtering."
-          else
-            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
-            BENCHMARK_MATRIX="${BENCHMARK_MATRIX}" python3 - <<'PY'
-          import json
-          import os
-
-          payload = json.loads(os.environ["BENCHMARK_MATRIX"])
-          print(f"Benchmark matrix cells: {len(payload.get('include', []))}")
-          PY
           fi
 
       - name: Persist benchmark matrix payload
@@ -1535,7 +1588,9 @@ jobs:
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
+            --ipc=host \
+            --network=host \
+            --group-add video \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \

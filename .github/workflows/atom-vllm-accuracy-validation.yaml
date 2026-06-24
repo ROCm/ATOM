@@ -15,6 +15,10 @@ on:
         default: none
         options:
           - none
+          - run_p0
+          - run_p1
+          - run_p2
+          - run_all
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -54,6 +58,10 @@ on:
         default: none
         options:
           - none
+          - run_p0
+          - run_p1
+          - run_p2
+          - run_all
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -93,6 +101,10 @@ on:
         default: none
         options:
           - none
+          - run_p0
+          - run_p1
+          - run_p2
+          - run_all
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -132,6 +144,10 @@ on:
         default: none
         options:
           - none
+          - run_p0
+          - run_p1
+          - run_p2
+          - run_all
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -171,6 +187,10 @@ on:
         default: none
         options:
           - none
+          - run_p0
+          - run_p1
+          - run_p2
+          - run_all
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -210,6 +230,10 @@ on:
         default: none
         options:
           - none
+          - run_p0
+          - run_p1
+          - run_p2
+          - run_all
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -249,6 +273,10 @@ on:
         default: none
         options:
           - none
+          - run_p0
+          - run_p1
+          - run_p2
+          - run_all
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -288,6 +316,10 @@ on:
         default: none
         options:
           - none
+          - run_p0
+          - run_p1
+          - run_p2
+          - run_all
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -523,7 +555,7 @@ jobs:
                   "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
                   "runner": "atom-plugin-acc-validation-runner",
               },
               {
@@ -791,15 +823,15 @@ jobs:
               },
               "Qwen3.5-397B-A17B-FP8 TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
               },
               "Qwen3.5-397B-A17B-FP8 TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
               },
               "Qwen3.5-397B-A17B TP8": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
               },
               "Kimi-K2-Thinking-MXFP4 TP4": {
                   "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
@@ -928,24 +960,39 @@ jobs:
           selected = []
           if event == "workflow_dispatch":
               by_name = {model["model_name"]: model for model in models}
+              group_selections = {
+                  "run_p0": [model for model in models if model["priority"] == "P0"],
+                  "run_p1": [model for model in models if model["priority"] == "P1"],
+                  "run_p2": [model for model in models if model["priority"] == "P2"],
+                  "run_all": models,
+              }
               seen = set()
+
+              def add_model(model):
+                  name = model["model_name"]
+                  if name in seen:
+                      return
+                  selected.append(matrix_entry(model))
+                  seen.add(name)
+
               for slot_idx in range(1, 9):
                   label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
                   if not label or label == "none":
+                      continue
+                  if label in group_selections:
+                      for model in group_selections[label]:
+                          add_model(model)
                       continue
                   if label not in by_name:
                       print(
                           f"Unknown model_slot_{slot_idx} selection: {label}",
                           file=sys.stderr,
                       )
-                      print("Available model_name values:", file=sys.stderr)
-                      for name in by_name:
-                          print(f" - {name}", file=sys.stderr)
+                      print("Available model_slot values:", file=sys.stderr)
+                      for value in ["none", *group_selections, *by_name]:
+                          print(f" - {value}", file=sys.stderr)
                       sys.exit(1)
-                  if label in seen:
-                      continue
-                  selected.append(matrix_entry(by_name[label]))
-                  seen.add(label)
+                  add_model(by_name[label])
           else:
               selected = [matrix_entry(model) for model in models]
 

@@ -65,7 +65,7 @@
           "label": "DPA TBO",
           "suffix": "-dpa-tbo",
           "extra_args": "--enable-dp-attention --enable-tbo",
-          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_CPU_AFFINITY=1",
+          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
           "conc_min": 256,
           "conc_max": 1024
         },

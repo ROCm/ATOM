@@ -22,6 +22,10 @@ on:
         description: "Benchmark GLM-5.1-MXFP4"
         type: boolean
         default: true
+      glm-5-2-fp8:
+        description: "Benchmark GLM-5.2-FP8"
+        type: boolean
+        default: true
       deepseek-r1-0528-mxfp4:
         description: "Benchmark DeepSeek-R1-0528 MXFP4 (+ MXFP4-MTP3)"
         type: boolean

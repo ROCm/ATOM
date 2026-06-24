@@ -309,6 +309,7 @@ class QuantizationConfig:
             "",
             "fp8",
             "mxfp4",
+            "mxfp8",
         ]:
             self.online_quant = True
             online_parser = get_quant_parser("online_quant")
@@ -525,7 +526,10 @@ class QuantizationConfig:
             for packed_key, packed_value in self.packed_modules_mapping.items():
                 # for self_attn.up_proj and self_attn.gate_up_proj
                 # up_proj in gate_up_proj, so add prefix .
-                if f".{packed_key}" in name:
+                match_key = (
+                    packed_key if packed_key.startswith(".") else f".{packed_key}"
+                )
+                if match_key in name:
                     if isinstance(packed_value, list):
                         # "gate_up_proj" → ["gate_proj", "up_proj"]
                         return [
@@ -581,6 +585,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "kimi_k25": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
+    "mistral3": "text_config",
 }
 
 # multimodal models fully supported by plugin mode
@@ -694,6 +699,37 @@ def get_generation_config(model: str) -> GenerationConfig:
         )
     except OSError:  # Not found
         return None
+
+
+def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
+    architectures = getattr(hf_config, "architectures", None) or ()
+    if any("MiniMaxM3" in arch for arch in architectures):
+        return True
+    text_config = getattr(hf_config, "text_config", None)
+    return any(
+        "minimax_m3" in str(model_type).lower()
+        for model_type in (
+            getattr(hf_config, "model_type", ""),
+            getattr(text_config, "model_type", ""),
+        )
+    )
+
+
+def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
+    if not _is_minimax_m3_config(hf_config):
+        return
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is None or text_config is hf_config:
+        return
+
+    if getattr(text_config, "hidden_act", None) == "swigluoai":
+        if getattr(text_config, "swiglu_beta", None) is None:
+            text_config.swiglu_beta = 1.0
+
+    for attr_name, attr_value in vars(text_config).items():
+        if attr_name.startswith("_") or getattr(hf_config, attr_name, None) is not None:
+            continue
+        setattr(hf_config, attr_name, attr_value)
 
 
 @dataclass
@@ -1052,6 +1088,7 @@ class Config:
         if self.hf_overrides:
             self.hf_config.update(self.hf_overrides)
             logger.info("Applied HF config overrides: %s", self.hf_overrides)
+        _normalize_minimax_m3_text_config(self.hf_config)
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
