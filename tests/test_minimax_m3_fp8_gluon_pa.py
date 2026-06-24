@@ -527,3 +527,131 @@ def test_gluon_decode_asm_matches_triton(num_heads):
 
     assert torch.isfinite(asm_out).all()
     torch.testing.assert_close(asm_out, ref_out, atol=3e-2, rtol=5e-2)
+
+
+# ── Task 4: SparseMHAPagedAttentionImpl.rope_cache override ─────────────────────
+
+
+def _build_sparse_impl(num_heads, num_kv_heads, head_dim, kv_cache_dtype, dev):
+    """Construct a SparseMHAPagedAttentionImpl with real Gemma norms + rope,
+    bypassing the Attention factory (which needs a full atom config)."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+    from atom.model_ops.layernorm import GemmaRMSNorm
+    from atom.model_ops.rotary_embedding import get_rope
+
+    eps = 1e-6
+    q_norm = GemmaRMSNorm(head_dim, eps=eps).to(dev).to(torch.bfloat16)
+    k_norm = GemmaRMSNorm(head_dim, eps=eps).to(dev).to(torch.bfloat16)
+    index_q_norm = GemmaRMSNorm(head_dim, eps=eps).to(dev).to(torch.bfloat16)
+    index_k_norm = GemmaRMSNorm(head_dim, eps=eps).to(dev).to(torch.bfloat16)
+    for n in (q_norm, k_norm, index_q_norm, index_k_norm):
+        torch.nn.init.normal_(n.weight, std=0.1)
+    rope = get_rope(head_dim, head_dim, 8192, 5_000_000.0)
+    rope.cos_cache = rope.cos_cache.to(dev, torch.bfloat16)
+    rope.sin_cache = rope.sin_cache.to(dev, torch.bfloat16)
+
+    impl = SparseMHAPagedAttentionImpl(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        scale=head_dim**-0.5,
+        num_kv_heads=num_kv_heads,
+        kv_cache_dtype=kv_cache_dtype,
+        layer_num=0,
+        rotary_emb=rope,
+        q_norm=q_norm,
+        k_norm=k_norm,
+        index_q_norm=index_q_norm,
+        index_k_norm=index_k_norm,
+        index_q_size=num_kv_heads * head_dim,
+        index_head_dim=head_dim,
+        topk=8,
+        init_blocks=1,
+        local_blocks=1,
+    )
+    return impl, SimpleNamespace
+
+
+@_gpu
+@pytest.mark.parametrize("kv_cache_dtype", ["bf16", "fp8"])
+def test_rope_cache_override_writes_caches_and_stashes_index_q(kv_cache_dtype):
+    """The override runs the fused qknorm+rope+SHUFFLE-insert, returns the parent
+    7-tuple, populates self._index_q, and mutates the KV + index caches."""
+    import aiter
+    from types import SimpleNamespace
+
+    dev = "cuda"
+    head_dim = 128
+    num_heads, num_kv_heads = 16, 1
+    num_tokens = 12
+    block_size = 16  # ASM page
+    x = 16 // (1 if kv_cache_dtype == "fp8" else 2)
+
+    impl, _ = _build_sparse_impl(num_heads, num_kv_heads, head_dim, kv_cache_dtype, dev)
+
+    cache_dt = aiter.dtypes.fp8 if kv_cache_dtype == "fp8" else torch.bfloat16
+    num_phys = num_tokens + 4
+    k_cache = torch.zeros(
+        num_phys, num_kv_heads, head_dim // x, block_size, x, dtype=cache_dt, device=dev
+    )
+    v_cache = torch.zeros(
+        num_phys, num_kv_heads, block_size // x, head_dim, x, dtype=cache_dt, device=dev
+    )
+    if kv_cache_dtype == "fp8":
+        k_scale = torch.zeros(
+            num_phys, num_kv_heads, block_size, dtype=torch.float32, device=dev
+        )
+        v_scale = torch.zeros(
+            num_phys, num_kv_heads, block_size, dtype=torch.float32, device=dev
+        )
+    else:
+        k_scale = v_scale = None
+    impl.index_cache = torch.zeros(
+        num_phys * block_size, head_dim, dtype=torch.bfloat16, device=dev
+    )
+
+    layer = SimpleNamespace(
+        k_cache=k_cache, v_cache=v_cache, k_scale=k_scale, v_scale=v_scale
+    )
+    slot_mapping = torch.randperm(num_phys * block_size, device=dev)[:num_tokens].to(
+        torch.int64
+    )
+    sparse_md = SimpleNamespace(slot_mapping=slot_mapping)
+    attn_md = SimpleNamespace(
+        slot_mapping=slot_mapping, sparse_attention_metadata=sparse_md
+    )
+    fwd_ctx = SimpleNamespace(attn_metadata=attn_md, kv_cache_data={"layer_0": layer})
+
+    q_size = num_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    iq_size = num_kv_heads * head_dim
+    ik_size = head_dim
+    qkv = (
+        torch.randn(
+            num_tokens,
+            q_size + 2 * kv_size + iq_size + ik_size,
+            dtype=torch.bfloat16,
+            device=dev,
+        )
+        * 0.1
+    )
+    positions = torch.randint(0, 4096, (num_tokens,), dtype=torch.int64, device=dev)
+
+    out = impl.rope_cache(None, None, None, qkv, positions, fwd_ctx)
+    assert len(out) == 7
+    q, k, v, kc, vc, ks, vs = out
+
+    # main q returned in [tokens, num_heads, head_dim]
+    assert q.shape == (num_tokens, num_heads, head_dim)
+    # index_q stashed
+    assert impl._index_q is not None
+    assert impl._index_q.shape == (num_tokens, num_kv_heads, head_dim)
+    # caches were written (non-zero somewhere at the written slots)
+    assert (k_cache != 0).any()
+    assert (v_cache != 0).any()
+    assert (impl.index_cache != 0).any()
+    if kv_cache_dtype == "fp8":
+        # fused op wrote per-token dequant scales
+        assert (k_scale != 0).any()
+        assert (v_scale != 0).any()

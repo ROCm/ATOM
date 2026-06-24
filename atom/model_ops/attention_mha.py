@@ -886,6 +886,40 @@ class PagedAttentionImpl(nn.Module):
         )
 
 
+def _minimax_m3_cos_sin_cache(
+    rotary_emb: nn.Module,
+    query: torch.Tensor,
+) -> torch.Tensor:
+    """Build (and cache on the rope module) the concatenated [cos, sin] table the
+    AITER fused qknorm+rope op expects, matching the model dtype/device."""
+    cache_name = "_minimax_m3_cos_sin_cache"
+    cos_cache = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+    cached = getattr(rotary_emb, cache_name, None)
+    expected_shape = (*cos_cache.shape[:-1], cos_cache.shape[-1] * 2)
+    if (
+        cached is not None
+        and cached.dtype == query.dtype
+        and cached.device == query.device
+        and tuple(cached.shape) == expected_shape
+    ):
+        return cached
+
+    sin_cache = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+    if cos_cache.dtype != query.dtype or cos_cache.device != query.device:
+        cos_cache = cos_cache.to(device=query.device, dtype=query.dtype)
+        sin_cache = sin_cache.to(device=query.device, dtype=query.dtype)
+    cos_sin_cache = torch.cat([cos_cache, sin_cache], dim=-1).contiguous()
+
+    if torch.compiler.is_compiling():
+        return cos_sin_cache
+
+    if cache_name in rotary_emb._buffers:
+        rotary_emb._buffers[cache_name] = cos_sin_cache
+    else:
+        rotary_emb.register_buffer(cache_name, cos_sin_cache, persistent=False)
+    return cos_sin_cache
+
+
 class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """MiniMax-M3 sparse attention as a first-class ``PagedAttentionImpl``.
 
@@ -961,9 +995,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # Indexer submodules + top-k parameters (impl-local state).
         self.index_q_norm = index_q_norm
         self.index_k_norm = index_k_norm
-        self.index_rotary_emb = index_rotary_emb
+        # MiniMax-M3 shares the main rope with the indexer; default to it.
+        self.index_rotary_emb = (
+            index_rotary_emb if index_rotary_emb is not None else rotary_emb
+        )
         self.index_q_size = index_q_size
         self.index_head_dim = index_head_dim
+        # M3 has one index head per kv head (num_idx_heads == num_kv_heads).
+        self.num_idx_heads = num_kv_heads
         self.topk = topk
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
@@ -974,12 +1013,95 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # dispatch_backend within the same single-threaded layer forward.
         self._index_q: Optional[torch.Tensor] = None
 
-    # NOTE: rope_cache / dispatch_backend are skeleton delegations to the parent
-    # so the standard (non-sparse) path stays functional as the TDD floor. The
-    # MiniMax-M3 sparse behavior is filled in by Tasks 4 and 5.
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
-        return super().rope_cache(q, k, v, qkv, position, fwd_ctx)
+        """MiniMax-M3 fused qk-norm + partial-NeoX-RoPE + page-16 SHUFFLE KV insert
+        + indexer-key insert, via ``aiter.fused_qknorm_idxrqknorm``.
+
+        Consumes the PACKED ``qkv`` tensor (Gemma (1+w) norm path needs it) laid
+        out as ``[q | k | v | index_q | index_k]``. Writes:
+          * normed+roped main K/V          -> SHUFFLE K/V cache (asm_layout=True)
+          * normed+roped index_k           -> page-128 index_cache
+          * fp8 per-token dequant scales   -> k_scale / v_scale (when fp8)
+        and outputs the normed+roped main ``q`` (returned in the parent 7-tuple)
+        and index ``q`` (stashed on ``self._index_q`` for dispatch_backend).
+
+        Returns the parent contract tuple
+        ``(q, k, v, k_cache, v_cache, k_scale, v_scale)``. ``k``/``v`` are returned
+        unchanged (already inserted into the cache); the sparse backends read the
+        cache, not these tensors.
+        """
+        attn_metadata = fwd_ctx.attn_metadata
+        kv_cache_data = fwd_ctx.kv_cache_data
+
+        layer = kv_cache_data[f"layer_{self.layer_num}"]
+        k_cache = layer.k_cache
+        v_cache = layer.v_cache
+        k_scale = layer.k_scale
+        v_scale = layer.v_scale
+
+        # M3 sparse attention is fixed to head_dim == 128 (ASM/gluon requirement)
+        # and the AITER fused path; no Triton fallback here.
+        self.use_triton_attn = False
+        self._cache_format = "SHUFFLE"
+
+        sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
+        if sparse_metadata is None:
+            sparse_metadata = attn_metadata
+        slot_mapping = sparse_metadata.slot_mapping
+
+        qkv = qkv.contiguous()
+        num_tokens = qkv.shape[0]
+        q_out = torch.empty(
+            (num_tokens, self.num_heads * self.head_dim),
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+        index_q = torch.empty(
+            (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
+        )
+        cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
+
+        is_fp8 = self.kv_cache_dtype == "fp8"
+        kv_cache_dtype = "auto" if not is_fp8 else self.kv_cache_dtype
+        # fp8: the fused op computes per-token dynamic quant and writes the
+        # per-token dequant scales into k_scale / v_scale (outputs).
+        fused_k_scale = k_scale if is_fp8 else None
+        fused_v_scale = v_scale if is_fp8 else None
+
+        aiter.fused_qknorm_idxrqknorm(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos_sin_cache,
+            position,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_emb.rotary_dim,
+            self.q_norm.variance_epsilon,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            self.num_idx_heads,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            self.index_cache,
+            k_cache.shape[3],  # SHUFFLE page size (== ASM_PAGE_SIZE == 16)
+            q_out,
+            index_q,
+            slot_mapping,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=fused_k_scale,
+            v_scale=fused_v_scale,
+            asm_layout=True,
+        )
+
+        q = q_out.view(-1, self.num_heads, self.head_dim)
+        # Stash the rotated indexer query for dispatch_backend (same-forward,
+        # single-threaded; cleared after the sparse backend consumes it).
+        self._index_q = index_q.view(-1, self.num_idx_heads, self.index_head_dim)
+
+        return q, k, v, k_cache, v_cache, k_scale, v_scale
 
     def dispatch_backend(
         self,
