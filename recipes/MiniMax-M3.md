@@ -106,7 +106,6 @@ checkpoint.
 model_path=${model_path:-amd/MiniMax-M3-MXFP4}
 run_name=${run_name:-m3-mxfp4}
 
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_M3_SPARSE_USE_ASM_PA=1
 
 python -m atom.entrypoints.openai_server \
@@ -118,7 +117,7 @@ python -m atom.entrypoints.openai_server \
   --kv_cache_dtype fp8 \
   --block-size 128 \
   --max-model-len 32768 \
-  --max-num-seqs 128 \
+  --max-num-seqs 256 \
   --max-num-batched-tokens 32768 \
   --no-enable_prefix_caching 2>&1 | tee "${run_name}-server.log"
 ```
@@ -230,7 +229,6 @@ model_path=amd/MiniMax-M3-MXFP4
 model_path=MiniMaxAI/MiniMax-M3-MXFP8
 draft_path=Inferact/MiniMax-M3-EAGLE3
 
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_M3_SPARSE_USE_ASM_PA=1
 
 python -m atom.entrypoints.openai_server \
@@ -242,7 +240,7 @@ python -m atom.entrypoints.openai_server \
   --kv_cache_dtype fp8 \
   --block-size 128 \
   --max-model-len 32768 \
-  --max-num-seqs 128 \
+  --max-num-seqs 256 \
   --max-num-batched-tokens 32768 \
   --no-enable_prefix_caching \
   --method eagle3 \
