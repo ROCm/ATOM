@@ -27,6 +27,15 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
+def _is_indexed_sparse_attention(module) -> bool:
+    """True for MiniMax-M3 sparse attention. The flag may live on the Attention
+    layer or on its impl (SparseMHAPagedAttentionImpl sets it as a class attr)."""
+    if getattr(module, "is_indexed_sparse_attention", False):
+        return True
+    impl = getattr(module, "impl", None)
+    return bool(getattr(impl, "is_indexed_sparse_attention", False))
+
+
 class AiterBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -499,22 +508,54 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         from atom.config import KVCacheTensor
         from aiter import dtypes
 
-        if getattr(module, "is_indexed_sparse_attention", False):
+        if _is_indexed_sparse_attention(module):
+            # MiniMax-M3 sparse attention. Binding is ADDITIVE: the standard
+            # 5D-SHUFFLE K/V + real fp8 scales (same as the plain MHA path below)
+            # PLUS the page-128 indexer-key cache bound onto the impl. The impl's
+            # rope_cache reads K/V/scale off the returned KVCacheTensor and the
+            # index cache off self.index_cache; no model-level bind_kv_cache.
             runner = self.model_runner
             config = runner.config
+            hf_config = config.hf_config
+            impl = module.impl
+
             sparse_idx = runner._sparse_attention_cache_next
             runner._sparse_attention_cache_next += 1
-            key_cache, value_cache = module.bind_kv_cache(
-                runner.kv_cache[:, layer_id],
-                runner.sparse_attention_index_cache[sparse_idx],
-                config.max_model_len,
+
+            x = 16 // runner.kv_cache.element_size()
+            k_cache = runner.kv_cache[0, layer_id].view(
+                runner.num_physical_kvcache_blocks,
+                runner.num_kv_heads,
+                hf_config.head_dim // x,
+                runner.physical_block_size,
+                x,
             )
+            v_cache = runner.kv_cache[1, layer_id].view(
+                runner.num_physical_kvcache_blocks,
+                runner.num_kv_heads,
+                runner.physical_block_size // x,
+                hf_config.head_dim,
+                x,
+            )
+            if config.kv_cache_dtype == "fp8":
+                module.k_scale = runner.kv_scale[0, layer_id]
+                module.v_scale = runner.kv_scale[1, layer_id]
+                impl.k_scale = module.k_scale
+                impl.v_scale = module.v_scale
+
+            module.max_model_len = config.max_model_len
+            module.k_cache = k_cache
+            module.v_cache = v_cache
+            # Indexer-key cache lives on the impl (page-128 [blocks, 128, idx_dim]).
+            impl.index_cache = runner.sparse_attention_index_cache[sparse_idx]
+            impl.max_model_len = config.max_model_len
+
             return KVCacheTensor(
                 layer_num=layer_id,
-                k_cache=key_cache,
-                v_cache=value_cache,
-                k_scale=None,
-                v_scale=None,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                k_scale=module.k_scale,
+                v_scale=module.v_scale,
             )
 
         if not (

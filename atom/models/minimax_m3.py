@@ -13,8 +13,9 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
-from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.config import Config, QuantizationConfig
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
@@ -30,14 +31,8 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.minimax_m3.index_topk import (
-    minimax_m3_index_topk,
-    minimax_m3_index_topk_decode,
-)
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
-    minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
 )
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
@@ -49,7 +44,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils.decorators import support_torch_compile
-from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -535,218 +529,48 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.index_q_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
         self.index_k_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
         self.index_rotary_emb = self.rotary_emb
-        self.kv_cache = torch.tensor([])
-        self.index_cache = torch.tensor([])
-        compilation_config = get_current_atom_config().compilation_config
-        if self.layer_name in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer: {self.layer_name}")
-        compilation_config.static_forward_context[self.layer_name] = self
 
-    def bind_kv_cache(
-        self,
-        layer_kv_cache: torch.Tensor,
-        index_cache: torch.Tensor,
-        max_model_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Bind runner-owned caches using MiniMax-M3 sparse kernel layout."""
-        # Runner stores one layer as [2, blocks, block_size, heads, dim].
-        # MiniMax-M3 sparse kernels consume [blocks, 2, block_size, heads, dim].
-        # permute creates a stride view, so this does not copy the KV cache.
-        self.kv_cache = layer_kv_cache.permute(1, 0, 2, 3, 4)
-        self.index_cache = index_cache
-        self.max_model_len = max_model_len
-        return self.kv_cache.unbind(1)
+        # First-class atom attention: plug in the MiniMax-M3 sparse impl, which
+        # owns all sparse/fp8/gluon behavior (fused qk/index norm+rope+SHUFFLE KV
+        # insert in rope_cache; index top-k -> page-16 sparse block table -> gluon
+        # PA in dispatch_backend). The standard AiterAttentionMetadataBuilder binds
+        # the page-16 SHUFFLE KV cache + scales (KVCacheTensor) and the page-128
+        # index cache (onto the impl). All indexer state lives on the impl.
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            self.num_kv_heads,
+            kv_cache_dtype=cache_config,
+            layer_num=layer_id,
+            use_mla=False,
+            rotary_emb=self.rotary_emb,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            prefix=f"{prefix}.attn",
+            impl_cls=SparseMHAPagedAttentionImpl,
+            # --- MiniMax-M3 sparse-attention indexer kwargs (impl-local) ---
+            index_q_norm=self.index_q_norm,
+            index_k_norm=self.index_k_norm,
+            index_rotary_emb=self.index_rotary_emb,
+            index_q_size=self.index_q_size,
+            index_head_dim=self.idx_head_dim,
+            topk=self.topk_blocks,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # Packed qkv = [q | k | v | index_q | index_k]. The sparse impl's
+        # rope_cache consumes the packed tensor directly (passed via qkv=); the
+        # split q/k/v slices satisfy forward_impl's view contract (they are
+        # rebuilt from qkv inside rope_cache).
         qkv = self.qkv_proj(hidden_states)
-        attn_output = torch.ops.aiter.minimax_m3_sparse_attention_native(
-            qkv,
-            positions,
-            self.layer_name,
-            self.q_size,
-        )
-        return self.o_proj(attn_output)
-
-    def _insert_kv(
-        self,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        index_k: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        if self.index_cache.numel() == 0:
-            return
-        if self.kv_cache.numel() == 0:
-            return
-        key_cache, value_cache = self.kv_cache.unbind(1)
-        kv_cache_dtype = (
-            "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
-        )
-        aiter.reshape_and_cache(
-            k.view(-1, self.num_kv_heads, self.head_dim),
-            v.view(-1, self.num_kv_heads, self.head_dim),
-            key_cache,
-            value_cache,
-            slot_mapping,
-            kv_cache_dtype=kv_cache_dtype,
-            k_scale=None,
-            v_scale=None,
-            asm_layout=False,
-        )
-        self.index_cache.view(-1, self.idx_head_dim)[slot_mapping] = index_k.to(
-            self.index_cache.dtype
-        )
-
-    def _run_prefill_sparse(
-        self,
-        q: torch.Tensor,
-        index_q: torch.Tensor,
-        sparse_metadata,
-    ) -> torch.Tensor:
-        prefill_metadata = sparse_metadata.prefill
-        assert prefill_metadata is not None
-        cu_seqlens_q = prefill_metadata.cu_seqlens_q
-        seq_lens = prefill_metadata.seq_lens
-        # Already-cached token count per sequence for chunked prefill.
-        prefix_lens = prefill_metadata.context_lens
-        block_tables = prefill_metadata.block_table
-        topk_idx = minimax_m3_index_topk(
-            index_q,
-            self.index_cache,
-            block_tables,
-            cu_seqlens_q,
-            seq_lens,
-            prefix_lens,
-            prefill_metadata.max_query_len,
-            prefill_metadata.max_seq_len,
-            self.topk_blocks,
-            self.init_blocks,
-            self.local_blocks,
-            self.num_kv_heads,
-            self.scaling,
-        )
-        output = torch.empty_like(q)
-        minimax_m3_sparse_attn(
-            q,
-            self.kv_cache,
-            topk_idx,
-            block_tables,
-            cu_seqlens_q,
-            seq_lens,
-            prefix_lens,
-            prefill_metadata.max_query_len,
-            self.num_kv_heads,
-            self.scaling,
-            output,
-        )
-        return output
-
-    def _run_decode_sparse(
-        self,
-        q: torch.Tensor,
-        index_q: torch.Tensor,
-        sparse_metadata,
-    ) -> torch.Tensor:
-        decode_metadata = sparse_metadata.decode
-        assert decode_metadata is not None
-        topk_idx = minimax_m3_index_topk_decode(
-            index_q,
-            self.index_cache,
-            decode_metadata.block_table,
-            decode_metadata.seq_lens,
-            sparse_metadata.max_seq_len,
-            self.topk_blocks,
-            self.init_blocks,
-            self.local_blocks,
-            self.num_kv_heads,
-            self.scaling,
-        )
-        output = torch.empty_like(q)
-        minimax_m3_sparse_attn_decode(
-            q,
-            self.kv_cache,
-            topk_idx,
-            decode_metadata.block_table,
-            decode_metadata.seq_lens,
-            self.num_kv_heads,
-            self.scaling,
-            output,
-        )
-        return output
-
-    def sparse_attention_forward_impl(
-        self,
-        qkv: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        fwd_ctx = get_forward_context()
-        if (
-            fwd_ctx.context.is_dummy_run
-            or fwd_ctx.attn_metadata is None
-            or self.kv_cache.numel() == 0
-            or self.index_cache.numel() == 0
-        ):
-            return torch.empty(
-                (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
-            )
-
-        attn_metadata = fwd_ctx.attn_metadata
-        sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
-        if sparse_metadata is None:
-            sparse_metadata = attn_metadata
-        if _can_use_fused_minimax_m3_attention_preproc(
-            qkv,
-            self.rotary_emb,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            self.index_q_norm.weight,
-            self.index_k_norm.weight,
-        ):
-            qkv = qkv.contiguous()
-            q = torch.empty(
-                (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
-            )
-            index_q = torch.empty(
-                (qkv.shape[0], self.index_q_size), dtype=qkv.dtype, device=qkv.device
-            )
-            cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
-            aiter.fused_qknorm_idxrqknorm(
-                qkv,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                cos_sin_cache,
-                positions,
-                self.num_heads,
-                self.num_kv_heads,
-                self.rotary_emb.rotary_dim,
-                self.q_norm.variance_epsilon,
-                self.index_q_norm.weight,
-                self.index_k_norm.weight,
-                self.num_idx_heads,
-                sparse_metadata.slot_mapping,
-                self.kv_cache,
-                self.index_cache,
-                self.kv_cache.shape[2],
-                q,
-                index_q,
-                sparse_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                None,
-                None,
-            )
-            q = q.view(-1, self.num_heads, self.head_dim)
-            index_q = index_q.view(-1, self.num_idx_heads, self.idx_head_dim)
-            if getattr(sparse_metadata, "num_prefills", 0) > 0:
-                output = self._run_prefill_sparse(q, index_q, sparse_metadata)
-            else:
-                output = self._run_decode_sparse(q, index_q, sparse_metadata)
-            return output.view(-1, self.q_size)
-
-        q, k, v, index_q, index_k = qkv.split(
+        q, k, v, _index_q, _index_k = qkv.split(
             [
                 self.q_size,
                 self.kv_size,
@@ -756,37 +580,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
-        q, k = _minimax_m3_gemma_qk_norm(
-            q,
-            k,
-            self.q_norm,
-            self.k_norm,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )
-        q, k = self.rotary_emb(positions, q, k)
-
-        index_q, index_k = _minimax_m3_gemma_qk_norm(
-            index_q,
-            index_k,
-            self.index_q_norm,
-            self.index_k_norm,
-            self.num_idx_heads,
-            1,
-            self.idx_head_dim,
-        )
-        index_q, index_k = self.index_rotary_emb(positions, index_q, index_k)
-
-        self._insert_kv(k, v, index_k, sparse_metadata.slot_mapping)
-
-        q = q.view(-1, self.num_heads, self.head_dim)
-        index_q = index_q.view(-1, self.num_idx_heads, self.idx_head_dim)
-        if getattr(sparse_metadata, "num_prefills", 0) > 0:
-            output = self._run_prefill_sparse(q, index_q, sparse_metadata)
-        else:
-            output = self._run_decode_sparse(q, index_q, sparse_metadata)
-        return output.view(-1, self.q_size)
+        attn_output = self.attn(q, k, v, positions, qkv=qkv)
+        return self.o_proj(attn_output)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
