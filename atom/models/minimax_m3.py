@@ -73,23 +73,6 @@ def _rope_theta(config: PretrainedConfig) -> float:
     return getattr(config, "rope_theta", 1000000.0)
 
 
-def _can_use_fused_minimax_m3_attention_preproc(
-    qkv: torch.Tensor,
-    rotary_emb: nn.Module,
-    *weights: torch.Tensor,
-) -> bool:
-    return (
-        hasattr(aiter, "fused_qknorm_idxrqknorm")
-        and qkv.dim() == 2
-        and qkv.is_cuda
-        and qkv.dtype in (torch.float16, torch.bfloat16)
-        and getattr(rotary_emb, "head_size", None) == 128
-        and getattr(rotary_emb, "rotary_dim", 0) > 0
-        and getattr(rotary_emb, "is_neox_style", False)
-        and all(weight.dtype == qkv.dtype for weight in weights)
-    )
-
-
 def _minimax_m3_cos_sin_cache(
     rotary_emb: nn.Module,
     query: torch.Tensor,
@@ -121,28 +104,6 @@ def _minimax_m3_cos_sin_cache(
         rotary_emb.register_buffer(cache_name, cos_sin_cache, persistent=False)
     return cos_sin_cache
 
-
-def _minimax_m3_gemma_qk_norm(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_norm: GemmaRMSNorm,
-    k_norm: GemmaRMSNorm,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    q, k = fused_qk_norm(
-        q.view(-1, num_q_heads, head_dim),
-        k.view(-1, num_kv_heads, head_dim),
-        q_norm.weight,
-        k_norm.weight,
-        q_norm.variance_epsilon,
-        add_unit_offset=True,
-    )
-    return (
-        q.view(-1, num_q_heads * head_dim),
-        k.view(-1, num_kv_heads * head_dim),
-    )
 
 
 def make_minimax_m3_expert_params_mapping(
@@ -383,19 +344,6 @@ class MiniMaxM3Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-    # def _qk_norm_rope(
-    #     self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
-    #     q, k = _minimax_m3_gemma_qk_norm(
-    #         q,
-    #         k,
-    #         self.q_norm,
-    #         self.k_norm,
-    #         self.num_heads,
-    #         self.num_kv_heads,
-    #         self.head_dim,
-    #     )
-    #     return self.rotary_emb(positions, q, k)
 
     def forward(
         self,
@@ -403,42 +351,7 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        # if _can_use_fused_minimax_m3_attention_preproc(
-        #     qkv, self.rotary_emb, self.q_norm.weight, self.k_norm.weight
-        # ):
-        #     qkv = qkv.contiguous()
-        #     q = torch.empty(
-        #         (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
-        #     )
-        #     cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
-        #     aiter.fused_qknorm_idxrqknorm(
-        #         qkv,
-        #         self.q_norm.weight,
-        #         self.k_norm.weight,
-        #         cos_sin_cache,
-        #         positions,
-        #         self.num_heads,
-        #         self.num_kv_heads,
-        #         self.rotary_emb.rotary_dim,
-        #         self.q_norm.variance_epsilon,
-        #         index_q_norm_weight=None,
-        #         index_k_norm_weight=None,
-        #         num_index_heads=0,
-        #         slot_mapping=None,
-        #         kv_cache_k=None,
-        #         kv_cache_v=None,
-        #         index_cache=None,
-        #         block_size=0,
-        #         q_out=q,
-        #         index_q_out=None,
-        #         index_slot_mapping=None,
-        #     )
-        #     _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        #     attn_output = self.attn(q, k, v)
-        #     return self.o_proj(attn_output)
-
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # q, k = self._qk_norm_rope(positions, q, k)
         attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
         return self.o_proj(attn_output)
 
@@ -573,7 +486,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         # split q/k/v slices satisfy forward_impl's view contract (they are
         # rebuilt from qkv inside rope_cache).
         qkv = self.qkv_proj(hidden_states)
-        q, k, v, _index_q, _index_k = qkv.split(
+        q, k, v, _, _ = qkv.split(
             [
                 self.q_size,
                 self.kv_size,

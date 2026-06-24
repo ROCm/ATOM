@@ -15,7 +15,11 @@ from atom.utils.block_convert import (
     kv_indices_generate_triton,
 )
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
-from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils.forward_context import (
+    AttentionMetaData,
+    Context,
+    get_forward_context,
+)
 from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
@@ -339,6 +343,58 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "reduce_partial_map": reduce_partial_map,
         }
 
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        positions: torch.Tensor,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor = None,
+    ):
+        """Per-draft-step metadata for a block-paged MHA Eagle3 draft.
+
+        Called by EagleProposer.propose at mid-step iters. The draft's decode
+        kernels (``paged_attention_{asm,triton}``) read ``block_tables`` +
+        ``context_lens``, both already bumped for this step by eagle (writing
+        in place into ``forward_vars``). The block_size==1024 persistent path
+        is the only one consuming ``kv_indptr``/``kv_indices``; MiniMax-M3 runs
+        at ``--block-size 128`` so the kernel never reads them — no rebuild.
+
+        The one value we must (re)compute is the write slot for the new draft
+        token in the draft's own block-paged KV cache:
+
+            slot = block_tables[seq, (ctx-1)//B] * B + (ctx-1) % B,   B = block_size
+
+        Returned under ``slot_mapping`` so EagleProposer skips its token-granular
+        (MLA physical block_size==1) flat-kv slot derivation, which would yield
+        a bare block id for ``B > 1``.
+
+        ``only_update`` / ``num_reject_tokens`` are MLA/V4-specific knobs and are
+        unused here: ``context_lens`` is already correct and there are no
+        persistent worker buffers to roll over for ``block_size != 1024``.
+        """
+        var = self.model_runner.forward_vars
+        slot_mapping = var["slot_mapping"].gpu[:bs]
+        # Warmup/dummy runs before KV allocation: the draft attention is skipped
+        # (PagedAttentionImpl's is_dummy_run guard), so slot_mapping is unused.
+        # The dummy batch's context_lens is the full prefill length, which eagle
+        # bumps by +1 to max_model_len+1 — its derived block column overruns the
+        # block_tables width and would OOB the gather below. No-op during dummy
+        # runs, matching deepseek_v4_attn.prepare_mtp_decode.
+        if get_forward_context().context.is_dummy_run:
+            return {"slot_mapping": slot_mapping}
+        block_size = self.model_runner.block_size
+        ctx = var["context_lens"].gpu[:bs]  # int32, already +1 for this step
+        block_tables = var["block_tables"].gpu[:bs]  # [bs, max_blocks] int32
+        last_pos = (ctx - 1).clamp_min(0).long()
+        block_col = last_pos // block_size
+        within = last_pos - block_col * block_size
+        phys_block = torch.gather(block_tables, 1, block_col.unsqueeze(1)).squeeze(1)
+        slot = phys_block.long() * block_size + within
+        slot_mapping.copy_(slot.to(slot_mapping.dtype))
+        return {"slot_mapping": slot_mapping}
+
     def compute_block_bytes(self) -> int:
         """Standard split-K/V MHA per-block bytes.
 
@@ -518,6 +574,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # PLUS the page-128 indexer-key cache bound onto the impl. The impl's
             # rope_cache reads K/V/scale off the returned KVCacheTensor and the
             # index cache off self.index_cache; no model-level bind_kv_cache.
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                ASM_PAGE_SIZE,
+                PAGES_PER_SPARSE_BLOCK,
+            )
+
             runner = self.model_runner
             config = runner.config
             hf_config = config.hf_config
@@ -526,26 +587,54 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             sparse_idx = runner._sparse_attention_cache_next
             runner._sparse_attention_cache_next += 1
 
+            # MiniMax-M3 ASM/gluon path reinterprets the page-128 KV storage as
+            # page-16 SHUFFLE: each logical 128-block is 8 contiguous physical
+            # 16-pages, so num_phys16 = num_blocks * 8 and the page dim is 16
+            # (NOT physical_block_size=128). The fused-insert writes and the gluon
+            # PA read both go through THESE views; using the page-128 geometry
+            # silently writes/reads the wrong slots -> garbage attention.
+            #   storage per layer: [num_blocks, 128, num_kv_heads, head_dim]
+            #   K: [num_blocks*8, num_kv_heads, head_dim//x, 16, x]
+            #   V: [num_blocks*8, num_kv_heads, 16//x, head_dim, x]
             x = 16 // runner.kv_cache.element_size()
+            num_phys16 = runner.num_physical_kvcache_blocks * PAGES_PER_SPARSE_BLOCK
             k_cache = runner.kv_cache[0, layer_id].view(
-                runner.num_physical_kvcache_blocks,
+                num_phys16,
                 runner.num_kv_heads,
                 hf_config.head_dim // x,
-                runner.physical_block_size,
+                ASM_PAGE_SIZE,
                 x,
             )
             v_cache = runner.kv_cache[1, layer_id].view(
-                runner.num_physical_kvcache_blocks,
+                num_phys16,
                 runner.num_kv_heads,
-                runner.physical_block_size // x,
+                ASM_PAGE_SIZE // x,
                 hf_config.head_dim,
                 x,
             )
             if config.kv_cache_dtype == "fp8":
-                module.k_scale = runner.kv_scale[0, layer_id]
-                module.v_scale = runner.kv_scale[1, layer_id]
-                impl.k_scale = module.k_scale
-                impl.v_scale = module.v_scale
+                # The scale buffer is stored page-128 [num_blocks, nkv, 128] but
+                # the fp8 write (fused_qknorm_idxrqknorm) and the gluon reader both
+                # index it in the SAME page-16 SHUFFLE layout as the KV cache:
+                # [num_blocks*8, nkv, 16]. 128 == 8*16 so this is a zero-copy
+                # reinterpretation; the row stride becomes 16 so a page-16 block id
+                # lands on the right scale. Without this view, gluon multiplies a
+                # page-16 block id by the page-128 row stride (128) and reads scales
+                # 8x out of position, corrupting fp8 attention once blocks reuse.
+                k_scale = runner.kv_scale[0, layer_id].view(
+                    num_phys16,
+                    runner.num_kv_heads,
+                    ASM_PAGE_SIZE,
+                )
+                v_scale = runner.kv_scale[1, layer_id].view(
+                    num_phys16,
+                    runner.num_kv_heads,
+                    ASM_PAGE_SIZE,
+                )
+                module.k_scale = k_scale
+                module.v_scale = v_scale
+                impl.k_scale = k_scale
+                impl.v_scale = v_scale
 
             module.max_model_len = config.max_model_len
             module.k_cache = k_cache
@@ -962,10 +1051,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 make_sparse_decode_metadata,
             )
 
-            if max_seqlen_q > 1:
-                raise NotImplementedError(
-                    "MiniMax-M3 FP4-only support does not include speculative decode."
-                )
+            # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
+            # the DECODE sparse path; the decode kernels handle q>1 per-token
+            # causal internally via max_query_len.
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables[:scheduled_bs],
                 attn_metadata.context_lens[:scheduled_bs],
@@ -976,6 +1064,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=int(max_seqlen_k),
+                max_query_len=int(max_seqlen_q),
             )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q
@@ -1173,10 +1262,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
 
             seq_lens = attn_metadata.context_lens
-            if max_q_len > 1:
-                raise NotImplementedError(
-                    "MiniMax-M3 FP4-only support does not include speculative decode."
-                )
+            # Both plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) use
+            # the DECODE sparse path; the decode kernels handle q>1 per-token causal
+            # internally (max_query_len), so no separate prefill graph is needed.
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables,
                 seq_lens,
@@ -1187,6 +1275,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=attn_metadata.max_seqlen_k,
+                max_query_len=max_q_len,
             )
 
         positions = var["positions"].copy_to_gpu(total_tokens)

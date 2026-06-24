@@ -47,6 +47,8 @@ class MiniMaxM3SparsePrefillMetadata:
 class MiniMaxM3SparseDecodeMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
+    # Query tokens per request: 1 == plain decode, num_spec+1 == eagle3 verify.
+    max_query_len: int = 1
 
 
 @dataclass
@@ -95,8 +97,11 @@ def make_sparse_decode_metadata(
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
     max_seq_len: int,
+    max_query_len: int = 1,
 ) -> MiniMaxM3SparseMetadata:
-    decode = MiniMaxM3SparseDecodeMetadata(seq_lens=seq_lens, block_table=block_table)
+    decode = MiniMaxM3SparseDecodeMetadata(
+        seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
+    )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
         max_seq_len=max_seq_len,
