@@ -166,10 +166,14 @@ server command above plus the three speculative-decoding flags):
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
-model_path=MiniMaxAI/MiniMax-M3-MXFP8
 draft_path=Inferact/MiniMax-M3-EAGLE3
 
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+# MiniMax-M3's dense attention has no bf16 block-128 ASM-PA kernel, so force the
+# Triton attention path (same as the MXFP4 base section above). Without this the
+# spec-verify dense attention (q = num_spec+1) falls into paged_attention_asm and
+# aborts in get_heuristic_kernel.
+export ATOM_FORCE_ATTN_TRITON=1
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
