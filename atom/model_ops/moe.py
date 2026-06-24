@@ -1395,9 +1395,6 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         layer.hidden_size = hidden_size
         layer.intermediate_size_per_partition = intermediate_size_per_partition
 
-        # Override to FP8 dtype
-        params_dtype = torch.float8_e4m3fn
-
         # Check block alignment for block quantization
         if self.block_quant:
             tp_size = get_tp_group().world_size
@@ -1777,8 +1774,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         self.num_experts = num_experts
-        # TODO hard code for now
-        params_dtype = torch.float8_e4m3fn
         intermediate_size_for_weight = intermediate_size_per_partition
 
         if self.block_quant:
