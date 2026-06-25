@@ -156,6 +156,54 @@
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     },
     {
+      "display": "MiniMax-M3-MXFP8",
+      "path": "MiniMaxAI/MiniMax-M3-MXFP8",
+      "prefix": "m3-mxfp8",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_FORCE_ATTN_TRITON=1\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "fp8",
+        "trust_remote_code": true,
+        "extra_args": "--gpu-memory-utilization 0.8 --block-size 128 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"vision_tower\", \"multi_modal_projector\", \"patch_merge_mlp\", \"*block_sparse_moe\"]}'"
+      },
+      "variants": [
+        { "label": "", "suffix": "", "extra_args": "--max-num-seqs 256" },
+        {
+          "label": "EAGLE3",
+          "suffix": "-eagle3",
+          "extra_args": "--max-num-seqs 256 --method eagle3 --draft-model Inferact/MiniMax-M3-EAGLE3 --num-speculative-tokens 3",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        }
+      ]
+    },
+    {
+      "display": "MiniMax-M3-MXFP4",
+      "path": "amd/MiniMax-M3-MXFP4",
+      "prefix": "m3-mxfp4",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_FORCE_ATTN_TRITON=1\nAITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "fp8",
+        "trust_remote_code": true,
+        "extra_args": "--gpu-memory-utilization 0.8 --block-size 128 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching"
+      },
+      "variants": [
+        { "label": "", "suffix": "", "extra_args": "--max-num-seqs 256" },
+        {
+          "label": "EAGLE3",
+          "suffix": "-eagle3",
+          "extra_args": "--max-num-seqs 256 --method eagle3 --draft-model Inferact/MiniMax-M3-EAGLE3 --num-speculative-tokens 3",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        }
+      ]
+    },
+    {
       "display": "Qwen3.5-397B-A17B-FP8",
       "path": "Qwen/Qwen3.5-397B-A17B-FP8",
       "prefix": "qwen35-397b-fp8",

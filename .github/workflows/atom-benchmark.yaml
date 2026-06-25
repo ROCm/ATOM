@@ -46,6 +46,14 @@ on:
         description: "Benchmark MiniMax-M2.7-MXFP4"
         type: boolean
         default: true
+      m3-mxfp8:
+        description: "Benchmark MiniMax-M3-MXFP8 (+ EAGLE3)"
+        type: boolean
+        default: true
+      m3-mxfp4:
+        description: "Benchmark MiniMax-M3-MXFP4 (+ EAGLE3)"
+        type: boolean
+        default: true
       qwen35-397b-fp8:
         description: "Benchmark Qwen3.5-397B-A17B-FP8"
         type: boolean
