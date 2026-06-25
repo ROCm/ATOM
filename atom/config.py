@@ -309,6 +309,7 @@ class QuantizationConfig:
             "",
             "fp8",
             "mxfp4",
+            "mxfp8",
         ]:
             self.online_quant = True
             online_parser = get_quant_parser("online_quant")
