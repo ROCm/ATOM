@@ -40,10 +40,11 @@ def _patch_eagle3_model_type_checks() -> None:
 
 
 def _get_attn_backend_block_size(backend) -> int:
+    supported = backend.get_supported_kernel_block_sizes()
     get_preferred = getattr(backend, "get_preferred_block_size", None)
-    if get_preferred is not None:
-        return get_preferred()
-    return backend.get_supported_kernel_block_sizes()[0]
+    if get_preferred is None:
+        return supported[0]
+    return get_preferred(supported[0])
 
 
 @functools.cache
