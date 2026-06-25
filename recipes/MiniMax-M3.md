@@ -169,11 +169,7 @@ model_path=amd/MiniMax-M3-MXFP4
 draft_path=Inferact/MiniMax-M3-EAGLE3
 
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-# MiniMax-M3's dense attention has no bf16 block-128 ASM-PA kernel, so force the
-# Triton attention path (same as the MXFP4 base section above). Without this the
-# spec-verify dense attention (q = num_spec+1) falls into paged_attention_asm and
-# aborts in get_heuristic_kernel.
-export ATOM_FORCE_ATTN_TRITON=1
+export AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
@@ -183,7 +179,8 @@ python -m atom.entrypoints.openai_server \
   --gpu-memory-utilization 0.8 \
   --block-size 128 \
   --max-model-len 32768 \
-  --max-num-seqs 128 \
+  --max-num-seqs 256 \
+  --kv_cache_dtype fp8 \
   --max-num-batched-tokens 32768 \
   --no-enable_prefix_caching \
   --method eagle3 \
@@ -218,16 +215,6 @@ local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://12
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9416|±  |0.0062|
 |     |       |strict-match    |     5|exact_match|↑  |0.9419|±  |0.0062|
-```
-
-Validated MXFP8+EAGLE GSM8K result:
-
-```text
-local-chat-completions ({'model': 'MiniMaxAI/MiniMax-M3-MXFP8', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
-|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
-|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9500|±  |0.0061|
-|     |       |strict-match    |     5|exact_match|↑  |0.9494|±  |0.0061|
 ```
 
 ### Serving Benchmark
@@ -266,16 +253,6 @@ Reference MXFP4 EAGLE3 results from our run on 4xMI355 GPUs:
 | 16 | 160 | 103.68 | 498.39 | 4218.43 | 10.03 | 22.49 | 1414.41 | 13210.97 |
 | 32 | 320 | 139.89 | 642.88 | 5327.78 | 13.91 | 33.04 | 2120.00 | 19933.90 |
 | 64 | 640 | 213.19 | 979.37 | 10432.72 | 21.05 | 51.05 | 2771.30 | 24947.04 |
-
-Reference MXFP8 EAGLE3 results from our run on 4xMI355 GPUs:
-
-| CONC | Requests | Duration (s) | Mean TTFT (ms) | P99 TTFT (ms) | Mean TPOT (ms) | P99 TPOT (ms) | Output tok/s | Total tok/s |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4 | 40 | 71.58 | 305.42 | 725.69 | 7.17 | 13.13 | 514.96 | 4723.03 |
-| 8 | 80 | 92.76 | 761.62 | 5615.31 | 8.83 | 19.75 | 799.67 | 7211.16 |
-| 16 | 160 | 118.81 | 502.76 | 2852.45 | 11.45 | 24.82 | 1234.39 | 12124.02 |
-| 32 | 320 | 165.54 | 681.16 | 5616.00 | 16.37 | 34.57 | 1791.67 | 16501.51 |
-| 64 | 640 | 249.99 | 1026.47 | 11151.09 | 24.90 | 59.52 | 2363.39 | 22374.37 |
 
 ### Acceptance Rate
 
