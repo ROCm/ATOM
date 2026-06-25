@@ -1069,11 +1069,11 @@ class LayerNorm(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         weight, bias = self.weight, self.bias
-        if self.dtype is not None and self.dtype != weight:
+        if self.dtype is not None and self.dtype != weight.dtype:
             weight, bias = weight.to(self.dtype), bias.to(self.dtype)
         if residual is None:
-            return layernorm2d_fwd_(x, self.weight, self.bias, self.eps, self.dim)
+            return layernorm2d_fwd_(x, weight, bias, self.eps, self.dim)
         else:
             return layernorm2d_fwd_with_add_(
-                x, self.weight, residual, self.bias, self.eps, self.dim
+                x, weight, residual, bias, self.eps, self.dim
             )
