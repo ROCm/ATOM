@@ -1551,7 +1551,7 @@ class Indexer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.weights_proj",
             )
-        self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
+        self.k_norm = LayerNorm(self.head_dim, eps=1e-6, dtype=torch.float32)
         self.softmax_scale = self.head_dim**-0.5
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
 
