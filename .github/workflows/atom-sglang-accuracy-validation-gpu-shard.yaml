@@ -166,9 +166,6 @@ jobs:
             --ulimit stack=67108864 \
             --env-file /tmp/sglang_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
-            -e HF_HOME="${MODEL_CACHE_ROOT}/.cache/huggingface" \
-            -e HUGGINGFACE_HUB_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/hub" \
-            -e TRANSFORMERS_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/transformers" \
             --name "$CONTAINER_NAME" \
             "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
         env:
