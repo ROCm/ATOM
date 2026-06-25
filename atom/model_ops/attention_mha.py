@@ -169,7 +169,6 @@ class PagedAttentionImpl(nn.Module):
         position: torch.Tensor = None,
         q_scale: torch.Tensor = None,
         qkv: torch.Tensor = None,
-        index_qk: torch.Tensor = None,
     ):
 
         fwd_ctx: ForwardContext = get_forward_context()
@@ -186,7 +185,7 @@ class PagedAttentionImpl(nn.Module):
 
         # rope cache
         q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(
-            q, k, v, qkv, index_qk, position, fwd_ctx
+            q, k, v, qkv, position, fwd_ctx
         )
 
         attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
@@ -197,7 +196,7 @@ class PagedAttentionImpl(nn.Module):
         return o
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
-    def rope_cache(self, q, k, v, qkv, index_qk, position, fwd_ctx: ForwardContext):
+    def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
         attn_metadata = fwd_ctx.attn_metadata
         kv_cache_data = fwd_ctx.kv_cache_data
 
@@ -880,7 +879,6 @@ class PagedAttentionImpl(nn.Module):
         position: torch.Tensor = None,
         q_scale: Optional[torch.Tensor] = None,
         qkv: torch.Tensor = None,
-        index_qk: torch.Tensor = None,
         output: torch.Tensor = None,
         **kwargs,
     ):
@@ -891,7 +889,6 @@ class PagedAttentionImpl(nn.Module):
             position=position,
             q_scale=q_scale,
             qkv=qkv,
-            index_qk=index_qk,
         )
 
 
@@ -1026,12 +1023,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         return k16, v16, k_scale, v_scale
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
-    def rope_cache(self, q, k, v, qkv, index_qk, position, fwd_ctx: ForwardContext):
+    def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
         """MiniMax-M3 fused qk-norm + partial-NeoX-RoPE + page-16 SHUFFLE KV insert
         + indexer-key insert, via ``aiter.fused_qknorm_idxrqknorm``.
 
-        Consumes the main ``qkv`` tensor laid out as ``[q | k | v]`` plus an
-        optional ``index_qk`` tensor laid out as ``[index_q | index_k]``. Writes:
+        Consumes the packed ``qkv`` tensor laid out as
+        ``[q | k | v | index_q | index_k]``. Writes:
           * normed+roped main K/V          -> SHUFFLE K/V cache (asm_layout=True)
           * normed+roped index_k           -> page-128 index_cache
           * fp8 per-token dequant scales   -> k_scale / v_scale (when fp8)
@@ -1071,8 +1068,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         slot_mapping = sparse_metadata.slot_mapping
 
         qkv = qkv.contiguous()
-        if index_qk is not None:
-            index_qk = index_qk.contiguous()
         num_tokens = qkv.shape[0]
         from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
 
@@ -1095,7 +1090,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self._debug_topk_cache_event(state, "skip_indexer_rope", ("rope",))
             q_size = self.num_heads * self.head_dim
             kv_size = self.num_kv_heads * self.head_dim
-            q_raw, k_raw, v_raw = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
+            q_raw, k_raw, v_raw, _, _ = torch.split(
+                qkv,
+                [q_size, kv_size, kv_size, self.index_q_size, self.index_head_dim],
+                dim=-1,
+            )
             q_out, k_out = triton_fused_norm_rope_cache(
                 q_raw,
                 k_raw,
@@ -1130,8 +1129,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             dtype=qkv.dtype,
             device=qkv.device,
         )
-        if index_qk is None:
-            raise RuntimeError("MiniMax-M3 non-skip sparse layer requires index_qk")
         index_q = torch.empty(
             (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
         )
@@ -1160,7 +1157,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             k_scale=fused_k_scale,
             v_scale=fused_v_scale,
             asm_layout=True,
-            index_qk=index_qk,
         )
 
         q = q_out.view(-1, self.num_heads, self.head_dim)

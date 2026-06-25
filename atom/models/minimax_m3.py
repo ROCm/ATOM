@@ -24,7 +24,7 @@ from atom.model_ops.layernorm import (
 )
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.linear import (
-    MinimaxM3IndexerParallelLinear,
+    MinimaxM3QKVParallelLinearWithIndexer,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -446,17 +446,10 @@ class MiniMaxM3SparseAttention(nn.Module):
                 f"sparse_score_type='max', got {score_type!r}."
             )
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.indexer_proj = MinimaxM3IndexerParallelLinear(
-            self.hidden_size,
             self.total_num_kv_heads,
             self.total_idx_heads,
             self.idx_head_dim,
@@ -525,12 +518,20 @@ class MiniMaxM3SparseAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Main qkv is always needed. The indexer projection is skipped on layers
-        # that reuse the previous sparse top-k.
+        # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
+        # the indexer norm/rope/top-k path, but still compute the packed GEMM.
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        index_qk = None if self.skip_index_topk else self.indexer_proj(hidden_states)
-        attn_output = self.attn(q, k, v, positions, qkv=qkv, index_qk=index_qk)
+        q, k, v, _, _ = qkv.split(
+            [
+                self.q_size,
+                self.kv_size,
+                self.kv_size,
+                self.index_q_size,
+                self.idx_head_dim,
+            ],
+            dim=-1,
+        )
+        attn_output = self.attn(q, k, v, positions, qkv=qkv)
         return self.o_proj(attn_output)
 
 
@@ -695,8 +696,8 @@ class MiniMaxM3Model(nn.Module):
 
 class MiniMaxM3SparseForCausalLM(nn.Module):
     packed_modules_mapping = {
-        ".index_q_proj": (".indexer_proj", "index_q"),
-        ".index_k_proj": (".indexer_proj", "index_k"),
+        ".index_q_proj": (".qkv_proj", "index_q"),
+        ".index_k_proj": (".qkv_proj", "index_k"),
         ".q_proj": (".qkv_proj", "q"),
         ".k_proj": (".qkv_proj", "k"),
         ".v_proj": (".qkv_proj", "v"),
