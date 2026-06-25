@@ -3,7 +3,7 @@
 import importlib
 import sys
 from types import ModuleType
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 
 def _package(name: str) -> ModuleType:
@@ -26,12 +26,19 @@ def test_rtpllm_wrapper_registers_qwen35_moe_override():
         pass
 
     fake_atom_qwen_mod.ATOMQwen35Moe = _FakeATOMQwen35Moe
+    fake_atom_glm_mod = ModuleType("atom.plugin.rtpllm.models.glm5")
+
+    class _FakeATOMGlm5Moe:
+        pass
+
+    fake_atom_glm_mod.ATOMGlm5Moe = _FakeATOMGlm5Moe
 
     fake_modules = {
         "rtp_llm": _package("rtp_llm"),
         "rtp_llm.models": _package("rtp_llm.models"),
         "rtp_llm.model_factory_register": fake_register_mod,
         "atom.plugin.rtpllm.models.qwen3_5": fake_atom_qwen_mod,
+        "atom.plugin.rtpllm.models.glm5": fake_atom_glm_mod,
     }
 
     with patch.dict(sys.modules, fake_modules):
@@ -46,6 +53,10 @@ def test_rtpllm_wrapper_registers_qwen35_moe_override():
             ]
             == "qwen35_moe"
         )
-        register_model_mock.assert_called_with(
-            "atom_qwen35_moe", _FakeATOMQwen35Moe, []
+        register_model_mock.assert_has_calls(
+            [
+                call("atom_qwen35_moe", _FakeATOMQwen35Moe, []),
+                call("atom_glm5_moe", _FakeATOMGlm5Moe, []),
+            ],
+            any_order=False,
         )
