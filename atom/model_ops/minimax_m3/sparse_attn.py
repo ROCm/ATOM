@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import aiter  # noqa: F401  (used by the gluon PA runners for aiter.dtypes.fp8)
 import torch
+from aiter.jit.utils.chip_info import get_gfx
 
 try:
     from vllm.triton_utils import tl, triton
@@ -123,6 +124,64 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
         getattr(torch, "float8_e5m2", None),
     )
     return kv_cache.dtype in {dtype for dtype in fp8_dtypes if dtype is not None}
+
+
+def _sparse_decode_unified_attention(
+    q_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim] (kv-head collapsed)
+    out_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim]
+    k_cache_view: torch.Tensor,  # SHUFFLE 5D, num_kv_heads collapsed to 1
+    v_cache_view: torch.Tensor,
+    sparse_bt: torch.Tensor,  # [num_seqs, max_pages] physical-16 block table
+    sparse_ctx: torch.Tensor,  # [num_seqs] per-row effective context length
+    sm_scale: float,
+    num_seqs: int,
+) -> None:
+    """gfx1250 fallback for the sparse per-token-as-decode gluon kernel.
+
+    gfx1250 (MI455) has no ``pa_decode_gluon`` kernel (gluon supports gfx942 /
+    gfx950 only). The sparse runners have already compacted the indexer's
+    selected blocks into a dense physical-16 ``sparse_bt`` + exact ``sparse_ctx``
+    over the (kv-head collapsed) SHUFFLE cache — which is exactly the
+    ``(block_table, seqused_k)`` contract ``unified_attention`` consumes with
+    ``shuffled_kv_cache=True``. Each token is a length-1 causal "sequence",
+    mirroring the gluon ``max_seqlen_q=1`` per-token-as-decode setup.
+
+    bf16 KV cache only: fp8 sparse decode plumbs per-token (per-page) descales
+    into the gluon kernel, which does not map onto ``unified_attention``'s descale
+    contract here; the caller raises NotImplementedError for fp8 on gfx1250.
+    """
+    from aiter.ops.triton.unified_attention import unified_attention
+
+    # block_size (page granularity) from the SHUFFLE cache:
+    # key_cache: [num_blocks, num_kv_heads, head_size // x, block_size, x]
+    block_size = k_cache_view.shape[3]
+    # Each token is its own length-1 sequence (decode); cu_seqlens_q = 0..num_seqs.
+    cu_seqlens_q = torch.arange(
+        num_seqs + 1, dtype=torch.int32, device=q_view.device
+    )
+    # Safe upper bound: full block table width * page size (>= every sparse_ctx).
+    max_seqlen_k = int(sparse_bt.shape[1]) * int(block_size)
+
+    unified_attention(
+        q_view,
+        k_cache_view,
+        v_cache_view,
+        out_view,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=1,
+        seqused_k=sparse_ctx,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=sm_scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=sparse_bt,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1177,6 +1236,29 @@ def minimax_m3_sparse_attn_decode_asm(
     v_cache_view = v_cache.view(nph16 * _hkv, 1, *v_cache.shape[2:])
 
     num_seqs = T * num_kv_heads
+
+    # gfx1250 (MI455): no gluon pa_decode kernel (gluon supports gfx942 / gfx950
+    # only). Route through the triton unified_attention sparse fallback over the
+    # same SHUFFLE cache + compacted sparse block table.
+    if get_gfx() == "gfx1250":
+        if _is_fp8_kv_cache_tensor(k_cache):
+            raise NotImplementedError(
+                "MiniMax-M3 fp8 sparse decode is not yet supported on gfx1250 "
+                "(MI455): the gluon per-page descale path has no unified_attention "
+                "equivalent here. Use a bf16 KV cache on gfx1250."
+            )
+        _sparse_decode_unified_attention(
+            q_view,
+            out_view,
+            k_cache_view,
+            v_cache_view,
+            sparse_bt,
+            sparse_ctx,
+            sm_scale,
+            num_seqs,
+        )
+        return
+
     num_kv_heads_view = 1
     query_group_size = g
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
@@ -1271,6 +1353,29 @@ def _run_prefill_fp8_gluon(
     v_cache_view = v_cache.view(nph16 * _hkv, 1, *v_cache.shape[2:])
 
     num_seqs = T * num_kv_heads
+
+    # gfx1250 (MI455): no gluon pa_decode kernel (gluon supports gfx942 / gfx950
+    # only). Route through the triton unified_attention sparse fallback over the
+    # same SHUFFLE cache + compacted sparse block table.
+    if get_gfx() == "gfx1250":
+        if _is_fp8_kv_cache_tensor(k_cache):
+            raise NotImplementedError(
+                "MiniMax-M3 fp8 sparse decode is not yet supported on gfx1250 "
+                "(MI455): the gluon per-page descale path has no unified_attention "
+                "equivalent here. Use a bf16 KV cache on gfx1250."
+            )
+        _sparse_decode_unified_attention(
+            q_view,
+            out_view,
+            k_cache_view,
+            v_cache_view,
+            sparse_bt,
+            sparse_ctx,
+            sm_scale,
+            num_seqs,
+        )
+        return
+
     num_kv_heads_view = 1
     query_group_size = g
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
