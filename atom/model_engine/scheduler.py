@@ -1256,6 +1256,19 @@ class Scheduler:
             # no-op).
             if stop_at_idx is not None and stop_at_idx < num_new_token - 1:
                 num_tokens -= (num_new_token - 1) - stop_at_idx
+                # The same truncation MUST apply to the EMITTED tokens, not just
+                # the internal seq length. The client-visible text is built from
+                # RequestOutput.output_tokens (an accumulation of `new_tokens`) by
+                # generate_async / the streaming callback — NOT from
+                # completion_token_ids (which the `seq.num_tokens` write above
+                # governs). Without trimming `new_tokens` here, the post-stop
+                # tokens the rejection sampler emits past EOS (it does not inspect
+                # EOS) leak into the response: strict-match still finds the answer,
+                # but flexible-extract's last-number picks up the leaked trailing
+                # digit. `injected_t0` (if present) prepends one slot not counted
+                # in stop_at_idx / num_new_token, so offset the cut by it.
+                keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
+                new_tokens = new_tokens[:keep]
 
             # Prepare stream output
             if stream_output_queue is not None and new_tokens:

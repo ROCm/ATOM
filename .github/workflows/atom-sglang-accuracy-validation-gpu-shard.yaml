@@ -37,40 +37,77 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Detect container engine
+        run: |
+          if command -v podman > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
+            echo "Container engine: podman"
+          elif docker info > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
+            echo "Container engine: docker"
+          else
+            echo "ERROR: Neither docker nor podman is available on this runner."
+            exit 1
+          fi
+
       - name: Docker Login
         run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+          REG="${SGLANG_IMAGE_TAG%%/*}"
+          if [[ "$REG" != *.* && "$REG" != localhost* && "$REG" != *:* ]]; then
+            REG="docker.io"
+          fi
+          echo "Logging in to registry: ${REG}"
+          echo "${{ secrets.DOCKER_PASSWORD }}" | $CONTAINER_ENGINE login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
             
-      - name: Print runner user and Docker diagnostics
+      - name: Print runner user and container engine diagnostics
         run: |
-          echo "=== Docker diagnostics ==="
+          echo "=== Container engine diagnostics ==="
           echo "PATH=${PATH}"
           echo "whoami=$(whoami)"
           echo "id=$(id)"
           echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
           echo "docker path: $(command -v docker || true)"
+          echo "podman path: $(command -v podman || true)"
           ls -l /var/run/docker.sock || true
           stat -c '%U %G %a %n' /var/run/docker.sock || true
-          echo "docker version:"
-          docker version || true
-          echo "docker info:"
-          docker info || true
-          echo "=== End Docker diagnostics ==="
+          echo "${CONTAINER_ENGINE} version:"
+          $CONTAINER_ENGINE version || true
+          echo "${CONTAINER_ENGINE} info:"
+          $CONTAINER_ENGINE info || true
+          echo "=== End container engine diagnostics ==="
         
       - name: Pull SGLANG image
         run: |
-          docker pull "${SGLANG_IMAGE_TAG}"
+          set -euo pipefail
+          IMG="${SGLANG_IMAGE_TAG}"
+          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+            if [[ "${IMG}" != */* ]]; then
+              IMG="docker.io/library/${IMG}"
+            else
+              reg="${IMG%%/*}"
+              if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
+                IMG="docker.io/${IMG}"
+              fi
+            fi
+          fi
+          echo "SGLANG_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+          echo "Pulling SGLANG image: ${IMG} (workflow tag: ${SGLANG_IMAGE_TAG})"
+          $CONTAINER_ENGINE pull "${IMG}"
 
       - name: Prepare model cache mount
         run: |
           MODEL_CACHE_MOUNT=""
-          MODEL_CACHE_ROOT=""
+          MODEL_CACHE_ROOT="/models"
           MODEL_CACHE_DESC=""
 
-          if [ -d "/mnt/raid0/pretrained_model" ]; then
+          if [ -d "/shared/data/WRH/models" ]; then
+            MODEL_CACHE_ROOT="/shared/data/WRH/models"
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
+            MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
+          elif [ -d "/mnt/raid0/pretrained_model" ]; then
             MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
             MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_CACHE_ROOT}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
@@ -91,11 +128,11 @@ jobs:
 
       - name: Clean up old containers
         run: |
-          containers=$(docker ps -q)
+          containers=$($CONTAINER_ENGINE ps -q)
           if [ -n "$containers" ]; then
-            docker kill $containers || true
+            $CONTAINER_ENGINE kill $containers || true
           fi
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
       - name: Start validation container
         run: |
@@ -103,6 +140,11 @@ jobs:
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
           else
             DEVICE_FLAG="--device /dev/dri"
+          fi
+          if [ "${CONTAINER_ENGINE}" = "podman" ]; then
+            GROUP_ADD_FLAG="--group-add keep-groups"
+          else
+            GROUP_ADD_FLAG="--group-add video"
           fi
 
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
@@ -112,12 +154,11 @@ jobs:
           ${{ matrix.env_vars }}
           EOF
 
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
-            --ipc=host --group-add video \
-            --shm-size=16G \
+            --ipc=host $GROUP_ADD_FLAG \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
@@ -129,21 +170,47 @@ jobs:
             -e HUGGINGFACE_HUB_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/hub" \
             -e TRANSFORMERS_CACHE="${MODEL_CACHE_ROOT}/.cache/huggingface/transformers" \
             --name "$CONTAINER_NAME" \
-            "${SGLANG_IMAGE_TAG}"
+            "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Collect GPU info (inside container)
         id: gpu-info
-        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.runner }}"
+
+      - name: Resolve local model path
+        run: |
+          set -euo pipefail
+          if [ -z "${MODEL_CACHE_MOUNT}" ]; then
+            echo "SGLANG_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
+            echo "No shared model cache mount; local model resolution skipped."
+            exit 0
+          fi
+
+          model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
+          if $CONTAINER_ENGINE exec \
+            -e MODEL_DIR="$model_dir" \
+            "$CONTAINER_NAME" \
+            bash -lc '[ -f "$MODEL_DIR/config.json" ]'; then
+            echo "Resolved local model path: ${model_dir}"
+            echo "SGLANG_MODEL_AVAILABLE_LOCALLY=true" >> "$GITHUB_ENV"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
+          else
+            echo "Local model path not found for ${{ matrix.model_path }} under ${model_dir}."
+            echo "SGLANG_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Download model if needed
         run: |
           set -euo pipefail
           model_dir="${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
+          if [ "${SGLANG_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
+            echo "Using local model path ${SGLANG_RESOLVED_MODEL_PATH}; skip download."
+            exit 0
+          fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
-            if ! docker exec \
+            if ! $CONTAINER_ENGINE exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
               -e MODEL_CACHE_ROOT="${MODEL_CACHE_ROOT}" \
               -e MODEL_PATH="${{ matrix.model_path }}" \
@@ -205,6 +272,10 @@ jobs:
       - name: Resolve SGLANG model path
         if: success()
         run: |
+          if [ "${SGLANG_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
+            echo "Using previously resolved local model path: ${SGLANG_RESOLVED_MODEL_PATH}"
+            exit 0
+          fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_CACHE_ROOT}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: ${MODEL_CACHE_ROOT}/${{ matrix.model_path }}"
@@ -224,7 +295,7 @@ jobs:
           STREAM_SGLANG_LOGS: "1"
           LM_EVAL_TASK: "gsm8k"
         run: |
-          docker exec \
+          $CONTAINER_ENGINE exec \
             -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
             -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$SGLANG_MODEL_PATH}" \
             -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
@@ -244,7 +315,7 @@ jobs:
       - name: Check SGLANG accuracy test results
         if: success()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
           result_file=$(ls -1t atom_sglang_accuracy_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
             echo "ERROR: No results JSON file found in atom_sglang_accuracy_results/"
@@ -277,14 +348,14 @@ jobs:
         if: success()
         run: |
           echo "SGLANG gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/atom_sglang_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/atom_sglang_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Collect artifacts
         if: always()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
+          $CONTAINER_ENGINE cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
 
       - name: Upload model artifacts
         if: always()
@@ -307,8 +378,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
-          docker stop "$CONTAINER_NAME" || true
-          docker rm "$CONTAINER_NAME" || true
-          docker rmi "${SGLANG_IMAGE_TAG}" || true
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
+          $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
+          $CONTAINER_ENGINE rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
 

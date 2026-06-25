@@ -13,6 +13,7 @@ from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from atom.utils import envs
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 logger = logging.getLogger("atom")
@@ -214,7 +215,9 @@ class LLMEngine:
         logger.info("Profiling started")
 
     def stop_profile(self) -> List[Dict[str, Any]]:
-        responses = self.core_mgr.broadcast_utility_command_sync("stop_profile")
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "stop_profile", timeout=envs.ATOM_PROFILER_TIMEOUT
+        )
         return [resp.get("result", {}) for resp in responses]
 
     def print_mtp_statistics(self):

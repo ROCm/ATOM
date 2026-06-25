@@ -309,6 +309,7 @@ class QuantizationConfig:
             "",
             "fp8",
             "mxfp4",
+            "mxfp8",
         ]:
             self.online_quant = True
             online_parser = get_quant_parser("online_quant")
@@ -724,6 +725,16 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if getattr(text_config, "hidden_act", None) == "swigluoai":
         if getattr(text_config, "swiglu_beta", None) is None:
             text_config.swiglu_beta = 1.0
+
+    for attr_name in (
+        "use_index_cache",
+        "index_topk_freq",
+        "index_topk_pattern",
+        "index_skip_topk_offset",
+    ):
+        attr_value = getattr(hf_config, attr_name, None)
+        if attr_value is not None:
+            setattr(text_config, attr_name, attr_value)
 
     for attr_name, attr_value in vars(text_config).items():
         if attr_name.startswith("_") or getattr(hf_config, attr_name, None) is not None:
@@ -1263,11 +1274,29 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_dp_attention)
+        text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (
-                getattr(self.hf_config, "use_index_cache", False),
-                getattr(self.hf_config, "index_topk_freq", None),
-                getattr(self.hf_config, "index_topk_pattern", None),
+                getattr(
+                    text_config,
+                    "use_index_cache",
+                    getattr(self.hf_config, "use_index_cache", False),
+                ),
+                getattr(
+                    text_config,
+                    "index_topk_freq",
+                    getattr(self.hf_config, "index_topk_freq", None),
+                ),
+                getattr(
+                    text_config,
+                    "index_topk_pattern",
+                    getattr(self.hf_config, "index_topk_pattern", None),
+                ),
+                getattr(
+                    text_config,
+                    "index_skip_topk_offset",
+                    getattr(self.hf_config, "index_skip_topk_offset", None),
+                ),
             )
         )
 

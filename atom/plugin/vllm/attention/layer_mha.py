@@ -190,6 +190,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             query,
             key,
             value,
+            self.kv_cache,
             self.layer_name,
             positions,
             q_scale,
