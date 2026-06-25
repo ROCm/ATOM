@@ -77,10 +77,10 @@ models:
       nightly:
         - name: ds-v4-1p1d-tp8
           topology: 1p1d
-          nodes: [mia1-p02-g42, mia1-p02-g44]
+          nodes: [mia1-p02-g47, mia1-p02-g44]
           isl: [8192]
           osl: 1024
-          concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
+          concurrency: [64, 128]
           run_eval: true
 
         - name: ds-v4-2p1d-dpa-tp8
@@ -88,7 +88,7 @@ models:
           nodes: [mia1-p02-g42, mia1-p02-g44, mia1-p02-g47]
           isl: [8192]
           osl: 1024
-          concurrency: [256, 512, 768, 1024, 2048]
+          concurrency: [256, 512]
           prefill:
             workers: 2
             tp: 8
