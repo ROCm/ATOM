@@ -291,6 +291,12 @@ class MiniMaxM3MoE(nn.Module):
             # padded intermediate avoids backend pad-skip precision issues.
             self.experts.quant_method.intermediate_pad = 0
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        # SwiGLU-OAI params for the standalone dense shared-expert GEMM
+        # (Mxfp4MoEMethod._apply_shared_experts_dense). The routed experts use
+        # alpha (default 1.702) and swiglu_add_residual=True (beta == 1.0); the
+        # dense shared experts must match.
+        self.experts.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
+        self.experts.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
