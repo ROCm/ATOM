@@ -274,7 +274,7 @@ jobs:
               SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
             accuracy_test_threshold: 0.76
-            runner: linux-atom-mi35x-4
+            runner: atom-mi308-8gpu-vllm-sgl-ci
           - model_name: "DeepSeek-V4-Pro TP8"
             model_path: "deepseek-ai/DeepSeek-V4-Pro"
             extra_args: "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4"
