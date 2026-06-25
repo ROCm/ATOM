@@ -116,9 +116,18 @@ class Attention(BaseAttention):
         positions: torch.Tensor = None,
         q_scale: Optional[torch.Tensor] = None,
         qkv: torch.Tensor = None,
+        index_qk: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         output = torch.ops.aiter.unified_attention_with_output_base(
-            query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
+            query,
+            q_scale,
+            key,
+            value,
+            positions,
+            self.layer_name,
+            self.use_mla,
+            qkv,
+            index_qk,
         )
         return output

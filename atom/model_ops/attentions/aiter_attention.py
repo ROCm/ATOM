@@ -499,6 +499,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 device="cuda",
             )
             tensors["_sparse_attention_cache_next"] = 0
+            if getattr(text_config, "use_index_cache", False) or getattr(
+                hf_config, "use_index_cache", False
+            ):
+                tensors["_sparse_attention_topk_cache_state"] = {}
         return tensors
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -530,6 +534,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             runner._sparse_attention_cache_next += 1
             module.impl.index_cache = runner.sparse_attention_index_cache[sparse_idx]
             module.impl.max_model_len = runner.config.max_model_len
+            module.impl.index_topk_cache_state = getattr(
+                runner, "_sparse_attention_topk_cache_state", None
+            )
             # NOTE: no return — fall through to the standard MHA binding below.
 
         if not (

@@ -24,7 +24,7 @@ from atom.model_ops.layernorm import (
 )
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.linear import (
-    MinimaxM3QKVParallelLinearWithIndexer,
+    MinimaxM3IndexerParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -60,6 +60,40 @@ def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
     if freq is None:
         return set()
     return {i for i, enabled in enumerate(freq) if enabled != 0}
+
+
+def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]:
+    return {
+        layer_id: ordinal
+        for ordinal, layer_id in enumerate(sorted(_sparse_attention_layer_ids(config)))
+    }
+
+
+def _should_skip_minimax_m3_index_topk(
+    config: PretrainedConfig, layer_id: int
+) -> tuple[bool, int]:
+    sparse_ordinals = _sparse_attention_layer_ordinals(config)
+    sparse_ordinal = sparse_ordinals.get(layer_id, -1)
+    if sparse_ordinal < 0:
+        return False, sparse_ordinal
+    if not getattr(config, "use_index_cache", False):
+        return False, sparse_ordinal
+
+    index_topk_freq = int(getattr(config, "index_topk_freq", 1) or 1)
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is not None:
+        if 0 <= sparse_ordinal < len(index_topk_pattern):
+            return index_topk_pattern[sparse_ordinal] == "S", sparse_ordinal
+        return False, sparse_ordinal
+
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    if index_topk_freq == 1:
+        return False, sparse_ordinal
+
+    # MiniMax-M3 schedules sharing by sparse-layer ordinal, not absolute layer id.
+    offset = int(getattr(config, "index_skip_topk_offset", 0))
+    return max(sparse_ordinal - offset, 0) % index_topk_freq != 0, sparse_ordinal
 
 
 def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
@@ -402,6 +436,9 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
         self.init_blocks = sparse_cfg.get("sparse_init_block", 0)
         self.local_blocks = sparse_cfg.get("sparse_local_block", 0)
+        self.skip_index_topk, self.sparse_layer_ordinal = (
+            _should_skip_minimax_m3_index_topk(config, layer_id)
+        )
         score_type = sparse_cfg.get("sparse_score_type", "max")
         if score_type != "max":
             raise ValueError(
@@ -409,10 +446,17 @@ class MiniMaxM3SparseAttention(nn.Module):
                 f"sparse_score_type='max', got {score_type!r}."
             )
 
-        self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
+        self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+        self.indexer_proj = MinimaxM3IndexerParallelLinear(
+            self.hidden_size,
             self.total_num_kv_heads,
             self.total_idx_heads,
             self.idx_head_dim,
@@ -472,6 +516,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             topk=self.topk_blocks,
             init_blocks=self.init_blocks,
             local_blocks=self.local_blocks,
+            skip_index_topk=self.skip_index_topk,
+            sparse_layer_ordinal=self.sparse_layer_ordinal,
         )
 
     def forward(
@@ -479,22 +525,12 @@ class MiniMaxM3SparseAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Packed qkv = [q | k | v | index_q | index_k]. The sparse impl's
-        # rope_cache consumes the packed tensor directly (passed via qkv=); the
-        # split q/k/v slices satisfy forward_impl's view contract (they are
-        # rebuilt from qkv inside rope_cache).
+        # Main qkv is always needed. The indexer projection is skipped on layers
+        # that reuse the previous sparse top-k.
         qkv = self.qkv_proj(hidden_states)
-        q, k, v, _, _ = qkv.split(
-            [
-                self.q_size,
-                self.kv_size,
-                self.kv_size,
-                self.index_q_size,
-                self.idx_head_dim,
-            ],
-            dim=-1,
-        )
-        attn_output = self.attn(q, k, v, positions, qkv=qkv)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        index_qk = None if self.skip_index_topk else self.indexer_proj(hidden_states)
+        attn_output = self.attn(q, k, v, positions, qkv=qkv, index_qk=index_qk)
         return self.o_proj(attn_output)
 
 
@@ -659,8 +695,8 @@ class MiniMaxM3Model(nn.Module):
 
 class MiniMaxM3SparseForCausalLM(nn.Module):
     packed_modules_mapping = {
-        ".index_q_proj": (".qkv_proj", "index_q"),
-        ".index_k_proj": (".qkv_proj", "index_k"),
+        ".index_q_proj": (".indexer_proj", "index_q"),
+        ".index_k_proj": (".indexer_proj", "index_k"),
         ".q_proj": (".qkv_proj", "q"),
         ".k_proj": (".qkv_proj", "k"),
         ".v_proj": (".qkv_proj", "v"),

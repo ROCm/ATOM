@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from functools import cache
 from typing import Optional
 
@@ -168,6 +169,7 @@ class PagedAttentionImpl(nn.Module):
         position: torch.Tensor = None,
         q_scale: torch.Tensor = None,
         qkv: torch.Tensor = None,
+        index_qk: torch.Tensor = None,
     ):
 
         fwd_ctx: ForwardContext = get_forward_context()
@@ -184,7 +186,7 @@ class PagedAttentionImpl(nn.Module):
 
         # rope cache
         q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(
-            q, k, v, qkv, position, fwd_ctx
+            q, k, v, qkv, index_qk, position, fwd_ctx
         )
 
         attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
@@ -195,7 +197,7 @@ class PagedAttentionImpl(nn.Module):
         return o
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
-    def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
+    def rope_cache(self, q, k, v, qkv, index_qk, position, fwd_ctx: ForwardContext):
         attn_metadata = fwd_ctx.attn_metadata
         kv_cache_data = fwd_ctx.kv_cache_data
 
@@ -878,11 +880,18 @@ class PagedAttentionImpl(nn.Module):
         position: torch.Tensor = None,
         q_scale: Optional[torch.Tensor] = None,
         qkv: torch.Tensor = None,
+        index_qk: torch.Tensor = None,
         output: torch.Tensor = None,
         **kwargs,
     ):
         return self.forward_impl(
-            q=query, k=key, v=value, position=position, q_scale=q_scale, qkv=qkv
+            q=query,
+            k=key,
+            v=value,
+            position=position,
+            q_scale=q_scale,
+            qkv=qkv,
+            index_qk=index_qk,
         )
 
 
@@ -937,6 +946,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         topk: int = 0,
         init_blocks: int = 0,
         local_blocks: int = 0,
+        skip_index_topk: bool = False,
+        sparse_layer_ordinal: int = -1,
         **kwargs,
     ):
         super().__init__(
@@ -972,9 +983,15 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.topk = topk
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
+        self.skip_index_topk = skip_index_topk
+        self.sparse_layer_ordinal = sparse_layer_ordinal
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: Optional[torch.Tensor] = None
+        # Optional shared dict bound by the metadata builder. It is scoped to the
+        # current sparse metadata object and carries the last full layer top-k.
+        self.index_topk_cache_state: Optional[dict] = None
+        self._index_q_cache_key_info: Optional[tuple] = None
         # Rotated indexer query produced by rope_cache, consumed (and cleared) by
         # dispatch_backend within the same single-threaded layer forward.
         self._index_q: Optional[torch.Tensor] = None
@@ -1009,12 +1026,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         return k16, v16, k_scale, v_scale
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
-    def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
+    def rope_cache(self, q, k, v, qkv, index_qk, position, fwd_ctx: ForwardContext):
         """MiniMax-M3 fused qk-norm + partial-NeoX-RoPE + page-16 SHUFFLE KV insert
         + indexer-key insert, via ``aiter.fused_qknorm_idxrqknorm``.
 
-        Consumes the PACKED ``qkv`` tensor (Gemma (1+w) norm path needs it) laid
-        out as ``[q | k | v | index_q | index_k]``. Writes:
+        Consumes the main ``qkv`` tensor laid out as ``[q | k | v]`` plus an
+        optional ``index_qk`` tensor laid out as ``[index_q | index_k]``. Writes:
           * normed+roped main K/V          -> SHUFFLE K/V cache (asm_layout=True)
           * normed+roped index_k           -> page-128 index_cache
           * fp8 per-token dequant scales   -> k_scale / v_scale (when fp8)
@@ -1054,15 +1071,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         slot_mapping = sparse_metadata.slot_mapping
 
         qkv = qkv.contiguous()
+        if index_qk is not None:
+            index_qk = index_qk.contiguous()
         num_tokens = qkv.shape[0]
-        q_out = torch.empty(
-            (num_tokens, self.num_heads * self.head_dim),
-            dtype=qkv.dtype,
-            device=qkv.device,
-        )
-        index_q = torch.empty(
-            (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
-        )
         from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
 
         cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
@@ -1074,6 +1085,56 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         fused_k_scale = k_scale if is_fp8 else None
         fused_v_scale = v_scale if is_fp8 else None
 
+        if self.skip_index_topk:
+            from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
+                triton_fused_norm_rope_cache,
+            )
+
+            state = self._topk_cache_state(sparse_metadata)
+            if state is not None:
+                self._debug_topk_cache_event(state, "skip_indexer_rope", ("rope",))
+            q_size = self.num_heads * self.head_dim
+            kv_size = self.num_kv_heads * self.head_dim
+            q_raw, k_raw, v_raw = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
+            q_out, k_out = triton_fused_norm_rope_cache(
+                q_raw,
+                k_raw,
+                v_raw,
+                position,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                rotary_emb=self.rotary_emb,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                k_scale=fused_k_scale,
+                v_scale=fused_v_scale,
+                slot_mapping=slot_mapping,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+            q = q_out.view(-1, self.num_heads, self.head_dim)
+            k = k_out.view(-1, self.num_kv_heads, self.head_dim)
+            v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
+            self._index_q = None
+            self._index_q_cache_key_info = (
+                (num_tokens, self.num_idx_heads, self.index_head_dim),
+                qkv.dtype,
+                qkv.device,
+            )
+            return q, k, v, k_cache, v_cache, k_scale, v_scale
+
+        q_out = torch.empty(
+            (num_tokens, self.num_heads * self.head_dim),
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+        if index_qk is None:
+            raise RuntimeError("MiniMax-M3 non-skip sparse layer requires index_qk")
+        index_q = torch.empty(
+            (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
+        )
         aiter.fused_qknorm_idxrqknorm(
             qkv,
             self.q_norm.weight,
@@ -1099,12 +1160,18 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             k_scale=fused_k_scale,
             v_scale=fused_v_scale,
             asm_layout=True,
+            index_qk=index_qk,
         )
 
         q = q_out.view(-1, self.num_heads, self.head_dim)
         # Stash the rotated indexer query for dispatch_backend (same-forward,
         # single-threaded; cleared after the sparse backend consumes it).
         self._index_q = index_q.view(-1, self.num_idx_heads, self.index_head_dim)
+        self._index_q_cache_key_info = (
+            tuple(self._index_q.shape),
+            self._index_q.dtype,
+            self._index_q.device,
+        )
 
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
@@ -1132,6 +1199,94 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         sm = getattr(attn_metadata, "sparse_attention_metadata", None)
         return sm if sm is not None else attn_metadata
 
+    def _topk_cache_state(self, sparse_metadata):
+        state = self.index_topk_cache_state
+        if state is None:
+            return None
+        metadata_id = id(sparse_metadata)
+        if state.get("metadata_id") != metadata_id:
+            debug_totals = state.get("_debug_totals")
+            state.clear()
+            if debug_totals is not None:
+                state["_debug_totals"] = debug_totals
+            state["metadata_id"] = metadata_id
+        return state
+
+    def _debug_topk_cache_event(self, state: dict, event: str, key: tuple):
+        if os.environ.get("ATOM_DEBUG_MINIMAX_M3_INDEX_CACHE") != "1":
+            return
+        totals = state.setdefault("_debug_totals", {})
+        mode = key[0] if key else "unknown"
+        counter_key = f"{mode}_{event}"
+        totals[counter_key] = totals.get(counter_key, 0) + 1
+        total_events = sum(totals.values())
+        interval = int(os.environ.get("ATOM_DEBUG_MINIMAX_M3_INDEX_CACHE_INTERVAL", "256"))
+        if total_events <= 32 or (interval > 0 and total_events % interval == 0):
+            print(
+                "[MiniMax-M3 IndexCache] "
+                f"pid={os.getpid()} event={event} mode={mode} "
+                f"layer={self.layer_num} sparse_ord={self.sparse_layer_ordinal} "
+                f"skip={self.skip_index_topk} totals={totals}",
+                flush=True,
+            )
+
+    def _topk_cache_key(
+        self,
+        mode: str,
+        index_q: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_query_len: int,
+        max_seq_len: int,
+    ) -> tuple:
+        if index_q is None:
+            if self._index_q_cache_key_info is None:
+                raise RuntimeError("MiniMax-M3 index cache key missing index_q metadata")
+            index_q_shape, index_q_dtype, index_q_device = self._index_q_cache_key_info
+        else:
+            index_q_shape = tuple(index_q.shape)
+            index_q_dtype = index_q.dtype
+            index_q_device = index_q.device
+        return (
+            mode,
+            index_q_shape,
+            index_q_dtype,
+            index_q_device,
+            tuple(block_table.shape),
+            tuple(block_table.stride()),
+            tuple(seq_lens.shape),
+            self.topk,
+            self.init_blocks,
+            self.local_blocks,
+            self.num_kv_heads,
+            max_query_len,
+            max_seq_len,
+        )
+
+    def _load_cached_topk(self, sparse_metadata, key: tuple):
+        if not self.skip_index_topk:
+            return None
+        state = self._topk_cache_state(sparse_metadata)
+        if state is None:
+            return None
+        entry = state.get("topk")
+        if entry is None or entry.get("key") != key:
+            self._debug_topk_cache_event(state, "miss", key)
+            return None
+        self._debug_topk_cache_event(state, "hit", key)
+        return entry["value"]
+
+    def _store_cached_topk(self, sparse_metadata, key: tuple, value: tuple):
+        state = self._topk_cache_state(sparse_metadata)
+        if state is not None:
+            state["topk"] = {
+                "key": key,
+                "value": value,
+                "layer_num": self.layer_num,
+                "sparse_layer_ordinal": self.sparse_layer_ordinal,
+            }
+            self._debug_topk_cache_event(state, "store", key)
+
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
     def _sparse_prefill(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -1150,22 +1305,39 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         prefix_lens = prefill_md.context_lens
         block_tables = prefill_md.block_table
 
-        topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk(
+        topk_key = self._topk_cache_key(
+            "prefill",
             index_q,
-            self.index_cache,
             block_tables,
-            cu_seqlens_q,
             seq_lens,
-            prefix_lens,
             prefill_md.max_query_len,
             prefill_md.max_seq_len,
-            self.topk,
-            self.init_blocks,
-            self.local_blocks,
-            self.num_kv_heads,
-            self.scale,
-            emit_sparse_block_table=True,
         )
+        cached_topk = self._load_cached_topk(sparse_metadata, topk_key)
+        if cached_topk is None:
+            if index_q is None:
+                raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
+            topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk(
+                index_q,
+                self.index_cache,
+                block_tables,
+                cu_seqlens_q,
+                seq_lens,
+                prefix_lens,
+                prefill_md.max_query_len,
+                prefill_md.max_seq_len,
+                self.topk,
+                self.init_blocks,
+                self.local_blocks,
+                self.num_kv_heads,
+                self.scale,
+                emit_sparse_block_table=True,
+            )
+            self._store_cached_topk(
+                sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
+            )
+        else:
+            topk_idx, sparse_bt, sparse_ctx = cached_topk
         output = torch.empty_like(q)
         minimax_m3_sparse_attn_prefill_asm(
             q,
@@ -1188,6 +1360,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
         output = output.view(*q.shape)
         self._index_q = None
+        self._index_q_cache_key_info = None
         return output
 
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
@@ -1205,20 +1378,37 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         assert decode_md is not None, "sparse decode metadata missing"
         max_query_len = getattr(decode_md, "max_query_len", 1)
 
-        topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
+        topk_key = self._topk_cache_key(
+            "decode",
             index_q,
-            self.index_cache,
             decode_md.block_table,
             decode_md.seq_lens,
+            max_query_len,
             sparse_metadata.max_seq_len,
-            self.topk,
-            self.init_blocks,
-            self.local_blocks,
-            self.num_kv_heads,
-            self.scale,
-            emit_sparse_block_table=True,
-            max_query_len=max_query_len,
         )
+        cached_topk = self._load_cached_topk(sparse_metadata, topk_key)
+        if cached_topk is None:
+            if index_q is None:
+                raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
+            topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
+                index_q,
+                self.index_cache,
+                decode_md.block_table,
+                decode_md.seq_lens,
+                sparse_metadata.max_seq_len,
+                self.topk,
+                self.init_blocks,
+                self.local_blocks,
+                self.num_kv_heads,
+                self.scale,
+                emit_sparse_block_table=True,
+                max_query_len=max_query_len,
+            )
+            self._store_cached_topk(
+                sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
+            )
+        else:
+            topk_idx, sparse_bt, sparse_ctx = cached_topk
         output = torch.empty_like(q)
         minimax_m3_sparse_attn_decode_asm(
             q,
@@ -1236,5 +1426,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             sparse_ctx=sparse_ctx,
         )
         self._index_q = None
+        self._index_q_cache_key_info = None
         output = output.view(*q.shape)
         return output
