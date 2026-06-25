@@ -74,6 +74,48 @@ def _register_hf_configs() -> None:
             raise
 
 
+def _register_mxfp8_quantization_config() -> None:
+    """Let ATOM-owned MXFP8 checkpoints pass vLLM config validation.
+
+    vLLM uses the same name, "mxfp8", for an online-quant shorthand. MiniMax-M3
+    MXFP8 checkpoints store "quant_method": "mxfp8" in config.json, and ATOM
+    parses/loads those weights itself. Registering this no-op config prevents
+    vLLM from routing the checkpoint config through OnlineQuantizationConfig.
+    """
+    from vllm.model_executor.layers.quantization import register_quantization_config
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+        QuantizeMethodBase,
+    )
+
+    @register_quantization_config("mxfp8")
+    class AtomMxfp8Config(QuantizationConfig):
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+        @classmethod
+        def get_min_capability(cls) -> int:
+            return 80
+
+        @classmethod
+        def get_name(cls):
+            return "mxfp8"
+
+        @classmethod
+        def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+            return [torch.bfloat16, torch.float16]
+
+        @classmethod
+        def get_config_filenames(cls) -> list[str]:
+            return []
+
+        def get_quant_method(
+            self, layer: torch.nn.Module, prefix: str
+        ) -> QuantizeMethodBase | None:
+            return None
+
+
 def register_platform() -> Optional[str]:
 
     if disable_vllm_plugin:
@@ -89,6 +131,7 @@ def register_platform() -> Optional[str]:
     # absent. Backbone is set in register_model() for real vLLM runs.
 
     _register_hf_configs()
+    _register_mxfp8_quantization_config()
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
