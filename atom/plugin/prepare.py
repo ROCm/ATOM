@@ -98,6 +98,7 @@ def _prepare_model_atom_sglang(
 def _prepare_model_atom_rtpllm(
     config: Any,
     atom_config: Any,
+    model_arch: str,
     model_cls: Any,
     set_attn_cls: Any,
     init_aiter_dist: Any,
@@ -120,6 +121,12 @@ def _prepare_model_atom_rtpllm(
     )
 
     set_attn_cls()
+    if model_arch == "GlmMoeDsaForCausalLM":
+        from atom.plugin.rtpllm.attention_backend import (
+            apply_attention_mla_rtpllm_patch,
+        )
+
+        apply_attention_mla_rtpllm_patch()
 
     # init aiter dist for using aiter custom collective ops
     init_aiter_dist(config=atom_config)
@@ -172,6 +179,7 @@ def prepare_model(config: Any, engine: str):
         return _prepare_model_atom_rtpllm(
             config,
             atom_config,
+            model_arch,
             model_cls,
             set_attn_cls,
             init_aiter_dist,

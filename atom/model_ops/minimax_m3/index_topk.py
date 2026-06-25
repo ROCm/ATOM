@@ -25,6 +25,10 @@ except ModuleNotFoundError:
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
+# Physical 16-pages per logical 128-block for the page-16 SHUFFLE ASM/gluon cache
+# (must match sparse_attn.PAGES_PER_SPARSE_BLOCK). Used by the fused block-table
+# emission in the topk kernels.
+PAGES_PER_SPARSE_BLOCK = 8
 
 
 # ---------------------------------------------------------------------------
@@ -199,10 +203,19 @@ def _topk_index_kernel(
     stride_ti_h,
     stride_ti_n,
     stride_ti_t,
+    # --- fused sparse block-table emission (ASM/gluon prefill path) ---
+    block_table_ptr,  # [batch, max_blocks] int32 logical 128-granularity (or dummy)
+    sparse_bt_ptr,  # out: [total_q, topk*pages_per_block] int32 (or dummy)
+    sparse_ctx_ptr,  # out: [total_q] int32 (or dummy)
+    stride_bt_b,
+    stride_sbt_n,
+    NUM_KV_HEADS: tl.constexpr,  # kv-head count folded into the emitted row + page id
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     MASK_INIT: tl.constexpr,
     MASK_LOCAL: tl.constexpr,
+    pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
+    EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction (per-kv-head row + encoded page)
 ):
     tl.static_assert(BLOCK_SIZE_K > BLOCK_SIZE_T)
     pid_q = tl.program_id(0)
@@ -282,6 +295,59 @@ def _topk_index_kernel(
     topk_idx = tl.where(store_mask & valid_mask, topk_idx, -1)
     tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty), mask=store_mask)
 
+    # --- fused sparse block-table build (per-query-token causal compaction) ---
+    # Mirrors _build_sparse_block_table_prefill_kernel over the in-register
+    # selection. EVERY kv-head emits its own row (the ASM/gluon path collapses
+    # (token, kv_head) into the row dim). Token absolute pos p = prefix_len + pid_q
+    # (sample_interval == 1); causal self-block = p // block_size, length p + 1.
+    # Page id is kv-head-encoded: (phys16_page)*NUM_KV_HEADS + pid_h; row is
+    # (block_start + pid_q)*NUM_KV_HEADS + pid_h. NUM_KV_HEADS == 1 -> original.
+    if EMIT_SPARSE_BT:
+        p = prefix_len + pid_q * sample_interval
+        self_blk = p // block_size
+        causal_len = p + 1
+        bt_blk = tl.where(off_t < topk, topk_idx, -1)
+        # causal: drop any selected block above the self-block (defensive; the
+        # indexer already caps selection at valid_blocks == self_blk + 1).
+        bt_valid = (bt_blk >= 0) & (bt_blk <= self_blk)
+        bt_is_tail = bt_valid & (bt_blk == self_blk)
+        bt_is_full = bt_valid & (bt_blk < self_blk)
+        bt_n_full = tl.sum(bt_is_full.to(tl.int32), axis=0)
+        bt_n_valid = tl.sum(bt_valid.to(tl.int32), axis=0)
+        bt_earlier_full = tl.cumsum(bt_is_full.to(tl.int32), axis=0) - bt_is_full.to(
+            tl.int32
+        )
+        bt_slot = tl.where(bt_is_full, bt_earlier_full, bt_n_full)  # tail -> n_full
+
+        bt_row = block_table_ptr + pid_b * stride_bt_b
+        bt_logical_page = tl.load(bt_row + bt_blk, mask=bt_valid, other=0).to(tl.int32)
+        bt_base_phys = bt_logical_page * pages_per_block * NUM_KV_HEADS + pid_h
+        bt_dst_base = bt_slot * pages_per_block
+
+        sbt_row = (
+            sparse_bt_ptr
+            + ((block_start + pid_q) * NUM_KV_HEADS + pid_h) * stride_sbt_n
+        )
+        for pj in range(pages_per_block):
+            tl.store(
+                sbt_row + bt_dst_base + pj,
+                bt_base_phys + pj * NUM_KV_HEADS,
+                mask=bt_valid,
+            )
+        bt_n_used = bt_n_valid * pages_per_block
+        off_w = tl.arange(0, BLOCK_SIZE_T * pages_per_block)
+        tl.store(sbt_row + off_w, tl.zeros_like(off_w), mask=off_w >= bt_n_used)
+
+        bt_tail_tokens = causal_len - self_blk * block_size
+        bt_has_tail = tl.sum(bt_is_tail.to(tl.int32), axis=0) > 0
+        bt_ctx = bt_n_full * block_size + tl.where(bt_has_tail, bt_tail_tokens, 0)
+        bt_ctx = tl.where(
+            bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
+        )
+        tl.store(
+            sparse_ctx_ptr + ((block_start + pid_q) * NUM_KV_HEADS + pid_h), bt_ctx
+        )
+
 
 # ---------------------------------------------------------------------------
 # Decode index-score kernel (split-K over seq blocks). Decode == one query
@@ -294,13 +360,13 @@ def _topk_index_kernel(
 )
 @triton.jit
 def _decode_index_score_kernel(
-    q_ptr,  # idx_q: [total_q (== batch), num_idx_heads, head_dim]
+    q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
     score_ptr,  # [num_idx_heads, total_q, max_block]
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens,  # [batch]
     num_idx_heads,
-    batch_size,
+    total_q,  # batch * max_q (one row per query token)
     head_dim,
     init_blocks,
     local_blocks,
@@ -315,21 +381,28 @@ def _decode_index_score_kernel(
     stride_s_n,
     stride_s_k,
     stride_bt_b,
+    MAX_Q: tl.constexpr,  # query tokens per request (num_spec + 1; 1 == plain decode)
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     NUM_KV_CHUNKS: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
-    pid_bc, pid_h = tl.program_id(0), tl.program_id(1)
-    pid_b = pid_bc % batch_size
-    pid_c = pid_bc // batch_size
+    pid_tc, pid_h = tl.program_id(0), tl.program_id(1)
+    pid_t = pid_tc % total_q  # global query-token row
+    pid_c = pid_tc // total_q
+    pid_b = pid_t // MAX_Q  # request index
+    tok = pid_t % MAX_Q  # token position within the request (0..MAX_Q-1)
     seq_len = tl.load(seq_lens + pid_b)
-    num_blocks = (seq_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    # Per-token causal length: token `tok` sits at absolute position
+    # (seq_len - MAX_Q + tok), so it attends (seq_len - MAX_Q + tok + 1) keys.
+    # MAX_Q == 1 -> causal_len == seq_len (plain decode, unchanged).
+    causal_len = seq_len - MAX_Q + tok + 1
+    num_blocks = (causal_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
     # block-aligned fixed-count split: grid independent of seq_len (cuda graph).
     chunk_size_blocks = (num_blocks + NUM_KV_CHUNKS - 1) // NUM_KV_CHUNKS
     chunk_start_block = pid_c * chunk_size_blocks
     chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
-    if chunk_start_block >= chunk_end_block:
+    if (causal_len <= 0) | (chunk_start_block >= chunk_end_block):
         return
     off_k = tl.arange(0, BLOCK_SIZE_K)  # positions within a 128-block
     off_d = tl.arange(0, BLOCK_SIZE_D)
@@ -339,7 +412,7 @@ def _decode_index_score_kernel(
     local_start = tl.maximum(0, num_blocks - local_blocks)
     # single query vector for this (token, index head)
     q = tl.load(
-        q_ptr + pid_b * stride_q_n + pid_h * stride_q_h + off_d * stride_q_d,
+        q_ptr + pid_t * stride_q_n + pid_h * stride_q_h + off_d * stride_q_d,
         mask=d_mask,
         other=0.0,
     ).to(
@@ -348,7 +421,7 @@ def _decode_index_score_kernel(
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
-        pos_mask = pos < seq_len
+        pos_mask = pos < causal_len
         k = tl.load(
             ik_cache_ptr
             + page * stride_ik_blk
@@ -366,7 +439,7 @@ def _decode_index_score_kernel(
         is_local = (blk >= local_start) & (blk < num_blocks)
         score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
         tl.store(
-            score_ptr + pid_h * stride_s_h + pid_b * stride_s_n + blk * stride_s_k,
+            score_ptr + pid_h * stride_s_h + pid_t * stride_s_n + blk * stride_s_k,
             score,
         )
 
@@ -388,13 +461,14 @@ def _decode_index_score_kernel(
 )
 @triton.jit
 def _topk_index_partial_kernel(
-    s_ptr,  # score: [num_idx_heads, batch, max_block]
-    ts_partial_ptr,  # partial scores out: [NUM_TOPK_CHUNKS, num_idx_heads, batch, T]
+    s_ptr,  # score: [num_idx_heads, total_q, max_block]
+    ts_partial_ptr,  # partial scores out: [NUM_TOPK_CHUNKS, num_idx_heads, total_q, T]
     ti_partial_ptr,  # partial idx out (1-indexed global, 0=invalid): same shape
     seq_lens,  # [batch]
     block_size: tl.constexpr,  # sparse block size (128)
     topk: tl.constexpr,
     chunk_blocks: tl.constexpr,  # how many score-blocks each chunk owns
+    MAX_Q: tl.constexpr,  # query tokens per request (num_spec + 1; 1 == plain decode)
     stride_s_h,
     stride_s_b,
     stride_s_k,
@@ -410,12 +484,16 @@ def _topk_index_partial_kernel(
     BLOCK_SIZE_T: tl.constexpr,
 ):
     tl.static_assert(topk < BLOCK_SIZE_K)
-    pid_b = tl.program_id(0)
+    pid_t = tl.program_id(0)  # global query-token row
     pid_h = tl.program_id(1)
     pid_chunk = tl.program_id(2)
 
+    pid_b = pid_t // MAX_Q  # request index
+    tok = pid_t % MAX_Q  # token position within the request (0..MAX_Q-1)
     seq_len = tl.load(seq_lens + pid_b)
-    num_blocks = (seq_len + block_size - 1) // block_size
+    # Per-token causal length (MAX_Q == 1 -> causal_len == seq_len, unchanged).
+    causal_len = seq_len - MAX_Q + tok + 1
+    num_blocks = (causal_len + block_size - 1) // block_size
 
     # Slice this chunk owns within [0, num_blocks).
     chunk_start = pid_chunk * chunk_blocks
@@ -427,7 +505,7 @@ def _topk_index_partial_kernel(
 
     s_ptrs = (
         s_ptr
-        + pid_b * stride_s_b
+        + pid_t * stride_s_b
         + pid_h * stride_s_h
         + (chunk_start + off_k) * stride_s_k
     )
@@ -489,14 +567,14 @@ def _topk_index_partial_kernel(
     ts_ptrs = (
         ts_partial_ptr
         + pid_chunk * stride_ts_c
-        + pid_b * stride_ts_b
+        + pid_t * stride_ts_b
         + pid_h * stride_ts_h
         + off_t * stride_ts_t
     )
     ti_ptrs = (
         ti_partial_ptr
         + pid_chunk * stride_ti_c
-        + pid_b * stride_ti_b
+        + pid_t * stride_ti_b
         + pid_h * stride_ti_h
         + off_t * stride_ti_t
     )
@@ -514,9 +592,9 @@ def _topk_index_partial_kernel(
 )
 @triton.jit
 def _topk_index_merge_kernel(
-    ts_partial_ptr,  # partial scores: [NUM_TOPK_CHUNKS, num_idx_heads, batch, T]
+    ts_partial_ptr,  # partial scores: [NUM_TOPK_CHUNKS, num_idx_heads, total_q, T]
     ti_partial_ptr,  # partial idx (1-indexed global, 0=invalid): same shape
-    ti_final_ptr,  # final idx (0-indexed, -1=invalid): [num_idx_heads, batch, topk]
+    ti_final_ptr,  # final idx (0-indexed, -1=invalid): [num_idx_heads, total_q, topk]
     seq_lens,  # [batch]
     block_size: tl.constexpr,  # sparse block size (128)
     topk: tl.constexpr,
@@ -531,15 +609,29 @@ def _topk_index_merge_kernel(
     stride_tif_h,
     stride_tif_b,
     stride_tif_t,
+    # --- fused sparse block-table emission (ASM/gluon decode path) ---
+    block_table_ptr,  # [batch, max_blocks] int32 logical 128-granularity (or dummy)
+    sparse_bt_ptr,  # out: [total_q, topk*pages_per_block] int32 (or dummy)
+    sparse_ctx_ptr,  # out: [total_q] int32 (or dummy)
+    stride_bt_b,
+    stride_sbt_b,
+    MAX_Q: tl.constexpr,  # query tokens per request (num_spec + 1; 1 == plain decode)
+    NUM_KV_HEADS: tl.constexpr,  # kv-head count folded into the emitted row + page id
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
+    EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction (per-kv-head row + encoded page)
 ):
-    pid_b = tl.program_id(0)
+    pid_t = tl.program_id(0)  # global query-token row
     pid_h = tl.program_id(1)
 
+    pid_b = pid_t // MAX_Q  # request index
+    tok = pid_t % MAX_Q  # token position within the request (0..MAX_Q-1)
     seq_len = tl.load(seq_lens + pid_b)
-    num_blocks = (seq_len + block_size - 1) // block_size
+    # Per-token causal length (MAX_Q == 1 -> causal_len == seq_len, unchanged).
+    causal_len = seq_len - MAX_Q + tok + 1
+    num_blocks = (causal_len + block_size - 1) // block_size
 
     # Load NUM_TOPK_CHUNKS * BLOCK_SIZE_T candidates, padded to BLOCK_SIZE_K.
     # Candidate at flat position p comes from chunk = p // BLOCK_SIZE_T,
@@ -552,13 +644,13 @@ def _topk_index_merge_kernel(
     score_offset = (
         chunk_idx * stride_ts_c
         + pid_h * stride_ts_h
-        + pid_b * stride_ts_b
+        + pid_t * stride_ts_b
         + in_chunk_idx * stride_ts_t
     )
     idx_offset = (
         chunk_idx * stride_ti_c
         + pid_h * stride_ti_h
-        + pid_b * stride_ti_b
+        + pid_t * stride_ti_b
         + in_chunk_idx * stride_ti_t
     )
 
@@ -586,7 +678,7 @@ def _topk_index_merge_kernel(
     tif_ptrs = (
         ti_final_ptr
         + pid_h * stride_tif_h
-        + pid_b * stride_tif_b
+        + pid_t * stride_tif_b
         + off_t * stride_tif_t
     )
     store_mask = off_t < topk
@@ -594,6 +686,58 @@ def _topk_index_merge_kernel(
     tl.store(
         tif_ptrs, topk_idx_final.to(ti_final_ptr.dtype.element_ty), mask=store_mask
     )
+
+    # --- fused sparse block-table build (per-(token, kv-head) compaction) ---
+    # Mirrors _build_sparse_block_table_kernel over the in-register selection,
+    # avoiding a second kernel launch + topk_idx HBM round-trip. EVERY kv-head
+    # emits its own row: the ASM/gluon path collapses (token, kv_head) into the
+    # row dim so it can run with num_kv_heads_view == 1. The physical page id is
+    # encoded as (phys16_page)*NUM_KV_HEADS + kv_head, matching the collapsed KV
+    # cache view [num_phys16*NUM_KV_HEADS, 1, ...]. NUM_KV_HEADS == 1 reduces to
+    # the original per-token emit (row == pid_t, page == phys16).
+    if EMIT_SPARSE_BT:
+        # Per-token tail block: the 128-block containing this token's last causal
+        # key (causal_len - 1). MAX_Q == 1 -> self_blk == (seq_len-1)//block_size.
+        self_blk = (causal_len - 1) // block_size
+        bt_blk = tl.where(off_t < topk, topk_idx_final, -1)
+        bt_valid = bt_blk >= 0
+        bt_is_tail = bt_valid & (bt_blk == self_blk)
+        bt_is_full = bt_valid & (bt_blk != self_blk)
+        bt_n_full = tl.sum(bt_is_full.to(tl.int32), axis=0)
+        bt_n_valid = tl.sum(bt_valid.to(tl.int32), axis=0)
+        bt_earlier_full = tl.cumsum(bt_is_full.to(tl.int32), axis=0) - bt_is_full.to(
+            tl.int32
+        )
+        bt_slot = tl.where(bt_is_full, bt_earlier_full, bt_n_full)  # tail -> n_full
+
+        bt_row = block_table_ptr + pid_b * stride_bt_b
+        bt_logical_page = tl.load(bt_row + bt_blk, mask=bt_valid, other=0).to(tl.int32)
+        # Encode kv-head into the page id. The 8 phys16 pages of one 128-block are
+        # NUM_KV_HEADS apart in the collapsed cache view (block-major then kv-head),
+        # so consecutive pj differ by NUM_KV_HEADS, not 1.
+        bt_base_phys = bt_logical_page * pages_per_block * NUM_KV_HEADS + pid_h
+        bt_dst_base = bt_slot * pages_per_block
+
+        # Fold kv-head into the row: row = pid_t * NUM_KV_HEADS + pid_h.
+        sbt_row = sparse_bt_ptr + (pid_t * NUM_KV_HEADS + pid_h) * stride_sbt_b
+        # write valid slots -> their pages; unused tail -> 0 (in-bounds page id).
+        for pj in range(pages_per_block):
+            tl.store(
+                sbt_row + bt_dst_base + pj,
+                bt_base_phys + pj * NUM_KV_HEADS,
+                mask=bt_valid,
+            )
+        bt_n_used = bt_n_valid * pages_per_block
+        off_w = tl.arange(0, BLOCK_SIZE_T * pages_per_block)
+        tl.store(sbt_row + off_w, tl.zeros_like(off_w), mask=off_w >= bt_n_used)
+
+        bt_tail_tokens = causal_len - self_blk * block_size
+        bt_has_tail = tl.sum(bt_is_tail.to(tl.int32), axis=0) > 0
+        bt_ctx = bt_n_full * block_size + tl.where(bt_has_tail, bt_tail_tokens, 0)
+        bt_ctx = tl.where(
+            bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
+        )
+        tl.store(sparse_ctx_ptr + (pid_t * NUM_KV_HEADS + pid_h), bt_ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -614,12 +758,19 @@ def minimax_m3_index_topk(
     local_blocks: int,
     num_kv_heads: int,
     sm_scale: float,
-) -> torch.Tensor:
+    emit_sparse_block_table: bool = False,
+):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
     Returns topk_idx [num_kv_heads, total_q, topk] of 0-indexed block ids
     (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
     per-index-head top-k maps 1:1 to kv heads (no index-head reduction needed).
+
+    When ``emit_sparse_block_table`` is True (requires num_idx_heads == 1), the
+    topk kernel ALSO fuses the per-query-token page-16 SHUFFLE block-table
+    compaction and returns ``(topk_idx, sparse_bt [total_q, topk*8], sparse_ctx
+    [total_q])`` ready for the ASM prefill kernel -- saving a separate build
+    launch + topk_idx HBM round-trip.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -665,6 +816,26 @@ def minimax_m3_index_topk(
         dtype=torch.int32,
         device=idx_q.device,
     )
+    # One emitted row per (query token, kv-head): the ASM/gluon path collapses
+    # kv-head into the row dim, so sparse_bt/ctx are total_q*num_idx_heads rows
+    # and the page ids are kv-head-encoded in the kernel. num_idx_heads == 1
+    # reduces to the original per-token layout.
+    emit = emit_sparse_block_table
+    if emit:
+        sparse_bt = torch.empty(
+            (total_q * num_idx_heads, topk * PAGES_PER_SPARSE_BLOCK),
+            dtype=torch.int32,
+            device=idx_q.device,
+        )
+        sparse_ctx = torch.empty(
+            (total_q * num_idx_heads,), dtype=torch.int32, device=idx_q.device
+        )
+        sbt_arg, sctx_arg = sparse_bt, sparse_ctx
+        bt_stride0, sbt_stride0 = block_table.stride(0), sparse_bt.stride(0)
+    else:
+        sbt_arg = torch.empty(1, dtype=torch.int32, device=idx_q.device)
+        sctx_arg = torch.empty(1, dtype=torch.int32, device=idx_q.device)
+        bt_stride0, sbt_stride0 = 0, 0
     # block_size_q == 1 -> query blocks coincide with query tokens.
     grid_topk = (max_query_len, batch, num_idx_heads)
     _topk_index_kernel[grid_topk](
@@ -684,15 +855,25 @@ def minimax_m3_index_topk(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
+        block_table,
+        sbt_arg,
+        sctx_arg,
+        bt_stride0,
+        sbt_stride0,
+        NUM_KV_HEADS=num_idx_heads,
         MASK_INIT=False,
         MASK_LOCAL=False,
+        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        EMIT_SPARSE_BT=emit,
     )
+    if emit:
+        return topk_idx, sparse_bt, sparse_ctx
     return topk_idx
 
 
 @torch.no_grad()
 def minimax_m3_index_topk_decode(
-    idx_q: torch.Tensor,  # [batch, num_idx_heads, head_dim]
+    idx_q: torch.Tensor,  # [total_q == batch*max_query_len, num_idx_heads, head_dim]
     index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
     block_table: torch.Tensor,  # [batch, max_blocks]
     seq_lens: torch.Tensor,  # [batch] int32
@@ -702,16 +883,30 @@ def minimax_m3_index_topk_decode(
     local_blocks: int,
     num_kv_heads: int,
     sm_scale: float,
-) -> torch.Tensor:
+    emit_sparse_block_table: bool = False,
+    max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
+):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
-    Returns topk_idx [num_kv_heads, batch, topk] (0-indexed block ids, -1 pad).
+    Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
+    For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
+    query tokens of a request is an independent row with its own causal cutoff
+    ``causal_len = seq_len - max_query_len + tok + 1``; ``max_query_len == 1`` is
+    plain decode (one token per request) and reduces to the original behavior.
+
+    When ``emit_sparse_block_table`` is True (requires num_idx_heads == 1), the
+    merge kernel ALSO fuses the page-16 SHUFFLE block-table compaction and returns
+    ``(topk_idx, sparse_bt [total_q, topk*8], sparse_ctx [total_q])`` ready for the
+    ASM/gluon decode kernel -- saving a separate build launch + topk_idx HBM
+    round-trip.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
         num_idx_heads == num_kv_heads
     ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    batch = total_q
+    assert (
+        total_q % max_query_len == 0
+    ), f"total_q {total_q} not divisible by max_query_len {max_query_len}"
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     score = torch.empty(
         (num_idx_heads, total_q, max_block),
@@ -723,10 +918,10 @@ def minimax_m3_index_topk_decode(
     TARGET_GRID = 4096
     MAX_NUM_KV_CHUNKS = 256
     target = max(
-        1, min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch * num_idx_heads))
+        1, min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, total_q * num_idx_heads))
     )
     num_kv_chunks = 1 << (target.bit_length() - 1)
-    grid_score = (batch * num_kv_chunks, num_idx_heads)
+    grid_score = (total_q * num_kv_chunks, num_idx_heads)
     _decode_index_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -734,7 +929,7 @@ def minimax_m3_index_topk_decode(
         block_table,
         seq_lens,
         num_idx_heads,
-        batch,
+        total_q,
         head_dim,
         init_blocks,
         local_blocks,
@@ -749,6 +944,7 @@ def minimax_m3_index_topk_decode(
         score.stride(1),
         score.stride(2),
         block_table.stride(0),
+        MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_KV_CHUNKS=num_kv_chunks,
     )
@@ -763,7 +959,7 @@ def minimax_m3_index_topk_decode(
     TOPK_TARGET_GRID = 64
     MAX_NUM_TOPK_CHUNKS = 16
     topk_target = max(
-        1, min(MAX_NUM_TOPK_CHUNKS, TOPK_TARGET_GRID // max(1, batch * num_idx_heads))
+        1, min(MAX_NUM_TOPK_CHUNKS, TOPK_TARGET_GRID // max(1, total_q * num_idx_heads))
     )
     num_topk_chunks = 1 << (topk_target.bit_length() - 1)
     block_size_t = triton.next_power_of_2(topk)
@@ -771,7 +967,7 @@ def minimax_m3_index_topk_decode(
     topk_score_partial = torch.empty(
         num_topk_chunks,
         num_idx_heads,
-        batch,
+        total_q,
         block_size_t,
         dtype=torch.float32,
         device=idx_q.device,
@@ -779,12 +975,12 @@ def minimax_m3_index_topk_decode(
     topk_idx_partial = torch.empty(
         num_topk_chunks,
         num_idx_heads,
-        batch,
+        total_q,
         block_size_t,
         dtype=torch.int32,
         device=idx_q.device,
     )
-    _topk_index_partial_kernel[(batch, num_idx_heads, num_topk_chunks)](
+    _topk_index_partial_kernel[(total_q, num_idx_heads, num_topk_chunks)](
         score,
         topk_score_partial,
         topk_idx_partial,
@@ -792,6 +988,7 @@ def minimax_m3_index_topk_decode(
         SPARSE_BLOCK_SIZE,
         topk,
         chunk_blocks,
+        max_query_len,  # MAX_Q
         score.stride(0),
         score.stride(1),
         score.stride(2),
@@ -804,7 +1001,28 @@ def minimax_m3_index_topk_decode(
         topk_idx_partial.stride(2),
         topk_idx_partial.stride(3),
     )
-    _topk_index_merge_kernel[(batch, num_idx_heads)](
+    # The fused emit now produces one row per (token, kv-head): the ASM/gluon path
+    # collapses kv-head into the row dim. sparse_bt/ctx are sized total_q*num_idx_heads
+    # and the page ids are kv-head-encoded inside the kernel. num_idx_heads == 1
+    # reduces to the original per-token layout.
+    emit = emit_sparse_block_table
+    if emit:
+        sparse_bt = torch.empty(
+            (total_q * num_idx_heads, topk * PAGES_PER_SPARSE_BLOCK),
+            dtype=torch.int32,
+            device=idx_q.device,
+        )
+        sparse_ctx = torch.empty(
+            (total_q * num_idx_heads,), dtype=torch.int32, device=idx_q.device
+        )
+        sbt_arg, sctx_arg = sparse_bt, sparse_ctx
+        bt_stride0, sbt_stride0 = block_table.stride(0), sparse_bt.stride(0)
+    else:
+        # dummy 1-elem tensors so the kernel always has valid pointers.
+        sbt_arg = torch.empty(1, dtype=torch.int32, device=idx_q.device)
+        sctx_arg = torch.empty(1, dtype=torch.int32, device=idx_q.device)
+        bt_stride0, sbt_stride0 = 0, 0
+    _topk_index_merge_kernel[(total_q, num_idx_heads)](
         topk_score_partial,
         topk_idx_partial,
         topk_idx,
@@ -822,6 +1040,17 @@ def minimax_m3_index_topk_decode(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
+        block_table,
+        sbt_arg,
+        sctx_arg,
+        bt_stride0,
+        sbt_stride0,
+        MAX_Q=max_query_len,
+        NUM_KV_HEADS=num_idx_heads,
         NUM_TOPK_CHUNKS=num_topk_chunks,
+        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        EMIT_SPARSE_BT=emit,
     )
+    if emit:
+        return topk_idx, sparse_bt, sparse_ctx
     return topk_idx

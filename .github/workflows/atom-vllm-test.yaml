@@ -250,7 +250,7 @@ jobs:
               ATOM_MOE_GU_ITLV=1
             lm_eval_num_fewshot: 20
             accuracy_test_threshold: 0.94
-            runner: linux-atom-mi35x-4
+            runner: atom-mi35x-8gpu-oot-acc
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
@@ -259,7 +259,7 @@ jobs:
             env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nVLLM_USE_V2_MODEL_RUNNER=1"
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.88
-            runner: linux-atom-mi35x-1
+            runner: atom-mi35x-8gpu-oot-acc
           - display_name: "Kimi-K2.5-MXFP4 TP4"
             model_name: "Kimi-K2.5-MXFP4"
             model_path: "amd/Kimi-K2.5-MXFP4-AttnFP8"
@@ -267,19 +267,17 @@ jobs:
             env_vars: ""
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.92
-            runner: linux-atom-mi35x-4
+            runner: atom-mi35x-8gpu-oot-acc
           - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
             model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
             extra_args: "--tensor-parallel-size 2 --attention-backend ROCM_AITER_FA"
-            # FIXME: Remove these temporary Qwen3.5 workarounds after the
-            # aiter fix landed
             env_vars: |
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
             lm_eval_num_fewshot: 3
             accuracy_test_threshold: 0.76
-            runner: linux-atom-mi35x-4
+            runner: atom-mi35x-8gpu-oot-acc
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
@@ -299,10 +297,15 @@ jobs:
           fi
 
       - name: Clean up containers and workspace
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'atom-mi35x-8gpu-oot-acc'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
-          containers=$(docker ps -q)
+          if ! docker ps >/tmp/docker-ps.out 2>/tmp/docker-ps.err; then
+            echo "::warning::Docker is unavailable on this runner. Skipping pre-cleanup."
+            cat /tmp/docker-ps.err || true
+            exit 0
+          fi
+          containers=$(cat /tmp/docker-ps.out)
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
@@ -313,9 +316,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Ensure Docker client config directory
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'atom-mi35x-8gpu-oot-acc'
         run: |
           set -euo pipefail
+          if [ -z "${DOCKER_CONFIG:-}" ]; then
+            echo "DOCKER_CONFIG is unset for runner ${{ matrix.runner }}; using Docker's default config path."
+            exit 0
+          fi
           mkdir -p "$DOCKER_CONFIG"
           chmod 700 "$DOCKER_CONFIG"
 
@@ -327,6 +334,24 @@ jobs:
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
+      - name: Print runner user
+        run: |
+          echo "=== Container engine diagnostics ==="
+          echo "PATH=${PATH}"
+          echo "whoami=$(whoami)"
+          echo "id=$(id)"
+          echo "docker path: $(command -v docker || true)"
+          echo "podman path: $(command -v podman || true)"
+          echo "docker version:"
+          docker version || true
+          echo "docker info:"
+          docker info || true
+          echo "podman version:"
+          podman version || true
+          echo "podman info:"
+          podman info || true
+          echo "=== End container engine diagnostics ==="
+      
       - name: Download aiter wheel
         uses: actions/download-artifact@v4
         with:
@@ -492,7 +517,7 @@ jobs:
           model_dir="/models/${{ matrix.model_path }}"
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             model_use_lock="true"
-            if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+            if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ] || [ "${{ matrix.runner }}" = "atom-mi35x-8gpu-oot-acc" ]; then
               model_use_lock="false"
             fi
             echo "Using shared model download script for ${model_dir} (MODEL_USE_LOCK=${model_use_lock})"
