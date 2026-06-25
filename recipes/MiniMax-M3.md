@@ -211,11 +211,12 @@ lm_eval \
 Validated MXFP4+EAGLE GSM8K result:
 
 ```text
-local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
-|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
-|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9416|±  |0.0062|
-|     |       |strict-match    |     5|exact_match|↑  |0.9419|±  |0.0062|
+| Case | Eagle | GSM8K flexible-extract | GSM8K strict-match | Eagle 接受率 | Avg toks/fwd | Accepted / Total Draft |
+|---|---:|---:|---:|---:|---:|---:|
+| `fp4_eagle_tp4` | yes | `0.9386 ± 0.0066` | `0.9393 ± 0.0066` | `75.18%` | `3.26` | `99238 / 132000` |
+
+Eagle accepted tokens distribution:
+`{0: 13.55%, 1: 11.02%, 2: 11.77%, 3: 63.66%}`
 ```
 
 ### Serving Benchmark
@@ -254,27 +255,3 @@ Reference MXFP4 EAGLE3 results from our run on 4xMI355 GPUs:
 | 16 | 160 | 103.68 | 498.39 | 4218.43 | 10.03 | 22.49 | 1414.41 | 13210.97 |
 | 32 | 320 | 139.89 | 642.88 | 5327.78 | 13.91 | 33.04 | 2120.00 | 19933.90 |
 | 64 | 640 | 213.19 | 979.37 | 10432.72 | 21.05 | 51.05 | 2771.30 | 24947.04 |
-
-### Acceptance Rate
-
-With `--num-speculative-tokens 3` the draft proposes 3 tokens per step. Measured
-over the full GSM8K run:
-
-```text
-Average accepted tokens / forward : 3.20    (1 verified + up to 3 speculated)
-Overall draft acceptance rate     : 73.45%  (accepted / total proposed draft tokens)
-Accepted-count distribution       : {0: 14.20%, 1: 12.11%, 2: 12.83%, 3: 60.86%}
-```
-
-Draft tokens are accepted sequentially — position *i* is kept only if every earlier
-position was kept — so the per-position acceptance rate is the marginal probability
-that each draft slot is accepted (`P(accepted ≥ i)`):
-
-| Draft position | Per-position acceptance rate |
-|----------------|------------------------------|
-| 1st            | 85.8%                        |
-| 2nd            | 73.7%                        |
-| 3rd            | 60.9%                        |
-
-The three per-position rates average to the 73.45% overall rate, and 60.86% of
-steps accept all 3 speculated tokens.
