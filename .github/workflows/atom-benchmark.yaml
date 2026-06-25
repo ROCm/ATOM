@@ -38,14 +38,6 @@ on:
         description: "Benchmark Kimi-K2.5-MXFP4"
         type: boolean
         default: true
-      MiniMax-M2.7:
-        description: "Benchmark MiniMax-M2.7"
-        type: boolean
-        default: true
-      MiniMax-M2.7-MXFP4:
-        description: "Benchmark MiniMax-M2.7-MXFP4"
-        type: boolean
-        default: true
       m3-mxfp8:
         description: "Benchmark MiniMax-M3-MXFP8 (+ EAGLE3)"
         type: boolean

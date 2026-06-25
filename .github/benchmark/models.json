@@ -138,24 +138,6 @@
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     },
     {
-      "display": "MiniMax-M2.7",
-      "path": "MiniMaxAI/MiniMax-M2.7",
-      "prefix": "MiniMax-M2.7",
-      "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 2, "kv_cache_dtype": "fp8", "trust_remote_code": true },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
-    },
-    {
-      "display": "MiniMax-M2.7-MXFP4",
-      "path": "amd/MiniMax-M2.7-MXFP4",
-      "prefix": "MiniMax-M2.7-MXFP4",
-      "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
-      "config": { "tp": 1, "kv_cache_dtype": "fp8", "trust_remote_code": true },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
-    },
-    {
       "display": "MiniMax-M3-MXFP8",
       "path": "MiniMaxAI/MiniMax-M3-MXFP8",
       "prefix": "m3-mxfp8",
