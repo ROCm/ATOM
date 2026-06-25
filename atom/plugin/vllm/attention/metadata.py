@@ -385,6 +385,10 @@ class AiterMlaSparseMetadataForVllm:
 class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
     """vLLM-only MHA metadata builder."""
 
+    # FULL decode graphs are safe when all replay-varying values are carried by
+    # stable vLLM buffers (seq_lens, block_table, slot_mapping, positions, and
+    # the layer-owned FP8 KV scale buffer). Mixed prefill/decode still runs in
+    # PIECEWISE under FULL_AND_PIECEWISE.
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
 
@@ -766,15 +770,42 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self,
         common_attn_metadata=None,
     ):
-        self.total_tokens = (
-            self.model_config.max_model_len
-            * self.vllm_config.scheduler_config.max_num_partial_prefills
+        # FULL capture is only used for uniform decode batches. Build a metadata
+        # object whose tensor fields are the same stable buffers that runtime
+        # replay updates, while avoiding the generic split path and its CPU syncs.
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        decode_metadata = AiterMhaPhaseMetadata(
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            query_start_loc=common_attn_metadata.query_start_loc,
         )
-        attn_metadata = self.build(
-            common_prefix_len=0, common_attn_metadata=common_attn_metadata
+        return AiterMhaMetadataForVllm(
+            num_actual_tokens=num_tokens,
+            num_actual_kv_tokens=0,
+            max_query_len=common_attn_metadata.max_query_len,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            seq_lens=common_attn_metadata.seq_lens,
+            block_table=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            num_decodes=num_reqs,
+            num_decode_tokens=num_tokens,
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_extends=0,
+            num_extend_tokens=0,
+            dropout_p=0.0,
+            decode_metadata=decode_metadata,
+            prefill_metadata=None,
+            extend_metadata=None,
+            use_cascade=False,
+            common_prefix_len=0,
+            total_tokens=(
+                self.model_config.max_model_len
+                * self.vllm_config.scheduler_config.max_num_partial_prefills
+            ),
         )
-        self.total_tokens = 0
-        return attn_metadata
 
 
 class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):

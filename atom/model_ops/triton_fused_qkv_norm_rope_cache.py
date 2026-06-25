@@ -76,9 +76,13 @@ def _fused_qkv_norm_rope_cache_kernel(
     ROTARY_DIM: tl.constexpr,
     ROTARY_DIM_HALF: tl.constexpr,
     IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
     # M-RoPE section boundaries (cumulative)
     MROPE_S0: tl.constexpr = 0,
     MROPE_S1: tl.constexpr = 0,
+    MROPE_SECTION_H: tl.constexpr = 0,
+    MROPE_SECTION_W: tl.constexpr = 0,
+    MROPE_INTERLEAVED: tl.constexpr = False,
     IS_MROPE: tl.constexpr = False,
 ):
     # Grid: (num_tokens * (num_heads + num_kv_heads),)
@@ -122,11 +126,16 @@ def _fused_qkv_norm_rope_cache_kernel(
             pos_t = tl.load(pos_ptr + 0 * pos_stride_row + token_id)
             pos_h = tl.load(pos_ptr + 1 * pos_stride_row + token_id)
             pos_w = tl.load(pos_ptr + 2 * pos_stride_row + token_id)
-            pos_per_dim = tl.where(
-                d_cos_idx < MROPE_S0,
-                pos_t,
-                tl.where(d_cos_idx < MROPE_S1, pos_h, pos_w),
-            )
+            if MROPE_INTERLEAVED:
+                use_h = ((d_cos_idx % 3) == 1) & (d_cos_idx < MROPE_SECTION_H * 3)
+                use_w = ((d_cos_idx % 3) == 2) & (d_cos_idx < MROPE_SECTION_W * 3)
+                pos_per_dim = tl.where(use_h, pos_h, tl.where(use_w, pos_w, pos_t))
+            else:
+                pos_per_dim = tl.where(
+                    d_cos_idx < MROPE_S0,
+                    pos_t,
+                    tl.where(d_cos_idx < MROPE_S1, pos_h, pos_w),
+                )
             cos_base = pos_per_dim * cos_sin_stride_pos
         else:
             pos = tl.load(pos_ptr + token_id)
@@ -191,11 +200,16 @@ def _fused_qkv_norm_rope_cache_kernel(
             pos_t = tl.load(pos_ptr + 0 * pos_stride_row + token_id)
             pos_h = tl.load(pos_ptr + 1 * pos_stride_row + token_id)
             pos_w = tl.load(pos_ptr + 2 * pos_stride_row + token_id)
-            pos_per_dim = tl.where(
-                d_cos_idx < MROPE_S0,
-                pos_t,
-                tl.where(d_cos_idx < MROPE_S1, pos_h, pos_w),
-            )
+            if MROPE_INTERLEAVED:
+                use_h = ((d_cos_idx % 3) == 1) & (d_cos_idx < MROPE_SECTION_H * 3)
+                use_w = ((d_cos_idx % 3) == 2) & (d_cos_idx < MROPE_SECTION_W * 3)
+                pos_per_dim = tl.where(use_h, pos_h, tl.where(use_w, pos_w, pos_t))
+            else:
+                pos_per_dim = tl.where(
+                    d_cos_idx < MROPE_S0,
+                    pos_t,
+                    tl.where(d_cos_idx < MROPE_S1, pos_h, pos_w),
+                )
             cos_base = pos_per_dim * cos_sin_stride_pos
         else:
             pos = tl.load(pos_ptr + token_id)
@@ -244,7 +258,7 @@ def _fused_qkv_norm_rope_cache_kernel(
             if IS_FP8:
                 # FP8 per-token quantization for k
                 k_abs_max = tl.max(tl.abs(k_roped), axis=0)
-                k_scale = k_abs_max / 240.0
+                k_scale = k_abs_max / FP8_MAX
                 k_scale = tl.where(k_scale == 0.0, 1.0, k_scale)
                 k_quant = (k_roped / k_scale).to(k_cache_ptr.dtype.element_ty)
 
@@ -276,7 +290,7 @@ def _fused_qkv_norm_rope_cache_kernel(
                 # FP8 per-token quantization for v
                 v_f32 = v.to(tl.float32)
                 v_abs_max = tl.max(tl.abs(v_f32), axis=0)
-                v_scale = v_abs_max / 240.0
+                v_scale = v_abs_max / FP8_MAX
                 v_scale = tl.where(v_scale == 0.0, 1.0, v_scale)
                 v_quant = (v_f32 / v_scale).to(v_cache_ptr.dtype.element_ty)
 
@@ -342,6 +356,7 @@ def triton_fused_norm_rope_cache(
     sin_cache = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
 
     is_fp8 = kv_cache_dtype == "fp8"
+    fp8_max = torch.finfo(k_cache.dtype).max if is_fp8 else 1.0
 
     block_size = k_cache.shape[3]  # k_cache: [B, H, D//X, block_size, X]
     x_size = k_cache.shape[4]
@@ -353,10 +368,16 @@ def triton_fused_norm_rope_cache(
         assert mrope_section is not None, "M-RoPE requires rotary_emb.mrope_section"
         s0 = mrope_section[0]
         s1 = s0 + mrope_section[1]
+        section_h = mrope_section[1]
+        section_w = mrope_section[2]
+        mrope_interleaved = getattr(rotary_emb, "mrope_interleaved", False)
         pos_stride_row = positions.stride(0)
     else:
         s0 = 0
         s1 = 0
+        section_h = 0
+        section_w = 0
+        mrope_interleaved = False
         pos_stride_row = 0
 
     # Allocate contiguous output tensors
@@ -410,8 +431,12 @@ def triton_fused_norm_rope_cache(
         ROTARY_DIM=rotary_dim,
         ROTARY_DIM_HALF=rotary_dim // 2,
         IS_FP8=is_fp8,
+        FP8_MAX=fp8_max,
         MROPE_S0=s0,
         MROPE_S1=s1,
+        MROPE_SECTION_H=section_h,
+        MROPE_SECTION_W=section_w,
+        MROPE_INTERLEAVED=mrope_interleaved,
         IS_MROPE=is_mrope,
     )
 
